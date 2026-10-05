@@ -52,6 +52,50 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   return { root, config, host, idle };
 };
 
+describe("watchdog custody at host admission", () => {
+  it("refuses custody before initialization and releases the acquired host fence", async () => {
+    const { root, config, host } = fixture();
+    const marker = path.join(config.residencyRoot, "watchdog-custody.json");
+    fs.writeFileSync(marker, "uncertain attempt, not a PID lease");
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(host.start()).rejects.toThrow("watchdog custody");
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
+      // Refusal must not strand our fence. Explicit fixture drain, not PID expiry.
+      fs.rmSync(marker);
+      await successor.start();
+      expect(successor.agents).toBeDefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not initialize while a custody publisher owns the transaction lock", async () => {
+    const { root, config, host } = fixture();
+    const publisher = await lockFile(path.join(config.residencyRoot, "handover.lock"), 0, process.platform === "linux");
+    try {
+      await expect(host.start()).rejects.toBeInstanceOf(fileLock.FileLockBusy);
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      // The publisher may now commit custody; a subsequent host must observe it.
+      fs.writeFileSync(path.join(config.residencyRoot, "watchdog-custody.json"), "retained");
+    } finally { fs.closeSync(publisher); }
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(successor.start()).rejects.toThrow("watchdog custody");
+      expect(successor.agents).toBeUndefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("fresh startup ownership batches", () => {
   it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
     const { root, config, host } = fixture();
@@ -317,7 +361,8 @@ describe("#3662 resident actor delivery routing", () => {
         await send("after repair", 2);
         expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
         expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
-        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        // Confirmed withdrawal still does not permit actor-output succession: the owner root
+        // remains the only custody address, even when its recorded lineage is closed.
         expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
         expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
         await host.mesh.put({
@@ -327,8 +372,8 @@ describe("#3662 resident actor delivery routing", () => {
         });
         expect(host.participants.lineageAlive(config.rootId)).toBe(false);
         await send("after withdrawal", 3);
-        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
-        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
       } finally {
         readFault?.mockRestore();
         statFault?.mockRestore();
@@ -341,9 +386,9 @@ describe("#3662 resident actor delivery routing", () => {
   it.each([
     ["expired lease with live lineage", true, true, "root"],
     ["dead root without bound integrator", false, false, "root"],
-    ["dead root with exact bound integrator", false, true, "integrator"],
-    ["dead root with actor repository different from host cwd", false, true, "integrator"],
-  ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
+    ["dead root with exact bound integrator", false, true, "root"],
+    ["dead root with actor repository different from host cwd", false, true, "root"],
+  ] as const)("keeps %s at the exact actor-owner mailbox", async (_case, rootPresent, bound, target) => {
     const { root, config, host } = fixture();
     const integratorId = "session:11111111-1111-4111-8111-111111111111";
     config.cwd = root;
@@ -398,7 +443,7 @@ describe("#3662 resident actor delivery routing", () => {
         delivery: "steer", triggerTurn: true,
       });
       await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
-      const expected = target === "integrator" ? integratorId : config.rootId;
+      const expected = config.rootId;
       const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });

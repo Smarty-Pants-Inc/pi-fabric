@@ -988,6 +988,29 @@ describe('model: "auto" spawn routing (#2890)', () => {
     expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
+  it.each(["task:merge-additive", "task:ci-test-fixture", "task:exact-checks"])("routes explicit opt-in %s on spawn and run, never from task text", async routeClass => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    for (const action of ["spawn", "run"]) {
+      const handle = await provider.invoke(action, { ...request, task: "ECHO_MODEL", routeClass }, context) as AgentHandleInfo;
+      expect(await agents.wait(handle.id)).toMatchObject({ model: "provider/model-b", thinking: "high", routeClass, routeClassSource: "explicit" });
+    }
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    const plain = await provider.invoke("spawn", { task: routeClass, name: routeClass, transport: "process", protected: false }, context) as AgentHandleInfo;
+    expect(await agents.wait(plain.id)).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived" });
+    expect(evaluate).toHaveBeenCalledTimes(2);
+  });
+  it("removes the quality reporting action without disabling opted-in LIVE", async () => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [request.routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    const registry = new ActionRegistry(); registry.register(provider);
+    await expect(registry.invoke("agents.routeOutcome", { id: "removed", routeQuality: "fail" }, { ...context, approve: async () => {}, audits: [], maxResultChars: 100000 })).rejects.toThrow();
+    const handle = await provider.invoke("spawn", request, context) as AgentHandleInfo & { routeDecision: { reasonCode: string } };
+    expect(handle.routeDecision.reasonCode).toBe("live-choice");
+    await agents.wait(handle.id);
+  });
   it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
     const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
@@ -2044,6 +2067,35 @@ const lifecycleSubscription = (
   });
 
   describe("AgentsProvider lifecycle coalescing", () => {
+    it.each(["main", "session:test"])("delivers exactly one local completion notification to %s during a directory outage", async (to) => {
+      const request = vi.fn();
+      const { provider, participants, mainAgent, mainDeliveries } = setup([], [], { request } as unknown as FabricControlPlane);
+      const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+      Object.assign(participants, {
+        routingUnavailable: () => "heartbeat failed",
+        refreshRoutingView,
+        get: vi.fn(() => { throw new Error("directory read failed"); }),
+      });
+      // Exercise the provider's local-Main grouping path as well as its router.
+      Object.assign(mainAgent, { supportsProvenance: () => true });
+      const errors = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const event = lifecycleEvent({ status: "completed" });
+      try {
+        await provider.deliverLifecycle(lifecycleSubscription({ to }), event);
+        await provider.flushLifecycleDeliveries();
+        await provider.flushLifecycleDeliveries();
+        expect(mainDeliveries).toHaveLength(1);
+        expect(mainDeliveries[0]).toMatchObject({ delivery: "followUp", data: event, triggerTurn: true });
+        expect(errors).not.toHaveBeenCalled();
+        expect(refreshRoutingView).not.toHaveBeenCalled();
+        await expect(provider.routeMessage("session:remote", "do not publish", undefined, "followUp"))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(refreshRoutingView).toHaveBeenCalledOnce();
+        expect(request).not.toHaveBeenCalled();
+        expect(mainDeliveries).toHaveLength(1);
+      } finally { errors.mockRestore(); }
+    });
     it("coalesces a burst of followUp lifecycle events into one wake delivery", async () => {
       const { provider, mainDeliveries } = setup();
       for (let index = 0; index < 5; index += 1) {
@@ -2350,6 +2402,16 @@ describe("AgentsProvider runner support", () => {
     expect((await provider.describe("peers", context))?.risk).toBe("read");
   });
 
+  it("keeps session: stop targets out of actor classification (#2386)", async () => {
+    const { provider, actors, agents } = setup();
+    const status = vi.spyOn(actors, "status");
+    const failure = new Error("stop dispatch reached");
+    const stop = vi.spyOn(agents, "stop").mockRejectedValue(failure);
+    await expect(provider.invoke("stop", { id: "session:peer" }, context)).rejects.toBe(failure);
+    expect(stop).toHaveBeenCalledWith("session:peer", { consume: false });
+    expect(status).not.toHaveBeenCalled();
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;
@@ -2362,7 +2424,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
     expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
-      { message: "hello", data: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge" });
+      { message: "hello", data: undefined, principal: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge", idempotencyKey: expect.any(String) });
   });
 
   it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
@@ -2374,6 +2436,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it.each([
+    ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2389,7 +2452,11 @@ describe("AgentsProvider runner support", () => {
     const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
-    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
+    if (scenario === "directory-unavailable") {
+      participants.routingUnavailable = () => "Timed out waiting for the Fabric mesh lock";
+      participants.refreshRoutingView = vi.fn().mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+    }
     const registry = new ActionRegistry();
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2408,7 +2475,7 @@ describe("AgentsProvider runner support", () => {
       });
       expect(result.success, result.error).toBe(true);
       expect(result.value).toEqual({ isError: true, name, code,
-        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+        ...(["not-yet-mirrored", "directory-unavailable"].includes(scenario) ? { retryable: true } : {}) });
     } finally {
       await registry.close();
     }
@@ -2490,11 +2557,11 @@ describe("AgentsProvider runner support", () => {
       .resolves.toMatchObject({ id: "session:lead" });
     await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
-    // Resident delivery never elects a replacement. An exact launch binding still uses the
-    // same resolver, so an unrecorded mirror cannot inherit a dead root's messages.
+    // Resident delivery never elects a replacement: even a recorded integrator cannot inherit
+    // a dead root's actor output, and an unrecorded mirror cannot either.
     expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:gone");
     const binding = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: lead.id }) };
-    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:gone");
     expect(deliveryRoot("session:gone", [mirrored], project, binding)).toBe("session:gone");
   });
 
@@ -4500,7 +4567,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 
@@ -4515,8 +4582,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const request = vi.fn().mockResolvedValue({ queued: true, messageId: "m", routed: "mesh", acknowledged: true });
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
-      await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
+      const idempotencyKey = `retry-${kind}`;
+      await expect(provider.invoke(kind, { id: child.id, message: `correct it (${kind})`, data: { key: "k" }, idempotencyKey }, context))
+        .resolves.toMatchObject({ acknowledged: true });
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" }, principal: undefined }, child.ownerIdentityId, { routedRemoteHost: null, idempotencyKey });
     }
     await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
     expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
@@ -4588,7 +4657,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } }),
       "identity:resident",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 

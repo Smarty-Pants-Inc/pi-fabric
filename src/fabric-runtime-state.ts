@@ -1,6 +1,7 @@
 import { nativeRoleBinding, assertNativeRolePair, assertNativeRoleParticipant, registerNativeRoleAttester } from "./agents/native-role-binding.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -80,7 +81,7 @@ import {
 import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
+import { MeshStore, type MeshIdentity } from "./mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
@@ -430,6 +431,8 @@ export class FabricRuntimeState {
   }
 
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
+    const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
+      ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
     this.#suppressResidentGuidanceSync = true;
     try {
       await this.#closeInternal();
@@ -595,14 +598,25 @@ export class FabricRuntimeState {
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: this.#config.mesh.lockProtocol },
+      {
+        readCacheMs: this.#config.mesh.idleReadCoalesceMs,
+        readActive: () => !context.isIdle() || context.hasPendingMessages() ||
+          (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
+        lockProtocol: this.#config.mesh.lockProtocol,
+      },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
+    let inboxMaintenance: MainInboxMaintenance | undefined;
     this.#participants = new ParticipantDirectory(this.#mesh, {
+      presencePass: async () => {
+        await rootPresenceAlarms(this.#mesh!, identity, hostId,
+          this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
+        await inboxMaintenance?.run();
+      },
       enabled: this.#config.mesh.enabled,
       hostId,
       rootId: mainAgentId,
@@ -622,19 +636,41 @@ export class FabricRuntimeState {
     // Resumption must invalidate an earlier terminal proof before actors/control
     // can activate, not merely as part of the later participant publication batch.
     await this.#participants.resumeLineage();
+    // Install this exact activation under the custody lock BEFORE either succession
+    // path publishes it. A competing drainer must never see B -> resumed C while
+    // C still carries a historical retired owner/successor (for example C -> D).
+    // Registration resets root activation only; per-carrier replay fences survive.
+    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.exclusive(() =>
+      registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.())) : undefined;
+    if (this.#config.mesh.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
+      predecessor.meshRoot === meshRoot && predecessor.cwd === context.cwd) {
+      await recordMainSuccessor(this.#mesh, predecessor.id, predecessor.sessionId, mainAgentId);
+    }
+    const recordedRotation = this.#config.mesh.enabled && mainAgent.local
+      ? await confirmMainSuccessor(this.#mesh, mainAgentId, context.sessionManager.getSessionFile?.()) : false;
     // No Main admission/drain starts while a prior-generation death proof survives.
     mainAgent.attachFollowUpDrain(
       context,
       followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
       path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
       this.#config.mesh.followUpStallSeconds,
+      this.#config.mesh.enabled && mainAgent.local ? {
+        owns: id => mainInboxOwns(meshRoot, mainAgentId, id),
+        active: () => mainInboxActive(meshRoot, mainAgentId, inboxActivation),
+      } : undefined,
     );
+    if (this.#config.mesh.enabled && mainAgent.local) {
+      inboxMaintenance = new MainInboxMaintenance(this.#mesh, identity, this.#participants, mainAgent, this.#config.mesh);
+      if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
+    }
     this.#rootInbox?.start();
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
+      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
+        this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -841,12 +877,12 @@ export class FabricRuntimeState {
       enqueue: (run, delivered) => completionInbox.enqueue(run, delivered),
       appendEntry: (data) => this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, data),
     });
-    const canManageActor = (actorId: string): boolean | undefined => {
-      const participant = this.#participants?.get(actorId);
+    const canManageActor = (actorId: string, fresh = true): boolean | undefined => {
+      const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project", fresh: true }) ?? [])
+    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
+      (this.#participants?.list({ scope: "project", fresh }) ?? [])
         .map((participant) => [participant.id, participant.ownerHostId === hostId]),
     );
     // Capture this generation's directory: replacement/quiesce must veto old
@@ -1645,7 +1681,7 @@ export class FabricRuntimeState {
     await this.#componentLoader?.settle();
   }
 
-  async shutdown(reason?: string): Promise<void> {
+  async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     if (reason === "reload") {
       // Stop admission synchronously, before the first await. In-flight handlers may only journal.
       this.#mainAgent?.prepareReload();
@@ -1684,6 +1720,10 @@ export class FabricRuntimeState {
     await this.#agents?.close();
     await this.shellJobs.close();
     await this.#outputArtifacts.close();
+    if ((reason === "new" || reason === "resume") && targetSessionFile && this.#mainAgent?.local &&
+      this.#mainAgent.sessionId && this.#mesh && this.#config?.mesh.enabled) {
+      await stageMainSuccessor(this.#mesh, this.#mainAgent.id, this.#mainAgent.sessionId, targetSessionFile);
+    }
     try {
       await this.#registry?.close();
     } finally {

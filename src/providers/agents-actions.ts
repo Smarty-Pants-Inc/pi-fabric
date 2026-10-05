@@ -31,7 +31,7 @@ const runProperties = {
     description:
       "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
-  routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Explicit run-history class. Record-only unless spawn also requests model: auto; auto permits bounded-lookup or status-groom only." },
+  routeClass: { type: "string", pattern: "^[a-z][a-z0-9:-]{0,63}$", description: "Explicit class, never inferred from task text. model: auto supports bounded-lookup/status-groom on spawn and task:merge-additive, task:ci-test-fixture, task:exact-checks on spawn/run. Live requires trusted liveClasses opt-in and clear protection." },
   protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
   modelReason: {
     type: "string",
@@ -79,7 +79,10 @@ const strictModelProperty = {
 
 const runSchema = {
   type: "object",
-  properties: runProperties,
+  properties: { ...runProperties,
+    pinModel: { type: "string", description: "Explicit role pin for model: auto with a named task class." },
+    pinThinking: runProperties.thinking,
+  },
   required: ["task"],
   additionalProperties: false,
 };
@@ -119,7 +122,7 @@ const spawnSchema = {
   properties: {
     ...runProperties, residency: residencySchema,
     idempotencyKey: residentIdempotencyKeySchema,
-    model: { ...runProperties.model, description: `${strictModelProperty.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
+    model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
   },
@@ -541,7 +544,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string" }, message: { type: "string" }, data: {} },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {},
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },
@@ -553,7 +557,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Queue a follow-up for Main, a task or an actor. Local Pi tasks have a 10 minute delivery deadline (override with deadlineMs), one sender alarm if late, and remain queued until a boundary or cancelFollowUp. Explicit deadlines require a local Pi task.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string" }, message: { type: "string" }, data: {}, deadlineMs: { type: "integer", minimum: 1 } },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {}, deadlineMs: { type: "integer", minimum: 1 },
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },

@@ -181,6 +181,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "haltOnEscape": true,
     "showAgentToolPreview": true,
     "toolDisplay": "compact",
+    "principalView": "auto",
     "updateDebounceMs": 100
   },
   "compaction": {
@@ -201,10 +202,14 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
     "actorPollMs": 250,
+    "idleReadCoalesceMs": 5000,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
     "followUpFlushMs": 120000,
-    "followUpStallSeconds": 600
+    "followUpStallSeconds": 600,
+    "rootPresenceAlarmMs": 900000,
+    "undeliveredAlarmMs": 1800000,
+    "rootGoneTtlMs": 7200000
   },
   "actors": {
     "maxSessionBytes": 20971520
@@ -541,6 +546,7 @@ See the [TypeScript MCP reference](../skillsets/typescript/fabric-exec/reference
 - `ui.maxRows` defaults to `6` and clamps the widget to `1..20` rows. The effective budget is also bounded by half the live terminal height, so a short pane or a tmux split cannot let the animated box fill the viewport and keep pi's scroll region moving under the editor. Rows beyond the budget collapse into a dim `+N` marker on the last line.
 - `ui.showAgentToolPreview` defaults to `true` and controls the child-agent and actor tool rows in both the parent `fabric_exec` card and the widget. Recursive agents render their full descendant tree, bounded by the preview depth/node budget. The version 2 config migration renamed this key from `ui.showNestedToolCalls`.
 - `ui.toolDisplay` is `"compact"` (default) or `"full"`. Compact elevates the declared display name and description and keeps bounded nested tool detail visible; full retains the outer Fabric program transcript. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript and collapses it again. Invalid values fall back to `"compact"`. If configuration fails to load, rendering falls back to full so a degraded startup never hides the transcript. Change it under `/fabric settings` → **UI**; successful changes apply immediately to live and completed cards.
+- `ui.principalView` is `"auto"` (default), `"on"`, or `"off"`. Auto enables for `org` and `org-agent` instances: `PI_FABRIC_ROLE` takes precedence over `SMARTY_ROLE`, with the `@stamp` suffix removed (`bin/smarty-role` exports `SMARTY_ROLE=org-agent@SHA`). Change it with **`/principal-view [on|off|auto]`**, **Ctrl+Alt+P**, or `/fabric settings` → **UI** → **Principal view**. No command argument toggles on/off. Commands persist to project `fabric.json` when trusted, otherwise the isolated agent directory's global `fabric.json`. On shows incoming agent/actor/mail chatter as one dim `↳ sender: body preview` line (~80 body characters), hides delivered inbox shadows, and collapses tool output using Pi's public UI API. **Ctrl+O** temporarily expands incoming/tool details. Off restores full native incoming rendering and the tool expansion state from before entering principal view. The old `ui.incomingMessages` preference is still read per config layer (`collapsed` → `on`, `expanded` → `off`) unless that layer specifies `principalView`; it is no longer a second settings row. Model context and assistant replies remain unchanged. Thinking visibility and native user-message styling are left alone because this Pi version exposes no display setter for them. See [Principal view](principal-view.md) for exact feed parity and the smallest proposed Pi-fork rendering hook.
 - `ui.updateDebounceMs` defaults to `100`. It applies one execution-wide coalescing interval to every live `fabric_exec` card update: nested calls, progress text, and agent tool previews. Continuous streams emit at most once per interval, so a long call no longer postpones every render until completion. Set it to `0` to emit every update. Accepted values clamp to `0..2000`. The version 3 config migration renamed this key from `ui.nestedToolDebounceMs`.
 - The widget renders above the chat, like `pi-supervisor`. Set `ui.enabled` to `false` to disable both the widget and the dashboard controller.
 
@@ -606,13 +612,32 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 call override → session binding → project default → Fabric default
 ```
 
-`mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. Native commands retain their existing timeout. An absent acknowledgement means the outcome is unknown, not that the handler did not run; do not retry blindly.
+`mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. ASK, bridge and explicitly bounded requests retain their timeout policy. Native steer/followUp commands with a validated fresh owner lease have a 60-second admission/ACK window plus the existing (up to 15-second) return-leg grace. While a message is pending, the sender polls only the captured owner's lease file; an owner more than the routing grace overdue produces retryable `FABRIC_PARTICIPANT_STALE` rather than an acknowledgement timeout.
+
+`PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS` configures resolution-only lease grace (default 45000 ms, range 0–300000; invalid values use the default). It does not lengthen heartbeat TTLs, discovery liveness, or residency consumption fences. When an exact native participant's lease is recently late and the mesh is write-stalled/lock-contended, or its matching lease file advanced beyond stored state, resolution waits at most 10 seconds, polling that file every 100 ms. A renewal restores ordinary resolution; no renewal gives `FABRIC_PARTICIPANT_STALE` (`retryable: true`, “lease late by Ns; retry”). A lease older than the grace or an explicit terminal session receipt remains Unknown. Same-name presence stays ambiguous even if one owner's lease is unavailable; there is no replacement-participant fallback.
+
+For a stale remote `agents.steer` or `agents.followUp`, retry once with the **same `idempotencyKey` and unchanged target/message/data**. Callers may supply the key up front; otherwise a generated key is included in the stale error text and metadata. The sender/owner/target/operation-scoped key maps to the owner's persisted command claim, so a lost ACK is re-observed, not redelivered. The existing bounded resend after positive `notRun` proof uses a stable second-attempt sub-key under the same logical key; it cannot replay a handler that already ran. Retry promptly while the retained claim is available. An absent ACK alone never proves non-delivery; do not retry with a new key.
 
 `mesh.followUpFlushMs` (default 120000) bounds how late an agent `followUp` reaches a busy Main. Fabric holds such a followUp while Main works. At the next boundary between tool calls, it sends every followUp that has waited this long as one batched steer, oldest first, behind any steer already queued. When the run is about to settle (`agent_before_settle`), it hands the rest to Pi's followUp queue, so Pi continues the run for them unless the user cancelled. `0` keeps Pi's own followUp queue, which Pi reads only when Main has no more work. Pi hosts older than 0.87.0 have no `agent_before_settle` and always keep Pi's queue.
 
 `mesh.followUpStallSeconds` (default 600) makes a stuck followUp queue visible to its sender. When Main is idle and the oldest followUp that Fabric still holds for it, from any sender, is at least this old, no boundary will release the queue: the owner marks its acknowledgement `stalled: true`, and `agents.followUp` and `agents.tell` to that Main throw `Fabric followUp to <target> was accepted but is not being delivered: <n> held, oldest <age> s, target idle.` The message stays held, not withdrawn; use `agents.steer` meanwhile. A busy Main is never reported stalled, because a long turn holds followUps until its next boundary. `0` disables the check. Owners older than this setting never report `stalled`.
 
+The owning host's existing committed presence heartbeat also checks runtime stalls (at most once per minute; no extra timer):
+
+- `mesh.rootPresenceAlarmMs` (default 900000, 15 minutes) publishes one `ops.owner` / `root.presence.alarm` per root absence episode when actors or agents remain after their root disappears from live discovery. It reports member counts by kind and status, including idle/stopped members. The durable identity is the root plus its first observed absence time; a returning root re-arms it. This is an alert, not proof that permits orphan adoption.
+- `mesh.undeliveredAlarmMs` (default 1800000, 30 minutes) publishes `ops.owner` / `inbox.age.alarm` to the sender and target owner for an unconfirmed Main followUp or steer, once per message/address. A queue ACK is not delivery: only the canonical synced native session receipt counts. Addressed age alarms cross the existing mesh bridge; unrelated `ops.owner` kinds remain excluded.
+- `mesh.rootGoneTtlMs` (default 7200000, 2 hours) supplies an explicit `undeliverable: root gone` receipt when a departed root has no recorded successor. A lapsed lease alone never moves a live writer's queue.
+
+Native `new`/`resume` session replacement records its explicit `targetSessionFile` after closing the old drainer. Only that exact successor inherits undelivered Main messages. A durable per-message claim precedes source removal; successor admission reuses the original native message ID and the existing journal/delivery-ID receipt machinery. A crash between move, admission and receipt is recoverable without delivery into both inboxes. The sender receives `rerouted: <old> -> <new>` through `fleet.work.inbox-receipts`, the existing root inbox and bridge work-event path. Recorded native deliveries never move. Reload does not rotate; labels, cwd matches and missing leases cannot invent a successor. The pre-switch abort boundary cannot flush to the old inbox; if another extension cancels a switch, explicit owner input reopens that inbox.
+
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
+
+Idle observations of shared state and participant files reuse a snapshot for at most
+`mesh.idleReadCoalesceMs` (default 5000 ms; range 0–10000, 0 disables reuse). File changes and
+UI remote-generation checks do not bypass that window while Main is idle. A running turn or
+pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
+always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
+The mesh file format and writer cadence are unchanged, including for legacy/mixed fleets.
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
 

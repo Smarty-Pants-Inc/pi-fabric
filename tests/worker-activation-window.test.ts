@@ -10,9 +10,13 @@ import { estimateContextTokens, estimateTextTokens } from "@earendil-works/pi-ai
 import { SessionManager, buildSessionContext, convertToLlm, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ResidentHost } from "../src/residency/host.js";
+import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 const roots: string[] = [];
 const managers: Array<{ close(): Promise<void> }> = [];
@@ -25,6 +29,7 @@ const root = () => {
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   // Windows releases an exited child's cwd a moment after its close event;
   // Node retries EBUSY/EPERM with backoff when maxRetries is set (smarty-dev#883).
@@ -395,8 +400,128 @@ describe("native activation window (offline; opted-in success needs exact native
     return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
 
+  // A real native Bash execution witnesses the review publisher's PI_SESSION_ID,
+  // not a guessed worker argument or a mocked identity (#4313).
+  const installBindingProbe = (dir: string) => {
+    const probes = path.join(dir, "binding-probes.jsonl");
+    fs.writeFileSync(path.join(dir, "noop.ts"), `
+      import fs from 'node:fs';
+      import { createBashToolDefinition } from '@earendil-works/pi-coding-agent';
+      export default function(pi) {
+        const observe = async (event, ctx) => {
+          const file = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
+          if (!file) return;
+          const header = JSON.parse(fs.readFileSync(file, 'utf8').split('\\n', 1)[0]);
+          const result = await createBashToolDefinition(ctx.cwd).execute('binding-probe',
+            { command: 'printf "%s" "$PI_SESSION_ID"' }, undefined, undefined, ctx);
+          fs.appendFileSync(${JSON.stringify(probes)}, JSON.stringify({ event: event.type,
+            registeredId: header.id, nativeId: ctx.sessionManager.getSessionId(),
+            launchEnvId: process.env.PI_SESSION_ID,
+            bashId: result.content.filter(part => part.type === 'text').map(part => part.text).join('')
+          }) + '\\n');
+        };
+        pi.on('before_provider_request', observe);
+        pi.on('session_compact', observe);
+      }
+    `);
+    // Add only this explicit test observer; preserve extensions:false and the
+    // actual worker/native tool allowlist used by these production-path tests.
+    const launch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+      return launch.call(this, { ...request, workerArguments: [...request.workerArguments,
+        "--fabric-extension", path.join(dir, "noop.ts")] });
+    });
+    return probes;
+  };
+  const expectBindingProbes = (file: string, evidence?: string) => {
+    expect(fs.existsSync(file), "The explicit native binding observer must execute").toBe(true);
+    const probes = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(probes.length).toBeGreaterThan(0);
+    for (const probe of probes) expect(probe).toMatchObject({
+      nativeId: probe.registeredId, launchEnvId: probe.registeredId, bashId: probe.registeredId,
+    });
+    const output = process.env.FABRIC_SESSION_BIND_EVIDENCE_DIR;
+    if (output && evidence) fs.copyFileSync(file, path.join(output, `${evidence}.jsonl`));
+    return probes;
+  };
+
+  it.skipIf(!selectedNativeBinary).each(["full-history", "activation"] as const)("4313 resumes a registered actor identity after manager restart and explicit/size rotation (%s)", async inferenceContext => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const probesFile = installBindingProbe(s.dir);
+    vi.stubEnv("PI_SESSION_ID", "stale-resident-parent-session");
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 64 * 1024, 100);
+    const makeManager = (maxSessionBytes = 0) => {
+      const manager = new ActorManager("binding-test", { id: "owner", name: "owner", kind: "main", sessionId: "binding-test" }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, s.manager, () => {},
+        { actorRoot: path.join(s.dir, "actors"), persistent: true, maxSessionBytes });
+      managers.push(manager);
+      return manager;
+    };
+    let actors = makeManager();
+    const actor = await actors.create({ name: "review", instructions: "Review the current task.", inferenceContext,
+      model: "window-test/offline", tools: [], extensions: false, transport: "process", residency: "durable", delivery: "mailbox" });
+    await actors.ask(actor.id, "FIRST_ACTIVATION");
+    const original = SessionManager.open(actor.sessionFile!).getSessionId();
+    await actors.close();
+    actors = makeManager();
+    await actors.ask(actor.id, "AFTER_HOST_RESTART");
+    expect(SessionManager.open(actor.sessionFile!).getSessionId()).toBe(original);
+    await actors.resetSession(actor.id);
+    const rotated = SessionManager.open(actor.sessionFile!).getSessionId();
+    expect(rotated).not.toBe(original);
+    await actors.ask(actor.id, "AFTER_EXPLICIT_ROTATION");
+    await actors.close();
+    actors = makeManager(1); // the next activation exceeds the size boundary
+    await actors.ask(actor.id, "AFTER_SIZE_ROTATION_AND_RESTART");
+    const sized = SessionManager.open(actor.sessionFile!).getSessionId();
+    expect(sized).not.toBe(rotated);
+    const probes = expectBindingProbes(probesFile);
+    expect(probes.map(probe => probe.registeredId)).toEqual([original, original, rotated, sized]);
+    const output = process.env.FABRIC_SESSION_BIND_EVIDENCE_DIR;
+    if (output) fs.copyFileSync(probesFile, path.join(output, `native-binding-${inferenceContext}.jsonl`));
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("4313 a restarted ResidentHost launches its durable actor with the current registered identity", async () => {
+    installInProcessResidentFence();
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const probesFile = installBindingProbe(s.dir);
+    vi.stubEnv("PI_SESSION_ID", "stale-resident-session");
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: "session:binding-resident", sessionId: "binding-resident",
+      cwd: s.dir, projectRoot: s.dir, meshRoot: path.join(s.dir, "resident-mesh"),
+      actorRoot: path.join(s.dir, "resident-actors"), residencyRoot: path.join(s.dir, "resident"),
+      fullCodeMode: false, agents: { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS, budgetUsd: 0 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
+      piBinary: nativeBinary, fabricExtensionPath: path.join(s.dir, "noop.ts"), claudeBinary: "claude", vedaBinary: "veda",
+      piModels: { available: [{ provider: "window-test", id: "offline" }], aliases: {}, defaultModel: "window-test/offline" },
+    };
+    let host = new ResidentHost(config);
+    managers.push(host);
+    await host.start();
+    const actor = await host.actors.create({ name: "resident-review", instructions: "Review.", residency: "durable",
+      inferenceContext: "activation", model: "window-test/offline", tools: [], extensions: false, transport: "process", delivery: "mailbox" });
+    await host.actors.ask(actor.id, "BEFORE_RESTART");
+    const registered = host.actors.status(actor.id).sessionFile!;
+    const original = SessionManager.open(registered).getSessionId();
+    await host.close();
+    host = new ResidentHost(config);
+    managers.push(host);
+    await host.start();
+    expect(host.actors.status(actor.id).sessionFile).toBe(registered);
+    await host.actors.ask(actor.id, "AFTER_RESTART");
+    await host.actors.resetSession(actor.id);
+    const rotated = SessionManager.open(registered).getSessionId();
+    expect(rotated).not.toBe(original);
+    await host.actors.ask(actor.id, "AFTER_ROTATION");
+    expect(expectBindingProbes(probesFile).map(probe => probe.registeredId)).toEqual([original, original, rotated]);
+    const output = process.env.FABRIC_SESSION_BIND_EVIDENCE_DIR;
+    if (output) fs.copyFileSync(probesFile, path.join(output, "native-binding-resident-restart.jsonl"));
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary)("full-history actor compacts overflow before dispatch, keeping the raw session journal", async () => {
     const s = await setup();
+    const bindingProbes = installBindingProbe(s.dir);
     fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
     const journal = path.join(s.dir, "full-history-actor.jsonl");
     const session = SessionManager.open(journal);
@@ -417,6 +542,8 @@ describe("native activation window (offline; opted-in success needs exact native
     const entries = SessionManager.open(journal).getBranch();
     expect(entries.some(entry => entry.type === "compaction")).toBe(true);
     expect(fs.readFileSync(journal, "utf8")).toContain("OLD_OBJECTIVE_0");
+    expectBindingProbes(bindingProbes, "native-binding-full-history-compaction");
+    expect(result.runnerSessionId).toBe(SessionManager.open(journal).getSessionId());
     expect(log).not.toContain('"type":"auto_retry_start"');
   }, TEST_GUARD_MS);
 
@@ -890,6 +1017,7 @@ describe("native activation window (offline; opted-in success needs exact native
 
   it.skipIf(!selectedNativeBinary).each([false, true])("compacts mid-run growth and overflowing latest batch before dispatch (oversized: %s)", async unfittable => {
     const s = await setup(5, unfittable ? 4 : 0);
+    const bindingProbes = installBindingProbe(s.dir);
     const alarms: Array<{message: {text?: string}}> = [];
     const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
     const actors = new ActorManager("growing-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "growing-window-test"}, mesh,
@@ -906,6 +1034,7 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(alarms).toHaveLength(0);
     expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(0);
     expect(s.requests).toHaveLength(6);
+    expectBindingProbes(bindingProbes, `native-binding-activation-compaction-${unfittable}`);
     const journal = readJournal(path.join(s.dir, "actors", actor.id, "session.jsonl"));
     const rawMessages = SessionManager.open(path.join(s.dir, "actors", actor.id, "session.jsonl")).getBranch()
       .flatMap(entry => entry.type === "message" ? sessionEntryToContextMessages(entry) : []);

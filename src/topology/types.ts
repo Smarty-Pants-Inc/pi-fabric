@@ -148,6 +148,14 @@ export interface FabricParticipantSource {
   peers(now?: number): FabricPeerInfo[];
   /** The reason peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled?(now?: number): Error | undefined;
+  /** Why a negative routing lookup is not authoritative (unjoined, overdue or failed view). */
+  routingUnavailable?(now?: number): string | undefined;
+  /** Wait for a briefly late native lease using only its file; false means too old/ended. */
+  resolveRoutingLease?(id: string): Promise<boolean>;
+  /** Bound retained-root delivery by routing grace, never by lineage absence alone. */
+  retainedRouteAllowed?(id: string): boolean;
+  /** One short, lock-bounded canonical read; does not renew or confirm a host lease. */
+  refreshRoutingView?(): Promise<void>;
   /** When this host last committed its heartbeat through the mesh. */
   confirmedAt?(): number;
   /**

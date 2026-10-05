@@ -1,13 +1,14 @@
+import { createCommitStats } from "./commit-stats.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
-import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
+import { MeshArchive, MeshArchiveLookupUnavailableError, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -26,6 +27,8 @@ export interface MeshEvent {
   verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
+  /** Host-only once-publication identity; never accepted from the public mesh provider. */
+  dedupeKey?: string;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -89,7 +92,13 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
+  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  readActive?: () => boolean;
 }
+
+// Capture the opt-in once at process startup/module load: no timer, key classification,
+// counters, extra serialization, filesystem work or per-commit environment lookup when off.
+const commitStats = createCommitStats();
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
 // Capture before entering the async lock so the actual writer survives the await boundary.
@@ -114,9 +123,11 @@ const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
  * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
  * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
  * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
+ * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
-export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
+export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -517,6 +528,24 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
+interface MeshDedupeIntent {
+  dedupeKey: string;
+  reservedSequence: number;
+  eventId: string;
+  /** Byte offset captured before the live append; it makes recovery a direct read. */
+  liveOffset: number;
+  /** Captured before append: removing/changing archive configuration cannot authorize retry. */
+  archiveDir?: string;
+}
+
+export class MeshDedupeRecoveryError extends Error {
+  readonly retryable = true;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MeshDedupeRecoveryError";
+  }
+}
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -538,13 +567,19 @@ export class MeshStore {
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #readActive: (() => boolean) | undefined;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
    * several readers at one cursor (a host's lifecycle subscriptions after a new event) moved it
    * past each other, and all but the first scanned the whole log again (smarty-dev#557).
    */
-  #readHints: { generation: number; inode: number; lines: Array<{ sequence: number; offset: number }> } | undefined;
+  #readHints: {
+    generation: number; inode: number;
+    lines: Array<{ sequence: number; offset: number }>;
+    /** LRU boundaries of readers paused behind the recent-line window (e.g. steer grace). */
+    anchors: Map<number, { sequence: number; offset: number }>;
+  } | undefined;
   #stateCache:
     | {
       device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
@@ -592,6 +627,7 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#readActive = options.readActive;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -601,11 +637,153 @@ export class MeshStore {
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
   get readCacheMs(): number {
-    return this.#readCacheMs;
+    return this.#readActive?.() ? 0 : this.#readCacheMs;
+  }
+
+  /** Time until an idle observer may revalidate; hits do not slide this deadline. */
+  get readCacheRemainingMs(): number {
+    return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
+  }
+
+  #dedupePath(dedupeKey: string, suffix: string): string {
+    return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
+  }
+
+  #confirmEventFile(file: string): void {
+    const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+  }
+
+  #readDedupeReceipt(dedupeKey: string): MeshEvent | undefined {
+    const file = this.#dedupePath(dedupeKey, ".json");
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const event = JSON.parse(text) as MeshEvent;
+    if (event.dedupeKey !== dedupeKey || typeof event.id !== "string" || !Number.isSafeInteger(event.sequence)) {
+      throw new Error("Invalid event publication receipt");
+    }
+    // A visible rename whose final barrier failed is not yet a durable receipt.
+    this.#confirmEventFile(file);
+    return event;
+  }
+
+  #removeDedupeIntent(file: string): void {
+    fs.rmSync(file, { force: true });
+    syncPathNamespace(path.dirname(file));
+  }
+
+  /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
+  #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const stat = fs.fstatSync(descriptor);
+      if (intent.liveOffset >= stat.size) return undefined;
+      const bytes = Buffer.allocUnsafe(Math.min(this.maxEventBytes + 1, stat.size - intent.liveOffset));
+      const count = fs.readSync(descriptor, bytes, 0, bytes.length, intent.liveOffset);
+      const newline = bytes.subarray(0, count).indexOf(0x0a);
+      if (newline < 0) return undefined; // A partial append never committed.
+      const event = JSON.parse(bytes.subarray(0, newline).toString("utf8")) as MeshEvent;
+      return event.sequence === intent.reservedSequence && event.id === intent.eventId &&
+        event.dedupeKey === intent.dedupeKey ? event : undefined;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT" || error instanceof SyntaxError) return undefined;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive): MeshEvent | undefined {
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const intent = JSON.parse(text) as MeshDedupeIntent;
+    if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
+        (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
+        !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
+        typeof intent.eventId !== "string" || !intent.eventId ||
+        !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 ||
+        (intent.archiveDir !== undefined && (typeof intent.archiveDir !== "string" || !path.isAbsolute(intent.archiveDir))) ||
+        file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
+      throw new Error("Invalid event publication intent");
+    }
+    // A crash may also leave both the receipt and its intent. Never replace a receipt.
+    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const live = prior ? undefined : this.#readEventAtIntent(intent);
+    let event = prior ?? live;
+    if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
+    }
+    if (!event && !prior && archive) {
+      let entry: (MeshArchiveEntry & { committed: boolean }) | undefined;
+      try { entry = archive.lookupEntry(intent.reservedSequence); }
+      catch (error) {
+        if (error instanceof MeshArchiveLookupUnavailableError) {
+          throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive lookup is unavailable`, { cause: error });
+        }
+        throw error;
+      }
+      const archived = entry?.event;
+      if (archived?.id === intent.eventId && archived.dedupeKey !== intent.dedupeKey) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive key does not match`);
+      }
+      // A different archived identity positively proves this reservation is absent. Never
+      // abort that other event; leave its archive visibility and index intact.
+      if (entry && archived?.id === intent.eventId) {
+        this.#repairEventLog();
+        const lastLive = this.#readLastEventSequence();
+        if (lastLive < archived.sequence) {
+          // An archive append is not a publication. Restore its exact bytes before issuing
+          // a receipt, and update the anchor first so another death cannot append it twice.
+          let liveOffset = 0;
+          try { liveOffset = fs.statSync(this.#eventsPath).size; }
+          catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
+          fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
+          this.#confirmEventFile(this.#eventsPath);
+        }
+        // A false sidecar is not non-publication evidence: an old writer can recover a
+        // completed live append without updating it, then compact away the live anchor.
+        // An overtaken archive-only append is indistinguishable. Prefer its one archive
+        // delivery over loss; never append behind the live sequence or publish a new id.
+        archive.confirmLive(archived.sequence, archived.id);
+        const pending = archive.pending();
+        // Receipt recovery is direct metadata work. Leave closed-day sealing to the next
+        // ordinary archive append, never scan history just to resolve this intent.
+        if (pending?.id === archived.id && pending.sequence === archived.sequence) archive.commit(pending, false);
+        event = archived;
+      }
+    }
+    if (event && !prior) {
+      if (live) {
+        this.#confirmEventFile(this.#eventsPath);
+        archive?.confirmLive(live.sequence, live.id);
+        const pending = archive?.pending();
+        if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
+      }
+      writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
+    }
+    this.#removeDedupeIntent(file);
+    return event;
+  }
+
+  /** Under the mesh lock, settle all intents before a rewrite can invalidate byte offsets. */
+  #settleDedupeIntents(archive?: MeshArchive): void {
+    const directory = path.join(this.root, "event-receipts");
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
+      this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
+    }
   }
 
   async publish(input: {
     topic: string;
+    /** Host-only durable publication receipt (alarms and inbox disposition receipts). */
+    dedupeKey?: string;
     kind?: string;
     from: MeshIdentity;
     to?: string;
@@ -624,14 +802,43 @@ export class MeshStore {
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
       input.signal?.throwIfAborted();
+      const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
+      const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
+      if (input.dedupeKey) {
+        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        if (prior) {
+          // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
+          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          return prior;
+        }
+      }
+      let archive: MeshArchive | undefined;
+      try { archive = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        throw error;
+      }
       this.#repairEventLog();
-      const archive = MeshArchive.fromRoot(this.root);
+      // Recover the whole reboot suffix before any one intent can advance the live horizon.
+      // In the same boot, defer ordinary pending cutback until the exact retry has settled.
+      // New keys still take only the normal recovery path, with no event-history lookup.
+      if (input.dedupeKey) {
+        if (archive && fs.existsSync(intentPath!)) {
+          try { this.#recoverArchive(archive, true); }
+          catch (error) {
+            throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
+          }
+        }
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
+        if (prior) return prior;
+      }
       if (archive) this.#recoverArchive(archive);
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
       const event: MeshEvent = {
         id: randomUUID(),
+        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
         sequence,
         topic: input.topic,
         kind: input.kind?.trim() || "message",
@@ -658,14 +865,38 @@ export class MeshStore {
       // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
       // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
       atomicWrite(this.#counterPath, sequence);
+      let liveOffset = 0;
+      try { liveOffset = fs.statSync(this.#eventsPath).size; }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      if (intentPath) {
+        // A durable negative lookup exists before the intent. Only begin() can replace it
+        // with the synced archive line address, before any live append.
+        archive?.reserveLookup(sequence);
+        // This is the crash fence: the intent is durable before the live append begins.
+        writeFileAtomic(intentPath, JSON.stringify({
+          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+          ...(archive ? { archiveDir: archive.dir } : {}),
+        } satisfies MeshDedupeIntent), { durable: true });
+      }
       const pending = archive?.begin({ event, line });
+      // Test-only process-death fence: unlike an append exception, no rollback can run.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
       try {
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
       } catch (error) {
         if (pending) archive!.rollback(pending);
         throw error;
       }
+      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
       if (pending) archive!.commit(pending);
+      // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
+      if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+      if (receiptPath) {
+        this.#confirmEventFile(this.#eventsPath);
+        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+        if (intentPath) this.#removeDedupeIntent(intentPath);
+      }
       this.#compactEventLog();
       return event;
     });
@@ -736,8 +967,9 @@ export class MeshStore {
   // stopped between its archive append and its commit is cut back out; if its event did go
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
-  #recoverArchive(archive: MeshArchive): void {
-    const recovery = archive.recover(this.#readLastEventSequence());
+  #recoverArchive(archive: MeshArchive, rebootOnly = false): void {
+    const recovery = archive.recover(this.#readLastEventSequence(), rebootOnly);
+    if (rebootOnly && !recovery.rebooted) return;
     if (recovery.rebooted) {
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.
@@ -752,7 +984,7 @@ export class MeshStore {
         }
         atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
       }
-      archive.recovered(last);
+      archive.recovered(last, recovery.promote);
     }
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
@@ -992,16 +1224,17 @@ export class MeshStore {
       // each read scanned the whole log (tens of MB on the fleet) from the start
       // (smarty-dev#557). A rotated log is a new file and generation, and the hint must end a line.
       const generation = this.#readGeneration();
-      const hints = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
-        ? this.#readHints.lines
-        : [];
-      let position = 0;
-      for (let index = hints.length - 1; index >= 0; index--) {
-        const hint = hints[index]!;
-        if (hint.sequence > after) continue;
-        if (hint.offset <= size && this.#endsLine(descriptor, hint.offset)) position = hint.offset;
-        break;
+      const cached = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
+        ? this.#readHints : undefined;
+      const hints = cached?.lines ?? [];
+      const anchors = cached?.anchors ?? new Map<number, { sequence: number; offset: number }>();
+      let boundary: { sequence: number; offset: number } | undefined;
+      for (const hint of [...hints, ...anchors.values()]) {
+        if (hint.sequence <= after && (!boundary || hint.sequence > boundary.sequence)) boundary = hint;
       }
+      let position = 0;
+      if (boundary && boundary.offset <= size && this.#endsLine(descriptor, boundary.offset)) position = boundary.offset;
+      else boundary = undefined;
       const scanned: Array<{ sequence: number; offset: number }> = [];
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
@@ -1015,7 +1248,9 @@ export class MeshStore {
           try {
             const event = JSON.parse(line) as MeshEvent;
             if (typeof event.sequence === "number" && lineEnd !== undefined) {
-              scanned.push({ sequence: event.sequence, offset: lineEnd });
+              const hint = { sequence: event.sequence, offset: lineEnd };
+              scanned.push(hint);
+              if (event.sequence <= after) boundary = hint;
               if (scanned.length > 2 * READ_HINT_LINES) scanned.splice(0, scanned.length - READ_HINT_LINES);
             }
             if (
@@ -1062,12 +1297,22 @@ export class MeshStore {
         }
       }
       if (!reachedLimit && (lineBytes > 0 || skippingOversizedLine)) emitLine();
-      if (scanned.length > 0) {
+      // A page can read hundreds of events beyond `after` while its caller waits at a grace
+      // boundary. Keeping only the last 128 lines evicted that boundary on every poll, making
+      // idle wakes scan the entire fleet log twice. Retain bounded reader anchors separately;
+      // they use the same generation/inode/line-end checks, never delivery authority (#2039).
+      if (boundary) {
+        anchors.delete(after);
+        anchors.set(after, boundary);
+        if (anchors.size > READ_HINT_LINES) anchors.delete(anchors.keys().next().value!);
+      }
+      if (scanned.length > 0 || boundary) {
         const lines = new Map(hints.map((hint) => [hint.sequence, hint.offset]));
         for (const line of scanned) lines.set(line.sequence, line.offset);
         this.#readHints = {
           generation,
           inode: stat.ino,
+          anchors,
           lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
             .map(([sequence, offset]) => ({ sequence, offset })),
         };
@@ -1097,7 +1342,10 @@ export class MeshStore {
   // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState(options.fresh === true).entries;
+    const state = options.fresh === true || options.snapshot === undefined
+      ? this.#readCachedState(options.fresh === true)
+      : options.snapshot as MeshStateFile;
+    const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
@@ -1161,7 +1409,8 @@ export class MeshStore {
   #signalledState(prefix: string): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    if (!cached || !namespace || this.#readCacheMs <= 0 || Date.now() - cached.parsedAt < this.#readCacheMs) return undefined;
+    const readCacheMs = this.readCacheMs;
+    if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
     // The canonical header decides, not the stat (which can repeat): an unchanged generation is
@@ -1262,6 +1511,7 @@ export class MeshStore {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
     }
     writeFileAtomic(this.#statePath, encoded.serialized);
+    commitStats?.record(encoded.serialized.byteLength, keys);
     const stamp = statStamp(this.#statePath);
     if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
@@ -1344,8 +1594,8 @@ export class MeshStore {
    * Runs an operation under the mesh lock without touching the state: for a rare step that must
    * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
    */
-  async exclusive<T>(operation: () => T): Promise<T> {
-    return this.#withLock(operation);
+  async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs);
   }
 
   /**
@@ -1538,7 +1788,8 @@ export class MeshStore {
 
   #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
     const recent = this.#stateCache;
-    if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+    const readCacheMs = this.readCacheMs;
+    if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
     let before: string;
@@ -1596,9 +1847,9 @@ export class MeshStore {
     }
   }
 
-  async #withLock<T>(operation: () => T): Promise<T> {
+  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + this.#lockTimeoutMs;
+    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
@@ -1789,11 +2040,14 @@ export class MeshStore {
   }
 
   #compactEventLog(): void {
+    // Never rewrite away an event named by a durable intent. Resolve every intent while
+    // the publish lock is held, before taking the retained tail snapshot.
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
+      this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,
@@ -1807,17 +2061,10 @@ export class MeshStore {
       const retained = captured.subarray(retainedStart);
       fs.closeSync(descriptor);
       descriptor = undefined;
-      const temporaryPath =
-        this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
-      try {
-        fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
-        fs.renameSync(temporaryPath, this.#eventsPath);
-      } finally {
-        try { fs.rmSync(temporaryPath, { force: true }); } catch {}
-      }
+      // Persist both the retained bytes and the rename. Later intents may name offsets in
+      // this generation; a reboot must not resurrect its unsynced predecessor or lose bytes.
+      writeFileAtomic(this.#eventsPath, retained, { durable: true });
       atomicWrite(this.#generationPath, this.#readGeneration() + 1);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }

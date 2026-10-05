@@ -652,7 +652,7 @@ export class FabricUiController {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    if (this.#timer || !this.#context) return;
+    if (this.#timer || !this.#context || !this.state.initialized) return;
     const localActive =
       this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
@@ -669,30 +669,56 @@ export class FabricUiController {
     // Remote records change at most once per owner heartbeat, and on a shared mesh some peer is
     // always present, so polling them at refreshMs kept every idle Pi rebuilding the snapshot
     // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
-    const delay = this.ownsInput || localActive
+    const pollDelay = this.ownsInput || localActive
       ? this.state.config.ui.refreshMs
       : Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
-    this.#timer = setTimeout(() => {
+    // Wake at the fixed cache deadline too: a recently warmed cache must not add a second
+    // 5 s UI poll window after the store's 5 s reuse window (smarty-dev#4383).
+    const remaining = this.state.config.mesh.enabled ? this.state.mesh.readCacheRemainingMs : 0;
+    const delay = remaining > 0 ? Math.min(pollDelay, remaining) : pollDelay;
+    const epoch = this.#epoch;
+    this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
       this.#timer = undefined;
       this.#refresh(false);
       this.#schedulePoll();
-    }, delay);
+    }), delay);
     this.#timer.unref();
   }
 
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#context) return;
+    if (this.#scheduledRefresh || !this.#context || !this.state.initialized) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
       Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs) - elapsed,
     );
-    this.#scheduledRefresh = setTimeout(() => {
+    const epoch = this.#epoch;
+    this.#scheduledRefresh = setTimeout(() => this.#runBackground(epoch, () => {
       this.#scheduledRefresh = undefined;
       this.#refresh();
       this.#schedulePoll(true);
-    }, delay);
+    }), delay);
     this.#scheduledRefresh.unref();
+  }
+
+  /** Both poll and coalesced refresh own their faults; a queued old tick cannot rearm. */
+  #runBackground(epoch: number, callback: () => void): void {
+    if (epoch !== this.#epoch || !this.#context || !this.state.initialized) return;
+    try {
+      callback();
+    } catch (error) {
+      this.#reportRefreshError(error);
+    }
+  }
+
+  #reportRefreshError(error: unknown): void {
+    const now = Date.now();
+    if (this.#lastRefreshErrorAt && now - this.#lastRefreshErrorAt < 10_000) return;
+    this.#lastRefreshErrorAt = now;
+    const message = error instanceof Error ? error.message : String(error);
+    // A host UI can already be disposed. Error reporting must not escape a timer either.
+    try { this.#context?.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning"); }
+    catch { /* stale UI; the lifecycle cleanup owns it */ }
   }
 
   #agentTranscriptSource(agent: FabricUiAgent): FabricTranscriptSource {
@@ -788,18 +814,22 @@ export class FabricUiController {
       const unchanged =
         !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
         local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
-        (remote === this.#builtRemote || now - this.#builtAt < REMOTE_REFRESH_MS);
+        (remote === this.#builtRemote || (
+          this.state.mesh.readCacheRemainingMs !== 0 && now - this.#builtAt < Math.min(REMOTE_REFRESH_MS,
+            this.state.config.mesh.enabled ? this.state.mesh.readCacheMs ?? REMOTE_REFRESH_MS : REMOTE_REFRESH_MS)
+        ));
       if (unchanged) {
         this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
       } else {
-        // A remote rebuild checks the canonical generation even if another reader just warmed
-        // the cache: a new writer UUID requires a parse now, not after that reader's TTL. Copied
-        // or missing markers retain ordinary TTL fallback, without extra warm-window full reads.
-        // Every rebuild records the consumed payload's stamp, not the file's, so an older payload
-        // keeps the gate open (review/astra F2 on #84).
+        // A changed file is a dirty hint, not a reason for an idle observer to bypass the
+        // store's bounded reuse window (smarty-dev#4383). Active/pending Main demand still
+        // revalidates now. Record the stamp actually consumed, never the disk's newer stamp.
         const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
-        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true, true);
-        if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot);   // revalidate the listing
+        const readActive = main.status === "running" || main.pendingMessages;
+        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(readActive, readActive);
+        if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot, {
+          maxAgeMs: readActive ? 0 : this.state.mesh.readCacheMs,
+        });
         this.#builtLocal = local;
         this.#builtAt = now;
         if (force || this.#dashboardOpen) this.#snapshotCache.clear();
@@ -826,12 +856,7 @@ export class FabricUiController {
       if (this.#dashboardTui) this.#dashboardTui.requestRender();
       else if (this.#widgetTui && this.#widget?.hasChanged()) this.#widgetTui.requestRender();
     } catch (error) {
-      const now = Date.now();
-      if (now - this.#lastRefreshErrorAt >= 10_000) {
-        this.#lastRefreshErrorAt = now;
-        const message = error instanceof Error ? error.message : String(error);
-        context.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning");
-      }
+      this.#reportRefreshError(error);
     }
   }
 

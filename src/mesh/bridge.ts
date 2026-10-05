@@ -56,7 +56,7 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolea
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
   event.topic.startsWith("fleet.work.") ||
-  (event.topic === "ops.owner" && event.kind === "pr.wake");
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
 
 /** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
 export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
@@ -155,9 +155,14 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   return value as unknown as FabricParticipantRecord;
 };
 
+/** A content digest, independent of JSON property order (smarty-dev#5036). */
+const contentDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(value, (_key, item) =>
+  isObject(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item,
+)).digest("hex");
+
 /** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
-  JSON.stringify({ ...value, updatedAt: undefined, expiresAt: undefined });
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
@@ -466,7 +471,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
           if (
             existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-            JSON.stringify(existing.updatedBy) === JSON.stringify(identity) &&
+            contentDigest(existing.updatedBy) === contentDigest(identity) &&
             (key.startsWith(HOST_PREFIX)
               ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
               : existing.value.updatedAt === value.updatedAt)
@@ -896,8 +901,11 @@ export class MeshBridge {
     this.options.log?.(message);
   }
 
-  /** Load the cursor (or start at both heads) and the ids bridged since the last save. */
+  /** Restore event recovery and reconcile live participants on every (re)connect. */
   async start(): Promise<void> {
+    // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
+    // even when this instance's previous presence pass would not yet be due (#5036).
+    this.#presenceAt = Number.NEGATIVE_INFINITY;
     const { local, remote, localName, remoteName } = this.options;
     let saved: CursorFile | undefined;
     try {
@@ -926,6 +934,10 @@ export class MeshBridge {
       allBridgedIds(local, this.#cursor.toLocal.mark),
     ]);
     this.#seen = { toRemote, toLocal };
+    // Read CURRENT natives (including participants/ files), never a saved projection set.
+    // Reconcile against the destination under its lock: unchanged digests skip state writes,
+    // but lost records must be recreated and missing sources must not have their lease renewed.
+    await this.syncPresence();
   }
 
   #save(): void {

@@ -98,6 +98,33 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 
+  it("does not build a directory snapshot for an empty manager's idle ownership refresh", () => {
+    const f = fixture(0);
+    const snapshot = vi.fn(() => new Map<string, boolean>());
+    const manager = f.make({ canManageActor: () => true, snapshotActorOwnership: snapshot });
+    snapshot.mockClear();
+    expect(manager.listOwned()).toEqual([]);
+    expect(snapshot).not.toHaveBeenCalled();
+  });
+
+  it("keeps idle snapshots coalesced but rechecks canonical ownership for tell", () => {
+    const f = fixture(1);
+    let canonical = true;
+    const rawOwnership = vi.fn(() => canonical);
+    const snapshot = vi.fn((fresh = true) => new Map(f.records.map((record) => [record.id, fresh ? canonical : true])));
+    const manager = f.make({ canManageActor: rawOwnership, snapshotActorOwnership: snapshot });
+    expect(snapshot).toHaveBeenCalledExactlyOnceWith(true);
+    canonical = false;
+    snapshot.mockClear();
+    expect(manager.listOwned().map((actor) => actor.id)).toContain(f.records[0]!.id);
+    expect(snapshot).toHaveBeenCalledExactlyOnceWith(false);
+    expect(rawOwnership).not.toHaveBeenCalled();
+    snapshot.mockClear();
+    expect(() => manager.tell(f.records[0]!.id, "must not be delivered")).toThrow("owned by another host");
+    expect(snapshot).toHaveBeenCalledWith(true);
+    expect(f.agents.list()).toEqual([]);
+  });
+
   it("rechecks lease/cede/ownership after the initial yield and preserves live/unknown workers", async () => {
     const f = fixture(3);
     const ownership = new Map(f.records.map((record) => [record.id, true]));

@@ -225,7 +225,7 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
-  /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
+  /** Unconsumed outcome retained for its exact bound Main root/session. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;

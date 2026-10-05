@@ -386,7 +386,8 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     const waiting = new Promise<void>((resolve) => { entered = resolve; });
     const batch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation((input) => { entered(); return batch(input); });
-    const pass = bridge.step();
+    // Connect already reconciled presence; explicitly hold the next presence write.
+    const pass = (async () => { await bridge.syncPresence(); return bridge.step(); })();
     await waiting;
     // Real store lock contention, with 20 s of lease time advanced deterministically.
     // Remote file renewals bypass the hub's lock, just like the production heartbeat.
@@ -1110,12 +1111,14 @@ describe("mesh bridge", () => {
     await bridge.start();
     await hub.publish({ topic: "fleet.work.smarty-dev.2004", kind: "ask", from: factory, to: sid("forge-main"), text: "w" });
     await hub.publish({ topic: "ops.owner", kind: "pr.wake", from: factory, to: sid("forge-main"), data: { rootId: sid("forge-main") } });
+    await hub.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: factory, to: sid("forge-main"), data: { messageId: "held" } });
+    await hub.publish({ topic: "fleet.work.inbox-receipts", kind: "rerouted", from: factory, to: sid("forge-main"), text: "rerouted: old -> new" });
     await hub.publish({ topic: "ops.owner", kind: "drift", from: factory, to: sid("forge-main") });
     await hub.publish({ topic: "github.pull_request", kind: "opened", from: factory, to: sid("forge-main") });
     await hub.publish({ topic: "fleet.work.smarty-dev.1", kind: "ask", from: factory, to: "someone-local", text: "stays" });
-    expect(await bridge.step()).toMatchObject({ toRemote: 2 });
+    expect(await bridge.step()).toMatchObject({ toRemote: 4 });
     expect(far.read({ after: 0, limit: 100 }).map((e) => `${e.topic}/${e.kind}`))
-      .toEqual(["fleet.work.smarty-dev.2004/ask", "ops.owner/pr.wake"]);
+      .toEqual(["fleet.work.smarty-dev.2004/ask", "ops.owner/pr.wake", "ops.owner/inbox.age.alarm", "fleet.work.inbox-receipts/rerouted"]);
   });
 
   it("reads past more than one page of events it does not carry", async () => {
@@ -1442,6 +1445,7 @@ describe("mesh bridge", () => {
       const held = new Promise<void>((resolve) => (release = resolve));
       let asked!: () => void;
       const presenceAsked = new Promise<void>((resolve) => (asked = resolve));
+      let holdPresence = false;
       const b = setup(undefined, {
         hub, remoteName: "ryzen2",
         wrapRemote: (remote) => ({
@@ -1452,13 +1456,16 @@ describe("mesh bridge", () => {
           bridgedIds: (after) => remote.bridgedIds(after),
           close: (error) => remote.close(error),
           presence: async () => {
-            asked();
-            await held;
+            if (holdPresence) {
+              asked();
+              await held;
+            }
             return remote.presence();
           },
         }),
       });
       await b.bridge.start();
+      holdPresence = true; // Hold the periodic pass, not the new connect reconciliation.
       await addRoot(b.far, "x"); // B claims X ...
       const pass = b.bridge.step();
       await presenceAsked; // ... B has read the hub; X is still free.
@@ -1501,8 +1508,8 @@ describe("mesh bridge", () => {
     };
     const { far, bridge, remote } = setup(undefined, { hub, stopMs: 200 });
     const forgeRoot = await addRoot(far, "forge-main");
-    await bridge.start();
-    const pass = bridge.step().catch((error: Error) => error);
+    // The first mirror now runs during connect; stopping must fence that write too.
+    const pass = bridge.start().catch((error: Error) => error);
     await inBatch;
     remote.close(new Error("transport failed"));
     const stopped = bridge.stop();

@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
@@ -422,6 +423,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // The user's Escape stop-the-world, held for the self-reload gate independently of the actor
   // and Jev halts and of any settle outcome; only a non-extension input lifts it (pi-fabric#160).
   let escapeLatched = false;
+  registerMainProviderRecovery(pi, {
+    halted: () => escapeLatched || state.escapeHalted,
+    report: async (message, context) => {
+      await state.ensure(context);
+      await state.reportMainProviderError(message);
+    },
+  });
   pi.on("input", (event) => {
     if ((event as { source?: string }).source !== "extension") escapeLatched = false;
   });

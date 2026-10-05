@@ -304,7 +304,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     while (!done() && Date.now() < deadline) await sleep(50);
   };
 
-  it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s, not for the stream error alone (#4012)", async (timing) => {
+  it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s before automatic stream-error recovery (#4012)", async (timing) => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
     session.setAutoRetryEnabled(false);
     const calls = faux.state.callCount;
@@ -319,7 +319,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await session.prompt("fail the stream");
     expect(session.isStreaming).toBe(false);
     if (timing === "after-error") {
-      await sleep(300); // An error with no new work must not retry itself.
+      await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
       missedWork("Follow up after stream disconnect.");
     }

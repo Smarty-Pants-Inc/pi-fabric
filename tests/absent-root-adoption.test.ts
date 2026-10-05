@@ -15,6 +15,8 @@ import { FabricParticipantStaleError, readHostLease, writeHostLease } from "../s
 import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { residentHostId } from "../src/residency/protocol.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
@@ -57,6 +59,7 @@ const fixture = async (suspendedOwner = false, ownerOpinion?: () => boolean | un
   expect(mesh.get(key("topology/participants/", oldRoot))).toBeUndefined();
   expect(mesh.get(key("topology/lineage-closures/", oldRoot))).toBeUndefined();
   const deliveries: string[] = [];
+  const candidateDirectories = new Map<string, ParticipantDirectory>();
   const candidate = async (name: string, project = root, role = "project-agent", beforeManager?: () => void) => {
     const rootId = "session:" + name, hostId = residentHostId(rootId);
     const hostIdentity: MeshIdentity = { id: hostId, kind: "agent", name: "resident" };
@@ -71,10 +74,12 @@ const fixture = async (suspendedOwner = false, ownerOpinion?: () => boolean | un
       lineageAdoptable: id => directory.lineageAdoptable(id),
     });
     cleanups.push(() => manager.close());
-    hostDirectory.registerSource(() => [], manager.participantCustody);
+    hostDirectory.registerSource(() => manager.listOwned().map(actor =>
+      actorParticipantRecord(actor, rootId, hostId, hostIdentity.id, rootId)), manager.participantCustody);
+    candidateDirectories.set(name, hostDirectory);
     return manager;
   };
-  return { root, mesh, actor, directory, candidate, deliveries, agents, owner };
+  return { root, mesh, actor, directory, candidate, candidateDirectories, deliveries, agents, owner };
 };
 
 const retainActorFile = (f: Awaited<ReturnType<typeof fixture>>) => {
@@ -296,6 +301,137 @@ describe("F3059 aged absent-root adoption", () => {
       expect(next.owns(f.actor.id)).toBe(true);
       expect(f.owner.owns(f.actor.id)).toBe(false);
     } finally { release(); await refresh; custody.mockRestore(); }
+  });
+
+  it.each(["retained-file", "retained-shared", "files-only"] as const)("replaces a revived predecessor advertisement on %s and routes passive Main messages exactly once", async mode => {
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const f = await fixture(true);
+    start.mockRestore();
+    if (mode === "files-only") await f.mesh.put({ key: "topology/liveness", identity: identity("observer"),
+      value: { version: 1, hostLeases: "files", participants: "files" } });
+    const a = new ParticipantDirectory(f.mesh, { enabled: true, hostId: oldRoot, rootId: oldRoot,
+      identity: identity(oldRoot), reapDeadHosts: false });
+    cleanups.push(() => a.close());
+    const captured = f.owner.listOwned().map(actor => actorParticipantRecord(actor, oldRoot, oldRoot, oldRoot, oldRoot));
+    let includeActor = true;
+    a.registerSource(() => includeActor ? captured : [], f.owner.participantCustody);
+    await a.refresh();
+    const participantKey = key("topology/participants/", f.actor.id);
+    const old = Date.now() - 20 * 60_000;
+    const retained = { ...captured[0], ownershipFence: 1 as const, startedAt: old - 1_000, updatedAt: old };
+    const clock = vi.spyOn(Date, "now").mockReturnValue(old);
+    try {
+      if (mode === "retained-shared") {
+        await f.mesh.put({ key: participantKey, identity: identity(oldRoot), value: retained });
+        fs.rmSync(participantPath(f), { force: true });
+      } else {
+        await f.mesh.delete({ key: participantKey });
+        writeParticipantFile(f.mesh.root, { key: participantKey, value: retained, version: 1,
+          updatedAt: old, updatedBy: identity(oldRoot) });
+      }
+    } finally { clock.mockRestore(); }
+    fs.rmSync(leasePath(f, oldRoot), { force: true });
+    await f.mesh.delete({ key: key("topology/hosts/", oldRoot) });
+    expect(f.directory.lineageAdoptable(oldRoot)).toBe(true);
+    const next = await f.candidate("addressable-successor");
+    const b = f.candidateDirectories.get("addressable-successor")!;
+    await wait(() => next.owns(f.actor.id));
+    const committed = new ActorRegistryStore(path.join(f.root, "actors")).records().find(row => row.id === f.actor.id)!;
+    // A resumes first. Its host is live, but the retained advertisement is obsolete.
+    await a.refresh();
+    expect(readHostLease(f.mesh.root, oldRoot)!.expiresAt).toBeGreaterThan(Date.now());
+    expect(b.get(f.actor.id, Date.now(), { fresh: true })).toBeUndefined();
+    await b.refresh(); // B's actual listOwned() source must replace A, not merely hide it.
+    const successor = { rootId: committed.rootId, ownershipToken: committed.ownershipToken,
+      ownerHostId: b.options.hostId, ownershipFence: 1, controlProtocol: "v1", stale: false };
+    const published = () => {
+      expect(b.get(f.actor.id, Date.now(), { fresh: true })).toMatchObject(successor);
+      expect(JSON.parse(fs.readFileSync(participantPath(f), "utf8")).value).toMatchObject({
+        rootId: committed.rootId, ownershipToken: committed.ownershipToken, ownerHostId: b.options.hostId,
+      });
+      if (mode !== "files-only") expect(f.mesh.get(participantKey, { fresh: true })?.value).toMatchObject({
+        rootId: committed.rootId, ownershipToken: committed.ownershipToken, ownerHostId: b.options.hostId,
+      });
+    };
+    published();
+    for (let heartbeat = 0; heartbeat < 3; heartbeat++) { await a.refresh(); await b.refresh(); published(); }
+
+    const passiveIdentity = identity("session:passive-main");
+    const passiveDirectory = new ParticipantDirectory(f.mesh, { enabled: true, hostId: passiveIdentity.id,
+      rootId: passiveIdentity.id, identity: passiveIdentity, reapDeadHosts: false });
+    cleanups.push(() => passiveDirectory.close());
+    const passive = new ActorManager("passive-main", passiveIdentity, f.mesh, DEFAULT_FABRIC_CONFIG.mesh, f.agents, () => {}, {
+      actorRoot: path.join(f.root, "actors"), persistent: true, rootId: passiveIdentity.id,
+      project: f.root, role: "project-agent", canManageActor: () => false,
+    });
+    cleanups.push(() => passive.close());
+    passiveDirectory.registerSource(() => [], passive.participantCustody);
+    await passiveDirectory.refresh();
+    expect(passive.owns(f.actor.id)).toBe(false);
+    const main = (id: string, local: boolean) => ({ id, local, matches: (target: string) => target === id,
+      deliverAgent: () => { throw new Error("Unexpected Main delivery"); } });
+    const plane = (who: MeshIdentity, hostId: string) => {
+      const control = new FabricControlPlane(new MeshStore(f.mesh.root, 64 * 1024, 100), who,
+        { enabled: true, hostId, pollMs: 20, acknowledgementTimeoutMs: 2_000 });
+      cleanups.push(() => control.close());
+      return control;
+    };
+    const ownerPlane = plane(next.identity, b.options.hostId);
+    const passivePlane = plane(passiveIdentity, passiveIdentity.id);
+    const receive = new AgentMessageRouter(f.agents, next, main(b.options.rootId, false), b, ownerPlane, binding => binding);
+    const send = new AgentMessageRouter(f.agents, passive, main(passiveIdentity.id, true), passiveDirectory, passivePlane, binding => binding);
+    const accept = vi.fn(receive.acceptControl.bind(receive));
+    ownerPlane.start(accept);
+    passivePlane.start(() => ({ accepted: false }));
+    const tell = vi.spyOn(next, "tell");
+    const run = vi.spyOn(f.agents, "run");
+    for (const kind of ["followUp", "steer"] as const) {
+      await a.refresh(); // A continues renewing its host lease during public routing.
+      const text = `PASSIVE_${kind}_${mode}`;
+      const outputsBefore = next.messages(f.actor.id).filter(message => message.direction === "out" && !message.error).length;
+      await expect(send.routeMessage(f.actor.id, text, undefined, kind)).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+      await wait(() => next.messages(f.actor.id).filter(message => message.direction === "out" && !message.error).length === outputsBefore + 1);
+      await wait(() => next.status(f.actor.id).status === "idle" && next.status(f.actor.id).queued === 0);
+      expect(next.messages(f.actor.id).filter(message => message.direction === "in" && (message.data as { message?: string })?.message === text)).toHaveLength(1);
+      expect(readHostLease(f.mesh.root, oldRoot)!.expiresAt).toBeGreaterThan(Date.now());
+    }
+    expect(accept).toHaveBeenCalledTimes(2);
+    expect(tell).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(f.owner.owns(f.actor.id)).toBe(false);
+    expect(() => f.owner.tell(f.actor.id, "STALE_DIRECT")).toThrow("owned by another host");
+    includeActor = false;
+    await a.refresh(); // A's cleanup and close must not delete B's published record.
+    published();
+    await a.close();
+    published();
+    expect(new ActorRegistryStore(path.join(f.root, "actors")).records().find(row => row.id === f.actor.id))
+      .toMatchObject({ rootId: committed.rootId, ownershipToken: committed.ownershipToken });
+  });
+
+  it("drops a captured legacy presence put that resumes after adoption without blocking registry custody", async () => {
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const f = await fixture(true);
+    start.mockRestore();
+    const put = f.mesh.put.bind(f.mesh);
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(f.mesh, "put").mockImplementation(async input => {
+      if (!entered && input.key === "actors/absent-main/" + f.actor.id) { entered = true; await gate; }
+      return put(input);
+    });
+    const stale = f.owner.setInstructions(f.actor.id, "CAPTURED_BEFORE_ADOPTION");
+    try {
+      await wait(() => entered);
+      const next = await f.candidate("presence-successor");
+      await wait(() => next.owns(f.actor.id));
+      const before = f.mesh.get("actors/absent-main/" + f.actor.id, { fresh: true });
+      release();
+      await stale;
+      expect(f.mesh.get("actors/absent-main/" + f.actor.id, { fresh: true })).toEqual(before);
+      expect(next.owns(f.actor.id)).toBe(true);
+      expect(f.owner.owns(f.actor.id)).toBe(false);
+    } finally { release(); await stale; }
   });
 
   it.each(["refresh", "close"] as const)("fences %s cleanup against a newer same-host ABA ownership token", async operation => {

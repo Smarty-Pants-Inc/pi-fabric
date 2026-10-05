@@ -3618,14 +3618,19 @@ export class ActorManager {
     const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
-        const publish = () => {
-          if (this.#actors.get(id) !== actor || !this.#registryOwns(actor) || !this.#ownershipDecision(id)) return;
-          return this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+        const captured = { id, rootId: actor.rootId, ownershipToken: actor.ownershipToken };
+        const revoked = new Error("Actor presence ownership changed");
+        const check = () => {
+          if (this.#actors.get(id) !== actor || !this.#registryOwns(captured) || !this.#ownershipDecision(id)) throw revoked;
         };
-        // Same registry -> mesh lock order as adoption. A suspended presence writer
-        // cannot commit its old advertisement after a successor's registry claim.
-        if (this.#persistent) await this.#registry.withLock(publish);
-        else await publish();
+        try {
+          const capture = () => { check(); return this.#publicInfo(actor); };
+          // Capture under registry custody, but release it BEFORE awaiting presence:
+          // stalled joins must not block queue saves or unrelated actors' preparation.
+          const value = this.#persistent ? await this.#registry.withLock(capture) : capture();
+          // Adoption changes root/token synchronously under this same mesh lock.
+          await this.mesh.put({ key: this.#presenceKey(id), value, identity: this.identity, beforeCommit: check });
+        } catch (error) { if (error !== revoked) throw error; }
       } else {
         await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
       }

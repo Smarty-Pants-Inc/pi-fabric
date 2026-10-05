@@ -58,6 +58,19 @@ afterEach(() => {
 });
 
 describe("MeshStore", () => {
+  it("checks put authority under the mesh lock and writes nothing when revoked", async () => {
+    const store = createStore();
+    const before = await store.put({ key: "guard/actor", value: "successor", identity });
+    const revoked = new Error("revoked incarnation");
+    await expect(store.put({ key: before.key, value: "predecessor", identity, beforeCommit: () => {
+      expect(fs.existsSync(path.join(store.root, ".lock", "owner"))).toBe(true);
+      throw revoked;
+    } })).rejects.toBe(revoked);
+    expect(store.get(before.key, { fresh: true })).toEqual(before);
+    await expect(store.put({ key: before.key, value: "current", identity, beforeCommit: () => {} }))
+      .resolves.toMatchObject({ value: "current" });
+  });
+
   it("#4383 traces only successful commits with changed keys and the originating caller", async () => {
     const store = createStore();
     const trace = path.join(store.root, "trace.jsonl");
@@ -667,6 +680,24 @@ describe("MeshStore.stateStamp", () => {
 });
 
 describe("MeshStore.writeBatch", () => {
+  it("checks put conditions against the locked batch state and leaves skipped CAS revisions unchanged", async () => {
+    const store = createStore();
+    const before = await store.put({ key: "guard/actor", value: "successor", identity });
+    const results = await store.writeBatch({ identity, ops: [
+      { kind: "put", key: "guard/epoch", value: 2 },
+      { kind: "put", key: before.key, value: "predecessor", ifVersion: 0, condition: current => {
+        expect(fs.existsSync(path.join(store.root, ".lock", "owner"))).toBe(true);
+        expect(current("guard/epoch")?.value).toBe(2);
+        return false;
+      } },
+      { kind: "put", key: "guard/current", value: "current", condition: current => current("guard/epoch")?.value === 2 },
+    ] });
+    expect(results.map(result => result.applied)).toEqual([true, false, true]);
+    expect(results[1]?.version).toBe(before.version);
+    expect(store.get(before.key, { fresh: true })).toEqual(before);
+    expect(store.get("guard/current", { fresh: true })?.value).toBe("current");
+  });
+
   it("applies puts and deletes in one write, with per-operation compare-and-swap", async () => {
     const store = createStore();
     const a = await store.put({ key: "k/a", value: 1, identity });

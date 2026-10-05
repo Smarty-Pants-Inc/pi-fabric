@@ -521,6 +521,8 @@ export type MeshBatchOperation =
       value: unknown | ((now: number) => unknown);
       /** Overrides the batch identity for a multi-owner transaction (e.g. bridge presence). */
       identity?: MeshIdentity;
+      /** Evaluated synchronously under the mesh lock; false skips this put. */
+      condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
       ifVersion?: number;
       onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
     }
@@ -1400,12 +1402,15 @@ export class MeshStore {
     value: unknown;
     identity: MeshIdentity;
     ifVersion?: number;
+    /** Synchronous authority check under the mesh lock; throwing prevents the write. */
+    beforeCommit?: () => void;
   }): Promise<MeshStateEntry> {
-    const { key, value, identity, ifVersion } = input;
+    const { key, value, identity, ifVersion, beforeCommit } = input;
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#withLock(() => {
+      beforeCommit?.();
       const { state, reuse } = this.#readStateForWrite();
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
@@ -1531,7 +1536,7 @@ export class MeshStore {
       for (const op of ops) {
         const slot = stateSlot(state, op.key);
         const existing = state.entries[op.key];
-        if (op.kind === "delete" && op.condition && !op.condition(current)) {
+        if (op.condition && !op.condition(current)) {
           results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }

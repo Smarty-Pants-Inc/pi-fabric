@@ -188,7 +188,11 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       expect(recovered.actor).toMatchObject({ id: before.actors[0].id, name: "untouched-rollback" });
       await stop(legacy, () => output);
       const after = JSON.parse(fs.readFileSync(registryPath, "utf8"));
-      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      // F4: this loaded-writer capability is not an actor setting. An unfenced
+      // prior release must drop it, or its rows would falsely authorize adoption.
+      expect(after.actors[0]).not.toHaveProperty("ownershipFence");
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages,
+        runnerSessionId: _runnerSessionId, ownershipFence: _ownershipFence, ...entry }: Record<string, unknown>) => entry;
       expect(after.actors.map(settings)).toEqual(before.actors.map(settings));
     } finally {
       if (current.exitCode === null && current.signalCode === null) { current.kill("SIGKILL"); await once(current, "exit"); }
@@ -244,8 +248,11 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       expect.soft(registry.actors).toHaveLength(beforeRegistry.actors.length);
       // Recovery legitimately updates running status, timestamps and run history,
       // but must not rewrite identity or any of the actor's persistent settings.
+      // F4 requires a B70 writer to lose the loaded-publication fence capability.
+      expect.soft(registry.actors[0]).not.toHaveProperty("ownershipFence");
       const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId,
-        messages: _messages, messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+        messages: _messages, messageHistory: _messageHistory, runnerSessionId: _runnerSessionId,
+        ownershipFence: _ownershipFence, ...entry }: Record<string, unknown>) => entry;
       expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
       // B70 legitimately drops #486's selecting field when saving its owned row.
       // The checkpoint, not that field, must preserve every accepted message.

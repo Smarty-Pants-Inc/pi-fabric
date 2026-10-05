@@ -1753,18 +1753,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
     let committedAt = 0;
     const results = await this.#withActorCustody(custody, () => this.mesh.writeBatch({
-      identity: this.options.identity, ops: [],
-      // Actual shared commit: registry -> mesh, same order as adoption. In particular
-      // an absent key is not authority to publish a captured predecessor incarnation.
-      prepare: () => ops.filter(op => {
+      identity: this.options.identity,
+      // Keep the actual operations visible to batch callers while checking custody
+      // at commit, in registry -> mesh order. An absent key is not publication authority.
+      ops: ops.map(op => ({ ...op, condition: current => {
+        if (op.condition && !op.condition(current)) return false;
         if (op.kind === "delete") {
           const captured = ownParticipant(stateByKey.get(op.key));
           return !captured || (desired.has(captured.id)
             ? this.#publicationAllowed(desired.get(captured.id)!, custody) : cleanupAllowed(captured));
         }
         const record = statePuts.get(op.key);
-        return !record || this.#publicationAllowed(record, custody);
-      }),
+        if (!record) return true;
+        const entry = current(op.key);
+        const holder = entry && participantFromEntry(entry);
+        return this.#publicationAllowed(record, custody) && (!holder || isLocal(holder, this.options.hostId) ||
+          holder.remoteHost !== undefined || !this.#ownerLive(holder));
+      } })),
       afterCommit: () => { committedAt = Date.now(); },
     }));
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
@@ -1853,6 +1858,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // the store's read cache) with its file lease, or, before its first shared record, its file lease
   // alone, which a host writes before any participant file (review/astra round 2 F1 on #142).
   #ownerLive(participant: FabricParticipantRecord, now = Date.now()): boolean {
+    // A live host cannot reserve an actor key with its obsolete registry incarnation.
+    // Callers publishing actors retain registry custody through the actual commit.
+    if (!this.#currentActorIncarnation(participant)) return false;
     const lease = readHostLease(this.mesh.root, participant.ownerHostId);
     const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), { fresh: true });
     const host = entry ? hostFromEntry(entry) : undefined;

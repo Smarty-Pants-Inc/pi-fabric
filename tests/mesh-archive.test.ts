@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_ARCHIVE_CONFIG, MeshArchive, archiveFileName, currentBoot } from "../src/mesh/archive.js";
+import { MESH_ARCHIVE_CONFIG, MeshArchive, MeshArchiveRecoveryChanged, archiveFileName, currentBoot } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
 
@@ -101,6 +101,25 @@ describe("mesh event archive", () => {
     expect(recovery.promote.map(entry => entry.event)).toEqual([later]);
     archive.recovered(recovery.promote.at(-1), recovery.promote);
     expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+  });
+
+  it("rejects an abort-marker change after off-lock reboot preflight", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.abort-race", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "abort-after-preflight", sequence: 2 };
+    const pending = archive.begin({ event, line: JSON.stringify(event) });
+    archive.commit(pending);
+    const markers = path.join(dir, path.dirname(pending.file), "ABORTED.json");
+    fs.writeFileSync(markers, "{}");
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    const plan = archive.prepareRecovery(1);
+    expect(plan?.promote.map(entry => entry.event.id)).toEqual([event.id]);
+    // In-place mutation does not change the parent directory identity. The
+    // off-lock plan must also fence the existing positive abort-marker file.
+    fs.writeFileSync(markers, JSON.stringify({ [event.sequence]: event.id }));
+    expect(() => archive.recover(1, plan)).toThrow(MeshArchiveRecoveryChanged);
+    expect(archive.prepareRecovery(1)?.promote).toEqual([]);
   });
 
   it.each(["at-offset", "before-offset", "shorter-replacement", "longer-replacement", "torn", "corrupt", "wrong-length"])("directly distinguishes old cutback/replacement from unavailable bytes (%s)", async damage => {

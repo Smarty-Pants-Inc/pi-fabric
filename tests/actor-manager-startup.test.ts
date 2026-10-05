@@ -98,6 +98,67 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 
+  it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
+    const f = fixture(17);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const lstat = fs.lstatSync;
+    let statusProbes = 0;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
+        statusProbes++;
+        // Controlled metadata latency, independent of whether this host has NTFS.
+        // Eight actors share 72 candidates: four status probes/run at 2 ms each
+        // exceed the existing heartbeat bound. One actor still does identical work.
+        const until = performance.now() + 2;
+        while (performance.now() < until) { /* slow filesystem metadata */ }
+      }
+      return Reflect.apply(lstat, fs, [file, ...args]);
+    }) as never);
+    await turn();
+    let previous = performance.now(), longest = 0, active = true;
+    let heartbeat: NodeJS.Immediate;
+    const beat = () => {
+      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (active) heartbeat = setImmediate(beat);
+    };
+    heartbeat = setImmediate(beat);
+    try {
+      f.make();
+      await eventually(() => !fs.existsSync(f.runDir(16, 8)));
+      await turn();
+      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
+      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
+      expect(longest).toBeLessThan(250);
+      for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
+    } finally { active = false; clearImmediate(heartbeat!); }
+  });
+
+  it.each(["ownership", "publication"] as const)("rechecks Windows %s between actor maintenance turns", async (fence) => {
+    const f = fixture(3);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const ownership = new Map(f.records.map(record => [record.id, true]));
+    let published = true;
+    const manager = f.make({ canManageActor: id => ownership.get(id), snapshotActorOwnership: () => new Map(ownership),
+      canConsumeMesh: () => published });
+    await turn();
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    if (fence === "ownership") {
+      ownership.set(f.records[1]!.id, false);
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    } else {
+      published = false;
+      await turn(); await turn();
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+      expect(fs.existsSync(f.runDir(2, 8))).toBe(true);
+      published = true; manager.resumeAfterRelease();
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(false);
+    }
+    for (let actor = 0; actor < 3; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
+  });
+
   it("keeps idle snapshots coalesced but rechecks canonical ownership for tell", () => {
     const f = fixture(1);
     let canonical = true;

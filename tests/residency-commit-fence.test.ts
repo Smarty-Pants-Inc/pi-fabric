@@ -1213,11 +1213,12 @@ describe("round 4 registered fabric_exec committed-output priority", { timeout: 
 
 describe("round 6 registered fabric_exec handled resident uncertainty", { timeout: 25_000 }, () => {
   const cases = [
-    ...engines.map(engine => ({ engine, label: engine as string, startupDelayMs: 0, loopback: false })),
+    ...engines.map(engine => ({ engine, label: engine as string, startupDelayMs: 0, loopback: false, reconciliationDelayMs: 0 })),
     ...(["native", "loopback"] as const).map(transport => ({ engine: "cpython" as const,
-      label: `cpython ${transport} slow startup`, startupDelayMs: 10_100, loopback: transport === "loopback" })),
+      label: `cpython ${transport} slow startup`, startupDelayMs: 10_100, loopback: transport === "loopback", reconciliationDelayMs: 0 })),
+    { engine: "cpython" as const, label: "cpython loopback slow reconciliation", startupDelayMs: 0, loopback: true, reconciliationDelayMs: 900 },
   ];
-  for (const { engine, label, startupDelayMs, loopback } of cases)
+  for (const { engine, label, startupDelayMs, loopback, reconciliationDelayMs } of cases)
   it(`${label} collects handled client-deadline receipts on normal completion, delivers priority output and reconciles without duplicates`, async () => {
     const state = await harness(false, undefined, 700); const main = mainProvider(state);
     let admitted = false;
@@ -1237,6 +1238,17 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       async list() { return [descriptor]; }, async describe() { return descriptor; },
       async invoke() { await waitFor(() => entries(state.residencyRoot, "processing").length === 0); return true; },
     });
+    if (reconciliationDelayMs) {
+      const stop = ActorDirectory.prototype.stop;
+      let delayed = false;
+      vi.spyOn(ActorDirectory.prototype, "stop").mockImplementation(async function(this: ActorDirectory, ...args) {
+        const result = await stop.apply(this, args);
+        // Actual host stop commits once. Delay only its response, like slow
+        // Windows publication I/O; never mock the mutation or its decision.
+        if (args[2] === true && !delayed) { delayed = true; await delay(reconciliationDelayMs); }
+        return result;
+      });
+    }
     let artifactPath: string | undefined;
     try {
       // Windows uses the authenticated TCP bridge instead of inherited fd 3.
@@ -1279,6 +1291,12 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
       const uncertain = decisions.filter(decision => decision !== successful);
+      // The 700ms budget deliberately expires the two creation exchanges above.
+      // Windows (including its loopback fixture) reconciliation is an ordinary
+      // fresh exchange, not another fault injection. Keep the executor's 10s
+      // ceiling and every receipt/status/stop assertion, with a finite 5s exchange.
+      // Native POSIX retains its original short budget.
+      if (process.platform === "win32") state.client.options.commandTimeoutMs = 5_000;
       const reconciled = [];
       for (const { id } of decisions) {
         await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
@@ -1286,7 +1304,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         const reconciliation = await run(python
           ? `return {"status": await agents.actorStatus(id="${id}"), "stop": await agents.stop(id="${id}")}`
           : `return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
-        expect(reconciliation.isError).not.toBe(true);
+        expect(reconciliation.isError, visibleText(reconciliation)).not.toBe(true);
         const record = JSON.parse(visibleText(reconciliation));
         expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ id, status: "stopped" });
         await waitFor(() => state.participants.get(id)?.status === "stopped");

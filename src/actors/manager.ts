@@ -3501,18 +3501,34 @@ export class ActorManager {
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
     const actors = [...this.#actors.values()];
-    // NTFS metadata/deletion is substantially more expensive than POSIX. Keep
-    // the same ownership/publication checks, but yield after each Windows actor
-    // rather than combining 80 run-tree inspections on one synchronous turn.
-    const batchSize = process.platform === "win32" ? 1 : 8;
+    // NTFS metadata/deletion can exceed the turn budget even for one actor.
+    // Windows resumes at most one run-tree operation per turn, with a fresh
+    // ownership/publication check each time. POSIX keeps its eight-actor batch.
+    const windows = process.platform === "win32";
+    const batchSize = windows ? 1 : 8;
     for (let offset = 0; offset < actors.length; offset += batchSize) {
       if (this.#closing || this.#canConsumeMesh?.() === false) return;
+      if (windows) {
+        const actor = actors[offset]!;
+        const slices = this.#logs.pruneRunsInSlices(actor, now);
+        for (;;) {
+          const more = this.#withOwnershipRead(() => {
+            if (this.#closing || this.#canConsumeMesh?.() === false ||
+                this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) return false;
+            return !slices.next().done;
+          });
+          if (!more) break;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        // Completion-record pruning is its own turn, not appended to the last run.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       this.#withOwnershipRead(() => {
         for (const actor of actors.slice(offset, offset + batchSize)) {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
-          this.#logs.pruneRuns(actor, now);
+          if (!windows) this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
             .filter((item) => item?.source === "child-completion").map((item) => item!.id));

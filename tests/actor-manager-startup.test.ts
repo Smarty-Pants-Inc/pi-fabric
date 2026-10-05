@@ -76,10 +76,21 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, ...args) {
       prunedSinceBeat++; return prune.apply(this, args);
     });
+    const slices = ActorLogStore.prototype.pruneRunsInSlices;
+    vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function*(this: ActorLogStore, ...args) {
+      prunedSinceBeat++; yield* slices.apply(this, args);
+    });
+    let deletedSinceBeat = 0, largestRunBatch = 0;
+    const remove = fs.rmSync;
+    vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
+      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) deletedSinceBeat++;
+      return remove(...args);
+    });
     let heartbeat: NodeJS.Immediate;
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
       largestBatch = Math.max(largestBatch, prunedSinceBeat); prunedSinceBeat = 0;
+      largestRunBatch = Math.max(largestRunBatch, deletedSinceBeat); deletedSinceBeat = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -97,13 +108,63 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await eventually(() => !fs.existsSync(f.runDir(199, 8)));
       await turn();
       expect(longest).toBeLessThan(250);
+      expect(largestBatch).toBeGreaterThan(0);
       expect(largestBatch).toBeLessThanOrEqual(process.platform === "win32" ? 1 : 8);
+      if (process.platform === "win32") expect(largestRunBatch).toBeLessThanOrEqual(1);
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
       }
       console.log(`ActorManager 200/2000: constructor=${construction.toFixed(1)}ms longestSlice=${longest.toFixed(1)}ms`);
     } finally { active = false; clearImmediate(heartbeat!); }
+  });
+
+  it("bounds slow Windows run deletion inside a single actor below 250ms", async () => {
+    const f = fixture(1);
+    const native = process.platform;
+    const platform = vi.spyOn(process, "platform", "get").mockImplementation(() =>
+      new Error().stack?.includes("src/actors/manager.ts") ? "win32" : native);
+    const remove = fs.rmSync;
+    let deleted = 0, sinceBeat = 0, largestBatch = 0;
+    vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
+      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) {
+        const deadline = performance.now() + 35;
+        while (performance.now() < deadline) {} // Controlled synchronous NTFS-like cost.
+        deleted++; sinceBeat++;
+      }
+      return remove(...args);
+    });
+    let previous = performance.now(), longest = 0, active = true;
+    let heartbeat: NodeJS.Immediate;
+    const beat = () => {
+      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      largestBatch = Math.max(largestBatch, sinceBeat); sinceBeat = 0;
+      if (active) heartbeat = setImmediate(beat);
+    };
+    heartbeat = setImmediate(beat);
+    try {
+      f.make();
+      await eventually(() => !fs.existsSync(f.runDir(0, 8))); await turn();
+      expect(deleted).toBe(9);
+      expect(longest).toBeLessThan(250);
+      expect(largestBatch).toBe(1);
+      expect(fs.existsSync(f.runDir(0, 9))).toBe(true);
+    } finally { active = false; clearImmediate(heartbeat!); platform.mockRestore(); }
+  });
+
+  it("refreshes ownership between individual Windows runs, not just between actors", async () => {
+    const f = fixture(1);
+    let owned = true;
+    const native = process.platform;
+    const platform = vi.spyOn(process, "platform", "get").mockImplementation(() =>
+      new Error().stack?.includes("src/actors/manager.ts") ? "win32" : native);
+    try {
+      f.make({ canManageActor: () => owned, snapshotActorOwnership: () => new Map([[f.records[0]!.id, owned]]) });
+      await eventually(() => !fs.existsSync(f.runDir(0, 0)));
+      owned = false;
+      await turn(); await turn();
+      for (let run = 1; run < 10; run++) expect(fs.existsSync(f.runDir(0, run))).toBe(true);
+    } finally { platform.mockRestore(); }
   });
 
   it("keeps idle snapshots coalesced but rechecks canonical ownership for tell", () => {
@@ -188,10 +249,13 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length + 1 : 10);
+      // Advance async immediates (including their promise continuations), not
+      // waitFor's synchronous timer tick. Windows has ten run turns per actor
+      // plus census/backup/completion boundaries; POSIX keeps its original ten.
+      await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length * 16 + 1 : 10);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length + 1 : 10); vi.useRealTimers(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length * 16 + 1 : 10); vi.useRealTimers(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {
@@ -213,7 +277,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     // before the second slice, like quiesce/reload while slow filesystem work yields.
     await turn(); published = false;
     await turn(); await turn();
-    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    // Windows can stop before inspecting even the first run; POSIX completes
+    // its original eight-actor slice before publication is withdrawn.
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(process.platform === "win32");
     expect(fs.existsSync(f.runDir(16, 8))).toBe(true);
     published = true; manager.resumeQueued();
     await eventually(() => !fs.existsSync(f.runDir(16, 8)));

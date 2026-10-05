@@ -3,7 +3,7 @@ import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
-import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
+import { pruneActorRunArchives, pruneActorRunArchiveSlices, pruneActorSessionBackups } from "../storage/retention.js";
 import type { FabricActorMessage } from "./types.js";
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -111,9 +111,20 @@ export class ActorLogStore {
     this.pruneRuns(actor);
   }
 
+  /** Windows startup must yield inside an actor, not only between actors. */
+  *pruneRunsInSlices(actor: ActorLogTarget, now = Date.now()): Generator<void> {
+    pruneActorSessionBackups(actor.sessionFile);
+    yield;
+    yield* pruneActorRunArchiveSlices({ ...this.#pruneOptions(actor, now), retainRun: id => actor.lastRunId === id });
+  }
+
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
     pruneActorSessionBackups(actor.sessionFile);
-    pruneActorRunArchives({
+    pruneActorRunArchives(this.#pruneOptions(actor, now));
+  }
+
+  #pruneOptions(actor: ActorLogTarget, now: number) {
+    return {
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
       ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),
       retentionMs: this.retention.actorRunArchiveMs,
@@ -122,7 +133,7 @@ export class ActorLogStore {
       ...(this.retention.terminalRunEventsMaxBytes !== undefined
         ? { terminalRunEventsMaxBytes: this.retention.terminalRunEventsMaxBytes } : {}),
       now,
-    });
+    };
   }
 
   retainedRunIds(actor: ActorLogTarget): string[] {

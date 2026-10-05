@@ -610,29 +610,44 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
   } catch { return []; }
 };
 
-export const pruneActorRunArchives = (options: {
+interface ActorRunArchivePruneOptions {
   runsDirectory: string;
   latestRunId?: string;
+  retainRun?: (runId: string) => boolean;
   retentionMs: number;
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
   now?: number;
-}): string[] => {
+}
+
+/** One run-tree inspection/deletion per resume. The caller must refresh its
+ * ownership/publication fence before each next(), never carry it across a yield. */
+export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions): Generator<void, string[]> {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
   if (!ownedStat(options.runsDirectory)?.isDirectory()) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === options.latestRunId) continue;
+    yield; // Also bound scans of latest, malformed and live entries.
+    if (!entry.isDirectory() || entry.name === options.latestRunId || options.retainRun?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
     if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
-      compactTerminalRunEvents(directory, { ...options, now });
+      compactTerminalRunEvents(directory, { ...options, now, isRetained: () => options.retainRun?.(entry.name) ?? false });
       continue;
     }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
+}
+
+/** Synchronous callers keep the original behavior and return value. */
+export const pruneActorRunArchives = (options: ActorRunArchivePruneOptions): string[] => {
+  const slices = pruneActorRunArchiveSlices(options);
+  for (;;) {
+    const step = slices.next();
+    if (step.done) return step.value;
+  }
 };

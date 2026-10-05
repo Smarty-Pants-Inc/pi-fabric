@@ -90,18 +90,27 @@ describe("fresh startup ownership batches", () => {
         registry.write(registry.records().map((record) => record.id === target.id ? { ...record, instructions: "remote-owner-state" } : record));
       };
       let published = false, writerError: unknown;
-      const prune = ActorLogStore.prototype.pruneRuns;
-      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
-        prune.call(this, actor, now);
-        if (actor.sessionFile === actors[7]!.sessionFile && !published) {
+      // Publish before the next actor batch, not after a fixed number of turns.
+      // Windows yields within its first actor; POSIX retains eight actors per batch.
+      const boundary = process.platform === "win32" ? 0 : 7;
+      const scheduleOwner = (actor: { sessionFile: string }) => {
+        if (actor.sessionFile === actors[boundary]!.sessionFile && !published) {
           setImmediate(() => {
             try { publishOwner(victim); published = true; }
             catch (error) { writerError = error; }
           });
         }
+      };
+      const prune = ActorLogStore.prototype.pruneRuns;
+      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+        prune.call(this, actor, now); scheduleOwner(actor);
+      });
+      const slices = ActorLogStore.prototype.pruneRunsInSlices;
+      vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function*(this: ActorLogStore, actor, now) {
+        yield* slices.call(this, actor, now); scheduleOwner(actor);
       });
       expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
-      for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.waitFor(() => { expect(writerError).toBeUndefined(); expect(published).toBe(true); });
       expect(writerError).toBeUndefined();
       expect(published).toBe(true);
       expect(fs.existsSync(expiredRun)).toBe(true);

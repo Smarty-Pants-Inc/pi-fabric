@@ -19,7 +19,12 @@ afterEach(async () => {
 });
 
 describe("#369 root custody precedes descendant scratch disposal", () => {
-  it.each(["missing-record", "cleanup-pending", "live-root"] as const)("preserves collectable child scratch when root custody is %s", fault => {
+  const faults = ["missing-record", "cleanup-pending", "live-root"] as const;
+  const cases = faults.flatMap(fault => [
+    { fault, windows: process.platform === "win32", simulate: false, label: `native ${process.platform}` },
+    ...(process.platform === "win32" ? [] : [{ fault, windows: true, simulate: true, label: "simulated win32 scratch gate" }]),
+  ]);
+  it.each(cases)("preserves collectable child scratch when root custody is $fault ($label)", ({ fault, windows, simulate }) => {
     const root = sandbox(), child = path.join(root, "nested", "child");
     fs.mkdirSync(child, { recursive: true, mode: 0o700 });
     const allocation = allocateRunTmpDirectory(child);
@@ -33,15 +38,29 @@ describe("#369 root custody precedes descendant scratch disposal", () => {
       ...status, ...(fault === "cleanup-pending" ? { cleanupPending: true } : { sessionId: String(process.pid) }),
     }));
     const reason = fault === "missing-record" ? /unknown root identity/ : fault === "cleanup-pending" ? /cleanup is not joined/ : /root worker may still be running/;
+    const platform = simulate ? vi.spyOn(process, "platform", "get").mockReturnValue("win32") : undefined;
     try {
       expect(runTreeExitVeto(root, 0, undefined, true)).toMatch(reason);
       expect(fs.readFileSync(path.join(allocation.directory, "data"), "utf8")).toBe("retain until root proof");
       expect(fs.readFileSync(path.join(child, UNRESOLVED_SCRATCH_FILE), "utf8")).toBe(fence);
     } finally {
-      // Release the fixture's checked empty scope only after root custody passes.
       fs.writeFileSync(path.join(root, "status.json"), JSON.stringify(status));
-      expect(runTreeExitVeto(root, 0, undefined, true)).toBeUndefined();
-      expect(fs.existsSync(allocation.directory)).toBe(false);
+      try {
+        if (windows) {
+          // Windows inherits TEMP: its gate cannot dispose legacy per-run scratch,
+          // even once root custody passes. The retained fence is not an exit receipt.
+          expect(runTreeExitVeto(root, 0, undefined, true)).toMatch(/scratch writer exit is unconfirmed/);
+          expect(fs.readFileSync(path.join(allocation.directory, "data"), "utf8")).toBe("retain until root proof");
+          expect(fs.readFileSync(path.join(child, UNRESOLVED_SCRATCH_FILE), "utf8")).toBe(fence);
+        } else {
+          // POSIX still releases the checked empty scope only after root proof.
+          expect(runTreeExitVeto(root, 0, undefined, true)).toBeUndefined();
+          expect(fs.existsSync(allocation.directory)).toBe(false);
+        }
+      } finally {
+        platform?.mockRestore();
+        if (simulate) expect(runTreeExitVeto(root, 0, undefined, true)).toBeUndefined();
+      }
     }
   });
 });

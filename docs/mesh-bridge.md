@@ -12,11 +12,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
   lease lasts one source TTL from the local observation, capped at 15 s. It does not use
   the source's absolute expiry. File-only heartbeats carry their effective renewal time. Presence
-  is normally refreshed every 5 s; a lapsed mirror is refreshed and revalidated once before an
-  event is refused. A source that stops renewing can remain mirrored for at most twice its TTL
-  from its last renewal (at most one extra capped TTL after the last live observation). When the
-  bridge stops, its mirrors lapse within 15 s. On a clean stop or transport failure it deletes
-  them at once.
+  is refreshed on every bridge (re)connect before startup completes, then every 5 s even without
+  event traffic. Each pass reads the current native records, including file-only roots in
+  `participants/`, rather than replaying a saved projection set. A lapsed mirror is refreshed
+  and revalidated once before an event is refused. A source that stops renewing can remain mirrored
+  for at most twice its TTL from its last renewal (at most one extra capped TTL after the last live
+  observation). When the bridge stops, its mirrors lapse within 15 s. On a clean stop or
+  transport failure it deletes them at once.
 - Nothing else. This excludes `github.*`, actor output, state and cache keys, and agent and actor
   participants.
 
@@ -58,7 +60,11 @@ existing events and mirrors root presence. There is no new store or protocol.
 - The hub routes to the remote only by canonical ids: host id, identity id, participant id and root
   id. Labels, session ids and names are never addresses across.
 - A mirror never replaces a native record or another bridge's mirror. It writes by
-  compare-and-swap only.
+  compare-and-swap only. Each reconciliation compares property-order-independent content
+  digests against the destination's current records under its mesh lock: unchanged participant
+  records do not rewrite shared state, but expired/pruned projections can be restored even when
+  the source set is unchanged. Host file leases renew separately; compatibility state lease
+  checkpoints remain bounded to their existing cadence.
 - Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A remote that misses it
   closes the transport. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
   wait, withdraws the local mirrors regardless, and then reaps the transport child

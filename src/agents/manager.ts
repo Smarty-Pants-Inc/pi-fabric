@@ -851,7 +851,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice),
+      new ProcessTransport(config.processSlice, config.placement),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -1082,6 +1082,8 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
+    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1429,6 +1431,18 @@ export class AgentManager {
           cwd: agentCwd,
           workerPath: this.#workerPath,
           workerArguments,
+          ...(request.needs ? { needs: [...request.needs] } : {}),
+          placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
+            ? "not a Main task spawn"
+            : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
+              ? "actor, routed, or inherited session requires the local worker"
+              : inheritedSessionPins?.length
+                ? "inherited account pins require the local worker"
+                : !extensions
+                  ? "extensions disabled require the local worker"
+                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+                    ? "requested worker features cannot be preserved by one-shot placement"
+                    : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,
           onUnconfirmedExit: (reason) => {
             const managed = this.#runs.get(id);
@@ -2544,6 +2558,7 @@ export class AgentManager {
 
   #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
     const managed = this.#requireRun(id);
+    if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
     if (record && terminalStatuses.has(record.status)) {
       throw new Error(

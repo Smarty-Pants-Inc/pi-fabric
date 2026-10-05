@@ -1,4 +1,4 @@
-import { isNativePassRole, snapshotNativeRoleBinding } from "../agents/native-role-binding.js";
+import { isNativePassRole, snapshotNativeRoleBinding, type NativeRoleBinding } from "../agents/native-role-binding.js";
 import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -111,9 +111,24 @@ interface ActorQueueItem {
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
 
+/**
+ * Factory actor-instance names are owner registration metadata, not role-template IDs.
+ * Translate only at owner creation/recovery and retain a separate canonical role.
+ * This helper is deliberately private to ActorManager: public task-child names,
+ * task text, route/history classes and environment labels must never select authority.
+ */
+function ownerNativePassRole(name: string): NativeRoleBinding["role"] | undefined {
+  if (isNativePassRole(name)) return name;
+  if (/(?:^|-)review-astra$/.test(name)) return "review-agent";
+  if (/(?:^|-)security-astra$/.test(name)) return "security-agent";
+  return undefined;
+}
+
 interface ManagedActor {
   id: string;
   name: string;
+  /** Canonical role selected only from the owner-managed definition, not a child launch. */
+  readonly nativePassRole: NativeRoleBinding["role"] | undefined;
   rootId: string;
   // Fencing token written when a host adopts this lineage: a lineage adopted
   // this recently still has an adopter finding its footing — do not adopt
@@ -755,6 +770,7 @@ export class ActorManager {
     const actor: ManagedActor = {
       id,
       name,
+      nativePassRole: ownerNativePassRole(name),
       rootId: this.#rootId,
       ...(this.#project ? { project: this.#project } : {}),
       instructions: request.instructions,
@@ -3034,9 +3050,9 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
-    // Role selection is the owner's actor definition, not a child request name or environment.
-    const nativeRoleBinding = actor.runner === "pi" && isNativePassRole(actor.name)
-      ? snapshotNativeRoleBinding({ role: actor.name, model: binding.model,
+    // Use the canonical owner snapshot, independently of this activation/child's public name.
+    const nativeRoleBinding = actor.runner === "pi" && actor.nativePassRole
+      ? snapshotNativeRoleBinding({ role: actor.nativePassRole, model: binding.model,
           thinking: binding.thinking, tools: actor.tools }) : undefined;
     return {
       ...(nativeRoleBinding ? { nativeRoleBinding } : {}),
@@ -3831,6 +3847,8 @@ export class ActorManager {
       const actor: ManagedActor = {
         id: record.id,
         name: record.name,
+        // Recover legacy factory actors too; never trust a serialized/public child binding.
+        nativePassRole: ownerNativePassRole(record.name),
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
         ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),

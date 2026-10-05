@@ -26,8 +26,12 @@ export default function nativeRoleProbe(pi: ExtensionAPI) {
           : scenario === "wrong-effort" ? { thinking: "medium" }
           : scenario === "wrong-tools" ? { tools: ["read"] } : {};
         const request = { task: "role native child probe", ...selections };
+        const handoff = scenario.startsWith("handoff-") ? { model: scenario === "handoff-model" ? "role-probe/global" : "role-probe/requested",
+          ...(scenario === "handoff-effort" ? { thinking: "medium" } : {}),
+          ...(scenario === "handoff-tools" ? { tools: ["read"] } : {}),
+          ...(scenario === "handoff-extensions" ? { extensions: false } : {}) } : undefined;
         content = [{ type: "toolCall", id: "spawn-role-child", name: "fabric_exec", arguments: { code:
-          `try { const child = await agents.spawn(${JSON.stringify(request)}); const result = await agents.wait({id: child.id}); return JSON.stringify({child: result}); } catch (error) { return JSON.stringify({refusal: String(error)}); }` } }];
+          `try { ${handoff ? `return await agents.handoff(${JSON.stringify(handoff)});` : ""} const child = await agents.spawn(${JSON.stringify(request)}); const result = await agents.wait({id: child.id}); return JSON.stringify({child: result}); } catch (error) { return JSON.stringify({refusal: String(error)}); }` } }];
         stopReason = "toolUse";
       } else if (!actor && turn++ === 0) {
         content = [{ type: "toolCall", id: "native-bash-proof", name: "bash", arguments: { command: "printf 'native-role-bash-delivered'" } }];

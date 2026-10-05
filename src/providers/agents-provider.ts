@@ -660,10 +660,20 @@ export class AgentsProvider implements FabricProvider {
     return messageTargetArgs(actionName, args);
   }
 
+  #assertHandoffUnbound(): void {
+    const binding = this.callerNativeRoleBinding();
+    if (binding) {
+      throw Object.assign(new Error(`NATIVE_ROLE_BINDING_MISMATCH: ${binding.role} trajectory handoff is unavailable; task was not sent`), {
+        code: "NATIVE_ROLE_BINDING_MISMATCH",
+      });
+    }
+  }
+
   async handoff(
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    this.#assertHandoffUnbound();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -694,6 +704,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    this.#assertHandoffUnbound();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");

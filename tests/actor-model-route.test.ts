@@ -205,6 +205,10 @@ describe("actor status-groom shadow routing", () => {
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const { routeClass: _route, protected: _protection, ...spec } = actorSpec;
     const actor = await actors.create({ ...spec, name, instructions: "Review security status-groom: untrusted instruction text.",
+      // Factory review/security actors now require a real native activation contract,
+      // independently of whether history classification opts them into shadow routing.
+      ...(routeClass === "actor:review" || routeClass === "actor:security"
+        ? { extensions: true, tools: ["read", "grep", "find", "ls", "bash", "write"] } : {}),
       ...(protection !== undefined ? { protected: protection } : {}) });
     await actors.ask(actor.id, "ECHO_MODEL review security status-groom", "test");
     const args = launch.mock.calls[0]![0].workerArguments;

@@ -850,6 +850,28 @@ describe("#2668 role-bound child provider admission", () => {
     await expect(h.provider.invoke("spawn", { task: "pass", ...patch }, context)).rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
     expect(launch).not.toHaveBeenCalled(); expect(h.agents.list()).toEqual([]);
   });
+  it.each(["review-agent", "security-agent"] as const)("%s rejects trajectory handoff before scheduling and at the executor boundary", async role => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding(role) });
+    const launch = vi.spyOn(h.agents, "spawn");
+    const deferHandoff = vi.fn();
+    const handoffContext = { ...context, deferHandoff };
+    for (const args of [{ model: binding(role).model }, { model: "provider/project" },
+      { model: binding(role).model, thinking: "medium" }, { model: binding(role).model, tools: ["read"] },
+      { model: binding(role).model, extensions: false }]) {
+      await expect(h.provider.invoke("handoff", args, handoffContext)).rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
+      await expect(h.provider.executeHandoff(args, handoffContext, {} as Parameters<AgentsProvider["executeHandoff"]>[2]))
+        .rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
+    }
+    expect(deferHandoff).not.toHaveBeenCalled(); expect(launch).not.toHaveBeenCalled();
+    expect(h.agents.list()).toEqual([]);
+  });
+  it.each(["review-agent", "security-agent"] as const)("%s independently refuses a deferred handoff at execution before model preparation", async role => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding(role) });
+    const launch = vi.spyOn(h.agents, "spawn");
+    await expect(h.provider.executeHandoff({ model: "provider/project", thinking: "medium", tools: ["read"], extensions: false },
+      context, {} as Parameters<AgentsProvider["executeHandoff"]>[2])).rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
+    expect(launch).not.toHaveBeenCalled(); expect(h.agents.list()).toEqual([]);
+  });
   it("run cannot bypass the same role-bound child launch checks", async () => {
     const h = setup([], [], undefined, { nativeRoleBinding: binding("security-agent") });
     const launch = vi.spyOn(h.agents, "spawn");

@@ -63,19 +63,20 @@ describe.runIf(process.env.FABRIC_4012_REAL_CLI === "1")("native RPC followUp af
       const initial = await receiver.promptAndWait("FAIL_STREAM", undefined, 30_000);
       expect(initial.some(event => event.type === "message_update" &&
         event.assistantMessageEvent.type === "text_delta" && event.assistantMessageEvent.delta.includes("partial"))).toBe(true);
-      expect(initial.filter(event => event.type === "agent_settled").at(-1)).toMatchObject({ outcome: "error" });
+      expect(initial.some(event => event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error")).toBe(true);
       states.afterError = await receiver.getState();
       expect(states.afterError).toMatchObject({ isStreaming: false });
+      // The bounded automatic recovery is separate from the later addressed mailbox wake.
+      await wait(() => events.receiver!.filter(event => event.type === "agent_settled").length === 2);
       const sent = await sender.promptAndWait(`${delivery === "followUp" ? "SEND" : "MAILBOX"} ${JSON.stringify({ id: ready.id, message: "WAKE_4012 after disconnect" })}`, undefined, 30_000);
       const receipt = sent.find(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec");
       expect(receipt).toMatchObject({ isError: false });
       if (delivery === "followUp") expect(JSON.stringify(receipt)).toContain('"acknowledged":true');
       else expect(JSON.stringify(receipt)).toContain('"topic":"fleet.work.pi-fabric.4012"');
       states.afterAcknowledgment = await receiver.getState();
-      // Fabric deliberately backs off the failed provider for 60s. No fake clock in native proof.
-      await wait(() => events.receiver!.filter(event => event.type === "agent_settled").length === 2, 70_000);
-      expect(events.receiver!.filter(event => event.type === "agent_start")).toHaveLength(2);
-      expect(await receiver.getLastAssistantText()).toBe("followUp processed after stream error");
+      await wait(() => events.receiver!.filter(event => event.type === "agent_settled").length === 3, 70_000);
+      expect(events.receiver!.filter(event => event.type === "agent_start")).toHaveLength(3);
+      expect(await receiver.getLastAssistantText()).toBe("later followUp processed");
       const messages = await receiver.getMessages();
       expect(messages.filter(message => message.role === "custom" && message.customType === (delivery === "followUp" ? "pi-fabric-agent-message" : "pi-fabric-inbox"))).toHaveLength(1);
       expect(fs.readFileSync(path.join(root, "receiver", "provider-context.jsonl"), "utf8")).toContain("WAKE_4012 after disconnect");

@@ -4721,6 +4721,9 @@ export class ActorManager {
   }
 
   #refreshOwnership(id?: string, fresh = true): void {
+    // Registry synchronization runs first on polls. With no local actors there is nothing
+    // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
+    if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
     this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
   }
 

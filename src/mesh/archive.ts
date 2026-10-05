@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ArchiveSha256, type Sha256State } from "./archive-sha256.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,12 +15,16 @@ import type { MeshEvent } from "./store.js";
  *   <dir>/PENDING.json                   a publish between its archive append and its commit
  *   <dir>/<yyyy>/<mm>/<dd>/<topic>.jsonl  one line per event, the same bytes as the live log
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
+ *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json durable per-file SHA-256 state and counters
+ *   <dir>/DIGEST-REPAIR.json              deferred oversized legacy line (read off-lock)
  *
  * A publish commits when its event reaches the live log. Before that, the archive holds it
  * durably but no reader sees it; a publish that fails or crashes first is cut back out.
  * The mesh root enables the archive with `event-archive.json` ({ "version": 1, "dir": "/abs" }),
- * so every store of that root archives, whatever its process's configuration. The store calls
- * this under its publish lock; nothing here locks.
+ * so every store of that root archives, whatever its process's configuration.
+ * New writers call read-only preflights before acquiring the publish lock; mutation and
+ * checkpoint installation remain under that lock. Legacy writers use the same lock and
+ * ignore the new checkpoint/repair metadata, so optimistic reads are validated against them.
  */
 export const MESH_ARCHIVE_CONFIG = "event-archive.json";
 
@@ -33,6 +38,10 @@ export interface MeshArchivePending {
   id: string;
   file: string;
   size: number;
+  /** New writers restore this on rollback; old writers safely ignore it. */
+  digestBefore?: DigestCheckpoint;
+  /** Installed durably only after the live append has committed. */
+  digestAfter?: DigestCheckpoint;
 }
 
 interface ArchiveHead {
@@ -48,12 +57,46 @@ export interface MeshArchiveRecovery {
   promote: Array<MeshArchiveEntry & { file: string }>;
 }
 
+export interface MeshArchiveDigestRepair {
+  file: string;
+  identity: string;
+  digest: DigestCheckpoint;
+}
+
+export interface MeshArchiveRecoveryPlan {
+  dir: string;
+  lastLive: number;
+  metadata: string;
+  pendingRepair?: { file: string; size: number; digest: DigestCheckpoint };
+  identities: Array<{ file: string; identity: string }>;
+  promote: Array<MeshArchiveEntry & { file: string }>;
+}
+
+/** An optimistic read raced an archive writer; retry before making any mutations. */
+export class MeshArchiveRecoveryChanged extends Error {
+  constructor() { super("Mesh archive changed during off-lock recovery"); }
+}
+
 interface SealFile {
   lines: number;
   firstSequence: number;
   lastSequence: number;
   sha256: string;
 }
+
+interface DigestCheckpoint {
+  version: 1;
+  identity: string;
+  hash: Sha256State;
+  lines: number;
+  firstSequence: number;
+  lastSequence: number;
+}
+
+// Shared by all files/days touched by a sealing pass, not a per-file allowance.
+export const ARCHIVE_DIGEST_SLICE_BYTES = 64 * 1024;
+const fileIdentity = (stat: fs.Stats): string =>
+  `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : undefined;
@@ -199,9 +242,14 @@ export class MeshArchive {
     let descriptor: number | undefined = fs.openSync(absolute, "a+", 0o600);
     let pending: MeshArchivePending | undefined;
     try {
-      this.#repairAndReadLast(descriptor, absolute);
-      pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: fs.fstatSync(descriptor).size };
+      const { digest } = this.#repairAndLoadDigest(descriptor, relative);
+      const before = fs.fstatSync(descriptor);
+      pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: before.size,
+        digestBefore: structuredClone(digest) };
+      this.#advanceDigest(descriptor, relative, digest, { bytes: ARCHIVE_DIGEST_SLICE_BYTES });
       const fresh = pending.size === 0;
+      this.#appendDigest(digest, pending.size, entry);
+      pending.digestAfter = digest;
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
       writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
       fs.fdatasyncSync(descriptor);
@@ -219,6 +267,7 @@ export class MeshArchive {
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
   commit(pending: MeshArchivePending): void {
+    if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)));
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
@@ -231,8 +280,143 @@ export class MeshArchive {
     this.#cutBack(pending);
   }
 
+  /** A legacy line larger than a slice is parsed only on this off-lock preflight.
+   * It is read-only: no archive-level lock is needed, and install validates old writers too.
+   */
+  prepareDigestRepair(): MeshArchiveDigestRepair | undefined {
+    const repair = this.#readJson<{ file: string }>("DIGEST-REPAIR.json");
+    if (!repair) return undefined;
+    const target = path.join(this.dir, repair.file);
+    if (!fs.existsSync(target)) return { file: repair.file, identity: "missing", digest: {
+      version: 1, identity: "missing", hash: new ArchiveSha256().state(), lines: 0, firstSequence: 0, lastSequence: 0 } };
+    const descriptor = fs.openSync(target, "r");
+    try {
+      const stat = fs.fstatSync(descriptor);
+      const digest = this.#loadDigest(repair.file, stat);
+      const hash = new ArchiveSha256(digest.hash);
+      let position = digest.hash.bytes;
+      const parts: Buffer[] = [];
+      while (position < stat.size) {
+        const bytes = Buffer.allocUnsafe(Math.min(ARCHIVE_DIGEST_SLICE_BYTES, stat.size - position));
+        const count = fs.readSync(descriptor, bytes, 0, bytes.length, position);
+        if (count !== bytes.length) throw new MeshArchiveRecoveryChanged();
+        const newline = bytes.indexOf(0x0a);
+        const part = bytes.subarray(0, newline < 0 ? bytes.length : newline + 1);
+        hash.update(part); parts.push(part); position += part.length;
+        if (newline >= 0) break;
+      }
+      digest.hash = hash.state();
+      for (const line of completeLines(Buffer.concat(parts).toString("utf8"))) {
+        const event = parseEvent(line);
+        if (event) this.#countLine(digest, event);
+      }
+      return { file: repair.file, identity: fileIdentity(stat), digest };
+    } finally { fs.closeSync(descriptor); }
+  }
+
+  /** Called only under the mesh lock; a raced read is discarded without mutating its file. */
+  installDigestRepair(repair: MeshArchiveDigestRepair | undefined): void {
+    if (!repair || this.#readJson<{ file: string }>("DIGEST-REPAIR.json")?.file !== repair.file) return;
+    const stat = fs.statSync(path.join(this.dir, repair.file), { throwIfNoEntry: false });
+    if (!stat) {
+      fs.rmSync(path.join(this.dir, "DIGEST-REPAIR.json"), { force: true });
+      return;
+    }
+    if (fileIdentity(stat) !== repair.identity) return;
+    this.#saveDigest(repair.file, repair.digest, stat);
+    fs.rmSync(path.join(this.dir, "DIGEST-REPAIR.json"), { force: true });
+  }
+
+  #recoveryMetadata(): string {
+    return JSON.stringify([this.#readText("BOOT"), this.#readText("HEAD.json"), this.#readText("PENDING.json"), this.#days()]);
+  }
+
+  /** Read-only preflight, called BEFORE taking the mesh lock. All reads are <=64 KiB.
+   * Old writers need no new lock protocol: the locked validation fences their changes too.
+   */
+  prepareRecovery(lastLive: number): MeshArchiveRecoveryPlan | undefined {
+    if (this.#readText("BOOT") === currentBoot()) return undefined;
+    this.#requireRoot();
+    const metadata = this.#recoveryMetadata();
+    const identities: MeshArchiveRecoveryPlan["identities"] = [];
+    const pending = this.pending();
+    let pendingRepair: MeshArchiveRecoveryPlan["pendingRepair"];
+    if (pending) {
+      const absolute = path.join(this.dir, pending.file);
+      if (fs.existsSync(absolute)) {
+        const descriptor = fs.openSync(absolute, "r");
+        try {
+          const stat = fs.fstatSync(descriptor);
+          identities.push({ file: pending.file, identity: fileIdentity(stat) });
+          let position = stat.size;
+          let size = 0;
+          while (position > 0) {
+            const start = Math.max(0, position - ARCHIVE_DIGEST_SLICE_BYTES);
+            const bytes = Buffer.allocUnsafe(position - start);
+            if (fs.readSync(descriptor, bytes, 0, bytes.length, start) !== bytes.length) throw new MeshArchiveRecoveryChanged();
+            const newline = bytes.lastIndexOf(0x0a);
+            if (newline >= 0) { size = start + newline + 1; break; }
+            position = start;
+          }
+          const digest = this.#loadDigest(pending.file, stat);
+          pendingRepair = { file: pending.file, size, digest: digest.hash.bytes <= size ? digest : {
+            version: 1, identity: fileIdentity(stat), hash: new ArchiveSha256().state(), lines: 0, firstSequence: 0, lastSequence: 0 } };
+        } finally { fs.closeSync(descriptor); }
+      }
+    }
+    const found = new Map<string, MeshArchiveEntry & { file: string }>();
+    for (const day of this.#days()) {
+      const directory = path.join(this.dir, day);
+      identities.push({ file: day, identity: fileIdentity(fs.statSync(directory)) });
+      const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
+      if (seal && Math.max(0, ...Object.values(seal.files).map(file => file.lastSequence)) <= lastLive) continue;
+      for (const name of fs.readdirSync(directory).filter(entry => entry.endsWith(".jsonl"))) {
+        const file = `${day}/${name}`;
+        const descriptor = fs.openSync(path.join(this.dir, file), "r");
+        try {
+          const stat = fs.fstatSync(descriptor);
+          identities.push({ file, identity: fileIdentity(stat) });
+          let position = stat.size;
+          let carry = Buffer.alloc(0);
+          let done = false;
+          while (position > 0 && !done) {
+            const start = Math.max(0, position - ARCHIVE_DIGEST_SLICE_BYTES);
+            const chunk = Buffer.allocUnsafe(position - start);
+            const count = fs.readSync(descriptor, chunk, 0, chunk.length, start);
+            if (count !== chunk.length) throw new MeshArchiveRecoveryChanged();
+            position = start;
+            const bytes = Buffer.concat([chunk, carry]);
+            const split = position === 0 ? 0 : bytes.indexOf(0x0a) + 1;
+            if (!split && position > 0) { carry = bytes; continue; }
+            carry = bytes.subarray(0, split);
+            const lines = completeLines(bytes.subarray(split).toString("utf8"));
+            for (let i = lines.length - 1; i >= 0; i--) {
+              const line = lines[i]!;
+              const event = parseEvent(line);
+              if (!event) continue;
+              if (event.sequence <= lastLive) { done = true; break; }
+              found.set(event.id, { event, line, file });
+            }
+          }
+        } finally { fs.closeSync(descriptor); }
+      }
+    }
+    return { dir: this.dir, lastLive, metadata, identities, ...(pendingRepair ? { pendingRepair } : {}),
+      promote: [...found.values()].sort((a, b) => a.event.sequence - b.event.sequence) };
+  }
+
+  #validateRecovery(plan: MeshArchiveRecoveryPlan | undefined, lastLive: number): asserts plan is MeshArchiveRecoveryPlan {
+    if (!plan || plan.dir !== this.dir || plan.lastLive > lastLive || plan.metadata !== this.#recoveryMetadata()) {
+      throw new MeshArchiveRecoveryChanged();
+    }
+    for (const { file, identity } of plan.identities) {
+      const stat = fs.statSync(path.join(this.dir, file), { throwIfNoEntry: false });
+      if (!stat || identity !== fileIdentity(stat)) throw new MeshArchiveRecoveryChanged();
+    }
+  }
+
   /**
-   * Settles what a stop left, before a publish.
+   * Settles what a stop left, under the mesh lock, before a publish.
    *
    * In the boot that BOOT names, a process crash kept every completed write. A pending record
    * at or below the head was committed (only its removal was lost), so it stays; any other is
@@ -243,9 +427,11 @@ export class MeshArchive {
    * publish returned. So nothing complete is discarded: a torn line is cut, and every archived
    * event past the live log's end, on any day, is returned to go live again. An event whose
    * publish never returned may come back too; across a power loss delivery is at least once.
+   * BOOT-mismatch reads and torn-tail boundaries must be prepared off-lock. Validation under
+   * this lock fences old and new writers before any mutation; a raced snapshot is retried.
    * The store then calls recovered(), which records this boot.
    */
-  recover(lastLive: number): MeshArchiveRecovery {
+  recover(lastLive: number, plan?: MeshArchiveRecoveryPlan): MeshArchiveRecovery {
     const pending = this.pending();
     if (this.#readText("BOOT") === currentBoot()) {
       if (pending) {
@@ -255,30 +441,17 @@ export class MeshArchive {
       return { rebooted: false, promote: [] };
     }
     this.#requireRoot();
+    this.#validateRecovery(plan, lastLive);
     if (pending) {
-      const absolute = path.join(this.dir, pending.file);
-      if (fs.existsSync(absolute)) {
-        const descriptor = fs.openSync(absolute, "a+", 0o600);
-        try {
-          this.#repairAndReadLast(descriptor, absolute);
-        } finally {
-          fs.closeSync(descriptor);
-        }
+      if (plan.pendingRepair) {
+        const { file, size, digest } = plan.pendingRepair;
+        const absolute = path.join(this.dir, file);
+        truncateTo(absolute, size);
+        this.#saveDigest(file, digest, fs.statSync(absolute));
       }
       fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     }
-    const found = new Map<string, MeshArchiveEntry & { file: string }>();
-    for (const day of this.#days()) {
-      const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
-      if (seal && Math.max(0, ...Object.values(seal.files).map((file) => file.lastSequence)) <= lastLive) continue;
-      for (const name of fs.readdirSync(path.join(this.dir, day)).filter((entry) => entry.endsWith(".jsonl"))) {
-        for (const line of completeLines(fs.readFileSync(path.join(this.dir, day, name), "utf8"))) {
-          const event = parseEvent(line);
-          if (event && event.sequence > lastLive) found.set(event.id, { event, line, file: `${day}/${name}` });
-        }
-      }
-    }
-    return { rebooted: true, promote: [...found.values()].sort((left, right) => left.event.sequence - right.event.sequence) };
+    return { rebooted: true, promote: plan.promote.filter(entry => entry.event.sequence > lastLive) };
   }
 
   /** After a new boot's recovery: the promoted events are live. Records the boot, durably. */
@@ -300,6 +473,7 @@ export class MeshArchive {
       descriptor: number;
       last: { sequence: number; id: string } | undefined;
       relative: string;
+      digest: DigestCheckpoint;
     }>();
     let last: ArchiveHead | undefined;
     try {
@@ -311,19 +485,25 @@ export class MeshArchive {
           const absolute = path.join(this.dir, relative);
           fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
           const descriptor = fs.openSync(absolute, "a+", 0o600);
-          file = { descriptor, last: undefined, relative };
+          const { last, digest } = this.#repairAndLoadDigest(descriptor, relative);
+          this.#advanceDigest(descriptor, relative, digest, { bytes: ARCHIVE_DIGEST_SLICE_BYTES });
+          file = { descriptor, last, relative, digest };
           open.set(relative, file);
-          file.last = this.#repairAndReadLast(descriptor, absolute);
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
         if (previous && (previous.sequence > event.sequence || (previous.sequence === event.sequence && previous.id === event.id))) {
           continue;
         }
+        const size = fs.fstatSync(file.descriptor).size;
         writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
+        this.#appendDigest(file.digest, size, { event, line });
         file.last = { sequence: event.sequence, id: event.id };
       }
-      for (const { descriptor } of open.values()) fs.fdatasyncSync(descriptor);
+      for (const { descriptor, relative, digest } of open.values()) {
+        fs.fdatasyncSync(descriptor);
+        this.#saveDigest(relative, digest, fs.fstatSync(descriptor));
+      }
       // Before the head moves, sync the directories of every day this catch-up touched, even
       // for files that already held lines: a stopped catch-up leaves complete lines whose
       // names may never have been synced, and only a retry that finishes the syncs moves on.
@@ -412,12 +592,17 @@ export class MeshArchive {
       if (fs.existsSync(path.join(this.dir, day, "SEAL.json"))) break;
       unsealed.unshift(day);
     }
-    for (const day of unsealed) this.#seal(day);
+    const budget = { bytes: ARCHIVE_DIGEST_SLICE_BYTES };
+    for (const day of unsealed) {
+      if (!this.#seal(day, budget)) break; // Preserve the sealed-prefix invariant.
+    }
   }
 
   #cutBack(pending: MeshArchivePending): void {
     try {
-      truncateTo(path.join(this.dir, pending.file), pending.size);
+      const absolute = path.join(this.dir, pending.file);
+      truncateTo(absolute, pending.size);
+      if (pending.digestBefore) this.#saveDigest(pending.file, pending.digestBefore, fs.statSync(absolute));
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     }
@@ -494,25 +679,103 @@ export class MeshArchive {
       if (readBytes === size || tail.lastIndexOf(0x0a, tail.length - 2) >= 0) return tail;
     }
   }
+  #repairAndLoadDigest(descriptor: number, relative: string): {
+    last: { sequence: number; id: string } | undefined; digest: DigestCheckpoint;
+  } {
+    let digest = this.#loadDigest(relative, fs.fstatSync(descriptor));
+    const last = this.#repairAndReadLast(descriptor, path.join(this.dir, relative));
+    const stat = fs.fstatSync(descriptor);
+    if (digest.hash.bytes > stat.size) digest = this.#loadDigest(relative, stat);
+    // Repair removed only a torn suffix, never any bytes in this validated durable prefix.
+    return { last, digest };
+  }
 
-  #seal(day: string): void {
+  #digestPath(relative: string): string {
+    return `${path.posix.dirname(relative)}/.digest-${createHash("sha256").update(path.posix.basename(relative)).digest("hex")}.json`;
+  }
+
+  #loadDigest(relative: string, stat: fs.Stats): DigestCheckpoint {
+    const saved = this.#readJson<DigestCheckpoint>(this.#digestPath(relative));
+    const identity = fileIdentity(stat);
+    const prior = saved?.identity.split(":");
+    // Checkpoints are installed only after the live append (or catch-up). Both protocols
+    // are append-only; rollback only removes an uncommitted suffix. A grown same-inode file
+    // therefore retains this durable prefix, including after a crash before checkpointing.
+    const appended = prior?.[0] === String(stat.dev) && prior[1] === String(stat.ino) &&
+      Number(prior[2]) < stat.size;
+    if (saved?.version === 1 && (saved.identity === identity || appended) && saved.hash.bytes <= stat.size) {
+      new ArchiveSha256(saved.hash); // Reject a malformed checkpoint; never emit a false seal.
+      return saved;
+    }
+    // Replacement, shrink, or same-size modification: never trust a stale digest. Legacy
+    // data is rebuilt in bounded slices, with oversized lines parsed only off-lock.
+    return { version: 1, identity: fileIdentity(stat), hash: new ArchiveSha256().state(),
+      lines: 0, firstSequence: 0, lastSequence: 0 };
+  }
+
+  #countLine(digest: DigestCheckpoint, event: MeshEvent): void {
+    digest.firstSequence = digest.lines ? Math.min(digest.firstSequence, event.sequence) : event.sequence;
+    digest.lastSequence = Math.max(digest.lastSequence, event.sequence);
+    digest.lines++;
+  }
+
+  #advanceDigest(descriptor: number, relative: string, digest: DigestCheckpoint, budget: { bytes: number }): void {
+    const size = fs.fstatSync(descriptor).size;
+    const length = Math.min(budget.bytes, size - digest.hash.bytes);
+    if (length <= 0) return;
+    const bytes = Buffer.allocUnsafe(length);
+    const read = fs.readSync(descriptor, bytes, 0, length, digest.hash.bytes);
+    budget.bytes -= read;
+    // End on a newline, except at EOF (old seals also hash a torn suffix). Oversized legacy
+    // lines are deferred, never read without a byte budget.
+    const end = digest.hash.bytes + read === size ? read : bytes.subarray(0, read).lastIndexOf(0x0a) + 1;
+    if (!end) {
+      if (!this.#readJson("DIGEST-REPAIR.json")) {
+        writeFileAtomic(path.join(this.dir, "DIGEST-REPAIR.json"), JSON.stringify({ file: relative }));
+      }
+      return;
+    }
+    const chunk = bytes.subarray(0, end);
+    digest.hash = new ArchiveSha256(digest.hash).update(chunk).state();
+    for (const line of completeLines(chunk.toString("utf8"))) {
+      const event = parseEvent(line);
+      if (event) this.#countLine(digest, event);
+    }
+  }
+
+  #appendDigest(digest: DigestCheckpoint, size: number, entry: MeshArchiveEntry): void {
+    if (digest.hash.bytes !== size) return;
+    digest.hash = new ArchiveSha256(digest.hash).update(Buffer.from(`${entry.line}\n`, "utf8")).state();
+    this.#countLine(digest, entry.event);
+  }
+
+  #saveDigest(relative: string, digest: DigestCheckpoint, stat: fs.Stats): void {
+    digest.identity = fileIdentity(stat);
+    writeFileAtomic(path.join(this.dir, this.#digestPath(relative)), `${JSON.stringify(digest)}\n`, { durable: true });
+  }
+
+  #seal(day: string, budget: { bytes: number }): boolean {
     const directory = path.join(this.dir, day);
     const files: Record<string, SealFile> = {};
+    let complete = true;
     for (const name of fs.readdirSync(directory).filter((entry) => entry.endsWith(".jsonl")).sort()) {
-      const bytes = fs.readFileSync(path.join(directory, name));
-      let lines = 0;
-      let firstSequence = Number.POSITIVE_INFINITY;
-      let lastSequence = 0;
-      for (const line of completeLines(bytes.toString("utf8"))) {
-        const event = parseEvent(line);
-        if (!event) continue;
-        lines++;
-        firstSequence = Math.min(firstSequence, event.sequence);
-        lastSequence = Math.max(lastSequence, event.sequence);
-      }
-      if (lines === 0) continue;
-      files[name] = { lines, firstSequence, lastSequence, sha256: createHash("sha256").update(bytes).digest("hex") };
+      const relative = `${day}/${name}`;
+      const descriptor = fs.openSync(path.join(directory, name), "r");
+      try {
+        const stat = fs.fstatSync(descriptor);
+        const digest = this.#loadDigest(relative, stat);
+        if (digest.hash.bytes !== stat.size) {
+          const before = digest.hash.bytes;
+          this.#advanceDigest(descriptor, relative, digest, budget);
+          if (digest.hash.bytes !== before) this.#saveDigest(relative, digest, stat);
+        }
+        if (digest.hash.bytes !== stat.size) { complete = false; continue; }
+        if (digest.lines) files[name] = { lines: digest.lines, firstSequence: digest.firstSequence,
+          lastSequence: digest.lastSequence, sha256: new ArchiveSha256(digest.hash).digest() };
+      } finally { fs.closeSync(descriptor); }
     }
-    writeFileAtomic(path.join(directory, "SEAL.json"), `${JSON.stringify({ version: 1, day, files })}\n`);
+    if (!complete) return false;
+    writeFileAtomic(path.join(directory, "SEAL.json"), `${JSON.stringify({ version: 1, day, files })}\n`, { durable: true });
+    return true;
   }
 }

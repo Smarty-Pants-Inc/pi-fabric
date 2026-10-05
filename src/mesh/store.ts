@@ -8,7 +8,7 @@ import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
-import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
+import { MeshArchive, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -642,88 +642,105 @@ export class MeshStore {
     const principal = copyFabricPrincipal(input.principal);
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
-    return this.#withLock(() => {
+    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
+    for (;;) {
       input.signal?.throwIfAborted();
-      this.#repairEventLog();
-      const archive = MeshArchive.fromRoot(this.root);
-      if (archive) this.#recoverArchive(archive);
-      const receiptPath = input.dedupeKey ? path.join(this.root, "event-receipts",
-        createHash("sha256").update(input.dedupeKey).digest("hex") + ".json") : undefined;
-      const confirmFile = (file: string): void => {
-        const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-        try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
-      };
-      if (receiptPath) {
-        try {
-          const prior = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as MeshEvent;
-          if (prior.dedupeKey !== input.dedupeKey || typeof prior.id !== "string" || !Number.isSafeInteger(prior.sequence)) throw new Error("Invalid event publication receipt");
-          // A visible rename whose final barrier failed is not yet a durable receipt.
-          confirmFile(receiptPath);
-          return prior;
-        } catch (error) {
-          if (errorCode(error) !== "ENOENT") throw error;
-        }
-        // A crash after the append but before its receipt must not publish twice. The
-        // append and receipt share the existing mesh lock; compaction comes afterwards.
-        for (let after = 0;;) {
-          const page = this.read({ after, limit: this.maxReadEvents });
-          const prior = page.find(event => event.dedupeKey === input.dedupeKey);
-          if (prior) {
-            confirmFile(this.#eventsPath);
-            writeFileAtomic(receiptPath, JSON.stringify(prior), { durable: true });
-            return prior;
-          }
-          if (!page.length) break;
-          after = page.at(-1)!.sequence;
-        }
-      }
-      const createdAt = Date.now();
-      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
-      const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-      const event: MeshEvent = {
-        id: randomUUID(),
-        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-        sequence,
-        topic: input.topic,
-        kind: input.kind?.trim() || "message",
-        from: jsonClone(input.from),
-        ...(principal ? { principal } : {}),
-        // Old bridges only wrote data.bridge. It can veto a native attestation, but
-        // arbitrary payload data cannot establish bridge verification or any authority.
-        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-          : { verification: "mesh" as const }),
-        ...(input.to ? { to: input.to } : {}),
-        ...(input.text !== undefined ? { text: input.text } : {}),
-        ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt,
-      };
-      const line = JSON.stringify(event);
-      if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
-        throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-      }
-      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive holds the event durably before it goes live (smarty-dev#754); the live
-      // append commits it. If either step fails, the event is cut back out of the archive.
-      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
-      atomicWrite(this.#counterPath, sequence);
-      const pending = archive?.begin({ event, line });
       try {
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        // BOOT recovery reads historical tails before acquisition. Validation below is
+        // read-only and retries if any old/new archive writer changed the snapshot.
+        const preflight = MeshArchive.fromRoot(this.root);
+        const prepared = preflight?.prepareRecovery(this.#readLastEventSequence());
+        const digestRepair = preflight?.prepareDigestRepair();
+        return await this.#withLock(() => {
+          input.signal?.throwIfAborted();
+          this.#repairEventLog();
+          const archive = MeshArchive.fromRoot(this.root);
+          if (archive) {
+            this.#recoverArchive(archive, prepared);
+            if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
+          }
+          const receiptPath = input.dedupeKey ? path.join(this.root, "event-receipts",
+            createHash("sha256").update(input.dedupeKey).digest("hex") + ".json") : undefined;
+          const confirmFile = (file: string): void => {
+            const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+            try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+          };
+          if (receiptPath) {
+            try {
+              const prior = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as MeshEvent;
+              if (prior.dedupeKey !== input.dedupeKey || typeof prior.id !== "string" || !Number.isSafeInteger(prior.sequence)) throw new Error("Invalid event publication receipt");
+              // A visible rename whose final barrier failed is not yet a durable receipt.
+              confirmFile(receiptPath);
+              return prior;
+            } catch (error) {
+              if (errorCode(error) !== "ENOENT") throw error;
+            }
+            // A crash after the append but before its receipt must not publish twice. The
+            // append and receipt share the existing mesh lock; compaction comes afterwards.
+            for (let after = 0;;) {
+              const page = this.read({ after, limit: this.maxReadEvents });
+              const prior = page.find(event => event.dedupeKey === input.dedupeKey);
+              if (prior) {
+                confirmFile(this.#eventsPath);
+                writeFileAtomic(receiptPath, JSON.stringify(prior), { durable: true });
+                return prior;
+              }
+              if (!page.length) break;
+              after = page.at(-1)!.sequence;
+            }
+          }
+          const createdAt = Date.now();
+          const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
+          const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+          const event: MeshEvent = {
+            id: randomUUID(),
+            ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+            sequence,
+            topic: input.topic,
+            kind: input.kind?.trim() || "message",
+            from: jsonClone(input.from),
+            ...(principal ? { principal } : {}),
+            // Old bridges only wrote data.bridge. It can veto a native attestation, but
+            // arbitrary payload data cannot establish bridge verification or any authority.
+            ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
+              : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
+              : { verification: "mesh" as const }),
+            ...(input.to ? { to: input.to } : {}),
+            ...(input.text !== undefined ? { text: input.text } : {}),
+            ...(eventData !== undefined ? { data: eventData } : {}),
+            createdAt,
+          };
+          const line = JSON.stringify(event);
+          if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
+            throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+          }
+          // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+          // The archive holds the event durably before it goes live (smarty-dev#754); the live
+          // append commits it. If either step fails, the event is cut back out of the archive.
+          // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
+          // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
+          // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
+          atomicWrite(this.#counterPath, sequence);
+          const pending = archive?.begin({ event, line });
+          try {
+            fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+          } catch (error) {
+            if (pending) archive!.rollback(pending);
+            throw error;
+          }
+          if (pending) archive!.commit(pending);
+          if (receiptPath) {
+            confirmFile(this.#eventsPath);
+            writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+          }
+          this.#compactEventLog();
+          return event;
+        });
       } catch (error) {
-        if (pending) archive!.rollback(pending);
-        throw error;
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        await delay(0);
       }
-      if (pending) archive!.commit(pending);
-      if (receiptPath) {
-        confirmFile(this.#eventsPath);
-        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-      }
-      this.#compactEventLog();
-      return event;
-    });
+    }
   }
 
   read(
@@ -791,8 +808,8 @@ export class MeshStore {
   // stopped between its archive append and its commit is cut back out; if its event did go
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
-  #recoverArchive(archive: MeshArchive): void {
-    const recovery = archive.recover(this.#readLastEventSequence());
+  #recoverArchive(archive: MeshArchive, prepared?: MeshArchiveRecoveryPlan): void {
+    const recovery = archive.recover(this.#readLastEventSequence(), prepared);
     if (recovery.rebooted) {
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.

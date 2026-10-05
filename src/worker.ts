@@ -691,8 +691,12 @@ const main = async (): Promise<void> => {
   let providerResumeAttempts = 0;
   let resumePrompt = false;
   let startupCompactResume: string | undefined;
-  const initialPiMessage = (): string => startupCompactResume ?? (resumePrompt
-    ? "Continue the task from the existing session. Do not repeat completed work." : task);
+  const initialPiMessage = (): string => {
+    // Only a provider retry generates a replaceable generic resume prompt. A
+    // fresh activation (including a mailbox event) must survive startup recovery.
+    if (startupCompactResume) return resumePrompt ? startupCompactResume : `${task}\n\n${startupCompactResume}`;
+    return resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
+  };
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -911,7 +915,9 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
+  // Even an inherited model must wait for native RPC startup: Fabric may
+  // announce committed recovery during session_start, before input opens.
+  }, activationWindow, true, Boolean(options.routeHeader));
   let modelControl = createModelControl();
 
   // Attributed token telemetry. Every usage-bearing child event emits one

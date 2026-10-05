@@ -15,7 +15,7 @@ export const resumeCompactInput = (pi: ExtensionAPI, context: ExtensionContext, 
   if (recovery.sessionId !== context.sessionManager.getSessionId()) { staged.delete(pi); return; }
   // A receipt, cancellation or tree navigation can change the active branch
   // between startup and input. Never deliver a stale staged snapshot.
-  const current = recoverCompactResume(pi, context, false, "stage");
+  const current = recoverCompactResume(pi, context, false, "stage", text);
   staged.delete(pi);
   if (!current || text === current) return;
   return { action: "transform", text: `${text}\n\n${current}` };
@@ -66,6 +66,7 @@ export const settleCompactResume = (
 // the gap while Pi defers sendUserMessage past its remaining settled handlers.
 export const recoverCompactResume = (
   pi: ExtensionAPI, context: ExtensionContext, discardUncommitted = false, delivery: "send" | "stage" = "send",
+  inputText?: string,
 ): string | undefined => {
   const pending = new Map<string, ResumeEntry>();
   const ready = new Set<string>();
@@ -95,7 +96,12 @@ export const recoverCompactResume = (
   }
   if (delivery === "stage") {
     staged.delete(pi);
-    const text = [...ready].filter(id => !messages.has(id)).map(id => resumeMessage(pending.get(id)!)).join("\n\n");
+    // The worker may already have bundled recovery with its fresh task for
+    // context admission. Suppress only those input markers here; they are not
+    // durable receipts until native Pi appends the admitted user message.
+    const inputReceipts = new Set(compactResumeMessageIds(inputText ?? ""));
+    const text = [...ready].filter(id => !messages.has(id) && !inputReceipts.has(id))
+      .map(id => resumeMessage(pending.get(id)!)).join("\n\n");
     if (text) staged.set(pi, { sessionId: context.sessionManager.getSessionId(), text });
     return text || undefined;
   }

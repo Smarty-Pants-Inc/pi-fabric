@@ -57,6 +57,33 @@ describe("compaction continuation", () => {
     expect(h.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("does not append recovery again when the worker bundles it with a fresh activation", () => {
+    const h = harness();
+    beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();
+    const recovery = recoverCompactResume(h.pi, h.context, true, "stage")!;
+    const input = `Fresh task B\n\n${recovery}`;
+    expect(resumeCompactInput(h.pi, h.context, input)).toBeUndefined();
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+    // Merely seeing the input is not a durable receipt: a crash before native
+    // admission must still allow the next worker to recover it.
+    expect(recoverCompactResume(h.pi, h.context, true, "stage")).toBe(recovery);
+    h.manager.appendMessage({ role: "user", content: input, timestamp: 3 });
+    expect(recoverCompactResume(h.pi, h.context, true, "stage")).toBeUndefined();
+  });
+
+  it("appends only missing recovery intents to a partially bundled fresh activation", () => {
+    const h = harness();
+    beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();
+    const first = recoverCompactResume(h.pi, h.context, true, "stage")!;
+    beginCompactResume(h.pi, h.controller.request({ resume: "Start Y" })); h.witness();
+    recoverCompactResume(h.pi, h.context, true, "stage");
+    const input = resumeCompactInput(h.pi, h.context, `Fresh task B\n\n${first}`)!;
+    expect(input.text.match(/Resume after compaction: Start X/g)).toHaveLength(1);
+    expect(input.text.match(/Resume after compaction: Start Y/g)).toHaveLength(1);
+    expect(input.text.startsWith("Fresh task B\n\n")).toBe(true);
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("coalesces direct RPC recovery with one input and retries an unadmitted startup after restart", () => {
     const h = harness();
     beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();

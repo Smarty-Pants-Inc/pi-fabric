@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshLockTicket } from "../src/mesh/lock-queue.js";
+import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 const roots: string[] = [];
@@ -15,7 +15,7 @@ const scratch = () => {
   roots.push(root);
   return root;
 };
-const queue = (root: string) => path.join(root, ".lock.q");
+const queue = meshLockQueueDirectory;
 const held = (root: string) => {
   const lock = path.join(root, ".lock");
   fs.mkdirSync(lock);
@@ -36,6 +36,88 @@ afterEach(() => {
 });
 
 describe("bounded FIFO mesh admission", () => {
+  it("keeps pending and completed tickets outside every mesh-root file scan", () => {
+    const root = scratch();
+    fs.writeFileSync(path.join(root, "state.json"), "{}");
+    const before = fs.readdirSync(root).map(name => [name, fs.readFileSync(path.join(root, name), "utf8")]);
+    const ticket = new MeshLockTicket(root, randomUUID(), 7000);
+    expect(path.relative(root, queue(root)).split(path.sep)[0]).toBe("..");
+    expect(fs.readdirSync(root).map(name => [name, fs.readFileSync(path.join(root, name), "utf8")])).toEqual(before);
+    // A queue receipt is NOT a canonical holder: the unchanged old-release mkdir
+    // succeeds even while a new-release head is enqueued.
+    const legacyLock = held(root);
+    expect(ticket.mayContend()).toBe(true);
+    expect(fs.readFileSync(path.join(legacyLock, "owner"), "utf8")).toContain("legacy\n");
+    fs.rmSync(legacyLock, { recursive: true });
+    ticket.close();
+    expect(fs.readdirSync(queue(root))).toEqual([]);
+    expect(fs.readdirSync(root).map(name => [name, fs.readFileSync(path.join(root, name), "utf8")])).toEqual(before);
+  });
+
+  it("keeps the shared admission namespace independent of process-specific TMPDIR", () => {
+    const root = scratch();
+    const directory = queue(root);
+    const before = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = path.join(scratch(), "other-process-temp");
+      expect(queue(root)).toBe(directory);
+    } finally {
+      if (before === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = before;
+    }
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("still writes to a writable mesh whose parent forbids advisory sidecars", async () => {
+    const parent = scratch();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(root);
+    fs.chmodSync(parent, 0o500);
+    try {
+      const store = new MeshStore(root, 65536, 100);
+      await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
+      expect(fs.readdirSync(parent)).toEqual(["mesh"]);
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally { fs.chmodSync(parent, 0o700); }
+  });
+
+  it.each(["symlink", "file"])("ignores an unsafe %s namespace instead of treating it as a holder", async kind => {
+    const root = scratch();
+    const namespace = path.dirname(queue(root));
+    const nativeMkdir = fs.mkdirSync.bind(fs);
+    const stat = fs.lstatSync.bind(fs);
+    // Inject only this attempt's namespace inspection: other suite roots may share
+    // its parent, so never alter a real shared admission namespace.
+    if (kind === "file") {
+      vi.spyOn(fs, "mkdirSync").mockImplementation((file, options) => {
+        if (String(file) === namespace) throw Object.assign(new Error("not a directory"), { code: "EEXIST" });
+        return nativeMkdir(file, options);
+      });
+    } else {
+      vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+        if (String(file) === namespace) return { isDirectory: () => false };
+        return stat(file, options as undefined);
+      }) as typeof fs.lstatSync);
+    }
+    const store = new MeshStore(root, 65536, 100);
+    await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("shares one queue across canonical mesh-root aliases and isolates other roots", () => {
+    const root = scratch();
+    const alias = path.join(scratch(), "alias");
+    fs.symlinkSync(root, alias, process.platform === "win32" ? "junction" : "dir");
+    expect(queue(alias)).toBe(queue(root));
+    expect(queue(scratch())).not.toBe(queue(root));
+    const head = new MeshLockTicket(root, randomUUID(), 7000);
+    const tail = new MeshLockTicket(alias, randomUUID(), 7000);
+    expect(tail.mayContend()).toBe(false);
+    head.close();
+    expect(tail.mayContend()).toBe(true);
+    tail.close();
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
   it("admits 24 enqueued waiters in ticket order, not repeated-winner order", async () => {
     // Leave the host monotonic clock real: fake hrtime gives all tickets the same age.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -128,7 +210,7 @@ describe("bounded FIFO mesh admission", () => {
 
   it.each([0, 4])("stress harness: 24 processes under CPU load, including %s legacy contenders", async (legacyN) => {
     const output = path.join(scratch(), "store.mjs");
-    buildSync({ entryPoints: ["src/mesh/store.ts"], bundle: true, platform: "node", format: "esm", outfile: output });
+    buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts"; export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";', resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", outfile: output });
     const { stdout } = await promisify(execFile)(process.execPath, ["scripts/stress-mesh-lock.mjs", `--module=${output}`,
       "--n=24", "--rounds=2", "--load=2", "--cpuMs=1", `--legacyN=${legacyN}`,
       `--legacyModule=${path.resolve("tests/fixtures/mesh-legacy-contender.mjs")}`], { timeout: 85000 });

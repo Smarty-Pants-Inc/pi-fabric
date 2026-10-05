@@ -1,4 +1,4 @@
-// Old-release contest: intentionally ignores .lock.q and retains the three-line owner wire.
+// Old-release contest: no advisory queue awareness; retains the three-line owner wire.
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';

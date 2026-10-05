@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
+import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import {
   MeshBatchConflictError,
   MeshStore,
@@ -218,7 +219,7 @@ describe("MeshStore", () => {
     expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
     expect(scan).not.toHaveBeenCalled();
     expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
-    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([path.join(store.root, ".lock.q")]);
+    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(await store.publish(packet)).toEqual(event);
     expect(store.latestSequence()).toBe(later.sequence);
@@ -262,7 +263,7 @@ describe("MeshStore", () => {
     const directories = vi.spyOn(fs, "readdirSync");
     const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
     expect(await store.publish(packet)).toEqual(event);
-    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([path.join(store.root, ".lock.q")]);
+    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
     expect(scans).not.toHaveBeenCalled();
     const archive = MeshArchive.fromRoot(store.root)!;
     expect(archive.pending()).toBeUndefined();
@@ -1273,7 +1274,7 @@ describe("MeshStore lock recovery", () => {
       await ready("initializer.ready");
       // Force the original recovery syscall seam despite advisory FIFO admission. A
       // removed/expired receipt (or an old-release initializer) must not weaken exclusion.
-      for (const name of fs.readdirSync(path.join(store.root, ".lock.q"))) fs.unlinkSync(path.join(store.root, ".lock.q", name));
+      for (const name of fs.readdirSync(meshLockQueueDirectory(store.root))) fs.unlinkSync(path.join(meshLockQueueDirectory(store.root), name));
       expect(fs.existsSync(ownerPath)).toBe(phase === "opened");
       if (phase === "opened") expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
       const past = new Date(Date.now() - 60_000);

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
+import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 
 const roots: string[] = [];
 const closes: Array<() => Promise<unknown>> = [];
@@ -184,7 +185,7 @@ describe("bounded durable bridge event batches", () => {
     await expect(side.publishBatch([{ event: event("one") }, { event: event("two") }])).rejects.toThrow("outcome is uncertain");
     expect(mesh.read().map(e => e.text)).toEqual(["one"]);
     expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(false);
-    expect(fs.readdirSync(path.join(mesh.root, ".lock.q"))).toEqual([]);
+    expect(fs.readdirSync(meshLockQueueDirectory(mesh.root))).toEqual([]);
   });
 
   it("does not acknowledge a failed final event-file sync", async () => {

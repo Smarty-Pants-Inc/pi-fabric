@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Build a source snapshot with esbuild, then run this harness against its --module.
+// Bundle store + lock-queue exports with esbuild, then run this harness against --module.
+// A separate queue snapshot can instead be supplied as --queueModule.
 // Pin the parent with taskset for reproducible saturation; children inherit affinity/nice.
 import { fork } from 'node:child_process';
 import fs from 'node:fs';
@@ -75,9 +76,11 @@ if (args.worker === 'load') {
       const at = q => Math.round((values[Math.min(values.length - 1, Math.ceil(q * values.length) - 1)] ?? 0) * 100) / 100;
       return { p50: at(.5), p99: at(.99), max: at(1), mean: Math.round(values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length) * 100) / 100 };
     };
-    const queue = path.join(root, '.lock.q');
+    const { meshLockQueueDirectory } = await import(pathToFileURL(args.queueModule ?? args.module).href);
+    if (typeof meshLockQueueDirectory !== 'function') throw new Error('Snapshot must export meshLockQueueDirectory (or supply --queueModule)');
+    const queue = meshLockQueueDirectory(root);
     const remainingTickets = fs.existsSync(queue) ? fs.readdirSync(queue).length : 0;
-    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock'))) throw new Error('Leaked lock/tickets');
+    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock')) || fs.readdirSync(root).length !== 0) throw new Error('Leaked lock/tickets or mesh-root sidecars');
     console.log(JSON.stringify({ n, rounds, load, cpuMs, legacyN, budgetMs: 7000, acquisitions: reports.reduce((sum, r) => sum + r.waits.length, 0), timeouts: reports.reduce((sum, r) => sum + r.timeouts, 0), waitMs: summarize(reports.flatMap(r => r.waits)), timeoutWaitMs: summarize(reports.flatMap(r => r.timeoutWaits)), holdMs: summarize(reports.flatMap(r => r.holds)), elapsedMs: Math.round(performance.now() - started), mutualExclusion: true, remainingTickets }, null, 2));
   } finally {
     clearTimeout(timer);

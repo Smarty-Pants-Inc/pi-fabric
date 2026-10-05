@@ -53,6 +53,50 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   return { root, config, host, idle };
 };
 
+describe("watchdog custody at host admission", () => {
+  it("refuses custody before initialization and releases the acquired host fence", async () => {
+    const { root, config, host } = fixture();
+    const marker = path.join(config.residencyRoot, "watchdog-custody.json");
+    fs.writeFileSync(marker, "uncertain attempt, not a PID lease");
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(host.start()).rejects.toThrow("watchdog custody");
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
+      // Refusal must not strand our fence. Explicit fixture drain, not PID expiry.
+      fs.rmSync(marker);
+      await successor.start();
+      expect(successor.agents).toBeDefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not initialize while a custody publisher owns the transaction lock", async () => {
+    const { root, config, host } = fixture();
+    const publisher = await lockFile(path.join(config.residencyRoot, "handover.lock"), 0, process.platform === "linux");
+    try {
+      await expect(host.start()).rejects.toBeInstanceOf(fileLock.FileLockBusy);
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      // The publisher may now commit custody; a subsequent host must observe it.
+      fs.writeFileSync(path.join(config.residencyRoot, "watchdog-custody.json"), "retained");
+    } finally { fs.closeSync(publisher); }
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(successor.start()).rejects.toThrow("watchdog custody");
+      expect(successor.agents).toBeUndefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("fresh startup ownership batches", () => {
   it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
     const { root, config, host } = fixture();

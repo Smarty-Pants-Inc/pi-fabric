@@ -27,6 +27,9 @@ import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { collectAgentToolPreviewNodes, waitWithProgress, waitWithActorProgress } from "../src/providers/agents-progress.js";
 import { collectAgentToolPreviewNodes as publicPreview, type AgentToolPreviewTreeOptions } from "../src/providers/agents-provider.js";
 
+// routeMessage allocates a UUID once per logical send, before any recovery waits.
+const generatedIdempotencyKey = expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
 const record = (id = "run"): AgentRunResult => ({
   id, name: id, task: "task", status: "completed", runner: "pi", transport: "process",
   cwd: "/project", startedAt: 1, updatedAt: 2, turns: 1, toolCalls: 2, text: "done",
@@ -364,8 +367,12 @@ describe("agents provider message routing service boundaries", () => {
       expect(await result).toMatchObject({ value: { queued: true } });
       expect(ensureActor).toHaveBeenCalledWith("actor");
       expect(ports.control.request).toHaveBeenLastCalledWith("resident", "actor", "followUp",
-        { message: "immediate", data: undefined, bindingProvenance: { kind: "owner-defaults", rootId: "main" } },
-        live.ownerIdentityId, { routedRemoteHost: null });
+        { message: "immediate", data: undefined, principal: undefined, bindingProvenance: { kind: "owner-defaults", rootId: "main" } },
+        live.ownerIdentityId, { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
+      expect(ports.control.request).toHaveBeenCalledTimes(stage === "route" ? 2 : 1);
+      const key = ports.control.request.mock.calls[0]![5]?.idempotencyKey;
+      expect(key).toEqual(generatedIdempotencyKey);
+      for (const call of ports.control.request.mock.calls) expect(call[5]?.idempotencyKey).toBe(key);
       expect(ports.main.deliverAgent).not.toHaveBeenCalled();
       expect(Date.now() - started).toBeLessThanOrEqual(40_000);
       // The router waits/retries only; MeshStore alone owns reclamation and fencing.
@@ -460,7 +467,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === peer.id ? { participant: peer, lapsedMs: 20_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
-    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined, principal: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
   });
 
   it.each(["steer", "followUp"] as const)("routes %s to a known Main regardless of lease age while its lineage is alive", async (kind) => {
@@ -475,7 +482,7 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage(peer.id, "reply", undefined, kind)).resolves.toMatchObject({ messageId: "live-main" });
     expect(lineageAlive).toHaveBeenCalledWith(peer.rootId);
     expect(control.request).toHaveBeenCalledWith("host", peer.id, kind,
-      { message: "reply", data: undefined, ...(kind === "followUp" ? { triggerTurn: true } : {}) }, "owner", { routedRemoteHost: null });
+      { message: "reply", data: undefined, principal: undefined, ...(kind === "followUp" ? { triggerTurn: true } : {}) }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
   });
 
   it.each(["steer", "followUp"] as const)("keeps %s routable when a cached native root's lease expires under the same authority", async (kind) => {
@@ -520,7 +527,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === root.id ? { participant: root, lapsedMs: 15_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "to-main", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(target, "result", undefined, "followUp")).resolves.toMatchObject({ messageId: "to-main" });
-    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined, principal: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
   });
 
   it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a cached native root when fresh authority changes (%s)", async (change) => {
@@ -686,7 +693,7 @@ describe("agents provider message routing service boundaries", () => {
     const remote = participant();
     participants.get.mockReturnValue(remote);
     await router.routeMessage("main", "first", null, "followUp");
-    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null, triggerTurn: true }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null, principal: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
     remote.capabilities = [];
     await expect(router.routeMessage("main", "second", null, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(1);
@@ -701,17 +708,18 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage(peer.id, "new authorized observation", { original: "fresh" }, "followUp",
       undefined, { triggerTurn: false })).resolves.toMatchObject({ messageId: "accepted" });
     expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp",
-      { message: "new authorized observation", data: { original: "fresh" }, triggerTurn: false }, "owner", { routedRemoteHost: null });
+      { message: "new authorized observation", data: { original: "fresh" }, principal: undefined, triggerTurn: false }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
     expect(actors.status).not.toHaveBeenCalled();
     expect(main.deliverAgent).not.toHaveBeenCalled();
     peer.ownerHostId = "replacement-host";
     peer.ownerIdentityId = "replacement-owner";
     await router.routeMessage(peer.id, "later observation", undefined, "followUp");
     expect(control.request).toHaveBeenLastCalledWith("replacement-host", peer.id, "followUp",
-      { message: "later observation", data: undefined, triggerTurn: true }, "replacement-owner", { routedRemoteHost: null });
+      { message: "later observation", data: undefined, principal: undefined, triggerTurn: true }, "replacement-owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
     peer.capabilities = [];
     await expect(router.routeMessage(peer.id, "withdrawn", undefined, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(2);
+    expect(control.request.mock.calls[1]![5]?.idempotencyKey).not.toBe(control.request.mock.calls[0]![5]?.idempotencyKey);
   });
 
   it("passes a participant's remote host separately from passive message data and rechecks capabilities", async () => {
@@ -723,8 +731,8 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage(peer.id, "observation", data, "followUp",
       undefined, { triggerTurn: false })).resolves.toMatchObject({ messageId: "delivered" });
     expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp",
-      { message: "observation", data: { remoteHost: "business-host", routedRemoteHost: "business-route" }, triggerTurn: false },
-      "owner", { routedRemoteHost: "forge" });
+      { message: "observation", data: { remoteHost: "business-host", routedRemoteHost: "business-route" }, principal: undefined, triggerTurn: false },
+      "owner", { routedRemoteHost: "forge", idempotencyKey: generatedIdempotencyKey });
     peer.capabilities = [];
     await expect(router.routeMessage(peer.id, "withdrawn", data, "followUp",
       undefined, { triggerTurn: false })).rejects.toThrow("does not support followUp");

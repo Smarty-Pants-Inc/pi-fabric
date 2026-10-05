@@ -3,6 +3,7 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
@@ -1227,19 +1228,7 @@ export class ActorManager {
 
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
   #hasSessionHeader(file: string): boolean {
-    const fd = fs.openSync(file, "r");
-    try {
-      const buffer = Buffer.alloc(64 * 1024);
-      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
-      const first = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0]!;
-      try {
-        const header = JSON.parse(first);
-        return header?.type === "session" && typeof header.id === "string" && header.id.length > 0 &&
-          typeof header.cwd === "string" && typeof header.timestamp === "string" &&
-          Number.isFinite(Date.parse(header.timestamp)) &&
-          (header.version === undefined || [1, 2, 3].includes(header.version));
-      } catch { return false; }
-    } finally { fs.closeSync(fd); }
+    return readPiSessionHeader(file) !== undefined;
   }
 
   #ensurePiSession(actor: ManagedActor): void {

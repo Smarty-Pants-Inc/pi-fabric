@@ -21,6 +21,7 @@ afterEach(async () => {
   for (const step of cleanup.splice(0).reverse()) await step();
 });
 
+const generatedIdempotencyKey = expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
 const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
 
@@ -161,7 +162,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, host: "forge" })]);
     expect(request).toHaveBeenCalledExactlyOnceWith(remote.id, remote.id, kind,
       { message: "first-minute reply", data: undefined, principal: undefined,
-        ...(kind === "followUp" ? { triggerTurn: true } : {}) }, remote.id, { routedRemoteHost: "forge" });
+        ...(kind === "followUp" ? { triggerTurn: true } : {}) }, remote.id, { routedRemoteHost: "forge", idempotencyKey: generatedIdempotencyKey });
   });
 
   // The far side of the bridge: the owner runs on its own mesh; a relay carries commands there and
@@ -224,9 +225,10 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     await expect(router.routeMessage(remote.id, "later", undefined, "followUp"))
       .resolves.toMatchObject({ routed: "mesh", acknowledged: true, messageId: "m-2" });
     expect(request).toHaveBeenNthCalledWith(1, remote.id, remote.id, "steer",
-      { message: "steer me", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+      { message: "steer me", data: undefined, principal: undefined }, remote.id, { routedRemoteHost: "forge", idempotencyKey: generatedIdempotencyKey });
     expect(request).toHaveBeenNthCalledWith(2, remote.id, remote.id, "followUp",
-      { message: "later", data: undefined, principal: undefined, triggerTurn: true }, remote.id, { routedRemoteHost: "forge" });
+      { message: "later", data: undefined, principal: undefined, triggerTurn: true }, remote.id, { routedRemoteHost: "forge", idempotencyKey: generatedIdempotencyKey });
+    expect(request.mock.calls[1]![5]?.idempotencyKey).not.toBe(request.mock.calls[0]![5]?.idempotencyKey);
     expect(received).toEqual([
       ["steer", remote.id, "steer me", local.id],
       ["followUp", remote.id, "later", local.id],
@@ -251,7 +253,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     await expect(router.routeMessage(remote.id, "native", data, "steer", undefined, { triggerTurn: false }))
       .resolves.toMatchObject({ acknowledged: true, messageId: "native-root" });
     expect(request).toHaveBeenCalledWith(remote.id, remote.id, "steer",
-      { message: "native", data, triggerTurn: false }, remote.id, { routedRemoteHost: null });
+      { message: "native", data, principal: undefined, triggerTurn: false }, remote.id, { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
     expect(received).toHaveBeenCalledWith(expect.objectContaining({
       destinationRemoteHost: null, message: "native", data, triggerTurn: false,
     }), expect.objectContaining({ id: local.id }), expect.any(AbortSignal), "mesh");

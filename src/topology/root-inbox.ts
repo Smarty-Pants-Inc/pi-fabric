@@ -104,7 +104,11 @@ const workReceipts = (fromId: string, data: unknown): string[] => {
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
 const eventReceipts = (event: MeshEvent): string[] => [
-  eventReceipt(event.id), receipt(event.from.id, "id", event.id), ...workReceipts(event.from.id, event.data),
+  eventReceipt(event.id), receipt(event.from.id, "id", event.id),
+  // Host-only publication keys are mesh-wide, even when a different maintenance owner
+  // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
+  ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
+  ...workReceipts(event.from.id, event.data),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {

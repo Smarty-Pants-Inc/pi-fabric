@@ -48,6 +48,10 @@ export interface FabricParticipantRecord {
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
   residency?: FabricParticipantResidency;
+  /** Captured actor registry incarnation, revalidated under custody at publication. */
+  ownershipToken?: string;
+  /** Loaded publisher implements registry-first resume/write fencing (not a desired config). */
+  ownershipFence?: 1;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport | "host";
   capabilities: FabricParticipantCapability[];
@@ -130,6 +134,13 @@ export interface FabricPeerInfo {
   local: false;
   /** The remote host of a peer mirrored by the mesh bridge (smarty-dev#2004). */
   host?: string;
+}
+
+export interface ActorPublicationCustody {
+  withLock<T>(operation: () => T | Promise<T>): Promise<T>;
+  owns(record: FabricParticipantRecord): boolean;
+  /** Undefined when this directory does not have custody for the actor's storage scope. */
+  current(record: FabricParticipantRecord): boolean | undefined;
 }
 
 export interface FabricParticipantSource {

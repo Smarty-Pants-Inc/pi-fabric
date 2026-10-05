@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } from "./types.js";
 import { ActorManager } from "./manager.js";
+import type { ActorPublicationCustody } from "../topology/types.js";
 
 export interface ActorDirectoryRoots {
   project: string;
@@ -10,6 +11,9 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  readonly #publicationCustody: ActorPublicationCustody;
+
+  override get participantCustody(): ActorPublicationCustody { return this.#publicationCustody; }
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
@@ -50,6 +54,14 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    const primary = super.participantCustody, secondary = this.#secondary.participantCustody;
+    // Always project -> session -> mesh/key, independent of the host's default scope.
+    const [project, session] = defaultScope === "project" ? [primary, secondary] : [secondary, primary];
+    this.#publicationCustody = {
+      withLock: operation => project.withLock(() => session.withLock(operation)),
+      owns: record => primary.owns(record) || secondary.owns(record),
+      current: record => primary.current(record) ?? secondary.current(record),
+    };
   }
 
   #isPrimary(id: string): boolean {

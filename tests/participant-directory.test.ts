@@ -293,7 +293,7 @@ describe("F3059 absent lineage death proof", () => {
       enabled: true, hostId: "observer", rootId: "observer", identity: { id: "observer", name: "main", kind: "main" }, ...(leaseMs ? { leaseMs } : {}),
     });
     directories.push(directory);
-    await directory.mesh.put({ key: "actors/absent/actor", identity, value: { id: "actor", name: "retained", runner: "pi", status: "idle", rootId: id } });
+    await directory.mesh.put({ key: "actors/absent/actor", identity, value: { id: "actor", name: "retained", runner: "pi", status: "idle", rootId: id, ownershipFence: 1 } });
     return { directory, id, at: directory.mesh.get("actors/absent/actor")!.updatedAt, identity };
   };
 
@@ -362,7 +362,7 @@ describe("F3059 absent lineage death proof", () => {
     const participant = { ...rootRecord(actorId, id, "absent"), rootId: id, kind: "agent" as const, updatedAt: at };
     writeParticipantFile(directory.mesh.root, { key, version: 1, updatedBy: identity, updatedAt: at, value: participant });
     expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
-    writeParticipantFile(directory.mesh.root, { key, version: 2, updatedBy: identity, updatedAt: at, value: { ...participant, kind: "actor" } });
+    writeParticipantFile(directory.mesh.root, { key, version: 2, updatedBy: identity, updatedAt: at, value: { ...participant, kind: "actor", ownershipFence: 1 } });
     expect(directory.lineageAdoptable(id, at + 20_000)).toBe(false);
     expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
   });

@@ -66,11 +66,12 @@ const fixture = async (suspendedOwner = false, ownerOpinion?: () => boolean | un
     beforeManager?.();
     const manager = new ActorManager(name, hostIdentity, mesh, config, agents, ({ message }) => { if (message.text) deliveries.push(message.text); }, {
       actorRoot: path.join(root, "actors"), persistent: true, rootId, project, role, claimResidency: "durable", adoptionGraceMs: 0,
-      canManageActor: id => { const participant = directory.get(id, Date.now(), { fresh: true }); return participant ? participant.ownerHostId === hostId : undefined; },
+      canManageActor: id => { const participant = hostDirectory.get(id, Date.now(), { fresh: true }); return participant ? participant.ownerHostId === hostId : undefined; },
       lineageAlive: id => directory.lineageAlive(id),
       lineageAdoptable: id => directory.lineageAdoptable(id),
     });
     cleanups.push(() => manager.close());
+    hostDirectory.registerSource(() => [], manager.participantCustody);
     return manager;
   };
   return { root, mesh, actor, directory, candidate, deliveries, agents, owner };
@@ -82,7 +83,7 @@ const retainActorFile = (f: Awaited<ReturnType<typeof fixture>>) => {
     key: key("topology/participants/", f.actor.id), version: 1, updatedBy: identity(oldRoot), updatedAt: old,
     value: { format: 1, id: f.actor.id, rootId: oldRoot, kind: "actor", name: "retained", status: "idle", runner: "pi",
       transport: "host", ownerHostId: oldRoot, ownerIdentityId: oldRoot, capabilities: ["fabric"], startedAt: old - 1000,
-      updatedAt: old, controlProtocol: "v1" },
+      updatedAt: old, ownershipFence: 1, controlProtocol: "v1" },
   });
 };
 type AdoptionFixture = Awaited<ReturnType<typeof fixture>>;
@@ -241,6 +242,140 @@ describe("F3059 aged absent-root adoption", () => {
     } finally { release(); await staleSave; custody.mockRestore(); }
   });
 
+  it.each(["files", "shared", "delayed-copy", "retained-file"] as const)("fences the real captured participant refresh on the %s publication path and delivers to B", async mode => {
+    let predecessorDispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      predecessorDispatch = this.callbacks.onEvent;
+    });
+    const f = await fixture(true);
+    start.mockRestore();
+    if (mode === "files") await f.mesh.put({ key: "topology/liveness", identity: identity("observer"),
+      value: { version: 1, hostLeases: "files", participants: "files" } });
+    if (mode === "retained-file") retainActorFile(f);
+    const a = new ParticipantDirectory(f.mesh, { enabled: true, hostId: oldRoot, rootId: oldRoot,
+      identity: identity(oldRoot), reapDeadHosts: false });
+    cleanups.push(() => a.close());
+    let captured = false;
+    // Exactly the production ResidentHost/Main source, not the legacy actors/ presence writer.
+    a.registerSource(() => {
+      const records = f.owner.listOwned().map(actor => actorParticipantRecord(actor, oldRoot, oldRoot, oldRoot, oldRoot));
+      captured = records.length === 1;
+      return records;
+    }, f.owner.participantCustody);
+    const lock = f.owner.participantCustody.withLock.bind(f.owner.participantCustody);
+    let entered = false, calls = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const custody = vi.spyOn(f.owner.participantCustody, "withLock").mockImplementation(async operation => {
+      if (++calls === (mode === "delayed-copy" ? 2 : 1)) { entered = true; await gate; }
+      return lock(operation);
+    });
+    const refresh = a.refresh();
+    try {
+      await wait(() => entered);
+      expect(captured).toBe(true);
+      // A is suspended: reaped advertisements/lease and aged retained actor history.
+      fs.rmSync(leasePath(f, oldRoot), { force: true });
+      await f.mesh.delete({ key: key("topology/hosts/", oldRoot) });
+      await f.mesh.delete({ key: key("topology/participants/", f.actor.id) });
+      const next = await f.candidate("real-refresh-successor");
+      await wait(() => next.owns(f.actor.id));
+      expect(f.directory.get(f.actor.id, Date.now(), { fresh: true })).toBeUndefined();
+      release();
+      await refresh;
+      if (mode === "retained-file") {
+        // Its host lease revives the retained old file, not an actor write. Both actual
+        // owner directories still reject that obsolete registry generation.
+        expect(f.directory.get(f.actor.id, Date.now(), { fresh: true })?.rootId).toBe(oldRoot);
+        expect(a.get(f.actor.id, Date.now(), { fresh: true })).toBeUndefined();
+      } else expect(f.directory.get(f.actor.id, Date.now(), { fresh: true })).toBeUndefined();
+      const event = await f.mesh.publish({ topic: "absent.proof", from: identity("sender"), text: "CAPTURED_REFRESH_EVENT" });
+      expect(predecessorDispatch(event)).toBe("ignored");
+      await wait(() => next.messages(f.actor.id).some(message => message.direction === "out"));
+      expect(next.messages(f.actor.id).filter(message => message.direction === "in" &&
+        JSON.stringify(message.data).includes("CAPTURED_REFRESH_EVENT"))).toHaveLength(1);
+      expect(next.owns(f.actor.id)).toBe(true);
+      expect(f.owner.owns(f.actor.id)).toBe(false);
+    } finally { release(); await refresh; custody.mockRestore(); }
+  });
+
+  it.each(["refresh", "close"] as const)("fences %s cleanup against a newer same-host ABA ownership token", async operation => {
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const f = await fixture(true);
+    start.mockRestore();
+    const a = new ParticipantDirectory(f.mesh, { enabled: true, hostId: oldRoot, rootId: oldRoot,
+      identity: identity(oldRoot), reapDeadHosts: false });
+    cleanups.push(() => a.close());
+    const captured = f.owner.listOwned().map(actor => actorParticipantRecord(actor, oldRoot, oldRoot, oldRoot, oldRoot));
+    let removed = false;
+    a.registerSource(() => removed ? [] : captured, f.owner.participantCustody);
+    await a.refresh();
+    const store = new ActorRegistryStore(path.join(f.root, "actors"));
+    await store.withLock(() => store.write(store.records().map(row => ({ ...row, ownershipToken: "successor-ABA-token" }))));
+    const successor = { ...actorParticipantRecord(f.actor, oldRoot, oldRoot, oldRoot, oldRoot),
+      ownershipToken: "successor-ABA-token", ownershipFence: 1 as const };
+    const participantKey = key("topology/participants/", f.actor.id);
+    const committed = await f.mesh.put({ key: participantKey, identity: identity(oldRoot), value: successor });
+    writeParticipantFile(f.mesh.root, committed);
+    const fileBefore = fs.readFileSync(participantPath(f), "utf8");
+    removed = true;
+    if (operation === "refresh") await a.refresh();
+    else await a.close();
+    expect(f.mesh.get(participantKey)).toEqual(committed);
+    expect(fs.readFileSync(participantPath(f), "utf8")).toBe(fileBefore);
+  });
+
+  it.each(["legacy-presence", "modern-presence", "registry"] as const)("fails closed for unfenced prior-release %s even when all predecessor leases are absent", async mode => {
+    const f = await fixture();
+    const store = new ActorRegistryStore(path.join(f.root, "actors"));
+    if (mode === "registry") await store.withLock(() => store.write(store.records().map(row => {
+      const { ownershipFence: _fence, ...old } = row;
+      return old;
+    })));
+    else if (mode === "modern-presence") {
+      retainActorFile(f);
+      const file = participantPath(f), entry = JSON.parse(fs.readFileSync(file, "utf8"));
+      delete entry.value.ownershipFence;
+      fs.writeFileSync(file, JSON.stringify(entry));
+    } else {
+      const entry = f.mesh.get("actors/absent-main/" + f.actor.id)!;
+      const { ownershipFence: _fence, ...old } = entry.value as Record<string, unknown>;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(entry.updatedAt);
+      try { await f.mesh.put({ key: entry.key, identity: identity(oldRoot), value: old }); }
+      finally { clock.mockRestore(); }
+    }
+    const next = await f.candidate("unfenced-successor");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(next.owns(f.actor.id)).toBe(false);
+    expect(store.records().find(row => row.id === f.actor.id)).toMatchObject({ rootId: oldRoot });
+    expect(store.records().find(row => row.id === f.actor.id)?.adoptedAt).toBeUndefined();
+  });
+
+  it.each(["matching", "mismatched"] as const)("validates a %s native session lease produced by the real Main writer", async mode => {
+    const f = await fixture();
+    const old = Date.now() - 20 * 60_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(old);
+    const main = new ParticipantDirectory(f.mesh, { enabled: true, hostId: oldRoot, rootId: oldRoot,
+      identity: identity(oldRoot), reapDeadHosts: false });
+    cleanups.push(() => main.close());
+    main.registerSource(() => [{ format: 1, id: oldRoot, rootId: oldRoot, kind: "root", name: "main", status: "idle",
+      runner: "pi", transport: "host", ownerHostId: oldRoot, ownerIdentityId: oldRoot, capabilities: ["fabric"],
+      sessionId: mode === "matching" ? oldRoot.slice(8) : "different-native-session", startedAt: old - 1000,
+      updatedAt: old, controlProtocol: "v1" }]);
+    try { await main.refresh(); }
+    finally { clock.mockRestore(); }
+    const lease = readHostLease(f.mesh.root, oldRoot)!;
+    expect(lease.session?.id).toBe(mode === "matching" ? oldRoot.slice(8) : "different-native-session");
+    // Reaper interrupted after advertisements, before lease cleanup.
+    await f.mesh.delete({ key: key("topology/participants/", oldRoot) });
+    await f.mesh.delete({ key: key("topology/hosts/", oldRoot) });
+    await f.mesh.delete({ key: "sessions/absent-main" });
+    fs.rmSync(path.join(f.mesh.root, "participants", key("topology/participants/", oldRoot).slice("topology/participants/".length) + ".json"), { force: true });
+    expect(f.directory.lineageAdoptable(oldRoot)).toBe(mode === "matching");
+    const next = await f.candidate("native-lease-successor");
+    if (mode === "matching") await wait(() => next.owns(f.actor.id));
+    else { await new Promise(resolve => setTimeout(resolve, 100)); expect(next.owns(f.actor.id)).toBe(false); }
+  });
+
   it("preserves adopted custody and checkpoint-only history through a registry checkpoint and reload", async () => {
     const f = await fixture();
     const actorRoot = path.join(f.root, "actors"), store = new ActorRegistryStore(actorRoot);
@@ -333,7 +468,7 @@ describe("F3059 aged absent-root adoption", () => {
           const old = Date.now() - 20 * 60_000, hostId = residentHostId(oldRoot);
           writeHostLease(f.mesh.root, { id: hostId, rootId: oldRoot, identityId: hostId, startedAt: old - 1000,
             updatedAt: old, expiresAt: old + 15_000,
-            session: { id: oldRoot, startedAt: old - 1000, updatedAt: old, expiresAt: old + 15_000 } });
+            session: { id: oldRoot.slice(8), startedAt: old - 1000, updatedAt: old, expiresAt: old + 15_000 } });
           rawTimestamp(leasePath(f, hostId), field.split("."), time);
         });
       });

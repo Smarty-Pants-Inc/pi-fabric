@@ -1058,6 +1058,7 @@ export class FabricRuntimeState {
       this.#actors!.listOwned().map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
+      this.#actors.participantCustody,
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());

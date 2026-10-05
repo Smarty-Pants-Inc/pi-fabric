@@ -574,6 +574,7 @@ export class ResidentHost {
             this.config.rootId,
           ),
         ),
+        this.actors.participantCustody,
       );
       this.agents.subscribeUi(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.participants.scheduleRefresh());

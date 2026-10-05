@@ -22,7 +22,7 @@ import {
 } from "../config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
-import type { FabricParticipantResidency } from "../topology/types.js";
+import type { ActorPublicationCustody, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
@@ -115,6 +115,7 @@ interface ManagedActor {
   id: string;
   name: string;
   rootId: string;
+  ownershipFence?: 1;
   // Fencing token written when a host adopts this lineage: a lineage adopted
   // this recently still has an adopter finding its footing — do not adopt
   // over it until ORPHAN_ADOPTION_RETRY_MS has elapsed.
@@ -780,6 +781,7 @@ export class ActorManager {
       id,
       name,
       rootId: this.#rootId,
+      ownershipFence: 1,
       ...(this.#project ? { project: this.#project } : {}),
       instructions: request.instructions,
       status: "idle",
@@ -3692,6 +3694,7 @@ export class ActorManager {
       id: actor.id,
       name: actor.name,
       rootId: actor.rootId,
+      ownershipFence: 1,
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
       ...(actor.ownershipToken !== undefined ? { ownershipToken: actor.ownershipToken } : {}),
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
@@ -4019,6 +4022,7 @@ export class ActorManager {
         id: record.id,
         name: record.name,
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
+        ...(record.ownershipFence === 1 ? { ownershipFence: 1 as const } : {}),
         ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
         ...(typeof record.ownershipToken === "string" ? { ownershipToken: record.ownershipToken } : {}),
@@ -4479,6 +4483,8 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ownershipFence: 1,
+      ...(actor.ownershipToken !== undefined ? { ownershipToken: actor.ownershipToken } : {}),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
       ...(actor.project ? { project: actor.project } : {}),
@@ -4562,6 +4568,21 @@ export class ActorManager {
     };
   }
 
+  /** Directory publication uses the same registry-first lock order as adoption/save. */
+  readonly #participantCustody: ActorPublicationCustody = {
+    withLock: operation => this.#persistent ? this.#registry.withLock(operation) : Promise.resolve(operation()),
+    owns: record => !this.#closing && record.rootId === this.#rootId &&
+      this.#registryOwns({ id: record.id, rootId: record.rootId, ownershipToken: record.ownershipToken }),
+    current: record => {
+      const current = this.#registryOwns({ id: record.id, rootId: record.rootId, ownershipToken: record.ownershipToken });
+      if (!this.#persistent || !this.meshConfig.enabled) return undefined;
+      if (!this.#custodyRecords) return false; // unreadable custody is not an absent actor
+      return this.#custodyRecords.has(record.id) ? current : undefined;
+    },
+  };
+
+  get participantCustody(): ActorPublicationCustody { return this.#participantCustody; }
+
   validateDirectMessage(message: string, data: unknown): void {
     if (!message.trim()) throw new Error("Actor message must not be empty");
     const serialized = JSON.stringify({ message, ...(data === undefined ? {} : { data }) });
@@ -4597,7 +4618,7 @@ export class ActorManager {
   }
 
   /** Cheap stat on every authority boundary; parse once per registry incarnation. */
-  #registryOwns(actor: ManagedActor): boolean {
+  #registryOwns(actor: { id: string; rootId: string; ownershipToken?: string | undefined }): boolean {
     if (!this.#persistent || !this.meshConfig.enabled) return true;
     const fingerprint = this.#registry.fingerprint();
     if (!this.#custodyRecords || fingerprint !== this.#custodyFingerprint) {
@@ -4666,6 +4687,7 @@ export class ActorManager {
     if (
       !this.#persistent ||
       this.#closing ||
+      (this.#lineageAdoptable !== undefined && actor.ownershipFence !== 1) ||
       !this.#canManageActor ||
       this.#claimResidency === undefined ||
       this.#adoptionPending.has(actor.id)
@@ -4723,6 +4745,9 @@ export class ActorManager {
         const current = records.find((record) => record.id === actor.id);
         // A racing adopter rewrote the lineage since we loaded it; they win.
         if (!current || current.rootId !== expectedRootId || current.ownershipToken !== actor.ownershipToken) return false;
+        // Aged absence cannot establish exit/quiescence of an unfenced old writer.
+        // Check this actor too: another fenced actor in the lineage is not its proof.
+        if (this.#lineageAdoptable && current.ownershipFence !== 1) return false;
         // A live owner opinion appeared while we waited for the lock.
         if (this.#canManageActor?.(actor.id) !== undefined) return false;
         // The lineage root turned out to be alive or unknown after all.

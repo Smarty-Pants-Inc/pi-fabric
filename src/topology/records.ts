@@ -83,6 +83,7 @@ export const actorParticipantRecord = (
   id: actor.id,
   kind: "actor",
   rootId: actor.rootId ?? rootId,
+  ...(actor.ownershipToken !== undefined ? { ownershipToken: actor.ownershipToken } : {}),
   ownerHostId,
   ownerIdentityId,
   parentId,

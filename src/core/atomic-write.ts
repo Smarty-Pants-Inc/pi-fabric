@@ -238,6 +238,11 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     return { entries, directories, parents };
 };
 
+/** Cheap complete-path identity for revalidating a previously confirmed namespace.
+ * Includes every ancestor and symlink, even links resolving to the same endpoint. */
+export const pathNamespaceIdentity = (target: string, receipt?: Inode): string =>
+  JSON.stringify(namespaceSnapshot(target, receipt).entries);
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
   if (process.platform !== "win32") {
@@ -265,8 +270,9 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
 
 /** Same namespace fence as the synchronous writer, with barriers off the event loop.
  * Always confirm all parent entries: an unchanged ancestor inode does not prove
- * that a newly created or replaced child directory is durably linked. */
-export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
+ * that a newly created or replaced child directory is durably linked.
+ * Return the exact confirmed identity for cheap revalidation after an unlocked handoff. */
+export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<string> => {
   const before = namespaceSnapshot(target, receipt);
   if (process.platform !== "win32") {
     for (const [directory, expected] of [...before.directories].reverse()) {
@@ -278,9 +284,11 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
       } finally { await handle.close(); }
     }
   }
-  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+  const identity = JSON.stringify(before.entries);
+  if (pathNamespaceIdentity(target, receipt) !== identity) {
     throw new Error("Namespace changed during durability barriers");
   }
+  return identity;
 };
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {

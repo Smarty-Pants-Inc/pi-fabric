@@ -43,6 +43,102 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("Astra F5 confirmed namespace handoff", () => {
+  const endpoint = (file: string) => {
+    const stat = fs.statSync(file);
+    return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+  };
+
+  it("retains a delivery after a lock-acquisition ancestor swap until the new namespace is confirmed", async () => {
+    const { root, dir, mesh, receipt } = setup(1);
+    const before = endpoint(receipt);
+    const mkdir = fs.mkdirSync.bind(fs);
+    let swapped = false;
+    vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      const result = (mkdir as (...args: unknown[]) => unknown)(file, ...args);
+      if (!swapped && String(file) === path.join(root, ".lock")) {
+        swapped = true;
+        fs.renameSync(dir, `${dir}-moved`);
+        fs.symlinkSync(`${dir}-moved`, dir, process.platform === "win32" ? "junction" : "dir");
+        expect(endpoint(receipt)).toEqual(before);
+      }
+      return result;
+    }) as typeof fs.mkdirSync);
+    expect(await mesh.compactReceipts()).toBe(0); // new link has no confirmed barrier
+    expect(swapped).toBe(true);
+    expect(mesh.get(deliveryKey("0000"))).toBeDefined();
+
+    const open = fs.promises.open.bind(fs.promises);
+    const barrier = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (String(args[0]) === `${dir}-moved`) throw Object.assign(new Error("new namespace barrier failed"), { code: "EIO" });
+      return open(...args);
+    });
+    if (process.platform !== "win32") {
+      expect(await mesh.compactReceipts()).toBe(0);
+      expect(mesh.get(deliveryKey("0000"))).toBeDefined();
+    }
+    barrier.mockRestore();
+    expect(endpoint(receipt)).toEqual(before);
+    expect(await mesh.compactReceipts()).toBe(1); // fresh successful confirmation only
+  });
+
+  it("retains an earlier confirmed candidate when a later candidate's replacement namespace barrier fails", async () => {
+    const { dir, mesh, receipt } = setup(2);
+    const before = endpoint(receipt);
+    const later = path.join(dir, `${hash("0001")}.json`);
+    const open = fs.promises.open.bind(fs.promises);
+    let swapped = false;
+    const barrier = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (swapped && String(args[0]) === `${dir}-moved`) throw Object.assign(new Error("later namespace barrier failed"), { code: "EIO" });
+      const handle = await open(...args);
+      if (!swapped && String(args[0]) === later) {
+        // The first candidate has finished confirmation. Swap only the ancestor:
+        // every receipt's inode and endpoint timestamps remain unchanged.
+        fs.renameSync(dir, `${dir}-moved`);
+        fs.symlinkSync(`${dir}-moved`, dir, process.platform === "win32" ? "junction" : "dir");
+        swapped = true;
+        expect(endpoint(receipt)).toEqual(before);
+        if (process.platform === "win32") handle.sync = async () => { throw new Error("later confirmation failed"); };
+      }
+      return handle;
+    });
+    // Deterministic attempt budget: a busy host must still reach the second receipt.
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    expect(await mesh.compactReceipts()).toBe(0);
+    expect(swapped).toBe(true);
+    expect(mesh.get(deliveryKey("0000"))).toBeDefined();
+    expect(mesh.get(deliveryKey("0001"))).toBeDefined();
+    barrier.mockRestore();
+    expect(await mesh.compactReceipts()).toBe(2);
+  });
+
+  it("rejects unreadable ancestors and replacement links to the same directory inode", async () => {
+    const { dir, root, receipt } = setup(1);
+    fs.renameSync(dir, `${dir}-moved`);
+    fs.symlinkSync(`${dir}-moved`, dir, process.platform === "win32" ? "junction" : "dir");
+    const { prepareReceiptCompaction, receiptCandidateUnchanged } = await import("../src/mesh/state-retention.js");
+    const entry = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8")).entries[deliveryKey("0000")] as MeshStateEntry;
+    const prepared = await prepareReceiptCompaction([entry], root, Date.now(), undefined, Infinity);
+    expect(prepared.confirmed).toHaveLength(1);
+    const candidate = prepared.confirmed[0]!;
+    expect(receiptCandidateUnchanged(candidate, entry)).toBe(true);
+    const lstat = fs.lstatSync.bind(fs);
+    const unreadable = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (String(file) === path.dirname(dir)) throw Object.assign(new Error("unreadable ancestor"), { code: "EACCES" });
+      return (lstat as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.lstatSync);
+    expect(receiptCandidateUnchanged(candidate, entry)).toBe(false);
+    unreadable.mockRestore();
+    expect(receiptCandidateUnchanged(candidate, entry)).toBe(true);
+    const before = endpoint(receipt);
+    // Retarget a new link to an equivalent spelling of the very same endpoint.
+    fs.unlinkSync(dir);
+    fs.symlinkSync(`${dir}-moved${path.sep}.`, dir, process.platform === "win32" ? "junction" : "dir");
+    expect(endpoint(receipt)).toEqual(before);
+    expect(receiptCandidateUnchanged(candidate, entry)).toBe(false);
+  });
+});
+
 describe("Astra F4 unlocked bounded receipt passes", () => {
   it("keeps Main's heartbeat, foreground and a competing real mutation responsive with a 3 MB backlog", async () => {
     const { root, dir, mesh } = setup(600);

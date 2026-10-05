@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { syncPathNamespaceAsync } from "../core/atomic-write.js";
+import { pathNamespaceIdentity, syncPathNamespaceAsync } from "../core/atomic-write.js";
 import { hostFromEntry, participantFromEntry } from "../topology/record-validation.js";
 import type { MeshStateEntry } from "./store.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
@@ -41,6 +41,7 @@ export interface ConfirmedReceiptCandidate {
   entry: MeshStateEntry;
   file: string;
   fingerprint: string;
+  namespace: string;
 }
 
 // A terminal result or a status flag is not an acknowledgement. Keep F1's fresh
@@ -61,9 +62,9 @@ const confirmDeliveryReceipt = async (
     if (receipt?.id !== id || typeof receipt.sessionId !== "string" || !receipt.sessionId ||
       !time(receipt.consumedAt) || receipt.consumedAt >= cutoff) return undefined;
     await handle.sync();
-    await syncPathNamespaceAsync(file, stat);
+    const namespace = await syncPathNamespaceAsync(file, stat);
     if (fingerprint(await handle.stat()) !== fingerprint(stat)) return undefined;
-    return { entry, file, fingerprint: fingerprint(stat) };
+    return { entry, file, fingerprint: fingerprint(stat), namespace };
   } catch { /* absent, malformed or unconfirmed durability never authorizes expiry */ }
   finally { await handle?.close().catch(() => undefined); }
   return undefined;
@@ -102,13 +103,16 @@ export const prepareReceiptCompaction = async (
 };
 
 /** Only cheap checks under the mutation fence; no receipt reads or barriers here.
- * Compare complete entries as well as metadata: legacy writers can copy CAS labels. */
+ * Compare complete entries as well as metadata: legacy writers can copy CAS labels.
+ * Endpoint metadata alone cannot authorize deletion after an ancestor/link swap. */
 export const receiptCandidateUnchanged = (
   candidate: ConfirmedReceiptCandidate, current: MeshStateEntry | undefined,
 ): boolean => {
   if (!current || JSON.stringify(current) !== JSON.stringify(candidate.entry)) return false;
-  try { return fingerprint(fs.statSync(candidate.file)) === candidate.fingerprint; }
-  catch { return false; }
+  try {
+    return fingerprint(fs.statSync(candidate.file)) === candidate.fingerprint &&
+      pathNamespaceIdentity(candidate.file) === candidate.namespace;
+  } catch { return false; }
 };
 
 /** Participant expiry only; receipt barriers never run in an ordinary commit. */

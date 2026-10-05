@@ -20,7 +20,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -452,6 +452,9 @@ export class ActorManager {
   #retentionSweep: Promise<void> | undefined;
   #initialRetentionPending = true;
   readonly #pendingPresence = new Set<string>();
+  /** Residents publish both scopes through their one registry-fenced host heartbeat. */
+  readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
+  readonly #presenceRevisions = new Map<string, object>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -530,6 +533,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Host publication/lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
+      /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
+      presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -578,6 +583,7 @@ export class ActorManager {
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
+    this.#presencePublisher = options.presencePublisher;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -849,6 +855,45 @@ export class ActorManager {
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor));
+  }
+
+  /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
+  hasActiveDurableActor(): boolean {
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    return [...this.#actors.values()].some(actor =>
+      this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped");
+  }
+
+  /** Called inside the host's registry -> mesh publication fence, without an await. */
+  presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void } {
+    this.#syncActorsFromRegistry();
+    return this.#withOwnershipRead(() => {
+      const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
+      const ids = new Set(pending.keys());
+      if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
+      const ops: MeshBatchOperation[] = [];
+      for (const id of ids) {
+        const actor = this.#actors.get(id);
+        if (actor) {
+          if (this.#ownershipDecision(id)) ops.push({ kind: "put", key: this.#presenceKey(id),
+            value: this.#publicInfo(actor), identity: this.identity });
+        } else {
+          const fence = this.#orphanPresence.get(id);
+          ops.push({ kind: "delete", key: this.#presenceKey(id),
+            ...(fence !== undefined ? { ifVersion: fence, onConflict: "skip" as const } : {}) });
+        }
+      }
+      return { ops, committed: () => {
+        for (const [id, revision] of pending) {
+          // A mutation while the shared write waited belongs to the next refresh.
+          if (this.#presenceRevisions.get(id) !== revision) continue;
+          this.#pendingPresence.delete(id);
+          this.#presenceRevisions.delete(id);
+          this.#orphanPresence.delete(id);
+        }
+      } };
+    });
   }
 
   async cede(id: string): Promise<FabricActorInfo> {
@@ -3611,6 +3656,17 @@ export class ActorManager {
   }
 
   async #writePresenceNow(id: string): Promise<void> {
+    if (this.#presencePublisher) {
+      this.#pendingPresence.add(id);
+      this.#presenceRevisions.set(id, {});
+      try { await this.#presencePublisher.refresh(); }
+      catch (error) {
+        // The failed acquisition wrote nothing. The host's next heartbeat carries
+        // every pending id, with no per-actor timer, extra retry, or warning storm.
+        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
       retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
@@ -3650,6 +3706,10 @@ export class ActorManager {
   }
 
   #schedulePresenceRetry(): void {
+    if (this.#presencePublisher) {
+      if (!this.#closing && this.#pendingPresence.size > 0) this.#presencePublisher.schedule();
+      return;
+    }
     if (this.#presenceTimer || this.#closing || this.#pendingPresence.size === 0) return;
     this.#presenceTimer = setTimeout(() => {
       this.#presenceTimer = undefined;

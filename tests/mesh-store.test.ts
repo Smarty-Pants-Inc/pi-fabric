@@ -165,6 +165,97 @@ describe("MeshStore", () => {
     expect(directoryRead.mock.calls.some(([directory]) => directory === path.join(store.root, "event-receipts"))).toBe(false);
   });
 
+  it("recovers an invalidated intent by one direct archive lookup, never a history scan", async () => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "old-compactor", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("before receipt");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("before receipt");
+    crash.mockRestore();
+    const event = store.read()[0]!;
+    // A pre-intent compactor drops this committed line and changes the offset's identity.
+    const later = { ...event, id: "later", sequence: event.sequence + 1 };
+    delete later.dedupeKey;
+    MeshArchive.fromRoot(store.root)!.catchUp([{ event: later, line: JSON.stringify(later) }]);
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), JSON.stringify(later) + "\n");
+    fs.writeFileSync(path.join(store.root, "sequence"), String(later.sequence));
+    const scan = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const lookup = vi.spyOn(MeshArchive.prototype, "lookup");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const dirs = vi.spyOn(fs, "readdirSync");
+    expect(await store.publish(packet)).toEqual(event);
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
+    expect(scan).not.toHaveBeenCalled();
+    expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
+    expect(dirs).not.toHaveBeenCalled();
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.latestSequence()).toBe(later.sequence);
+  });
+
+  it.each(["missing", "corrupt", "unreadable", "missing-segment", "short-segment", "missing-root", "missing-config", "wrong-intent-id", "null-index", "oversized-index"])("fails closed for an invalidated intent when its archive is %s", async damage => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "unavailable-" + damage, text: "once" };
+    const event = await store.publish(packet);
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    fs.rmSync(base + ".json");
+    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: event.sequence, eventId: damage === "wrong-intent-id" ? "unrelated" : event.id, liveOffset: 0, archiveDir }));
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const index = path.join(archiveDir, "sequence-index", "0", event.sequence + ".json");
+    const entry = JSON.parse(fs.readFileSync(index, "utf8"));
+    if (damage === "missing") fs.rmSync(index);
+    if (damage === "corrupt") fs.writeFileSync(index, "invalid");
+    if (damage === "null-index") fs.writeFileSync(index, "null");
+    if (damage === "oversized-index") fs.writeFileSync(index, " ".repeat(4097));
+    if (damage === "unreadable") { fs.rmSync(index); fs.mkdirSync(index); }
+    if (damage === "missing-segment") fs.rmSync(path.join(archiveDir, entry.file));
+    if (damage === "short-segment") fs.truncateSync(path.join(archiveDir, entry.file), 10);
+    if (damage === "missing-root") fs.rmSync(archiveDir, { recursive: true, force: true });
+    if (damage === "missing-config") fs.rmSync(path.join(store.root, MESH_ARCHIVE_CONFIG));
+    await expect(store.publish(packet)).rejects.toMatchObject({ name: "MeshDedupeRecoveryError", retryable: true });
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    expect(fs.statSync(path.join(store.root, "events.jsonl")).size).toBe(0);
+    expect(store.latestSequence()).toBe(event.sequence);
+  });
+
+  it("settles indexed archive evidence before ordinary recovery can roll it back, without sealing scans", async () => {
+    const { store } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "archive-commit-crash", text: "once" };
+    const crash = vi.spyOn(MeshArchive.prototype, "commit").mockImplementationOnce(() => { throw new Error("before archive commit"); });
+    await expect(store.publish(packet)).rejects.toThrow("before archive commit");
+    crash.mockRestore();
+    const event = store.read()[0]!;
+    // An older rewrite can remove the live anchor; the synced indexed archive is still proof.
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const directories = vi.spyOn(fs, "readdirSync");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    expect(await store.publish(packet)).toEqual(event);
+    expect(directories).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+    const archive = MeshArchive.fromRoot(store.root)!;
+    expect(archive.pending()).toBeUndefined();
+    expect(archive.head()?.id).toBe(event.id);
+    expect(archive.lookup(event.sequence)).toEqual(event);
+  });
+
+  it("publishes when a direct archive reservation proves that the intent never appended", async () => {
+    const { store } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "provably-absent", text: "once" };
+    const before = vi.spyOn(MeshArchive.prototype, "begin").mockImplementationOnce(() => { throw new Error("before archive append"); });
+    await expect(store.publish(packet)).rejects.toThrow("before archive append");
+    before.mockRestore();
+    expect(MeshArchive.fromRoot(store.root)!.lookup(1)).toBeUndefined();
+    const event = await store.publish(packet);
+    expect(event.sequence).toBe(2);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
   it("does not recover a legacy append that has no intent (the documented migration residual)", async () => {
     const { store } = createArchivedStore();
     const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });

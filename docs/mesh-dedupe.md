@@ -10,28 +10,37 @@ All steps hold the existing mesh lock:
 
 1. Read `event-receipts/<hash>.json`. A valid receipt is authoritative; confirm
    its file/namespace barriers, finish any pending-file cleanup, and return it.
-2. Repair a torn live tail and finish ordinary archive recovery. If
-   `event-receipts/<hash>.pending.json` exists, read **one line at its recorded
-   byte offset** and match all of `reservedSequence`, `eventId`, and `dedupeKey`.
-   An existing event is confirmed, receipted durably, and returned. An absent or
-   incomplete/mismatched append has not committed that intent: delete the intent
-   durably and start a fresh reservation. Corrupt intents/receipts and I/O or
-   durability-barrier failures fail closed.
-3. Neither file means **new**, not "search history". Reserve the sequence and
-   create `{ dedupeKey, reservedSequence, eventId, liveOffset }` in the pending
-   file with atomic rename and file/namespace fsync **before** any event append.
-4. Perform the existing archive-before-live protocol; append the event with the
-   reserved sequence and id. Confirm the live file, durably write the receipt,
-   and only then unlink/sync the intent.
+2. If `event-receipts/<hash>.pending.json` exists, read **one line at its
+   recorded live byte offset** and match `reservedSequence`, `eventId`, and
+   `dedupeKey`. If the line no longer matches (including after an old compactor
+   rewrites the live tail), directly read
+   `sequence-index/<floor(sequence/1024)>/<sequence>.json` in the archive, then
+   seek exactly its segment/file offset and read the one recorded line.
+   A matching archived event counts as committed: finish any archive pending
+   commit, write the durable receipt, and return the original event. Only an
+   explicit durable `{ sequence, absent: true }` proves non-append. A missing,
+   corrupt, unreadable, or mismatched index/segment is **unavailable**, not absent:
+   retain the intent and return retryable `MeshDedupeRecoveryError`, never publish.
+   The captured `archiveDir` also fences removal/change of archive configuration.
+   Settle the intent before ordinary archive recovery can cut back its evidence.
+3. Neither file means **new**, not "search history". Repair the live tail and
+   finish ordinary archive recovery, reserve a sequence, and install a durable
+   negative sequence sidecar in the archive. Create
+   `{ dedupeKey, reservedSequence, eventId, liveOffset, archiveDir? }` atomically
+   with file/namespace fsync **before** either event append.
+4. The archive append syncs the event line, then durably replaces the sidecar
+   with `{ sequence, id, file, offset, length }` in that same append operation,
+   before the event can go live. A rollback installs the explicit negative record.
+   Append live, commit archive metadata, confirm the live file, durably write
+   the receipt, and only then unlink/sync the intent.
 
-The offset is an exact direct-live lookup; no archive index or archive scan is
-needed because **every live-log compaction settles every pending intent before
-rewriting**. Each existing event gets a durable receipt first; each absent append
-loses only its abandoned intent. Failure to settle aborts the rewrite. Compaction
-also durably writes the retained bytes and rename, so subsequent intents cannot
-name offsets in a generation whose data/rename is lost on reboot. Tail repair
-only removes incomplete appends; archive reboot recovery restores synced events
-before intent settlement. An abandoned sequence is not reused.
+Archive lookup never scans a segment, index log, receipt directory, or day tree.
+It is one sequence-addressed sidecar read and one positioned event-line read.
+The archive is day/topic segmented, so the direct index preserves exact offsets
+without backfilling or scanning historical segments. Old writers ignore the
+sidecars but do not rewrite committed archive lines. New compaction still settles
+all pending intents before rewriting and durably writes retained bytes/rename.
+Tail repair only removes incomplete appends. An abandoned sequence is not reused.
 
 Normal new-key publish work is independent of event-history size. The ordinary
 fixed-size tail/sequence/archive-append metadata reads still happen. No
@@ -43,11 +52,14 @@ these maintenance operations are not claimed to be O(1).
 
 ## Consumer and rollout contract
 
-All writers/compactors of a shared mesh must use this intent-aware protocol;
-rollback/mixed-version old compactors cannot be allowed to rewrite a log with
-new pending intents. Retain receipts indefinitely. Manual deletion/corruption
-of receipts or out-of-protocol log rewrites are not supported recovery actions.
-These are storage/deployment assumptions, not a lossy dedupe window.
+On an archived mesh, old writers/compactors may continue to rewrite the live log:
+new pending intents remain recoverable through their exact sequence sidecars.
+The archive must remain available and its append-only segment offsets and
+sequence sidecars must be retained. Missing/corrupt sidecars never authorize a
+second publish; they fail closed until repaired. A mesh without an archive
+cannot recover bytes discarded by an old compactor and still requires
+intent-aware compaction. Retain receipts indefinitely. Manual deletion or
+rollback of receipts/archive evidence is not a supported recovery action.
 
 The #460 callers (`src/topology/stall-alarms.ts`) publish only:
 
@@ -98,6 +110,16 @@ original inbox carrier again.
 - Crash followed by unrelated byte-bounded compaction: the event leaves the
   live log only after its receipt is durable; retry still returns the event,
   with and without the archive. A failed receipt barrier prevents compaction.
+- Actual RC3 (`81c0f9f0`) mixed-version regression: build the old commit in a
+  scratch worktree, SIGKILL the new publisher after append/before receipt, and
+  let the old store compact until the original event leaves the live tail while
+  its intent remains. Retry must return the exact original event with one
+  archived publication. Run `nice -n 19 node scripts/verify-mixed-version-dedupe.mjs`
+  after building this head.
+- Direct archive recovery: one exact sidecar plus one positioned event-line read,
+  zero archive directory enumeration/history scans. Missing/corrupt/unreadable
+  sidecar or missing/short segment preserves the intent and returns a retryable
+  `MeshDedupeRecoveryError`; a durable negative reservation permits publication.
 - Consumer replay: a different event id with the same dedupe key does not
   re-deliver after recipient reload, including a new maintenance sender; unrelated
   publication keys remain deliverable.

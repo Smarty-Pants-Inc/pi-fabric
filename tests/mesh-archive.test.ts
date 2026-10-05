@@ -40,6 +40,40 @@ afterEach(() => {
 });
 
 describe("mesh event archive", () => {
+  it("installs a durable direct sequence address before a live append and returns only its exact line", async () => {
+    const { store, root, dir } = setup();
+    const append = fs.appendFileSync.bind(fs);
+    const spy = vi.spyOn(fs, "appendFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (target === path.join(root, "events.jsonl")) {
+        const event = JSON.parse(String(args[0]));
+        expect(new MeshArchive(dir, root).lookup(event.sequence)).toEqual(event);
+      }
+      return (append as (...args: unknown[]) => void)(target, ...args);
+    }) as typeof fs.appendFileSync);
+    const first = await store.publish({ topic: "indexed.first", from, text: "one", dedupeKey: "indexed" });
+    spy.mockRestore();
+    await store.publish({ topic: "indexed.second", from, text: "two" });
+    const directories = vi.spyOn(fs, "readdirSync");
+    const reads = vi.spyOn(fs, "readSync");
+    expect(new MeshArchive(dir, root).lookup(first.sequence)).toEqual(first);
+    expect(directories).not.toHaveBeenCalled();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(reads.mock.results[0]!.value).toBe(Buffer.byteLength(JSON.stringify(first) + "\n"));
+  });
+
+  it("keeps an explicit negative index after rollback and treats a missing index as unavailable", async () => {
+    const { root, dir } = setup();
+    const archive = new MeshArchive(dir, root);
+    archive.reserveLookup(1);
+    expect(archive.lookup(1)).toBeUndefined();
+    const event: MeshEvent = { id: "indexed-pending", sequence: 1, topic: "indexed.pending", kind: "message", from, createdAt: Date.now() };
+    const pending = archive.begin({ event, line: JSON.stringify(event) });
+    expect(archive.lookup(1)).toEqual(event);
+    archive.rollback(pending);
+    expect(archive.lookup(1)).toBeUndefined();
+    expect(() => archive.lookup(2)).toThrow("sequence index is unavailable");
+  });
+
   it("writes each event to its topic's file for its UTC day, with the live log's bytes", async () => {
     const { store, file, lines, live, dir } = setup();
     vi.useFakeTimers({ now: Date.parse("2026-09-27T23:59:59.500Z"), toFake: ["Date"] });

@@ -8,7 +8,7 @@ import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
-import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
+import { MeshArchive, MeshArchiveLookupUnavailableError, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -534,6 +534,16 @@ interface MeshDedupeIntent {
   eventId: string;
   /** Byte offset captured before the live append; it makes recovery a direct read. */
   liveOffset: number;
+  /** Captured before append: removing/changing archive configuration cannot authorize retry. */
+  archiveDir?: string;
+}
+
+export class MeshDedupeRecoveryError extends Error {
+  readonly retryable = true;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MeshDedupeRecoveryError";
+  }
 }
 
 export class MeshStore {
@@ -658,7 +668,7 @@ export class MeshStore {
     syncPathNamespace(path.dirname(file));
   }
 
-  /** Read the exact line named by an intent; never scans history or consults the archive. */
+  /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
   #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
     let descriptor: number | undefined;
     try {
@@ -680,7 +690,7 @@ export class MeshStore {
     }
   }
 
-  #settleDedupeIntent(file: string, dedupeKey?: string): MeshEvent | undefined {
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -690,14 +700,39 @@ export class MeshStore {
         !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
         typeof intent.eventId !== "string" || !intent.eventId ||
         !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 ||
+        (intent.archiveDir !== undefined && (typeof intent.archiveDir !== "string" || !path.isAbsolute(intent.archiveDir))) ||
         file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
       throw new Error("Invalid event publication intent");
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
     const prior = this.#readDedupeReceipt(intent.dedupeKey);
-    const event = prior ?? this.#readEventAtIntent(intent);
+    const live = prior ? undefined : this.#readEventAtIntent(intent);
+    let event = prior ?? live;
+    if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
+    }
+    if (!event && !prior && archive) {
+      let archived: MeshEvent | undefined;
+      try { archived = archive.lookup(intent.reservedSequence); }
+      catch (error) {
+        if (error instanceof MeshArchiveLookupUnavailableError) {
+          throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive lookup is unavailable`, { cause: error });
+        }
+        throw error;
+      }
+      if (archived && (archived.id !== intent.eventId || archived.dedupeKey !== intent.dedupeKey)) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive identity does not match`);
+      }
+      if (archived) {
+        const pending = archive.pending();
+        // Receipt recovery is direct metadata work. Leave closed-day sealing to the next
+        // ordinary archive append, never scan history just to resolve this intent.
+        if (pending?.id === archived.id && pending.sequence === archived.sequence) archive.commit(pending, false);
+        event = archived;
+      }
+    }
     if (event && !prior) {
-      this.#confirmEventFile(this.#eventsPath);
+      if (live) this.#confirmEventFile(this.#eventsPath);
       writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
     }
     this.#removeDedupeIntent(file);
@@ -705,13 +740,13 @@ export class MeshStore {
   }
 
   /** Under the mesh lock, settle all intents before a rewrite can invalidate byte offsets. */
-  #settleDedupeIntents(): void {
+  #settleDedupeIntents(archive?: MeshArchive): void {
     const directory = path.join(this.root, "event-receipts");
     let names: string[];
     try { names = fs.readdirSync(directory); }
     catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
     for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
-      this.#settleDedupeIntent(path.join(directory, name));
+      this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
     }
   }
 
@@ -747,14 +782,20 @@ export class MeshStore {
           return prior;
         }
       }
-      this.#repairEventLog();
-      const archive = MeshArchive.fromRoot(this.root);
-      if (archive) this.#recoverArchive(archive);
+      let archive: MeshArchive | undefined;
+      try { archive = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        throw error;
+      }
+      // Settle before ordinary archive recovery can roll back a pending archive line.
       // Neither receipt nor intent means NEW: no event-history read, regardless of its size.
       if (input.dedupeKey) {
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey);
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
         if (prior) return prior;
       }
+      this.#repairEventLog();
+      if (archive) this.#recoverArchive(archive);
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
@@ -791,9 +832,13 @@ export class MeshStore {
       try { liveOffset = fs.statSync(this.#eventsPath).size; }
       catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
       if (intentPath) {
+        // A durable negative lookup exists before the intent. Only begin() can replace it
+        // with the synced archive line address, before any live append.
+        archive?.reserveLookup(sequence);
         // This is the crash fence: the intent is durable before the live append begins.
         writeFileAtomic(intentPath, JSON.stringify({
           dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+          ...(archive ? { archiveDir: archive.dir } : {}),
         } satisfies MeshDedupeIntent), { durable: true });
       }
       const pending = archive?.begin({ event, line });
@@ -804,6 +849,8 @@ export class MeshStore {
         throw error;
       }
       if (pending) archive!.commit(pending);
+      // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
+      if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
       if (receiptPath) {
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
@@ -1945,7 +1992,7 @@ export class MeshStore {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
-      this.#settleDedupeIntents();
+      this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,

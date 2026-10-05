@@ -22,6 +22,7 @@ import type { MeshEvent } from "./store.js";
  * this under its publish lock; nothing here locks.
  */
 export const MESH_ARCHIVE_CONFIG = "event-archive.json";
+const MESH_ARCHIVE_SEQUENCE_INDEX = "sequence-index";
 
 export interface MeshArchiveEntry {
   event: MeshEvent;
@@ -33,6 +34,16 @@ export interface MeshArchivePending {
   id: string;
   file: string;
   size: number;
+  /** New writers index the append before it can go live. Old writers ignore this field. */
+  indexed?: true;
+}
+
+interface MeshArchiveIndexEntry {
+  sequence: number;
+  id: string;
+  file: string;
+  offset: number;
+  length: number;
 }
 
 interface ArchiveHead {
@@ -57,6 +68,14 @@ interface SealFile {
 
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : undefined;
+
+export class MeshArchiveLookupUnavailableError extends Error {
+  readonly retryable = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "MeshArchiveLookupUnavailableError";
+  }
+}
 
 const pad = (value: number): string => String(value).padStart(2, "0");
 
@@ -200,14 +219,22 @@ export class MeshArchive {
     let pending: MeshArchivePending | undefined;
     try {
       this.#repairAndReadLast(descriptor, absolute);
-      pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: fs.fstatSync(descriptor).size };
+      pending = {
+        sequence: entry.event.sequence,
+        id: entry.event.id,
+        file: relative,
+        size: fs.fstatSync(descriptor).size,
+        indexed: true,
+      };
       const fresh = pending.size === 0;
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
-      writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
+      const bytes = Buffer.from(`${entry.line}\n`, "utf8");
+      writeAll(descriptor, bytes);
       fs.fdatasyncSync(descriptor);
+      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length });
       if (fresh) this.#syncDays(relative);
     } catch (error) {
-      fs.closeSync(descriptor);
+      if (descriptor !== undefined) fs.closeSync(descriptor);
       descriptor = undefined;
       if (pending) this.#cutBack(pending);
       throw error;
@@ -218,12 +245,12 @@ export class MeshArchive {
   }
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
-  commit(pending: MeshArchivePending): void {
+  commit(pending: MeshArchivePending, sealClosedDays = true): void {
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
-    this.#sealClosedDays(pending.file);
+    if (sealClosedDays) this.#sealClosedDays(pending.file);
   }
 
   /** The event never went live: cut it back out of its file. */
@@ -317,10 +344,22 @@ export class MeshArchive {
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
+        const bytes = Buffer.from(`${line}\n`, "utf8");
         if (previous && (previous.sequence > event.sequence || (previous.sequence === event.sequence && previous.id === event.id))) {
+          // Recovery may have rolled an indexed pending line back out before catch-up.
+          // The exact last line can repair its sidecar without scanning this file.
+          if (event.dedupeKey && previous.sequence === event.sequence && previous.id === event.id) {
+            fs.fdatasyncSync(file.descriptor);
+            this.#writeIndex(event.sequence, { sequence: event.sequence, id: event.id, file: relative, offset: fs.fstatSync(file.descriptor).size - bytes.length, length: bytes.length });
+          }
           continue;
         }
-        writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
+        const offset = fs.fstatSync(file.descriptor).size;
+        writeAll(file.descriptor, bytes);
+        if (event.dedupeKey) {
+          fs.fdatasyncSync(file.descriptor);
+          this.#writeIndex(event.sequence, { sequence: event.sequence, id: event.id, file: relative, offset, length: bytes.length });
+        }
         file.last = { sequence: event.sequence, id: event.id };
       }
       for (const { descriptor } of open.values()) fs.fdatasyncSync(descriptor);
@@ -335,6 +374,50 @@ export class MeshArchive {
     if (last) {
       this.#writeHead(last);
       this.#sealClosedDays(last.file);
+    }
+  }
+
+  /**
+   * Directly resolves one exact reserved sequence through the sidecar index. This deliberately
+   * reads only the indexed archive line; it never scans archive topic files. A missing index is
+   * an unavailable proof, not evidence that the event was not committed.
+   */
+  lookup(sequence: number): MeshEvent | undefined {
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new MeshArchiveLookupUnavailableError("Invalid mesh archive sequence lookup");
+    const indexPath = this.#indexPath(sequence);
+    let indexed: MeshArchiveIndexEntry | { sequence: number; absent: true };
+    try {
+      this.#requireRoot();
+      if (fs.statSync(indexPath).size > 4096) throw new Error("Oversized archive sequence index");
+      indexed = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+      if (typeof indexed !== "object" || indexed === null || Array.isArray(indexed)) throw new Error("Invalid archive sequence index");
+    } catch {
+      throw new MeshArchiveLookupUnavailableError(`Mesh archive sequence index is unavailable: ${indexPath}`);
+    }
+    if (indexed.sequence !== sequence) throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
+    // Missing/corrupt sidecars are UNKNOWN. Only this durable negative reservation proves lack.
+    if ("absent" in indexed && indexed.absent === true) return undefined;
+    if (!("file" in indexed) || typeof indexed.id !== "string" || typeof indexed.file !== "string" ||
+        !/^\d{4}\/\d{2}\/\d{2}\/[^/\\]+\.jsonl$/.test(indexed.file) ||
+        !Number.isSafeInteger(indexed.offset) || indexed.offset < 0 ||
+        !Number.isSafeInteger(indexed.length) || indexed.length < 1 || indexed.length > 64 * 1024 * 1024) {
+      throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
+    }
+    let descriptor: number | undefined;
+    try {
+      const file = path.join(this.dir, indexed.file);
+      descriptor = fs.openSync(file, "r");
+      const bytes = Buffer.allocUnsafe(indexed.length);
+      const count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+      if (count !== bytes.length || bytes[bytes.length - 1] !== 0x0a) throw new Error("short archive line");
+      const event = parseEvent(bytes.subarray(0, bytes.length - 1).toString("utf8"));
+      if (!event || event.sequence !== sequence || event.id !== indexed.id) throw new Error("archive index mismatch");
+      return event;
+    } catch (error) {
+      if (error instanceof MeshArchiveLookupUnavailableError) throw error;
+      throw new MeshArchiveLookupUnavailableError(`Mesh archive sequence ${sequence} is unavailable`);
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
     }
   }
 
@@ -418,10 +501,25 @@ export class MeshArchive {
   #cutBack(pending: MeshArchivePending): void {
     try {
       truncateTo(path.join(this.dir, pending.file), pending.size);
+      if (pending.indexed) this.reserveLookup(pending.sequence);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     }
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+  }
+
+  /** Install a durable proof of non-append before creating a publication intent. */
+  reserveLookup(sequence: number): void {
+    this.#requireRoot();
+    this.#writeIndex(sequence, { sequence, absent: true });
+  }
+
+  #indexPath(sequence: number): string {
+    return path.join(this.dir, MESH_ARCHIVE_SEQUENCE_INDEX, String(Math.floor(sequence / 1024)), `${sequence}.json`);
+  }
+
+  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }): void {
+    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable: true });
   }
 
   #readJson<T>(relative: string): T | undefined {

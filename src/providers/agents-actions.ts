@@ -544,7 +544,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string" }, message: { type: "string" }, data: {} },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {},
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },
@@ -556,7 +557,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Queue a follow-up for Main, a task or an actor. Local Pi tasks have a 10 minute delivery deadline (override with deadlineMs), one sender alarm if late, and remain queued until a boundary or cancelFollowUp. Explicit deadlines require a local Pi task.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string" }, message: { type: "string" }, data: {}, deadlineMs: { type: "integer", minimum: 1 } },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {}, deadlineMs: { type: "integer", minimum: 1 },
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },

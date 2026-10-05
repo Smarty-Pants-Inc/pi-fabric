@@ -900,7 +900,13 @@ type FabricMessageTarget =
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
 /** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
-type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
+type FabricMessageArgs = FabricMessageTarget & {
+  message: string;
+  /** See FabricMessageData. */ data?: unknown;
+  /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
+  idempotencyKey?: string;
+};
+type FabricMessageSteerArgs = FabricMessageArgs;
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -1015,7 +1021,7 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
-  steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
   cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;

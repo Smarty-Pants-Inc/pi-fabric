@@ -202,6 +202,52 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
       code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true, keys: ["code", "message", "name", "retryable"] });
   });
 
+  it("carries bounded STALE metadata and the original key through a public same-key guest retry", async () => {
+    const calls: unknown[] = [];
+    const result = await new QuickJsRuntime().execute(
+      `let stale;
+       try { await agents.followUp({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }); }
+       catch (error) { stale = { name: error.name, code: error.code, retryable: error.retryable, idempotencyKey: error.idempotencyKey,
+         keys: Object.keys(error).sort() }; }
+       const retry = await agents.followUp({ id: "session:test", message: "unchanged", idempotencyKey: stale.idempotencyKey });
+       return { stale, retry };`,
+      async (_ref, args) => {
+        calls.push(args);
+        if (calls.length === 1) throw Object.assign(new Error("lease late; retry"), {
+          name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: "original-key",
+          targetId: "session:test", lapsedMs: 2000, secret: "never bridge", cause: { secret: "never bridge" },
+        });
+        return { queued: true, messageId: "one-delivery" };
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ stale: { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true,
+      idempotencyKey: "original-key", keys: ["code", "idempotencyKey", "message", "name", "retryable"] }, retry: { queued: true, messageId: "one-delivery" } });
+    expect(calls).toEqual(Array(2).fill({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }));
+  });
+
+  it("never bridges invalid, oversized, inherited, unrelated or getter retry keys", async () => {
+    const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
+    const make = (key: unknown) => Object.assign(new Error("stale"), {
+      name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: key,
+    });
+    const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x".repeat(200)), make("getter"), make("inherited"), make("unrelated")];
+    Object.defineProperty(errors[5], "idempotencyKey", { get: getter });
+    delete (errors[6] as { idempotencyKey?: unknown }).idempotencyKey;
+    Object.setPrototypeOf(errors[6], Object.assign(Object.create(Error.prototype), { idempotencyKey: "inherited" }));
+    Object.assign(errors[7]!, { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE" });
+    let index = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = []; for (let i = 0; i < 8; i++) {
+        try { await agents.steer({ id: "peer", message: "unchanged" }); }
+        catch (error) { failures.push(error.idempotencyKey ?? null); }
+      } return failures;`, async () => { throw errors[index++]; }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual([null, null, null, null, "x".repeat(200), null, null, null]);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it("preserves host Error names but does not export unvetted codes or accessors as Fabric metadata", async () => {
     const result = await new QuickJsRuntime().execute(
       `try { await agents.followUp({ id: "session:test", message: "hello" }); }

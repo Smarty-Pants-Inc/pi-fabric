@@ -91,6 +91,12 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 7_000): Promise<voi
   }
 };
 
+const actorRecordWithHistory = (actorRoot: string, id: string) => {
+  const store = new ActorRegistryStore(actorRoot);
+  const record = store.records().find(record => record.id === id);
+  return record ? { ...record, messages: store.messages(record) as FabricActorMessage[] } : undefined;
+};
+
 const mainTarget = (
   identity: MeshIdentity,
   deliveries: FabricMainAgentDeliveryRequest[],
@@ -416,7 +422,7 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
       expect.soft(fs.existsSync(responsePath)).toBe(false);
       expect.soft(subscriptions(), "lifecycle delivery must not advance before readiness").toEqual(beforeSubscriptions);
       expect.soft(cursorPaths.map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined), "actor mesh cursor must not advance before readiness").toEqual(cursors);
-      const messages = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)?.messages as FabricActorMessage[];
+      const messages = actorRecordWithHistory(state.config.actorRoot, actor.id)?.messages as FabricActorMessage[];
       const inputText = (message: FabricActorMessage): string | undefined =>
         message.text ?? (message.data as { message?: string } | undefined)?.message;
       expect.soft(messages.some(message => inputText(message)?.includes("control backlog") || inputText(message)?.includes("mesh backlog")), "control/actor delivery must remain unconsumed").toBe(false);
@@ -433,10 +439,10 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
       expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true, requestId });
       expect(fs.existsSync(requestPath)).toBe(false);
       await waitFor(() => {
-        const record = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id);
+        const record = actorRecordWithHistory(state.config.actorRoot, actor.id);
         return (record?.messages as FabricActorMessage[] | undefined)?.some(message => message.direction === "out") === true;
       }, 10_000);
-      const records = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      const records = actorRecordWithHistory(state.config.actorRoot, actor.id)!;
       expect((records.messages as FabricActorMessage[]).filter(message => message.direction === "in" && inputText(message) === "accepted but never launched")).toHaveLength(1);
       console.log(JSON.stringify({ proof: "S4", mode, startupBudgetMs: 5_000, stoppedMs: stoppedAt - began,
         nativeHostPid: attempted.pid, preReadinessWorkers: 0, escapedHelperBorn: false, acceptedAttempts: 0,
@@ -1754,7 +1760,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       }
       expect(idleSingle.lastRunId).not.toBe(baseline.lastRunId);
       expect(idleSingle.lastRunId).not.toBe(running.actorRun!.id);
-      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      const persisted = actorRecordWithHistory(state.config.actorRoot, actor.id)!;
       expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out").map(message => message.text)).toEqual([
         "fake worker complete", "live attempt 1 complete", "fake worker complete", "fake worker complete",
       ]);
@@ -1974,8 +1980,11 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       control, (binding) => binding, client);
     const ownerPath = path.join(state.config.residencyRoot, "owner.json");
     const owner = () => JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
-    const registry = () => JSON.parse(fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8")) as
-      { actors: Array<{ id: string; messages: Array<{ text?: string; data?: { message?: string } }>; queue: unknown[] }> };
+    const registry = () => {
+      const store = new ActorRegistryStore(state.config.actorRoot);
+      return { actors: store.records().map(record => ({ ...record, messages: store.messages(record) })) } as
+        { actors: Array<{ id: string; messages: Array<{ text?: string; data?: { message?: string } }>; queue: unknown[] }> };
+    };
     let senderRestart: Promise<void> | undefined;
     let ownerlessLockCreatedAt: number | undefined;
     try {
@@ -2079,7 +2088,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(worker).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
       await first;
       await waitFor(() => state.deliveries.length === (queued ? 2 : 1) && participant()?.actorRun === undefined);
-      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      const persisted = actorRecordWithHistory(state.config.actorRoot, actor.id)!;
       expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
       await delay(200);
       expect(state.deliveries).toHaveLength(queued ? 2 : 1);
@@ -2153,10 +2162,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await client.ensureActor(actor.id);
 
     const messageCount = (): number => {
-      const registry = JSON.parse(
-        fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8"),
-      ) as { actors: Array<{ id: string; messages?: unknown[] }> };
-      return registry.actors.find((candidate) => candidate.id === actor.id)?.messages?.length ?? 0;
+      const record = new ActorRegistryStore(state.config.actorRoot).records().find(row => row.id === actor.id);
+      const history = record?.messageHistory as { count?: number } | undefined;
+      return history?.count ?? (Array.isArray(record?.messages) ? record.messages.length : 0);
     };
     const originalControl = new FabricControlPlane(state.mesh, state.identity, {
       enabled: true,

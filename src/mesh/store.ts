@@ -1,4 +1,5 @@
 import { createCommitStats } from "./commit-stats.js";
+import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -66,10 +67,12 @@ interface MeshStateFile {
    * committed payload's identity from a bounded header. Older readers ignore unknown fields.
    */
   readGeneration?: string;
+  /** Hash-chain head for optional incremental readers, committed with the canonical payload. */
+  readJournalHash?: string;
 }
 
 export interface MeshReadOptions {
-  /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
+  /** Revalidate canonical commit/physical identity now, bypassing the idle age window. */
   fresh?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
@@ -94,6 +97,8 @@ export interface MeshStoreOptions {
   readCacheMs?: number;
   /** A live turn/pending operation bypasses the idle reuse window on demand. */
   readActive?: () => boolean;
+  /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
+  writeReadJournal?: boolean;
 }
 
 // Capture the opt-in once at process startup/module load: no timer, key classification,
@@ -298,10 +303,11 @@ const readState = (
 // observe the committed generation (the stat stamp alone can repeat, ABA). The signal is only a
 // hint: its `generation` (first field) must equal the canonical header, so a failed, crashed or
 // capped signal publication can never hide a commit; it only forces the canonical parse.
-// Fresh authoritative payload reads always parse the canonical file: legacy writers can copy an existing marker
-// unchanged, and repeated metadata plus that marker cannot prove the payload unchanged.
-// Nonfresh expired reads re-parse markerless files; copied-marker, same-stat rewrites remain
-// outside the nonfresh cache's change detection (smarty-dev#2355).
+// Fresh observations bypass the idle window, but not the physical-generation gate. High-resolution
+// inode/mtime/ctime metadata detects cooperating atomic and in-place replacements, including old
+// writers copying a UUID. If an adapter cannot supply that identity, fresh reads retain the canonical
+// payload fallback (#2355). Journal replay additionally binds both physical endpoints and every
+// delta through the chain head committed IN state.json; a self-checksummed sidecar is not authority.
 const MAX_SIGNAL_BYTES = 128 * 1024;
 const HEADER_BYTES = 64;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -405,7 +411,18 @@ const statStamp = (filePath: string): string | undefined => {
  * runtime MeshStore stays tolerant; readers that must not report false absence call this first.
  */
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
-  readState(path.join(root, "state.json"), maxBytes, false);
+  const file = path.resolve(root, "state.json");
+  const identity = stateReadIdentity(file);
+  const shared = processReadSnapshots.get(file)?.deref();
+  if (identity !== undefined && shared?.identity === identity && shared.canonicalReadable && shared.size <= maxBytes) return;
+  let readable = false;
+  const state = readState(file, maxBytes, false, () => { readable = true; });
+  if (identity !== undefined && stateReadIdentity(file) === identity) {
+    const stat = fs.statSync(file);
+    rememberReadSnapshot(file, { device: stat.dev, inode: stat.ino, size: stat.size, modifiedAt: stat.mtimeMs,
+      stamp: stampOf(stat), parsedAt: Date.now(), state, generation: generationOf(state), identity,
+      canonicalReadable: readable });
+  }
 };
 
 const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
@@ -546,6 +563,23 @@ export class MeshDedupeRecoveryError extends Error {
   }
 }
 
+interface ParsedStateSnapshot {
+  device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
+  generation: string | undefined;
+  identity: string | undefined;
+  canonicalReadable: boolean;
+  journalCursor?: JournalCursor;
+}
+// Reader snapshots only: mutable write transactions never share their state. Weak references
+// avoid retaining abandoned roots; a small key cap bounds stale root names too.
+const processReadSnapshots = new Map<string, WeakRef<ParsedStateSnapshot>>();
+const rememberReadSnapshot = (file: string, snapshot: ParsedStateSnapshot): void => {
+  if (processReadSnapshots.size >= 64 && !processReadSnapshots.has(file)) {
+    processReadSnapshots.delete(processReadSnapshots.keys().next().value!);
+  }
+  processReadSnapshots.set(file, new WeakRef(snapshot));
+};
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -560,6 +594,7 @@ export class MeshStore {
   #writeEncodings: { serialized: string; entries: Map<string, EncodedStateEntry> } | undefined;
   /** The last full signal index parsed, keyed by its unique generation: one object, bounded. */
   #signalIndex: { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined;
+  #signalIdentity: string | undefined;
   readonly #maxEventLogBytes: number;
   readonly #retainedEventLogBytes: number;
   readonly #maxStateBytes: number;
@@ -568,6 +603,8 @@ export class MeshStore {
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
   readonly #readActive: (() => boolean) | undefined;
+  readonly #writeReadJournal: boolean;
+  #requireCanonicalRead = false;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
@@ -575,13 +612,9 @@ export class MeshStore {
    * past each other, and all but the first scanned the whole log again (smarty-dev#557).
    */
   #readHints: { generation: number; inode: number; lines: Array<{ sequence: number; offset: number }> } | undefined;
-  #stateCache:
-    | {
-      device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
-      /** The payload's own canonical readGeneration; undefined for a legacy (no-marker) payload. */
-      generation: string | undefined;
-    }
-    | undefined;
+  #stateCache: ParsedStateSnapshot | undefined;
+  #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
+  #journalBase: JournalBase | undefined;
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
 
   constructor(
@@ -623,6 +656,7 @@ export class MeshStore {
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
     this.#readActive = options.readActive;
+    this.#writeReadJournal = options.writeReadJournal !== false;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -1320,8 +1354,8 @@ export class MeshStore {
     return true;
   }
 
-  // fresh: read and parse the canonical file, bypassing all snapshot reuse, for a read that
-  // decides a protocol step rather than a listing.
+  // Fresh protocol observations bypass idle coalescing, not the physical commit gate.
+  // Actual writes still read authoritative bytes under the lock and apply verified CAS.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
     const state = options.fresh === true || options.snapshot === undefined
@@ -1364,7 +1398,7 @@ export class MeshStore {
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     const fresh = options.fresh === true;
-    const state = options.snapshot !== undefined
+    const state = options.snapshot !== undefined && !fresh
       ? options.snapshot as MeshStateFile
       : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
     const memo = this.#memoOf(state);
@@ -1414,6 +1448,8 @@ export class MeshStore {
   // The current signal's index: its bounded header every call, the full body only when the
   // generation differs from the memoized one (once per commit, across all namespaces).
   #readSignalIndex(): { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined {
+    const identity = stateReadIdentity(this.#signalPath);
+    if (identity !== undefined && this.#signalIdentity === identity && this.#signalIndex) return this.#signalIndex;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#signalPath, "r");
@@ -1430,6 +1466,7 @@ export class MeshStore {
         signal?.generation !== generation || typeof signal.stamp !== "string" ||
         typeof namespaces !== "object" || namespaces === null || Array.isArray(namespaces)
       ) return undefined;
+      if (identity !== undefined && stateReadIdentity(this.#signalPath) === identity) this.#signalIdentity = identity;
       return this.#signalIndex = { generation, stamp: signal.stamp, namespaces: namespaces as Record<string, unknown> };
     } catch {
       return undefined;
@@ -1438,13 +1475,21 @@ export class MeshStore {
     }
   }
 
-  // The canonical state.json's commit generation from its 64-byte header: open, read, close.
+  // Canonical commit UUID and optional journal hash: one bounded header per physical generation.
   // undefined: a legacy file without a marker; false: unreadable, which never matches a label.
   #canonicalGeneration(): string | undefined | false {
+    const identity = stateReadIdentity(this.#statePath);
+    if (identity !== undefined && this.#canonicalHeader?.identity === identity) return this.#canonicalHeader.generation;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#statePath, "r");
-      return readHeader(descriptor, STATE_HEADER);
+      const buffer = Buffer.alloc(192);
+      const read = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+      const header = buffer.toString("latin1", 0, read);
+      const generation = STATE_HEADER.exec(header)?.[1];
+      const journalHash = /^\{"readGeneration":"[0-9a-f-]{36}","readJournalHash":"([0-9a-f]{64})"/.exec(header)?.[1];
+      if (identity !== undefined && stateReadIdentity(this.#statePath) === identity) this.#canonicalHeader = { identity, generation, journalHash };
+      return generation;
     } catch {
       return false;
     } finally {
@@ -1472,6 +1517,7 @@ export class MeshStore {
       // can change an entry without advancing any of those labels. Always read and parse fresh.
       if (serialized === this.#writeEncodings?.serialized) reuse = this.#writeEncodings.entries;
     });
+    this.#journalBase = journalBase(state, this.#statePath);
     return { state, reuse };
   }
 
@@ -1486,8 +1532,12 @@ export class MeshStore {
   #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
     const payload: MeshStateFile = { ...state };
     delete payload.readGeneration;
+    delete payload.readJournalHash;
     const generation = randomUUID();
-    const stamped: MeshStateFile = { readGeneration: generation, ...payload };
+    const unstamped: MeshStateFile = { readGeneration: generation, ...payload };
+    const journal = this.#writeReadJournal ? prepareStateJournal(unstamped, this.#journalBase, keys) : undefined;
+    const stamped: MeshStateFile = journal
+      ? { readGeneration: generation, readJournalHash: journal.hash, ...payload } : unstamped;
     const encoded = encodeState(stamped, reuse);
     if (encoded.serialized.byteLength > this.#maxStateBytes) {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
@@ -1495,7 +1545,10 @@ export class MeshStore {
     writeFileAtomic(this.#statePath, encoded.serialized);
     commitStats?.record(encoded.serialized.byteLength, keys);
     const stamp = statStamp(this.#statePath);
-    if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
+    if (stamp !== undefined) {
+      if (this.#writeReadJournal) appendStateJournal(this.root, journal, stamp);
+      this.#writeSignal(encoded.entries, stamp, generation);
+    }
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
     this.#writeEncodings = { serialized: encoded.serialized.toString("utf8"), entries: encoded.entries };
     const trace = process.env.PI_FABRIC_COMMIT_TRACE;
@@ -1582,12 +1635,15 @@ export class MeshStore {
 
   /**
    * Takes and releases the mesh lock without writing the state: evidence that the shared state is
-   * writable now, for a heartbeat that renewed only its file lease. Discards this store's cached
-   * snapshot so the next state read must read the canonical file, even if metadata is unchanged.
+   * writable now, for a heartbeat that renewed only its file lease. Revalidates on the next
+   * read without discarding an unchanged parsed snapshot. Explicit confirmation starts one
+   * new fixed idle window; ordinary cache hits never slide that deadline.
    */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
     await this.#withLock(() => {
-      this.#stateCache = undefined;
+      // Invalidate observation age, not the payload. Metadata + generation still guard reuse.
+      this.#requireCanonicalRead = true;
+      if (this.#stateCache) this.#stateCache = { ...this.#stateCache, parsedAt: 0 };
       onAcquired?.(Date.now());
     });
   }
@@ -1769,6 +1825,8 @@ export class MeshStore {
   }
 
   #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
+    const confirmed = this.#requireCanonicalRead;
+    if (confirmed) { fresh = true; canonical = true; this.#requireCanonicalRead = false; }
     const recent = this.#stateCache;
     const readCacheMs = this.readCacheMs;
     if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
@@ -1776,15 +1834,42 @@ export class MeshStore {
     }
     let before: string;
     try {
-      before = stampOf(fs.statSync(this.#statePath));
-      // Metadata alone can repeat (ABA): a same-stamp cache is reused only while the canonical
-      // header still names the payload's own generation (a 64-byte peek, not a parse). A payload
-      // without a marker (legacy) is UNKNOWN: expired nonfresh reads always re-parse it.
-      // Only the UI observer (fresh, !canonical) may reuse matching metadata + missing header.
+      const observed = fs.statSync(this.#statePath);
+      if (observed.size > this.#maxStateBytes) throw new Error(`Failed to read Fabric mesh state: state exceeds ${this.#maxStateBytes} bytes`);
+      before = stampOf(observed);
+      const identity = stateReadIdentity(this.#statePath);
+      const generation = this.#canonicalGeneration();
       const cached = this.#stateCache;
-      if (
-        !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) && cached.generation === this.#canonicalGeneration()
-      ) return cached.state;
+      // Nanosecond ctime/inode also detect an older writer that copies the UUID or writes
+      // in place. Without that identity retain the historical conservative fresh fallback.
+      const matches = (snapshot: ParsedStateSnapshot | undefined): boolean =>
+        !!snapshot && snapshot.size <= this.#maxStateBytes && snapshot.stamp === before &&
+        identity !== undefined && snapshot.identity === identity &&
+        (generation === undefined || snapshot.generation === generation); // Legacy markers need not occupy the header.
+      if (cached && matches(cached)) {
+        if (confirmed) this.#stateCache = { ...cached, parsedAt: Date.now() };
+        return cached.state;
+      }
+      if (!canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) &&
+        cached.generation === generation) return cached.state;
+      const shared = processReadSnapshots.get(path.resolve(this.#statePath))?.deref();
+      if (shared && matches(shared)) {
+        this.#stateCache = confirmed ? { ...shared, parsedAt: Date.now() } : shared;
+        return shared.state;
+      }
+      // A newly constructed store can replay from this process's prior snapshot too;
+      // it need not parse the whole file merely because another store observed it first.
+      const base = cached ?? shared;
+      if (base && identity !== undefined && typeof generation === "string") {
+        const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
+          this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor);
+        if (replay && stateReadIdentity(this.#statePath) === identity && this.#canonicalGeneration() === generation &&
+          this.#cacheState(replay.state, before)) {
+          this.#stateCache!.journalCursor = replay.cursor;
+          rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
+          return replay.state;
+        }
+      }
     } catch (error) {
       this.#stateCache = undefined;
       if (errorCode(error) === "ENOENT") return emptyState();
@@ -1795,8 +1880,12 @@ export class MeshStore {
     // The label is the parsed payload's own canonical readGeneration, never a separately observed
     // marker, so an older payload can never carry a newer commit's generation.
     for (let attempt = 0; ; attempt++) {
-      const state = readState(this.#statePath, this.#maxStateBytes);
-      if (this.#cacheState(state, before)) return state;
+      let readable = false;
+      const state = readState(this.#statePath, this.#maxStateBytes, true, () => { readable = true; });
+      if (this.#cacheState(state, before, readable)) {
+        rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
+        return state;
+      }
       const next = statStamp(this.#statePath);
       if (attempt >= 2 || next === undefined) {
         this.#stateCache = undefined;                   // served once, never cached or stamped
@@ -1808,7 +1897,7 @@ export class MeshStore {
 
   // Under the lock (writes) no expected stamp is needed; lock-free reads pass the pre-read stamp.
   // The entry is labelled with the payload's own canonical generation.
-  #cacheState(state: MeshStateFile, expectedStamp: string | undefined): boolean {
+  #cacheState(state: MeshStateFile, expectedStamp: string | undefined, canonicalReadable = true): boolean {
     try {
       const stat = fs.statSync(this.#statePath);
       if (expectedStamp !== undefined && stampOf(stat) !== expectedStamp) return false;
@@ -1821,6 +1910,8 @@ export class MeshStore {
         parsedAt: Date.now(),
         state,
         generation: generationOf(state),
+        identity: stateReadIdentity(this.#statePath),
+        canonicalReadable,
       };
       return true;
     } catch {

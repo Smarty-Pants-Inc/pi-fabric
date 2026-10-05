@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assertMainProofCaller, assertWorkHostRoutes, linkProofModels } from "../scripts/lib/native-placement-proof.mjs";
 
@@ -118,7 +119,7 @@ export async function createAgentSession() {
     const map = path.join(directory, "work-hosts.json");
     fs.writeFileSync(map, JSON.stringify(aliases));
     const probe = path.resolve("scripts/probe-native-process-placement.mjs");
-    const result = spawnSync(process.execPath, ["--import", preload, probe, sdk, output, process.execPath, "ryzen2", map, "ssh"], {
+    const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, probe, sdk, output, process.execPath, "ryzen2", map, "ssh"], {
       cwd, encoding: "utf8", timeout: 20_000,
       env: { ...process.env, TMPDIR: temp, TMP: temp, TEMP: temp, PI_CODING_AGENT_DIR: hostProfile,
         PROOF_MODELS_FROM_PROFILE: mode === "default" ? "0" : "1", FIXTURE_HOST_PROFILE: hostProfile,

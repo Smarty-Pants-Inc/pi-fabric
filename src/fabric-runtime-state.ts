@@ -433,7 +433,6 @@ export class FabricRuntimeState {
   }
 
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
-    const role = this.#managedHost ? undefined : this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
     this.#suppressResidentGuidanceSync = true;
@@ -567,6 +566,7 @@ export class FabricRuntimeState {
       return;
     }
     const sessionId = context.sessionManager.getSessionId();
+    const role = this.#roleGrant.roleFor(sessionId, context.cwd);
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
     await builtins.install(createProviderComponent({
       provider: "cache",

@@ -10,7 +10,9 @@ import { JOINED_SCRATCH_FILE, NEVER_STARTED_FILE, RUN_TMP_DIRECTORY, UNRESOLVED_
 // metadata costs dominate this path. readFileSync/rmSync can issue multiple
 // native syscalls internally, so these counts are not a native Windows trace.
 describe("actor archive slice fs cost", () => {
-  it.each(["win32", "linux"] as const)("bounds per-run custody work (%s)", async (platform) => {
+  it.each([
+    ["win32", false], ["linux", false], ["win32", true],
+  ] as const)("bounds per-run custody work (%s, JS removal traversal=%s)", async (platform, jsRemovalTraversal) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-cost-"));
     const count = 2_000;
     const old = Date.now() - 10 * 24 * 60 * 60_000;
@@ -24,16 +26,32 @@ describe("actor archive slice fs cost", () => {
       fs.writeFileSync(path.join(run, "task.txt"), "fixture task");
     }
     const calls: Record<string, number> = {};
-    let scratchCalls = 0;
+    let scratchCalls = 0, removalDepth = 0;
     const keys = ["lstatSync", "statSync", "existsSync", "readdirSync", "readFileSync", "rmSync"] as const;
     const platformMock = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     for (const key of keys) {
       const original = fs[key];
       // Overloaded fs signatures cannot be expressed as one implementation.
       vi.spyOn(fs, key).mockImplementation(((...args: unknown[]) => {
-        calls[key] = (calls[key] ?? 0) + 1;
-        if (["tmp", "unresolved-scratch.json"].includes(path.basename(String(args[0])))) scratchCalls++;
-        return Reflect.apply(original, fs, args);
+        // Count the policy's public crossings, not rmSync's implementation.
+        // Older Node versions expose recursive removal's lstat/readdir calls
+        // through fs when win32 is mocked on POSIX; newer versions use native IO.
+        if (removalDepth === 0) {
+          calls[key] = (calls[key] ?? 0) + 1;
+          if (["tmp", "unresolved-scratch.json"].includes(path.basename(String(args[0])))) scratchCalls++;
+        }
+        if (key === "rmSync") removalDepth++;
+        try {
+          if (key === "rmSync" && jsRemovalTraversal) {
+            // Deterministically exercise the five nested crossings seen in CI,
+            // even on a runtime whose actual recursive deletion is native.
+            fs.lstatSync(args[0] as fs.PathLike);
+            for (const name of fs.readdirSync(args[0] as fs.PathLike)) {
+              fs.lstatSync(path.join(String(args[0]), name));
+            }
+          }
+          return Reflect.apply(original, fs, args);
+        } finally { if (key === "rmSync") removalDepth--; }
       }) as never);
     }
     let longest = 0, largestCalls = 0, largestDeletes = 0;
@@ -52,7 +70,7 @@ describe("actor archive slice fs cost", () => {
         await new Promise<void>(resolve => setImmediate(resolve));
       }
       process.stdout.write(`retention-trace-end ${platform}\n`);
-      process.stdout.write(JSON.stringify({ platform, runs: count, calls, perRun: (total() - 2) / count,
+      process.stdout.write(JSON.stringify({ platform, jsRemovalTraversal, runs: count, calls, perRun: (total() - 2) / count,
         scratchCallsPerRun: scratchCalls / count, largestCalls, largestDeletes, longestSliceMs: longest }) + "\n");
       expect(removed).toHaveLength(count);
       expect(largestDeletes).toBe(1);

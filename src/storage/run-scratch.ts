@@ -21,8 +21,11 @@ export const JOINED_SCRATCH_FILE = "scratch-scope-joined.json";
 export const prepareRunRoot = (root: string): string => {
   if (process.platform !== "win32") return posixDataRoot(root, { create: true });
   const missing: string[] = [];
-  // Refuse the final caller spelling before any directory/ACL access or mkdir.
-  let current = windowsRootSpelling(root);
+  // Refuse Windows spellings before any directory/ACL access or mkdir. Keep
+  // POSIX-native orchestration seams on their existing validation/call path;
+  // on native Windows every spelling still gets the early lexical proof.
+  const posixSpelling = path.sep === "/" && root.startsWith("/") && !root.startsWith("//");
+  let current = posixSpelling ? path.resolve(root) : windowsRootSpelling(root);
   for (;;) {
     try { fs.lstatSync(current); break; }
     catch (error) {

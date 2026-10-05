@@ -17,11 +17,20 @@ nanosecond mtime/ctime. One bounded 192-byte header observes the UUID and option
 hash when that physical identity changes. Namespace signal indexes also reuse their
 parsed index while their physical identity is unchanged.
 
-An explicit successful `confirmWritable` requires canonical revalidation on the next read
+`confirmWritable` is a lock-free atomic filesystem probe, not acquisition of the shared
+state mutation lock. It requires canonical revalidation on the next read even on failure
 and starts a new fixed idle window, without throwing away an unchanged payload. Ordinary
-cache hits do not slide the deadline. Participant indexes preserve unchanged entry
-identities; on full-parse fallback they compare entry bytes, rather than allowing unchanged
-version/timestamp labels to conceal a legacy name/ownership edit.
+cache hits do not slide the deadline. An unchanged file-only heartbeat writes no shared state.
+
+Participant expiry and bounded receipt compaction both commit through the canonical writer:
+removal keys join the journal delta before a new first-field `readGeneration` and optional
+`readJournalHash` are atomically published. Generation-gated readers therefore observe the
+compacted snapshot; prior tokens remain immutable. Receipt durability confirmation stays
+outside the lock, with current-entry/namespace checks under the mutation fence.
+
+Participant indexes preserve unchanged entry identities; on full-parse fallback they compare
+entry bytes, rather than allowing unchanged version/timestamp labels to conceal a legacy
+name/ownership edit.
 
 A strict readability check only shares a snapshot known to come from a valid canonical
 envelope. A tolerant dashboard parse of `{}`/damaged bytes cannot certify routing absence.

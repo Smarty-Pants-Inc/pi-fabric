@@ -29,7 +29,6 @@ describe("disposable actor mesh-write lifetime (#5256)", () => {
       store.delete({ key: "keep/value" }),
       store.publish({ topic: "cancel.notice", from: identity }),
       store.writeBatch({ ops: [{ kind: "delete", key: "keep/value" }], identity }),
-      store.confirmWritable(callback),
       store.exclusive(callback),
     ].map(promise => promise.then(() => "unexpected commit", error => error));
     // A real acquisition attempt, not a timing sleep, establishes the blocked path.
@@ -45,6 +44,25 @@ describe("disposable actor mesh-write lifetime (#5256)", () => {
     await expect(store.put({ key: "later/value", value: 1, identity })).rejects.toMatchObject({ name: "AbortError" });
     // Cancellation belongs to this store lifetime, not the shared mesh or another owner.
     await new MeshStore(root, 64 * 1024, 100).put({ key: "other/value", value: 2, identity });
+  });
+
+  it.each([1, 2] as const)("lock-free probes do not wait on protocol %s's holder, but reject a revoked lifetime", async lockProtocol => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-mesh-cancel-")); roots.push(root);
+    const controller = new AbortController();
+    const store = new MeshStore(root, 64 * 1024, 100, { lockProtocol, writeSignal: controller.signal });
+    await store.put({ key: "keep/value", value: "committed", identity });
+    const lock = path.join(root, ".lock"); fs.mkdirSync(lock);
+    const owner = `owned-fixture\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(path.join(lock, "owner"), owner);
+    const callback = vi.fn();
+    await store.confirmWritable(callback);
+    expect(callback).toHaveBeenCalledOnce();
+    controller.abort();
+    await expect(store.confirmWritable(callback)).rejects.toMatchObject({ name: "AbortError" });
+    expect(callback).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+    expect(store.get("keep/value")?.value).toBe("committed");
+    expect(fs.readdirSync(root).some(name => name.startsWith(".writable."))).toBe(false);
   });
 
   it("does not roll back a synchronous operation already admitted under the lock", async () => {

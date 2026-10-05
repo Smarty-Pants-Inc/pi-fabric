@@ -575,17 +575,20 @@ owner record to match and detach the owned directory before recursive release. R
 requires a complete recorded owner and, for same-namespace or legacy owners, proof that
 its PID is absent (native `ESRCH`), or that its native incarnation differs. On Linux an
 owner in a different PID namespace is never probed via local `kill(pid, 0)` or
-`/proc/<pid>`: those could name an unrelated process. Instead it is recoverable strictly
-after **120 seconds** from the later of its recorded acquisition time and owner-file
-mtime, only while the full owner record, directory identity, and mtime remain unchanged.
-A replacement token's publication resets this age even if it copied an old timestamp.
-This source-level bound is below the #5047 watchdog's 180-second kill; there is no
-existing maximum-hold lease. Namespace-aware owners also use the age bound when the
-reader cannot read its own namespace. Timeouts identify such holders as
-`pid N in a foreign pid namespace`, never as the unrelated host PID's process state.
-A foreign holder paused beyond this bound may resume: this is bounded recovery, not
-a kernel fencing guarantee. Keep critical sections below the bound and restart stuck
-sandboxed writers; legacy receipts/binaries cannot provide namespace-aware recovery.
+`/proc/<pid>`: those could name an unrelated process. Such an owner remains protected
+**regardless of age**, also when the reader cannot read its own namespace. A stopped
+holder can resume between any token/heartbeat check and a state or event write, so
+neither receipt age nor a missing heartbeat is a death proof or a write fence. The
+previous 120-second foreign-owner expiry has been removed. Timeouts identify these
+holders as `pid N in a foreign pid namespace`, never as an unrelated local process.
+Recovery of an unknown foreign orphan requires trusted repair with **all** possible
+writers/cleaners stopped and prevented from resuming/respawning; killing just the
+apparent local numeric PID is not safe. Automatic dead/incarnation recovery remains
+available to a reader in the owner's namespace.
+Protocol 2 verifies canonical directory identity and the complete receipt after
+publication, before entering the critical section. Its private receipt can age during
+an arbitrarily delayed initialization: its timestamp is diagnostic only, not a recovery
+clock. Pauses before or after publication therefore cannot expire a live/unknown owner.
 An empty directory with no owner record is stale
 strictly after the 30-second grace (source-level `staleLockMs`). Recovery uses atomic
 empty-directory removal, not rename or recursive deletion: an initializer that publishes

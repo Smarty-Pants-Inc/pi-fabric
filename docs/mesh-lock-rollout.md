@@ -22,7 +22,7 @@ release, and stale reclaim, not just the selector.
 | `6b15d905` | Accepted; native incarnation checked | Rejected: only split lengths 4/5 allowed | Dead owner wedges |
 | `195e5ac9` | Accepted; native incarnation checked | Rejected: only split lengths 4/5 allowed | Dead owner wedges |
 | `147890953` | Accepted; Linux start ticks checked | Extra lines ignored | Same foreign-namespace wrongful-reclaim risk as `dd65af9a` |
-| #505 `5f77644b` | Accepted | Accepted; namespace read before any local PID probe | Same-namespace dead/reused PID recovers; foreign owner uses the 120-second bound |
+| #505 (Astra round-1 repair) | Accepted | Accepted; namespace read before any local PID probe | Same-namespace dead/reused PID recovers; unknown foreign owner never expires, requiring fully fenced repair or recovery from its own namespace |
 
 Four-line receipts carry no namespace, so even readers that accept them cannot prove
 a namespaced PID belongs to their local namespace. Do not infer cross-namespace
@@ -72,3 +72,55 @@ or subjected to the 200-acquisition contention test.
 
 Do not suppress the namespace field or weaken fail-closed receipt validation to make
 mixed-version probes pass. Protocol 1 is not a downgrade to the old Linux receipt.
+
+## Real namespace acceptance: pending repository owner Light
+
+The round-1 repair deliberately protects unknown foreign owners indefinitely. A
+watchdog timeout, missing heartbeat, or stopped holder is not a safe reclamation
+signal. An owner-namespace reader can recover a proven-dead holder; if that namespace
+has disappeared, recovery needs a fully fenced maintenance window. Do not restore
+age expiry to make the operational probe complete.
+
+Ryzen 2 cannot supply real namespace proof: the requested
+`unshare --user --map-root-user --pid --fork --mount-proc` fails writing `uid_map`
+with `Operation not permitted`, and neither `bwrap` nor rootless `podman` is installed.
+The available unit/process regressions and the compiled probe's `--self-test` are
+not substitutes for distinct kernel namespaces.
+
+**Proposed owner: Light on Ryzen 1. This is not an owner-authored acceptance gate.**
+Before namespace-writer rollout (preferably before merge), Light should build the exact
+candidate and run, from the repository root with a fresh persistent evidence directory:
+
+```sh
+: "${TASK_OUT:?set a persistent evidence directory}"
+nice -n 19 bun run build
+nice -n 19 node scripts/probe-mesh-pid-namespace.mjs \
+  --launcher unshare --out "$TASK_OUT/namespace-proof"
+```
+
+This needs working unprivileged user/PID/mount namespaces and a writable `uid_map`,
+plus Linux procfs. If Ryzen 1's supported sandbox is bubblewrap, substitute
+`--launcher bwrap` (the launcher uses `bwrap --unshare-pid --dev-bind / / --proc /proc`).
+Do not weaken host policies to run it. The output directory must be empty to prevent
+stale handshakes from counting as evidence. The script imports the compiled public
+`pi-fabric/mesh` entry, writes only isolated temporary mesh roots, joins owned children,
+and removes those roots after preserving evidence.
+
+Required evidence: successful `probe-result.json` with `realPidNamespaceProof: true`,
+distinct recorded kernel namespaces and native five-field receipts; both protocols;
+actual SIGSTOP/CONT holders in both host/sandbox directions whose waiters time out
+without changing the receipt; preserved resumed-holder and successor state; 40
+contention iterations per writer with no overlapping sentinel, 80 unique increasing
+event sequences per protocol; and killed-holder recovery by readers in each holder's
+own namespace. A killed foreign orphan must remain protected from unrelated local
+PID/age recovery. Keep the receipt/proc-status records, journals, events, state and logs.
+The self-test sets `realPidNamespaceProof: false` even when it passes.
+
+If proof must wait until installation, Light must author the PR gate naming the exact
+candidate, evidence location, rollout owner and rollback trigger. Proposed trigger:
+any overlap, lost acknowledged state, wrong-namespace reclaim, failed owner-namespace
+death recovery or missing/mismatched namespace evidence blocks rollout; if already
+installed, fence every writer/cleaner, stop respawn, revert to the last accepted reader
+build and repair only under that fence. Changing the selector back to 1 alone is not
+rollback. Until Light supplies proof or an explicit owner-authored gate, the real
+namespace review blocker remains open.

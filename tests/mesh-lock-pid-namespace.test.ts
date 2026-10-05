@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ownProcessIncarnation } from "../src/core/atomic-write.js";
-import { FOREIGN_PID_NAMESPACE_LOCK_MS, MeshStore } from "../src/mesh/store.js";
+import { MeshStore } from "../src/mesh/store.js";
+
+// Regression boundary only: production no longer has any foreign-owner age lease.
+const FORMER_UNSAFE_BOUND_MS = 120_000;
 
 const roots: string[] = [];
 afterEach(() => {
@@ -62,9 +65,9 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(fs.existsSync(h.lock)).toBe(false);
     });
 
-    it(`protocol ${label} never reclaims a same-namespace live owner even beyond the age bound`, async () => {
+    it(`protocol ${label} never reclaims a same-namespace live owner even beyond the former unsafe bound`, async () => {
       const h = setup(protocol);
-      const old = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const old = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
       const owner = h.receipt("live", process.pid, old, h.namespace, (await ownProcessIncarnation())!);
       h.hold(owner, old);
       const error = await h.timeout();
@@ -86,7 +89,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
 
     it(`protocol ${label} fails closed on a malformed fifth-line namespace even for a dead PID`, async () => {
       const h = setup(protocol);
-      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
       const owner = h.receipt("malformed", 999999999, at, "not-a-pid-namespace");
       h.hold(owner, at);
       await h.timeout();
@@ -106,7 +109,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
     it.each([process.pid, 999999999])(`protocol ${label} protects a young foreign owner with local PID %s without any liveness probe`, async pid => {
       const h = setup(protocol);
       await ownProcessIncarnation(); // populate own-start cache before auditing holder reads
-      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS + 1000;
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS + 1000;
       const owner = h.receipt("foreign-young", pid, at);
       h.hold(owner, at);
       const kill = vi.spyOn(process, "kill");
@@ -119,43 +122,63 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(h.fences()).toEqual([]);
     });
 
-    it(`protocol ${label} reclaims an expired foreign owner exactly once across contenders`, async () => {
+    it(`protocol ${label} protects an ancient foreign owner against all contenders`, async () => {
       const h = setup(protocol);
-      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
       h.hold(h.receipt("foreign-old", process.pid, at), at);
       await ownProcessIncarnation();
       const kill = vi.spyOn(process, "kill");
       const rename = vi.spyOn(fs, "renameSync");
       const operations = Array.from({ length: 16 }, () => vi.fn());
+      const owner = fs.readFileSync(h.ownerPath, "utf8");
       const pending = operations.map(operation => new MeshStore(h.root, 65536, 100, {
         ...(protocol === undefined ? {} : { lockProtocol: protocol }), lockTimeoutMs: 1000,
-      }).exclusive(operation));
+      }).exclusive(operation).catch((error: unknown) => error));
       await vi.advanceTimersByTimeAsync(1000);
-      await Promise.all(pending);
-      expect(operations.every(operation => operation.mock.calls.length === 1)).toBe(true);
-      expect(rename.mock.calls.filter(([from, to]) => String(from) === h.lock && String(to).startsWith(`${h.lock}.dead.`))).toHaveLength(1);
-      expect(h.fences()).toHaveLength(1);
+      expect(await Promise.all(pending)).toEqual(operations.map(() =>
+        expect.objectContaining({ code: "FABRIC_MESH_LOCK_TIMEOUT" })));
+      expect(operations.every(operation => operation.mock.calls.length === 0)).toBe(true);
+      expect(rename).not.toHaveBeenCalled();
+      expect(h.fences()).toEqual([]);
       expect(kill).not.toHaveBeenCalled();
-      expect(fs.existsSync(h.lock)).toBe(false);
+      expect(fs.readFileSync(h.ownerPath, "utf8")).toBe(owner);
     });
 
-    it(`protocol ${label} resets foreign-owner age when the token changes, even with a copied old timestamp`, async () => {
+    it(`protocol ${label} protects a replacement foreign token indefinitely, even with a copied old timestamp`, async () => {
       const h = setup(protocol);
-      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
       h.hold(h.receipt("previous", process.pid, at), at);
       const replacement = h.receipt("successor", process.pid, at);
       fs.writeFileSync(h.ownerPath, replacement); // publication mtime starts the successor's clock
       await h.timeout();
       expect(fs.readFileSync(h.ownerPath, "utf8")).toBe(replacement);
       expect(h.fences()).toEqual([]);
-      await vi.advanceTimersByTimeAsync(FOREIGN_PID_NAMESPACE_LOCK_MS + 1);
-      await h.store.exclusive(() => "reclaimed successor only after its own bound");
-      expect(h.fences()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(FORMER_UNSAFE_BOUND_MS + 1);
+      await h.timeout();
+      expect(fs.readFileSync(h.ownerPath, "utf8")).toBe(replacement);
+      expect(h.fences()).toEqual([]);
     });
 
-    it(`protocol ${label} refuses expired-owner reclaim if the token changes during the final comparison`, async () => {
+    it(`protocol ${label} protects an old namespace receipt when its own namespace cannot be read`, async () => {
       const h = setup(protocol);
-      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
+      const owner = h.receipt("unknown-reader-namespace", 999999999, at, h.namespace);
+      h.hold(owner, at);
+      const readlink = fs.readlinkSync.bind(fs);
+      vi.spyOn(fs, "readlinkSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+        if (String(file) === "/proc/self/ns/pid") throw Object.assign(new Error("procfs unavailable"), { code: "ENOENT" });
+        return (readlink as (...args: unknown[]) => unknown)(file, ...args);
+      }) as typeof fs.readlinkSync);
+      const kill = vi.spyOn(process, "kill");
+      await h.timeout();
+      expect(kill).not.toHaveBeenCalled();
+      expect(fs.readFileSync(h.ownerPath, "utf8")).toBe(owner);
+      expect(h.fences()).toEqual([]);
+    });
+
+    it(`protocol ${label} never reclaims a foreign owner whose token changes between attempts`, async () => {
+      const h = setup(protocol);
+      const at = Date.now() - FORMER_UNSAFE_BOUND_MS - 1000;
       h.hold(h.receipt("previous", process.pid, at), at);
       const replacement = h.receipt("successor", process.pid, Date.now());
       const read = fs.readFileSync.bind(fs);

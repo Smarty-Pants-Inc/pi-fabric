@@ -748,7 +748,7 @@ describe("MeshStore lock recovery", () => {
       signal("initializer.go");
       await ready("initializer.entered"); // actual acquisition validation succeeded; operation remains live
       const held = JSON.parse(fs.readFileSync(path.join(store.root, "initializer.entered"), "utf8")) as { owner: string; ino: number; dev: number };
-      expect(held.owner.trim().split("\n")).toHaveLength(3); // default wire did not change
+      expect(held.owner.trim().split("\n")).toHaveLength(process.platform === "linux" ? 5 : 3); // Linux adds start time and PID namespace
       signal("recoverer.go");
       expect(await recoverer.closed, recoverer.output().stderr).toBe(0);
       // Still inside the initializer's synchronous critical section. Baseline detaches
@@ -1237,8 +1237,9 @@ describe("MeshStore lock recovery", () => {
     const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
     await store.exclusive(() => {
       const owner = fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").trim().split("\n");
-      expect(owner).toHaveLength(4);
+      expect(owner).toHaveLength(5);
       expect(owner[3]).toBe(startTime);
+      expect(owner[4]).toBe(fs.readlinkSync("/proc/self/ns/pid"));
     });
     holdLock(store, `reused-pid\n${process.pid}\n${Date.now()}\n${BigInt(startTime) + 1n}\n`);
     const operation = vi.fn();

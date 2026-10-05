@@ -558,21 +558,36 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
-store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
-wire without an incarnation: if a dead holder's PID is reused by a live process, v1
-protects the receipt and can time out until trusted repair after fencing all writers/cleaners.
+store. Protocol 1 keeps the B68 canonical-directory mkdir and leading token/PID/time
+fields. On Linux both protocols append the process start time (kernel clock ticks) and
+PID namespace identity (`/proc/self/ns/pid`, for example `pid:[4026531836]`). Elsewhere
+protocol 1 keeps its three-line wire: a reused live PID protects a dead owner's receipt
+until trusted repair after fencing all writers/cleaners.
 It publishes its owner exclusively and verifies the canonical directory/record
 before entering the critical section. An initializer whose canonical directory has been
 replaced aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` rather than overwriting a successor.
 Protocol 2 uses fully initialized private-directory publication. Both require the complete
 owner record to match and detach the owned directory before recursive release. Recovery
-requires a complete recorded owner and proof that its PID is absent (native `ESRCH`), or
-that its native incarnation differs. An empty directory with no owner record is stale
+requires a complete recorded owner and, for same-namespace or legacy owners, proof that
+its PID is absent (native `ESRCH`), or that its native incarnation differs. On Linux an
+owner in a different PID namespace is never probed via local `kill(pid, 0)` or
+`/proc/<pid>`: those could name an unrelated process. Instead it is recoverable strictly
+after **120 seconds** from the later of its recorded acquisition time and owner-file
+mtime, only while the full owner record, directory identity, and mtime remain unchanged.
+A replacement token's publication resets this age even if it copied an old timestamp.
+This source-level bound is below the #5047 watchdog's 180-second kill; there is no
+existing maximum-hold lease. Namespace-aware owners also use the age bound when the
+reader cannot read its own namespace. Timeouts identify such holders as
+`pid N in a foreign pid namespace`, never as the unrelated host PID's process state.
+A foreign holder paused beyond this bound may resume: this is bounded recovery, not
+a kernel fencing guarantee. Keep critical sections below the bound and restart stuck
+sandboxed writers; legacy receipts/binaries cannot provide namespace-aware recovery.
+An empty directory with no owner record is stale
 strictly after the 30-second grace (source-level `staleLockMs`). Recovery uses atomic
 empty-directory removal, not rename or recursive deletion: an initializer that publishes
 an owner before removal prevents it, even if the recoverer paused after its last check.
 Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecorded
-directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
+directories fail closed; same-namespace recorded live owners never expire. Unrecoverable unrecorded
 orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
 proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
 These safeguards do not repair old B68 binaries still running on the root. Even on

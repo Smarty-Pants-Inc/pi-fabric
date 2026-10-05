@@ -1,4 +1,5 @@
 import { createCommitStats } from "./commit-stats.js";
+import { MeshLockTicket } from "./lock-queue.js";
 import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -37,6 +38,24 @@ export interface MeshEvent {
   text?: string;
   data?: unknown;
   createdAt: number;
+}
+
+export interface MeshPublishInput {
+  topic: string;
+  /** Host-only durable publication receipt; never accepted by the public provider. */
+  dedupeKey?: string;
+  /** Host-only durability fence; batches share this barrier across their prefix. */
+  durable?: boolean;
+  kind?: string;
+  from: MeshIdentity;
+  to?: string;
+  text?: string;
+  /** Checked under the lock before admission. */
+  signal?: AbortSignal | undefined;
+  /** Host-only relay metadata. */
+  principal?: FabricPrincipal | undefined;
+  /** A function receives commit time under the lock. */
+  data?: unknown;
 }
 
 export interface MeshTailResult {
@@ -834,163 +853,209 @@ export class MeshStore {
     }
   }
 
-  async publish(input: {
-    topic: string;
-    /** Host-only durable publication receipt (alarms and inbox disposition receipts). */
-    dedupeKey?: string;
-    kind?: string;
-    from: MeshIdentity;
-    to?: string;
-    text?: string;
-    /** Host-only cancellation fence, checked under the lock before admission. */
-    signal?: AbortSignal | undefined;
-    /** Host-only relay metadata. The public provider never forwards args.principal. */
-    principal?: FabricPrincipal | undefined;
-    /** A function receives the commit time, under the lock (smarty-dev#816). */
-    data?: unknown;
-  }): Promise<MeshEvent> {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
-    const principal = copyFabricPrincipal(input.principal);
+    const principal = input.principal;
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
-    const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
+    const fixedData = stamp ? undefined : input.data;
+    input.signal?.throwIfAborted();
+    // Historical reads are prepared off-lock and validated before any mutation.
+    // An authoritative receipt needs no archive recovery, even if its mount is gone.
+    let preflight: MeshArchive | undefined;
+    if (!input.dedupeKey || !fs.existsSync(this.#dedupePath(input.dedupeKey, ".json"))) {
+      try { preflight = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (input.dedupeKey && fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
+          throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        }
+        throw error;
+      }
+    }
+    let prepared: MeshArchiveRecoveryPlan | undefined;
+    let digestRepair: ReturnType<MeshArchive["prepareDigestRepair"]>;
+    try {
+      prepared = preflight?.prepareRecovery(this.#readLastEventSequence());
+      digestRepair = preflight?.prepareDigestRepair();
+    } catch (error) {
+      if (!(error instanceof MeshArchiveRecoveryChanged) && input.dedupeKey &&
+          fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
+        throw new MeshDedupeRecoveryError("Event archive preflight is unavailable during dedupe recovery", { cause: error });
+      }
+      throw error;
+    }
+    return () => {
+      input.signal?.throwIfAborted();
+      const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
+      const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
+      if (input.dedupeKey) {
+        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        if (prior) {
+          // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
+          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          return prior;
+        }
+      }
+      let archive: MeshArchive | undefined;
+      try { archive = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        throw error;
+      }
+      this.#repairEventLog();
+      // Recover the whole reboot suffix before any one intent can advance the live horizon.
+      // In the same boot, defer ordinary pending cutback until the exact retry has settled.
+      // New keys still take only the normal recovery path, with no event-history lookup.
+      if (input.dedupeKey) {
+        if (archive && fs.existsSync(intentPath!)) {
+          try { this.#recoverArchive(archive, true, prepared); }
+          catch (error) {
+            if (error instanceof MeshArchiveRecoveryChanged) throw error;
+            throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
+          }
+        }
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
+        if (prior) return prior;
+      }
+      if (archive) {
+        this.#recoverArchive(archive, false, prepared);
+        if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
+      }
+      const createdAt = Date.now();
+      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
+      const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+      const event: MeshEvent = {
+        id: randomUUID(),
+        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+        sequence,
+        topic: input.topic,
+        kind: input.kind?.trim() || "message",
+        from: jsonClone(input.from),
+        ...(principal ? { principal } : {}),
+        // Old bridges only wrote data.bridge. It can veto a native attestation, but
+        // arbitrary payload data cannot establish bridge verification or any authority.
+        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
+          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
+          : { verification: "mesh" as const }),
+        ...(input.to ? { to: input.to } : {}),
+        ...(input.text !== undefined ? { text: input.text } : {}),
+        ...(eventData !== undefined ? { data: eventData } : {}),
+        createdAt,
+      };
+      const line = JSON.stringify(event);
+      if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
+        throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+      }
+      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+      // The archive holds the event durably before it goes live (smarty-dev#754); the live
+      // append commits it. If either step fails, the event is cut back out of the archive.
+      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
+      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
+      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
+      atomicWrite(this.#counterPath, sequence);
+      let liveOffset = 0;
+      try { liveOffset = fs.statSync(this.#eventsPath).size; }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      if (intentPath) {
+        // A durable negative lookup exists before the intent. Only begin() can replace it
+        // with the synced archive line address, before any live append.
+        archive?.reserveLookup(sequence);
+        // This is the crash fence: the intent is durable before the live append begins.
+        writeFileAtomic(intentPath, JSON.stringify({
+          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+          ...(archive ? { archiveDir: archive.dir } : {}),
+        } satisfies MeshDedupeIntent), { durable: true });
+      }
+      const pending = archive?.begin({ event, line });
+      // Test-only process-death fence: unlike an append exception, no rollback can run.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
+      try {
+        if (batch) batch.appendStarted = true;
+        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+      } catch (error) {
+        if (pending) archive!.rollback(pending);
+        throw error;
+      }
+      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
+      if (pending) archive!.commit(pending);
+      // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
+      if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+      if (receiptPath) {
+        this.#confirmEventFile(this.#eventsPath);
+        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+        if (intentPath) this.#removeDedupeIntent(intentPath);
+      }
+      if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
+      else {
+        this.#compactEventLog();
+        if (input.durable && !receiptPath) this.#confirmEventFile(this.#eventsPath);
+      }
+      return event;
+    };
+  }
+
+  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+    // Freeze ordinary payload/principal bytes once, even if archive validation retries.
+    input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
     for (;;) {
-      input.signal?.throwIfAborted();
+      try { return await this.#withLock(this.#preparePublish(input)); }
+      catch (error) {
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        await delay(0);
+      }
+    }
+  }
+
+  /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
+   * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
+   * Events retain publish's append/archive protocol, with one final durability barrier. A failed suffix
+   * is retried by the caller after checkpointing the returned committed prefix.
+   */
+  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
+    inputs = inputs.map(input => this.#capturePublication(input));
+    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
+    for (;;) {
       try {
-        // Historical reads are prepared off-lock and validated before any mutation.
-        // An authoritative receipt needs no archive recovery, even if its mount is gone.
-        let preflight: MeshArchive | undefined;
-        if (!input.dedupeKey || !fs.existsSync(this.#dedupePath(input.dedupeKey, ".json"))) {
-          try { preflight = MeshArchive.fromRoot(this.root); }
-          catch (error) {
-            if (input.dedupeKey && fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
-              throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
-            }
-            throw error;
-          }
-        }
-        let prepared: MeshArchiveRecoveryPlan | undefined;
-        let digestRepair: ReturnType<MeshArchive["prepareDigestRepair"]>;
-        try {
-          prepared = preflight?.prepareRecovery(this.#readLastEventSequence());
-          digestRepair = preflight?.prepareDigestRepair();
-        } catch (error) {
-          if (!(error instanceof MeshArchiveRecoveryChanged) && input.dedupeKey &&
-              fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
-            throw new MeshDedupeRecoveryError("Event archive preflight is unavailable during dedupe recovery", { cause: error });
-          }
-          throw error;
+        const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number } }> = [];
+        for (const input of inputs) {
+          const outcome = { appendStarted: false, bytes: 0 };
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome), outcome }); }
+          catch (error) { if (!prepared.length) throw error; break; }
         }
         return await this.#withLock(() => {
-          input.signal?.throwIfAborted();
-          const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
-          const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
-          if (input.dedupeKey) {
-            const prior = this.#readDedupeReceipt(input.dedupeKey);
-            if (prior) {
-              // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-              if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
-              return prior;
+          const started = performance.now();
+          const events: MeshEvent[] = [];
+          let bytes = 0;
+          for (const { commit, outcome } of prepared) {
+            // Keep the entire uncheckpointed prefix inside the retained tail, including
+            // a line-boundary slack event, rather than compacting away its recovery IDs.
+            if (events.length && (performance.now() - started >= 50 || bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
+            try { events.push(commit()); bytes += outcome.bytes; }
+            catch (error) {
+              // After append begins, success may be unknown. Stop rather than replay a
+              // possibly complete event; a restarted bridge reconciles its committed IDs.
+              if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });
+              if (!events.length) throw error;
+              break;
             }
-          }
-          let archive: MeshArchive | undefined;
-          try { archive = MeshArchive.fromRoot(this.root); }
-          catch (error) {
-            if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
-            throw error;
-          }
-          this.#repairEventLog();
-          // Recover the whole reboot suffix before any one intent can advance the live horizon.
-          // In the same boot, defer ordinary pending cutback until the exact retry has settled.
-          // New keys still take only the normal recovery path, with no event-history lookup.
-          if (input.dedupeKey) {
-            if (archive && fs.existsSync(intentPath!)) {
-              try { this.#recoverArchive(archive, true, prepared); }
-              catch (error) {
-                if (error instanceof MeshArchiveRecoveryChanged) throw error;
-                throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
-              }
-            }
-            const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
-            if (prior) return prior;
-          }
-          if (archive) {
-            this.#recoverArchive(archive, false, prepared);
-            if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
-          }
-          const createdAt = Date.now();
-          const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
-          const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-          const event: MeshEvent = {
-            id: randomUUID(),
-            ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-            sequence,
-            topic: input.topic,
-            kind: input.kind?.trim() || "message",
-            from: jsonClone(input.from),
-            ...(principal ? { principal } : {}),
-            // Old bridges only wrote data.bridge. It can veto a native attestation, but
-            // arbitrary payload data cannot establish bridge verification or any authority.
-            ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-              : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-              : { verification: "mesh" as const }),
-            ...(input.to ? { to: input.to } : {}),
-            ...(input.text !== undefined ? { text: input.text } : {}),
-            ...(eventData !== undefined ? { data: eventData } : {}),
-            createdAt,
-          };
-          const line = JSON.stringify(event);
-          if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
-            throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-          }
-          // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-          // The archive holds the event durably before it goes live (smarty-dev#754); the live
-          // append commits it. If either step fails, the event is cut back out of the archive.
-          // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-          // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-          // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
-          atomicWrite(this.#counterPath, sequence);
-          let liveOffset = 0;
-          try { liveOffset = fs.statSync(this.#eventsPath).size; }
-          catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-          if (intentPath) {
-            // A durable negative lookup exists before the intent. Only begin() can replace it
-            // with the synced archive line address, before any live append.
-            archive?.reserveLookup(sequence);
-            // This is the crash fence: the intent is durable before the live append begins.
-            writeFileAtomic(intentPath, JSON.stringify({
-              dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
-              ...(archive ? { archiveDir: archive.dir } : {}),
-            } satisfies MeshDedupeIntent), { durable: true });
-          }
-          const pending = archive?.begin({ event, line });
-          // Test-only process-death fence: unlike an append exception, no rollback can run.
-          if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
-          try {
-            fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-          } catch (error) {
-            if (pending) archive!.rollback(pending);
-            throw error;
-          }
-          // This distinct fence leaves the live event complete but the sidecar unconfirmed.
-          if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-          if (pending) archive!.commit(pending);
-          // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
-          if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
-          if (receiptPath) {
-            this.#confirmEventFile(this.#eventsPath);
-            writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-            if (intentPath) this.#removeDedupeIntent(intentPath);
           }
           this.#compactEventLog();
-          return event;
+          this.#confirmEventFile(this.#eventsPath);
+          return events;
         });
       } catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
       }
     }
+  }
+
+  #capturePublication(input: MeshPublishInput): MeshPublishInput {
+    return { ...input, principal: copyFabricPrincipal(input.principal),
+      data: typeof input.data === "function" || input.data === undefined ? input.data : jsonClone(input.data) };
   }
 
   read(
@@ -2043,93 +2108,102 @@ export class MeshStore {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    // Attempts and the largest gap between two of them: a large gap means this waiter stalled
-    // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
-    let attempts = 0;
-    let maxGapMs = 0;
-    let lastAttemptAt = Date.now();
-    let retryAttempt = 0;
-    while (true) {
-      this.#writeAbortSignal?.throwIfAborted();
-      const attemptAt = Date.now();
-      if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
-      attempts += 1;
-      lastAttemptAt = attemptAt;
-      try {
-        if (this.#lockProtocol === 1) {
-          // Keep the B68 three-line wire, but never overwrite an owner published by a
-          // successor while this initializer was stopped after canonical mkdir.
-          fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-          const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
-            code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
-          });
-          try {
-            const directory = fs.lstatSync(this.#lockPath);
-            fs.writeFileSync(ownerPath, ownerRecord, {
-              encoding: "utf8", flag: "wx", mode: 0o600,
-            });
-            // The exclusive create may itself have paused with an open descriptor to a
-            // recovered directory. Prove publication still belongs to the canonical lock
-            // before entering the critical section; never clean a successor on failure.
-            const current = fs.lstatSync(this.#lockPath);
-            if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
-              fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
-          } catch (error) {
-            // A resumed initializer may have published into an empty replacement before
-            // rejecting its directory identity. Remove only that attempt's exact receipt.
-            releaseOwned();
-            if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
-            throw error;
-          }
-        } else {
-          // Never expose an ownerless canonical directory: a stalled initializer must not
-          // resume its owner write through a name that legacy recovery gave to a successor.
-          const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
-          try {
-            fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
-              encoding: "utf8", flag: "wx", mode: 0o600,
-            });
-            // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
-            // lock may be an in-flight creator. Route every observed canonical path through
-            // the original owner/stale checks instead of publishing over it.
-            try {
-              fs.lstatSync(this.#lockPath);
-              throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
-            } catch (error) {
-              if (errorCode(error) !== "ENOENT") throw error;
-            }
-            // New-format competitors publish nonempty owners atomically. This does not fence
-            // old-format writers that create an empty canonical after the absence check.
-            fs.renameSync(staging, this.#lockPath);
-          } finally {
-            fs.rmSync(staging, { recursive: true, force: true });
-          }
-        }
-        break;
-      } catch (error) {
-        const code = errorCode(error);
-        if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
-          (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-        if (await this.#clearStaleLock(ownerPath)) continue;
-        if (Date.now() >= deadline) {
-          throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-        }
-        // Full jitter spreads a fleet after a stalled holder resumes. The original
-        // absolute deadline still bounds every sleep (including a zero draw).
-        await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
-      }
-    }
+    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
     try {
-      this.#writeAbortSignal?.throwIfAborted();
-      return operation();
-    } catch (error) {
-      // A failed write (a version conflict above all) means this store's view is behind: the
-      // next read parses the file again instead of reusing a recent parse.
-      this.#stateCache = undefined;
-      throw error;
-    } finally {
-      releaseOwned();
-    }
+      // Attempts and the largest gap between two of them: a large gap means this waiter stalled
+      // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
+      let attempts = 0;
+      let maxGapMs = 0;
+      let lastAttemptAt = Date.now();
+      let retryAttempt = 0;
+      while (true) {
+        this.#writeAbortSignal?.throwIfAborted();
+        if (!ticket.mayContend()) {
+          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          await delay(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          continue;
+        }
+        const attemptAt = Date.now();
+        if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
+        attempts += 1;
+        lastAttemptAt = attemptAt;
+        try {
+          if (this.#lockProtocol === 1) {
+            // Keep the B68 three-line wire, but never overwrite an owner published by a
+            // successor while this initializer was stopped after canonical mkdir.
+            fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+            const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+              code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
+            });
+            try {
+              const directory = fs.lstatSync(this.#lockPath);
+              fs.writeFileSync(ownerPath, ownerRecord, {
+                encoding: "utf8", flag: "wx", mode: 0o600,
+              });
+              // The exclusive create may itself have paused with an open descriptor to a
+              // recovered directory. Prove publication still belongs to the canonical lock
+              // before entering the critical section; never clean a successor on failure.
+              const current = fs.lstatSync(this.#lockPath);
+              if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
+                fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
+            } catch (error) {
+              // A resumed initializer may have published into an empty replacement before
+              // rejecting its directory identity. Remove only that attempt's exact receipt.
+              releaseOwned();
+              if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
+              throw error;
+            }
+          } else {
+            // Never expose an ownerless canonical directory: a stalled initializer must not
+            // resume its owner write through a name that legacy recovery gave to a successor.
+            const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
+            try {
+              fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
+                encoding: "utf8", flag: "wx", mode: 0o600,
+              });
+              // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
+              // lock may be an in-flight creator. Route every observed canonical path through
+              // the original owner/stale checks instead of publishing over it.
+              try {
+                fs.lstatSync(this.#lockPath);
+                throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
+              } catch (error) {
+                if (errorCode(error) !== "ENOENT") throw error;
+              }
+              // New-format competitors publish nonempty owners atomically. This does not fence
+              // old-format writers that create an empty canonical after the absence check.
+              fs.renameSync(staging, this.#lockPath);
+            } finally {
+              fs.rmSync(staging, { recursive: true, force: true });
+            }
+          }
+          break;
+        } catch (error) {
+          const code = errorCode(error);
+          if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
+            (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
+          if (await this.#clearStaleLock(ownerPath)) continue;
+          if (Date.now() >= deadline) {
+            throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          }
+          // Only the FIFO head probes promptly. After the bounded admission fallback,
+          // full jitter spreads plain contenders; the original deadline bounds every sleep.
+          await delay(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+        }
+      }
+      try {
+        this.#writeAbortSignal?.throwIfAborted();
+        return operation();
+      } catch (error) {
+        // A failed write (a version conflict above all) means this store's view is behind: the
+        // next read parses the file again instead of reusing a recent parse.
+        this.#stateCache = undefined;
+        throw error;
+      } finally {
+        releaseOwned();
+      }
+    } finally { ticket.close(); }
   }
 
   // Complete dead/different-incarnation receipts recover immediately. Empty ownerless

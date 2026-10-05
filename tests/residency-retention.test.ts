@@ -89,6 +89,31 @@ describe("resident terminal event retention", () => {
     } finally { collector.close(); }
   });
 
+  it.each(["none", "pending archive", "live worker", "new latest"])("keeps fresh %s safety after recovery exceeds the slice deadline", change => {
+    const dir = root(), actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [] });
+    const run = make(dir, "slow-recovery", "completed");
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const recover = vi.fn((directory: string) => {
+      elapsed += 6;
+      if (change === "pending archive") fs.writeFileSync(path.join(directory, "archive-pending.json"), "{}");
+      if (change === "live worker") write(directory, ".", "status", {
+        status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid),
+      });
+      if (change === "new latest") write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "slow-recovery" }] });
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot], { terminalRunEventsMaxBytes: 128 * 1024 }, recover);
+    try {
+      for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(recover).toHaveBeenCalled();
+      const events = fs.readFileSync(path.join(run, "events.jsonl"));
+      if (change === "none") expect(events.length).toBeLessThanOrEqual(128 * 1024);
+      else expect(events).toEqual(log);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
+    } finally { collector.close(); }
+  });
+
   it.each(([undefined, "unknown", "herdr", "localterm"] as const).flatMap(transport =>
     (["startup", "streaming"] as const).map(phase => ({ transport, phase }))))(
     "preserves receiptless $transport root custody through $phase retention", ({ transport, phase }) => {

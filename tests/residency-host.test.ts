@@ -635,7 +635,7 @@ describe("resident retention config reload", () => {
       reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
     { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
       reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
-  ])("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change)", async ({ initial, reloaded }) => {
+  ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ initial, reloaded, recoveryMs }) => {
     // The streamed first sweep must genuinely retain this fixture: unlike the
     // former startup sweep, it runs after the log is created. Set the initial
     // policy before constructing the host, which takes its own shared copy.
@@ -664,6 +664,20 @@ describe("resident retention config reload", () => {
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
+      // Model consistently slow Windows filesystem recovery separately from age:
+      // no wall-clock sleep, age/mtime adjustment, open handle, or rename failure.
+      // Keep the native host poll and the unchanged production 5-ms slice.
+      if (recoveryMs) {
+        let elapsed = 0;
+        const nativeNow = performance.now.bind(performance);
+        vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+        const recover = host.agents.recoverPendingArchives.bind(host.agents);
+        vi.spyOn(host.agents, "recoverPendingArchives").mockImplementation((...args) => {
+          const result = recover(...args);
+          elapsed += recoveryMs;
+          return result;
+        });
+      }
       // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
       const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       const nativeSweep = ResidentRequestRetention.prototype.sweep;

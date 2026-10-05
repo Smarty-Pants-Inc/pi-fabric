@@ -135,12 +135,17 @@ export class ResidentRequestRetention {
         // Incomplete reference preparation is a veto, never authority to walk
         // or discharge unknown custody. Legacy archival has its own full proof.
         const defer = () => {
-          // Retry a unit that started after reference/recovery consumed its
-          // budget, but never let a permanently oversized tree starve later IDs.
+          // Retry an unsuccessful unit on a fresh slice, but never let a
+          // permanently oversized or vetoed tree starve later IDs.
           if ((pending?.attempts ?? 0) < 2) this.#pendingRun = { entry: entry!, attempts: (pending?.attempts ?? 0) + 1 };
         };
         if (entry.isDirectory()) this.recoverRunArchives?.(file, expired);
-        if (expired()) { defer(); return; }
+        // Recovery is resumable/count-bounded, but even its no-op filesystem
+        // checks can consume a whole slice on Windows. Finish this run's bounded
+        // compaction attempt before stopping BETWEEN runs: restarting recovery
+        // first on every deferred attempt otherwise starves the mutation unit.
+        // Fresh exit/tree/archive/latest-run checks below still veto mutation
+        // if recovery was incomplete or a writer/source appeared meanwhile.
         // Wildcards never authorize request expiry, but run collection has
         // independent fresh native exit/tree proof and O(1) manager custody.
         if (this.custody?.run(entry.name)) continue;

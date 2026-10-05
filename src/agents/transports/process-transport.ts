@@ -71,7 +71,8 @@ export class ProcessTransport implements AgentTransportAdapter {
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(this.placement, request.cwd).reason;
       // --src ships the Main's workspace, unlike --cwd which names a target-local
-      // lane. Home/non-Git directories must never become a fleet source packet.
+      // lane. Require the launcher's tracked/unignored manifest branch; home,
+      // non-Git and ignored roots must never enter its recursive-copy branch.
       if (!reason && this.placement.command.some((entry, index) => entry === "--src" && this.placement!.command[index + 1] === "{cwd}")) {
         try {
           const cwd = fs.realpathSync(request.cwd);
@@ -80,6 +81,19 @@ export class ProcessTransport implements AgentTransportAdapter {
             timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
           });
           if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
+          // check-ignore -q exits 0 for ignored, 1 for definitely unignored,
+          // and >1 (or a signal/timeout) for indeterminate. Only 1 is safe.
+          let unignored = false;
+          try {
+            await executeFile("git", ["-C", cwd, "check-ignore", "-q", "--", cwd], {
+              timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+            });
+          } catch (error) {
+            const exit = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
+            unignored = exit?.code === 1 && exit.signal == null && !exit.killed
+              && exit.stdout === "" && exit.stderr === "";
+          }
+          if (!unignored) throw new Error("ignored or indeterminate source root");
         } catch { reason = "cwd-not-shippable"; }
       }
       if (!reason) {

@@ -7,6 +7,7 @@ import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "
 import { AgentManager } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
 import { probeAgentPlacement } from "../src/agents/placement-config.js";
@@ -15,6 +16,7 @@ import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 const roots: string[] = [], managers: AgentManager[] = [];
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -181,6 +183,39 @@ describe("host process task placement", () => {
     const h=await f.manager.spawn({task:"x",transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each([".local", "huge-cache"])("never invokes the launcher or ships an ignored %s source root", async directory => {
+    const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    fs.writeFileSync(path.join(f.root, ".gitignore"), `${directory}/\n`);
+    const cwd = path.join(f.root, directory); fs.mkdirSync(cwd);
+    const privateFile = path.join(cwd, "private-fixture.txt"); fs.writeFileSync(privateFile, "NONSECRET PRIVATE FIXTURE");
+    expect(execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).trim()).toBe("true");
+    expect(() => execFileSync("git", ["-C", cwd, "check-ignore", "-q", "--", cwd])).not.toThrow();
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    const result = await f.manager.run({ task: "must remain local", cwd, transport: "process" });
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL", cwd });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "cwd-not-shippable" })]);
+    expect(fs.existsSync(f.results)).toBe(false); // The fake launcher creates this on any invocation.
+    expect(fs.readFileSync(privateFile, "utf8")).toBe("NONSECRET PRIVATE FIXTURE");
+  });
+  it.each([
+    { code: 128, stdout: "", stderr: "fatal: unable to check ignore rules" },
+    { code: 1, killed: true, stdout: "", stderr: "" },
+    { code: 1, signal: "SIGKILL", stdout: "", stderr: "" },
+    { code: 1, stdout: "", stderr: "unexpected diagnostic" },
+    { code: "ENOENT", stdout: "", stderr: "" },
+    {},
+  ])("keeps failed or indeterminate ignore checks local (%j)", async failure => {
+    const f = fixture();
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    const query = vi.spyOn(processUtils, "executeFile").mockResolvedValueOnce({ stdout: "true\n", stderr: "" }).mockRejectedValueOnce(Object.assign(new Error("ignore check failed"), failure));
+    const result = await f.manager.run({ task: "must remain local", transport: "process" });
+    expect(result.text).toBe("LOCAL");
+    expect(query).toHaveBeenNthCalledWith(2, "git", ["-C", fs.realpathSync(f.root), "check-ignore", "-q", "--", fs.realpathSync(f.root)], expect.objectContaining({ killSignal: "SIGKILL" }));
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(line => line.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "cwd-not-shippable" })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each(["request", "parent"] as const)("keeps %s account pins local and forwards the resolved snapshot", async source => {

@@ -954,7 +954,7 @@ export class ActorManager {
     if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
     else delete actor.modelReason;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -988,7 +988,7 @@ export class ActorManager {
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1005,7 +1005,7 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.tools = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1016,7 +1016,7 @@ export class ActorManager {
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set future runs' niceness (smarty-dev#1579); it only raises agents.nice, never lowers it. */
@@ -1026,7 +1026,7 @@ export class ActorManager {
     if (parsed === undefined) throw new Error("nice is required");
     actor.nice = parsed;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
@@ -1039,7 +1039,7 @@ export class ActorManager {
       this.#mergeCoalesced(actor);                              // work queued before the key (smarty-dev#1065)
     }
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1060,7 +1060,7 @@ export class ActorManager {
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1078,7 +1078,7 @@ export class ActorManager {
     }
     actor.events = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1096,7 +1096,7 @@ export class ActorManager {
     actor.delivery = policy.delivery;
     actor.triggerTurn = policy.triggerTurn;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1110,7 +1110,7 @@ export class ActorManager {
     actor.messages = [];
     this.#resetMessages.add(actor);
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1134,7 +1134,7 @@ export class ActorManager {
     }
     options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1167,7 +1167,7 @@ export class ActorManager {
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
-    return this.#publishDrainPresence(live).then(
+    return this.#publishDrainPresence(live, waiters !== undefined).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
       (error: unknown) => {
         this.#recordPreparationFailure(live, error);
@@ -1286,7 +1286,7 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1773,7 +1773,7 @@ export class ActorManager {
     }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",
@@ -1928,7 +1928,7 @@ export class ActorManager {
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
       // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
       try {
-        await this.#saveActors(new Set(), { durable: true });
+        await this.#saveActors(new Set(), { durable: true, requiredActor: actor });
       } catch (error) {
         delete actor.removal;
         throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
@@ -2541,11 +2541,15 @@ export class ActorManager {
     }
   }
 
-  async #publishDrainPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishDrainPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
     // Preparation is an admission boundary, not a coalescible worker status pulse.
-    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true }));
+    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
+      ...(requireCommit ? { requiredActor: actor } : {}) }));
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
@@ -3543,13 +3547,18 @@ export class ActorManager {
     }
   }
 
-  async #publishPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
     // Global order: actor registries (sorted path), then mesh. The registry
     // mutation finishes/releases before presence takes the mesh lock; callers
     // must not wrap this async setter/create/remove path in mesh.exclusive.
-    await this.#saveActors();
+    // Maintenance may skip a displaced actor, but an acknowledged mutation must
+    // prove its selected object/generation survived inside the commit fence.
+    await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor } : undefined);
     await this.#writePresence(actor.id);
   }
 
@@ -3825,9 +3834,11 @@ export class ActorManager {
     }
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string> }): Promise<void> {
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
+    durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+  }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
-    if (removedIds.size === 0 && !options?.durable && this.#savedActors) {
+    if (removedIds.size === 0 && !options?.durable && !options?.requiredActor && this.#savedActors) {
       const owned = [...this.#actors.values()].filter((actor) =>
         !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
       if (this.#deferSoftRegistrySave(owned.map((actor) => this.#serializedActor(actor)), options?.flush === true)) return;
@@ -3842,9 +3853,15 @@ export class ActorManager {
       const owned = [...this.#actors.values()].filter((actor) =>
         !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
+      if (options?.requiredActor && !owned.includes(options.requiredActor)) {
+        // Do not acknowledge a mutation filtered out by a custody change during
+        // the lock wait. Refuse before any write; the successor's full row stays intact.
+        throw new ActorRegistryOwnershipError();
+      }
       const rows = owned.map((actor) => this.#serializedActor(actor));
       // Recheck after the lock wait: concurrent soft callers share one commit window.
-      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true || options?.flush === true)) return false;
+      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
+        options?.flush === true || options?.requiredActor !== undefined)) return false;
       if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
       this.#registrySaveTimer = undefined;
       const revoked = [...removedIds].filter((id) => {

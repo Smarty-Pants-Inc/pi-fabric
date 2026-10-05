@@ -5,9 +5,11 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
@@ -22,7 +24,7 @@ const fixture = () => {
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:absent-main", sessionId: "absent-main",
     cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"),
-    actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+    actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(path.join(root, "mesh"), "session:absent-main"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
@@ -192,32 +194,78 @@ describe("resident actor participant renewal without a Main", () => {
     }
   });
 
-  it.each(["moved-root", "same-root"])("rechecks an adopted generation after a management save waits for registry custody (%s)", async (move) => {
+  const mutationCases = (["shared", "files"] as const).flatMap(mode =>
+    (["moved-root", "same-root"] as const).flatMap(move =>
+      (["manager", "resident-client"] as const).flatMap(route =>
+        (["setInstructions", "setTools"] as const).map(operation => ({ mode, move, route, operation })))));
+  it.each(mutationCases)("rejects a management mutation that loses registry custody ($mode, $move, $route, $operation)", async ({ mode, move, route, operation }) => {
     const { root, config, host, observer } = fixture();
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const main = new ParticipantDirectory(new MeshStore(config.meshRoot, 65_536, 1_000), {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+    });
+    main.registerSource(() => [{ format: 1, id: identity.id, kind: "root", rootId: identity.id,
+      ownerHostId: identity.id, ownerIdentityId: identity.id, name: "Main", status: "idle", residency: "session",
+      runner: "pi", transport: "host", capabilities: ["fabric"], cwd: root, sessionId: config.sessionId,
+      startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
+    const client = new ResidentActorClient(config.meshRoot, config.rootId, 8_000);
     let save: Promise<unknown> | undefined;
+    let spy: { mockRestore(): void } | undefined;
     try {
+      if (mode === "files") await observer.mesh.put({ key: LIVENESS_POLICY_KEY,
+        value: { version: 1, hostLeases: "files", participants: "files" }, identity: observer.options.identity });
+      await main.start();
       await host.start();
-      const actor = await host.actors.create({ name: "save-review", instructions: "wait", residency: "durable" });
+      const actor = await host.actors.create({ name: "save-review", instructions: "wait", residency: "durable", tools: [] });
       await host.participants.refresh();
+      // Observe real setter entry, not an assumed command-poll delay. The original
+      // setter selects its actor and starts waiting for the production registry lock.
+      let reached!: () => void;
+      const selected = new Promise<void>(resolve => { reached = resolve; });
+      if (operation === "setInstructions") {
+        const setter = host.actors.setInstructions.bind(host.actors);
+        spy = vi.spyOn(host.actors, "setInstructions").mockImplementation(async (...args) => {
+          reached(); return setter(...args);
+        });
+      } else {
+        const setter = host.actors.setTools.bind(host.actors);
+        spy = vi.spyOn(host.actors, "setTools").mockImplementation(async (...args) => {
+          reached(); return setter(...args);
+        });
+      }
       const registry = new ActorRegistryStore(config.actorRoot);
       let adoptedRow: Record<string, unknown> | undefined;
       await registry.withLock(async () => {
-        save = host.actors.setInstructions(actor.id, "predecessor edit");
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        const mutation = operation === "setInstructions"
+          ? { operation, id: actor.id, instructions: "predecessor edit", replace: true }
+          : { operation, id: actor.id, tools: ["bash"] };
+        const pending = route === "resident-client"
+          ? client.setActor(mutation, undefined, { identity, hostId: identity.id })
+          : operation === "setInstructions"
+            ? host.actors.setInstructions(actor.id, mutation.instructions!)
+            : host.actors.setTools(actor.id, mutation.tools!);
+        // Attach a rejection handler immediately, including while custody is held.
+        save = pending.catch(error => error);
+        await Promise.race([selected, save.then(() => { throw new Error("Mutation settled before entering its setter"); })]);
         registry.write(registry.records().map((record) => record.id === actor.id
           ? { ...record, rootId: move === "moved-root" ? "session:successor" : config.rootId,
             adoptedAt: Date.now(), adoptedFrom: ["session:earlier-custodian"] } : record));
         adoptedRow = registry.records().find((record) => record.id === actor.id);
       });
-      await save;
+      const error = await save;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/ownership|owned by another host|generation/i);
+      if (route === "manager") expect(error).toBeInstanceOf(ActorRegistryOwnershipError);
       expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+      expect(adoptedRow).toMatchObject({ instructions: "wait", tools: [] });
       await host.participants.refresh();
       expect(host.actors.owns(actor.id)).toBe(false);
       expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toBeUndefined();
       await host.close();
       expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
     } finally {
-      await Promise.allSettled([save]); await host.close(); await observer.close();
+      await Promise.allSettled([save]); spy?.mockRestore();
+      await host.close(); await main.close(); await observer.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

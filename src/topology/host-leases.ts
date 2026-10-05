@@ -92,8 +92,12 @@ export interface FabricHostLease {
 const fileName = (hostId: string): string =>
   createHash("sha256").update(hostId).digest("hex").slice(0, 32) + ".json";
 
+/** Canonical own-host path, shared by peers and the residency launcher watchdog. */
+export const hostLeasePath = (meshRoot: string, hostId: string): string =>
+  path.join(meshRoot, LEASE_DIR, fileName(hostId));
+
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
-  writeJsonAtomic(path.join(meshRoot, LEASE_DIR, fileName(lease.id)), { format: 1, ...lease });
+  writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });

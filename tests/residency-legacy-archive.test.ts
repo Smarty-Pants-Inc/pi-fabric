@@ -220,6 +220,10 @@ describe("bounded retention reference preparation", () => {
     const root = temporary();
     for (let i = 0; i < 256; i++) run(root, `history-${i}`, { sessionId: "2147483647" });
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: path.join(root, "runs") });
+    // Keep the slice budget independent of native filesystem speed. The
+    // explicit refresh timestamp below crosses after exactly 64 prepared runs,
+    // not after an arbitrary prefix cut short by the 100 ms wall-clock budget.
+    const budgetClock = vi.spyOn(performance, "now").mockReturnValue(0);
     const reads = new Map<string, number>(), original = fs.readFileSync;
     fs.readFileSync = ((...args: Parameters<typeof original>) => {
       const file = String(args[0]);
@@ -229,6 +233,7 @@ describe("bounded retention reference preparation", () => {
     try {
       expect(manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 }).has("*")).toBe(true);
       const prefixReads = [...reads.values()].reduce((sum, count) => sum + count, 0);
+      expect(reads.size).toBe(64);
       let complete = false;
       for (let slice = 0; slice < 16; slice++) {
         if (!manager.retentionReferences({ now: now + 60_001, budgetMs: 100, maxEntries: 64 }).has("*")) { complete = true; break; }
@@ -238,7 +243,7 @@ describe("bounded retention reference preparation", () => {
       // run, including the prefix inspected before the interval boundary.
       expect(prefixReads).toBe(64 * 5);
       expect([...reads.values()].every(count => count === 5)).toBe(true);
-    } finally { fs.readFileSync = original; await manager.close(); }
+    } finally { fs.readFileSync = original; budgetClock.mockRestore(); await manager.close(); }
   });
 
   it("20,000 disk runs never restart the prefix, unchanged polls read zero statuses and the loop remains below 50 ms p99", async () => {

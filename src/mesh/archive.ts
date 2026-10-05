@@ -14,13 +14,15 @@ import type { MeshEvent } from "./store.js";
  *   <dir>/PENDING.json                   a publish between its archive append and its commit
  *   <dir>/<yyyy>/<mm>/<dd>/<topic>.jsonl  one line per event, the same bytes as the live log
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
- *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  reserved events overtaken before live publication
- *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and keyed live-commit proof
+ *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  positive event-identity abort markers
+ *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and advisory live confirmation
  *
- * A publish commits when its event reaches the live log. Before that, the archive holds it
- * durably but no reader sees it. Ordinary recovery cuts uncommitted appends back out;
- * a keyed intent retry can first complete the live publication. An overtaken reservation
- * is aborted instead: readers must never discover it behind their cursor.
+ * A publish normally commits when its event reaches the live log. Ordinary recovery cuts
+ * pending appends back out; a keyed intent retry can first complete the live publication.
+ * Old writers can restore/compact a live event without confirming its sidecar. Thus a false
+ * marker (or PENDING) never hides archived bytes within the live sequence horizon and never
+ * proves non-publication. An overtaken exact archive identity is retained, not republished:
+ * prefer one archive delivery to loss when archive-only and old-compacted are ambiguous.
  * The mesh root enables the archive with `event-archive.json` ({ "version": 1, "dir": "/abs" }),
  * so every store of that root archives, whatever its process's configuration. The store calls
  * this under its publish lock; nothing here locks.
@@ -50,7 +52,7 @@ interface MeshArchiveIndexEntry {
   file: string;
   offset: number;
   length: number;
-  /** False until the keyed event reaches the live log; absent on legacy sidecars. */
+  /** New-writer confirmation only. False cannot disprove an old-writer live recovery. */
   committed?: boolean;
 }
 
@@ -407,7 +409,7 @@ export class MeshArchive {
     return this.lookupEntry(sequence)?.event;
   }
 
-  /** The exact archived bytes and whether they were ever committed to the live log. */
+  /** Exact archived bytes and advisory new-writer confirmation, never absence evidence. */
   lookupEntry(sequence: number): (MeshArchiveEntry & { committed: boolean }) | undefined {
     if (!Number.isSafeInteger(sequence) || sequence < 1) throw new MeshArchiveLookupUnavailableError("Invalid mesh archive sequence lookup");
     const indexPath = this.#indexPath(sequence);
@@ -435,12 +437,26 @@ export class MeshArchive {
     try {
       const file = path.join(this.dir, indexed.file);
       descriptor = fs.openSync(file, "r");
-      const bytes = Buffer.allocUnsafe(indexed.length);
-      const count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
-      if (count !== bytes.length || bytes[bytes.length - 1] !== 0x0a) throw new Error("short archive line");
-      const line = bytes.subarray(0, bytes.length - 1).toString("utf8");
+      const available = fs.fstatSync(descriptor).size - indexed.offset;
+      // An old writer can cut PENDING back without updating its new sidecar. The file
+      // ending at/before that address proves absence; a torn line after it does not.
+      if (available <= 0) return undefined;
+      let bytes = Buffer.allocUnsafe(Math.min(indexed.length, available));
+      let count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+      let newline = bytes.subarray(0, count).indexOf(0x0a);
+      // The old writer may reuse that address for a differently sized event. Resolve
+      // only this one bounded line, never search the segment for the missing identity.
+      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < 64 * 1024 * 1024) {
+        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024));
+        count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+        newline = bytes.subarray(0, count).indexOf(0x0a);
+      }
+      if (newline < 0) throw new Error("short archive line");
+      const line = bytes.subarray(0, newline).toString("utf8");
       const event = parseEvent(line);
-      if (!event || event.sequence !== sequence || event.id !== indexed.id) throw new Error("archive index mismatch");
+      if (!event) throw new Error("invalid archive line");
+      if (event.sequence !== sequence || event.id !== indexed.id) return undefined;
+      if (newline + 1 !== indexed.length) throw new Error("archive index length mismatch");
       const pending = this.pending();
       return { event, line, committed: indexed.committed ?? !(pending?.sequence === sequence && pending.id === event.id) };
     } catch (error) {
@@ -452,7 +468,7 @@ export class MeshArchive {
   }
 
   /**
-   * A reserved event overtaken by the live log must never fill a hole behind a cursor.
+   * Record a positively established abort, never inferred from a false commit marker.
    * Keep its bytes/addresses intact, but durably hide it before declaring the reservation
    * absent. The day marker also covers a death before the negative sidecar is installed.
    */
@@ -473,10 +489,10 @@ export class MeshArchive {
 
   /**
    * Committed events after a sequence, in sequence order, for reads older than the live log.
-   * `through` is the newest live sequence: nothing past it, and no pending event, is committed.
+   * `through` is the newest live sequence: nothing past it is published. Within that
+   * horizon, only a positive abort hides an event; old writers may leave stale metadata.
    */
   readAfter(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): MeshEvent[] {
-    const pendingId = this.pending()?.id;
     const found: MeshEvent[] = [];
     for (const day of this.#days()) {
       const aborted = this.#readJson<Record<string, string>>(`${day}/ABORTED.json`);
@@ -498,7 +514,7 @@ export class MeshArchive {
         }
         for (const line of completeLines(text)) {
           const event = parseEvent(line);
-          if (event && event.sequence > after && event.sequence <= through && event.id !== pendingId && aborted?.[event.sequence] !== event.id && this.#isPublished(event) && matches(event)) {
+          if (event && event.sequence > after && event.sequence <= through && this.#isPublished(event, aborted) && matches(event)) {
             dayEvents.push(event);
           }
         }
@@ -509,12 +525,10 @@ export class MeshArchive {
     return found.slice(0, limit);
   }
 
-  // PENDING can be overwritten by a mixed-version writer. Its archive-only reservation
-  // must still stay invisible until live commitment, even when a later sequence is live.
-  #isPublished(event: MeshEvent): boolean {
-    if (!event.dedupeKey) return true;
-    const indexed = this.#readJson<MeshArchiveIndexEntry | { absent: true }>(path.relative(this.dir, this.#indexPath(event.sequence)));
-    return !indexed || (!("absent" in indexed) && indexed.committed !== false);
+  // Old recovery can leave PENDING/committed:false on an already-live event. Neither
+  // is negative evidence. Only this exact positive abort may hide archived bytes.
+  #isPublished(event: MeshEvent, aborted: Record<string, string> | undefined): boolean {
+    return aborted?.[event.sequence] !== event.id;
   }
 
   // The event's day, but never a day before `floor`, the head's day: every sealed day is

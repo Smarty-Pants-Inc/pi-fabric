@@ -16,11 +16,17 @@ All steps hold the existing mesh lock:
    rewrites the live tail), directly read
    `sequence-index/<floor(sequence/1024)>/<sequence>.json` in the archive, then
    seek exactly its segment/file offset and read the one recorded line.
-   A matching archived event counts as committed: finish any archive pending
-   commit, write the durable receipt, and return the original event. Only an
-   explicit durable `{ sequence, absent: true }` proves non-append. A missing,
-   corrupt, unreadable, or mismatched index/segment is **unavailable**, not absent:
-   retain the intent and return retryable `MeshDedupeRecoveryError`, never publish.
+   A matching archived event counts as committed, regardless of `committed: false`:
+   if the live log has not reached its sequence, first append its exact bytes to live
+   (durably update the intent offset first). Otherwise do not append behind the live
+   sequence. Confirm its sidecar, finish any matching archive pending commit without
+   sealing scans, write the durable receipt, and return the original event. A durable
+   `{ sequence, absent: true }`, a positive exact-id abort, a different event at that
+   sequence/address, or the day file ending at/before the indexed offset proves
+   absence. Only then may a retry abandon the intent and publish a fresh sequence.
+   A missing/corrupt/unreadable sidecar or missing/torn/corrupt segment is
+   **unavailable**, not absent: retain the intent and return retryable
+   `MeshDedupeRecoveryError`, never publish.
    The captured `archiveDir` also fences removal/change of archive configuration.
    Settle the intent before ordinary archive recovery can cut back its evidence.
 3. Neither file means **new**, not "search history". Repair the live tail and
@@ -29,7 +35,8 @@ All steps hold the existing mesh lock:
    `{ dedupeKey, reservedSequence, eventId, liveOffset, archiveDir? }` atomically
    with file/namespace fsync **before** either event append.
 4. The archive append syncs the event line, then durably replaces the sidecar
-   with `{ sequence, id, file, offset, length }` in that same append operation,
+   with `{ sequence, id, file, offset, length, committed: false }` for keyed events
+   in that same append operation (the confirmation is advisory),
    before the event can go live. A rollback installs the explicit negative record.
    Append live, commit archive metadata, confirm the live file, durably write
    the receipt, and only then unlink/sync the intent.
@@ -38,7 +45,9 @@ Archive lookup never scans a segment, index log, receipt directory, or day tree.
 It is one sequence-addressed sidecar read and one positioned event-line read.
 The archive is day/topic segmented, so the direct index preserves exact offsets
 without backfilling or scanning historical segments. Old writers ignore the
-sidecars but do not rewrite committed archive lines. New compaction still settles
+sidecars but do not rewrite committed archive lines. An old pending cutback can
+leave an obsolete sidecar at EOF or at a replacement event; direct lookup handles
+those positive absence proofs. New compaction still settles
 all pending intents before rewriting and durably writes retained bytes/rename.
 Tail repair only removes incomplete appends. An abandoned sequence is not reused.
 
@@ -49,6 +58,29 @@ enumeration is used to decide whether a new key has already published. Actual
 compaction enumerates the receipt directory to find pending files, and reboot
 recovery/archive catch-up/day sealing have their existing non-constant work;
 these maintenance operations are not claimed to be O(1).
+
+## Recovery decision table (round-five F1)
+
+Readers within the newest **actual live sequence** treat archived bytes as published
+unless the day file has a **positive `ABORTED.json` mark for that exact event id**.
+Neither `committed: false`, a negative sidecar, nor stale `PENDING.json` alone hides
+archived bytes. Events beyond the live horizon remain invisible until promoted.
+
+| Direct evidence on a key retry | Decision | Live-tail reader | Archive `nextEventAfter` reader |
+| --- | --- | --- | --- |
+| Valid receipt | Return it; finish intent cleanup | No append/replay | Original archived identity |
+| Exact live event at saved offset | Confirm live/archive, receipt same id/sequence | Already-live event once; no retry append | Original event, even with false marker or stale PENDING |
+| Exact archived id/sequence, no positive abort; live end below sequence | Append original bytes first; confirm and receipt | Original event now goes live once | Original event once within updated live horizon |
+| Exact archived id/sequence, no positive abort; live has reached/passed sequence | Confirm and receipt original; **never abort or republish** | No retry append. A reader present before old compaction saw the original; a later live-only reader cannot recover compacted bytes | Original event once for a cursor not already beyond its sequence |
+| Same as above, but event actually never went live and was overtaken | Same conservative decision: ambiguous with old compaction; prefer one archive delivery over loss | No original event and no replay/fresh id; live-only reader sees the later event(s) | Original archived event once for a cursor not already beyond it (including compacted `read({ after })` fallback) |
+| No exact live match **and** positive archive absence: negative sidecar, positive abort, different exact event, or day EOF at/before indexed offset after old cutback | Abandon absent reservation; publish/receipt one fresh sequence. Never abort another archived identity | Fresh event once; original never appended on this evidence | Fresh event; any positively aborted original remains hidden |
+| No exact live match and unavailable archive/config evidence | Retryable error; retain intent; no publication | No new event | No manufactured abort |
+
+A cursor already beyond the ambiguous old sequence cannot be rewound safely;
+this does not claim delivery of compacted or never-live bytes to a live-only tail.
+The deliberate preference is duplicate-free archive delivery over destructive loss,
+not replaying an old sequence at the tail. False markers are advisory confirmations
+left by writers that old recovery cannot update, not proof of non-publication.
 
 ## Consumer and rollout contract
 
@@ -111,15 +143,22 @@ original inbox carrier again.
   live log only after its receipt is durable; retry still returns the event,
   with and without the archive. A failed receipt barrier prevents compaction.
 - Actual RC3 (`81c0f9f0`) mixed-version regression: build the old commit in a
-  scratch worktree, SIGKILL the new publisher after append/before receipt, and
-  let the old store compact until the original event leaves the live tail while
-  its intent remains. Retry must return the exact original event with one
-  archived publication. Run `nice -n 19 node scripts/verify-mixed-version-dedupe.mjs`
+  scratch worktree, seed event 1, and SIGKILL the new keyed publisher at sequence 2
+  **after live append/before archive commit**, leaving `committed: false`. The old
+  writer's real recovery/publish of event 3 must leave that marker untouched, while
+  a new normal cursor returns 2 then 3. Let that old writer compact event 2 away:
+  retries return exactly event 2, with one archived publication, no abort/new
+  sequence/live replay/history scan. The same probe preserves the earlier
+  after-commit/before-receipt regression and adds actual old-writer pre-live
+  cutback tests (same-topic replacement and other-topic exact EOF).
+  Run `nice -n 19 node scripts/verify-mixed-version-dedupe.mjs`
   after building this head.
 - Direct archive recovery: one exact sidecar plus one positioned event-line read,
   zero archive directory enumeration/history scans. Missing/corrupt/unreadable
-  sidecar or missing/short segment preserves the intent and returns a retryable
-  `MeshDedupeRecoveryError`; a durable negative reservation permits publication.
+  sidecar or missing/torn/corrupt segment preserves the intent and returns a
+  retryable `MeshDedupeRecoveryError`; explicit negative reservation, positive
+  abort, different exact event, or EOF at/before the indexed address permits
+  publication only after the live anchor does not match.
 - Consumer replay: a different event id with the same dedupe key does not
   re-deliver after recipient reload, including a new maintenance sender; unrelated
   publication keys remain deliverable.

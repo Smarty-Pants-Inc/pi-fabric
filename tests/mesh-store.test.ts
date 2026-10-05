@@ -50,11 +50,11 @@ const createArchivedStore = (): { store: MeshStore; archiveDir: string } => {
   return { store: new MeshStore(root, 64 * 1024, 100), archiveDir };
 };
 
-// A real child death bypasses rollback catches and leaves the archive-before-live state intact.
-const crashAfterArchiveBegin = async (store: MeshStore, packet: Parameters<MeshStore["publish"]>[0]): Promise<void> => {
+// A real child death bypasses rollback catches at either side of the live append.
+const crashPublisher = async (store: MeshStore, packet: Parameters<MeshStore["publish"]>[0], fence = "PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN"): Promise<void> => {
   const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-archive-before-live-crash.mjs"), store.root, JSON.stringify(packet)], {
     cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN: "1" },
+    env: { ...process.env, [fence]: "1" },
   });
   let stderr = "", timedOut = false;
   child.stderr.on("data", chunk => { stderr += chunk; });
@@ -224,13 +224,13 @@ describe("MeshStore", () => {
     expect(store.latestSequence()).toBe(later.sequence);
   });
 
-  it.each(["missing", "corrupt", "unreadable", "missing-segment", "short-segment", "missing-root", "missing-config", "wrong-intent-id", "null-index", "oversized-index"])("fails closed for an invalidated intent when its archive is %s", async damage => {
+  it.each(["missing", "corrupt", "unreadable", "missing-segment", "short-segment", "missing-root", "missing-config", "null-index", "oversized-index"])("fails closed for an invalidated intent when its archive is %s", async damage => {
     const { store, archiveDir } = createArchivedStore();
     const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "unavailable-" + damage, text: "once" };
     const event = await store.publish(packet);
     const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
     fs.rmSync(base + ".json");
-    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: event.sequence, eventId: damage === "wrong-intent-id" ? "unrelated" : event.id, liveOffset: 0, archiveDir }));
+    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: event.sequence, eventId: event.id, liveOffset: 0, archiveDir }));
     fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
     const index = path.join(archiveDir, "sequence-index", "0", event.sequence + ".json");
     const entry = JSON.parse(fs.readFileSync(index, "utf8"));
@@ -278,7 +278,7 @@ describe("MeshStore", () => {
     const live = path.join(store.root, "events.jsonl");
     const seedBytes = fs.readFileSync(live, "utf8");
     let cursor = store.latestOffset();
-    await crashAfterArchiveBegin(store, packet);
+    await crashPublisher(store, packet);
     const archive = MeshArchive.fromRoot(store.root)!;
     const orphan = archive.lookupEntry(2)!;
     expect(orphan).toMatchObject({ committed: false, event: { sequence: 2, dedupeKey: packet.dedupeKey } });
@@ -306,7 +306,8 @@ describe("MeshStore", () => {
     }
     if (unrelated) {
       expect(restarted.read({ after: 1 })).toEqual([unrelated]);
-      expect(restarted.nextEventAfter(1)).toEqual(unrelated); // No archive-only event is visible before retry.
+      // Exact archived bytes remain visible even if an old writer left a false marker.
+      expect(restarted.nextEventAfter(1)).toEqual(ordering === "overtaken-archive" ? orphan.event : unrelated);
       const beforeRetry = restarted.tail(cursor, 100);
       delivered.push(...beforeRetry.events);
       cursor = beforeRetry.nextOffset; // A normal consumer has already passed the reserved sequence.
@@ -323,22 +324,30 @@ describe("MeshStore", () => {
       expect(recovered).toEqual(orphan.event);
       expect(fs.readFileSync(live, "utf8")).toBe(seedBytes + orphan.line + "\n"); // Exact bytes and sequence restored.
       unrelated = await restarted.publish({ topic: packet.topic, from: identity, text: "unrelated" });
-    } else {
+    } else if (ordering === "unrelated-first") {
       expect(recovered.sequence).toBe(4);
       expect(recovered.id).not.toBe(orphan.event.id);
       expect(archive.lookup(2)).toBeUndefined();
+    } else {
+      // This never-live case is indistinguishable from old recovery + compaction.
+      // Receipt the original event; no live-tail replay behind sequence 3.
+      expect(recovered).toEqual(orphan.event);
+      expect(archive.lookupEntry(2)?.committed).toBe(true);
+      expect(fs.readFileSync(live, "utf8")).toBe(seedBytes + JSON.stringify(unrelated) + "\n");
+      expect(restarted.latestSequence()).toBe(3);
     }
     expect(await restarted.publish({ ...packet, text: "retry again" })).toEqual(recovered);
     expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(recovered);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     for (const after of [0, 1]) {
       const events = restarted.read({ after });
-      expect(events.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
-      expect(events.map(event => event.sequence)).toEqual(ordering === "retry-first" ? (after === 0 ? [1, 2, 3] : [2, 3]) : (after === 0 ? [1, 3, 4] : [3, 4]));
+      const overtaken = ordering === "overtaken-archive";
+      expect(events.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual(overtaken ? [] : [recovered]);
+      expect(events.map(event => event.sequence)).toEqual(ordering === "retry-first" ? (after === 0 ? [1, 2, 3] : [2, 3]) : overtaken ? (after === 0 ? [1, 3] : [3]) : (after === 0 ? [1, 3, 4] : [3, 4]));
     }
     const tail = restarted.tail(cursor, 100);
     delivered.push(...tail.events);
-    expect(delivered.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    expect(delivered.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual(ordering === "overtaken-archive" ? [] : [recovered]);
     expect(restarted.tail(tail.nextOffset, 100).events).toEqual([]);
     const archived = archive.readAfter(1, restarted.latestSequence(), () => true, 100);
     expect(archived.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
@@ -351,13 +360,59 @@ describe("MeshStore", () => {
     }
     expect(normal.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
     if (ordering === "overtaken-archive") {
-      // Compacted cursor reads must not rediscover the aborted archive line.
+      // After compaction, the archive cursor delivers the retained ambiguous identity once.
       const compacting = new MeshStore(store.root, store.maxEventBytes, 100, { maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
       for (let index = 0; index < 5; index++) await compacting.publish({ topic: packet.topic, from: identity, text: "x".repeat(20_000) });
       expect(compacting.oldestSequence()).toBeGreaterThan(recovered.sequence);
       expect(compacting.read({ after: 1 }).filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
     }
   }, 30_000);
+
+  it("delivers a real live-append-before-commit death despite false and pending markers", async () => {
+    const { store } = createArchivedStore();
+    await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const cursor = store.latestOffset();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "process-death-before-commit", text: "once" };
+    await crashPublisher(store, packet, "PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT");
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const original = archive.lookupEntry(2)!;
+    expect(original.committed).toBe(false);
+    expect(archive.pending()?.id).toBe(original.event.id);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    expect(restarted.nextEventAfter(1)).toEqual(original.event);
+    expect(archive.readAfter(1, 2, () => true, 100)).toEqual([original.event]);
+    const delivered = restarted.tail(cursor, 100);
+    expect(delivered.events).toEqual([original.event]);
+    const abort = vi.spyOn(MeshArchive.prototype, "abort");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    expect(await restarted.publish(packet)).toEqual(original.event);
+    expect(await restarted.publish(packet)).toEqual(original.event);
+    expect(abort).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+    expect(archive.lookupEntry(2)?.committed).toBe(true);
+    expect(restarted.latestSequence()).toBe(2);
+    expect(restarted.tail(delivered.nextOffset, 100).events).toEqual([]);
+  }, 30_000);
+
+  it("abandons a positively different archived identity without aborting that event", async () => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "different-archive-identity", text: "once" };
+    const existing = await store.publish(packet);
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    fs.rmSync(base + ".json");
+    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: existing.sequence, eventId: "absent-reservation", liveOffset: 0, archiveDir }));
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const abort = vi.spyOn(MeshArchive.prototype, "abort");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const recovered = await store.publish(packet);
+    expect(recovered.sequence).toBe(2);
+    expect(recovered.id).not.toBe(existing.id);
+    expect(archive.lookup(1)).toEqual(existing);
+    expect(abort).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+    expect(await store.publish(packet)).toEqual(recovered);
+  });
 
   it("publishes when a direct archive reservation proves that the intent never appended", async () => {
     const { store } = createArchivedStore();

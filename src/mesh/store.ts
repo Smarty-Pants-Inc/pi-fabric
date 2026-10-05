@@ -721,10 +721,12 @@ export class MeshStore {
         throw error;
       }
       const archived = entry?.event;
-      if (archived && (archived.id !== intent.eventId || archived.dedupeKey !== intent.dedupeKey)) {
-        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive identity does not match`);
+      if (archived?.id === intent.eventId && archived.dedupeKey !== intent.dedupeKey) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive key does not match`);
       }
-      if (entry && archived) {
+      // A different archived identity positively proves this reservation is absent. Never
+      // abort that other event; leave its archive visibility and index intact.
+      if (entry && archived?.id === intent.eventId) {
         this.#repairEventLog();
         const lastLive = this.#readLastEventSequence();
         if (lastLive < archived.sequence) {
@@ -736,14 +738,12 @@ export class MeshStore {
           writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
-          archive.confirmLive(archived.sequence, archived.id);
-        } else if (!entry.committed) {
-          // Never fill a missing reservation behind a reader's cursor. Abort its archive
-          // visibility first; publish() will reserve a fresh sequence for this same key.
-          archive.abort(entry);
-          this.#removeDedupeIntent(file);
-          return undefined;
         }
+        // A false sidecar is not non-publication evidence: an old writer can recover a
+        // completed live append without updating it, then compact away the live anchor.
+        // An overtaken archive-only append is indistinguishable. Prefer its one archive
+        // delivery over loss; never append behind the live sequence or publish a new id.
+        archive.confirmLive(archived.sequence, archived.id);
         const pending = archive.pending();
         // Receipt recovery is direct metadata work. Leave closed-day sealing to the next
         // ordinary archive append, never scan history just to resolve this intent.
@@ -875,6 +875,8 @@ export class MeshStore {
         if (pending) archive!.rollback(pending);
         throw error;
       }
+      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
       if (pending) archive!.commit(pending);
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");

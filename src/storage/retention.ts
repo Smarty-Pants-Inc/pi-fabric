@@ -120,6 +120,10 @@ export const runTreeResourceVeto = (
 const runTreeVeto = (
   directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
   options: RunTreeExitOptions,
+  // Internal collection-only optimization. Every directory will subsequently
+  // pass safeRunTree's recursive artifact allowlist, which rejects tmp and all
+  // scratch receipts. Never used by the public exit/resource predicates.
+  scratchCoveredByAllowlist = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -202,14 +206,17 @@ const runTreeVeto = (
     if (hasNested) {
       if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
       for (const name of fs.readdirSync(nested)) {
-        const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, { disposeScratch: options.disposeScratch !== false });
+        const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit,
+          { disposeScratch: options.disposeScratch !== false }, scratchCoveredByAllowlist);
         if (reason) return reason;
       }
     }
     // Report a known worker/descendant obligation before the independent
     // scratch fence. Both still have to pass; native exit never bypasses it.
-    const scratchVeto = runScratchExitVeto(directory, expired, options.disposeScratch);
-    if (scratchVeto) return scratchVeto;
+    if (!scratchCoveredByAllowlist) {
+      const scratchVeto = runScratchExitVeto(directory, expired, options.disposeScratch);
+      if (scratchVeto) return scratchVeto;
+    }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
@@ -255,7 +262,12 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
   // authorize recordless pre-launch rollback through the non-retention mode.
-  if (runTreeExitVeto(root, 0, expired, true, options)) return false;
+  // Windows has no per-run scratch allocation/disposal. Its recursive artifact
+  // allowlist below already rejects scratch directories, fences and receipts,
+  // including links and unreadable entries. Avoid two extra negative NTFS stats
+  // per run (and descendant) just to discover the same absence. POSIX must still
+  // attempt custody-checked disposal before inspecting the remaining contents.
+  if (runTreeVeto(root, 0, expired, true, true, true, options, process.platform === "win32")) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes

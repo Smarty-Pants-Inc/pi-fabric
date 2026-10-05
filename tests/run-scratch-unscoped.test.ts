@@ -87,6 +87,51 @@ describe.skipIf(process.platform !== "linux")("unscoped main-compatible terminal
     expect(disposeRunTmpDirectory(root)).toBe(true); expect(fs.existsSync(allocation.directory)).toBe(false);
   });
 
+  it("D15 retains a recorded zombie's scratch until its matching birth identity is reaped", async () => {
+    const project = sandbox(), root = path.join(project, "run"), release = path.join(project, "release");
+    fs.mkdirSync(root, { mode: 0o700 });
+    vi.spyOn(scopes, "createProcessScratchScope").mockReturnValue(undefined);
+    const allocation = allocateRunTmpDirectory(root);
+    fs.writeFileSync(path.join(allocation.directory, "data"), "retain while zombie identity matches");
+    // The Python parent deliberately postpones waitpid: unlike Node's child
+    // watcher, this gives us an observable, genuinely unreaped Linux zombie.
+    const helper = childProcess.spawn("python3", ["-c", `import os,time
+pid=os.fork()
+if pid == 0: os._exit(0)
+print(pid,flush=True)
+end=time.monotonic()+15
+while not os.path.exists(${JSON.stringify(release)}) and time.monotonic()<end: time.sleep(0.01)
+os.waitpid(pid,0)
+`], { stdio: ["ignore", "pipe", "pipe"] });
+    let output = ""; helper.stdout.on("data", chunk => { output += chunk; });
+    const closed = new Promise<void>((resolve, reject) => {
+      helper.once("error", reject);
+      helper.once("close", code => code === 0 ? resolve() : reject(new Error(`Zombie fixture exited ${code}`)));
+    });
+    void closed.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(output.trim()).toMatch(/^\d+$/), { timeout: 3000 });
+      const pid = Number(output.trim());
+      await vi.waitFor(() => {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        expect(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]).toBe("Z");
+      }, { timeout: 3000 });
+      const birth = processIdentity.processStartTime(pid); expect(birth).toBeDefined();
+      fs.writeFileSync(path.join(root, "status.json"), JSON.stringify({
+        status: "completed", transport: "process", sessionId: String(pid), processStartTime: birth, finishedAt: 1,
+      }));
+      allocation.workerClosed(pid);
+      expect(disposeRunTmpDirectory(root)).toBe(false);
+      expect(fs.readFileSync(path.join(allocation.directory, "data"), "utf8")).toBe("retain while zombie identity matches");
+      expect(fs.existsSync(path.join(root, UNRESOLVED_SCRATCH_FILE))).toBe(true);
+      fs.writeFileSync(release, "reap"); await closed;
+      expect(processIdentity.processStartTime(pid)).toBeUndefined();
+      expect(disposeRunTmpDirectory(root)).toBe(true);
+      expect(fs.existsSync(allocation.directory)).toBe(false);
+      scratchEvidence("d15-zombie-identity-retention", { pid, birth, nativeZombieObserved: true, retainedUntilReaped: true });
+    } finally { fs.writeFileSync(release, "reap"); await closed; }
+  }, 20_000);
+
   it("documents the scope cut: native worker close is not unscoped detached-writer exit proof", async () => {
     const project = sandbox(), run = path.join(project, "run"), ready = path.join(project, "ready"), release = path.join(project, "release"), writer = path.join(project, "writer.mjs"), worker = path.join(project, "worker.mjs"), status = path.join(run, "status.json");
     fs.mkdirSync(run, { mode: 0o700 }); vi.spyOn(scopes, "createProcessScratchScope").mockReturnValue(undefined);

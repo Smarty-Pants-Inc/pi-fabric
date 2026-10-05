@@ -66,7 +66,9 @@ const visit = node => {
   ts.forEachChild(node, visit);
 };
 visit(activation);
-assert.equal(workers.length, 2);
+// Registered actor journal coverage (#4313) adds a third native worker
+// selector. Every one still has to preserve the exact opt-in below.
+assert.equal(workers.length, 3);
 for (const worker of workers) {
   vm.runInContext(js("globalThis.worker = " + worker), context);
   assert.equal(context.worker, path.resolve(input.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"));

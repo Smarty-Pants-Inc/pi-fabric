@@ -3501,11 +3501,17 @@ export class ActorManager {
         const actor = actors[offset]!;
         const slices = this.#logs.pruneRunsInSlices(actor, now);
         for (;;) {
-          const more = this.#withOwnershipRead(() => {
+          const resume = () => {
             if (this.#closing || this.#canConsumeMesh?.() === false ||
                 this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) return false;
             return !slices.next().done;
-          });
+          };
+          // A one-actor turn needs one fresh canonical ownership decision, not
+          // a copied full-fleet Map on every run. The latter made the new run
+          // slicing quadratic in fleet size (and retained every Map in spies).
+          // Snapshot-only hosts still use the fresh batch contract; never cache
+          // either authority path across a yield.
+          const more = this.#canManageActor ? resume() : this.#withOwnershipRead(resume);
           if (!more) break;
           await new Promise<void>((resolve) => setImmediate(resolve));
         }

@@ -119,6 +119,41 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 
+  it("uses fresh single actor ownership checks instead of full-fleet snapshots on each Windows run", async () => {
+    const f = fixture(200);
+    let runPhase = false, fullFleetSnapshots = 0, copiedDecisions = 0, singleActorChecks = 0;
+    const slices = ActorLogStore.prototype.pruneRunsInSlices;
+    vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function(this: ActorLogStore, ...args) {
+      runPhase = true;
+      const iterator = slices.apply(this, args);
+      return (function*() { try { yield* iterator; } finally { runPhase = false; } })();
+    });
+    const snapshot = () => {
+      if (runPhase && new Error().stack?.includes("sweepRetainedRuns")) {
+        fullFleetSnapshots++; copiedDecisions += f.records.length;
+      }
+      return new Map(f.records.map(record => [record.id, true]));
+    };
+    const single = (_id: string, fresh = true) => {
+      expect(fresh).toBe(true);
+      if (runPhase) singleActorChecks++;
+      return true;
+    };
+    // The fixture's agent manager is already constructed on the native host.
+    // Select the actual Windows retention path, not Windows ACL admission.
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      f.make({ canManageActor: single, snapshotActorOwnership: snapshot });
+      await eventually(() => !fs.existsSync(f.runDir(199, 8))); await turn();
+      process.stdout.write(JSON.stringify({ probe: "Windows-200-actors-2000-runs-ownership", fullFleetSnapshots,
+        copiedDecisions, singleActorChecks }) + "\n");
+      expect(fullFleetSnapshots).toBe(0);
+      expect(copiedDecisions).toBe(0);
+      expect(singleActorChecks).toBeGreaterThanOrEqual(2_000);
+      expect(fs.existsSync(f.runDir(199, 9))).toBe(true);
+    } finally { platform.mockRestore(); }
+  });
+
   it("bounds slow Windows run deletion inside a single actor below 250ms", async () => {
     const f = fixture(1);
     const native = process.platform;
@@ -162,6 +197,24 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       f.make({ canManageActor: () => owned, snapshotActorOwnership: () => new Map([[f.records[0]!.id, owned]]) });
       await eventually(() => !fs.existsSync(f.runDir(0, 0)));
       owned = false;
+      await turn(); await turn();
+      for (let run = 1; run < 10; run++) expect(fs.existsSync(f.runDir(0, run))).toBe(true);
+    } finally { platform.mockRestore(); }
+  });
+
+  it.each(["snapshot-only", "publication"] as const)("refreshes the %s fence between Windows run slices", async (fence) => {
+    const f = fixture(1);
+    let owned = true, published = true;
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      f.make({
+        ...(fence === "publication" ? { canManageActor: () => owned } : {}),
+        snapshotActorOwnership: () => new Map([[f.records[0]!.id, owned]]),
+        canConsumeMesh: () => published,
+      });
+      await eventually(() => !fs.existsSync(f.runDir(0, 0)));
+      if (fence === "snapshot-only") owned = false;
+      else published = false;
       await turn(); await turn();
       for (let run = 1; run < 10; run++) expect(fs.existsSync(f.runDir(0, run))).toBe(true);
     } finally { platform.mockRestore(); }

@@ -289,6 +289,8 @@ export class ResidentHost {
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
       canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });

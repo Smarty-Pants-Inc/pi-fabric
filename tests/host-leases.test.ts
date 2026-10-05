@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeasesStamp, readHostLease, readHostLeases, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseSnapshot, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // Windows fails an open with EPERM while the owner's heartbeat renames a new lease file over the
 // old one. A live host then looked leaseless, and the failed read stayed cached until its next
@@ -147,6 +147,26 @@ describe("host lease files on a transient read failure", () => {
     writeHostLease(root, lease(2_000));
     ctimeNs += 100n;
     expect(readHostLeases(root).get("host:a")).toEqual(lease(2_000));
+  });
+
+  it("exposes a numeric snapshot timestamp for recovery comparisons", () => {
+    const { root, lease } = setup();
+    writeHostLease(root, lease(1_000));
+    const dir = path.join(root, "host-leases");
+    const file = path.join(dir, fs.readdirSync(dir)[0]!);
+    fs.utimesSync(file, 1_800_000_000, 1_800_000_000);
+    const stat = fs.statSync(file, { bigint: true });
+    expect(typeof stat.mtimeMs).toBe("bigint");
+
+    const snapshot = readHostLeaseSnapshot(root, "host:a")!;
+    expect(snapshot.lease).toEqual(lease(1_000));
+    expect(typeof snapshot.mtimeMs).toBe("number");
+    expect(snapshot.mtimeMs).toBe(Number(stat.mtimeMs));
+    // A file only advances recovery when newer than the numeric owner.updatedAt.
+    expect(snapshot.mtimeMs > 1_799_999_999_999).toBe(true);
+    expect(snapshot.mtimeMs > 1_800_000_000_000).toBe(false);
+    expect(snapshot.mtimeMs > 1_800_000_000_001).toBe(false);
+    expect(snapshot.mtimeMs - 1_799_999_999_999).toBe(1);
   });
 
   it("shares a valid unchanged cached lease without rereading", () => {

@@ -2346,7 +2346,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
     expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
-      { message: "hello", data: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge" });
+      { message: "hello", data: undefined, principal: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge", idempotencyKey: expect.any(String) });
   });
 
   it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
@@ -4489,7 +4489,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 
@@ -4504,8 +4504,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const request = vi.fn().mockResolvedValue({ queued: true, messageId: "m", routed: "mesh", acknowledged: true });
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
-      await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
+      const idempotencyKey = `retry-${kind}`;
+      await expect(provider.invoke(kind, { id: child.id, message: `correct it (${kind})`, data: { key: "k" }, idempotencyKey }, context))
+        .resolves.toMatchObject({ acknowledged: true });
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" }, principal: undefined }, child.ownerIdentityId, { routedRemoteHost: null, idempotencyKey });
     }
     await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
     expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
@@ -4577,7 +4579,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } }),
       "identity:resident",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 

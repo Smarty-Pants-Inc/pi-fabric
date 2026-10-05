@@ -64,10 +64,15 @@ const setup = async () => {
       .filter(id => readResidentRequestDecision(config.residencyRoot, id)?.operation === operation),
     ack: (id: string) => JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "acknowledgements", `${id}.json`), "utf8")),
     retained: (id: string) => fs.existsSync(path.join(config.residencyRoot, "decisions", `${id}.json`)),
-    scan: async (time: number) => {
+    scan: async (time: number, until?: () => boolean) => {
       const before = scans; now = time;
+      // Expiry is asynchronous maintenance, not a promise that the first 2-ms
+      // tick finishes all reference preparation. Keep the existing wait deadline
+      // and assert the actual public collection outcome, without racing a
+      // conservative incomplete snapshot or transient targeted-proof timeout.
+      host.agents.retentionReferences({ now: time, budgetMs: 100 });
       due ??= vi.spyOn(ResidentRequestRetention.prototype, "due"); due.mockReturnValue(true);
-      await waitFor(() => scans > before); due.mockReturnValue(false);
+      await waitFor(() => scans > before && (!until || until())); due.mockReturnValue(false);
     },
     close: async () => {
       due?.mockRestore(); sweep.mockRestore();
@@ -77,14 +82,19 @@ const setup = async () => {
   };
 };
 
-it("completed-but-not-cleaned durable agents release acknowledged capacity debt using saved results, not stale running handles", async () => {
+it.each(["native", "win32"])("completed-but-not-cleaned durable agents release acknowledged capacity debt using saved results, not stale running handles (%s)", async platform => {
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
   const fixture = await setup();
   try {
     const handles = [];
     for (let index = 0; index < 3; index++) {
       const handle = await fixture.client.spawnAgent({ task: `completed task ${index}`, transport: "process", extensions: false }, AbortSignal.timeout(5_000));
       handles.push(handle);
-      await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, handle.id)) && !fixture.host.agents.retentionReferences().has(handle.id));
+      // The public custody assertion is count/correctness coverage, not a
+      // 2-ms filesystem-speed assertion. Deadline retry behavior is separately
+      // covered at the production budget in residency-legacy-archive.test.ts.
+      await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, handle.id)) && !fixture.host.agents.retentionReferences({ budgetMs: 100 }).has(handle.id));
       expect(fixture.client.statusAgent(handle.id)).toMatchObject({ status: "completed" });
       const metadata = JSON.parse(fs.readFileSync(path.join(fixture.config.residencyRoot, "agents", `${handle.id}.json`), "utf8"));
       expect(metadata.handle.status).toBe("running");
@@ -92,7 +102,7 @@ it("completed-but-not-cleaned durable agents release acknowledged capacity debt 
     const ids = fixture.creationIds("spawnBound");
     expect(ids).toHaveLength(3);
     const now = Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1;
-    await fixture.scan(now);
+    await fixture.scan(now, () => ids.every(id => !fixture.retained(id)));
     expect(ids.filter(fixture.retained)).toEqual([]);
     for (const handle of handles) {
       // Collection releases exchange capacity, NOT result/output ownership.
@@ -100,7 +110,9 @@ it("completed-but-not-cleaned durable agents release acknowledged capacity debt 
       expect(fixture.client.statusAgent(handle.id)).toMatchObject({ status: "completed" });
       expect(fs.existsSync(residentResultPath(fixture.config.residencyRoot, handle.id))).toBe(true);
     }
-  } finally { await fixture.close(); }
+  } finally {
+    try { await fixture.close(); } finally { Object.defineProperty(process, "platform", nativePlatform); }
+  }
 }, 30_000);
 
 it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadable", "unresolved", "unknown descendant"])("completed spawn keeps uncertain capacity debt: %s", async kind => {
@@ -108,7 +120,7 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
   try {
     const handle = await fixture.client.spawnAgent({ task: "completed negative control", transport: "process", extensions: false }, AbortSignal.timeout(5_000));
     const saved = residentResultPath(fixture.config.residencyRoot, handle.id);
-    await waitFor(() => fs.existsSync(saved) && !fixture.host.agents.retentionReferences().has(handle.id));
+    await waitFor(() => fs.existsSync(saved) && !fixture.host.agents.retentionReferences({ budgetMs: 100 }).has(handle.id));
     const original = fs.readFileSync(saved, "utf8");
     const result = JSON.parse(original);
     const run = fixture.host.agents.runDirectory(handle.id)!;
@@ -131,7 +143,7 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
     fs.writeFileSync(saved, original);
     fs.rmSync(path.join(run, "unresolved-worker.json"), { force: true });
     fs.rmSync(path.join(run, "nested"), { recursive: true, force: true });
-    await fixture.scan(now + 60_001);
+    await fixture.scan(now + 60_001, () => !fixture.retained(id));
     expect(fixture.retained(id)).toBe(false);
     expect(fixture.client.statusAgent(handle.id)).toMatchObject({ status: "completed" });
   } finally { await fixture.close(); }
@@ -167,7 +179,7 @@ it.each(["spawnBound", "createActor"] as const)("later cached %s retries acknowl
       await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, first.id)));
       await fixture.client.cleanupAgent(first.id);
     } else await fixture.client.removeActor(first.id);
-    await fixture.scan(Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1);
+    await fixture.scan(Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1, () => ids.every(id => !fixture.retained(id)));
     for (const id of ids) {
       expect(fixture.retained(id)).toBe(false);
       expect(fs.existsSync(path.join(fixture.config.residencyRoot, "acknowledgements", `${id}.json`))).toBe(false);

@@ -639,13 +639,23 @@ describe("resident retention config reload", () => {
       reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
     { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
       reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
-  ])("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change)", async ({ initial, reloaded }) => {
+  ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ initial, reloaded, recoveryMs }) => {
     // The streamed first sweep must genuinely retain this fixture: unlike the
     // former startup sweep, it runs after the log is created. Set the initial
     // policy before constructing the host, which takes its own shared copy.
     const { root, config, host } = fixture(initial);
     const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
+    let elapsed = 0;
+    if (process.platform === "win32") {
+      // This is a policy-reload test, not a native filesystem throughput test.
+      // A cold Windows status read can exhaust the 2-ms reference-proof slice
+      // and keep a protective live hint for this safely terminal fixture. Freeze
+      // the monotonic clock from the first scan; only injected recovery below
+      // advances it. Date.now/finishedAt and the host poll stay real; the 2-ms
+      // reference and 5-ms sweep budget values are unchanged.
+      vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    }
     try {
       await host.start();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
@@ -668,6 +678,21 @@ describe("resident retention config reload", () => {
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
+      // Model consistently slow Windows filesystem recovery separately from age:
+      // no wall-clock sleep, age/mtime adjustment, open handle, or rename failure.
+      // Keep the native host poll and the unchanged production 5-ms slice.
+      if (recoveryMs) {
+        if (process.platform !== "win32") {
+          const nativeNow = performance.now.bind(performance);
+          vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+        }
+        const recover = host.agents.recoverPendingArchives.bind(host.agents);
+        vi.spyOn(host.agents, "recoverPendingArchives").mockImplementation((...args) => {
+          const result = recover(...args);
+          elapsed += recoveryMs;
+          return result;
+        });
+      }
       // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
       const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       const nativeSweep = ResidentRequestRetention.prototype.sweep;
@@ -931,6 +956,14 @@ describe("resident orphan retention", () => {
       await host.start();
       // Startup does not inspect archives; the streaming collector runs later.
       expect(fs.existsSync(old)).toBe(true);
+      // This case tests streaming collection, not the separately covered
+      // reference-preparation budget. Finish that synchronous preparation before
+      // the first collector tick so transient live hints cannot skip this sample.
+      const references = host.agents.retentionReferences({ budgetMs: 100, maxEntries: 64 });
+      // Malformed/live fixtures deliberately retain the wildcard; neither
+      // collectable ID may be a transient per-run hint in this first sample.
+      expect(references.has("terminal-old")).toBe(false);
+      expect(references.has("actor-old")).toBe(false);
       await vi.waitFor(() => {
         expect(fs.existsSync(old)).toBe(false);
         expect(fs.existsSync(actor)).toBe(false);

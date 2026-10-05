@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -486,8 +487,8 @@ export const compactTerminalRunEvents = (
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
-      !canRemoveTerminalRun(directory, expired)) return false;
+  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
+      (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -527,6 +528,11 @@ export const compactTerminalRunEvents = (
     if (stat.size <= maxBytes && (retained.length === stat.size ||
         (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
          tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
+    // four redundant status reads for that no-op (native directory order can
+    // put the historical prefix inside the resident run phase).
+    // A real replacement still requires both independent fresh safety walks.
+    if (retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired))) return false;
     // Truncation is now known to be necessary. Reserve the marker's space and
     // drop only complete prefix lines; look behind by one byte so an exactly
     // aligned final event is kept. An oversized final event leaves only a marker.

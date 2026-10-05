@@ -121,7 +121,8 @@ governor derives their lane from the child's cwd, not from a role or a lane envi
 and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
 ordinary task spawned by an actor clears `PI_FABRIC_ACTOR_NAME`, so its governed
 writes count as the task-agent writer, not as the spawning actor. This is write attribution, not an authorization boundary.
-Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override and `SMARTY_READ_CLASS`,
+Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override, `PI_FABRIC_ROLE_SESSION`,
+`PI_FABRIC_ROLE_PROJECT`, and `SMARTY_READ_CLASS`,
 so participant discovery cannot still report the parent's role or critical-read class.
 Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
 
@@ -644,6 +645,28 @@ localterm start
 Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-<id>` branch from the repository containing the selected `cwd`. Fabric writes that worktree at `<repo>/.pi/fabric/worktrees/<id>` so copy-on-write cloning can keep ignored build artifacts on the same volume, and it records the path in the repository `.git/info/exclude` file. Simple `git worktree add` commands run through `pi.bash` take the same clone-first path. Fabric retains worktrees for inspection until you call `agents.cleanup()`. When the selected cwd is a repository subdirectory, Fabric uses the matching subdirectory in the generated worktree when it exists; otherwise it uses the worktree root. The reported effective cwd is the generated worktree path, and Pi evaluates that generated path as its own canonical cwd. The caller's project and mesh roots remain unchanged, so a child targeting another repository still belongs to the orchestrating Fabric topology. A recursive child in a worktree stays in the same participant directory and does not create another `.pi/fabric/mesh` inside that worktree.
 
 [Model-guidance components](components.md#model-facing-guidance-components) can target participants by canonical provider/model. Direct agents and actors retain their role prompt and receive matching append guidance after it. Recursive Pi children load the project components and resolve their own replaceable Fabric execution slot, so the parent does not duplicate guidance. Durable owners use the latest atomically committed guidance snapshot for each launch. Guidance changes prompts only; it cannot widen tools, approvals, or committed capabilities. Task text, message envelopes, run IDs, and timestamps stay out of the guidance system prompt, so repeated runs with the same role, model, and component projection retain a byte-stable prefix.
+
+### Session-bound launch roles
+
+A launch role is not transferable to every history opened by a Pi process. At the first
+`session_start`, Fabric binds the env role (`PI_FABRIC_ROLE`, else stamped `SMARTY_ROLE`)
+to the **native session id and `projectOf(session cwd)`** before any lazy runtime use.
+On `/new`, fork/clone, or resume/switch to a different history, an env-granted root
+publishes `area-lead`, not `project-agent`. Actor adoption, resident-host configuration,
+and completion-recipient metadata use the same checked role. Returning to the exact
+original session/project retains its grant; changing only the cwd to another project
+demotes it too. `PI_FABRIC_PROJECT` and Fabric session/id aliases cannot satisfy this check.
+
+A launcher targeting an existing session can supply both `PI_FABRIC_ROLE_SESSION`
+(the bare native id, without `session:`) and `PI_FABRIC_ROLE_PROJECT` (the exact canonical
+project path). Both compare case-sensitively, without trimming or origin normalization;
+partial/empty metadata fails closed. Older launchers without either field bind their
+first native session, and Fabric records both fields in that process's environment so
+`/reload` cannot rebind an old grant to a new history. The in-memory grant is immutable:
+changing role env during a process does not promote another session. An explicit launcher
+re-grant in a fresh process can authorize the new tuple, and an explicit same-tuple restart
+keeps its role. These non-secret bindings are launch metadata, not proof against arbitrary
+code already running with the host process's privileges.
 
 ## Unified participants and steering
 

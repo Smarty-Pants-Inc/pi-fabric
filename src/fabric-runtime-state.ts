@@ -136,7 +136,7 @@ import {
   type FabricProvider,
   type FabricProviderDiscovery,
 } from "./protocol.js";
-import { participantProject, participantRole } from "./topology/project-identity.js";
+import { participantProject, ParticipantRoleGrant } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
@@ -177,6 +177,7 @@ import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./buil
 const FABRIC_RUNTIME_MODULE_IDENTITY = captureLoadedFileIdentity(import.meta.url);
 
 export interface FabricRuntimeStateOptions {
+  roleGrant?: ParticipantRoleGrant;
   managedHost?: FabricManagedHost;
   activity?: FabricActivityStore;
   prewalk?: PrewalkController;
@@ -200,6 +201,7 @@ const notifyDetached = (context: ExtensionContext, message: string): void => {
 };
 
 export class FabricRuntimeState {
+  readonly #roleGrant: ParticipantRoleGrant;
   #registry: ActionRegistry | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
@@ -259,6 +261,7 @@ export class FabricRuntimeState {
     readonly capturedTools: CapturedToolCatalog,
     options: FabricRuntimeStateOptions = {},
   ) {
+    this.#roleGrant = options.roleGrant ?? new ParticipantRoleGrant();
     this.activity = options.activity ?? new FabricActivityStore();
     this.prewalk = options.prewalk ?? new PrewalkController();
     this.prewalkDrift = options.prewalkDrift ?? new PrewalkDriftTracker();
@@ -430,6 +433,7 @@ export class FabricRuntimeState {
   }
 
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
+    const role = this.#managedHost ? undefined : this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
     this.#suppressResidentGuidanceSync = true;
@@ -767,7 +771,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -936,7 +940,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),
-            role: participantRole(),
+            role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -958,7 +962,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),
-            role: participantRole(),
+            role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -998,7 +1002,7 @@ export class FabricRuntimeState {
             projectRoot,
             mainName: rootParticipantName(this.pi.getSessionName?.()),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
-            ...(participantRole() ? { role: participantRole()! } : {}),
+            ...(role ? { role } : {}),
             project: participantProject(context.cwd),
             meshRoot,
             actorRoot: actorRoots.project,
@@ -1037,7 +1041,7 @@ export class FabricRuntimeState {
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
         // The existing presence heartbeat rereads the Pi name, including renames and clearing.
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
+        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.(), { role }),
       ]);
     }
     this.#participants.registerSource(() =>

@@ -9,6 +9,9 @@ export const taskAgentEnvironment = (environment: NodeJS.ProcessEnv = process.en
   // participantRole prefers this override; leaving it inherited hides the
   // child's task role. A parent's critical-read class is role-specific too.
   delete child.PI_FABRIC_ROLE;
+  // The task role is a new launch grant, never the parent root's session/project binding.
+  delete child.PI_FABRIC_ROLE_SESSION;
+  delete child.PI_FABRIC_ROLE_PROJECT;
   delete child.SMARTY_READ_CLASS;
   // An actor's task child is a task, not another activation of the parent's actor.
   delete child.PI_FABRIC_ACTOR_ID;

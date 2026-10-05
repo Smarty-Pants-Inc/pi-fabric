@@ -195,6 +195,48 @@ describe("F3059 aged absent-root adoption", () => {
     } finally { release(); await staleSave; custody.mockRestore(); }
   });
 
+  it("preserves adopted custody and checkpoint-only history through a registry checkpoint and reload", async () => {
+    const f = await fixture();
+    const actorRoot = path.join(f.root, "actors"), store = new ActorRegistryStore(actorRoot);
+    const history = [{ id: "before-adoption", source: "direct", direction: "in", createdAt: 1, text: "Retain across adoption." }];
+    await store.withLock(() => store.write(store.records().map(row => ({ ...row, messages: history }))));
+    const registry = path.join(actorRoot, "actors.json");
+    const stripHistoryReference = () => {
+      // A legacy owned-row save drops the selecting field, leaving only #486's checkpoint.
+      const saved = JSON.parse(fs.readFileSync(registry, "utf8"));
+      for (const row of saved.actors) delete row.messageHistory;
+      fs.writeFileSync(registry, JSON.stringify(saved));
+    };
+    stripHistoryReference();
+    const archivePath = path.join(actorRoot, f.actor.id, "registry", "messages.jsonl");
+    const headPath = path.join(actorRoot, f.actor.id, "registry", "messages-head.json");
+    const archive = fs.readFileSync(archivePath, "utf8"), historyHead = fs.readFileSync(headPath, "utf8");
+    const next = await f.candidate("checkpoint-successor");
+    await wait(() => next.owns(f.actor.id));
+    const adopted = store.records().find(row => row.id === f.actor.id)!;
+    expect(adopted).toMatchObject({ rootId: "session:checkpoint-successor", ownershipToken: expect.any(String), adoptedAt: expect.any(Number) });
+    next.pauseForRelease();
+    await next.checkpointForRelease();
+    await next.close();
+    expect(store.records().find(row => row.id === f.actor.id)).toMatchObject({
+      rootId: adopted.rootId, ownershipToken: adopted.ownershipToken, adoptedAt: adopted.adoptedAt,
+    });
+    expect(store.records().find(row => row.id === f.actor.id)?.adoptedFrom).toEqual(adopted.adoptedFrom);
+    expect(fs.readFileSync(headPath, "utf8")).toBe(historyHead);
+    stripHistoryReference();
+    const reloaded = await f.candidate("checkpoint-successor");
+    expect(reloaded.owns(f.actor.id)).toBe(true);
+    expect(reloaded.status(f.actor.id).rootId).toBe(adopted.rootId);
+    expect(reloaded.messages(f.actor.id)).toEqual(history);
+    reloaded.pauseForRelease();
+    await reloaded.checkpointForRelease();
+    expect(store.records().find(row => row.id === f.actor.id)).toMatchObject({
+      rootId: adopted.rootId, ownershipToken: adopted.ownershipToken, adoptedAt: adopted.adoptedAt,
+    });
+    expect(fs.readFileSync(archivePath, "utf8")).toBe(archive);
+    expect(fs.readFileSync(headPath, "utf8")).toBe(historyHead);
+  });
+
   it("reaps the root, then two same-project project-agent hosts adopt and run one event exactly once", async () => {
     const f = await fixture();
     expect(f.directory.lineageAlive(oldRoot)).toBe(true);

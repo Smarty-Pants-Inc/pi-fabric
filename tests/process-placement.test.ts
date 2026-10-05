@@ -10,6 +10,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
 import { probeAgentPlacement } from "../src/agents/placement-config.js";
+import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
 afterEach(async () => {
@@ -39,7 +40,7 @@ if (mode === 'launch') {
  console.log(JSON.stringify(fs.existsSync(rc) ? {rc:fs.readFileSync(rc,'utf8').trim(),text:fs.readFileSync(path.join(dir,'result.md'),'utf8')} : {rc:null}));
 } else if (mode === 'bad-poll') { console.log('not JSON'); }
 `;
-const fixture = (pollCommand = false, timeoutMs = 1_000) => {
+const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-")); roots.push(root);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile); vi.stubEnv("PI_CODING_AGENT_DIR", profile);
   const launcher = path.join(root, "launcher.mjs"); fs.writeFileSync(launcher, fake);
@@ -52,7 +53,7 @@ const fixture = (pollCommand = false, timeoutMs = 1_000) => {
   const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, placement: normalizeFabricConfig({agents:{placement:raw}}).agents.placement! };
   const worker = path.join(root, "local.mjs");
   fs.writeFileSync(worker, `import fs from 'node:fs'; const args = new Map(); for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]); const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify({id:args.get('--id'),name:args.get('--name'),task:'local',status:'completed',runner:'pi',transport:'process',cwd:args.get('--cwd'),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:0,text:'LOCAL',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
-  const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs") }); managers.push(manager);
+  const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs"), ...(resolveInheritedSessionPins ? { resolveInheritedSessionPins } : {}) }); managers.push(manager);
   return { root, profile, results, raw, config, manager, launcher };
 };
 const launch = (f: ReturnType<typeof fixture>, task: string, timeoutMs = 80): AgentTransportLaunch => {
@@ -181,6 +182,37 @@ describe("host process task placement", () => {
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
     expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["request", "parent"] as const)("keeps %s account pins local and forwards the resolved snapshot", async source => {
+    const pins = [{ pool: "anthropic", accountId: "explicit-work", label: "Work" }];
+    const resolver = vi.fn(() => source === "parent" ? pins : undefined);
+    const f = fixture(false, 1_000, resolver);
+    const worker = path.join(f.root, "local.mjs");
+    fs.appendFileSync(worker, `fs.writeFileSync(${JSON.stringify(path.join(f.root, "worker-argv.json"))}, JSON.stringify(Object.fromEntries(args)));`);
+    const h = await f.manager.spawn({ task: "pinned", transport: "process", ...(source === "request" ? { inheritedSessionPins: pins } : {}) });
+    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    const argv = JSON.parse(fs.readFileSync(path.join(f.root, "worker-argv.json"), "utf8"));
+    expect(JSON.parse(argv["--inherited-session-pins"])).toEqual(pins);
+    expect(resolver).toHaveBeenCalledTimes(source === "parent" ? 1 : 0);
+    const lines = fs.readFileSync(path.join(f.manager.runDirectory(h.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
+    expect(lines).toEqual([expect.objectContaining({ reason: "inherited account pins require the local worker" })]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["configured", "requested"] as const)("keeps agents.run with %s disabled extensions local using the effective setting", async source => {
+    const f = fixture();
+    if (source === "configured") f.config.extensions = false;
+    const worker = path.join(f.root, "local.mjs");
+    fs.appendFileSync(worker, `fs.writeFileSync(${JSON.stringify(path.join(f.root, "worker-argv.json"))}, JSON.stringify(Object.fromEntries(args)));`);
+    const result = await f.manager.run({ task: "disabled extensions", transport: "process", ...(source === "requested" ? { extensions: false } : {}) });
+    expect(result.text).toBe("LOCAL");
+    expect(JSON.parse(fs.readFileSync(path.join(f.root, "worker-argv.json"), "utf8"))["--extensions"]).toBe("false");
+    const lines = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(line => line.type === "placement.local");
+    expect(lines).toEqual([expect.objectContaining({ reason: "extensions disabled require the local worker" })]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("allows an explicit extension opt-in to override the disabled host default", async () => {
+    const f = fixture(); f.config.extensions = false;
+    expect(await f.manager.run({ task: "enabled", extensions: true, transport: "process" })).toMatchObject({ status: "completed", text: "REMOTE: enabled" });
   });
   it("keeps actor and durable requests local with a recorded reason", async () => {
     const f=fixture();

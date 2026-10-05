@@ -1426,9 +1426,13 @@ export class AgentManager {
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
               ? "actor, routed, or inherited session requires the local worker"
-              : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.extensions === false || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
-                ? "requested worker features cannot be preserved by one-shot placement"
-                : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
+              : inheritedSessionPins?.length
+                ? "inherited account pins require the local worker"
+                : !extensions
+                  ? "extensions disabled require the local worker"
+                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+                    ? "requested worker features cannot be preserved by one-shot placement"
+                    : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,
           onUnconfirmedExit: (reason) => {
             const managed = this.#runs.get(id);

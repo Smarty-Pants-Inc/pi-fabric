@@ -383,6 +383,36 @@ export class RootInbox {
   }
 }
 
+/** Only receipt identity survives the canonical-file scan. Delivered bodies and
+ * arbitrary metadata are already durable in Pi; caching them again defeats its
+ * cold entries. Preserve every field consumed by both receipt readers below. */
+export const projectRootInboxReceipt = (value: unknown): unknown => {
+  const object = (item: unknown): Record<string, unknown> | undefined =>
+    item !== null && typeof item === "object" ? item as Record<string, unknown> : undefined;
+  const carried = (item: unknown): Record<string, unknown> | undefined => {
+    const row = object(item);
+    if (!row) return undefined;
+    const from = object(row.from), data = object(row.data);
+    return {
+      id: row.id, chain: row.chain, deliveryId: row.deliveryId,
+      ...(from ? { from: { id: from.id } } : {}),
+      ...(data ? { data: { key: data.key, ref: data.ref, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
+    };
+  };
+  const entry = object(value);
+  if (!entry) return value;
+  const details = object(entry.details);
+  return {
+    type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
+    ...(details ? { details: {
+      ...carried(details), ids: details.ids, receipts: details.receipts,
+      // Keep malformed shapes unchanged: consumers retain their existing
+      // validation/failure behavior; projection must not manufacture a receipt.
+      items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
+    } } : {}),
+  };
+};
+
 const matchesInboxReceipt = (line: string): boolean =>
   line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE);
 
@@ -390,7 +420,7 @@ const matchesMainReceipt = (line: string): boolean => line.includes(AGENT_MESSAG
 /** Original native carrier IDs, for a retired/dead Main's inbox rotation. This uses
  * the same cached canonical receipt/barrier path as the root shadow inbox. */
 export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId: string): Set<string> => {
-  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt);
+  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt, projectRootInboxReceipt);
   const ids = new Set<string>();
   if (!snapshot.count) return ids;
   type Entry = { type?: string; id?: string; customType?: string; details?: { id?: string; chain?: string; items?: Array<{ id?: string; chain?: string }> } };
@@ -411,7 +441,7 @@ export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId:
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
 export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootInboxSession => {
   try {
-    const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt);
+    const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt);
     return inboxReceiptSession(snapshot.entries, snapshot.count);
   } catch {
     return rootInboxSession([]);

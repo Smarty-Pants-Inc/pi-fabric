@@ -343,8 +343,8 @@ export class FabricRuntimeState {
     return this.#mainAgent.info(context);
   }
 
-  peerInfos(): FabricPeerInfo[] {
-    return this.#participants?.peers() ?? [];
+  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
+    return this.#participants?.peers(undefined, options) ?? [];
   }
 
   /**
@@ -605,7 +605,7 @@ export class FabricRuntimeState {
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
       {
-        readCacheMs: this.#config.mesh.idleReadCoalesceMs,
+        backgroundReadCacheMs: this.#config.mesh.idleReadCoalesceMs,
         readActive: () => !context.isIdle() || context.hasPendingMessages() ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,

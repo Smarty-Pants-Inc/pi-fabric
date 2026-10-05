@@ -9,10 +9,21 @@ routing validation use a process-local canonical snapshot. Stores at the same re
 state path share parsed reader snapshots; abandoned roots use weak references and the
 root-name index is capped at 64. Write transactions never mutate a shared reader snapshot.
 
-Ordinary idle reads retain the existing fixed `mesh.idleReadCoalesceMs` window (default
-5 seconds), with a 1-second floor in runtime/resident stores. Active turns and pending
-messages shorten ordinary background observation reuse to 1 second, rather than disabling
-it. Explicit fresh reads bypass the age window, not the physical-generation gate.
+Ordinary runtime/resident reads are exact on change, including during live invocations:
+no TTL or floor applies to state bindings, ownership, routing, admission or delivery.
+Only explicit `{ background: true }` display observations use `backgroundReadCacheMs`,
+configured from `mesh.idleReadCoalesceMs` (default 5 seconds), with a 1-second floor.
+Active turns and pending messages shorten that background-only window to 1 second.
+Schema hypothesis, verification and commit state bindings explicitly request `{ fresh: true }`.
+Fresh reads bypass the age window, not the physical-generation gate. The existing explicit
+`MeshStoreOptions.readCacheMs` TTL remains supported for callers that choose it; it has
+no new floor, and runtime/resident stores no longer opt into it.
+
+The opt-in consumers are dashboard participant/peer listings, dashboard mesh entries and
+UI cached-state stamp observation. Directory namespaces and participant files inherit the
+opt-in only for those display listings. Heartbeat/publication preparation does **not** opt
+in: migration policy, legacy reader compatibility and ownership affect decisions, even
+though the refresh runs in the background.
 Actor mesh watch notifications and fallback polls are limited to one trailing poll per
 `max(1000, mesh.actorPollMs)` milliseconds; continuous bursts cannot starve the final
 change. Explicit scheduling and paged catch-up remain prompt. Residency delivery drains

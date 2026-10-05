@@ -9,7 +9,7 @@ import { DEFAULT_FABRIC_CONFIG, type FabricSchemaMode } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricState } from "../src/fabric-state.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { SchemaProvider } from "../src/providers/schema-provider.js";
 import type { FabricInvocationContext, FabricProvider } from "../src/protocol.js";
@@ -23,10 +23,10 @@ const identity: MeshIdentity = { id: "session:schema", name: "main", kind: "main
 const sha = (value: string): string =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
-const fixture = (mode: FabricSchemaMode = "enforce", ttl = 30_000) => {
+const fixture = (mode: FabricSchemaMode = "enforce", ttl = 30_000, meshOptions: MeshStoreOptions = {}) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-schema-workspace-"));
   roots.push(cwd);
-  const mesh = new MeshStore(path.join(cwd, ".pi", "fabric", "mesh"), 256 * 1024, 500);
+  const mesh = new MeshStore(path.join(cwd, ".pi", "fabric", "mesh"), 256 * 1024, 500, meshOptions);
   const config = { ...structuredClone(DEFAULT_FABRIC_CONFIG.schema), mode, certificateTtlMs: ttl };
   const state = new StateStore(mesh);
   const controller = new SchemaController(cwd, config, mesh, identity, state);
@@ -283,6 +283,41 @@ describe("Schema transactions", () => {
     ).rejects.toThrow("generation is stale");
   });
 
+  it.each(["idle", "active", "legacy"])("rejects peer-invalidated state binding before any edit with a warm cache (%s)", async policy => {
+    const setup = fixture("enforce", 30_000, policy === "legacy" ? { readCacheMs: 60_000 }
+      : { backgroundReadCacheMs: 5_000, readActive: () => policy === "active" });
+    fs.writeFileSync(path.join(setup.cwd, "a.txt"), "alpha\n");
+    await setup.state.transition({ label: "initial", to: "A", summary: "A" }, identity, setup.cwd);
+    const artifacts = await hypothesisAndCertificate(setup, [{ kind: "file_exists", path: "a.txt" }]);
+    expect(artifacts.verified.verified).toBe(true);
+    const snapshot = setup.mesh.stateToken({ background: true });
+    const otherMesh = new MeshStore(setup.mesh.root, 256 * 1024, 500);
+    const otherState = new StateStore(otherMesh);
+    await otherState.transition({ label: "invalidate", to: "B", summary: "B" }, identity, setup.cwd);
+    expect(setup.mesh.stateToken({ background: true })).toBe(snapshot);
+    const put = vi.spyOn(setup.mesh, "put");
+    await expect(setup.controller.commit({
+      hypothesisId: artifacts.hypothesisId, certificate: artifacts.certificate,
+      operations: [{ kind: "edit", path: "a.txt", oldText: "alpha", newText: "beta", expectedSha256: sha("alpha\n") }],
+      postconditions: [{ kind: "file_contains", path: "a.txt", literal: "beta" }],
+    }, artifacts.context)).rejects.toThrow("Schema state head changed after verification");
+    expect(fs.readFileSync(path.join(setup.cwd, "a.txt"), "utf8")).toBe("alpha\n");
+    expect(put).not.toHaveBeenCalled(); // no certificate consumption or workspace generation commit
+    expect(setup.controller.status().generation).toBe(0);
+    expect(setup.state.getHead({ fresh: true })?.to).toBe("B");
+  });
+
+  it("revalidates Schema verification even with an explicitly configured legacy TTL", async () => {
+    const setup = fixture("enforce", 30_000, { readCacheMs: 60_000 });
+    fs.writeFileSync(path.join(setup.cwd, "a.txt"), "alpha\n");
+    const context = invocation(setup.cwd);
+    const hypothesis = await setup.controller.hypothesize({ label: "state", summary: "state", evidence: [{ kind: "file_exists", path: "a.txt" }] }, context);
+    setup.state.getHead();
+    const peerState = new StateStore(new MeshStore(setup.mesh.root, 256 * 1024, 500));
+    await peerState.transition({ label: "invalidate", to: "B", summary: "B" }, identity, setup.cwd);
+    expect(setup.state.getHead()).toBeNull(); // legacy explicit TTL is genuinely stale
+    expect(await setup.controller.verify(String(hypothesis.hypothesisId), context)).toMatchObject({ verified: false, reason: "state head changed since hypothesis" });
+  });
   it("commits bounded edits, advances generation, and consumes the certificate once", async () => {
     const setup = fixture();
     fs.writeFileSync(path.join(setup.cwd, "a.txt"), "alpha\n");

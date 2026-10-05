@@ -290,7 +290,7 @@ export class FabricState {
   }
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
-  peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
+  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] { return this.#current()?.peerInfos(options) ?? []; }
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle);
   }

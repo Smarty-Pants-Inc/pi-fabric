@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 describe("startup mesh lock selector", () => {
-  it.each([undefined, 1] as const)("%s keeps the B68 v1 wire with exclusive publication and detached release", async (lockProtocol) => {
+  it.each([undefined, 1] as const)("%s keeps B68 v1 acquisition with Linux identity fields and detached release", async (lockProtocol) => {
     const mesh = store(lockProtocol === undefined ? {} : { lockProtocol });
     const lock = path.join(mesh.root, ".lock");
     const mkdir = vi.spyOn(fs, "mkdirSync");
@@ -31,7 +31,13 @@ describe("startup mesh lock selector", () => {
     let token = "";
     await mesh.exclusive(() => {
       const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
-      expect(owner).toMatch(new RegExp(`^[^\\n]+\\n${process.pid}\\n[0-9]+\\n$`));
+      const fields = owner.trim().split("\n");
+      expect(fields.slice(0, 3)).toEqual([expect.any(String), String(process.pid), expect.stringMatching(/^\d+$/)]);
+      expect(fields).toHaveLength(process.platform === "linux" ? 5 : 3);
+      if (process.platform === "linux") {
+        expect(fields[3]).toMatch(/^\d+$/);
+        expect(fields[4]).toBe(fs.readlinkSync("/proc/self/ns/pid"));
+      }
       expect(mkdir).toHaveBeenCalledWith(lock, { mode: 0o700 });
       token = owner.split("\n")[0]!;
       expect(write).toHaveBeenCalledWith(path.join(lock, "owner"), owner, {

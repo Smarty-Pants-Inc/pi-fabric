@@ -560,21 +560,43 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
-store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
-wire without an incarnation: if a dead holder's PID is reused by a live process, v1
-protects the receipt and can time out until trusted repair after fencing all writers/cleaners.
+store. The default remains `1` because the fleet's older readers cannot safely recover
+namespace-bearing receipts; see the [mixed-version audit and rollout order](mesh-lock-rollout.md).
+Selecting `1` does **not** restore the old Linux wire: both protocols already append the
+namespace field. Do not mix these writers with the older readers listed in that audit.
+Protocol 1 keeps the B68 canonical-directory mkdir and leading token/PID/time fields.
+On Linux both protocols append the process start time (kernel clock ticks) and
+PID namespace identity (`/proc/self/ns/pid`, for example `pid:[4026531836]`). Elsewhere
+protocol 1 keeps its three-line wire: a reused live PID protects a dead owner's receipt
+until trusted repair after fencing all writers/cleaners.
 It publishes its owner exclusively and verifies the canonical directory/record
 before entering the critical section. An initializer whose canonical directory has been
 replaced aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` rather than overwriting a successor.
 Protocol 2 uses fully initialized private-directory publication. Both require the complete
 owner record to match and detach the owned directory before recursive release. Recovery
-requires a complete recorded owner and proof that its PID is absent (native `ESRCH`), or
-that its native incarnation differs. An empty directory with no owner record is stale
+requires a complete recorded owner and, for same-namespace or legacy owners, proof that
+its PID is absent (native `ESRCH`), or that its native incarnation differs. On Linux an
+owner in a different PID namespace is never probed via local `kill(pid, 0)` or
+`/proc/<pid>`: those could name an unrelated process. Such an owner remains protected
+**regardless of age**, also when the reader cannot read its own namespace. A stopped
+holder can resume between any token/heartbeat check and a state or event write, so
+neither receipt age nor a missing heartbeat is a death proof or a write fence. The
+previous 120-second foreign-owner expiry has been removed. Timeouts identify these
+holders as `pid N in a foreign pid namespace`, never as an unrelated local process.
+Recovery of an unknown foreign orphan requires trusted repair with **all** possible
+writers/cleaners stopped and prevented from resuming/respawning; killing just the
+apparent local numeric PID is not safe. Automatic dead/incarnation recovery remains
+available to a reader in the owner's namespace.
+Protocol 2 verifies canonical directory identity and the complete receipt after
+publication, before entering the critical section. Its private receipt can age during
+an arbitrarily delayed initialization: its timestamp is diagnostic only, not a recovery
+clock. Pauses before or after publication therefore cannot expire a live/unknown owner.
+An empty directory with no owner record is stale
 strictly after the 30-second grace (source-level `staleLockMs`). Recovery uses atomic
 empty-directory removal, not rename or recursive deletion: an initializer that publishes
 an owner before removal prevents it, even if the recoverer paused after its last check.
 Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecorded
-directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
+directories fail closed; same-namespace recorded live owners never expire. Unrecoverable unrecorded
 orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
 proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
 These safeguards do not repair old B68 binaries still running on the root. Even on

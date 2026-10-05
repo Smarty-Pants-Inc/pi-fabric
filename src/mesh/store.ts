@@ -76,14 +76,14 @@ export interface MeshReadOptions {
 }
 
 export interface MeshStoreOptions {
-  /** Captured at construction, never reloaded. Defaults to B68-compatible protocol 1. */
+  /** Captured at construction, never reloaded. Defaults to 1 pending the namespace-reader rollout. */
   lockProtocol?: MeshLockProtocol;
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
-  /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
+  /** Grace for an empty ownerless directory; same-namespace live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
@@ -109,6 +109,9 @@ const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
+// Recorded owners have no hold lease. Age (including a missing heartbeat) cannot
+// prove a stopped foreign holder is dead or fence its eventual writes. Unknown
+// foreign owners therefore stay protected until trusted, fully fenced repair.
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
@@ -151,9 +154,30 @@ const PROCESS_STATES: Record<string, string> = {
   Z: "zombie", X: "dead", I: "idle",
 };
 
-// Names the holder in a lock timeout. A live holder is never taken over (a resumed
-// holder could commit stale state), so a stuck one must be found and restarted from
-// outside; tonight's stopped holder (smarty-dev#266) only showed up as expired sessions.
+// Read at actual lock use, not import/registration. Missing /proc cannot prove that
+// a recorded namespace is ours; namespace-aware receipts then remain protected.
+const ownPidNamespace = (): string | undefined => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const namespace = fs.readlinkSync("/proc/self/ns/pid");
+    return /^pid:\[\d+\]$/.test(namespace) ? namespace : undefined;
+  } catch { return undefined; }
+};
+
+// Linux publication stays synchronous, including protocol 1's immediate first attempt.
+const ownLinuxProcessStart = (): string | undefined => {
+  try {
+    const stat = fs.readFileSync("/proc/self/stat", "utf8");
+    const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    return validProcessIncarnation(start) ? start : undefined;
+  } catch { return undefined; }
+};
+
+const foreignPidNamespace = (namespace: string | undefined): boolean =>
+  process.platform === "linux" && namespace !== undefined && namespace !== ownPidNamespace();
+
+// Names the holder in a lock timeout. Same-namespace live holders never expire:
+// a stuck one must be found and restarted externally (smarty-dev#266).
 // ponytail: the process state comes from Linux /proc; other platforms report the PID only.
 const describeLockHolder = (ownerPath: string): string => {
   let owner: string;
@@ -162,11 +186,13 @@ const describeLockHolder = (ownerPath: string): string => {
   } catch {
     return " (lock directory has no owner record)";
   }
-  const [, pidText, createdText] = owner.trim().split("\n");
+  const [, pidText, createdText, , namespace] = owner.trim().split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return " (lock owner record is unreadable)";
   const createdAt = Number(createdText);
   const held = Number.isFinite(createdAt) ? ` for ${Math.max(0, Math.round((Date.now() - createdAt) / 1000))} s` : "";
+  // Never describe a different host process that happens to have this numeric PID.
+  if (foreignPidNamespace(namespace)) return ` held by pid ${pid} in a foreign pid namespace (${namespace})${held}`;
   if (!processAlive(pid)) return ` held by pid ${pid} (not running)${held}`;
   let state = "";
   try {
@@ -1852,8 +1878,15 @@ export class MeshStore {
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
-    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    const namespace = ownPidNamespace();
+    const startTime = process.platform === "linux" ? ownLinuxProcessStart()
+      : this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
+    // Preserve the first three legacy fields and the v2 start-time slot. Linux
+    // appends its PID namespace in both acquisition protocols; other OSes keep their wire.
+    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${namespace ? `${startTime ?? ""}\n${namespace}\n` : startTime ? `${startTime}\n` : ""}`;
+    const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+      code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
+    });
     const releaseOwned = (): void => {
       try {
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
@@ -1880,12 +1913,9 @@ export class MeshStore {
       lastAttemptAt = attemptAt;
       try {
         if (this.#lockProtocol === 1) {
-          // Keep the B68 three-line wire, but never overwrite an owner published by a
+          // Keep the B68 acquisition path, but never overwrite an owner published by a
           // successor while this initializer was stopped after canonical mkdir.
           fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-          const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
-            code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
-          });
           try {
             const directory = fs.lstatSync(this.#lockPath);
             fs.writeFileSync(ownerPath, ownerRecord, {
@@ -1909,6 +1939,7 @@ export class MeshStore {
           // resume its owner write through a name that legacy recovery gave to a successor.
           const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
           try {
+            const directory = fs.lstatSync(staging);
             fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
               encoding: "utf8", flag: "wx", mode: 0o600,
             });
@@ -1924,6 +1955,17 @@ export class MeshStore {
             // New-format competitors publish nonempty owners atomically. This does not fence
             // old-format writers that create an empty canonical after the absence check.
             fs.renameSync(staging, this.#lockPath);
+            // Publication may be delayed arbitrarily: the staged receipt's time is
+            // diagnostic only, never an expiry clock. A pause on either side of
+            // rename cannot make a live/unknown owner reclaimable. Verify canonical
+            // identity before entering, just as protocol 1 does.
+            const current = fs.lstatSync(this.#lockPath);
+            if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
+              fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
+          } catch (error) {
+            releaseOwned();
+            if (errorCode(error) === "ENOENT") throw ownershipLost();
+            throw error;
           } finally {
             fs.rmSync(staging, { recursive: true, force: true });
           }
@@ -1984,23 +2026,33 @@ export class MeshStore {
         return true;
       }
       const fields = owner.split("\n");
-      const [token, pidText, createdText, startText] = fields;
+      const [token, pidText, createdText, startText, namespace] = fields;
       // An in-flight/torn fourth line is not evidence of PID reuse.
       const recordedStart = owner?.endsWith("\n") ? startText : undefined;
       const pid = Number(pidText);
       const validPid = Number.isSafeInteger(pid) && pid > 0;
-      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5) &&
+      const validOwner = owner?.endsWith("\n") &&
+        (fields.length === 4 || fields.length === 5 ||
+          (fields.length === 6 && namespace !== undefined && /^pid:\[\d+\]$/.test(namespace))) &&
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
-      if (processAlive(pid)) {
+      const ownerStat = fs.statSync(ownerPath);
+      if (foreignPidNamespace(fields.length === 6 ? namespace : undefined)) {
+        // /proc/<pid> and kill(pid, 0) would inspect an unrelated local process.
+        // No elapsed time, token comparison or heartbeat can fence a stopped holder
+        // between its last ownership check and its next state/event write. Refuse
+        // reclaim even for an ancient receipt or when our own namespace is unknown.
+        return false;
+      } else if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         const actualStart = await processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
-        return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
+        return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&
+          readOwner() === owner && fs.statSync(ownerPath).mtimeMs === ownerStat.mtimeMs;
       };
       if (!unchanged()) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;

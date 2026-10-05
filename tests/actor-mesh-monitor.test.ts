@@ -38,6 +38,51 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it.skipIf(process.platform === "win32").each([250, 1_600])("bounds watch bursts to max(1 s, actorPollMs=%i) and retains the trailing change", async actorPollMs => {
+    const s = setup();
+    s.monitor.config.actorPollMs = actorPollMs;
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    s.monitor.start(); await flush();
+    const call = vi.mocked(fs.watch).mock.calls[0]! as unknown[];
+    const notify = call.at(-1) as (event: string, filename: string | null) => void;
+    const window = Math.max(1_000, actorPollMs);
+    for (let burst = 0; burst < 3; burst++) {
+      for (let elapsed = 0; elapsed < window; elapsed += 100) {
+        notify("change", elapsed === 0 ? null : "events.jsonl");
+        notify("rename", "state.read-signal.json"); // unrelated files do not schedule polls
+        await vi.advanceTimersByTimeAsync(Math.min(100, window - elapsed));
+      }
+      expect(s.mesh.tail).toHaveBeenCalledTimes(burst + 2);
+    }
+    // A final, isolated change inside the next window must be consumed without another notification.
+    const final = { topic: "last" } as MeshEvent;
+    await vi.advanceTimersByTimeAsync(100);
+    s.mesh.tail.mockReturnValue({ events: [final], nextOffset: 20 });
+    notify("change", "events.jsonl");
+    await vi.advanceTimersByTimeAsync(window - 101);
+    expect(s.onEvent).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.onEvent).toHaveBeenCalledExactlyOnceWith(final);
+    notify("change", "events.jsonl"); // close cancels the pending trailing wake
+    s.monitor.close();
+    await vi.advanceTimersByTimeAsync(window * 2);
+    expect(s.onEvent).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("uses the same 1 s floor on the Windows polling path", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const s = setup(); s.monitor.start(); await flush();
+      expect(fs.watch).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(s.mesh.tail).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
   it("3864 holds the event boundary when the lease is lost during dispatch", async () => {
     const s = setup('{"format":1,"cursor":3}');
     let leased = true;
@@ -86,7 +131,9 @@ describe("ActorMeshMonitor", () => {
     await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count);
+    await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     s.monitor.schedule();
     s.monitor.close();
@@ -217,7 +264,9 @@ describe("ActorMeshMonitor", () => {
     s.monitor.start();
     await flush();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(1);
   });
@@ -527,12 +576,13 @@ describe("ActorManager idle checkpoints", () => {
     const poll = async () => {
       const finished = new Promise<void>((resolve) => { pollFinished = resolve; });
       watcher.emit("change", "change", "events.jsonl");
-      if (process.platform === "win32") await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1_000);
       await finished;
     };
     const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { cursor: number; last?: { sequence: number; id: string } };
     const from = { id: "session:peer", name: "main", kind: "main" as const };
-    return { mesh, actors, agents, actor, run, firstRun, allRuns, release, cursorPath, cursor, from, poll };
+    const notify = () => watcher.emit("change", "change", "events.jsonl");
+    return { mesh, actors, agents, actor, run, firstRun, allRuns, release, cursorPath, cursor, from, poll, notify };
   };
 
   it("real manager ignores unrelated appends but immediately checkpoints a relevant skip and direct event", async () => {
@@ -544,8 +594,10 @@ describe("ActorManager idle checkpoints", () => {
       for (let index = 0; index < 40; index++) {
         const event = await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
         if (index === 0) firstIgnored = event;
-        await s.poll();
+        if (index === 0) await s.poll();
+        else s.notify(); // one burst inside the next fixed poll window
       }
+      await s.poll();
       // An empty seed is safe at sequence zero; the first real ignored event anchors
       // immediately, then the remaining unrelated burst stays batched.
       expect(initial.last).toEqual({ sequence: 0, id: "" });

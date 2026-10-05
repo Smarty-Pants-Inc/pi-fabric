@@ -309,7 +309,7 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
-  /** Maximum age of idle observational mesh/participant snapshots; 0 disables reuse. */
+  /** Idle observational age; runtimes enforce a 1 s floor, including active turns. */
   idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
   bridgeControlTimeoutMs: number;

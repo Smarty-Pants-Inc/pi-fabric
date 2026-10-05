@@ -735,10 +735,13 @@ Native `new`/`resume` session replacement records its explicit `targetSessionFil
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
 
 Idle observations of shared state and participant files reuse a snapshot for at most
-`mesh.idleReadCoalesceMs` (default 5000 ms; range 0–10000, 0 disables reuse). File changes and
-UI remote-generation checks do not bypass that window while Main is idle. A running turn or
-pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
-always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
+`mesh.idleReadCoalesceMs` (default 5000 ms; accepted range 0–10000, with a 1000 ms runtime
+floor). File changes and UI remote-generation checks do not bypass that window while Main
+is idle. A running turn or pending Main message shortens it to 1000 ms; explicit fresh
+reads for CAS, ownership and delivery always bypass it. Actor watch/fallback polling and
+residency delivery drains run at most once per `max(1000, mesh.actorPollMs)` ms, retaining
+a trailing wake for the last change in a burst; explicit scheduling/catch-up stays prompt.
+Listings can lag by this window; expiration does not slide on cache hits.
 Fresh readers revalidate canonical physical generation instead of parsing an unchanged file
 again. Stores share parsed reader snapshots within a process, and a bounded optional read
 journal advances changed snapshots incrementally. Missing/legacy/invalid journals fall back

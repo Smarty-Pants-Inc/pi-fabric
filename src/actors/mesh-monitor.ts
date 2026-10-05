@@ -6,6 +6,7 @@ import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
 const MESH_WATCH_RECONCILE_MS = 2_000;
+const MESH_BACKGROUND_POLL_MS = 1_000;
 const CURSOR_CHECKPOINT_MS = 10_000;
 type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
@@ -20,6 +21,8 @@ export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
+  #watchTimer: NodeJS.Timeout | undefined;
+  #lastPollAt = Number.NEGATIVE_INFINITY;
   #offset: number;
   #scheduled = false;
   #polling = false;
@@ -80,20 +83,20 @@ export class ActorMeshMonitor {
     if (this.#started || this.#closed || !this.config.enabled) return;
     this.#started = true;
     if (process.platform === "win32") {
-      this.#startTimer(this.config.actorPollMs);
+      this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
       this.schedule();
       return;
     }
     try {
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (filename !== null && path.basename(filename.toString()) !== "events.jsonl") return;
-        this.schedule();
+        this.#scheduleBackground();
       });
       this.#watcher = watcher;
       watcher.on("error", () => this.#fallback(watcher));
       this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
     } catch {
-      this.#startTimer(this.config.actorPollMs);
+      this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
     }
     this.schedule();
   }
@@ -111,6 +114,8 @@ export class ActorMeshMonitor {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#watchTimer) clearTimeout(this.#watchTimer);
+    this.#watchTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     if (this.#started) this.#persistCursor(true);
@@ -126,22 +131,40 @@ export class ActorMeshMonitor {
     });
   }
 
+  // One trailing wake per fixed window, not a resetting debounce: a continuous burst
+  // cannot postpone the last change forever. Explicit schedule()/catch-up stays prompt.
+  #scheduleBackground(): void {
+    if (this.#watchTimer || this.#closed || !this.config.enabled) return;
+    const wait = this.#lastPollAt + Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs) - Date.now();
+    if (wait <= 0) {
+      this.schedule();
+      return;
+    }
+    this.#watchTimer = setTimeout(() => {
+      this.#watchTimer = undefined;
+      // An explicit poll may have run while waiting; retain the trailing notification.
+      this.#scheduleBackground();
+    }, wait);
+    this.#watchTimer.unref();
+  }
+
   #fallback(watcher: FSWatcher): void {
     if (this.#closed || this.#watcher !== watcher) return;
     watcher.close();
     this.#watcher = undefined;
-    this.#startTimer(this.config.actorPollMs);
-    this.schedule();
+    this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
+    this.#scheduleBackground();
   }
 
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
-    this.#timer = setInterval(() => this.schedule(), delay);
+    this.#timer = setInterval(() => this.#scheduleBackground(), delay);
     this.#timer.unref();
   }
 
   async #poll(): Promise<void> {
     if (this.#polling || this.#closed || !this.config.enabled) return;
+    this.#lastPollAt = Date.now();
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
     this.#polling = true;
     try {

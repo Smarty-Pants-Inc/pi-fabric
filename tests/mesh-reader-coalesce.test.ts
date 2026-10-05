@@ -111,18 +111,37 @@ describe("idle reader coalescing (smarty-dev#4383)", () => {
     expect(s.count()).toBe(count + 1);
   });
 
-  it("bypasses coalescing on active/pending-operation demand and resumes idle reuse", () => {
+  it("bounds active/pending observations to a fixed 1 s window and resumes idle reuse", () => {
+    vi.useFakeTimers({ now: 1_000_000 });
     const s = setup(); s.replace("before"); s.reader.get("status");
     s.replace("turn"); s.setActive(true);
-    expect(s.reader.readCacheMs).toBe(0);
-    expect(s.reader.get("status")?.value).toBe("turn");
-    s.replace("pending");
+    expect(s.reader.readCacheMs).toBe(1_000);
+    const initial = s.count();
+    for (let tick = 1; tick <= 9; tick++) {
+      vi.setSystemTime(1_000_000 + tick * 100); s.replace(tick);
+      expect(s.reader.get("status")?.value).toBe("before");
+      expect(s.reader.listAll("status")[0]?.value).toBe("before");
+    }
+    expect(s.count()).toBe(initial);
+    vi.setSystemTime(1_001_000); s.replace("pending");
     expect(s.reader.listAll("status")[0]?.value).toBe("pending");
+    expect(s.count()).toBe(initial + 1);
+    s.replace("fresh");
+    expect(s.reader.get("status", { fresh: true })?.value).toBe("fresh");
     s.setActive(false);
     expect(s.reader.readCacheMs).toBe(5_000);
     const count = s.count(); s.replace("idle");
-    expect(s.reader.get("status")?.value).toBe("pending");
+    expect(s.reader.get("status")?.value).toBe("fresh");
     expect(s.count()).toBe(count);
+  });
+
+  it("does not let an idle runtime configuration of 0 disable the background floor", () => {
+    const s = setup(); s.replace("before");
+    const reader = new MeshStore(s.root, 64 * 1024, 100, { readCacheMs: 0, readActive: () => false });
+    expect(reader.readCacheMs).toBe(1_000);
+    reader.get("status"); s.replace("after");
+    expect(reader.get("status")?.value).toBe("before");
+    expect(reader.get("status", { fresh: true })?.value).toBe("after");
   });
 
   it("never coalesces fresh ownership/delivery snapshots, including legacy copied generations", () => {

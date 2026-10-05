@@ -98,7 +98,7 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
-  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  /** A live turn/pending operation shortens the idle window to 1 s; fresh reads still bypass it. */
   readActive?: () => boolean;
   /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
   writeReadJournal?: boolean;
@@ -132,10 +132,12 @@ const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
  * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
  * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
  * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
- * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * Main messages shorten it to 1 s; CAS, ownership and delivery still request canonical freshness.
  * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
 export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
+/** Floor for runtime background observations, including active turns (smarty-dev#4383). */
+export const MIN_BACKGROUND_MESH_READ_CACHE_MS = 1_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -691,7 +693,9 @@ export class MeshStore {
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
   get readCacheMs(): number {
-    return this.#readActive?.() ? 0 : this.#readCacheMs;
+    if (!this.#readActive) return this.#readCacheMs;
+    return this.#readActive() ? MIN_BACKGROUND_MESH_READ_CACHE_MS
+      : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, this.#readCacheMs);
   }
 
   /** Time until an idle observer may revalidate; hits do not slide this deadline. */

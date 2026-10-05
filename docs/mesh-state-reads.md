@@ -10,8 +10,15 @@ state path share parsed reader snapshots; abandoned roots use weak references an
 root-name index is capped at 64. Write transactions never mutate a shared reader snapshot.
 
 Ordinary idle reads retain the existing fixed `mesh.idleReadCoalesceMs` window (default
-5 seconds). Fresh reads and active/pending-message observations bypass that age window,
-not the physical-generation gate. Unchanged canonical metadata reuses the parse instead
+5 seconds), with a 1-second floor in runtime/resident stores. Active turns and pending
+messages shorten ordinary background observation reuse to 1 second, rather than disabling
+it. Explicit fresh reads bypass the age window, not the physical-generation gate.
+Actor mesh watch notifications and fallback polls are limited to one trailing poll per
+`max(1000, mesh.actorPollMs)` milliseconds; continuous bursts cannot starve the final
+change. Explicit scheduling and paged catch-up remain prompt. Residency delivery drains
+use the same interval floor; participant change refreshes already coalesce for 1 second.
+
+Unchanged canonical metadata reuses the parse instead
 of repeatedly opening/decoding megabytes. Metadata includes device, inode, size and
 nanosecond mtime/ctime. One bounded 192-byte header observes the UUID and optional journal
 hash when that physical identity changes. Namespace signal indexes also reuse their

@@ -527,7 +527,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    // Cold spawn admission is not the operation whose deadline this case tests.
+    // Worker/cold spawn admission is setup, not the abandonment deadline being tested.
     // Keep the 500ms cleanup deadline, but do not spend it loading a new worker.
     const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;

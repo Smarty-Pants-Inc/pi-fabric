@@ -380,6 +380,10 @@ export const ROOT_COLLISION_TOPIC = "fabric.topology.root-collision";
 
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
+  /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
+  renewActorParticipants?: boolean;
+  /** Registry -> mesh/key lock order: retain actor custody through every publication write. */
+  withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -537,7 +541,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const startedAt = Date.now();
     this.#refreshStartedAt = startedAt;
     if (!full) this.#changeRefreshAt = startedAt;
-    const operation = this.#refresh(full);
+    const operation = this.options.withPublicationFence
+      ? this.options.withPublicationFence(() => this.#refresh(full)) : this.#refresh(full);
     const settled = operation.then(() => undefined);
     settled.catch(() => undefined);                            // awaiters still see a failure
     this.#refreshing = settled;
@@ -1440,9 +1445,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const key = keyFor(PARTICIPANT_PREFIX, record.id);
       const current = existingById.get(record.id);
       const currentFile = ownParticipant(filesByKey.get(key));
-      if (filesOnly
+      // A resident's fence, not its Main's lease, owns these actors. External routing
+      // readers still use participant envelope freshness; retain actor activity time
+      // in the value, and do not turn change-only refreshes into heartbeats (#5128).
+      const renewActor = full && this.options.renewActorParticipants === true && !this.#quiescing &&
+        record.kind === "actor" && record.rootId === this.options.rootId;
+      if (!renewActor && (filesOnly
         ? !current && currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
-        : current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
+        : current && JSON.stringify(current.participant) === JSON.stringify(record))) continue;
       const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key, read));
       // Before the switch the shared state arbitrates ownership (its compare-and-swap), so it
       // decides occupancy: a stale file of this host never hides a newer owner there, and never
@@ -1462,11 +1472,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ) continue;
       if (filesOnly) {
         // A file write does not take the mesh lock, so it does not count as a shared change.
-        if (current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
+        if (renewActor || current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
         else if (activityOf(currentFile, record)) activityWrites.push(record);
         continue;
       }
-      if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
+      if (renewActor || !current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
       else if (activityOf(current.participant, record)) activity = true;
       // Liveness belongs to the host lease. A host renewal or another participant's real
       // change must not republish this record just because its source stamped updatedAt.

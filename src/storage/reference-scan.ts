@@ -31,6 +31,7 @@ export class RetentionReferenceScan {
   #nextRefresh = 0;
   #refs = new Set<string>();
   #complete = false;
+  #retry = false;
   #expired: () => boolean = () => true;
   readonly intervalMs = 60_000;
   rebuilds = 0;
@@ -45,7 +46,7 @@ export class RetentionReferenceScan {
     }
   }
 
-  snapshot(generation: string, scan: (protect: (id: string, actorId?: string) => void, expired: () => boolean) => Generator<void>,
+  snapshot(generation: string, scan: (protect: (id: string, actorId?: string) => void, expired: () => boolean, retry: () => void) => Generator<void>,
     options: { now?: number; budgetMs?: number; maxEntries?: number; refresh?: boolean } = {}): Set<string> {
     const now = options.now ?? Date.now();
     const started = performance.now();
@@ -57,7 +58,7 @@ export class RetentionReferenceScan {
       this.close(); this.#generation = generation; this.#refs = new Set(); this.#complete = false;
     }
     if (!this.#complete && !this.#cursor) {
-      this.rebuilds++;
+      this.rebuilds++; this.#retry = false;
       const protect = (id: string, actorId?: string) => {
         // Returning/copying a reference set must be bounded too. Overflow vetoes
         // everything rather than truncating custody references silently.
@@ -65,7 +66,7 @@ export class RetentionReferenceScan {
           if (this.#refs.size < 1024) this.#refs.add(value); else this.#refs.add("*");
         }
       };
-      this.#cursor = scan(protect, () => this.#expired());
+      this.#cursor = scan(protect, () => this.#expired(), () => { this.#retry = true; });
     }
     try {
       for (let count = 0; this.#cursor && count < (options.maxEntries ?? 64) && !expired(); count++) {
@@ -73,7 +74,7 @@ export class RetentionReferenceScan {
           // Keep the generation captured when the cursor started. A change
           // during preparation queues a fresh delta on the next call, even if
           // the factory has already reconciled filesystem additions.
-          this.#cursor = undefined; this.#complete = true; this.#nextRefresh = now + this.intervalMs;
+          this.#cursor = undefined; this.#complete = true; this.#nextRefresh = this.#retry ? now : now + this.intervalMs;
         }
       }
     } catch { this.#refs.add("*"); this.close(); this.#complete = true; this.#nextRefresh = now + this.intervalMs; }

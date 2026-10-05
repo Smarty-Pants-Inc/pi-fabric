@@ -102,6 +102,49 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
   } catch { return; }
 };
 
+/** A stable visible PID list is not a complete census. Require a real,
+ * unfiltered procfs rooted in the initial PID/user/cgroup namespaces and the
+ * host init's mount namespace. Linux reserves these initial namespace inodes;
+ * an unknown kernel/view is a veto, never a fallback to visible PIDs. Comparing
+ * PID 1's mount namespace also excludes host-PID containers/private mounts.
+ * Repeat the whole observation around BOTH censuses, not just at preflight. */
+const linuxProcessCensusFence = async (procRoot: string): Promise<string | undefined> => {
+  try {
+    if (!await unaliasedDirectory(procRoot) || (await fsp.statfs(procRoot)).type !== 0x9fa0) return;
+    const namespaces: string[] = [];
+    for (const [name, initial] of [["pid", "pid:[4026531836]"], ["user", "user:[4026531837]"], ["cgroup", "cgroup:[4026531835]"]] as const) {
+      const value = await fsp.readlink(path.join(procRoot, "self", "ns", name));
+      if (value !== initial) return;
+      namespaces.push(value);
+    }
+    const mountNamespace = await fsp.readlink(path.join(procRoot, "self", "ns", "mnt"));
+    if (!/^mnt:\[\d+\]$/.test(mountNamespace) || mountNamespace !== await fsp.readlink(path.join(procRoot, "1", "ns", "mnt"))) return;
+    namespaces.push(mountNamespace);
+    const mountinfo = await fsp.readFile(path.join(procRoot, "self", "mountinfo"), "utf8");
+    if (mountinfo.length > 1024 * 1024) return;
+    const decode = (value: string) => value.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+    let roots = 0;
+    for (const line of mountinfo.trim().split("\n")) {
+      const [before, after] = line.split(" - ");
+      if (!before || !after) return;
+      const fields = before.split(" "), superblock = after.split(" ");
+      const target = decode(fields[4] ?? "");
+      if (target === procRoot) {
+        if (++roots !== 1 || decode(fields[3] ?? "") !== "/" || superblock[0] !== "proc") return;
+        const options = `${fields[5]},${superblock[2]}`.split(",");
+        if (options.some(option => option.startsWith("hidepid=") && option !== "hidepid=0" || option.startsWith("subset="))) return;
+      } else if (target.startsWith(procRoot + path.sep)) {
+        // Only kernel-global subtrees may be separately mounted. A bind mount
+        // over a PID/task, self, or any unknown part can hide custody.
+        if (!/^(sys|fs|irq|bus)(\/|$)/.test(target.slice(procRoot.length + 1))) return;
+      }
+    }
+    if (roots !== 1) return;
+    const stat = await fsp.stat(procRoot);
+    return JSON.stringify([namespaces, stat.dev, stat.ino, mountinfo]);
+  } catch { return; }
+};
+
 /** Full Linux /proc observation, including open descriptors, cwd/root and mmap
  * after fd close. Permission errors are UNKNOWN (not absence). procRoot is an
  * injection seam for isolated tests, never a configurable production bypass. */
@@ -185,7 +228,9 @@ export const linuxRunFilesIdle = async (directories: readonly string[], procRoot
   // Both censuses include TIDs, not only process leaders. New/reused tasks
   // invalidate the proof; disappeared tasks have released their custody.
   try {
-    if (!await census(false) || !await census(true) || expired()) return false;
+    const fence = await linuxProcessCensusFence(procRoot);
+    if (!fence || !await census(false) || await linuxProcessCensusFence(procRoot) !== fence ||
+        !await census(true) || await linuxProcessCensusFence(procRoot) !== fence || expired()) return false;
     for (const directory of directories) if (!await unaliasedDirectory(directory)) return false;
     return true;
   }

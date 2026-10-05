@@ -14,8 +14,11 @@ fresh targeted writer/tree proof (including indexed actor runs) within its own
 2-ms/64-run budget. In-place nested/status changes are therefore fenced even
 without a run-set mtime change. Regular compaction/deletion retains the existing
 native worker-exit, descendant, result preservation and actor-reference fences.
-A unit interrupted after reference preparation/recovery can retry on two later
-ticks; oversized tree-proof units are retained without starving later entries.
+An interrupted proof resumes at its failed predicate, not at the initial status
+read. Each predicate can retry on two later ticks; timed-out units veto the
+current snapshot and retry on the next completed delta pass rather than becoming
+60-second cached ownership facts. Oversized tree-proof units are retained without
+starving later entries.
 Pending full-result custody records have **no** 1-MiB protocol cutoff: recovery
 retains its nested DFS continuation and reads one source in 64-KiB chunks across
 count/time slices. Parsing and atomic sink discharge use a one-record slow path.
@@ -62,6 +65,12 @@ All of the following are required:
   uncertainty, not proof of absence. The census is rechecked for newly born or
   reused task identities (TIDs), including threads with private fd tables. A
   1-second/32,768-entry proof limit yields a veto, not partial authorization.
+  Before and around both censuses, a procfs mount/namespace fence requires an
+  actual procfs, an unfiltered mount rooted at `/`, initial Linux PID/user/cgroup
+  namespaces, and the same mount namespace as host PID 1. `hidepid` other than
+  zero, `subset`, process-subtree overmounts, private/container namespaces and
+  unreadable topology all veto; two stable visible PID lists are not completeness
+  evidence. Mount/namespace changes during either census veto as well.
   Unsupported platforms and restricted /proc skip automatically.
 
 `archive-retention.json` records checked/archived/skipped counts, incomplete

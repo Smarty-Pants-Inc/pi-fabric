@@ -25,7 +25,28 @@ const run = (root: string, id: string, record: Record<string, unknown> = {}) => 
   fs.writeFileSync(path.join(dir, "events.jsonl"), Buffer.from([0, 255, 10, 65, 66]), { mode: 0o600 });
   return dir;
 };
-const emptyProc = (root: string) => { const dir = path.join(root, "proc"); fs.mkdirSync(dir, { mode: 0o700 }); return dir; };
+const emptyProc = (root: string) => {
+  const dir = path.join(root, "proc"); fs.mkdirSync(dir, { mode: 0o700 });
+  // An isolated complete view includes the same topology evidence as production.
+  // Only the filesystem type syscall is mocked; mount/namespace checks run in full.
+  fs.mkdirSync(path.join(dir, "self", "ns"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "1", "ns"), { recursive: true });
+  for (const [name, value] of Object.entries({ pid: "pid:[4026531836]", user: "user:[4026531837]", cgroup: "cgroup:[4026531835]", mnt: "mnt:[4026531841]" })) {
+    fs.symlinkSync(value, path.join(dir, "self", "ns", name));
+  }
+  fs.symlinkSync("mnt:[4026531841]", path.join(dir, "1", "ns", "mnt"));
+  fs.writeFileSync(path.join(dir, "self", "mountinfo"), `26 31 0:24 / ${dir} rw - proc proc rw\n`);
+  const stat = `1 (init) ${["Z", ...Array(18).fill("0"), "100"].join(" ")}`;
+  fs.writeFileSync(path.join(dir, "1", "stat"), stat);
+  fs.mkdirSync(path.join(dir, "1", "task", "1"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "1", "task", "1", "stat"), stat);
+  const statfs = fsp.statfs;
+  vi.spyOn(fsp, "statfs").mockImplementation((...args: Parameters<typeof statfs>) => {
+    if (String(args[0]) === dir) return Promise.resolve({ type: 0x9fa0 } as Awaited<ReturnType<typeof statfs>>);
+    return statfs(...args);
+  });
+  return dir;
+};
 const archiver = (root: string, procRoot: string, options = {}) => new ResidentLegacyRunArchive(root, {}, {
   isRetained: () => false, processFilesIdle: dirs => linuxRunFilesIdle(dirs, procRoot), ...options,
 });
@@ -67,7 +88,9 @@ describe("bounded retention reference preparation", () => {
     } finally { timing.mockRestore(); cursor.mockRestore(); await manager.close(); }
   });
 
-  it("historical tail progresses under new runs and UI/status activity, then safely expires an acknowledged exchange", async () => {
+  it.each(["native", "win32"])("historical tail progresses under new runs and UI/status activity, then safely expires an acknowledged exchange (%s)", async platform => {
+    const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const root = temporary(), count = 4096;
     for (let i = 0; i < count; i++) run(root, `history-${i}`, { sessionId: "2147483647" });
     const cursor = fs.opendirSync(path.join(root, "runs")); let tail = "";
@@ -98,7 +121,11 @@ describe("bounded retention reference preparation", () => {
           const outcome = await manager.run({ task: `ordinary UI/status activity ${slice}`, transport: "process" });
           manager.status(outcome.id); manager.listForUi();
         }
-        const live = manager.retentionReferences({ now, budgetMs: 2, maxEntries: 64 }); lastRefs = live;
+        // This exercises activity/cursor correctness, not filesystem latency.
+        // A 2-ms turn cannot guarantee four 5-read disk proofs on Windows.
+        // Keep the count bound and every ownership/read assertion; the 20k
+        // test below independently exercises the production 2-ms budget.
+        const live = manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 }); lastRefs = live;
         if (!live.has("*")) {
           complete = true;
           expect(manager.retentionCustodyVeto(tail)).toBe(false);
@@ -124,8 +151,51 @@ describe("bounded retention reference preparation", () => {
       const held = run(root, "new-pending", { sessionId: "2147483647" });
       fs.writeFileSync(path.join(held, "archive-pending.json"), "{}");
       expect(manager.retentionCustodyVeto("new-pending")).toBe(true);
-    } finally { fs.readFileSync = original; retention.close(); await manager.close(); }
+    } finally {
+      fs.readFileSync = original; retention.close();
+      try { await manager.close(); } finally { Object.defineProperty(process, "platform", nativePlatform); }
+    }
   }, 30_000);
+
+  it("resumes at a timed-out predicate without rereading the prepared historical prefix", async () => {
+    const root = temporary(); run(root, "boundary-run", { sessionId: "2147483647" });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: path.join(root, "runs") });
+    let clock = 0, reads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const result = read(...args);
+      if (String(args[0]) === path.join(root, "runs", "boundary-run", "status.json") && ++reads === 5) clock += 3;
+      return result;
+    });
+    try {
+      let refs = manager.retentionReferences({ now, budgetMs: 2 });
+      expect(refs.has("*")).toBe(true); expect(reads).toBe(5);
+      for (let slice = 0; slice < 4 && refs.has("*"); slice++) refs = manager.retentionReferences({ now, budgetMs: 2 });
+      expect(refs.has("*")).toBe(false); expect(reads).toBeLessThanOrEqual(8);
+    } finally { vi.restoreAllMocks(); await manager.close(); }
+  });
+
+  it("retries transient custody on the next pass without caching a timeout for 60 seconds", async () => {
+    const root = temporary(); run(root, "retry-run", { sessionId: "2147483647" });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: path.join(root, "runs") });
+    let clock = 0, slow = true, reads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const result = read(...args);
+      if (String(args[0]) === path.join(root, "runs", "retry-run", "status.json")) { reads++; if (slow) clock += 3; }
+      return result;
+    });
+    try {
+      for (let slice = 0; slice < 8; slice++) expect(manager.retentionReferences({ now, budgetMs: 2 }).has("*")).toBe(true);
+      const failedReads = reads; slow = false;
+      let refs = new Set(["*"]);
+      for (let slice = 0; slice < 8 && refs.has("*"); slice++) refs = manager.retentionReferences({ now, budgetMs: 2 });
+      expect(reads).toBeGreaterThan(failedReads); expect(refs.has("*")).toBe(false);
+      expect(manager.retentionCustodyVeto("retry-run")).toBe(false);
+    } finally { vi.restoreAllMocks(); await manager.close(); }
+  });
 
   it("crossing the refresh interval mid-walk preserves the prepared historical prefix", async () => {
     const root = temporary();
@@ -216,6 +286,45 @@ it("Windows has no /proc archival proof and safely leaves every legacy byte in p
 });
 
 describe.skipIf(process.platform !== "linux")("legacy run archive proof", () => {
+  it.each(["hidepid=1", "hidepid=2", "hidepid=4", "hidepid=ptraceable", "subset=pid"])("vetoes invisible file custody in a filtered procfs view (%s)", async option => {
+    const root = temporary(), dir = run(root, "invisible-holder"), proc = emptyProc(root);
+    // The holder is omitted entirely, not a visible PID returning EACCES.
+    const fd = fs.openSync(path.join(dir, "events.jsonl"), "a");
+    const mountinfo = path.join(proc, "self", "mountinfo");
+    fs.writeFileSync(mountinfo, `26 31 0:24 / ${proc} rw - proc proc rw,${option}\n`);
+    const archive = archiver(root, proc);
+    try {
+      expect(fs.readdirSync(proc).filter(name => /^\d+$/.test(name))).toEqual(["1"]);
+      expect(await linuxRunFilesIdle([], proc)).toBe(false);
+      expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+      await archive.sweep(now, 32, 1000);
+      expect(archive.health.archived).toBe(0); expect(archive.health.processProofIncomplete).toBe(1);
+      expect(fs.existsSync(dir)).toBe(true); expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
+      fs.writeSync(fd, "invisible writer retained\n");
+      expect(fs.readFileSync(path.join(dir, "events.jsonl"), "utf8")).toContain("invisible writer retained");
+    } finally { fs.closeSync(fd); await archive.close(); }
+  });
+
+  it.each(["pid", "user", "cgroup", "mnt"])("vetoes a container/restricted %s namespace despite a stable visible census", async namespace => {
+    const root = temporary(), dir = run(root, "namespace-held"), proc = emptyProc(root);
+    const link = path.join(proc, "self", "ns", namespace);
+    fs.unlinkSync(link); fs.symlinkSync(`${namespace}:[999999]`, link);
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+  });
+
+  it("fences a procfs view that becomes filtered between task censuses", async () => {
+    const root = temporary(), dir = run(root, "view-changed"), proc = emptyProc(root);
+    const open = fsp.opendir;
+    let censuses = 0;
+    vi.spyOn(fsp, "opendir").mockImplementation((...args: Parameters<typeof open>) => {
+      if (String(args[0]) === proc && ++censuses === 2) {
+        fs.writeFileSync(path.join(proc, "self", "mountinfo"), `26 31 0:24 / ${proc} rw - proc proc rw,hidepid=2\n`);
+      }
+      return open(...args);
+    });
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(false); expect(censuses).toBe(2);
+  });
+
   it("inspects every live task and every fd, including a private table after an unrelated descriptor", async () => {
     const root = temporary(), dir = run(root, "task-private-fd"), proc = emptyProc(root);
     const group = path.join(proc, "123"), stat = (id: number) => `${id} (fixture) ${["S", ...Array(18).fill("0"), "100"].join(" ")}`;

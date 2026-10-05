@@ -2048,7 +2048,7 @@ export class AgentManager {
     const now = options.now ?? Date.now();
     if (options.refresh) this.#retentionWatermarkRefresh = 0;
     const generation = this.#retentionGeneration();
-    const refs = this.#referenceScan.snapshot(generation, (protect, expired) => this.#scanRetentionReferences(protect, expired, now), options);
+    const refs = this.#referenceScan.snapshot(generation, (protect, expired, retry) => this.#scanRetentionReferences(protect, expired, retry, now), options);
     // Expose a readable owner while its tree proof is suspended, without
     // baking a transient deadline fence into the completed snapshot.
     if (this.#retentionSliceHint) {
@@ -2105,7 +2105,7 @@ export class AgentManager {
     return expired();
   }
 
-  *#scanRetentionReferences(protect: (id: string, actorId?: string) => void, expired: () => boolean, now: number): Generator<void> {
+  *#scanRetentionReferences(protect: (id: string, actorId?: string) => void, expired: () => boolean, retry: () => void, now: number): Generator<void> {
     // Refresh only at a factory boundary: crossing the interval while the
     // historical walk is suspended must not erase its already-visited prefix.
     if (now >= this.#retentionWatermarkRefresh) {
@@ -2124,19 +2124,37 @@ export class AgentManager {
       if (!ids) this.#retentionActors.set(actorId, ids = new Set());
       ids.add(id);
     };
+    // Resume at the failed predicate, not at the status read for the whole
+    // unit. Slow filesystems can consume a slice in any one synchronous call.
+    // Such a timeout is a protective hint for this snapshot, never a 60-second
+    // cached ownership fact; retry it on a later completed factory/delta pass.
+    let incomplete = false;
+    function* proof(check: () => boolean): Generator<void, boolean> {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (expired()) yield;
+        const result = check();
+        if (!expired()) return result;
+        if (attempt < 2) yield;
+      }
+      incomplete = true; retry(); return false;
+    }
     for (const queued of this.#queued.values()) {
+      incomplete = false;
       index(queued.info.id, queued.info.actorId);
-      if (!queued.terminal || queued.cleanupPending || !boundedRunTree(path.join(this.#runRoot, queued.info.id), expired) || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id), 0, expired)) {
+      if (!queued.terminal || queued.cleanupPending || !(yield* proof(() => boundedRunTree(path.join(this.#runRoot, queued.info.id), expired))) ||
+          !(yield* proof(() => !hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id), 0, expired)))) {
         protect(queued.info.id, queued.info.actorId);
       }
       yield;
     }
     for (const managed of this.#runs.values()) {
+      incomplete = false;
       index(managed.id, managed.actorId);
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
       if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
-          unconfirmedProcess || !boundedRunTree(managed.runDirectory, expired) || runTreeExitVeto(managed.runDirectory, 0, expired, true)) protect(managed.id, managed.actorId);
+          unconfirmedProcess || !(yield* proof(() => boundedRunTree(managed.runDirectory, expired))) ||
+          !(yield* proof(() => !runTreeExitVeto(managed.runDirectory, 0, expired, true)))) protect(managed.id, managed.actorId);
       yield;
     }
     // Reconcile activity with a persistent identity watermark. Directory
@@ -2160,29 +2178,24 @@ export class AgentManager {
               const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}:${stat.ctimeMs}`;
               let prepared = this.#retentionWatermark.get(entry.name);
               if (prepared?.identity !== identity) {
-                // A unit reached at the slice boundary gets a fresh turn,
-                // rather than caching a transient timeout as permanent custody.
-                for (let attempt = 0; ; attempt++) {
-                  const status = ownedStat(path.join(run, "status.json"));
-                  const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
-                  // Publish the actor ownership hint before the bounded native/tree
-                  // proof. A time slice may interrupt that proof, but it must not
-                  // omit an already-readable owner from the conservative snapshot.
-                  const actorId = record?.actorId;
-                  index(entry.name, actorId);
-                  const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
-                    ? Number(record.sessionId) : undefined;
-                  prepared = { identity, actorId,
-                    held: !(pid !== undefined && !processAlive(pid) && boundedRunTree(run, expired) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) };
-                  // The incomplete snapshot already has a wildcard fence.
-                  // Do not make a transient deadline fence permanent if the
-                  // same unit succeeds after yielding into a fresh slice.
-                  if (pid === undefined || !expired() || attempt >= 2) break;
-                  this.#retentionSliceHint = { id: entry.name, actorId };
-                  yield;
-                  this.#retentionSliceHint = undefined;
-                }
-                this.#retentionWatermark.set(entry.name, prepared);
+                incomplete = false;
+                const status = ownedStat(path.join(run, "status.json"));
+                const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
+                // Keep the readable owner visible while individual proof stages
+                // yield. The fresh collection veto remains independent of this
+                // cached preparation and rechecks the exact current run tree.
+                const actorId = record?.actorId;
+                index(entry.name, actorId);
+                const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+                  ? Number(record.sessionId) : undefined;
+                this.#retentionSliceHint = { id: entry.name, actorId };
+                prepared = { identity, actorId,
+                  held: !(pid !== undefined && !processAlive(pid) &&
+                    (yield* proof(() => boundedRunTree(run, expired))) &&
+                    (yield* proof(() => !runTreeExitVeto(run, 0, expired, true))) &&
+                    (yield* proof(() => canRemoveTerminalRun(run, expired)))) };
+                this.#retentionSliceHint = undefined;
+                if (!incomplete) this.#retentionWatermark.set(entry.name, prepared);
                 index(entry.name, prepared.actorId);
                 if (prepared.held) protect(typeof prepared.actorId === "string" && /^[A-Za-z0-9_-]+$/.test(prepared.actorId) ? entry.name : "*", prepared.actorId);
                 yield;

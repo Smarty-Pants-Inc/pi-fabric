@@ -150,6 +150,55 @@ const emit = async (handlers: Map<string, ExtensionHandler[]>, event: string, co
 };
 
 describe("Fabric tool display lifecycle", () => {
+  it("applies the principal-view settings row through the registered controller", async () => {
+    const harness = createHarness();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "principal-settings-"));
+    fs.mkdirSync(path.join(cwd, ".pi")); fs.mkdirSync(path.join(cwd, "agent"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({
+      ui: { principalView: "on", enabled: false }, components: [], prewalk: { enabled: false },
+      mesh: { enabled: false }, agents: { enabled: false }, mcp: { enabled: false },
+    }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("PI_FABRIC_ROLE", "org");
+    try {
+      await piFabric(harness.pi);
+      const getToolsExpanded = vi.fn(() => true);
+      const setToolsExpanded = vi.fn();
+      const context = {
+        mode: "tui", cwd, isProjectTrusted: () => true, hasUI: true,
+        ui: { setStatus: vi.fn(), notify: vi.fn(), getToolsExpanded, setToolsExpanded },
+        sessionManager: { getBranch: () => [], getSessionId: () => "principal-settings-test" },
+      } as unknown as ExtensionContext;
+      settingsSaveId.current = "ui.principalView";
+      await commandHandlerOf(harness.pi)("settings", context);
+      expect(getToolsExpanded).toHaveBeenCalledOnce();
+      expect(setToolsExpanded.mock.calls).toEqual([[false]]);
+      expect(context.ui.setStatus).toHaveBeenCalledWith("fabric-principal-view", "principal view · Ctrl+Alt+P");
+    } finally {
+      settingsSaveId.current = "ui.toolDisplay";
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+  it.each([false, true])("refreshes incoming message settings through the host while preserving tool expansion=%s", async expanded => {
+    const harness = createHarness();
+    await piFabric(harness.pi);
+    const getToolsExpanded = vi.fn(() => expanded);
+    const setToolsExpanded = vi.fn();
+    const context = {
+      mode: "code", cwd: process.cwd(), isProjectTrusted: () => true, hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), getToolsExpanded, setToolsExpanded },
+      sessionManager: { getBranch: () => [], getSessionId: () => "settings-test" },
+    } as unknown as ExtensionContext;
+    settingsSaveId.current = "ui.incomingMessages";
+    try {
+      await commandHandlerOf(harness.pi)("settings", context);
+      expect(getToolsExpanded).toHaveBeenCalledOnce();
+      expect(setToolsExpanded.mock.calls).toEqual([[!expanded], [expanded]]);
+    } finally {
+      settingsSaveId.current = "ui.toolDisplay";
+    }
+  });
   it("drops abandoned-branch invalidators when session_tree rebuilds the transcript", async () => {
     const harness = createHarness();
     await piFabric(harness.pi);

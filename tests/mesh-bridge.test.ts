@@ -386,7 +386,8 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     const waiting = new Promise<void>((resolve) => { entered = resolve; });
     const batch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation((input) => { entered(); return batch(input); });
-    const pass = bridge.step();
+    // Connect already reconciled presence; explicitly hold the next presence write.
+    const pass = (async () => { await bridge.syncPresence(); return bridge.step(); })();
     await waiting;
     // Real store lock contention, with 20 s of lease time advanced deterministically.
     // Remote file renewals bypass the hub's lock, just like the production heartbeat.
@@ -1444,6 +1445,7 @@ describe("mesh bridge", () => {
       const held = new Promise<void>((resolve) => (release = resolve));
       let asked!: () => void;
       const presenceAsked = new Promise<void>((resolve) => (asked = resolve));
+      let holdPresence = false;
       const b = setup(undefined, {
         hub, remoteName: "ryzen2",
         wrapRemote: (remote) => ({
@@ -1454,13 +1456,16 @@ describe("mesh bridge", () => {
           bridgedIds: (after) => remote.bridgedIds(after),
           close: (error) => remote.close(error),
           presence: async () => {
-            asked();
-            await held;
+            if (holdPresence) {
+              asked();
+              await held;
+            }
             return remote.presence();
           },
         }),
       });
       await b.bridge.start();
+      holdPresence = true; // Hold the periodic pass, not the new connect reconciliation.
       await addRoot(b.far, "x"); // B claims X ...
       const pass = b.bridge.step();
       await presenceAsked; // ... B has read the hub; X is still free.
@@ -1503,8 +1508,8 @@ describe("mesh bridge", () => {
     };
     const { far, bridge, remote } = setup(undefined, { hub, stopMs: 200 });
     const forgeRoot = await addRoot(far, "forge-main");
-    await bridge.start();
-    const pass = bridge.step().catch((error: Error) => error);
+    // The first mirror now runs during connect; stopping must fence that write too.
+    const pass = bridge.start().catch((error: Error) => error);
     await inBatch;
     remote.close(new Error("transport failed"));
     const stopped = bridge.stop();

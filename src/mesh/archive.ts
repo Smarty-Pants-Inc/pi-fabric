@@ -17,9 +17,15 @@ import type { MeshEvent } from "./store.js";
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
  *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json durable per-file SHA-256 state and counters
  *   <dir>/DIGEST-REPAIR.json              deferred oversized legacy line (read off-lock)
+ *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  positive event-identity abort markers
+ *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and advisory live confirmation
  *
- * A publish commits when its event reaches the live log. Before that, the archive holds it
- * durably but no reader sees it; a publish that fails or crashes first is cut back out.
+ * A publish normally commits when its event reaches the live log. Ordinary recovery cuts
+ * pending appends back out; a keyed intent retry can first complete the live publication.
+ * Old writers can restore/compact a live event without confirming its sidecar. Thus a false
+ * marker (or PENDING) never hides archived bytes within the live sequence horizon and never
+ * proves non-publication. An overtaken exact archive identity is retained, not republished:
+ * prefer one archive delivery to loss when archive-only and old-compacted are ambiguous.
  * The mesh root enables the archive with `event-archive.json` ({ "version": 1, "dir": "/abs" }),
  * so every store of that root archives, whatever its process's configuration.
  * New writers call read-only preflights before acquiring the publish lock; mutation and
@@ -27,6 +33,7 @@ import type { MeshEvent } from "./store.js";
  * ignore the new checkpoint/repair metadata, so optimistic reads are validated against them.
  */
 export const MESH_ARCHIVE_CONFIG = "event-archive.json";
+const MESH_ARCHIVE_SEQUENCE_INDEX = "sequence-index";
 
 export interface MeshArchiveEntry {
   event: MeshEvent;
@@ -42,6 +49,20 @@ export interface MeshArchivePending {
   digestBefore?: DigestCheckpoint;
   /** Installed durably only after the live append has committed. */
   digestAfter?: DigestCheckpoint;
+  /** New writers index the append before it can go live. Old writers ignore this field. */
+  indexed?: true;
+  /** Keyed publications also record their live commit in the sequence sidecar. */
+  dedupe?: true;
+}
+
+interface MeshArchiveIndexEntry {
+  sequence: number;
+  id: string;
+  file: string;
+  offset: number;
+  length: number;
+  /** New-writer confirmation only. False cannot disprove an old-writer live recovery. */
+  committed?: boolean;
 }
 
 interface ArchiveHead {
@@ -100,6 +121,14 @@ const fileIdentity = (stat: fs.Stats): string =>
 
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : undefined;
+
+export class MeshArchiveLookupUnavailableError extends Error {
+  readonly retryable = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "MeshArchiveLookupUnavailableError";
+  }
+}
 
 const pad = (value: number): string => String(value).padStart(2, "0");
 
@@ -245,17 +274,20 @@ export class MeshArchive {
       const { digest } = this.#repairAndLoadDigest(descriptor, relative);
       const before = fs.fstatSync(descriptor);
       pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: before.size,
-        digestBefore: structuredClone(digest) };
+        digestBefore: structuredClone(digest), indexed: true,
+        ...(entry.event.dedupeKey ? { dedupe: true as const } : {}) };
       this.#advanceDigest(descriptor, relative, digest, { bytes: ARCHIVE_DIGEST_SLICE_BYTES });
       const fresh = pending.size === 0;
       this.#appendDigest(digest, pending.size, entry);
       pending.digestAfter = digest;
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
-      writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
+      const bytes = Buffer.from(`${entry.line}\n`, "utf8");
+      writeAll(descriptor, bytes);
       fs.fdatasyncSync(descriptor);
+      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) });
       if (fresh) this.#syncDays(relative);
     } catch (error) {
-      fs.closeSync(descriptor);
+      if (descriptor !== undefined) fs.closeSync(descriptor);
       descriptor = undefined;
       if (pending) this.#cutBack(pending);
       throw error;
@@ -266,13 +298,23 @@ export class MeshArchive {
   }
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
-  commit(pending: MeshArchivePending): void {
+  commit(pending: MeshArchivePending, sealClosedDays = true): void {
     if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)));
+    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id);
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
-    this.#sealClosedDays(pending.file);
+    if (sealClosedDays) this.#sealClosedDays(pending.file);
+  }
+
+  /** A direct live anchor (or a synced reboot promotion) proves publication, not just append. */
+  confirmLive(sequence: number, id: string): void {
+    const indexed = this.#readJson<MeshArchiveIndexEntry | { absent: true }>(path.relative(this.dir, this.#indexPath(sequence)));
+    // Old catch-ups had no sidecar; only new reserved entries need this transition.
+    if (!indexed || "absent" in indexed) return;
+    if (indexed.id !== id) throw new MeshArchiveLookupUnavailableError("Cannot commit a mismatched archive sequence index");
+    if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true });
   }
 
   /** The event never went live: cut it back out of its file. */
@@ -368,6 +410,10 @@ export class MeshArchive {
     for (const day of this.#days()) {
       const directory = path.join(this.dir, day);
       identities.push({ file: day, identity: fileIdentity(fs.statSync(directory)) });
+      const abortedFile = `${day}/ABORTED.json`;
+      const abortedStat = fs.statSync(path.join(this.dir, abortedFile), { throwIfNoEntry: false });
+      identities.push({ file: abortedFile, identity: abortedStat ? fileIdentity(abortedStat) : "missing" });
+      const aborted = this.#readJson<Record<string, string>>(abortedFile);
       const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
       if (seal && Math.max(0, ...Object.values(seal.files).map(file => file.lastSequence)) <= lastLive) continue;
       for (const name of fs.readdirSync(directory).filter(entry => entry.endsWith(".jsonl"))) {
@@ -395,7 +441,7 @@ export class MeshArchive {
               const event = parseEvent(line);
               if (!event) continue;
               if (event.sequence <= lastLive) { done = true; break; }
-              found.set(event.id, { event, line, file });
+              if (aborted?.[event.sequence] !== event.id) found.set(event.id, { event, line, file });
             }
           }
         } finally { fs.closeSync(descriptor); }
@@ -411,7 +457,7 @@ export class MeshArchive {
     }
     for (const { file, identity } of plan.identities) {
       const stat = fs.statSync(path.join(this.dir, file), { throwIfNoEntry: false });
-      if (!stat || identity !== fileIdentity(stat)) throw new MeshArchiveRecoveryChanged();
+      if (identity !== (stat ? fileIdentity(stat) : "missing")) throw new MeshArchiveRecoveryChanged();
     }
   }
 
@@ -430,11 +476,14 @@ export class MeshArchive {
    * BOOT-mismatch reads and torn-tail boundaries must be prepared off-lock. Validation under
    * this lock fences old and new writers before any mutation; a raced snapshot is retried.
    * The store then calls recovered(), which records this boot.
+   *
+   * rebootOnly defers same-boot pending cleanup, so an exact keyed retry can settle
+   * its intent AFTER reboot promotion without ordinary cutback erasing its evidence.
    */
-  recover(lastLive: number, plan?: MeshArchiveRecoveryPlan): MeshArchiveRecovery {
+  recover(lastLive: number, plan?: MeshArchiveRecoveryPlan, rebootOnly = false): MeshArchiveRecovery {
     const pending = this.pending();
     if (this.#readText("BOOT") === currentBoot()) {
-      if (pending) {
+      if (pending && !rebootOnly) {
         if ((this.head()?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
         else this.#cutBack(pending);
       }
@@ -455,7 +504,8 @@ export class MeshArchive {
   }
 
   /** After a new boot's recovery: the promoted events are live. Records the boot, durably. */
-  recovered(last: (MeshArchiveEntry & { file: string }) | undefined): void {
+  recovered(last: (MeshArchiveEntry & { file: string }) | undefined, promoted: MeshArchiveEntry[] = []): void {
+    for (const { event } of promoted) if (event.dedupeKey) this.confirmLive(event.sequence, event.id);
     if (last) this.#writeHead({ sequence: last.event.sequence, id: last.event.id, file: last.file });
     writeDurable(path.join(this.dir, "BOOT"), currentBoot());
   }
@@ -492,12 +542,23 @@ export class MeshArchive {
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
+        const bytes = Buffer.from(`${line}\n`, "utf8");
         if (previous && (previous.sequence > event.sequence || (previous.sequence === event.sequence && previous.id === event.id))) {
+          // Recovery may have rolled an indexed pending line back out before catch-up.
+          // The exact last line can repair its sidecar without scanning this file.
+          if (event.dedupeKey && previous.sequence === event.sequence && previous.id === event.id) {
+            fs.fdatasyncSync(file.descriptor);
+            this.#writeIndex(event.sequence, { sequence: event.sequence, id: event.id, file: relative, offset: fs.fstatSync(file.descriptor).size - bytes.length, length: bytes.length, committed: true });
+          }
           continue;
         }
-        const size = fs.fstatSync(file.descriptor).size;
-        writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
-        this.#appendDigest(file.digest, size, { event, line });
+        const offset = fs.fstatSync(file.descriptor).size;
+        writeAll(file.descriptor, bytes);
+        this.#appendDigest(file.digest, offset, { event, line });
+        if (event.dedupeKey) {
+          fs.fdatasyncSync(file.descriptor);
+          this.#writeIndex(event.sequence, { sequence: event.sequence, id: event.id, file: relative, offset, length: bytes.length, committed: true });
+        }
         file.last = { sequence: event.sequence, id: event.id };
       }
       for (const { descriptor, relative, digest } of open.values()) {
@@ -519,13 +580,101 @@ export class MeshArchive {
   }
 
   /**
+   * Directly resolves one exact reserved sequence through the sidecar index. This deliberately
+   * reads only the indexed archive line; it never scans archive topic files. A missing index is
+   * an unavailable proof, not evidence that the event was not committed.
+   */
+  lookup(sequence: number): MeshEvent | undefined {
+    return this.lookupEntry(sequence)?.event;
+  }
+
+  /** Exact archived bytes and advisory new-writer confirmation, never absence evidence. */
+  lookupEntry(sequence: number): (MeshArchiveEntry & { committed: boolean }) | undefined {
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new MeshArchiveLookupUnavailableError("Invalid mesh archive sequence lookup");
+    const indexPath = this.#indexPath(sequence);
+    let indexed: MeshArchiveIndexEntry | { sequence: number; absent: true };
+    try {
+      this.#requireRoot();
+      if (fs.statSync(indexPath).size > 4096) throw new Error("Oversized archive sequence index");
+      indexed = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+      if (typeof indexed !== "object" || indexed === null || Array.isArray(indexed)) throw new Error("Invalid archive sequence index");
+    } catch {
+      throw new MeshArchiveLookupUnavailableError(`Mesh archive sequence index is unavailable: ${indexPath}`);
+    }
+    if (indexed.sequence !== sequence) throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
+    // Missing/corrupt sidecars are UNKNOWN. Only this durable negative reservation proves lack.
+    if ("absent" in indexed && indexed.absent === true) return undefined;
+    if (!("file" in indexed) || typeof indexed.id !== "string" || typeof indexed.file !== "string" ||
+        !/^\d{4}\/\d{2}\/\d{2}\/[^/\\]+\.jsonl$/.test(indexed.file) ||
+        !Number.isSafeInteger(indexed.offset) || indexed.offset < 0 ||
+        !Number.isSafeInteger(indexed.length) || indexed.length < 1 || indexed.length > 64 * 1024 * 1024 ||
+        (indexed.committed !== undefined && typeof indexed.committed !== "boolean")) {
+      throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
+    }
+    if (this.#readJson<Record<string, string>>(`${indexed.file.split("/").slice(0, 3).join("/")}/ABORTED.json`)?.[sequence] === indexed.id) return undefined;
+    let descriptor: number | undefined;
+    try {
+      const file = path.join(this.dir, indexed.file);
+      descriptor = fs.openSync(file, "r");
+      const available = fs.fstatSync(descriptor).size - indexed.offset;
+      // An old writer can cut PENDING back without updating its new sidecar. The file
+      // ending at/before that address proves absence; a torn line after it does not.
+      if (available <= 0) return undefined;
+      let bytes = Buffer.allocUnsafe(Math.min(indexed.length, available));
+      let count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+      let newline = bytes.subarray(0, count).indexOf(0x0a);
+      // The old writer may reuse that address for a differently sized event. Resolve
+      // only this one bounded line, never search the segment for the missing identity.
+      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < 64 * 1024 * 1024) {
+        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024));
+        count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+        newline = bytes.subarray(0, count).indexOf(0x0a);
+      }
+      if (newline < 0) throw new Error("short archive line");
+      const line = bytes.subarray(0, newline).toString("utf8");
+      const event = parseEvent(line);
+      if (!event) throw new Error("invalid archive line");
+      if (event.sequence !== sequence || event.id !== indexed.id) return undefined;
+      if (newline + 1 !== indexed.length) throw new Error("archive index length mismatch");
+      const pending = this.pending();
+      return { event, line, committed: indexed.committed ?? !(pending?.sequence === sequence && pending.id === event.id) };
+    } catch (error) {
+      if (error instanceof MeshArchiveLookupUnavailableError) throw error;
+      throw new MeshArchiveLookupUnavailableError(`Mesh archive sequence ${sequence} is unavailable`);
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * Record a positively established abort, never inferred from a false commit marker.
+   * Keep its bytes/addresses intact, but durably hide it before declaring the reservation
+   * absent. The day marker also covers a death before the negative sidecar is installed.
+   */
+  abort(entry: MeshArchiveEntry): void {
+    const indexed = this.#readJson<MeshArchiveIndexEntry>(path.relative(this.dir, this.#indexPath(entry.event.sequence)));
+    if (!indexed || indexed.id !== entry.event.id || typeof indexed.file !== "string") {
+      throw new MeshArchiveLookupUnavailableError("Cannot abort an unavailable archive sequence index");
+    }
+    const day = indexed.file.split("/").slice(0, 3).join("/");
+    const aborted = this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) ?? {};
+    writeFileAtomic(path.join(this.dir, day, "ABORTED.json"), JSON.stringify({ ...aborted, [entry.event.sequence]: entry.event.id }), { durable: true });
+    this.reserveLookup(entry.event.sequence);
+    const pending = this.pending();
+    if (pending?.sequence === entry.event.sequence && pending.id === entry.event.id) {
+      fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+    }
+  }
+
+  /**
    * Committed events after a sequence, in sequence order, for reads older than the live log.
-   * `through` is the newest live sequence: nothing past it, and no pending event, is committed.
+   * `through` is the newest live sequence: nothing past it is published. Within that
+   * horizon, only a positive abort hides an event; old writers may leave stale metadata.
    */
   readAfter(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): MeshEvent[] {
-    const pendingId = this.pending()?.id;
     const found: MeshEvent[] = [];
     for (const day of this.#days()) {
+      const aborted = this.#readJson<Record<string, string>>(`${day}/ABORTED.json`);
       const directory = path.join(this.dir, day);
       const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
       if (seal && Math.max(0, ...Object.values(seal.files).map((file) => file.lastSequence)) <= after) continue;
@@ -544,7 +693,7 @@ export class MeshArchive {
         }
         for (const line of completeLines(text)) {
           const event = parseEvent(line);
-          if (event && event.sequence > after && event.sequence <= through && event.id !== pendingId && matches(event)) {
+          if (event && event.sequence > after && event.sequence <= through && this.#isPublished(event, aborted) && matches(event)) {
             dayEvents.push(event);
           }
         }
@@ -553,6 +702,12 @@ export class MeshArchive {
       if (found.length >= limit) break;
     }
     return found.slice(0, limit);
+  }
+
+  // Old recovery can leave PENDING/committed:false on an already-live event. Neither
+  // is negative evidence. Only this exact positive abort may hide archived bytes.
+  #isPublished(event: MeshEvent, aborted: Record<string, string> | undefined): boolean {
+    return aborted?.[event.sequence] !== event.id;
   }
 
   // The event's day, but never a day before `floor`, the head's day: every sealed day is
@@ -603,10 +758,25 @@ export class MeshArchive {
       const absolute = path.join(this.dir, pending.file);
       truncateTo(absolute, pending.size);
       if (pending.digestBefore) this.#saveDigest(pending.file, pending.digestBefore, fs.statSync(absolute));
+      if (pending.indexed) this.reserveLookup(pending.sequence);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     }
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+  }
+
+  /** Install a durable proof of non-append before creating a publication intent. */
+  reserveLookup(sequence: number): void {
+    this.#requireRoot();
+    this.#writeIndex(sequence, { sequence, absent: true });
+  }
+
+  #indexPath(sequence: number): string {
+    return path.join(this.dir, MESH_ARCHIVE_SEQUENCE_INDEX, String(Math.floor(sequence / 1024)), `${sequence}.json`);
+  }
+
+  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }): void {
+    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable: true });
   }
 
   #readJson<T>(relative: string): T | undefined {

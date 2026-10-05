@@ -769,6 +769,9 @@ describe("registered fabric_exec compact transcript rendering", () => {
     const args = { code: "const currentPresentation = true;" };
     const context = renderContext(args);
     const resultContext = renderContext(args);
+    // Pi's ToolExecutionComponent.getRenderContext creates fresh callbacks but
+    // shares its rendererState across call/result and preference re-renders.
+    resultContext.state = context.state;
     const result = {
       content: [] as Array<{ type: "text"; text: string }>,
       details: { success: true, audits: [], phases: [] },

@@ -733,19 +733,50 @@ const main = async (): Promise<void> => {
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
-  const toolCallStreamGuard = new ToolCallStreamGuard((error) => {
-    if (terminalStatus) return;
+  let whitespaceStalls = 0;
+  let pendingWhitespaceStall: import("./worker/tool-call-stream-guard.js").RunawayToolCallStreamError | undefined;
+  let resumedModel: string | undefined;
+  let resumedThinking: typeof thinking;
+  const createToolCallStreamGuard = (): InstanceType<typeof ToolCallStreamGuard> => new ToolCallStreamGuard((error) => {
+    if (terminalStatus || pendingWhitespaceStall) return;
+    whitespaceStalls++;
+    const canRetry = whitespaceStalls === 1 && options.runner === "pi" && modelControl.ready &&
+      piSessionFile && fs.existsSync(piSessionFile) && record.model &&
+      record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight";
+    const stall = { runId: options.id, taskId: options.id, attempt: whitespaceStalls,
+      action: canRetry ? "retry" : "failed", errorCode: error.code, error: error.message,
+      model: error.model, effort: error.effort, bytes: error.bytes,
+      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex };
+    emitLifecycle("stall.whitespace-toolcall", stall);
+    appendLog(`${JSON.stringify({ type: "stall.whitespace-toolcall", ...stall })}\n`);
+    if (canRetry) {
+      // Abort this owned execution, then drain its entire group before the
+      // exact-session restart below. Never replay the original task or tools.
+      pendingWhitespaceStall = error;
+      piControlLive = false;
+      recoveryWatchdog.suspend();
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = undefined;
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      update();
+      terminateChild(child, "SIGTERM");
+      killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+      killTimer.unref();
+      child.stdin?.end();
+      return;
+    }
     terminalStatus = "failed";
-    terminalError = error.message;
-    record.error = error.message;
+    terminalError = `${error.message}; ${whitespaceStalls > 1
+      ? "whitespace tool-call stall repeated after one same-model retry"
+      : "cannot safely retry without an admitted model and idle durable Pi session"}; terminating child`;
+    record.error = terminalError;
     record.errorCode = error.code;
     update();
-    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", errorCode: error.code,
-      error: error.message, model: error.model, effort: error.effort, bytes: error.bytes,
-      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex })}\n`);
-    process.stderr.write(`${error.name}: ${error.message}\n`);
+    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", ...stall, error: terminalError })}\n`);
+    process.stderr.write(`${error.name}: ${terminalError}\n`);
     killChild();
   }, () => ({ model: record.model ?? "unknown", effort: record.thinking ?? "unknown" }));
+  let toolCallStreamGuard = createToolCallStreamGuard();
   const killChild = (): void => {
     recoveryWatchdog.dispose();
     toolCallStreamGuard.dispose();
@@ -855,7 +886,7 @@ const main = async (): Promise<void> => {
     // issue a second prompt in that gap; wait for the native agent_start.
     replayAfterStart = true;
   };
-  const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, options.model, thinking, {
+  const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, resumedModel ?? options.model, resumedThinking ?? thinking, {
     send(frame) {
       if (terminalStatus) return;
       child.stdin?.write(`${JSON.stringify(frame)}\n`);
@@ -1323,6 +1354,21 @@ const main = async (): Promise<void> => {
       return;
     }
     runLog.event(line, event);
+    if (pendingWhitespaceStall) {
+      // Late aborted/settled frames must not close or revive this attempt.
+      // Retain usage emitted during shutdown without treating it as progress.
+      const message = event.message;
+      if (event.type === "message_end" && typeof message === "object" && message !== null &&
+          !Array.isArray(message) && (message as Record<string, unknown>).role === "assistant") {
+        const assistant = message as Record<string, unknown>;
+        const delta = extractUsageDelta(assistant);
+        applyUsage(record, assistant);
+        emitTokenUsage(delta, { model: stringField(assistant.model), provider: stringField(assistant.provider) }, assistant);
+        enforceTokenLimit();
+        update();
+      }
+      return;
+    }
     if (options.runner === "claude") {
       processClaudeEvent(event);
       return;
@@ -1879,42 +1925,57 @@ const main = async (): Promise<void> => {
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
     }
-    if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
-        (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
-        record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
-        !piSessionFile || !fs.existsSync(piSessionFile)) break;
-    const errorMessage = terminalError ?? stderr.trim();
-    if (!errorMessage) break;
-    if (!retryableProviderError(errorMessage)) break;
-    recoveryWatchdog.arm(errorMessage);
-    const delayMs = PI_PROVIDER_RESUME_DELAYS_MS[providerResumeAttempts];
-    if (delayMs === undefined) {
-      terminalError = `${errorMessage}; Pi provider recovery exhausted 3 same-session resumes within the 10-minute bound; session retained: ${piSessionFile}`;
-      sawAgentError = true;
-      break;
-    }
-    const waitMs = delayMs * recoveryScale;
-    if (waitMs >= recoveryWatchdog.remainingMs) {
-      terminalError = `${errorMessage}; Pi provider recovery cannot resume within the 10-minute bound (600000ms); session retained: ${piSessionFile}`;
-      sawAgentError = true;
-      break;
-    }
-    recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
-    const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
-      delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-    record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
-    update();
-    emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
-    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, waitMs);
-      cancelResumeWait = () => { clearTimeout(timer); resolve(); };
-    });
-    cancelResumeWait = undefined;
     if (terminalStatus) break;
-    providerResumeAttempts++;
-    emitLifecycle("run.resumed", { ...resume, phase: "starting" });
-    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "starting" })}\n`);
+    if (pendingWhitespaceStall) {
+      const error = pendingWhitespaceStall;
+      pendingWhitespaceStall = undefined;
+      // Pin the actual admitted model/effort, even when the initial request
+      // inherited a launcher default. There is no fallback model.
+      resumedModel = error.model;
+      resumedThinking = record.thinking;
+      const resume = { runId: options.id, taskId: options.id, attempt: 1, maxAttempts: 1,
+        model: resumedModel, effort: resumedThinking, sessionFile: piSessionFile };
+      emitLifecycle("run.resumed", { ...resume, reason: "stall.whitespace-toolcall", phase: "starting" });
+      appendLog(`${JSON.stringify({ type: "fabric_whitespace_toolcall_retry", ...resume })}\n`);
+      toolCallStreamGuard = createToolCallStreamGuard();
+    } else {
+      if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
+          (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
+          record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
+          !piSessionFile || !fs.existsSync(piSessionFile)) break;
+      const errorMessage = terminalError ?? stderr.trim();
+      if (!errorMessage) break;
+      if (!retryableProviderError(errorMessage)) break;
+      recoveryWatchdog.arm(errorMessage);
+      const delayMs = PI_PROVIDER_RESUME_DELAYS_MS[providerResumeAttempts];
+      if (delayMs === undefined) {
+        terminalError = `${errorMessage}; Pi provider recovery exhausted 3 same-session resumes within the 10-minute bound; session retained: ${piSessionFile}`;
+        sawAgentError = true;
+        break;
+      }
+      const waitMs = delayMs * recoveryScale;
+      if (waitMs >= recoveryWatchdog.remainingMs) {
+        terminalError = `${errorMessage}; Pi provider recovery cannot resume within the 10-minute bound (600000ms); session retained: ${piSessionFile}`;
+        sawAgentError = true;
+        break;
+      }
+      recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
+      const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
+        delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      update();
+      emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
+      appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        cancelResumeWait = () => { clearTimeout(timer); resolve(); };
+      });
+      cancelResumeWait = undefined;
+      if (terminalStatus) break;
+      providerResumeAttempts++;
+      emitLifecycle("run.resumed", { ...resume, phase: "starting" });
+      appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "starting" })}\n`);
+    }
     // --session <exact path> is Pi's noninteractive resume selector. --continue
     // alone selects the most recent session, which may belong to another task.
     resumePrompt = true;

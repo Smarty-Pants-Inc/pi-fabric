@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -12,6 +12,7 @@ describe("real worker tool-call stream guard", () => {
   const managers: AgentManager[] = [];
   afterEach(async () => {
     await Promise.all(managers.splice(0).map(manager => manager.close()));
+    vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
   const run = async (task: string, timeoutMs = 5_000) => {
@@ -23,49 +24,132 @@ describe("real worker tool-call stream guard", () => {
     });
     managers.push(manager);
     const result = await manager.run({ task, thinking: "high", transport: "process" });
-    const status = JSON.parse(fs.readFileSync(path.join(root, result.id, "status.json"), "utf8"));
-    const events = fs.readFileSync(path.join(root, result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    return { manager, result, status, events };
+    const directory = path.join(root, result.id);
+    const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+    const events = fs.readFileSync(path.join(directory, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const lifecycle = fs.readFileSync(path.join(directory, "lifecycle.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const evidenceDir = process.env.FABRIC_WHITESPACE_TEST_EVIDENCE_DIR;
+    if (evidenceDir) {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      fs.writeFileSync(path.join(evidenceDir, task + "-result.json"), JSON.stringify(result, null, 2));
+      for (const file of ["status.json", "events.jsonl", "lifecycle.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(evidenceDir, task + "-" + file));
+    }
+    return { manager, result, status, events, lifecycle };
+  };
+  const stalls = (events: Array<Record<string, any>>) => events.filter(event => event.type === "stall.whitespace-toolcall");
+  const assertOneRetry = (events: Array<Record<string, any>>, runId: string) => {
+    expect(events.filter(event => event.type === "fabric_whitespace_toolcall_retry")).toEqual([
+      expect.objectContaining({ runId, taskId: runId, attempt: 1, maxAttempts: 1,
+        model: "openai-codex/gpt-5.6-sol", effort: "high" }),
+    ]);
+    const prompts = events.filter(event => event.type === "fabric_fixture_command" && event.command === "prompt");
+    expect(prompts).toHaveLength(2);
+    const [first, second] = prompts;
+    if (!first || !second) throw new Error("Expected exactly two native attempts");
+    expect(second.message).toBe("Continue the task from the existing session. Do not repeat completed work.");
+    expect(second.message).not.toBe(first.message);
+    expect(second.pid).not.toBe(first.pid);
+    expect(second.sessionFile).toBe(first.sessionFile);
+    expect(prompts.map(event => [event.model, event.effort])).toEqual([
+      ["openai-codex/gpt-5.6-sol", "high"], ["openai-codex/gpt-5.6-sol", "high"],
+    ]);
+    expect(events.some(event => event.type === "fabric_fixture_command" && event.command === "set_model" &&
+      event.provider === "openai-codex" && event.modelId === "gpt-5.6-sol")).toBe(true);
+    // A returned terminal result must follow native close/drain of both attempts.
+    for (const event of prompts) expect(() => process.kill(event.pid, 0)).toThrow();
   };
 
-  it("aborts at 64 KiB and propagates the typed error to result, durable status, UI and run log", async () => {
-    const { manager, result, status, events } = await run("whitespace");
+  it("retries the 64 KiB prefix runaway once and propagates the repeated typed error", async () => {
+    const { manager, result, status, events, lifecycle } = await run("whitespace");
     const expected = { status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" };
     expect(result).toMatchObject(expected);
     expect(status).toMatchObject(expected);
     expect(manager.listForUi()[0]).toMatchObject(expected);
-    expect(result.error).toMatch(/^runaway: whitespace-only tool-call stream for [\d.]+s \/ 65536 bytes \(openai-codex\/gpt-5.6-sol, high\)$/);
+    expect(result.error).toMatch(/^runaway: whitespace-only tool-call stream for [\d.]+s \/ 65536 bytes \(openai-codex\/gpt-5.6-sol, high\); whitespace tool-call stall repeated after one same-model retry; terminating child$/);
+    expect(stalls(events)).toEqual([
+      expect.objectContaining({ taskId: result.id, attempt: 1, action: "retry", bytes: 65536 }),
+      expect.objectContaining({ taskId: result.id, attempt: 2, action: "failed", bytes: 65536 }),
+    ]);
     expect(events.filter(event => event.type === "fabric_runaway_error")).toEqual([
       expect.objectContaining({ errorCode: expected.errorCode, error: result.error, bytes: 65536,
         model: "openai-codex/gpt-5.6-sol", effort: "high", contentIndex: 0 }),
     ]);
+    expect(lifecycle.filter(event => event.event === "stall.whitespace-toolcall")).toHaveLength(2);
+    assertOneRetry(events, result.id);
   });
 
-  it("aborts at 60 seconds of blank deltas and propagates the timed typed error", async () => {
-    const { result, status, events } = await run("whitespace-time", 75_000);
+  it("aborts each indefinite blank stream at the default 90s, retries once, then fails", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", undefined);
+    const { result, status, events } = await run("whitespace-time", 210_000);
     expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
     expect(status).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
-    const errors = events.filter(event => event.type === "fabric_runaway_error");
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ error: result.error, model: "openai-codex/gpt-5.6-sol", effort: "high" });
-    expect(errors[0].elapsedMs).toBeGreaterThanOrEqual(60_000);
-    expect(errors[0].elapsedMs).toBeLessThan(65_000);
-    expect(errors[0].bytes).toBeGreaterThan(0);
-    expect(errors[0].bytes).toBeLessThan(65536);
-  }, 90_000);
+    expect(stalls(events)).toHaveLength(2);
+    for (const stall of stalls(events)) {
+      expect(stall.elapsedMs).toBeGreaterThanOrEqual(90_000);
+      expect(stall.elapsedMs).toBeLessThan(95_000);
+      expect(stall.bytes).toBeGreaterThan(0);
+      expect(stall.bytes).toBeLessThan(65536);
+    }
+    expect(result.error).toContain("repeated after one same-model retry");
+    assertOneRetry(events, result.id);
+  }, 240_000);
+
+  it.each(["whitespace-time-native", "prefix-time"])("honours the configured bound and fails the second stall (%s)", async task => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
+    const { result, events } = await run(task);
+    expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
+    expect(stalls(events)).toHaveLength(2);
+    expect(stalls(events).every(event => event.elapsedMs >= 150 && event.elapsedMs < 1500)).toBe(true);
+    assertOneRetry(events, result.id);
+  });
+
+  it("retries and fails within the bound even when EOF and SIGTERM are refused", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
+    const { result, events } = await run("whitespace-time-stubborn", 30_000);
+    expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
+    expect(result.error).toContain("repeated after one same-model retry");
+    expect(stalls(events)).toHaveLength(2);
+    assertOneRetry(events, result.id);
+  }, 40_000);
+
+  it("completes when the one same-model retry makes progress", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
+    const { result, status, events } = await run("whitespace-time-success");
+    expect(result.status, result.error).toBe("completed");
+    expect(result.error).toBeUndefined();
+    expect(status.errorCode).toBeUndefined();
+    expect(stalls(events)).toEqual([expect.objectContaining({ taskId: result.id, action: "retry", attempt: 1 })]);
+    expect(events.some(event => event.type === "fabric_runaway_error")).toBe(false);
+    assertOneRetry(events, result.id);
+  });
+
+  it.each(["mixed", "text-whitespace"])("does not abort healthy/unaffected deltas across multiple intervals (%s)", async task => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
+    const { result, events } = await run(task);
+    expect(result.status, result.error).toBe("completed");
+    expect(stalls(events)).toHaveLength(0);
+    expect(events.filter(event => event.type === "fabric_fixture_command" && event.command === "prompt")).toHaveLength(1);
+  });
+
+  it("fails clearly rather than replaying a task when its durable session is unavailable", async () => {
+    const { result, events } = await run("missing-session");
+    expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
+    expect(result.error).toContain("cannot safely retry");
+    expect(events.some(event => event.type === "fabric_whitespace_toolcall_retry")).toBe(false);
+  });
 
   it("does not infer a runaway from whitespace after a dropped oversized meaningful argument event", async () => {
     const { result, events } = await run("oversized-normal");
     expect(result.status).toBe("completed");
     expect(result.error).toBeUndefined();
     expect(result.warnings).toEqual([expect.stringContaining("Dropped an oversized agent event line (message_update")]);
-    expect(events.some(event => event.type === "fabric_runaway_error")).toBe(false);
+    expect(stalls(events)).toHaveLength(0);
   });
 
   it("does not abort a normal long tool call with more than 64 KiB of whitespace after JSON content", async () => {
     const { result, events } = await run("normal");
     expect(result.status).toBe("completed");
     expect(result.error).toBeUndefined();
-    expect(events.some(event => event.type === "fabric_runaway_error")).toBe(false);
+    expect(stalls(events)).toHaveLength(0);
   });
 });

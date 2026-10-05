@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, createBashToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { ActivationSession } from "../src/worker/activation-session.js";
 
@@ -39,6 +39,45 @@ const compactedActivation = (journal: string, dir: string) => {
 };
 
 describe("activation journal retention", () => {
+  it("binds the native session and Bash PI_SESSION_ID to the registered header across compaction and rotation (#4313)", async () => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const prior = SessionManager.open(journal);
+    prior.appendMessage(user("OLD_PRIVATE_HISTORY"));
+    prior.appendMessage(assistant("old reply"));
+    const probe = async (run: string) => {
+      const activation = new ActivationSession(journal, path.join(dir, run), dir);
+      const session = SessionManager.open(activation.file);
+      const header = JSON.parse(fs.readFileSync(journal, "utf8").split("\n", 1)[0]!);
+      const observed: string[] = [];
+      const bash = createBashToolDefinition(dir, { operations: { exec: async (_command, _cwd, options) => {
+        observed.push(options.env!.PI_SESSION_ID!);
+        return { exitCode: 0 };
+      } } });
+      const check = async () => {
+        await bash.execute("probe", { command: "true" }, undefined, undefined,
+          { sessionManager: session } as unknown as ExtensionContext);
+        expect(session.getSessionId()).toBe(header.id);
+        expect(observed.at(-1)).toBe(header.id);
+      };
+      expect(session.getBranch()).toEqual([]); // identity does not leak history
+      await check();
+      const kept = session.appendMessage(user("CURRENT_ACTIVATION"));
+      session.appendMessage(assistant("current reply"));
+      session.appendCompaction("LOCAL_SUMMARY", kept, 1000);
+      await check();
+      activation.retain();
+      expect(SessionManager.open(journal).getSessionId()).toBe(header.id);
+      return header.id;
+    };
+    const original = await probe("first");
+    expect(await probe("restarted-worker")).toBe(original);
+    fs.renameSync(journal, journal + ".bak");
+    const rotated = SessionManager.open(journal);
+    rotated.appendMessage(user("NEW_ROTATED_HISTORY"));
+    rotated.appendMessage(assistant("new reply"));
+    expect(await probe("after-rotation")).not.toBe(original);
+  });
   it.each([false, true])("retains every local inference record as non-message audit data (existing journal: %s)", existing => {
     const dir = root();
     const journal = path.join(dir, "actor.jsonl");

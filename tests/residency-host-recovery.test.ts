@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
@@ -53,52 +53,69 @@ describe("resident recovery startup and lease fence (#3864)", () => {
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("publishes a lease without reading a synthetic 10k-run / 8GB archive", { timeout: 30_000 }, async () => {
-    const { root, config, host } = fixture();
-    const runs = path.join(config.residencyRoot, "runs");
-    const status = path.join(root, "terminal.json");
-    fs.writeFileSync(status, JSON.stringify({ status: "completed", text: "archived", updatedAt: 1 }));
-    for (let i = 0; i < 10_000; i++) {
-      const run = path.join(runs, `archived-${i}`);
-      fs.mkdirSync(run, { recursive: true });
-      fs.copyFileSync(status, path.join(run, "status.json"));
-      const fd = fs.openSync(path.join(run, "events.jsonl"), "w");
-      // POSIX truncation is sparse. NTFS does not make SetEndOfFile sparse:
-      // filling 8 GB here tests fixture I/O, not lease publication. On Windows
-      // use empty real files with synthetic logical sizes below instead.
-      if (process.platform !== "win32") fs.ftruncateSync(fd, 800_000);
-      fs.closeSync(fd);
-    }
-    const lstat = fs.lstatSync;
-    const sizes = process.platform === "win32" ? vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
-      const stat = lstat(...args);
-      if (stat && String(args[0]).startsWith(runs + path.sep) && path.basename(String(args[0])) === "events.jsonl") {
-        return Object.assign(stat, { size: 800_000 });
+  describe("large archived-run fixture", () => {
+    let state: ReturnType<typeof fixture>;
+    // Creating and deleting 30k filesystem entries is fixture work, not lease
+    // publication. Bound those phases separately so NTFS/antivirus latency
+    // cannot spend the unchanged startup test's 30-second lifetime guard.
+    beforeAll(() => {
+      state = fixture();
+      const { root, config } = state;
+      const runs = path.join(config.residencyRoot, "runs");
+      const status = path.join(root, "terminal.json");
+      fs.writeFileSync(status, JSON.stringify({ status: "completed", text: "archived", updatedAt: 1 }));
+      for (let i = 0; i < 10_000; i++) {
+        const run = path.join(runs, `archived-${i}`);
+        fs.mkdirSync(run, { recursive: true });
+        fs.copyFileSync(status, path.join(run, "status.json"));
+        const fd = fs.openSync(path.join(run, "events.jsonl"), "w");
+        // POSIX truncation is sparse. NTFS does not make SetEndOfFile sparse:
+        // filling 8 GB here tests fixture I/O, not lease publication. On Windows
+        // use empty real files with synthetic logical sizes below instead.
+        if (process.platform !== "win32") fs.ftruncateSync(fd, 800_000);
+        fs.closeSync(fd);
       }
-      return stat;
-    }) as typeof fs.lstatSync) : undefined;
-    expect(fs.lstatSync(path.join(runs, "archived-0", "events.jsonl")).size).toBe(800_000);
-    expect(fs.readdirSync(runs)).toHaveLength(10_000);
-    const read = fs.readFileSync;
-    let archiveReads = 0, beforeLease = 0;
-    const spy = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
-      if (String(args[0]).startsWith(runs + path.sep)) {
-        archiveReads++;
-        if (!fs.existsSync(path.join(config.residencyRoot, "owner.json"))) beforeLease++;
-      }
-      return read(...args);
+    }, 60_000);
+    afterAll(async () => {
+      if (!state) return;
+      await state.host.close();
+      fs.rmSync(state.root, { recursive: true, force: true });
+    }, 60_000);
+
+    it("publishes a lease without reading a synthetic 10k-run / 8GB archive", { timeout: 30_000 }, async () => {
+      const { root, config, host } = state;
+      const runs = path.join(config.residencyRoot, "runs");
+      const lstat = fs.lstatSync;
+      const sizes = process.platform === "win32" ? vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+        const stat = lstat(...args);
+        if (stat && String(args[0]).startsWith(runs + path.sep) && path.basename(String(args[0])) === "events.jsonl") {
+          return Object.assign(stat, { size: 800_000 });
+        }
+        return stat;
+      }) as typeof fs.lstatSync) : undefined;
+      expect(fs.lstatSync(path.join(runs, "archived-0", "events.jsonl")).size).toBe(800_000);
+      expect(fs.readdirSync(runs)).toHaveLength(10_000);
+      const read = fs.readFileSync;
+      let archiveReads = 0, beforeLease = 0;
+      const spy = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+        if (String(args[0]).startsWith(runs + path.sep)) {
+          archiveReads++;
+          if (!fs.existsSync(path.join(config.residencyRoot, "owner.json"))) beforeLease++;
+        }
+        return read(...args);
+      });
+      try {
+        const started = performance.now();
+        await host.start();
+        const elapsed = performance.now() - started;
+        console.info(`3864 startup: 10000 runs / 8000000000 logical bytes, ${elapsed.toFixed(1)} ms, ${archiveReads} archive reads`);
+        expect(archiveReads).toBe(0); // structural check, not a flaky millisecond CI threshold
+        expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+        expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(true);
+        await vi.waitFor(() => expect(archiveReads).toBeGreaterThan(0));
+        expect(beforeLease).toBe(0);
+      } finally { spy.mockRestore(); sizes?.mockRestore(); }
     });
-    try {
-      const started = performance.now();
-      await host.start();
-      const elapsed = performance.now() - started;
-      console.info(`3864 startup: 10000 runs / 8000000000 logical bytes, ${elapsed.toFixed(1)} ms, ${archiveReads} archive reads`);
-      expect(archiveReads).toBe(0); // structural check, not a flaky millisecond CI threshold
-      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
-      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(true);
-      await vi.waitFor(() => expect(archiveReads).toBeGreaterThan(0));
-      expect(beforeLease).toBe(0);
-    } finally { spy.mockRestore(); sizes?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each(["confirmWritable", "writeBatch"] as const)("stops actor, control and lifecycle cursor reads on failed %s renewal, then replays after recovery", async (renewal) => {

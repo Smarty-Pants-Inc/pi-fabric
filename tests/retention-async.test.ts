@@ -64,10 +64,17 @@ describe("Windows asynchronous archive queue", () => {
     const { run, options, status } = fixture();
     let owned = true, latest = false;
     const entered = deferred(), release = deferred(), stat = fs.promises.lstat;
+    const originalRoot = await stat(run);
     let rootStats = 0;
     vi.spyOn(fs.promises, "lstat").mockImplementation(async (...args) => {
       if (String(args[0]) === run && ++rootStats === 2) { entered.resolve(); await release.promise; }
-      return stat(...args);
+      const checked = await stat(...args);
+      if (fence === "scratch" && String(args[0]) === run && rootStats >= 2) {
+        // Model coarse NTFS/adapter metadata deterministically: adding tmp need
+        // not change these labels, so only a fresh namespace check can veto it.
+        Object.assign(checked, { mtimeMs: originalRoot.mtimeMs, ctimeMs: originalRoot.ctimeMs, size: originalRoot.size });
+      }
+      return checked;
     });
     const queued = pruneActorRunArchivesAsync({ ...options, retainRun: () => latest }, () => owned);
     try {

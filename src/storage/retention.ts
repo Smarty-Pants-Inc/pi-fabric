@@ -119,7 +119,7 @@ export const runTreeExitVeto = (
 export const runTreeResourceVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false, requireRootExit = false,
 ): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit, {});
-interface RunInspection { root: fs.Stats; record: RunRecordSummary | undefined; statusStat: fs.Stats | undefined }
+interface RunInspection { root: fs.Stats; record: RunRecordSummary | undefined; statusStat: fs.Stats | undefined; names?: string[] }
 const isOwnedStat = (stat: fs.Stats): boolean => !stat.isSymbolicLink() && !(stat.isFile() && stat.nlink !== 1) &&
   (!process.getuid || stat.uid === process.getuid());
 function* treeOwnedStat(file: string): TreeWalk<fs.Stats | undefined> {
@@ -321,7 +321,9 @@ function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, 
     if (!(yield* treeOwnedStat(path.join(root, "task.txt")))?.isFile()) return false;
   }
   try {
-    for (const name of (yield* treeList(root))) {
+    const names = yield* treeList(root);
+    if (inspection) inspection.names = names;
+    for (const name of names) {
       if (expired()) return false;
       const file = path.join(root, name);
       const stat = name === "status.json" && inspection ? inspection.statusStat : yield* treeOwnedStat(file);
@@ -368,7 +370,15 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   inspectTreeSync(inspectSafeRunTree(root, childrenStopped, depth, expired, options));
 /** Explicit resident roots require the same terminal/exit/allowlist proof. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline,
-  options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => safeRunTree(directory, false, 0, expired, options);
+  options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
+  if (process.platform === "win32") {
+    // Main's Windows wrapper independently rereads terminal status before its
+    // exit/allowlist walk; do not activate the POSIX snapshot optimization here.
+    const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+    return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, options);
+  }
+  return safeRunTree(directory, false, 0, expired, options);
+};
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
   catch { return false; }
@@ -548,7 +558,17 @@ type TerminalRunCompactionOptions = TerminalRunEventsRetention & {
   onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
 };
 function* inspectCompactionTree(directory: string, expired: Deadline, scratchCoveredByAllowlist: boolean): TreeWalk<boolean> {
-  const inspections = new Map<string, RunInspection>(), options = { disposeScratch: false };
+  const options = { disposeScratch: false };
+  if (process.platform === "win32" && !scratchCoveredByAllowlist) {
+    // Synchronous Windows compaction keeps main's independent exit, terminal
+    // wrapper and allowlist reads. Only the explicitly async archive walk below
+    // uses a within-slice inspection snapshot; neither path disposes scratch.
+    if (yield* inspectRunTree(directory, 0, expired, true, true, true, options)) return false;
+    const record = yield* treeJson<RunRecordSummary>(path.join(directory, "status.json"));
+    return !!record?.status && TERMINAL_STATUSES.has(record.status) &&
+      (yield* inspectSafeRunTree(directory, false, 0, expired, options));
+  }
+  const inspections = new Map<string, RunInspection>();
   // Async Windows inspection never enters the synchronous scratch API. The
   // recursive artifact allowlist immediately following this exit proof vetoes
   // every scratch directory/fence/receipt instead; no disposal is authorized.
@@ -760,6 +780,13 @@ export const pruneActorRunArchivesAsync = async (options: ActorRunArchivePruneOp
             before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.size !== after.size) { unchanged = false; break; }
       }
       if (!unchanged) break;
+      // Directory timestamps can be coarse/unchanged after a late insertion
+      // (including tmp). Recheck the accepted names after the asynchronous
+      // metadata crossings, not just mtime/ctime, before deleting this tree.
+      try {
+        const names = await fs.promises.readdir(run), accepted = new Set(checked.names);
+        if (!checked.names || names.length !== checked.names.length || names.some(name => !accepted.has(name))) { unchanged = false; break; }
+      } catch { unchanged = false; break; }
     }
     if (!unchanged || expired() || !canPrune()) continue;
     try { await fs.promises.rm(directory, { recursive: true, force: true }); removed.push(directory); } catch { /* retain on failed removal */ }

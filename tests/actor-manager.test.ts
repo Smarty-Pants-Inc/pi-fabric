@@ -1036,18 +1036,29 @@ describe("ActorManager across a session reload", () => {
     };
     const owner = host("owner", true);
     const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
-    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
-    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
-    await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
-    await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
-    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
-    const passive = passiveHost("passive");                   // loads the foreign actor
-    await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
-    passive.listOwned();                                                // ... that the passive view picks up
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const files = queueFiles(root, actor.id);
-    expect(files).toHaveLength(1);                                      // the owner's, and only it
-    expect(JSON.parse(files[0]!.text).items).toHaveLength(3);
+    const workerRelease = path.join(root, "release-owner-worker");
+    try {
+      // Hold the real worker until the passive-refresh assertions finish. The
+      // ordinary LIVE fixture completes after 1.5 s: on a slow Windows host a
+      // legitimate owner settlement used to look like a passive queue deletion.
+      await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first", data: { fakeWorkerReleasePath: workerRelease } });
+      await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+      await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
+      await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
+      await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+      const accepted = JSON.parse(queueFiles(root, actor.id)[0]!.text).items;
+      expect(accepted).toHaveLength(3);
+      const passive = passiveHost("passive");                   // loads the foreign actor
+      await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
+      passive.listOwned();                                                // ... that the passive view picks up
+      // Cross the old fixture lifetime deliberately; accepted work must still
+      // be byte-for-byte intact while the owner worker is held, on every OS.
+      await new Promise((resolve) => setTimeout(resolve, 1_800));
+      const files = queueFiles(root, actor.id);
+      expect(files).toHaveLength(1);                                      // the owner's, and only it
+      expect(JSON.parse(files[0]!.text).items).toEqual(accepted);
+      expect(runs.filter((run) => run.finishedAt !== undefined)).toEqual([]);
+    } finally { fs.writeFileSync(workerRelease, "release"); }
     await owner.close();
     host("owner", true);                                                // the owner restarts
     await waitFor(() => runs.filter((run) => /held-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);

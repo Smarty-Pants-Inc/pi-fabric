@@ -44,6 +44,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
+import { readPiSessionHeader } from "./core/pi-session-header.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -552,6 +553,9 @@ const main = async (): Promise<void> => {
   const childEnvironment = applyTaskReturnAddress(
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
+  // Native session metadata belongs to this child, never its parent/resident host.
+  delete childEnvironment.PI_SESSION_ID;
+  delete childEnvironment.PI_SESSION_FILE;
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   delete childEnvironment.PI_FABRIC_PINNED_EXTENSION;
   if (options.runner === "pi" && options.fabricExtensionPath) childEnvironment.PI_FABRIC_PINNED_EXTENSION = pinnedFabricExtension;
@@ -581,6 +585,15 @@ const main = async (): Promise<void> => {
   }
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
   const releaseEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/release-entry.ts" : "./worker/release-entry.js", import.meta.url));
+  const actorSessionEnvironment = (): NodeJS.ProcessEnv => {
+    // Re-read at actual launch (also provider resumes), not from cached actor
+    // runnerSessionId or a resident host's inherited PI_SESSION_ID (#4313).
+    const nativeFile = activationSession?.file ?? piSessionFile;
+    if (options.runner !== "pi" || !options.actorId || !nativeFile || !fs.existsSync(nativeFile)) return {};
+    const header = readPiSessionHeader(nativeFile);
+    if (!header) throw new Error("Actor launch session has no valid native header");
+    return { PI_SESSION_ID: header.id, PI_SESSION_FILE: nativeFile };
+  };
   const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
@@ -588,6 +601,7 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
+      ...actorSessionEnvironment(),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),

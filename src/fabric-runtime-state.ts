@@ -669,6 +669,8 @@ export class FabricRuntimeState {
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
+      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
+        this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
@@ -37,6 +38,14 @@ export type FabricAgentTransport =
 export type FabricAgentRunner = "pi" | "claude" | "veda";
 export type FabricUiWidgetMode = "auto" | "always" | "hidden";
 type FabricToolDisplayMode = "full" | "compact";
+export type FabricIncomingMessageMode = "auto" | "collapsed" | "expanded";
+export type FabricPrincipalViewMode = "auto" | "on" | "off";
+
+/** Read the old incoming-only preference until a principal-view preference is saved. */
+const principalViewModeValue = (ui: Record<string, unknown>): FabricPrincipalViewMode =>
+  ui.principalView === "on" || ui.principalView === "off" || ui.principalView === "auto"
+    ? ui.principalView
+    : ui.incomingMessages === "collapsed" ? "on" : ui.incomingMessages === "expanded" ? "off" : "auto";
 export type FabricResultFormat = "auto" | "yaml" | "json" | "text";
 export type FabricPrewalkMode = "in-place" | "trajectory";
 export type FabricExecutorRuntime = "quickjs" | "node-process" | "bun-process";
@@ -167,6 +176,8 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Host-only Linux user scope slice; unset launches workers directly. */
   processSlice?: string;
+  /** Host-only opt-in process task placement; workspace files cannot override it. */
+  placement?: AgentPlacementConfig;
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
@@ -230,6 +241,9 @@ interface FabricUiConfig {
   haltOnEscape: boolean;
   showAgentToolPreview: boolean;
   toolDisplay: FabricToolDisplayMode;
+  /** @deprecated Use principalView; retained for incoming-only config compatibility. */
+  incomingMessages: FabricIncomingMessageMode;
+  principalView: FabricPrincipalViewMode;
   updateDebounceMs: number;
 }
 
@@ -524,6 +538,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     haltOnEscape: true,
     showAgentToolPreview: true,
     toolDisplay: "compact",
+    incomingMessages: "auto",
+    principalView: "auto",
     updateDebounceMs: 100,
   },
   compaction: {
@@ -786,6 +802,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
+  const placement = normalizeAgentPlacement(agents.placement);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1070,6 +1087,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      ...(placement ? { placement } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1213,6 +1231,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ui.showAgentToolPreview ?? ui.showNestedToolCalls,
         DEFAULT_FABRIC_CONFIG.ui.showAgentToolPreview,
       ),
+      incomingMessages: ui.incomingMessages === "collapsed" || ui.incomingMessages === "expanded"
+        ? ui.incomingMessages : "auto",
+      principalView: principalViewModeValue(ui),
       toolDisplay: toolDisplayModeValue(
         ui.toolDisplay,
         DEFAULT_FABRIC_CONFIG.ui.toolDisplay,
@@ -1627,6 +1648,12 @@ const resolveFabricConfig = (
     if (!plan) continue;
     if (plan.changed) writeJsonAtomic(plan.path, plan.document, plan.source);
     const document = { ...plan.document };
+    const ui = objectValue(document.ui);
+    // Translate each persisted layer before merging with defaults, so legacy
+    // project preferences still override global ones without rewriting files.
+    if (ui.principalView === undefined && ui.incomingMessages !== undefined) {
+      document.ui = { ...ui, principalView: principalViewModeValue(ui) };
+    }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
       delete agents.modelPolicy;
@@ -1634,6 +1661,7 @@ const resolveFabricConfig = (
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
       delete agents.processSlice;
+      delete agents.placement;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

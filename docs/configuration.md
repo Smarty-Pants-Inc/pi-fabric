@@ -9,6 +9,104 @@ Pi Fabric reads configuration from two JSON files. Project values override globa
 
 `configVersion` versions each configuration document. Fabric migrates each applicable file independently before it applies global/project precedence, then rewrites migrated files atomically. Version 0, the historical unversioned format, renames `subagents` to `agents`. Versions 2 and 3 rename legacy UI settings. Version 4 repairs `prewalk.enabled` string booleans emitted by the settings UI in affected builds. When both legacy and canonical sections exist, canonical values win conflicts and non-conflicting values survive. Fabric migrates trusted project files, and it never reads or rewrites untrusted project files. Add future schema changes as sequential migrations. Avoid runtime aliases.
 
+## Process task placement
+
+`agents.placement` is **host-only**: put it in the selected `PI_CODING_AGENT_DIR/fabric.json`, never a workspace override. Absent means unchanged local spawns. When configured, `default` is `"local"` unless explicitly `"remote"`. A remote Main task launches through `command` rather than the local worker; `needs?: string[]` on spawn/run routes unmet needs locally. `capabilities` defaults to `[]` and must describe guarantees on every target selected by the launcher.
+
+Ryzen 1 example (the existing fleet launcher, **not executed by the offline tests**):
+
+```json
+{
+  "agents": {
+    "placement": {
+      "default": "remote",
+      "command": [
+        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "{id}",
+        "--host",
+        "auto",
+        "--minutes",
+        "{minutes}",
+        "--src",
+        "{cwd}",
+        "--model",
+        "{model}",
+        "--thinking",
+        "{thinking}",
+        "--",
+        "{task}"
+      ],
+      "capabilities": [],
+      "sshAliases": {
+        "ryzen2": "ryzen2-agent",
+        "ryzen3": "forge-agent",
+        "ryzen4": "ryzen4-agent",
+        "ryzen5": "ryzen5-agent"
+      },
+      "resultCommand": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "{sshAlias}",
+        "python3 -c 'import json, pathlib, sys; p=pathlib.Path(\"/srv/scratch/paul/tasks/direct\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}"
+      ],
+      "cancelCommand": [
+        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "--host",
+        "{host}",
+        "--cancel",
+        "{id}"
+      ],
+      "pollIntervalMs": 1000,
+      "commandTimeoutMs": 30000
+    }
+  }
+}
+```
+
+The Ryzen 1 Main's cwd (for example `/home/paul/smarty/smarty-pants/pi-fabric`) is a **source** workspace, not a target-local lane: `--src {cwd}` makes the launcher ship tracked and unignored files to the selected task's `OUT/src` and run there. Do not substitute `--cwd`, which the launcher permits only for existing target-local lanes under `/home/paul/lanes`, `/home/paul/repos`, or `/srv/scratch/paul/tasks`. With `--src {cwd}`, home/root, non-Git or ignored source directories stay local with audit reason `cwd-not-shippable`. A failed, timed-out or indeterminate Git ignore check also stays local. Fabric requires the launcher's tracked/unignored manifest branch; it never knowingly selects the recursive-copy fallback for ignored (potentially huge or private) source roots.
+
+`sshAliases` copies smarty-dev's `setup/factory/work-hosts.json` mapping: `ryzen2 → ryzen2-agent`, **`ryzen3 → forge-agent`**, `ryzen4 → ryzen4-agent`, `ryzen5 → ryzen5-agent`. Keep this host-owned map synchronized with that file; Fabric does not read smarty-dev files or invent `{host}-agent`. `{sshAlias}` is looked up using the accepted host, and requires a nonempty map of safe host/alias tokens. An unmapped accepted host retains launch custody rather than guessing an alias or starting a local duplicate. This example uses normal SSH host-key verification, with only read-only result polling added. Verify the aliases and shippable source workspace before enabling it. For a target without `python3`, use an equivalent host-owned reader that implements the JSON contract below. The hook itself does not call SSH implicitly or retrieve a remote file as if it were local. The launcher selects the host; its `RYZEN2_TASK_ACCEPTED <id> on <host> ...` line must match the Fabric run ID. `{host}` in polling/cancellation comes from that receipt, not from `auto`.
+
+All commands are **argv arrays**, passed to `execFile` without a shell. Template substitution occurs once; task quotes/newlines/metacharacters remain a single argument. Available placeholders are `{id}`, `{cwd}`, `{task}`, `{minutes}` (rounded up from the run timeout), `{model}`, `{thinking}`; after acceptance, `{host}`, `{sshAlias}` (when mapped), and `{resultDir}` (when configured) are available. `{host}`/`{sshAlias}`/`{resultDir}` cannot be used on the launch command. Model and effort must be included to preserve the caller's selection. The adapter exports the parent Fabric session as `PI_SESSION_ID` for the launcher's existing completion/inbox binding.
+
+Configure exactly one result source:
+
+- `resultDirectory`: an **absolute** local/shared directory template, such as `/srv/shared/tasks/{id}`. Poll `rc` first, then `result.md` and optional `stderr.log`. The fleet's default result directory is target-local, **not** automatically shared with Ryzen 1.
+- `resultCommand`: a bounded read-only argv template whose stdout is only JSON: `{"rc":null}` while pending, or `{"rc":0,"text":"full final result","stderr":"optional"}` after native execution exits. Integer/string exit receipts are supported. Nonzero rc maps to `failed`; 124 or a timeout string maps to `timed_out`. The reader must never emit terminal rc before the remote task/process tree is actually stopped. Poll failures are retried only until the task deadline; they do not relaunch the task.
+
+`cancelCommand` is required and requests cancellation; a successful command alone does not prove exit. The adapter waits up to `min(commandTimeoutMs, 5000)` for the final receipt. Missing receipt retains exit debt and files/admission, and reports the stop/timeout with a warning instead of inventing successful cleanup. Launch errors or mismatched acceptance retain conservative custody (except a missing executable, which is known unlaunched). Remote launches are never automatically retried or replaced by a local spawn.
+
+At extension `session_start`, configured placement gets a filesystem-only startup probe: the first `command` element must resolve to an existing executable regular file (an absolute path, a cwd-relative path, or a name on `PATH`; no dynamic executable placeholders). One clear `[pi-fabric] agents.placement startup probe:` line reports readiness or local fallback. Probe failure preserves the configured policy but keeps eligible tasks local, appending `placement.local` with `placement-probe-failed: command missing or not executable: ...`. Unconfigured placement does not probe or log. Config reload rechecks readiness without repeating an unchanged diagnostic. No launcher is invoked: the fleet launcher has `--dry-run`, not `--probe`, and even a dry run can select hosts/check inputs over SSH. A startup success does not attest remote availability, cwd shipment, or command arguments; post-invocation failures still retain conservative custody.
+
+`pollIntervalMs` defaults to 1000 (range 10–60000). `commandTimeoutMs` defaults to 30000 (range 100–120000). No polling starts during registration or idle lifecycle hooks; the adapter is a stable lazy entry loaded at actual first remote use. The manager owns polling/cancellation, with no extra detached watcher in Fabric. The fleet launcher still has its own existing inbox watcher; this does not replace Fabric's wait result.
+
+One-shot placement supports ordinary Main Pi tasks (up to 240 minutes, launcher-supported effort low/medium/high/xhigh/max). Actor/nested/durable/inherited/routed runs, non-Pi or Python kernels, recursive/worktree requests, custom tools/schema/images/system prompt, resolved account pins (request-supplied or inherited from the parent), effectively disabled extensions (including the host default), per-run niceness, and active token/cost ceilings remain local rather than dropping required semantics. Those decisions append `placement.local` with their reason to the run event log. Remote runs do not preserve streaming, controls, telemetry/usage/cost, local transcript export/recovery, host instruction/permission/tool profile parity, native session identity or return-address/mesh bridge features. See [agents](agents.md#opt-in-process-task-placement).
+
+### Native fleet proof and rollout gate
+
+`scripts/probe-process-placement.mjs` is an **offline adapter proof** with a fake launcher and fake receipt; it is not evidence of a real Main-to-work-host model call. The separate opt-in `scripts/probe-native-process-placement.mjs` loads the installed Pi SDK and the freshly built extension into an isolated agent directory, invokes `agents.spawn` → `agents.wait` through the **real** fleet launcher, and retains its acceptance line, native terminal rc, full result, manager audit, exact candidate SHA and command. Its caller makes no inference calls and reads no host authentication files; only the real launcher uses the work host's existing native Pi profile. SSH proof is restricted to the approved Main hostnames `dev1.smartypants.ai` (also `dev1`) and `ryzen1` (also `ryzen1.smartypants.ai`); work hosts are rejected, and neither Main name may appear as a work-host key or SSH alias route. It ships a tiny public Git source packet, not the repository/private corpus or credential-bearing inputs.
+
+From a **Ryzen 1 Main owner**, after a fresh build on the clean candidate:
+
+```sh
+PROOF_MODELS_FROM_PROFILE=1 nice -n 19 node scripts/probe-native-process-placement.mjs \
+  /absolute/installed/pi-coding-agent/package \
+  /absolute/kept/evidence-directory \
+  /home/paul/.local/bin/smarty-task-ryzen2 ryzen2 \
+  /home/paul/.local/share/smarty-dev/factory/current/setup/factory/work-hosts.json ssh
+```
+
+`PROOF_MODELS_FROM_PROFILE=1` opts into the selected host profile's model providers: before replacing `PI_CODING_AGENT_DIR`, the probe resolves that directory (default `~/.pi/agent`) and symlinks its `models.json` into the private isolated profile. The installed SDK consumes the symlink with network/model refresh disabled and in-memory authentication; the probe never copies or prints the models file, passes it on argv, or includes it or its contents in the evidence directory. No authentication store is linked. The scratch profile and symlink are removed on completion without modifying the host file. A missing models file fails closed; private failure diagnostics are omitted from evidence/stdout/stderr when this option is enabled. Leave the option unset for the inert offline provider metadata instead. Only the real work task makes an inference call through the target profile.
+
+Use `local` instead of `ssh` only on the selected work host **if its real launcher contract permits a local run**. Work hosts currently install a deliberate refusal stub: `smarty-task-ryzen2` is a Ryzen 1 Main tool and lanes spawn locally. Do not bypass that stub with a retired/reference launcher, install peer SSH credentials, or treat its exit 2 as a successful proof. Retain the exact-head failed attempt and launcher contract as blocker evidence; the reference launcher's own header likewise excludes work-host lanes. A filesystem startup probe can correctly pass for the stub without attesting task admission.
+
+When that deployment boundary prevents a pre-merge native receipt, the repository owner (the Main handling the PR) owns an explicit exact-head evidence gate on Ryzen 1 after push/install, **before placement is enabled fleet-wide**. Record: candidate SHA and clean build; command and caller hostname; installed SDK and extension paths; one `RYZEN2_TASK_ACCEPTED <id> on ryzen2`; `placement.remote` and `placement.result`; native rc 0; selected host's hostname and full `agents.wait` result; and kept evidence paths. Pending/partial results, fake launchers/receipts, or unconfirmed exit debt fail the gate. If the receipt/result fails, keep placement absent/local; do not claim rollout acceptance. If failure is discovered after installation/enabling, revert the candidate release and restore the saved host config.
+
+Capacity-lead owns the subsequent Ryzen 1 host rollout: back up the selected `pi-agent/fabric.json`, enable host-only `default: "remote"` using the `--src`/host-map example above, canary one Main spawn/wait, then expand only after the same terminal receipt and full result pass. Revert means restoring that exact backup (and reverting the candidate release for an implementation failure). Re-measure Ryzen 1 spawned-agent CPU the next day; no workspace override enables the policy.
+
 ## Execution kernels
 
 `executor.kernel` selects the exclusive language for every `fabric_exec` call: `"typescript"` (default) or `"python"`. There is no per-call kernel selector or automatic language switching. Selecting Python is explicit opt-in; no additional enabled flag is required. `executor.pythonRuntime` defaults to `"monty"`, a sandboxed Python subset with VM-enforced resource limits and no ambient OS access. Monty is not CPython and cannot import arbitrary libraries; use the host bridge for I/O. Missing or invalid backend values choose Monty, and missing native Monty dependencies fail loudly without falling back. Set `executor.pythonRuntime: "cpython"` explicitly for the trusted native escape hatch, analogous to TypeScript's Node/Bun backends. `executor.cpython.binary` defaults to `"python3"` and accepts a CPython **3.10+** executable name or path, not shell arguments. Invalid kernel values fall back to TypeScript; absent, blank, or non-string binaries fall back to `python3`.
@@ -181,6 +279,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "haltOnEscape": true,
     "showAgentToolPreview": true,
     "toolDisplay": "compact",
+    "principalView": "auto",
     "updateDebounceMs": 100
   },
   "compaction": {
@@ -545,6 +644,7 @@ See the [TypeScript MCP reference](../skillsets/typescript/fabric-exec/reference
 - `ui.maxRows` defaults to `6` and clamps the widget to `1..20` rows. The effective budget is also bounded by half the live terminal height, so a short pane or a tmux split cannot let the animated box fill the viewport and keep pi's scroll region moving under the editor. Rows beyond the budget collapse into a dim `+N` marker on the last line.
 - `ui.showAgentToolPreview` defaults to `true` and controls the child-agent and actor tool rows in both the parent `fabric_exec` card and the widget. Recursive agents render their full descendant tree, bounded by the preview depth/node budget. The version 2 config migration renamed this key from `ui.showNestedToolCalls`.
 - `ui.toolDisplay` is `"compact"` (default) or `"full"`. Compact elevates the declared display name and description and keeps bounded nested tool detail visible; full retains the outer Fabric program transcript. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript and collapses it again. Invalid values fall back to `"compact"`. If configuration fails to load, rendering falls back to full so a degraded startup never hides the transcript. Change it under `/fabric settings` → **UI**; successful changes apply immediately to live and completed cards.
+- `ui.principalView` is `"auto"` (default), `"on"`, or `"off"`. Auto enables for `org` and `org-agent` instances: `PI_FABRIC_ROLE` takes precedence over `SMARTY_ROLE`, with the `@stamp` suffix removed (`bin/smarty-role` exports `SMARTY_ROLE=org-agent@SHA`). Change it with **`/principal-view [on|off|auto]`**, **Ctrl+Alt+P**, or `/fabric settings` → **UI** → **Principal view**. No command argument toggles on/off. Commands persist to project `fabric.json` when trusted, otherwise the isolated agent directory's global `fabric.json`. On shows incoming agent/actor/mail chatter as one dim `↳ sender: body preview` line (~80 body characters), hides delivered inbox shadows, and collapses tool output using Pi's public UI API. **Ctrl+O** temporarily expands incoming/tool details. Off restores full native incoming rendering and the tool expansion state from before entering principal view. The old `ui.incomingMessages` preference is still read per config layer (`collapsed` → `on`, `expanded` → `off`) unless that layer specifies `principalView`; it is no longer a second settings row. Model context and assistant replies remain unchanged. Thinking visibility and native user-message styling are left alone because this Pi version exposes no display setter for them. See [Principal view](principal-view.md) for exact feed parity and the smallest proposed Pi-fork rendering hook.
 - `ui.updateDebounceMs` defaults to `100`. It applies one execution-wide coalescing interval to every live `fabric_exec` card update: nested calls, progress text, and agent tool previews. Continuous streams emit at most once per interval, so a long call no longer postpones every render until completion. Set it to `0` to emit every update. Accepted values clamp to `0..2000`. The version 3 config migration renamed this key from `ui.nestedToolDebounceMs`.
 - The widget renders above the chat, like `pi-supervisor`. Set `ui.enabled` to `false` to disable both the widget and the dashboard controller.
 
@@ -610,7 +710,11 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 call override → session binding → project default → Fabric default
 ```
 
-`mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. Native commands retain their existing timeout. An absent acknowledgement means the outcome is unknown, not that the handler did not run; do not retry blindly.
+`mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. ASK, bridge and explicitly bounded requests retain their timeout policy. Native steer/followUp commands with a validated fresh owner lease have a 60-second admission/ACK window plus the existing (up to 15-second) return-leg grace. While a message is pending, the sender polls only the captured owner's lease file; an owner more than the routing grace overdue produces retryable `FABRIC_PARTICIPANT_STALE` rather than an acknowledgement timeout.
+
+`PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS` configures resolution-only lease grace (default 45000 ms, range 0–300000; invalid values use the default). It does not lengthen heartbeat TTLs, discovery liveness, or residency consumption fences. When an exact native participant's lease is recently late and the mesh is write-stalled/lock-contended, or its matching lease file advanced beyond stored state, resolution waits at most 10 seconds, polling that file every 100 ms. A renewal restores ordinary resolution; no renewal gives `FABRIC_PARTICIPANT_STALE` (`retryable: true`, “lease late by Ns; retry”). A lease older than the grace or an explicit terminal session receipt remains Unknown. Same-name presence stays ambiguous even if one owner's lease is unavailable; there is no replacement-participant fallback.
+
+For a stale remote `agents.steer` or `agents.followUp`, retry once with the **same `idempotencyKey` and unchanged target/message/data**. Callers may supply the key up front; otherwise a generated key is included in the stale error text and metadata. The sender/owner/target/operation-scoped key maps to the owner's persisted command claim, so a lost ACK is re-observed, not redelivered. The existing bounded resend after positive `notRun` proof uses a stable second-attempt sub-key under the same logical key; it cannot replay a handler that already ran. Retry promptly while the retained claim is available. An absent ACK alone never proves non-delivery; do not retry with a new key.
 
 `mesh.followUpFlushMs` (default 120000) bounds how late an agent `followUp` reaches a busy Main. Fabric holds such a followUp while Main works. At the next boundary between tool calls, it sends every followUp that has waited this long as one batched steer, oldest first, behind any steer already queued. When the run is about to settle (`agent_before_settle`), it hands the rest to Pi's followUp queue, so Pi continues the run for them unless the user cancelled. `0` keeps Pi's own followUp queue, which Pi reads only when Main has no more work. Pi hosts older than 0.87.0 have no `agent_before_settle` and always keep Pi's queue.
 

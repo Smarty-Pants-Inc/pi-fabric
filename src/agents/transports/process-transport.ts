@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
 import type {
   AgentTransportAdapter,
@@ -9,9 +10,11 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { findExecutable, spawnDetached } from "./process-utils.js";
+import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
+import type { AgentPlacementConfig } from "../placement-config.js";
+import { agentPlacementProbe } from "../placement-config.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -49,7 +52,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
-  constructor(private readonly processSlice?: string) {}
+  constructor(private readonly processSlice?: string, private readonly placement?: AgentPlacementConfig) {}
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
@@ -62,6 +65,47 @@ export class ProcessTransport implements AgentTransportAdapter {
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    if (this.placement) {
+      const unmet = (request.needs ?? []).filter(need => !this.placement!.capabilities.includes(need));
+      let reason = this.placement.default === "local" ? "placement default is local"
+        : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
+      if (!reason) reason = agentPlacementProbe(this.placement, request.cwd).reason;
+      // --src ships the Main's workspace, unlike --cwd which names a target-local
+      // lane. Require the launcher's tracked/unignored manifest branch; home,
+      // non-Git and ignored roots must never enter its recursive-copy branch.
+      if (!reason && this.placement.command.some((entry, index) => entry === "--src" && this.placement!.command[index + 1] === "{cwd}")) {
+        try {
+          const cwd = fs.realpathSync(request.cwd);
+          if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
+          const git = await executeFile("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+            timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+          });
+          if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
+          // check-ignore -q exits 0 for ignored, 1 for definitely unignored,
+          // and >1 (or a signal/timeout) for indeterminate. Only 1 is safe.
+          let unignored = false;
+          try {
+            await executeFile("git", ["-C", cwd, "check-ignore", "-q", "--", cwd], {
+              timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+            });
+          } catch (error) {
+            const exit = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
+            unignored = exit?.code === 1 && exit.signal == null && !exit.killed
+              && exit.stdout === "" && exit.stderr === "";
+          }
+          if (!unignored) throw new Error("ignored or indeterminate source root");
+        } catch { reason = "cwd-not-shippable"; }
+      }
+      if (!reason) {
+        const { launchPlacedTask } = await import("./placement.js");
+        return launchPlacedTask(request, this.placement);
+      }
+      const args = new Map<string, string>();
+      for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
+      const log = args.get("--log-file");
+      if (!log) throw new Error("Placement audit requires a run event log");
+      fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
+    }
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);

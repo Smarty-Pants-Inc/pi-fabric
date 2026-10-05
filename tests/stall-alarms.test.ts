@@ -295,7 +295,11 @@ it("publication receipt recovers append-before-receipt without a second alarm, a
   const packet = { topic: "ops.owner", from: A, dedupeKey: "crash-append", text: "alarm" };
   const first = await mesh.publish(packet);
   const receiptFile = path.join(mesh.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex") + ".json");
-  fs.unlinkSync(receiptFile); // Exact persisted state of a crash between append and receipt.
+  fs.unlinkSync(receiptFile);
+  // Exact persisted state of a crash between append and receipt now also has its intent.
+  fs.writeFileSync(receiptFile.replace(/\.json$/, ".pending.json"), JSON.stringify({
+    dedupeKey: packet.dedupeKey, reservedSequence: first.sequence, eventId: first.id, liveOffset: 0,
+  }));
   expect((await mesh.publish(packet)).id).toBe(first.id);
   expect(mesh.read({ topic: "ops.owner" })).toHaveLength(1);
   fs.writeFileSync(path.join(mesh.root, "events.jsonl"), "");

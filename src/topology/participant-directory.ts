@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -22,6 +24,10 @@ import {
   hostLiveness,
   LIVENESS_POLICY_KEY,
   readHostLease,
+  readHostLeaseSnapshot,
+  participantLeaseGraceMs,
+  waitForHostLeaseRenewal,
+  type RoutingLeaseWaitOptions,
   readHostLeases,
   removeHostLease,
   STATE_LEASE_RENEW_MS,
@@ -381,6 +387,8 @@ export interface ParticipantDirectoryOptions {
   selfOwnerIdentityId?: string;
   heartbeatMs?: number;
   leaseMs?: number;
+  /** Resolution-only grace; clock/lock/sleep injection keeps contention tests deterministic. */
+  routingLease?: RoutingLeaseWaitOptions;
   /**
    * Sweep records of hosts gone for this long (default 6 h), at most every sweepMs (default
    * 15 min, the first sweep waiting as long). false disables it (secondary directories, tests).
@@ -820,6 +828,92 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt };
   }
 
+  #routingOwner(id: string) {
+    if (!this.options.enabled) return undefined;
+    const target = id === "main" ? this.options.rootId : id;
+    const read = { snapshot: this.mesh.stateToken() };
+    const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
+    const participant = entry ? participantFromEntry(entry) : undefined;
+    if (!participant || participant.id !== target || participant.remoteHost) return undefined;
+    const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), read);
+    const owner = hostEntry ? hostFromEntry(hostEntry) : undefined;
+    if (!owner || !ownerMatches(participant, owner, this.options.hostId) ||
+      owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) return undefined;
+    return { participant, owner, read };
+  }
+
+  #sessionEnded(rootId: string, read: MeshReadOptions = {}): boolean {
+    const entry = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, rootId), read);
+    const value = entry?.value;
+    return !!(isObject(value) && value.format === 1 && value.rootId === rootId &&
+      value.ownerHostId === rootId && value.ownerIdentityId === rootId &&
+      entry?.updatedBy.id === rootId && entry.updatedBy.kind === "main" &&
+      typeof value.closedAt === "number" && Number.isFinite(value.closedAt));
+  }
+
+  /** A Main's close certifies its own host, not an independently leased resident.
+   * The old root address stays closed even if another host retains its presence. */
+  #routeEnded(participant: FabricParticipantRecord, read: MeshReadOptions = {}): boolean {
+    return (participant.kind === "root" || participant.residency !== "durable" || participant.ownerHostId === participant.rootId) &&
+      this.#sessionEnded(participant.rootId, read);
+  }
+
+  /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
+  captureControlOwnerLease(ownerHostId: string, ownerIdentityId: string, targetId: string): (() => number) | undefined {
+    const record = this.#routingOwner(targetId);
+    if (!record || record.owner.id !== ownerHostId || record.owner.identity.id !== ownerIdentityId ||
+      this.#routeEnded(record.participant, record.read)) return undefined;
+    const { owner } = record;
+    return () => {
+      const lease = readHostLease(this.mesh.root, owner.id);
+      return hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner);
+    };
+  }
+
+  /** Retained presence is not authority to route a long-dead or explicitly ended session. */
+  retainedRouteAllowed(id: string): boolean {
+    const record = this.#routingOwner(id);
+    if (!record) return false;
+    const now = (this.options.routingLease?.now ?? Date.now)();
+    const expiry = this.captureControlOwnerLease(record.owner.id, record.owner.identity.id, id)?.();
+    return expiry !== undefined && now - expiry <= participantLeaseGraceMs(this.options.routingLease?.graceMs);
+  }
+
+  /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
+  async resolveRoutingLease(id: string): Promise<boolean> {
+    const record = this.#routingOwner(id);
+    if (!record) return true; // Unknown/mirrored ids retain the ordinary resolver and bridge rules.
+    const { participant, owner } = record;
+    const options = this.options.routingLease ?? {};
+    const now = (options.now ?? Date.now)();
+    if (this.#routeEnded(participant, record.read)) return false;
+    const snapshot = readHostLeaseSnapshot(this.mesh.root, owner.id);
+    const lease = snapshot?.lease;
+    const matching = lease && lease.rootId === owner.rootId && lease.identityId === owner.identity.id &&
+      (lease.startedAt === undefined || lease.startedAt === owner.startedAt);
+    const expiresAt = hostLeaseExpiry(matching ? new Map([[owner.id, lease]]) : new Map(), owner);
+    if (expiresAt >= now) return true;
+    if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
+      participant.status === "stopping" || participant.status === "reloading") return false;
+    const lockWaiting = options.lockWaiting ?? (() => fs.existsSync(path.join(this.mesh.root, ".lock")));
+    // A replaced lease file newer than the stored ownership record also explains a cached lapse.
+    const advanced = matching && snapshot!.mtimeMs > owner.updatedAt;
+    if (!advanced && !lockWaiting() && !this.writeStalled(now)) return true;
+    await waitForHostLeaseRenewal(id, () => {
+      const current = readHostLease(this.mesh.root, owner.id);
+      return hostLeaseExpiry(current ? new Map([[owner.id, current]]) : new Map(), owner);
+    }, options);
+    // Shared authority and terminal state are rechecked once, not on each file poll.
+    const current = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, participant.id), { fresh: true });
+    const refreshed = current ? participantFromEntry(current) : undefined;
+    const currentOwnerEntry = this.mesh.get(keyFor(HOST_PREFIX, owner.id));
+    const currentOwner = currentOwnerEntry ? hostFromEntry(currentOwnerEntry) : undefined;
+    return !!refreshed && refreshed.ownerHostId === owner.id && refreshed.ownerIdentityId === owner.identity.id &&
+      refreshed.rootId === participant.rootId && !refreshed.remoteHost &&
+      !["stopping", "reloading"].includes(refreshed.status) && currentOwner?.startedAt === owner.startedAt &&
+      currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
+  }
+
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
@@ -847,9 +941,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // checks call this per actor (smarty-dev#784). A missing or stale record takes the full
     // list, which also knows legacy roots, so the answer is the same.
     if (this.options.enabled) {
-      const read = { fresh: options.fresh === true };
+      const read = { snapshot: this.mesh.stateToken({ fresh: options.fresh === true }) };
       const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
       const participant = entry ? participantFromEntry(entry) : undefined;
+      if ((participant && this.#routeEnded(participant, read)) ||
+        (target.startsWith("session:") && participant?.kind !== "root" && this.#sessionEnded(target, read))) return undefined;
       if (participant?.id === target && (
         participant.remoteHost === undefined ||
         !this.#collides(participant, this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read)))
@@ -1290,7 +1386,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const participant = entry && participantFromEntry(entry);
       return participant && isLocal(participant, this.options.hostId) ? participant : undefined;
     };
-    const stateEntries = this.mesh.listAll(PARTICIPANT_PREFIX, read);
+    // Read-only preparation from the pinned snapshot: cloning every retained actor payload
+    // on each idle heartbeat adds fleet-sized allocations and GC work (#2039). Mutations
+    // below still use CAS and fresh locked checks; no shared entry is modified here.
+    const stateEntries = this.mesh.listAllShared(PARTICIPANT_PREFIX, read);
     const stateByKey = new Map(stateEntries.map((entry) => [entry.key, entry]));
     const fileEntries = readParticipantFiles(this.mesh.root);
     const filesByKey = new Map(fileEntries.map((entry) => [entry.key, entry]));
@@ -1301,7 +1400,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const existingById = new Map(existing.map((item) => [item.participant.id, item]));
     const legacyRoots = new Map(
       this.mesh
-        .listAll(LEGACY_SESSION_PREFIX, read)
+        .listAllShared(LEGACY_SESSION_PREFIX, read)
         .flatMap((entry) => {
           const root = legacyRootFromEntry(entry, this.options.rootId, now, this.mesh.root);
           return root ? [[root.id, root] as const] : [];
@@ -1309,7 +1408,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
     const legacyActorOwners = new Map(
       this.mesh
-        .listAll(LEGACY_ACTOR_PREFIX, read)
+        .listAllShared(LEGACY_ACTOR_PREFIX, read)
         .flatMap((entry) => {
           const actor = legacyActorFromEntry(entry, legacyRoots);
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
@@ -1690,7 +1789,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
   }
 
-  #participantEntry(key: string, read: { fresh?: boolean } = {}): MeshStateEntry | undefined {
+  #participantEntry(key: string, read: MeshReadOptions = {}): MeshStateEntry | undefined {
     return newer(readParticipantFile(this.mesh.root, key), this.mesh.get(key, read));
   }
 

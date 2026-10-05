@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { allocateRunTmpDirectory, disposeRunTmpDirectory, runScratchExitVeto, JOINED_SCRATCH_FILE, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
 import { createProcessScratchScope, checkedProcessScratchScope, removeEmptyProcessScratchScope, type ProcessScratchScope } from "../src/storage/process-scratch-scope.js";
 import * as scopes from "../src/storage/process-scratch-scope.js";
-import { runTreeExitVeto } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, runTreeExitVeto } from "../src/storage/retention.js";
 
 const roots: string[] = [], groups: ProcessScratchScope[] = [];
 const sandbox = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")); roots.push(root); return root; };
@@ -24,7 +24,22 @@ describe("identity-bound scratch scopes", () => {
     vi.stubEnv(key,"synthetic-preload");
     expect(createProcessScratchScope()).toBeUndefined();
   });
-  it("retains the legacy/uncontained fence when delegation is unavailable", () => {
+  it.each([...new Set([process.platform, "win32" as const])])("retains the legacy/uncontained fence when delegation is unavailable (%s)", platform => {
+    vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    if (platform === "win32") {
+      // Windows allocates no per-run scratch. Legacy artifacts are retained by
+      // the collection allowlist, not inspected or disposed by scratch custody.
+      const root = sandbox();
+      fs.mkdirSync(path.join(root, "tmp"));
+      fs.writeFileSync(path.join(root, UNRESOLVED_SCRATCH_FILE), "{}");
+      fs.writeFileSync(path.join(root, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647" }));
+      expect(canRemoveTerminalRun(root)).toBe(false);
+      expect(disposeRunTmpDirectory(root)).toBe(false);
+      expect(runScratchExitVeto(root)).toBeUndefined();
+      expect(fs.existsSync(path.join(root, "tmp"))).toBe(true);
+      expect(fs.existsSync(path.join(root, UNRESOLVED_SCRATCH_FILE))).toBe(true);
+      return;
+    }
     vi.spyOn(scopes,"createProcessScratchScope").mockReturnValue(undefined);
     const root=sandbox(), allocation=allocateRunTmpDirectory(root);
     expect(allocation.scope).toBeUndefined();

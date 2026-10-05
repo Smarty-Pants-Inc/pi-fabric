@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { canRemoveTerminalRun } from "../src/storage/retention.js";
-import { createRunTmpDirectory, runScratchExitVeto, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
+import { createRunTmpDirectory, disposeRunTmpDirectory, runScratchExitVeto, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
 
 // Linux exposes birth identity and zombie state, so fixture teardown can confirm
 // the orphan stopped writing without ever signaling an unowned/reused PID.
@@ -37,10 +37,31 @@ describe("scratch descendant custody (#369 F1)", () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("fails closed when scratch custody inspection is unreadable", () => {
+  it.each([...new Set([process.platform, "win32" as const])])("fails closed when scratch custody inspection is unreadable (%s)", platform => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-custody-unreadable-"));
+    fs.mkdirSync(path.join(root, "tmp"));
+    fs.writeFileSync(path.join(root, "tmp", "data"), "possibly live descendant");
+    fs.writeFileSync(path.join(root, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647" }));
+    vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     const fault = vi.spyOn(fs, "lstatSync").mockImplementation(() => { throw Object.assign(new Error("denied"), {code:"EACCES"}); });
-    try { expect(runScratchExitVeto("unreadable-run")).toMatch(/inspection failed/); }
-    finally { fault.mockRestore(); }
+    const removal = vi.spyOn(fs, "rmSync");
+    try {
+      if (platform === "win32") {
+        // Scope cut: no Windows scratch inspection, including on unreadable IO.
+        expect(runScratchExitVeto(root)).toBeUndefined();
+        expect(disposeRunTmpDirectory(root)).toBe(false);
+        expect(fault).not.toHaveBeenCalled();
+      } else {
+        expect(runScratchExitVeto(root)).toMatch(/inspection failed/);
+      }
+      expect(removal).not.toHaveBeenCalled();
+      fault.mockRestore();
+      expect(canRemoveTerminalRun(root)).toBe(false);
+      expect(fs.readFileSync(path.join(root, "tmp", "data"), "utf8")).toBe("possibly live descendant");
+    } finally {
+      vi.restoreAllMocks();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
   it("refuses offline collection of legacy scratch without a complete scope exit receipt", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-custody-"));

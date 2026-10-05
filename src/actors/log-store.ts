@@ -3,7 +3,7 @@ import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
-import { pruneActorRunArchives, pruneActorRunArchiveSlices, pruneActorSessionBackups } from "../storage/retention.js";
+import { pruneActorRunArchives, pruneActorRunArchiveSlices, pruneActorRunArchivesAsync, pruneActorSessionBackups } from "../storage/retention.js";
 import type { FabricActorMessage } from "./types.js";
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -116,6 +116,15 @@ export class ActorLogStore {
     pruneActorSessionBackups(actor.sessionFile);
     yield;
     yield* pruneActorRunArchiveSlices({ ...this.#pruneOptions(actor, now), retainRun: id => actor.lastRunId === id });
+  }
+
+  /** One sequential asynchronous archive queue; the caller owns the barrier and
+   * supplies fresh authority, including after each awaited run inspection. */
+  async pruneRunsAsync(actor: ActorLogTarget, now: number, canPrune: () => boolean): Promise<void> {
+    if (!canPrune()) return;
+    pruneActorSessionBackups(actor.sessionFile);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await pruneActorRunArchivesAsync({ ...this.#pruneOptions(actor, now), retainRun: id => actor.lastRunId === id }, canPrune);
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {

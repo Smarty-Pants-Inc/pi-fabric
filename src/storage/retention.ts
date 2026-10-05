@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { runScratchExitVeto } from "./run-scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
+import { inspectTreeSync, inspectTreeAsync, treeStat, treeRead, treeList, treeExists, treeOpen, treeHandleStat, treeClose, treeTail, treeWrite, treeTimes, type TreeWalk } from "./retention-io.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -117,37 +118,56 @@ export const runTreeExitVeto = (
 export const runTreeResourceVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false, requireRootExit = false,
 ): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit, {});
-const runTreeVeto = (
+interface RunInspection { root: fs.Stats; record: RunRecordSummary | undefined; statusStat: fs.Stats | undefined }
+const isOwnedStat = (stat: fs.Stats): boolean => !stat.isSymbolicLink() && !(stat.isFile() && stat.nlink !== 1) &&
+  (!process.getuid || stat.uid === process.getuid());
+function* treeOwnedStat(file: string): TreeWalk<fs.Stats | undefined> {
+  try { const stat = yield* treeStat(file); return isOwnedStat(stat) ? stat : undefined; } catch { return; }
+}
+function* treeJson<T>(file: string, maxBytes = 1024 * 1024): TreeWalk<T | undefined> {
+  try {
+    const stat = yield* treeOwnedStat(file);
+    if (!stat?.isFile() || stat.size > maxBytes) return;
+    return JSON.parse(yield* treeRead(file)) as T;
+  } catch { return; }
+}
+function* inspectRunTree(
   directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
   options: RunTreeExitOptions,
   // Internal collection-only optimization. Every directory will subsequently
   // pass safeRunTree's recursive artifact allowlist, which rejects tmp and all
   // scratch receipts. Never used by the public exit/resource predicates.
   scratchCoveredByAllowlist = false,
-): string | undefined => {
+  inspections?: Map<string, RunInspection>,
+): TreeWalk<string | undefined> {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
   // initial absence is safe; errors or changes during inspection veto cleanup.
-  try { fs.lstatSync(directory); }
+  let rootStat: fs.Stats;
+  try { rootStat = yield* treeStat(directory); }
   catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT" && !requirePersistedExit
       ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
-    if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (!isOwnedStat(rootStat) || !rootStat.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
+    if (preserveArchives && (yield* treeExists(path.join(directory, "archive-pending.json")))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";
+    if (preserveArchives && (yield* treeExists(path.join(directory, "actor-run-archive-pending.json")))) return "actor run receipt archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
+    if ((yield* treeExists(path.join(directory, UNRESOLVED_WORKER_FILE)))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
-    const record = readJson<RunRecordSummary>(statusFile);
-    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    let statusExists = false;
-    try { fs.lstatSync(statusFile); statusExists = true; }
+    let statusStat: fs.Stats | undefined;
+    try { statusStat = yield* treeStat(statusFile); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const statusExists = statusStat !== undefined;
+    let record: RunRecordSummary | undefined;
+    if (statusStat && isOwnedStat(statusStat) && statusStat.isFile() && statusStat.size <= 1024 * 1024) {
+      try { record = JSON.parse(yield* treeRead(statusFile)) as RunRecordSummary; } catch { /* existing unreadable records veto below */ }
+    }
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (statusExists && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
     if (record?.transport === "tmux" || record?.transport === "screen") {
@@ -201,16 +221,18 @@ const runTreeVeto = (
     // Unknown children/receipts/identities veto the entire parent collection.
     const nested = path.join(directory, "nested");
     let hasNested = false;
-    try { fs.lstatSync(nested); hasNested = true; }
+    let nestedStat: fs.Stats | undefined;
+    try { nestedStat = yield* treeStat(nested); hasNested = true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (hasNested) {
-      if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
-      for (const name of fs.readdirSync(nested)) {
-        const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit,
-          { disposeScratch: options.disposeScratch !== false }, scratchCoveredByAllowlist);
+      if (!nestedStat || !isOwnedStat(nestedStat) || !nestedStat.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
+      for (const name of (yield* treeList(nested))) {
+        const reason = yield* inspectRunTree(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit,
+          { disposeScratch: options.disposeScratch !== false }, scratchCoveredByAllowlist, inspections);
         if (reason) return reason;
       }
     }
+    inspections?.set(directory, { root: rootStat, record, statusStat });
     // Report a known worker/descendant obligation before the independent
     // scratch fence. Both still have to pass; native exit never bypasses it.
     if (!scratchCoveredByAllowlist) {
@@ -219,6 +241,10 @@ const runTreeVeto = (
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
+const runTreeVeto = (
+  directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean,
+  requireRootExit: boolean, options: RunTreeExitOptions,
+): string | undefined => inspectTreeSync(inspectRunTree(directory, depth, expired, requirePersistedExit, preserveArchives, requireRootExit, options));
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
   time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 // Every file the worker and manager write into a run directory. A missing name made the run
@@ -234,41 +260,42 @@ const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 /** Only paired, owned admission/final-receipt artifacts authorize collection.
  * A passed alarm deadline is not expiry of the payload: the sender may wait.
  * Queued, crashed claims, malformed state, links and unknown contents veto. */
-const safeFollowUps = (directory: string, expired: Deadline): boolean => {
-  const names = fs.readdirSync(directory);
+function* inspectFollowUps(directory: string, expired: Deadline): TreeWalk<boolean> {
+  const names = (yield* treeList(directory));
   for (const name of names) {
     if (expired()) return false;
     const admissionName = name.endsWith(".settled") ? name.slice(0, -8) : name;
     if (!followUpName.test(admissionName)) return false;
     const file = path.join(directory, admissionName);
-    const admission = readJson<{ messageId?: unknown; deadlineAt?: unknown }>(file, 4096);
+    const admission = (yield* treeJson<{ messageId?: unknown; deadlineAt?: unknown }>(file, 4096));
     if (!admission || admission.messageId !== admissionName.slice(0, -5) ||
         !Number.isSafeInteger(admission.deadlineAt) || (admission.deadlineAt as number) < 0 ||
         Object.keys(admission).some(key => key !== "messageId" && key !== "deadlineAt")) return false;
     const settled = file + ".settled";
-    if (!ownedStat(settled)?.isDirectory()) return false;
-    const contents = fs.readdirSync(settled);
+    if (!(yield* treeOwnedStat(settled))?.isDirectory()) return false;
+    const contents = (yield* treeList(settled));
     if (contents.length !== 1 || contents[0] !== "state") return false;
-    const stateFile = path.join(settled, "state"), stat = ownedStat(stateFile);
+    const stateFile = path.join(settled, "state"), stat = (yield* treeOwnedStat(stateFile));
     if (!stat?.isFile() || stat.size > 9) return false;
-    const state = fs.readFileSync(stateFile, "utf8");
+    const state = (yield* treeRead(stateFile));
     if (state !== "delivered" && state !== "cancelled") return false;
   }
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
-  if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  // Offline collection cannot establish never-launched custody from filenames
-  // or a host-wide childrenStopped marker. Only the live admission caller can
-  // authorize recordless pre-launch rollback through the non-retention mode.
-  // Windows has no per-run scratch allocation/disposal. Its recursive artifact
-  // allowlist below already rejects scratch directories, fences and receipts,
-  // including links and unreadable entries. Avoid two extra negative NTFS stats
-  // per run (and descendant) just to discover the same absence. POSIX must still
-  // attempt custody-checked disposal before inspecting the remaining contents.
-  if (runTreeVeto(root, 0, expired, true, true, true, options, process.platform === "win32")) return false;
-  const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline,
+  options: Pick<RunTreeExitOptions, "disposeScratch"> = {}, inspections?: Map<string, RunInspection>): TreeWalk<boolean> {
+  if (expired() || depth > 32) return false;
+  // This snapshot belongs to ONE inspection only, never a resumed run/turn. The
+  // exit walk validates directory/status once; the allowlist and age predicate
+  // consume those same checked objects. Descendants are inspected once too.
+  if (!inspections) {
+    inspections = new Map();
+    if (yield* inspectRunTree(root, 0, expired, true, true, true, options, process.platform === "win32", inspections)) return false;
+  }
+  const inspection = inspections.get(root);
+  if (!inspection) return false;
+  const record = inspection.record;
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
   // a sweep to remove a run with a live or unknown saved PID. Apply this at
@@ -278,34 +305,36 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
-    if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
+    if (!(yield* treeOwnedStat(path.join(root, "task.txt")))?.isFile()) return false;
   }
   try {
-    for (const name of fs.readdirSync(root)) {
+    for (const name of (yield* treeList(root))) {
       if (expired()) return false;
       const file = path.join(root, name);
-      const stat = ownedStat(file);
+      const stat = name === "status.json" ? inspection.statusStat : yield* treeOwnedStat(file);
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
-        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        for (const child of yield* treeList(file)) {
+          if (!child.endsWith(".jsonl") || !(yield* treeOwnedStat(path.join(file, child)))?.isFile()) return false;
+        }
         continue;
       }
       if (stat.isDirectory() && name === "follow-ups") {
-        if (!safeFollowUps(file, expired)) return false;
+        if (!(yield* inspectFollowUps(file, expired))) return false;
         continue;
       }
       if (stat.isDirectory() && name === "deliveries") {
         // Empty ingress is normal. A final tracked receipt also authorizes
         // its owned envelope: a crash can fall between receipt write and unlink.
         // Anonymous, pending, uncertain, malformed or linked content still vetoes.
-        const children = fs.readdirSync(file);
+        const children = (yield* treeList(file));
         const followUps = path.join(root, "follow-ups");
-        if (children.length && (!ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired))) return false;
+        if (children.length && (!(yield* treeOwnedStat(followUps))?.isDirectory() || !(yield* inspectFollowUps(followUps, expired)))) return false;
         for (const child of children) {
-          if (expired() || !followUpName.test(child) || !ownedStat(path.join(followUps, child))?.isFile()) return false;
-          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; provenance?: unknown }>(path.join(file, child));
+          if (expired() || !followUpName.test(child) || !(yield* treeOwnedStat(path.join(followUps, child)))?.isFile()) return false;
+          const item = (yield* treeJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; provenance?: unknown }>(path.join(file, child)));
           if (!item || item.delivery !== "followUp" || item.followUpId !== child.slice(0, -5) ||
               typeof item.message !== "string" || !copyFabricProvenance(item.provenance) ||
               Object.keys(item).some(key => !["message", "delivery", "followUpId", "provenance"].includes(key))) return false;
@@ -313,7 +342,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, options)) return false;
+        for (const child of (yield* treeList(file))) if (!(yield* inspectSafeRunTree(path.join(file, child), false, depth + 1, expired, options, inspections))) return false;
         continue;
       }
       return false;
@@ -321,12 +350,12 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
-/** Explicit resident roots have no managed-temp owner. Require terminal status
- * plus checked process absence, and veto nested survivors and unresolved markers. */
-export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
-  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, options);
-};
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline,
+  options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean =>
+  inspectTreeSync(inspectSafeRunTree(root, childrenStopped, depth, expired, options));
+/** Explicit resident roots require the same terminal/exit/allowlist proof. */
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline,
+  options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => safeRunTree(directory, false, 0, expired, options);
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
   catch { return false; }
@@ -501,11 +530,20 @@ const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"termina
  * The marker counts against the byte cap. A single oversized final event may leave only
  * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
-export const compactTerminalRunEvents = (
-  directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
-    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
-): boolean => {
+type TerminalRunCompactionOptions = TerminalRunEventsRetention & {
+  now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
+  onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
+};
+function* inspectCompactionTree(directory: string, expired: Deadline, scratchCoveredByAllowlist: boolean): TreeWalk<boolean> {
+  const inspections = new Map<string, RunInspection>(), options = { disposeScratch: false };
+  // Async Windows inspection never enters the synchronous scratch API. The
+  // recursive artifact allowlist immediately following this exit proof vetoes
+  // every scratch directory/fence/receipt instead; no disposal is authorized.
+  if (yield* inspectRunTree(directory, 0, expired, true, true, true, options, scratchCoveredByAllowlist, inspections)) return false;
+  return yield* inspectSafeRunTree(directory, false, 0, expired, options, inspections);
+}
+function* inspectTerminalRunEvents(directory: string, options: TerminalRunCompactionOptions,
+  scratchCoveredByAllowlist = false): TreeWalk<boolean> {
   const now = options.now ?? Date.now();
   const ageMs = options.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000;
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
@@ -513,22 +551,20 @@ export const compactTerminalRunEvents = (
   // Compaction is observation until atomic replacement, including dry-run and
   // already-bounded no-ops. Scratch disposal belongs to collection, never to
   // these guards: even a failed disposal can alter the directory's TTL clock.
-  const inspection = { disposeScratch: false };
-  const directoryStat = ownedStat(directory);
+  const directoryStat = yield* treeOwnedStat(directory);
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
       maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
-  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  const record = (yield* treeJson<RunRecordSummary>(path.join(directory, "status.json")));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
-      now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
+      now - recordAgeReference(record, (yield* treeOwnedStat(directory))?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
-  const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true, inspection) ||
-      !canRemoveTerminalRun(directory, expired, inspection)) return false;
+  const stat = yield* treeOwnedStat(file);
+  if (!stat?.isFile() || stat.size === 0 || !(yield* inspectCompactionTree(directory, expired, scratchCoveredByAllowlist))) return false;
   try {
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const fd = yield* treeOpen(file);
     let tail: Buffer;
     try {
-      const opened = fs.fstatSync(fd);
+      const opened = yield* treeHandleStat(fd);
       if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
           opened.mtimeMs !== stat.mtimeMs) return false;
       // Establish whether the original satisfies both limits before reserving
@@ -539,11 +575,11 @@ export const compactTerminalRunEvents = (
       let read = 0;
       while (read < length) {
         if (expired()) return false;
-        const count = fs.readSync(fd, tail, read, length - read, stat.size - length + read);
+        const count = yield* treeTail(fd, tail, read, length - read, stat.size - length + read);
         if (count === 0) return false;
         read += count;
       }
-    } finally { fs.closeSync(fd); }
+    } finally { yield* treeClose(fd); }
     // Skip a partial first line only when we did not read from the start.
     let retained = tail;
     if (tail.length < stat.size) {
@@ -571,19 +607,19 @@ export const compactTerminalRunEvents = (
       const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
       retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
     }
-    const checked = ownedStat(file);
+    const checked = yield* treeOwnedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        runTreeExitVeto(directory, 0, expired, true, inspection) || !canRemoveTerminalRun(directory, expired, inspection) ||
+        !(yield* inspectCompactionTree(directory, expired, scratchCoveredByAllowlist)) ||
         expired() || options.isRetained?.()) return false;
     if (!options.dryRun) {
-      try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }
+      try { yield* treeWrite(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }
       finally {
         // Residency expiry (and legacy timestamp fallback) uses directory mtime.
         // Creating/renaming the atomic tail must not restart that retention clock.
-        const current = ownedStat(directory);
+        const current = yield* treeOwnedStat(directory);
         if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
-          try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
+          try { yield* treeTimes(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
           catch { /* A failed timestamp restore only delays collection; it cannot authorize it. */ }
         }
       }
@@ -592,6 +628,9 @@ export const compactTerminalRunEvents = (
     return true;
   } catch { return false; }
 };
+
+export const compactTerminalRunEvents = (directory: string, options: TerminalRunCompactionOptions = {}): boolean =>
+  inspectTreeSync(inspectTerminalRunEvents(directory, options));
 
 /** Immutable, ordinary rotation history only. Malformed-session orphan backups are
  * recovery evidence, not rotation history, and keep their existing exemption. */
@@ -644,9 +683,12 @@ export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions
     yield; // Also bound scans of latest, malformed and live entries.
     if (!entry.isDirectory() || entry.name === options.latestRunId || options.retainRun?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
-    const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
-    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
+    const inspections = new Map<string, RunInspection>();
+    if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, process.platform === "win32", inspections)) ||
+        !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
+    const { record, root } = inspections.get(directory)!;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status)) continue;
+    if (now - recordAgeReference(record, root.mtimeMs) < options.retentionMs) {
       compactTerminalRunEvents(directory, { ...options, now, isRetained: () => options.retainRun?.(entry.name) ?? false });
       continue;
     }
@@ -654,6 +696,48 @@ export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions
   }
   return removed;
 }
+
+/** Windows' bounded queue: one in-flight run, every filesystem crossing awaited.
+ * No scratch disposal or synchronous compaction on the RPC slice. Event-tail
+ * compaction uses the same shared policy and awaited IO driver too.
+ * Ownership/publication/latestRunId are refreshed after IO,
+ * immediately before removal, never cached across the asynchronous inspection. */
+export const pruneActorRunArchivesAsync = async (options: ActorRunArchivePruneOptions, canPrune: () => boolean): Promise<string[]> => {
+  const removed: string[] = [], now = options.now ?? Date.now();
+  if (!canPrune() || !(await inspectTreeAsync(treeOwnedStat(options.runsDirectory)))?.isDirectory()) return removed;
+  let entries: fs.Dirent[];
+  try { entries = await fs.promises.readdir(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
+  for (const entry of entries) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (!canPrune()) return removed;
+    if (!entry.isDirectory() || entry.name === options.latestRunId || options.retainRun?.(entry.name)) continue;
+    const directory = path.join(options.runsDirectory, entry.name), inspections = new Map<string, RunInspection>();
+    const expired = () => !!options.retainRun?.(entry.name);
+    if (await inspectTreeAsync(inspectRunTree(directory, 0, expired, true, true, true, { disposeScratch: false }, true, inspections)) ||
+        !await inspectTreeAsync(inspectSafeRunTree(directory, false, 0, expired, { disposeScratch: false }, inspections))) continue;
+    const { record, root } = inspections.get(directory)!;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status)) continue;
+    if (now - recordAgeReference(record, root.mtimeMs) < options.retentionMs) {
+      await inspectTreeAsync(inspectTerminalRunEvents(directory, { ...options, now,
+        expired: () => !canPrune(), isRetained: () => !!options.retainRun?.(entry.name) }, true));
+      continue;
+    }
+    // Async IO allows other work between crossings. Refuse changed namespaces or
+    // status records, not only a changed host authority, before starting deletion.
+    let unchanged = true;
+    for (const [run, checked] of inspections) {
+      for (const [file, before] of [[run, checked.root], [path.join(run, "status.json"), checked.statusStat]] as const) {
+        const after = await inspectTreeAsync(treeOwnedStat(file));
+        if (!before || !after || before.dev !== after.dev || before.ino !== after.ino ||
+            before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.size !== after.size) { unchanged = false; break; }
+      }
+      if (!unchanged) break;
+    }
+    if (!unchanged || expired() || !canPrune()) continue;
+    try { await fs.promises.rm(directory, { recursive: true, force: true }); removed.push(directory); } catch { /* retain on failed removal */ }
+  }
+  return removed;
+};
 
 /** Synchronous callers keep the original behavior and return value. */
 export const pruneActorRunArchives = (options: ActorRunArchivePruneOptions): string[] => {

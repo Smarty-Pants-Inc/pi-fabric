@@ -2031,7 +2031,11 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // This case proves NO activation/compensation attempt, not a 200 ms native
+    // publication SLA. Main Windows eebea382 passed; PR369's native log instead
+    // exhausted that client wait during successful create publication. Keep a
+    // short removal timeout only if the forbidden compensation path is entered.
+    const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
@@ -2040,6 +2044,7 @@ describe("round 1 public cancellation contract", () => {
     let removalError: unknown;
     const originalClientRemove = state.client.removeActor.bind(state.client);
     const remove = vi.spyOn(state.client, "removeActor").mockImplementation(async (id) => {
+      state.client.options.commandTimeoutMs = 200; // Forbidden compensation still exercises the short unknown-outcome deadline.
       try { return await originalClientRemove(id); }
       catch (error) { removalError = error; throw error; }
     });

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createScratch } from "../src/storage/scratch.js";
-import { createRunTmpDirectory } from "../src/storage/run-scratch.js";
+import { createRunTmpDirectory, prepareRunRoot } from "../src/storage/run-scratch.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
@@ -182,14 +182,27 @@ fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JS
     expect(sddl(directory)).toBe(before);
   }, 30000);
 
-  it.skipIf(process.platform === "win32")("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
+  it("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
     const directory = privateDirectory("existing-scratch");
     const tmp = path.join(directory, "tmp");
     fs.mkdirSync(tmp);
     grant(tmp, "S-1-1-0", 0x1);
-    const before = sddl(tmp);
+    fs.writeFileSync(path.join(tmp, "foreign-data"), "do not mutate");
+    const before = sddl(tmp), entries = fs.readdirSync(directory);
     expect(() => createRunTmpDirectory(directory)).toThrow(/not private/);
     expect(sddl(tmp)).toBe(before);
+    expect(fs.readFileSync(path.join(tmp, "foreign-data"), "utf8")).toBe("do not mutate");
+    expect(fs.readdirSync(directory)).toEqual(entries);
+  }, 30000);
+
+  it.each(["dot", "parent", "trailing-dot", "reserved"])("refuses invalid explicit %s spelling before allocation or ACL mutation", kind => {
+    const directory = privateDirectory("invalid-spelling"), before = sddl(directory);
+    const missing = path.join(directory, "must-not-create");
+    const spelling = kind === "dot" ? `${missing}\\.\\child` : kind === "parent" ? `${missing}\\..\\child`
+      : kind === "trailing-dot" ? `${missing}.` : `${missing}\\NUL.txt`;
+    expect(() => prepareRunRoot(spelling)).toThrow(/ambiguous Windows path component/);
+    expect(fs.readdirSync(directory)).toEqual([]);
+    expect(sddl(directory)).toBe(before);
   }, 30000);
 
   it("rejects a foreign-owned root without changing ownership or ACLs", () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
+import { prepareRunRoot } from "../src/storage/run-scratch.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 
 // Policy unit tests supply raw snapshots; transport/cold-vs-warm checks live in
@@ -45,6 +46,13 @@ afterEach(() => {
 });
 
 describe("Windows file-data namespace ACL policy", () => {
+  it.each(["R:relative", "R:\\private\\missing\\.\\child", "R:\\private\\missing\\..\\child", "R:\\private\\missing.", "R:\\private\\missing\\NUL.txt"])("refuses explicit spelling %s before filesystem/ACL access", spelling => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const lstat = vi.spyOn(fs, "lstatSync"), mkdir = vi.spyOn(fs, "mkdirSync"), chmod = vi.spyOn(fs, "chmodSync");
+    expect(() => prepareRunRoot(spelling)).toThrow(/absolute local drive path|ambiguous Windows path component/);
+    expect(lstat).not.toHaveBeenCalled(); expect(mkdir).not.toHaveBeenCalled(); expect(chmod).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+  });
   it("accepts a private user namespace through fabricDataRoot without using mode bits or writing", () => {
     Object.defineProperty(process, "platform", { value: "win32" });
     vi.stubEnv("PI_FABRIC_TMPDIR", root + "\\");

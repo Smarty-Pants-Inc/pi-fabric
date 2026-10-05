@@ -57,7 +57,16 @@ describe("actor archive slice fs cost", () => {
       expect(removed).toHaveLength(count);
       expect(largestDeletes).toBe(1);
       expect(longest).toBeLessThan(250);
-      expect(largestCalls).toBeLessThanOrEqual(platform === "win32" ? 20 : 23);
+      // Flat three-file fixture: root lstat (1); archive/actor-archive/worker
+      // marker exists checks (3); status lstat/read (2); nested absence lstat
+      // (1); root readdir (1); task/events lstat (2); rm (1) = 11. The checked
+      // status/root snapshot is reused by allowlist/TTL, never across a run.
+      // POSIX adds fence lstat for disposal plus fence/tmp veto lstat (3) = 14.
+      const exact = platform === "win32" ? 11 : 14;
+      expect(largestCalls).toBe(exact);
+      expect((total() - 2) / count).toBe(exact); // Only root lstat/census are outside run slices.
+      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 5 : 8) * count + 1,
+        readdirSync: count + 1, existsSync: 3 * count, readFileSync: count, rmSync: count });
       expect(scratchCalls).toBe(platform === "win32" ? 0 : 3 * count);
     } finally {
       platformMock.mockRestore(); vi.restoreAllMocks();

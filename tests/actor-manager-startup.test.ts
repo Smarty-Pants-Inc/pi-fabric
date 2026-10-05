@@ -63,8 +63,9 @@ async function eventually(predicate: () => boolean) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in slices below 250ms", async () => {
+  it.each(["native", "win32"] as const)("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in slices below 250ms (%s)", async mode => {
     const f = fixture(200);
+    const platform = mode === "win32" ? vi.spyOn(process, "platform", "get").mockReturnValue("win32") : undefined;
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
     const read = vi.spyOn(ActorRegistryStore.prototype, "read");
@@ -76,15 +77,20 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, ...args) {
       prunedSinceBeat++; return prune.apply(this, args);
     });
-    const slices = ActorLogStore.prototype.pruneRunsInSlices;
-    vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function*(this: ActorLogStore, ...args) {
-      prunedSinceBeat++; yield* slices.apply(this, args);
+    const queued = ActorLogStore.prototype.pruneRunsAsync;
+    vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync").mockImplementation(function(this: ActorLogStore, ...args) {
+      prunedSinceBeat++; return queued.apply(this, args);
     });
     let deletedSinceBeat = 0, largestRunBatch = 0;
     const remove = fs.rmSync;
     vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
       if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) deletedSinceBeat++;
       return remove(...args);
+    });
+    const removeAsync = fs.promises.rm;
+    vi.spyOn(fs.promises, "rm").mockImplementation(async (...args) => {
+      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) deletedSinceBeat++;
+      return removeAsync(...args);
     });
     let heartbeat: NodeJS.Immediate;
     const beat = () => {
@@ -115,18 +121,17 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
       }
-      console.log(`ActorManager 200/2000: constructor=${construction.toFixed(1)}ms longestSlice=${longest.toFixed(1)}ms`);
-    } finally { active = false; clearImmediate(heartbeat!); }
+      process.stdout.write(JSON.stringify({ probe: "ActorManager-200-2000", mode, platform: process.platform, constructorMs: construction, longestSliceMs: longest, largestBatch, largestRunBatch }) + "\n");
+    } finally { active = false; clearImmediate(heartbeat!); platform?.mockRestore(); }
   });
 
   it("uses fresh single actor ownership checks instead of full-fleet snapshots on each Windows run", async () => {
     const f = fixture(200);
     let runPhase = false, fullFleetSnapshots = 0, copiedDecisions = 0, singleActorChecks = 0;
-    const slices = ActorLogStore.prototype.pruneRunsInSlices;
-    vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function(this: ActorLogStore, ...args) {
+    const queued = ActorLogStore.prototype.pruneRunsAsync;
+    vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync").mockImplementation(async function(this: ActorLogStore, ...args) {
       runPhase = true;
-      const iterator = slices.apply(this, args);
-      return (function*() { try { yield* iterator; } finally { runPhase = false; } })();
+      try { await queued.apply(this, args); } finally { runPhase = false; }
     });
     const snapshot = () => {
       if (runPhase && new Error().stack?.includes("sweepRetainedRuns")) {
@@ -159,13 +164,14 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const native = process.platform;
     const platform = vi.spyOn(process, "platform", "get").mockImplementation(() =>
       new Error().stack?.includes("src/actors/manager.ts") ? "win32" : native);
-    const remove = fs.rmSync;
-    let deleted = 0, sinceBeat = 0, largestBatch = 0;
-    vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
+    const remove = fs.promises.rm;
+    let deleted = 0, sinceBeat = 0, largestBatch = 0, activeDeletes = 0, largestActive = 0;
+    vi.spyOn(fs.promises, "rm").mockImplementation(async (...args) => {
       if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) {
-        const deadline = performance.now() + 35;
-        while (performance.now() < deadline) {} // Controlled synchronous NTFS-like cost.
+        activeDeletes++; largestActive = Math.max(largestActive, activeDeletes);
         deleted++; sinceBeat++;
+        await new Promise<void>(resolve => setTimeout(resolve, 35)); // Native work is off the RPC turn.
+        try { return await remove(...args); } finally { activeDeletes--; }
       }
       return remove(...args);
     });
@@ -181,6 +187,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       f.make();
       await eventually(() => !fs.existsSync(f.runDir(0, 8))); await turn();
       expect(deleted).toBe(9);
+      expect(largestActive).toBe(1);
       expect(longest).toBeLessThan(250);
       expect(largestBatch).toBe(1);
       expect(fs.existsSync(f.runDir(0, 9))).toBe(true);
@@ -288,9 +295,13 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     vi.spyOn(f.agents, "run").mockImplementation(async (request) => {
       tasks.push(request.task); started(); await gate; throw new Error("fixture ended");
     });
-    // Freeze only maintenance turns, not promise/lock I/O. This proves admission
-    // happens before the last actor's retention slice, rather than relying on timing.
-    vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
+    // Hold only initial maintenance turns, not promise/lock I/O. Then release
+    // actual native IO: fake-timer advancement cannot drain an async NTFS queue.
+    const held: Array<() => void> = [];
+    const immediate = vi.spyOn(globalThis, "setImmediate").mockImplementation(((callback: () => void) => {
+      held.push(callback); return {} as NodeJS.Immediate;
+    }) as typeof setImmediate);
+    const resumeMaintenance = () => { immediate.mockRestore(); for (const callback of held.splice(0)) callback(); };
     try {
       const manager = f.make();
       // Also cover a restored handoff that expires after loading but before drain.
@@ -302,13 +313,11 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      // Advance async immediates (including their promise continuations), not
-      // waitFor's synchronous timer tick. Windows has ten run turns per actor
-      // plus census/backup/completion boundaries; POSIX keeps its original ten.
-      await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length * 16 + 1 : 10);
+      resumeMaintenance();
+      await eventually(() => !fs.existsSync(store.resultFile(expired)));
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length * 16 + 1 : 10); vi.useRealTimers(); }
+    } finally { release(); resumeMaintenance(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {

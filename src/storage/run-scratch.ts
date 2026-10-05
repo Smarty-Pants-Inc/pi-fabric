@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { windowsDataRoot } from "./windows-temp-root.js";
+import { windowsDataRoot, windowsRootSpelling } from "./windows-temp-root.js";
 import { posixDataRoot } from "./temp-root.js";
 import type { ScratchHostEpoch } from "./scratch-process-census.js";
 import { processStartTime } from "../residency/process-identity.js";
@@ -21,7 +21,8 @@ export const JOINED_SCRATCH_FILE = "scratch-scope-joined.json";
 export const prepareRunRoot = (root: string): string => {
   if (process.platform !== "win32") return posixDataRoot(root, { create: true });
   const missing: string[] = [];
-  let current = path.resolve(root);
+  // Refuse the final caller spelling before any directory/ACL access or mkdir.
+  let current = windowsRootSpelling(root);
   for (;;) {
     try { fs.lstatSync(current); break; }
     catch (error) {
@@ -141,7 +142,10 @@ const disposeUnscopedRunTmp = (runDirectory: string, receipt: ScratchFence, expi
 export const disposeRunTmpDirectory = (runDirectory: string, expired: () => boolean = () => false): boolean => {
   let unlock: (() => void) | undefined;
   try {
-    if (expired()) return false;
+    // Explicit scope cut: Windows inherits TEMP. Direct disposal is a no-op too,
+    // not only the manager's veto path. Retention keeps hostile/legacy scratch.
+    // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4010
+    if (process.platform === "win32" || expired()) return false;
     // No scratch custody means nothing to dispose. Do not create/remove a lock
     // merely to inspect an ordinary retained run: that mutates mtime/ctime and
     // can indefinitely restart residency's directory-based expiry clock.

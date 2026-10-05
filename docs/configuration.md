@@ -444,8 +444,8 @@ Authentication uses `/login jev`/`TYPESAFE_API_KEY` on the TypeSafe route, the e
 
 ## Run temporary-directory scope
 
-- **POSIX:** Each task or actor run receives `<run>/tmp` with mode `0700` and exports it as `TMPDIR`; the parent Main environment is unchanged. Unscoped collection removes scratch on worker, PID, birth, and namespace custody. The deferred 24-hour grace and complete-holder policy do not ship here. A detached writer that outlives the worker is a known limit tracked in [smarty-dev#4800](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4800) or [smarty-dev#4786](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4786).
-- **Windows:** Runs inherit the caller's `TMPDIR`, `TMP`, and `TEMP`. There is no per-run allocation and no deletion; see [smarty-dev#4800](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4800).
+- **POSIX:** Each task or actor run receives `<run>/tmp` with mode `0700` and exports it as `TMPDIR`; the parent Main environment is unchanged. Unscoped collection removes scratch on worker, PID, birth, and namespace custody. The deferred 24-hour grace and complete-holder policy do not ship here. A detached writer that outlives the worker is a known limit tracked in [smarty-dev#4010](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4010#issuecomment-5973129376).
+- **Windows:** Runs inherit the caller's `TMPDIR`, `TMP`, and `TEMP`. There is no per-run scratch allocation or deletion; even direct scratch disposal is an explicit no-op ([scope cut / smarty-dev#4010](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4010#issuecomment-5988997198)). Ordinary terminal archive expiry and event-tail compaction remain enabled through a sequential asynchronous queue, with fresh ownership/publication/latest-run gates before mutation. Existing scratch directories and custody receipts still veto collection. Future Windows temporary-directory isolation remains tracked in [smarty-dev#4800](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4800).
 
 ## Temporal retention
 

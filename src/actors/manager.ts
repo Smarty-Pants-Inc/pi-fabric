@@ -3491,30 +3491,26 @@ export class ActorManager {
     await new Promise<void>((resolve) => setImmediate(resolve));
     const actors = [...this.#actors.values()];
     // NTFS metadata/deletion can exceed the turn budget even for one actor.
-    // Windows resumes at most one run-tree operation per turn, with a fresh
-    // ownership/publication check each time. POSIX keeps its eight-actor batch.
+    // Windows queues at most one asynchronous run-tree operation, with fresh
+    // ownership/publication gates before inspection/removal. POSIX keeps its
+    // eight-actor batch; no synchronous NTFS run work stays on its RPC slice.
     const windows = process.platform === "win32";
     const batchSize = windows ? 1 : 8;
     for (let offset = 0; offset < actors.length; offset += batchSize) {
       if (this.#closing || this.#canConsumeMesh?.() === false) return;
       if (windows) {
         const actor = actors[offset]!;
-        const slices = this.#logs.pruneRunsInSlices(actor, now);
-        for (;;) {
-          const resume = () => {
-            if (this.#closing || this.#canConsumeMesh?.() === false ||
-                this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) return false;
-            return !slices.next().done;
-          };
-          // A one-actor turn needs one fresh canonical ownership decision, not
-          // a copied full-fleet Map on every run. The latter made the new run
-          // slicing quadratic in fleet size (and retained every Map in spies).
-          // Snapshot-only hosts still use the fresh batch contract; never cache
-          // either authority path across a yield.
-          const more = this.#canManageActor ? resume() : this.#withOwnershipRead(resume);
-          if (!more) break;
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        }
+        const canPrune = () => {
+          const fresh = () => !this.#closing && this.#canConsumeMesh?.() !== false &&
+            this.#actors.get(actor.id) === actor && this.#ownershipDecision(actor.id);
+          // One canonical decision, never a full-fleet copy when the host has
+          // single-ID authority. Snapshot-only hosts refresh on each gate too.
+          return this.#canManageActor ? fresh() : this.#withOwnershipRead(fresh);
+        };
+        // One in-flight run; all its native fs work is asynchronous. A slow
+        // lstat/read/delete cannot block the RPC heartbeat, even for one run.
+        // Shutdown joins #retentionSweep; no unowned background queue survives.
+        await this.#logs.pruneRunsAsync(actor, now, canPrune);
         // Completion-record pruning is its own turn, not appended to the last run.
         await new Promise<void>((resolve) => setImmediate(resolve));
       }

@@ -73,19 +73,24 @@ public static class FabricTempRootDevice {
 }
 `;
 
-/** Existing, local Windows directories only; no repair or writes on uncertain ACLs. */
-export const windowsDataRoot = (root: string, options: { private?: boolean } = {}): string => {
-  const fail = (directory: string, reason: string): never => {
-    throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
-  };
-  // Drive-relative, UNC, device and Win32-normalized names need different namespace
-  // proofs. Do not accept those aliases, alternate data streams or reserved devices.
+const fail = (directory: string, reason: string): never => {
+  throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
+};
+
+/** Lexical policy must run before allocation or native inspection: resolving a
+ * dot/reserved component first would erase the caller's unsupported spelling. */
+export const windowsRootSpelling = (root: string): string => {
   if (!/^[a-z]:[\\/]/i.test(root)) fail(root, "must be an absolute local drive path");
   const components = root.slice(3).split(/[\\/]/).filter(Boolean);
   if (components.some(component => /[<>:"|?*\x00-\x1f]|[. ]$/.test(component) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(component))) {
     fail(root, "has an ambiguous Windows path component");
   }
-  const directory = path.win32.resolve(root);
+  return path.win32.resolve(root);
+};
+
+/** Existing, local Windows directories only; no repair or writes on uncertain ACLs. */
+export const windowsDataRoot = (root: string, options: { private?: boolean } = {}): string => {
+  const directory = windowsRootSpelling(root);
   const chain: string[] = [];
   for (let current = directory; ; current = path.win32.dirname(current)) {
     chain.unshift(current);

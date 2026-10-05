@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
+import { ACTOR_RETENTION_BATCH_SIZE } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import * as modelRefresh from "../src/core/model-refresh.js";
 import { execFileSync, spawn } from "node:child_process";
@@ -135,8 +136,8 @@ describe("fresh startup ownership batches", () => {
       };
       let published = false, writerError: unknown;
       // Publish before the next actor batch, not after a fixed number of turns.
-      // The Windows scope cut restores main's eight-actor batch on every host.
-      const boundary = 7;
+      // Main yields after one Windows actor or eight actors on other platforms.
+      const boundary = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"] - 1;
       const scheduleOwner = (actor: { sessionFile: string }) => {
         if (actor.sessionFile === actors[boundary]!.sessionFile && !published) {
           setImmediate(() => {
@@ -154,7 +155,10 @@ describe("fresh startup ownership batches", () => {
         yield* slices.call(this, actor, now); scheduleOwner(actor);
       });
       expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
-      await vi.waitFor(() => { expect(writerError).toBeUndefined(); expect(published).toBe(true); });
+      const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+      // Reach every maintenance batch and the writer queued at the batch boundary.
+      const maintenanceTurns = Math.ceil(actors.length / batchSize) + 2;
+      for (let i = 0; i < maintenanceTurns; i++) await new Promise<void>((resolve) => setImmediate(resolve));
       expect(writerError).toBeUndefined();
       expect(published).toBe(true);
       expect(fs.existsSync(expiredRun)).toBe(true);

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ACTOR_RETENTION_BATCH_SIZE, ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -115,7 +115,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await turn();
       expect(longest).toBeLessThan(250);
       expect(largestBatch).toBeGreaterThan(0);
-      expect(largestBatch).toBeLessThanOrEqual(8); // Main's unchanged actor-batch boundary.
+      expect(largestBatch).toBeLessThanOrEqual(ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"]);
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
@@ -124,7 +124,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); platform?.mockRestore(); }
   });
 
-  it("keeps Windows startup on main's synchronous eight-actor sweep, without an added custody queue", async () => {
+  it("keeps Windows startup on main's synchronous per-actor sweep, without an added custody queue", async () => {
     const f = fixture(9);
     const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const asyncQueue = vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync");
@@ -141,11 +141,12 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
 
   it.each(["ownership", "publication"] as const)("keeps main's fresh Windows %s veto between actor batches", async fence => {
     const f = fixture(9);
+    const boundary = ACTOR_RETENTION_BATCH_SIZE.win32 - 1;
     let owned = true, published = true;
     const prune = ActorLogStore.prototype.pruneRuns;
     vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
       prune.call(this, actor, now);
-      if (path.dirname(actor.sessionFile) === path.join(f.actorRoot, f.records[7]!.id)) setImmediate(() => {
+      if (path.dirname(actor.sessionFile) === path.join(f.actorRoot, f.records[boundary]!.id)) setImmediate(() => {
         if (fence === "ownership") owned = false; else published = false;
       });
     });
@@ -153,10 +154,71 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     try {
       f.make({ snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, owned])),
         canConsumeMesh: () => published });
-      await eventually(() => !fs.existsSync(f.runDir(7, 8)));
+      await eventually(() => !fs.existsSync(f.runDir(boundary, 8)));
       await turn(); await turn();
       for (let run = 0; run < 10; run++) expect(fs.existsSync(f.runDir(8, run))).toBe(true);
     } finally { platform.mockRestore(); }
+  });
+
+  it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
+    const f = fixture(17);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const lstat = fs.lstatSync;
+    let statusProbes = 0;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
+        statusProbes++;
+        // Controlled metadata latency, independent of whether this host has NTFS.
+        // Eight actors share 72 candidates: four status probes/run at 2 ms each
+        // exceed the existing heartbeat bound. One actor still does identical work.
+        const until = performance.now() + 2;
+        while (performance.now() < until) { /* slow filesystem metadata */ }
+      }
+      return Reflect.apply(lstat, fs, [file, ...args]);
+    }) as never);
+    await turn();
+    let previous = performance.now(), longest = 0, active = true;
+    let heartbeat: NodeJS.Immediate;
+    const beat = () => {
+      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (active) heartbeat = setImmediate(beat);
+    };
+    heartbeat = setImmediate(beat);
+    try {
+      f.make();
+      await eventually(() => !fs.existsSync(f.runDir(16, 8)));
+      await turn();
+      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
+      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
+      expect(longest).toBeLessThan(250);
+      for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
+    } finally { active = false; clearImmediate(heartbeat!); }
+  });
+
+  it.each(["ownership", "publication"] as const)("rechecks Windows %s between actor maintenance turns", async (fence) => {
+    const f = fixture(3);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const ownership = new Map(f.records.map(record => [record.id, true]));
+    let published = true;
+    const manager = f.make({ canManageActor: id => ownership.get(id), snapshotActorOwnership: () => new Map(ownership),
+      canConsumeMesh: () => published });
+    await turn();
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    if (fence === "ownership") {
+      ownership.set(f.records[1]!.id, false);
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    } else {
+      published = false;
+      await turn(); await turn();
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+      expect(fs.existsSync(f.runDir(2, 8))).toBe(true);
+      published = true; manager.resumeAfterRelease();
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(false);
+    }
+    for (let actor = 0; actor < 3; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
   });
 
   it("does not build a directory snapshot for an empty manager's idle ownership refresh", () => {
@@ -214,6 +276,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
 
   it.each(["restore", "admission"] as const)("rejects expired context in a later batch before maintenance, but protects a fresh active snapshot (%s)", async (phase) => {
     const f = fixture(17), actor = f.records[16]!;
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    // One initial yield, then one turn per batch, including the final completion yield.
+    const maintenanceTurns = Math.ceil(f.records.length / batchSize) + 1;
     new ActorRegistryStore(f.actorRoot).write(f.records.map((record) => ({ ...record, status: "idle" })));
     const sessionFile = path.join(f.actorRoot, actor.id, "session.jsonl");
     const store = new ActorChildCompletionStore(sessionFile);
@@ -236,13 +301,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     vi.spyOn(f.agents, "run").mockImplementation(async (request) => {
       tasks.push(request.task); started(); await gate; throw new Error("fixture ended");
     });
-    // Hold only initial maintenance turns, not promise/lock I/O. Then release
-    // actual native IO: fake-timer advancement cannot drain an async NTFS queue.
-    const held: Array<() => void> = [];
-    const immediate = vi.spyOn(globalThis, "setImmediate").mockImplementation(((callback: () => void) => {
-      held.push(callback); return {} as NodeJS.Immediate;
-    }) as typeof setImmediate);
-    const resumeMaintenance = () => { immediate.mockRestore(); for (const callback of held.splice(0)) callback(); };
+    // Freeze only maintenance turns, not promise/lock I/O. Admission must happen
+    // before the last actor's real platform-specific retention batch.
+    vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
     try {
       const manager = f.make();
       // Also cover a restored handoff that expires after loading but before drain.
@@ -254,11 +315,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      resumeMaintenance();
-      await eventually(() => !fs.existsSync(store.resultFile(expired)));
+      await vi.advanceTimersByTimeAsync(maintenanceTurns);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); resumeMaintenance(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(maintenanceTurns); vi.useRealTimers(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {
@@ -280,9 +340,8 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     // before the second slice, like quiesce/reload while slow filesystem work yields.
     await turn(); published = false;
     await turn(); await turn();
-    // Windows can stop before inspecting even the first run; POSIX completes
-    // its original eight-actor slice before publication is withdrawn.
-    expect(fs.existsSync(f.runDir(0, 8))).toBe(process.platform === "win32");
+    // Main completes the first platform-specific actor batch before yielding.
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
     expect(fs.existsSync(f.runDir(16, 8))).toBe(true);
     published = true; manager.resumeQueued();
     await eventually(() => !fs.existsSync(f.runDir(16, 8)));

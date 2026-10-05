@@ -44,7 +44,7 @@ The newest installed runtime on the lane is `623f57905b902feafdaeb6b5aeed9812faf
 
 Add a **per-UI display-only setter**, analogous to `setEditorComponent`, rather than teaching Fabric to patch transcript internals:
 
-```ts
+```ts host
 ctx.ui.setUserMessageRenderer(
   renderer?: (text: string, options: { outputPad: number; timestamp: number }, theme: Theme)
     => Component | undefined,

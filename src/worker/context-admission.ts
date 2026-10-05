@@ -2,6 +2,11 @@ import fs from "node:fs";
 import * as nodeModule from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { summarizeActorState } from "./context-reseed.js";
+
+export interface ActorContextReseed {
+  tokens: number; contextWindow: number; reason: string; summary: string; summaryTokens: number;
+}
 
 /** Pure estimator belonging to the selected Pi launcher, not a bundled peer/runtime. */
 export async function loadActorInputEstimator(binary: string): Promise<((text: string) => number) | undefined> {
@@ -59,12 +64,16 @@ export class ActorContextAdmission {
     ready(): void;
     fail(error: string): void;
     compact(tokens: number, contextWindow: number, reason: string): void;
+    reseed(recovery: ActorContextReseed): void;
   };
   private pending: { id: string; command: string } | undefined;
   private sequence = 0;
   private contextWindow = 0;
   private compacted = false;
   private finished = false;
+  private summary = "";
+  private summaryTokens = 8192;
+  private lastTokens = 0;
 
   constructor(runId: string, task: string, systemPrompt: string, estimate: (text: string) => number, io: ActorContextAdmission["io"]) {
     this.runId = runId; this.task = task; this.systemPrompt = systemPrompt; this.estimate = estimate; this.io = io;
@@ -99,7 +108,9 @@ export class ActorContextAdmission {
     if (event.type !== "response" || event.id !== this.pending.id) return false;
     const command = this.pending.command;
     this.pending = undefined;
-    if (event.command !== command || event.success !== true || command !== "get_messages") {
+    if (event.command === command && command === "compact") {
+      this.reseed(this.lastTokens, `native compaction response exceeds event cap (${chars} characters)`);
+    } else if (event.command !== command || event.success !== true || command !== "get_messages") {
       this.fail(`Actor context admission ${command} failed: oversized RPC response (${chars} characters)`);
     } else {
       // A wire-size overflow is an explicit recovery reason, not a token estimate.
@@ -109,9 +120,17 @@ export class ActorContextAdmission {
     return true;
   }
 
+  private reseed(tokens: number, reason: string): void {
+    if (this.finished) return;
+    this.finished = true; this.pending = undefined;
+    this.io.reseed({ tokens, contextWindow: this.contextWindow, reason,
+      summary: this.summary, summaryTokens: this.summaryTokens });
+  }
+
   private recover(tokens: number, reason: string): void {
+    this.lastTokens = tokens;
     if (this.compacted) {
-      this.fail(`Context exceeds window: ${reason}; pre-dispatch compaction did not make this activation fit`);
+      this.reseed(tokens, `${reason}; pre-dispatch compaction did not make this activation fit`);
       return;
     }
     this.compacted = true;
@@ -122,6 +141,10 @@ export class ActorContextAdmission {
   observe(event: Record<string, unknown>): boolean {
     if (event.type !== "response" || !this.pending || event.id !== this.pending.id) return false;
     const command = this.pending.command; this.pending = undefined;
+    if (event.command === command && command === "compact" && event.success !== true) {
+      this.reseed(this.lastTokens, `native compaction failed: ${String(event.error ?? "invalid RPC response")}`);
+      return true;
+    }
     if (event.command !== command || event.success !== true) {
       this.fail(`Actor context admission ${command} failed: ${String(event.error ?? "invalid RPC response")}`);
       return true;
@@ -133,11 +156,13 @@ export class ActorContextAdmission {
         this.fail("Actor context admission requires an idle Pi child and a model context window");
       } else {
         this.contextWindow = window;
+        const activationTokens = this.estimate(JSON.stringify({ task: this.task, systemPrompt: this.systemPrompt }));
+        this.summaryTokens = Math.max(0, Math.min(8192, Math.floor(window * 0.1), Math.floor(window * 0.85) - activationTokens - 1024));
         this.send("get_messages");
       }
     } else if (command === "compact") {
       // Native compact resolves only after its checkpoint has been committed.
-      // Measure the resulting context; a failed/ineffective summary never dispatches.
+      // Measure the resulting context; failed/ineffective compaction reseeds before dispatch.
       this.send("get_messages");
     } else {
       if (!Array.isArray(data?.messages)) {
@@ -147,8 +172,8 @@ export class ActorContextAdmission {
       // Fresh content estimate, not stale assistant usage. Reserve room for native
       // prompt/tool framing and output; systemPrompt includes the actor persona.
       const tokens = this.estimate(JSON.stringify({ messages: data.messages, task: this.task, systemPrompt: this.systemPrompt }));
-      const reserve = Math.min(8192, Math.floor(this.contextWindow * 0.1));
-      if (tokens > this.contextWindow - reserve) {
+      if (tokens > Math.floor(this.contextWindow * 0.85)) {
+        this.summary = summarizeActorState(data.messages);
         this.recover(tokens, `estimated ${tokens} input tokens, window ${this.contextWindow}`);
       } else {
         this.finished = true;

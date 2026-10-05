@@ -108,7 +108,21 @@ export class ActorRegistryStore {
     });
   }
 
-  /** Retains registry custody while an adoption also acquires the mesh resume fence. */
+  /** Acquire all registry fences in one global order before any mesh lock.
+   * Deduplicate normalized paths: project/session roots may name the same store.
+   * The callback retains every fence through source selection and publication;
+   * it must never be invoked while the caller already holds mesh custody. */
+  static withLocks<T>(registries: readonly ActorRegistryStore[], operation: () => T | Promise<T>): Promise<T> {
+    const stores = new Map(registries.map((store) => [path.resolve(store.#registryPath), store]));
+    const ordered = [...stores.keys()].sort().map((key) => stores.get(key)!);
+    const acquire = (index: number): Promise<T> => index === ordered.length
+      ? Promise.resolve().then(operation)
+      : ordered[index]!.withLock(() => acquire(index + 1));
+    return acquire(0);
+  }
+
+  /** Global order: actor registries (sorted path), then mesh; never the reverse.
+   * Retains registry custody while adoption/publication acquires the mesh fence. */
   async withLock<T>(operation: () => T | Promise<T>): Promise<T> {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");

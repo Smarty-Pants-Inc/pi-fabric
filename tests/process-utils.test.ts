@@ -96,6 +96,8 @@ describe("process task role environment (#2998)", () => {
   it.each(["worktree-agent@0123456789ab", undefined])("sets the worker role before exec from parent %s and strips spawner role overrides", async (parentRole) => {
     vi.stubEnv("SMARTY_ROLE", parentRole);
     vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+    vi.stubEnv("PI_FABRIC_ROLE_SESSION", "parent-session");
+    vi.stubEnv("PI_FABRIC_ROLE_PROJECT", process.cwd());
     vi.stubEnv("SMARTY_READ_CLASS", "critical");
     vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
     vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", "session:parent");
@@ -103,7 +105,7 @@ describe("process task role environment (#2998)", () => {
     const expectedRole = parentRole ? "task-agent@0123456789ab" : "task-agent";
     const source = `import fs from "node:fs";
 fs.writeFileSync("env.json", JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => [
-  "SMARTY_ROLE", "PI_FABRIC_ROLE", "SMARTY_READ_CLASS", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID"
+  "SMARTY_ROLE", "PI_FABRIC_ROLE", "PI_FABRIC_ROLE_SESSION", "PI_FABRIC_ROLE_PROJECT", "SMARTY_READ_CLASS", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID"
 ].includes(key)))));
 setInterval(() => {}, 1000);`;
     await withOwnedWorker(source, async (handle, root) => {

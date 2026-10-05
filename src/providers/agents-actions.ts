@@ -12,6 +12,7 @@ import type { FabricActionDescriptor } from "../protocol.js";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
   runner: {
     type: "string",
     enum: ["pi", "claude", "veda"],

@@ -51,6 +51,7 @@ import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
+import { probeAgentPlacement } from "./agents/placement-config.js";
 
 export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
@@ -71,6 +72,7 @@ export class FabricState {
   #config: FabricConfig | undefined;
   #provisionalConfig: FabricConfig | undefined;
   #kernelReloadRequired = false;
+  #placementProbeLine: string | undefined;
 
   readonly #roleGrant = new ParticipantRoleGrant();
   #cwd: string | undefined;
@@ -203,6 +205,7 @@ export class FabricState {
       projectTrusted: context.isProjectTrusted(),
     });
     this.#config = config;
+    this.#probePlacement(config, context.cwd, true);
     this.#kernelReloadRequired = false;
     this.prewalk.cancel();
     this.prewalkDrift.clear();
@@ -230,6 +233,7 @@ export class FabricState {
       this.#kernelReloadRequired = next.executor.kernel !== this.#config.executor.kernel;
       next.executor.kernel = this.#config.executor.kernel;
       this.#config = next;
+      this.#probePlacement(next, context.cwd);
     }
     await this.#activate(context, true);
   }
@@ -390,6 +394,7 @@ export class FabricState {
       }
     }
     this.#config = next;
+    this.#probePlacement(next, context.cwd);
     this.#runtime?.reloadConfig(context, next);
   }
 
@@ -440,6 +445,17 @@ export class FabricState {
       { cwd: context.cwd, agentDir: resolveAgentDir(), projectTrusted },
       projectTrusted ? "project" : "global",
     );
+  }
+
+  #probePlacement(config: FabricConfig, cwd: string, startup = false): void {
+    const placement = config.agents.placement;
+    if (!placement) { this.#placementProbeLine = undefined; return; }
+    const probe = probeAgentPlacement(placement, cwd);
+    const line = probe.reason
+      ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
+      : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
+    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    this.#placementProbeLine = line;
   }
 
   #assertOpen(): void {

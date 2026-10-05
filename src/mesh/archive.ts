@@ -292,11 +292,14 @@ export class MeshArchive {
    * event past the live log's end, on any day, is returned to go live again. An event whose
    * publish never returned may come back too; across a power loss delivery is at least once.
    * The store then calls recovered(), which records this boot.
+   *
+   * rebootOnly defers same-boot pending cleanup, so an exact keyed retry can settle
+   * its intent AFTER reboot promotion without ordinary cutback erasing its evidence.
    */
-  recover(lastLive: number): MeshArchiveRecovery {
+  recover(lastLive: number, rebootOnly = false): MeshArchiveRecovery {
     const pending = this.pending();
     if (this.#readText("BOOT") === currentBoot()) {
-      if (pending) {
+      if (pending && !rebootOnly) {
         if ((this.head()?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
         else this.#cutBack(pending);
       }

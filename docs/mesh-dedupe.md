@@ -10,9 +10,13 @@ All steps hold the existing mesh lock:
 
 1. Read `event-receipts/<hash>.json`. A valid receipt is authoritative; confirm
    its file/namespace barriers, finish any pending-file cleanup, and return it.
-2. If `event-receipts/<hash>.pending.json` exists, read **one line at its
-   recorded live byte offset** and match `reservedSequence`, `eventId`, and
-   `dedupeKey`. If the line no longer matches (including after an old compactor
+2. If `event-receipts/<hash>.pending.json` exists, repair the live tail and finish
+   the existing archive BOOT check and full reboot promotion **before settling
+   the intent**, under the same lock. This restores all earlier synced archived
+   events in sequence order, not just the retried key. In the same boot, this
+   recovery pass defers pending cutback so the intent's archive evidence survives.
+   Then read **one line at its recorded live byte offset** and match
+   `reservedSequence`, `eventId`, and `dedupeKey`. If the line no longer matches (including after an old compactor
    rewrites the live tail), directly read
    `sequence-index/<floor(sequence/1024)>/<sequence>.json` in the archive, then
    seek exactly its segment/file offset and read the one recorded line.
@@ -28,7 +32,8 @@ All steps hold the existing mesh lock:
    **unavailable**, not absent: retain the intent and return retryable
    `MeshDedupeRecoveryError`, never publish.
    The captured `archiveDir` also fences removal/change of archive configuration.
-   Settle the intent before ordinary archive recovery can cut back its evidence.
+   Same-boot pending cleanup remains deferred until settlement, so it cannot
+   cut back the exact archive-only reservation being retried.
 3. Neither file means **new**, not "search history". Repair the live tail and
    finish ordinary archive recovery, reserve a sequence, and install a durable
    negative sequence sidecar in the archive. Create
@@ -159,6 +164,11 @@ original inbox carrier again.
   retryable `MeshDedupeRecoveryError`; explicit negative reservation, positive
   abort, different exact event, or EOF at/before the indexed address permits
   publication only after the live anchor does not match.
+- Reboot with live `[1]` and synced archive `[1, 2, 3]`, where ordinary event 2
+  was acknowledged and keyed event 3 retains its intent/positive sidecar: retry
+  key 3 as the first operation. `read({ after: 1 })` and the real paged RootInbox
+  cursor both deliver 2 then 3; repeated retries do not append 3 again. Repeat
+  with an unrelated ordinary publication first.
 - Consumer replay: a different event id with the same dedupe key does not
   re-deliver after recipient reload, including a new maintenance sender; unrelated
   publication keys remain deliverable.

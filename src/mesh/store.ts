@@ -813,13 +813,20 @@ export class MeshStore {
         if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
         throw error;
       }
-      // Settle before ordinary archive recovery can roll back a pending archive line.
-      // Neither receipt nor intent means NEW: no event-history read, regardless of its size.
+      this.#repairEventLog();
+      // Recover the whole reboot suffix before any one intent can advance the live horizon.
+      // In the same boot, defer ordinary pending cutback until the exact retry has settled.
+      // New keys still take only the normal recovery path, with no event-history lookup.
       if (input.dedupeKey) {
+        if (archive && fs.existsSync(intentPath!)) {
+          try { this.#recoverArchive(archive, true); }
+          catch (error) {
+            throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
+          }
+        }
         const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
         if (prior) return prior;
       }
-      this.#repairEventLog();
       if (archive) this.#recoverArchive(archive);
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
@@ -955,8 +962,9 @@ export class MeshStore {
   // stopped between its archive append and its commit is cut back out; if its event did go
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
-  #recoverArchive(archive: MeshArchive): void {
-    const recovery = archive.recover(this.#readLastEventSequence());
+  #recoverArchive(archive: MeshArchive, rebootOnly = false): void {
+    const recovery = archive.recover(this.#readLastEventSequence(), rebootOnly);
+    if (rebootOnly && !recovery.rebooted) return;
     if (recovery.rebooted) {
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.

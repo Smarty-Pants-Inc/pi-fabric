@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { parsePiSessionHeader } from "../core/pi-session-header.js";
 
 /**
  * Activation inference must be empty before Pi starts, not only after its
@@ -20,7 +21,13 @@ export class ActivationSession {
     // crash must not let run cleanup erase unmerged activation evidence.
     fs.mkdirSync(path.dirname(journal), { recursive: true, mode: 0o700 });
     this.file = path.join(path.dirname(journal), `.activation-${path.basename(runDirectory)}.jsonl`);
-    fs.writeFileSync(this.file, JSON.stringify({
+    // Isolation changes inference history, not actor identity (#4313). Native
+    // Bash exports the live SessionManager ID, while review fences read the
+    // registered journal header. Read that header anew for every activation,
+    // including the first one after resident restart or session rotation.
+    const header = this.before ? parsePiSessionHeader(this.before.split("\n", 1)[0]!) : undefined;
+    if (this.before && !header) throw new Error("Actor journal has no valid native session header");
+    fs.writeFileSync(this.file, JSON.stringify(header ?? {
       type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd,
     }) + "\n", { mode: 0o600, flag: "wx" });
   }

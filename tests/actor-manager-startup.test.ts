@@ -115,8 +115,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await turn();
       expect(longest).toBeLessThan(250);
       expect(largestBatch).toBeGreaterThan(0);
-      expect(largestBatch).toBeLessThanOrEqual(process.platform === "win32" ? 1 : 8);
-      if (process.platform === "win32") expect(largestRunBatch).toBeLessThanOrEqual(1);
+      expect(largestBatch).toBeLessThanOrEqual(8); // Main's unchanged actor-batch boundary.
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
@@ -125,105 +124,38 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); platform?.mockRestore(); }
   });
 
-  it("uses fresh single actor ownership checks instead of full-fleet snapshots on each Windows run", async () => {
-    const f = fixture(200);
-    let runPhase = false, fullFleetSnapshots = 0, copiedDecisions = 0, singleActorChecks = 0;
-    const queued = ActorLogStore.prototype.pruneRunsAsync;
-    vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync").mockImplementation(async function(this: ActorLogStore, ...args) {
-      runPhase = true;
-      try { await queued.apply(this, args); } finally { runPhase = false; }
-    });
-    const snapshot = () => {
-      if (runPhase && new Error().stack?.includes("sweepRetainedRuns")) {
-        fullFleetSnapshots++; copiedDecisions += f.records.length;
-      }
-      return new Map(f.records.map(record => [record.id, true]));
-    };
-    const single = (_id: string, fresh = true) => {
-      expect(fresh).toBe(true);
-      if (runPhase) singleActorChecks++;
-      return true;
-    };
-    // The fixture's agent manager is already constructed on the native host.
-    // Select the actual Windows retention path, not Windows ACL admission.
+  it("keeps Windows startup on main's synchronous eight-actor sweep, without an added custody queue", async () => {
+    const f = fixture(9);
     const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const asyncQueue = vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync");
+    const sync = vi.spyOn(ActorLogStore.prototype, "pruneRuns");
     try {
-      f.make({ canManageActor: single, snapshotActorOwnership: snapshot });
-      await eventually(() => !fs.existsSync(f.runDir(199, 8))); await turn();
-      process.stdout.write(JSON.stringify({ probe: "Windows-200-actors-2000-runs-ownership", fullFleetSnapshots,
-        copiedDecisions, singleActorChecks }) + "\n");
-      expect(fullFleetSnapshots).toBe(0);
-      expect(copiedDecisions).toBe(0);
-      expect(singleActorChecks).toBeGreaterThanOrEqual(2_000);
-      expect(fs.existsSync(f.runDir(199, 9))).toBe(true);
+      f.make({ canManageActor: () => true,
+        snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, true])) });
+      await eventually(() => !fs.existsSync(f.runDir(8, 8)));
+      expect(sync).toHaveBeenCalledTimes(9);
+      expect(asyncQueue).not.toHaveBeenCalled();
+      for (let actor = 0; actor < 9; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { platform.mockRestore(); }
   });
 
-  it("bounds slow Windows run deletion inside a single actor below 250ms", async () => {
-    const f = fixture(1);
-    const native = process.platform;
-    const platform = vi.spyOn(process, "platform", "get").mockImplementation(() =>
-      new Error().stack?.includes("src/actors/manager.ts") ? "win32" : native);
-    const remove = fs.promises.rm;
-    let deleted = 0, sinceBeat = 0, largestBatch = 0, activeDeletes = 0, largestActive = 0;
-    vi.spyOn(fs.promises, "rm").mockImplementation(async (...args) => {
-      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) {
-        activeDeletes++; largestActive = Math.max(largestActive, activeDeletes);
-        deleted++; sinceBeat++;
-        await new Promise<void>(resolve => setTimeout(resolve, 35)); // Native work is off the RPC turn.
-        try { return await remove(...args); } finally { activeDeletes--; }
-      }
-      return remove(...args);
-    });
-    let previous = performance.now(), longest = 0, active = true;
-    let heartbeat: NodeJS.Immediate;
-    const beat = () => {
-      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
-      largestBatch = Math.max(largestBatch, sinceBeat); sinceBeat = 0;
-      if (active) heartbeat = setImmediate(beat);
-    };
-    heartbeat = setImmediate(beat);
-    try {
-      f.make();
-      await eventually(() => !fs.existsSync(f.runDir(0, 8))); await turn();
-      expect(deleted).toBe(9);
-      expect(largestActive).toBe(1);
-      expect(longest).toBeLessThan(250);
-      expect(largestBatch).toBe(1);
-      expect(fs.existsSync(f.runDir(0, 9))).toBe(true);
-    } finally { active = false; clearImmediate(heartbeat!); platform.mockRestore(); }
-  });
-
-  it("refreshes ownership between individual Windows runs, not just between actors", async () => {
-    const f = fixture(1);
-    let owned = true;
-    const native = process.platform;
-    const platform = vi.spyOn(process, "platform", "get").mockImplementation(() =>
-      new Error().stack?.includes("src/actors/manager.ts") ? "win32" : native);
-    try {
-      f.make({ canManageActor: () => owned, snapshotActorOwnership: () => new Map([[f.records[0]!.id, owned]]) });
-      await eventually(() => !fs.existsSync(f.runDir(0, 0)));
-      owned = false;
-      await turn(); await turn();
-      for (let run = 1; run < 10; run++) expect(fs.existsSync(f.runDir(0, run))).toBe(true);
-    } finally { platform.mockRestore(); }
-  });
-
-  it.each(["snapshot-only", "publication"] as const)("refreshes the %s fence between Windows run slices", async (fence) => {
-    const f = fixture(1);
+  it.each(["ownership", "publication"] as const)("keeps main's fresh Windows %s veto between actor batches", async fence => {
+    const f = fixture(9);
     let owned = true, published = true;
+    const prune = ActorLogStore.prototype.pruneRuns;
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+      prune.call(this, actor, now);
+      if (path.dirname(actor.sessionFile) === path.join(f.actorRoot, f.records[7]!.id)) setImmediate(() => {
+        if (fence === "ownership") owned = false; else published = false;
+      });
+    });
     const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     try {
-      f.make({
-        ...(fence === "publication" ? { canManageActor: () => owned } : {}),
-        snapshotActorOwnership: () => new Map([[f.records[0]!.id, owned]]),
-        canConsumeMesh: () => published,
-      });
-      await eventually(() => !fs.existsSync(f.runDir(0, 0)));
-      if (fence === "snapshot-only") owned = false;
-      else published = false;
+      f.make({ snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, owned])),
+        canConsumeMesh: () => published });
+      await eventually(() => !fs.existsSync(f.runDir(7, 8)));
       await turn(); await turn();
-      for (let run = 1; run < 10; run++) expect(fs.existsSync(f.runDir(0, run))).toBe(true);
+      for (let run = 0; run < 10; run++) expect(fs.existsSync(f.runDir(8, run))).toBe(true);
     } finally { platform.mockRestore(); }
   });
 

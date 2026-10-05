@@ -372,6 +372,15 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
     const evidence = () => JSON.stringify({ platform: process.platform,
       exists: fs.existsSync(run), files: fs.existsSync(run) ? fs.readdirSync(run) : [],
       veto: runTreeExitVeto(run, 0, undefined, true) });
+    if (process.platform === "win32" && fs.existsSync(path.join(run, "unresolved-worker.json"))) {
+      // Main's unresolved-worker veto is independent of the Windows scratch
+      // scope cut. Native close uncertainty is retained, never forged into exit.
+      expect(result, evidence()).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unresolved worker marker/);
+      expect(fs.existsSync(path.join(run, "task.txt.provenance.json"))).toBe(true);
+      expect(fs.existsSync(deliveries)).toBe(true);
+      return;
+    }
     expect(result.removedRuns, result.removedRuns.length ? undefined : evidence()).toEqual([run]);
     expect(result.removedRoots).toEqual([fixture.runRoot]);
     expect(fs.existsSync(run)).toBe(false);

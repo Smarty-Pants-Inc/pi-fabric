@@ -75,16 +75,16 @@ describe("actor archive slice fs cost", () => {
       expect(removed).toHaveLength(count);
       expect(largestDeletes).toBe(1);
       expect(longest).toBeLessThan(250);
-      // Flat three-file fixture: root lstat (1); archive/actor-archive/worker
-      // marker exists checks (3); status lstat/read (2); nested absence lstat
-      // (1); root readdir (1); task/events lstat (2); rm (1) = 11. The checked
-      // status/root snapshot is reused by allowlist/TTL, never across a run.
-      // POSIX adds fence lstat for disposal plus fence/tmp veto lstat (3) = 14.
-      const exact = platform === "win32" ? 11 : 14;
+      // Windows uses main's original 11 lstat + 4 exists + 3 read +
+      // 1 readdir + 1 rm = 20 crossings, with zero scratch probes. POSIX
+      // retains the PR's reused custody snapshot (11 crossings) plus fence
+      // lstat for disposal and fence/tmp veto lstat (3) = 14.
+      const exact = platform === "win32" ? 20 : 14; // win32 equals main 74edbdd0 exactly.
       expect(largestCalls).toBe(exact);
       expect((total() - 2) / count).toBe(exact); // Only root lstat/census are outside run slices.
-      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 5 : 8) * count + 1,
-        readdirSync: count + 1, existsSync: 3 * count, readFileSync: count, rmSync: count });
+      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 11 : 8) * count + 1,
+        readdirSync: count + 1, existsSync: (platform === "win32" ? 4 : 3) * count,
+        readFileSync: (platform === "win32" ? 3 : 1) * count, rmSync: count });
       expect(scratchCalls).toBe(platform === "win32" ? 0 : 3 * count);
     } finally {
       platformMock.mockRestore(); vi.restoreAllMocks();
@@ -113,7 +113,7 @@ describe("actor archive slice fs cost", () => {
           else fs.writeFileSync(artifact, "{}");
           expect(canRemoveTerminalRun(run)).toBe(false);
           if (name === RUN_TMP_DIRECTORY || name === UNRESOLVED_SCRATCH_FILE) {
-            expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/scratch writer exit is unconfirmed/);
+            expect(runTreeExitVeto(run, 0, undefined, true)).toBeUndefined(); // scratch sweep is a no-op
           }
           const slices = pruneActorRunArchiveSlices({ runsDirectory: root, retentionMs: 0 });
           while (!slices.next().done) { /* Every candidate must remain. */ }

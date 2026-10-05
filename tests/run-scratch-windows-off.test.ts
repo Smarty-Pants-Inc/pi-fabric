@@ -15,7 +15,7 @@ vi.mock("../src/agents/transports/process-utils.js", async importOriginal => {
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
-describe("Windows per-run scratch scope cut (#4800)", () => {
+describe("Windows scratch disposal and custody scope cut (#4010; allocation remains deferred to #4800)", () => {
   it.each(["absent", "tmp", "unresolved-scratch.json"] as const)("offline scratch inspection never disposes inherited temp and keeps legacy %s custody", artifact => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-win-off-retention-"));
     if (artifact === "tmp") fs.mkdirSync(path.join(root, artifact));
@@ -27,7 +27,12 @@ describe("Windows per-run scratch scope cut (#4800)", () => {
     const rm = vi.spyOn(fs, "rmSync");
     const acl = vi.spyOn(windowsRoots, "windowsDataRoot");
     try {
-      expect(scratch.runScratchExitVeto(root)).toEqual(artifact === "absent" ? undefined : expect.stringContaining("scratch writer exit is unconfirmed"));
+      const stat = vi.spyOn(fs, "lstatSync");
+      const before = artifact === "absent" ? [] : [artifact];
+      expect(scratch.runScratchExitVeto(root)).toBeUndefined();
+      expect(scratch.disposeRunTmpDirectory(root)).toBe(false);
+      expect(stat).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual(before); // no custody sweep, nothing deleted
       expect(read).not.toHaveBeenCalled();
       expect(mkdir).not.toHaveBeenCalled();
       expect(rm).not.toHaveBeenCalled();

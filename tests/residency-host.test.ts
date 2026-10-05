@@ -135,8 +135,8 @@ describe("fresh startup ownership batches", () => {
       };
       let published = false, writerError: unknown;
       // Publish before the next actor batch, not after a fixed number of turns.
-      // Windows yields within its first actor; POSIX retains eight actors per batch.
-      const boundary = process.platform === "win32" ? 0 : 7;
+      // The Windows scope cut restores main's eight-actor batch on every host.
+      const boundary = 7;
       const scheduleOwner = (actor: { sessionFile: string }) => {
         if (actor.sessionFile === actors[boundary]!.sessionFile && !published) {
           setImmediate(() => {

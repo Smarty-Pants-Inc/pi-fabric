@@ -47,9 +47,10 @@ describe("#369 root custody precedes descendant scratch disposal", () => {
       fs.writeFileSync(path.join(root, "status.json"), JSON.stringify(status));
       try {
         if (windows) {
-          // Windows inherits TEMP: its gate cannot dispose legacy per-run scratch,
-          // even once root custody passes. The retained fence is not an exit receipt.
-          expect(runTreeExitVeto(root, 0, undefined, true)).toMatch(/scratch writer exit is unconfirmed/);
+          // Windows scratch custody/disposal is a no-op once worker custody
+          // passes. No scratch is inspected or removed; the allowlist still
+          // retains this tree during automatic collection.
+          expect(runTreeExitVeto(root, 0, undefined, true)).toBeUndefined();
           expect(fs.readFileSync(path.join(allocation.directory, "data"), "utf8")).toBe("retain until root proof");
           expect(fs.readFileSync(path.join(child, UNRESOLVED_SCRATCH_FILE), "utf8")).toBe(fence);
         } else {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
-import { runScratchExitVeto } from "./run-scratch.js";
+import { logWindowsScratchScopeCut, runScratchExitVeto } from "./run-scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
@@ -150,7 +150,10 @@ function* inspectRunTree(
       ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
-    if (!isOwnedStat(rootStat) || !rootStat.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    // The Windows scope cut preserves main's exact inspection crossings.
+    const mainWindows = process.platform === "win32" && !scratchCoveredByAllowlist;
+    const ownedRoot = mainWindows ? yield* treeOwnedStat(directory) : rootStat;
+    if (!ownedRoot || !isOwnedStat(ownedRoot) || !ownedRoot.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && (yield* treeExists(path.join(directory, "archive-pending.json")))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -168,7 +171,7 @@ function* inspectRunTree(
       try { record = JSON.parse(yield* treeRead(statusFile)) as RunRecordSummary; } catch { /* existing unreadable records veto below */ }
     }
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (statusExists && !record) return "worker exit is unconfirmed: unreadable run record";
+    if ((mainWindows ? yield* treeExists(statusFile) : statusExists) && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
@@ -286,16 +289,25 @@ function* inspectFollowUps(directory: string, expired: Deadline): TreeWalk<boole
 function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline,
   options: Pick<RunTreeExitOptions, "disposeScratch"> = {}, inspections?: Map<string, RunInspection>): TreeWalk<boolean> {
   if (expired() || depth > 32) return false;
-  // This snapshot belongs to ONE inspection only, never a resumed run/turn. The
-  // exit walk validates directory/status once; the allowlist and age predicate
-  // consume those same checked objects. Descendants are inspected once too.
-  if (!inspections) {
-    inspections = new Map();
-    if (yield* inspectRunTree(root, 0, expired, true, true, true, options, process.platform === "win32", inspections)) return false;
+  // Scope cut: synchronous Windows collection uses main's existing custody
+  // path, not the PR's scratch sweep or snapshot-reuse optimization. Keep the
+  // original crossings so Windows per-run work is mechanically main-equivalent.
+  let record: RunRecordSummary | undefined;
+  let inspection: RunInspection | undefined;
+  if (process.platform === "win32" && !inspections) {
+    if (!(yield* treeOwnedStat(root))?.isDirectory()) return false;
+    if (yield* inspectRunTree(root, 0, expired, true, true, true, options)) return false;
+    record = yield* treeJson<RunRecordSummary>(path.join(root, "status.json"));
+  } else {
+    // POSIX keeps this PR's single-inspection snapshot, never across a yield.
+    if (!inspections) {
+      inspections = new Map();
+      if (yield* inspectRunTree(root, 0, expired, true, true, true, options, false, inspections)) return false;
+    }
+    inspection = inspections.get(root);
+    if (!inspection) return false;
+    record = inspection.record;
   }
-  const inspection = inspections.get(root);
-  if (!inspection) return false;
-  const record = inspection.record;
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
   // a sweep to remove a run with a live or unknown saved PID. Apply this at
@@ -311,7 +323,7 @@ function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, 
     for (const name of (yield* treeList(root))) {
       if (expired()) return false;
       const file = path.join(root, name);
-      const stat = name === "status.json" ? inspection.statusStat : yield* treeOwnedStat(file);
+      const stat = name === "status.json" && inspection ? inspection.statusStat : yield* treeOwnedStat(file);
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
@@ -683,12 +695,21 @@ export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions
     yield; // Also bound scans of latest, malformed and live entries.
     if (!entry.isDirectory() || entry.name === options.latestRunId || options.retainRun?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
-    const inspections = new Map<string, RunInspection>();
-    if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, process.platform === "win32", inspections)) ||
-        !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
-    const { record, root } = inspections.get(directory)!;
+    let record: RunRecordSummary | undefined, root: fs.Stats | undefined;
+    if (process.platform === "win32") {
+      logWindowsScratchScopeCut();
+      record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+      if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
+      root = ownedStat(directory);
+    } else {
+      // POSIX behavior is unchanged by the Windows cut.
+      const inspections = new Map<string, RunInspection>();
+      if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, false, inspections)) ||
+          !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
+      ({ record, root } = inspections.get(directory)!);
+    }
     if (!record?.status || !TERMINAL_STATUSES.has(record.status)) continue;
-    if (now - recordAgeReference(record, root.mtimeMs) < options.retentionMs) {
+    if (now - recordAgeReference(record, root?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, { ...options, now, isRetained: () => options.retainRun?.(entry.name) ?? false });
       continue;
     }

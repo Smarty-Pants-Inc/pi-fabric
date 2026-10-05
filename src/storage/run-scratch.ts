@@ -142,13 +142,18 @@ const disposeUnscopedRunTmp = (runDirectory: string, receipt: ScratchFence, expi
  * their native-close receipt proves only the worker, not descendant exit.
  * Unknown launches and legacy scratch stay fenced.
  * Calling this later allows cleanup/retention after a background tool exits. */
+/** Windows scratch disposal/custody is deliberately outside this PR's scope. */
+let windowsScratchScopeCutLogged = false;
+export const logWindowsScratchScopeCut = (): void => {
+  if (windowsScratchScopeCutLogged) return;
+  windowsScratchScopeCutLogged = true;
+  console.warn("[pi-fabric] Scope cut: Smarty-Pants-Inc/smarty-dev#4010 (Windows scratch disposal and custody); no-op, scratch retained for Main's existing collection path");
+};
 export const disposeRunTmpDirectory = (runDirectory: string, expired: () => boolean = () => false): boolean => {
   let unlock: (() => void) | undefined;
   try {
-    // Explicit scope cut: Windows inherits TEMP. Direct disposal is a no-op too,
-    // not only the manager's veto path. Retention keeps hostile/legacy scratch.
-    // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4010
-    if (process.platform === "win32" || expired()) return false;
+    if (process.platform === "win32") { logWindowsScratchScopeCut(); return false; }
+    if (expired()) return false;
     // No scratch custody means nothing to dispose. Do not create/remove a lock
     // merely to inspect an ordinary retained run: that mutates mtime/ctime and
     // can indefinitely restart residency's directory-based expiry clock.
@@ -181,10 +186,10 @@ export const disposeRunTmpDirectory = (runDirectory: string, expired: () => bool
 };
 
 export const runScratchExitVeto = (runDirectory: string, expired: () => boolean = () => false, disposeScratch = true): string | undefined => {
-  // Windows inherits the caller TEMP and has no per-run scratch allocation or
-  // disposal. Do not try POSIX/legacy disposal here. Existing scratch artifacts
-  // still veto collection below; the inheritance gate is not an exit receipt.
-  if (disposeScratch && process.platform !== "win32") disposeRunTmpDirectory(runDirectory, expired);
+  // Scope cut: no Windows scratch custody sweep, including negative stats.
+  // Main's existing worker/descendant and artifact-allowlist gates still apply.
+  if (process.platform === "win32") { logWindowsScratchScopeCut(); return; }
+  if (disposeScratch) disposeRunTmpDirectory(runDirectory, expired);
   for (const name of [UNRESOLVED_SCRATCH_FILE, RUN_TMP_DIRECTORY]) {
     try { fs.lstatSync(path.join(runDirectory, name)); }
     catch (error) {
@@ -314,6 +319,7 @@ const allocateRunTmpDirectoryLocked = (runDirectory: string): { directory: strin
       finally { unlock?.(); }
     },
     neverStarted() {
+      if (process.platform === "win32") { logWindowsScratchScopeCut(); return; }
       let unlock: (() => void) | undefined;
       try {
         unlock = lockScratchCustody(runDirectory);

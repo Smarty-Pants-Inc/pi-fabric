@@ -3490,36 +3490,16 @@ export class ActorManager {
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
     const actors = [...this.#actors.values()];
-    // NTFS metadata/deletion can exceed the turn budget even for one actor.
-    // Windows queues at most one asynchronous run-tree operation, with fresh
-    // ownership/publication gates before inspection/removal. POSIX keeps its
-    // eight-actor batch; no synchronous NTFS run work stays on its RPC slice.
-    const windows = process.platform === "win32";
-    const batchSize = windows ? 1 : 8;
-    for (let offset = 0; offset < actors.length; offset += batchSize) {
+    // Windows scope cut (#4010): keep main's startup sweep exactly. No
+    // additional per-run scratch custody queue, inspection or disposal.
+    for (let offset = 0; offset < actors.length; offset += 8) {
       if (this.#closing || this.#canConsumeMesh?.() === false) return;
-      if (windows) {
-        const actor = actors[offset]!;
-        const canPrune = () => {
-          const fresh = () => !this.#closing && this.#canConsumeMesh?.() !== false &&
-            this.#actors.get(actor.id) === actor && this.#ownershipDecision(actor.id);
-          // One canonical decision, never a full-fleet copy when the host has
-          // single-ID authority. Snapshot-only hosts refresh on each gate too.
-          return this.#canManageActor ? fresh() : this.#withOwnershipRead(fresh);
-        };
-        // One in-flight run; all its native fs work is asynchronous. A slow
-        // lstat/read/delete cannot block the RPC heartbeat, even for one run.
-        // Shutdown joins #retentionSweep; no unowned background queue survives.
-        await this.#logs.pruneRunsAsync(actor, now, canPrune);
-        // Completion-record pruning is its own turn, not appended to the last run.
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
       this.#withOwnershipRead(() => {
-        for (const actor of actors.slice(offset, offset + batchSize)) {
+        for (const actor of actors.slice(offset, offset + 8)) {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
-          if (!windows) this.#logs.pruneRuns(actor, now);
+          this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
             .filter((item) => item?.source === "child-completion").map((item) => item!.id));

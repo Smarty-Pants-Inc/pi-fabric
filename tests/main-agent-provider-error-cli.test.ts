@@ -20,7 +20,10 @@ const wait = async (check: () => boolean, timeout = 20_000) => {
 
 // Artifact-backed native RPC proof, no provider credentials or remote transport.
 describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", () => {
-  it.each(["FAIL_ONCE", "FAIL_TWICE", "ABORT", "NATIVE_RETRY", "OVERFLOW", "RESET"] as const)("bounds %s recovery and parent reporting", async scenario => {
+  it.each(["FAIL_ONCE", "FAIL_TWICE", "ABORT", "NATIVE_RETRY", "OVERFLOW", "RESET", "COMPACT_FAIL_ONCE", "COMPACT_FAIL_TWICE"] as const)("bounds %s recovery and parent reporting", async scenario => {
+    const delayedCompaction = scenario.startsWith("COMPACT_");
+    const failureTwice = scenario.endsWith("FAIL_TWICE");
+    const recoverable = ["FAIL_ONCE", "FAIL_TWICE", "RESET"].includes(scenario) || delayedCompaction;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-provider-error-4012-"));
     const clients: RpcClient[] = [];
     const events: Record<string, RpcEvent[]> = { parent: [], lane: [] };
@@ -29,13 +32,14 @@ describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", (
       const agentDir = path.join(cwd, "agent");
       fs.mkdirSync(agentDir, { recursive: true });
       fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({
-        retry: { enabled: scenario === "NATIVE_RETRY", maxRetries: 1, baseDelayMs: 10 }, compaction: { enabled: false },
+        retry: { enabled: scenario === "NATIVE_RETRY", maxRetries: 1, baseDelayMs: 10 }, compaction: { enabled: false, keepRecentTokens: delayedCompaction ? 1 : 16_384 },
       }));
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({
         executor: { kernel: "typescript" }, fullCodeMode: false,
         mesh: { enabled: true, announce: true, followUpFlushMs: 120_000 },
         mcp: { enabled: false }, jev: { enabled: false }, memory: { enabled: false },
-        compaction: { engine: "pi" }, entropy: { compile: false }, speculation: { enabled: false },
+        compaction: { engine: "pi", ...(delayedCompaction && name === "lane"
+          ? { tokenThresholds: { "provider-error-4012/faux-1": 6_000 } } : {}) }, entropy: { compile: false }, speculation: { enabled: false },
       }));
       const client = new RpcClient({ cliPath: cli, cwd, provider: "provider-error-4012", model: "faux-1",
         env: {
@@ -65,12 +69,18 @@ describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", (
       const lane = make("lane", lead);
       await lane.start();
       await wait(() => fs.existsSync(path.join(root, "lane", "ready.json")));
-      await lane.prompt(scenario === "RESET" ? "FAIL_ONCE" : scenario);
+      // A prior turn makes native compaction meaningful; the failing turn's
+      // large input crosses Fabric's threshold, with Pi auto-compaction off.
+      if (delayedCompaction) {
+        await lane.promptAndWait("WARM", undefined, 30_000);
+        expect(events.lane!.some(event => event.type === "compaction_start")).toBe(false);
+      }
+      await lane.prompt(delayedCompaction ? `${scenario}\n${"history ".repeat(2_000)}` : scenario === "RESET" ? "FAIL_ONCE" : scenario);
       if (scenario === "ABORT") {
         await wait(() => events.lane!.some(event => event.type === "message_update" && event.assistantMessageEvent.type === "text_delta"));
         await lane.abort();
       }
-      const expectedSettles = ["FAIL_ONCE", "FAIL_TWICE", "RESET"].includes(scenario) ? 2 : 1;
+      const expectedSettles = (recoverable ? 2 : 1) + (delayedCompaction ? 1 : 0);
       await wait(() => settled() >= expectedSettles);
       if (scenario === "RESET") {
         await lane.prompt("FAIL_ONCE");
@@ -81,18 +91,29 @@ describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", (
       const blocked = messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-provider-blocked");
       const retries = messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-provider-retry");
       const reports = (await parent.getMessages()).filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message" && JSON.stringify(message).includes("BLOCKED: provider error:"));
-      const fabricRetries = scenario === "RESET" ? 2 : ["FAIL_ONCE", "FAIL_TWICE"].includes(scenario) ? 1 : 0;
+      const fabricRetries = scenario === "RESET" ? 2 : recoverable ? 1 : 0;
       if (scenario === "NATIVE_RETRY") {
         expect(events.lane!.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
         expect(events.lane!.filter(event => event.type === "auto_retry_end")).toMatchObject([{ success: true }]);
       }
       expect(retries).toHaveLength(fabricRetries);
-      expect(blocked).toHaveLength(scenario === "FAIL_TWICE" ? 1 : 0);
-      expect(reports).toHaveLength(scenario === "FAIL_TWICE" ? 1 : 0);
+      expect(blocked).toHaveLength(failureTwice ? 1 : 0);
+      expect(reports).toHaveLength(failureTwice ? 1 : 0);
       expect(starts()).toBe(scenario === "NATIVE_RETRY" ? 2 : scenario === "RESET" ? 4 : expectedSettles);
-      expect(attempts()).toHaveLength(scenario === "RESET" ? 4 : ["FAIL_ONCE", "FAIL_TWICE", "NATIVE_RETRY"].includes(scenario) ? 2 : 1);
+      expect(attempts()).toHaveLength(scenario === "RESET" ? 4 : recoverable || scenario === "NATIVE_RETRY" ? 2 : 1);
       expect(await lane.getState()).toMatchObject({ isStreaming: false });
-      if (scenario === "FAIL_TWICE") {
+      if (delayedCompaction) {
+        const compactions = fs.readFileSync(path.join(root, "lane", "compactions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        const start = compactions.find(record => record.phase === "start")!;
+        const backoff = compactions.find(record => record.phase === "backoff")!;
+        const complete = compactions.find(record => record.phase === "complete")!;
+        expect(backoff).toMatchObject({ idle: false });
+        expect(backoff.at - start.at).toBeGreaterThan(1_000);
+        expect(complete.at - start.at).toBeGreaterThan(1_500);
+        expect(attempts()[1].at).toBeGreaterThanOrEqual(complete.at);
+        expect(messages.some(message => message.role === "compactionSummary")).toBe(true);
+      }
+      if (failureTwice) {
         expect(blocked[0]).toMatchObject({ content: "BLOCKED: provider error: stream error: stream disconnected before completion", display: true });
         expect(JSON.stringify(reports[0])).not.toContain("second diagnostic line");
       } else if (scenario === "ABORT") {
@@ -115,6 +136,8 @@ describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", (
         }
         const attemptsFile = path.join(root, "lane", "attempts.jsonl");
         if (fs.existsSync(attemptsFile)) fs.copyFileSync(attemptsFile, path.join(evidence, "attempts.jsonl"));
+        const compactionsFile = path.join(root, "lane", "compactions.jsonl");
+        if (fs.existsSync(compactionsFile)) fs.copyFileSync(compactionsFile, path.join(evidence, "compactions.jsonl"));
       }
       await Promise.all(clients.map(async client => { await client.abort().catch(() => undefined); await client.stop(); }));
       fs.rmSync(root, { recursive: true, force: true });

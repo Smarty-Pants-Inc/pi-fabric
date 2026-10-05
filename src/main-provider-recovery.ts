@@ -56,16 +56,24 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
       catch (error) { context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error"); }
       return;
     }
-    retried = true;
     // An owner input, another turn, session replacement, or Escape cancels this wake.
-    timer = setTimeout(() => {
+    // Later settlement hooks may compact past the backoff. Keep the wake pending
+    // until Pi is idle; a busy sample is not a triggered retry and spends no budget.
+    const wakeWhenIdle = (): void => {
       timer = undefined;
-      if (generation !== current || context.signal?.aborted || options.halted() || !context.isIdle()) return;
+      if (generation !== current || context.signal?.aborted || options.halted()) return;
+      if (!context.isIdle() || (context as { isSettling?: () => boolean }).isSettling?.()) {
+        timer = setTimeout(wakeWhenIdle, 100);
+        timer.unref?.();
+        return;
+      }
+      retried = true;
       sendFabricMessage(pi, {
         customType: "pi-fabric-provider-retry", display: true,
         content: "Continue the interrupted turn after the provider error. This is Fabric's one automatic retry.",
       }, { deliverAs: "followUp", triggerTurn: true });
-    }, 1_000);
+    };
+    timer = setTimeout(wakeWhenIdle, 1_000);
     timer.unref?.();
   });
 };

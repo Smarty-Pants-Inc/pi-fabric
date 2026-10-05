@@ -9,6 +9,7 @@ import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
+import { writeJsonAtomic } from "../src/core/atomic-write.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -130,13 +131,45 @@ describe("stale directory bookkeeping", () => {
         const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
         if (kind === "wrong-key") state.entries[entry.key].value.sessionId = "other";
         else state.entries[entry.key].updatedBy = kind === "wrong-writer" ? writer : null;
-        fs.writeFileSync(statePath, JSON.stringify(state));
+        // Publish a replacement, not an equal-length in-place edit whose UUID
+        // and filesystem timestamps can still identify the cached valid writer.
+        writeJsonAtomic(statePath, state);
       }
       expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
       expect(mesh.get(inboxKey(recipient.id), { fresh: true })).toBeUndefined();
       expect(mesh.get(entry.key, { fresh: true })).toBeDefined(); // fresh terminal/nonterminal record is not swept
     },
   );
+  it("rejects a wrong writer after an atomic replacement even when all state timestamps repeat", async () => {
+    const { mesh, now, recipient, session } = await recoveryFixture();
+    const entry = await session();
+    const statePath = path.join(mesh.root, "state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const before = fs.statSync(statePath);
+    const precise = fs.statSync(statePath, { bigint: true });
+    const stat = fs.statSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof stat>) => {
+      const current = Reflect.apply(stat, fs, args);
+      if (current && String(args[0]) === statePath) {
+        const frozen = typeof current.ino === "bigint" ? precise : before;
+        for (const field of ["mtime", "ctime", "birthtime", "mtimeMs", "ctimeMs", "birthtimeMs", "mtimeNs", "ctimeNs", "birthtimeNs"]) {
+          if (field in frozen) Reflect.set(current, field, Reflect.get(frozen, field));
+        }
+      }
+      return current;
+    }) as never);
+    state.entries[entry.key].updatedBy = writer;
+    // Keep the old UUID and equal payload length too: the replacement's real
+    // file identity, not a clock advance or generated commit marker, must win.
+    writeJsonAtomic(statePath, state);
+    expect(fs.statSync(statePath).size).toBe(before.size);
+    expect(fs.statSync(statePath).ino).not.toBe(before.ino);
+    expect(mesh.get(entry.key, { fresh: true })?.updatedBy).toEqual(writer);
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
+    expect(mesh.get(inboxKey(recipient.id), { fresh: true })).toBeUndefined();
+    expect(mesh.get(entry.key, { fresh: true })).toBeDefined();
+  });
+
   it("prunes old orphan cursors and terminal sessions together with dead hosts in one commit", async () => {
     const mesh = store();
     const now = Date.now();

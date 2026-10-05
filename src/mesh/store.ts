@@ -574,7 +574,12 @@ export class MeshStore {
    * several readers at one cursor (a host's lifecycle subscriptions after a new event) moved it
    * past each other, and all but the first scanned the whole log again (smarty-dev#557).
    */
-  #readHints: { generation: number; inode: number; lines: Array<{ sequence: number; offset: number }> } | undefined;
+  #readHints: {
+    generation: number; inode: number;
+    lines: Array<{ sequence: number; offset: number }>;
+    /** LRU boundaries of readers paused behind the recent-line window (e.g. steer grace). */
+    anchors: Map<number, { sequence: number; offset: number }>;
+  } | undefined;
   #stateCache:
     | {
       device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
@@ -1256,16 +1261,17 @@ export class MeshStore {
       // each read scanned the whole log (tens of MB on the fleet) from the start
       // (smarty-dev#557). A rotated log is a new file and generation, and the hint must end a line.
       const generation = this.#readGeneration();
-      const hints = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
-        ? this.#readHints.lines
-        : [];
-      let position = 0;
-      for (let index = hints.length - 1; index >= 0; index--) {
-        const hint = hints[index]!;
-        if (hint.sequence > after) continue;
-        if (hint.offset <= size && this.#endsLine(descriptor, hint.offset)) position = hint.offset;
-        break;
+      const cached = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
+        ? this.#readHints : undefined;
+      const hints = cached?.lines ?? [];
+      const anchors = cached?.anchors ?? new Map<number, { sequence: number; offset: number }>();
+      let boundary: { sequence: number; offset: number } | undefined;
+      for (const hint of [...hints, ...anchors.values()]) {
+        if (hint.sequence <= after && (!boundary || hint.sequence > boundary.sequence)) boundary = hint;
       }
+      let position = 0;
+      if (boundary && boundary.offset <= size && this.#endsLine(descriptor, boundary.offset)) position = boundary.offset;
+      else boundary = undefined;
       const scanned: Array<{ sequence: number; offset: number }> = [];
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
@@ -1279,7 +1285,9 @@ export class MeshStore {
           try {
             const event = JSON.parse(line) as MeshEvent;
             if (typeof event.sequence === "number" && lineEnd !== undefined) {
-              scanned.push({ sequence: event.sequence, offset: lineEnd });
+              const hint = { sequence: event.sequence, offset: lineEnd };
+              scanned.push(hint);
+              if (event.sequence <= after) boundary = hint;
               if (scanned.length > 2 * READ_HINT_LINES) scanned.splice(0, scanned.length - READ_HINT_LINES);
             }
             if (
@@ -1326,12 +1334,22 @@ export class MeshStore {
         }
       }
       if (!reachedLimit && (lineBytes > 0 || skippingOversizedLine)) emitLine();
-      if (scanned.length > 0) {
+      // A page can read hundreds of events beyond `after` while its caller waits at a grace
+      // boundary. Keeping only the last 128 lines evicted that boundary on every poll, making
+      // idle wakes scan the entire fleet log twice. Retain bounded reader anchors separately;
+      // they use the same generation/inode/line-end checks, never delivery authority (#2039).
+      if (boundary) {
+        anchors.delete(after);
+        anchors.set(after, boundary);
+        if (anchors.size > READ_HINT_LINES) anchors.delete(anchors.keys().next().value!);
+      }
+      if (scanned.length > 0 || boundary) {
         const lines = new Map(hints.map((hint) => [hint.sequence, hint.offset]));
         for (const line of scanned) lines.set(line.sequence, line.offset);
         this.#readHints = {
           generation,
           inode: stat.ino,
+          anchors,
           lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
             .map(([sequence, offset]) => ({ sequence, offset })),
         };

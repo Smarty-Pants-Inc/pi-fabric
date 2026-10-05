@@ -15,6 +15,14 @@ let buffer = "";
 let streamTimer;
 let finishTimer;
 let activeMessage;
+let leaf;
+const persist = message => {
+  if (!persistent || !fs.existsSync(sessionFile)) return;
+  const entries = fs.readFileSync(sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+  leaf = entries.at(-1).type === "session" ? null : entries.at(-1).id;
+  const id = randomUUID();
+  fs.appendFileSync(sessionFile, JSON.stringify({ type: "message", id, parentId: leaf, timestamp: new Date().toISOString(), message }) + "\n");
+};
 const finish = (message, text = "fixture completed") => {
   clearInterval(streamTimer);
   emit({ type: "message_end", message: { ...message, content: [{ type: "text", text }], stopReason: "stop" } });
@@ -39,12 +47,27 @@ process.stdin.on("data", chunk => {
     } else if (frame.type === "set_thinking_level") {
       effort = frame.level;
       emit({ type: "response", id: frame.id, command: frame.type, success: true });
+    } else if (frame.type === "abort") {
+      if (prior?.task === "whitespace-time-stubborn") continue;
+      clearInterval(streamTimer);
+      clearTimeout(finishTimer);
+      if (activeMessage) {
+        const message = { ...activeMessage, stopReason: "aborted", errorMessage: "fixture abort" };
+        persist(message);
+        if (prior?.task === "invalid-session") fs.appendFileSync(sessionFile, '{"type":\n');
+        if (prior?.task === "header-only-session") fs.writeFileSync(sessionFile, fs.readFileSync(sessionFile, "utf8").split("\n")[0] + "\n");
+        emit({ type: "message_end", message });
+        emit({ type: "agent_end" });
+        emit({ type: "agent_settled", outcome: "aborted" });
+      }
+      emit({ type: "response", command: frame.type, id: frame.id, success: true });
     } else if (frame.type === "prompt") {
       const task = prior?.task ?? frame.message;
       const attempt = (prior?.attempt ?? 0) + 1;
       if (persistent && task !== "missing-session") {
         if (!fs.existsSync(sessionFile)) fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
         fs.writeFileSync(fixtureFile, JSON.stringify({ task, attempt }));
+        persist({ role: "user", content: frame.message });
       }
       prior = { task, attempt };
       const message = { role: "assistant", provider: model.provider, model: model.id, content: [] };

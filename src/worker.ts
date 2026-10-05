@@ -734,6 +734,7 @@ const main = async (): Promise<void> => {
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
   let whitespaceStalls = 0;
+  let whitespaceAbortAcknowledged = false;
   let pendingWhitespaceStall: import("./worker/tool-call-stream-guard.js").RunawayToolCallStreamError | undefined;
   let resumedModel: string | undefined;
   let resumedThinking: typeof thinking;
@@ -741,7 +742,7 @@ const main = async (): Promise<void> => {
     if (terminalStatus || pendingWhitespaceStall) return;
     whitespaceStalls++;
     const canRetry = whitespaceStalls === 1 && options.runner === "pi" && modelControl.ready &&
-      piSessionFile && fs.existsSync(piSessionFile) && record.model &&
+      piSessionFile && record.model &&
       record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight";
     const stall = { runId: options.id, taskId: options.id, attempt: whitespaceStalls,
       action: canRetry ? "retry" : "failed", errorCode: error.code, error: error.message,
@@ -759,10 +760,12 @@ const main = async (): Promise<void> => {
       closeTimer = undefined;
       record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
       update();
-      terminateChild(child, "SIGTERM");
+      // Native abort waits for the assistant to finalize/persist. Close stdin
+      // only after its acknowledgement; SIGTERM + EOF together can race two
+      // shutdowns and exit before an unseeded session becomes durable.
+      child.stdin?.write(`${JSON.stringify({ type: "abort", id: `whitespace-abort-${options.id}` })}\n`);
       killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
-      child.stdin?.end();
       return;
     }
     terminalStatus = "failed";
@@ -1355,6 +1358,11 @@ const main = async (): Promise<void> => {
     }
     runLog.event(line, event);
     if (pendingWhitespaceStall) {
+      compactControl.observe(event); // Preserve the compaction fence during abort/drain.
+      if (event.type === "response" && event.id === `whitespace-abort-${options.id}` && event.success === true) {
+        whitespaceAbortAcknowledged = true;
+        child.stdin?.end(); // Only one graceful shutdown, after abort persistence.
+      }
       // Late aborted/settled frames must not close or revive this attempt.
       // Retain usage emitted during shutdown without treating it as progress.
       const message = event.message;
@@ -1929,6 +1937,21 @@ const main = async (): Promise<void> => {
     if (pendingWhitespaceStall) {
       const error = pendingWhitespaceStall;
       pendingWhitespaceStall = undefined;
+      const { stalledSessionResumeError } = await import("./worker/stall-session.js");
+      const resumeError = !whitespaceAbortAcknowledged ? "native abort was not acknowledged"
+        : record.compaction?.status === "queued" || record.compaction?.status === "in_flight"
+        ? "native compaction is active"
+        : await stalledSessionResumeError(piSessionFile!, options.cwd, error.model, record.runnerSessionId);
+      if (resumeError) {
+        terminalStatus = "failed";
+        terminalError = `${error.message}; cannot safely retry: ${resumeError}; child drained`;
+        record.error = terminalError;
+        record.errorCode = error.code;
+        update();
+        appendLog(`${JSON.stringify({ type: "fabric_runaway_error", taskId: options.id, attempt: whitespaceStalls,
+          action: "failed", errorCode: error.code, error: terminalError })}\n`);
+        break;
+      }
       // Pin the actual admitted model/effort, even when the initial request
       // inherited a launcher default. There is no fallback model.
       resumedModel = error.model;

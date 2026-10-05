@@ -103,13 +103,15 @@ describe("real worker tool-call stream guard", () => {
     assertOneRetry(events, result.id);
   });
 
-  it("retries and fails within the bound even when EOF and SIGTERM are refused", async () => {
+  it("fails closed after draining a child that refuses abort without persisting the stalled turn", async () => {
     vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
     const { result, events } = await run("whitespace-time-stubborn", 30_000);
     expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
-    expect(result.error).toContain("repeated after one same-model retry");
-    expect(stalls(events)).toHaveLength(2);
-    assertOneRetry(events, result.id);
+    expect(result.error).toContain("cannot safely retry");
+    expect(stalls(events)).toHaveLength(1);
+    expect(events.filter(event => event.type === "fabric_whitespace_toolcall_retry")).toHaveLength(0);
+    const prompt = events.find(event => event.type === "fabric_fixture_command" && event.command === "prompt");
+    expect(() => process.kill(prompt!.pid, 0)).toThrow();
   }, 40_000);
 
   it("completes when the one same-model retry makes progress", async () => {
@@ -131,8 +133,8 @@ describe("real worker tool-call stream guard", () => {
     expect(events.filter(event => event.type === "fabric_fixture_command" && event.command === "prompt")).toHaveLength(1);
   });
 
-  it("fails clearly rather than replaying a task when its durable session is unavailable", async () => {
-    const { result, events } = await run("missing-session");
+  it.each(["missing-session", "invalid-session", "header-only-session"])("fails clearly rather than replaying a task when its durable session is unsafe (%s)", async task => {
+    const { result, events } = await run(task);
     expect(result).toMatchObject({ status: "failed", errorCode: "RUNAWAY_TOOL_CALL_STREAM" });
     expect(result.error).toContain("cannot safely retry");
     expect(events.some(event => event.type === "fabric_whitespace_toolcall_retry")).toBe(false);

@@ -11,7 +11,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { FabricParticipantStaleError, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { residentHostId } from "../src/residency/protocol.js";
 
@@ -125,6 +126,51 @@ const damagedStates = ["{truncated", "", " \n\t", "{}", '{"format":1,"entries":{
   '{"format":1,"entries":{}}\n{"format":1,"entries":{}}'] as const;
 
 describe("F3059 aged absent-root adoption", () => {
+  it("keeps an adopted root and its durable actor retryable inside routing lease grace without transferring custody again", async () => {
+    const f = await fixture();
+    const next = await f.candidate("grace-successor");
+    await wait(() => next.owns(f.actor.id));
+    next.pauseForRelease();
+    const rootId = "session:grace-successor", hostId = residentHostId(rootId);
+    const store = new ActorRegistryStore(path.join(f.root, "actors"));
+    const committed = store.records().find(row => row.id === f.actor.id)!;
+    expect(committed).toMatchObject({ rootId, ownershipToken: expect.any(String), adoptedAt: expect.any(Number) });
+    const actorPresence = actorParticipantRecord(next.status(f.actor.id), rootId, hostId, hostId, rootId);
+    const main = new ParticipantDirectory(f.mesh, { enabled: true, hostId: rootId, rootId, identity: identity(rootId), reapDeadHosts: false });
+    const resident = new ParticipantDirectory(f.mesh, { enabled: true, hostId, rootId, identity: next.identity, reapDeadHosts: false });
+    cleanups.push(() => main.close(), () => resident.close());
+    main.registerSource(() => [{ ...actorPresence, id: rootId, kind: "root", ownerHostId: rootId, ownerIdentityId: rootId }]);
+    resident.registerSource(() => [actorPresence]);
+    await main.refresh(); await resident.refresh();
+    // Advance beyond both published host/session TTLs; a fabricated older file
+    // must not override the fresher shared-state lease.
+    let now = Date.now() + 120_000;
+    f.directory.options.routingLease = { now: () => now, graceMs: 45_000, waitMs: 30, pollMs: 10,
+      lockWaiting: () => true, sleep: async ms => { now += ms; } };
+    const leases = [rootId, hostId].map(id => readHostLease(f.mesh.root, id)!);
+    for (const lease of leases) writeHostLease(f.mesh.root, { ...lease, updatedAt: now - 17_000, expiresAt: now - 2_000 });
+    for (const target of [rootId, f.actor.id]) {
+      expect(f.directory.get(target, now, { fresh: true })).toBeUndefined();
+      expect(f.directory.retainedRouteAllowed(target)).toBe(true);
+      const error = await f.directory.resolveRoutingLease(target).catch(error => error);
+      expect(error).toBeInstanceOf(FabricParticipantStaleError);
+      expect(error).toMatchObject({ targetId: target, code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+      expect(error.message).not.toContain("Unknown");
+    }
+    expect(f.directory.lineageAdoptable(rootId, now)).toBe(false);
+    expect(store.records().find(row => row.id === f.actor.id)).toEqual(committed);
+    f.directory.options.routingLease.sleep = async ms => {
+      now += ms;
+      for (const lease of leases) writeHostLease(f.mesh.root, { ...lease, updatedAt: now, expiresAt: now + 60_000 });
+    };
+    for (const target of [rootId, f.actor.id]) {
+      expect(await f.directory.resolveRoutingLease(target)).toBe(true);
+      expect(f.directory.get(target, now, { fresh: true })).toMatchObject({ rootId, stale: false,
+        ownerHostId: target === rootId ? rootId : hostId });
+    }
+    expect(store.records().find(row => row.id === f.actor.id)).toEqual(committed);
+    expect(f.directory.get(oldRoot, now, { fresh: true })).toBeUndefined();
+  });
   it.each(["missing", "stale-positive"])("fences an existing suspended predecessor with %s directory opinion before the adopter publishes its participant", async mode => {
     // Stop only A's polling, not its manager: its original actor and cached ownership
     // survive the entire absence. B starts normally after the spy is restored.

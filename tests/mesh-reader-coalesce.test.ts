@@ -165,11 +165,17 @@ describe("idle reader coalescing (smarty-dev#4383)", () => {
       } },
     ] });
     expect(directory.get("peer")?.ownerHostId).toBe("h"); // A real live participant, not an invalid row.
+    const idleSnapshot = s.reader.stateToken();
     await writer.delete({ key: hostKey });
     expect(directory.get("peer")?.ownerHostId).toBe("h"); // Idle observation still has the old snapshot.
     const get = vi.spyOn(s.reader, "get");
+    const stateToken = vi.spyOn(s.reader, "stateToken");
     expect(directory.get("peer", undefined, { fresh: true })).toBeUndefined();
-    expect(get).toHaveBeenCalledWith(hostKey, { fresh: true }); // Ownership/delivery port reads canonical.
+    expect(stateToken).toHaveBeenCalledWith({ fresh: true });
+    const snapshot = stateToken.mock.results[0]!.value;
+    expect(snapshot).not.toBe(idleSnapshot);
+    // Ownership/delivery uses the freshly captured canonical snapshot, not the idle view.
+    expect(get).toHaveBeenCalledWith(hostKey, { snapshot });
     expect(s.reader.get(hostKey)).toBeUndefined();
   });
 });

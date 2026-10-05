@@ -57,6 +57,41 @@ export async function stopObservedDescendants(attempt: ObservedProcessTree, chil
   throw new Error("Observed resident processes did not exit; fallback is blocked");
 }
 
+/** Necessary exit check for the detached child's entire Linux session, including
+ * reparented members and zombies. This is NOT whole-attempt containment: workers
+ * can call setsid()/enter external scopes. Never use an empty session alone as
+ * permission to replace a serving resident (see assertAutomaticReleaseRecovery).
+ * Unlike ancestry sampling, an unreadable member makes the check fail closed.
+ */
+export function checkResidentSessionExit(sessionId: number | undefined): { empty: boolean; reason: string; members: number[] } {
+  const unavailable = (reason: string) => ({ empty: false, reason, members: [] as number[] });
+  if (process.platform !== "linux" || !sessionId) return unavailable("owned session check unavailable");
+  try {
+    // hidepid makes absence unprovable. This check never treats restricted /proc
+    // visibility or an enumeration/read failure as an empty session.
+    if (/\bhidepid=(?!0\b)\w+/.test(fs.readFileSync("/proc/mounts", "utf8"))) return unavailable("restricted proc visibility");
+    const members: number[] = [];
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      let stat: string;
+      try { stat = fs.readFileSync(`/proc/${name}/stat`, "utf8"); }
+      catch (error) {
+        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+        throw error;
+      }
+      const close = stat.lastIndexOf(")");
+      const fields = stat.slice(close + 2).trim().split(/\s+/);
+      if (close < 0 || fields.length < 20 || !/^\d+$/.test(fields[3]!)) return unavailable("invalid proc stat");
+      if (Number(fields[3]) === sessionId) members.push(Number(name));
+    }
+    // Kernel group existence also catches a member born after enumeration. No
+    // destructive group signal: owned shutdown remains PID/birth validated.
+    try { process.kill(-sessionId, 0); return { empty: false, reason: "owned process group still exists", members }; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    return { empty: members.length === 0, reason: members.length ? "owned session still has members" : "owned session exited", members };
+  } catch (error) { return unavailable(`session exit unproven: ${String(error).slice(0, 300)}`); }
+}
+
 export interface ResidentOwnerObservation {
   claimed: boolean;
   observedOwner: boolean;

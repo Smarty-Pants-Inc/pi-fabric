@@ -16,6 +16,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_COMMANDS, RESIDENT_HOST_FORMAT, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { launchLog, stopAllOwned } from "./helpers/owned-processes.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 
 // CI can supply a pinned prior release; local rollout probes use installed B70.
 const legacyRelease = process.env.PI_FABRIC_LEGACY_RELEASE ?? path.join(os.homedir(), ".local/share/smarty-dev/fabric/releases/b243bc926beec5da8717135893dd6b578af73f7b");
@@ -216,6 +217,8 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       const registryPath = path.join(config.actorRoot, "actors.json");
       const beforeRegistry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
       const actor = beforeRegistry.actors[0];
+      const beforeHistory = new ActorRegistryStore(config.actorRoot).messages(actor);
+      expect(beforeHistory.length).toBeGreaterThan(0);
       const actorDir = path.join(config.actorRoot, actor.id);
       const queues = () => !fs.existsSync(actorDir) ? [] : fs.readdirSync(actorDir).filter(file => file.startsWith("queue-")).flatMap(file =>
         JSON.parse(fs.readFileSync(path.join(actorDir, file), "utf8")).items);
@@ -242,8 +245,15 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       // Recovery legitimately updates running status, timestamps and run history,
       // but must not rewrite identity or any of the actor's persistent settings.
       const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId,
-        messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+        messages: _messages, messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
       expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
+      // B70 legitimately drops #486's selecting field when saving its owned row.
+      // The checkpoint, not that field, must preserve every accepted message.
+      const afterHistory = new ActorRegistryStore(config.actorRoot).messages(registry.actors[0]);
+      expect.soft(afterHistory).toEqual(expect.arrayContaining(beforeHistory));
+      for (const message of beforeHistory as { id: string }[]) {
+        expect.soft((afterHistory as { id: string }[]).filter(item => item.id === message.id)).toHaveLength(1);
+      }
       expect.soft(registry.actors[0]?.removal).toBeUndefined();
       const afterItems = queues();
       // B70 retries recovered deliveries and predates bindingVersion. Preserve

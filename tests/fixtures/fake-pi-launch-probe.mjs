@@ -63,6 +63,17 @@ let started = false;
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", (line) => {
   if (started || !line.trim()) return;
+  const command = JSON.parse(line);
+  // Mandatory native startup admission precedes the business prompt, even
+  // when the worker inherits its model. Answer correlated controls, not work.
+  if (command.type === "get_state" || command.type === "get_messages") {
+    const data = command.type === "get_state"
+      ? { model: { provider: "fake", id: "fake-model", contextWindow: 128_000 }, thinkingLevel: "off", isStreaming: false, isCompacting: false }
+      : { messages: [] };
+    send({ type: "response", id: command.id, command: command.type, success: true, data });
+    return;
+  }
+  if (command.type !== "prompt") return;
   started = true;
   send({ type: "response", command: "prompt", success: true });
   send({ type: "agent_start" });

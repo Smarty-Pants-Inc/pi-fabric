@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { CompactResumeDelivery } from "./compaction/resume-delivery.js";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1015,7 +1014,6 @@ const main = async (): Promise<void> => {
   });
 
   let compactControl = createCompactControl();
-  const compactResumeDelivery = new CompactResumeDelivery();
 
   // Preemptive per-child token guard. timeoutMs bounds wall time and budgetUsd
   // bounds cost, but a single runaway child can still blow its own context
@@ -1329,7 +1327,6 @@ const main = async (): Promise<void> => {
       return;
     }
     runLog.event(line, event);
-    compactResumeDelivery.observe(event);
     if (options.runner === "claude") {
       processClaudeEvent(event);
       return;
@@ -1346,7 +1343,8 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "fabric_compact_resume_refused") {
       if (event.protocol === 1 && event.runId === options.id && Number.isSafeInteger(event.count) && Number(event.count) > 0) {
-        const warning = "Compaction restart recovery refused: original admission cannot be proven. Re-submit the pending work explicitly.";
+        const warning = typeof event.message === "string" && event.message.length <= 1024
+          ? event.message : "Automatic compaction resume is disabled; re-submit pending work explicitly (smarty-dev#5282).";
         record.warnings = [...(record.warnings ?? []), warning].slice(-20);
         update();
       }
@@ -1577,8 +1575,7 @@ const main = async (): Promise<void> => {
         // sendUserMessage may still be in asynchronous input admission. A
         // completed native boundary is not proof that tracked payloads were
         // consumed. Keep stdin alive for their deferred native turn/cancellation.
-        deferredFollowUpSettle = piSettledSuccessfully &&
-          (hasUnsettledFollowUps() || compactResumeDelivery.pending);
+        deferredFollowUpSettle = piSettledSuccessfully && hasUnsettledFollowUps();
         if (!deferredFollowUpSettle) compactControl.childSettled();
       }
       return;
@@ -1747,7 +1744,7 @@ const main = async (): Promise<void> => {
   };
   const steerTimer = options.steerFile ? setInterval(() => {
     pollSteer();
-    if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps() && !compactResumeDelivery.pending) {
+    if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
     }
@@ -1955,7 +1952,6 @@ const main = async (): Promise<void> => {
     contextAdmission = undefined;
     modelControl = createModelControl();
     compactControl = createCompactControl();
-    compactResumeDelivery.reset();
     child = spawnChild();
     retainExecutionCustody(child);
     childExited = false;

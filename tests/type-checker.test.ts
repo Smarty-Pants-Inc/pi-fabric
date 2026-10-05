@@ -6,6 +6,18 @@ import {
 } from "../src/runtime/type-checker.js";
 
 describe("Fabric guest type checker", () => {
+  it("types explicit compaction resume work and its refusal intent without permitting unknown keys", () => {
+    const result = typeCheckFabricCode(`
+const request = await compact.request({ resume: "work to refuse", instructions: "Keep the map" });
+const pending = (await compact.status()).pending;
+const resume: string | undefined = request.intent.resume;
+const resumeId: string | undefined = pending?.resumeId;
+return { resume, resumeId };
+`, GUEST_TYPE_DECLARATIONS);
+    expect(result.errors).toEqual([]);
+    const invalid = typeCheckFabricCode('return compact.request({ resmue: "typo" });', GUEST_TYPE_DECLARATIONS);
+    expect(invalid.errors.length).toBeGreaterThan(0);
+  });
   it("types the advertised systemPrompt on agents.run and durable agents.spawn (#2985)", () => {
     const result = typeCheckFabricCode(`
 await agents.run({ task: "review", systemPrompt: "Use the acceptance checklist" });

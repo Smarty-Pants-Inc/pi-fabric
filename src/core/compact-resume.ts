@@ -1,13 +1,11 @@
+import { writeSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompactLastCommit, CompactPendingIntent } from "./compact-controller.js";
-import { COMPACT_RESUME_ENTRY_TYPE as ENTRY_TYPE, compactResumeMessage as resumeMessage, compactResumeMessageIds } from "../compaction/resume-delivery.js";
+import { COMPACT_RESUME_ENTRY_TYPE as ENTRY_TYPE, compactResumeMessageIds } from "../compaction/resume-delivery.js";
 
 interface ResumeEntry { id: string; resume: string; state: "pending" | "cancelled"; reason?: string }
-const scheduled = new WeakMap<ExtensionAPI, Set<string>>();
-// A journal alone cannot establish the original sender. Only intents begun by
-// this extension instance may resume in the live session; restart/reload cannot
-// borrow the next input's principal. No startup input transform is installed.
-const live = new WeakMap<ExtensionAPI, Set<string>>();
+export const LIVE_COMPACT_RESUME_REFUSAL = "automatic compaction resume disabled: re-submit pending work explicitly (smarty-dev#5282)";
+export const RESTART_COMPACT_RESUME_REFUSAL = "restart recovery refused: original admission cannot be proven";
 
 // Only an explicit compound compact directive is inferred. Arbitrary old tasks,
 // summary-preservation instructions, and a plain /compact must not wake a turn.
@@ -29,37 +27,46 @@ export const inferCompactResume = (context: ExtensionContext): string | undefine
   return undefined;
 };
 
-// Write immediately before compact starts, not when the replaceable intent is
-// requested. Cancelled/replaced intents therefore cannot become stale wakeups.
+export const reportCompactResumeRefusal = (context: ExtensionContext, count: number, startup = false): void => {
+  if (!count) return;
+  const message = startup
+    ? "Compaction restart recovery refused: original admission cannot be proven. Automatic resume is disabled (smarty-dev#5282); re-submit the pending work explicitly."
+    : "Automatic compaction resume is disabled (smarty-dev#5282). Re-submit the pending work explicitly.";
+  if (context.hasUI) context.ui.notify(message, "warning");
+  if (context.mode === "rpc") {
+    writeSync(1, `${JSON.stringify({ type: "fabric_compact_resume_refused", protocol: 1,
+      runId: process.env.PI_FABRIC_PARENT_RUN, count, message })}\n`);
+  }
+};
+
+// Journal immediately before compact starts, not when the replaceable intent is
+// requested. If the process dies mid-compaction, startup retires this entry.
 export const beginCompactResume = (pi: ExtensionAPI, intent: CompactPendingIntent): void => {
   if (intent.resume && intent.resumeId) {
-    let owned = live.get(pi);
-    if (!owned) { owned = new Set(); live.set(pi, owned); }
-    owned.add(intent.resumeId);
     pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { id: intent.resumeId, resume: intent.resume, state: "pending" });
   }
 };
 
 export const settleCompactResume = (
-  pi: ExtensionAPI, intent: CompactPendingIntent, status: CompactLastCommit["status"], context: ExtensionContext,
+  pi: ExtensionAPI, intent: CompactPendingIntent, _status: CompactLastCommit["status"], context: ExtensionContext,
 ): void => {
   if (!intent.resume || !intent.resumeId) return;
-  if (status !== "committed") {
-    pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { id: intent.resumeId, resume: intent.resume, state: "cancelled" });
-    return;
-  }
-  recoverCompactResume(pi, context);
+  // Refuse every outcome, including successful compaction after an explicit
+  // abort. At agent_settled native Pi may already have cleared context.signal;
+  // neither that signal nor a successful compaction authorizes a fresh turn.
+  // Also journal a pre-start abort, where onBegin never ran.
+  pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { id: intent.resumeId, resume: intent.resume, state: "cancelled",
+    reason: LIVE_COMPACT_RESUME_REFUSAL });
+  reportCompactResumeRefusal(context, 1);
 };
 
-// A successful compaction entry is the durable commit witness. The delivered
-// user message is the durable receipt, rather than a pre-delivery claim that
-// could lose the continuation on a crash. The process-local set only closes
-// the gap while Pi defers sendUserMessage past its remaining settled handlers.
+// The safe floor never replays a continuation, live or recovered. Retire all
+// pending journal entries before new input, regardless of whether compaction
+// committed. Already admitted legacy receipts remain untouched.
 export const recoverCompactResume = (
   pi: ExtensionAPI, context: ExtensionContext, startup = false,
 ): number => {
   const pending = new Map<string, ResumeEntry>();
-  const ready = new Set<string>();
   const messages = new Set<string>();
   for (const entry of context.sessionManager?.getBranch?.() ?? []) {
     if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
@@ -67,9 +74,7 @@ export const recoverCompactResume = (
       if (!data || typeof data.id !== "string" || typeof data.resume !== "string" ||
         !data.resume.trim() || data.resume.length > 16_384) continue;
       if (data.state === "pending") pending.set(data.id, data as ResumeEntry);
-      else if (data.state === "cancelled") { pending.delete(data.id); ready.delete(data.id); }
-    } else if (entry.type === "compaction") {
-      for (const id of pending.keys()) ready.add(id);
+      else if (data.state === "cancelled") pending.delete(data.id);
     } else if (entry.type === "message" && entry.message.role === "user") {
       const content = entry.message.content;
       const text = typeof content === "string" ? content : content
@@ -77,35 +82,12 @@ export const recoverCompactResume = (
       for (const receipt of compactResumeMessageIds(text)) messages.add(receipt);
     }
   }
-  // Restart recovery is deliberately refused until the journal can establish
-  // original admission AND the parent's cumulative output lineage. Persist the
-  // refusal before any new input; neither committed nor pre-commit work may be
-  // revived by a later compaction. Already admitted receipts remain untouched.
-  if (startup) {
-    live.delete(pi);
-    let refused = 0;
-    for (const [id, intent] of pending) {
-      if (messages.has(id)) continue;
-      pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { ...intent, state: "cancelled",
-        reason: "restart recovery refused: original admission cannot be proven" });
-      refused++;
-    }
-    return refused;
+  let refused = 0;
+  for (const [id, intent] of pending) {
+    if (messages.has(id)) continue;
+    pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { ...intent, state: "cancelled",
+      reason: startup ? RESTART_COMPACT_RESUME_REFUSAL : LIVE_COMPACT_RESUME_REFUSAL });
+    refused++;
   }
-  let sent = scheduled.get(pi);
-  if (!sent) { sent = new Set(); scheduled.set(pi, sent); }
-  for (const id of ready) {
-    const intent = pending.get(id)!;
-    const text = resumeMessage(intent);
-    const key = `${context.sessionManager.getSessionId()}:${id}`;
-    if (!live.get(pi)?.has(id) || messages.has(id) || sent.has(key)) continue;
-    sent.add(key);
-    try {
-      pi.sendUserMessage(text, { deliverAs: "followUp" });
-    } catch (error) {
-      sent.delete(key);
-      throw error;
-    }
-  }
-  return 0;
+  return refused;
 };

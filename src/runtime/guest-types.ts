@@ -1494,6 +1494,8 @@ interface FabricSchemaApi {
   }>;
 }
 interface FabricCompactPendingIntent {
+  resume?: string;
+  resumeId?: string;
   reason?: string;
   instructions?: string;
   preserve?: string[];
@@ -1635,6 +1637,8 @@ interface FabricCacheApi {
 
 interface FabricCompactApi {
   request(args?: {
+    /** Automatic resume is disabled; this work is durably refused. */
+    resume?: string;
     reason?: string;
     instructions?: string;
     preserve?: string[];

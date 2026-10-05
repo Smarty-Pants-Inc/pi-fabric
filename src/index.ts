@@ -53,7 +53,7 @@ import {
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
-import { recoverCompactResume } from "./core/compact-resume.js";
+import { recoverCompactResume, reportCompactResumeRefusal } from "./core/compact-resume.js";
 import {
   createToolOwnershipReassertion,
   FabricToolLifecycle,
@@ -738,15 +738,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Hold the lease through activation, actor re-arm and reporting, even on failure.
       releaseSlot?.();
     }
-    const refused = recoverCompactResume(pi, context, true);
-    if (refused) {
-      const message = "Compaction restart recovery refused: original admission cannot be proven. Re-submit the pending work explicitly.";
-      if (context.hasUI) context.ui.notify(message, "warning");
-      if (context.mode === "rpc") {
-        writeSync(1, `${JSON.stringify({ type: "fabric_compact_resume_refused", protocol: 1,
-          runId: process.env.PI_FABRIC_PARENT_RUN, count: refused, message })}\n`);
-      }
-    }
+    reportCompactResumeRefusal(context, recoverCompactResume(pi, context, true), true);
   });
 
   // Keep activation/reload startup first; the renderer's session_start hook

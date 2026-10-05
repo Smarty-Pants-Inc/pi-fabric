@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 const mode = process.argv[2] ?? 'compound';
 const out = path.resolve(process.env.COMPACT_PROBE_OUT ?? fs.mkdtempSync(path.join(os.tmpdir(),'compact-native-')));
@@ -41,8 +41,55 @@ const flags = {'id':'compact-native-'+mode,'runner':'pi','name':'compact-native-
 if(mode === 'restart-actor' || fresh) flags['actor-id'] = 'compact-proof-actor';
 // No Fabric selector: inherit Pi's configured native model, with no actor/probe fence.
 if(mode === 'restart-inherited') delete flags.model;
-const env = {PATH:process.env.PATH, HOME:cwd, TMPDIR:process.env.TMPDIR ?? cwd, PI_CODING_AGENT_DIR:profile, PI_OFFLINE:'1', PI_SKIP_VERSION_CHECK:'1', PI_TELEMETRY:'0', COMPACT_PROBE_TRANSCRIPT:transcript};
-const result = spawnSync(source ? 'bun' : process.execPath,[worker,...Object.entries(flags).flatMap(([key,value])=>['--'+key,value])],{cwd:process.cwd(),env,encoding:'utf8',timeout:55000,maxBuffer:4*1024*1024});
+const env = {PATH:process.env.PATH, HOME:cwd, TMPDIR:process.env.TMPDIR ?? cwd, PI_CODING_AGENT_DIR:profile, PI_OFFLINE:'1', PI_SKIP_VERSION_CHECK:'1', PI_TELEMETRY:'0', COMPACT_PROBE_TRANSCRIPT:transcript, COMPACT_PROBE_INHERITED:mode === 'restart-inherited' ? '1' : '0'};
+// The abort lane drives native Pi directly so a real RPC abort can arrive
+// after compact.request records its intent but before native settlement. No
+// mocked ExtensionContext or fabricated settlement event participates.
+const runAbort = () => new Promise(resolve => {
+  const child = spawn(process.execPath, [pi, '--mode', 'rpc', '--session', manager.getSessionFile(),
+    '--no-extensions', '--extension', path.resolve('tests/fixtures/compact-resume-native-provider.ts'),
+    '--extension', fabric, '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files',
+    '--provider', 'compact-proof', '--model', 'offline', '--thinking', 'off', '--tools', 'fabric_exec,write'],
+    {cwd, env: {...env, PI_FABRIC_FULL_CODE_MODE:'true', COMPACT_PROBE_ABORT:'1'}});
+  let stdout = '', stderr = '', buffer = '', aborted = false, closeTimer;
+  const send = frame => child.stdin.write(JSON.stringify(frame)+'\n');
+  const timeout = setTimeout(() => { stderr += '\nNative abort probe timed out'; child.kill('SIGKILL'); }, 55000);
+  child.stdout.on('data', chunk => {
+    stdout += chunk; buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0,newline); buffer = buffer.slice(newline+1);
+      let event; try { event = JSON.parse(line); } catch { continue; }
+      if (event.type === 'response' && event.id === 'abort-startup' && event.success) send({id:'abort-prompt',type:'prompt',message:task});
+      if (event.type === 'tool_execution_end' && event.toolCallId === 'compact-proof-call' && !aborted) {
+        if (event.isError || event.result?.details?.success === false) {
+          stderr += '\nRequest tool failed: '+JSON.stringify(event.result);
+        }
+        // Abort even a failed request so fixture failures fail promptly rather
+        // than hanging in post-tool inference. The durable-refusal oracle below
+        // independently requires proof that the request really executed.
+        aborted = true;
+        fs.appendFileSync(transcript,JSON.stringify({type:'rpc-abort-sent',at:Date.now()})+'\n');
+        send({id:'real-abort',type:'abort'});
+      }
+      if (event.type === 'response' && event.id === 'real-abort' && event.success) {
+        // Keep stdin open long enough to observe any illicit deferred fresh
+        // turn; end only after native abort has awaited compaction/settlement.
+        closeTimer = setTimeout(() => child.stdin.end(), 1200);
+      }
+    }
+  });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.on('error', error => { stderr += error.message; });
+  child.on('close', code => {
+    clearTimeout(timeout); clearTimeout(closeTimer);
+    fs.writeFileSync(flags['log-file'],stdout);
+    resolve({status:code,stdout,stderr});
+  });
+  child.stdin.on('error', error => { stderr += error.message; });
+  send({id:'abort-startup',type:'get_state'});
+});
+const result = mode === 'abort' ? await runAbort() : spawnSync(source ? 'bun' : process.execPath,[worker,...Object.entries(flags).flatMap(([key,value])=>['--'+key,value])],{cwd:process.cwd(),env,encoding:'utf8',timeout:55000,maxBuffer:4*1024*1024});
 fs.writeFileSync(path.join(cwd,'worker-output.log'),(result.stdout??'')+'\nSTDERR\n'+(result.stderr??''));
 const status = fs.existsSync(flags['status-file']) ? JSON.parse(fs.readFileSync(flags['status-file'],'utf8')) : null;
 const events = fs.readFileSync(transcript,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -56,11 +103,23 @@ const assistantIndex = wire.findIndex(e=>e.type === 'message_start' && e.message
 const contextAdmitted = contextIndex >= 0 && contextIndex < assistantIndex;
 const errors = [];
 if((mode === 'restart-actor' || fresh) && !contextAdmitted) errors.push('native actor context admission must precede the first assistant');
-if(result.status !== 0 || status?.status !== 'completed') errors.push('worker failed: '+(status?.error ?? result.stderr ?? result.error));
-if(mode === 'compound') {
-  if(x.length !== 1 || status?.text !== 'X completed') errors.push('expected exactly one completed continuation');
-  if(!fs.existsSync(path.join(cwd,'item-X.txt')) || fs.readFileSync(path.join(cwd,'item-X.txt'),'utf8') !== 'X completed') errors.push('X must execute the real write tool');
-  if(!complete || !x[0] || x[0].at-complete.at > 60000) errors.push('X must start within one minute of compaction');
+if(result.status !== 0 || (mode !== 'abort' && status?.status !== 'completed')) errors.push('native run failed: '+(status?.error ?? result.stderr ?? result.error));
+if(mode === 'compound' || mode === 'abort') {
+  if(x.length || prompts.length !== 1 || fs.existsSync(path.join(cwd,'item-X.txt'))) errors.push('automatic continuation must never start, including after abort');
+  if(!complete) errors.push('the safe floor must preserve successful native compaction');
+  const refusal = wire.find(e=>e.type === 'fabric_compact_resume_refused');
+  if(refusal?.count !== 1 || !refusal.message.includes('Automatic compaction resume is disabled')) errors.push('live refusal must be explicit and caller-visible');
+  if(mode === 'compound' && !status?.warnings?.some(warning=>warning.includes('Automatic compaction resume is disabled'))) errors.push('worker result must retain the live refusal warning');
+  const branch = SessionManager.open(manager.getSessionFile()).getBranch();
+  if(!branch.some(e=>e.type === 'custom' && e.customType === 'fabric-compact-resume' && e.data.state === 'cancelled' && e.data.reason?.includes('automatic compaction resume disabled'))) errors.push('live refusal must be durable');
+  if(mode === 'abort') {
+    const abort = events.find(e=>e.type === 'rpc-abort-sent');
+    const settled = events.find(e=>e.type === 'native-settled');
+    if(!abort || !settled || abort.at > settled.at || abort.at > complete?.at) errors.push('real RPC abort must precede native compaction and settlement');
+    if(settled?.signalPresent !== false) errors.push('regression must exercise the cleared boundary signal');
+    if(!wire.some(e=>e.type === 'message_end' && e.message?.stopReason === 'aborted')) errors.push('native inference must have been explicitly aborted');
+    if(!wire.some(e=>e.type === 'response' && e.id === 'real-abort' && e.success)) errors.push('native abort must settle successfully');
+  }
 }
 if(mode === 'receipt' && (x.length || prompts.length !== 1)) errors.push('persisted receipt must not replay its continuation');
 if(mode === 'plain' && (x.length || prompts.length !== 1 || !complete)) errors.push('plain compaction must stay idle after its initial prompt');

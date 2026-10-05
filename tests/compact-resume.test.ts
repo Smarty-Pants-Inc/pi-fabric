@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AgentSession, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompactController } from "../src/core/compact-controller.js";
-import { beginCompactResume, inferCompactResume, recoverCompactResume, settleCompactResume } from "../src/core/compact-resume.js";
+import { beginCompactResume, inferCompactResume, LIVE_COMPACT_RESUME_REFUSAL, recoverCompactResume,
+  RESTART_COMPACT_RESUME_REFUSAL, reportCompactResumeRefusal, settleCompactResume } from "../src/core/compact-resume.js";
+import { compactResumeMessage } from "../src/compaction/resume-delivery.js";
 import { CompactProvider } from "../src/providers/compact-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 
@@ -19,10 +21,11 @@ const warm = (manager: SessionManager) => {
 const harness = (text = "Compact first, then start item X", manager = SessionManager.inMemory(process.cwd())) => {
   if (text) manager.appendMessage({ role: "user", content: text, timestamp: 1 });
   let options: Parameters<ExtensionContext["compact"]>[0];
-  const queued: string[] = [];
-  const sendUserMessage = vi.fn((message: string) => { queued.push(message); });
+  const sendUserMessage = vi.fn();
+  const notify = vi.fn();
   const pi = { appendEntry: (type: string, data: unknown) => manager.appendCustomEntry(type, data), sendUserMessage } as unknown as ExtensionAPI;
-  const context = { sessionManager: manager, compact: (args: typeof options) => { options = args; } } as unknown as ExtensionContext;
+  const context = { sessionManager: manager, compact: vi.fn((args: typeof options) => { options = args; }),
+    hasUI: true, ui: { notify } } as unknown as ExtensionContext;
   const controller = new CompactController({
     onBegin: intent => beginCompactResume(pi, intent),
     onSettled: (intent, status, ctx) => settleCompactResume(pi, intent, status, ctx),
@@ -31,124 +34,141 @@ const harness = (text = "Compact first, then start item X", manager = SessionMan
   const invocation: FabricInvocationContext = { extensionContext: context, cwd: process.cwd(),
     signal: undefined, parentToolCallId: "compact-test", nestedToolCallId: "nested", update() {} };
   const witness = () => manager.appendCompaction("compacted", manager.getBranch()[0]!.id, 1000);
-  const complete = () => { witness(); options!.onComplete!({ summary: "compacted", firstKeptEntryId: "kept", tokensBefore: 1000 }); };
-  const admit = () => { for (const content of queued.splice(0)) manager.appendMessage({ role: "user", content, timestamp: 3 }); };
-  return { manager, pi, context, controller, provider, invocation, queued, sendUserMessage, witness, complete, admit,
-    fail: (message: string) => options!.onError!(new Error(message)),
-    callbackAgain: () => options!.onComplete!({ summary: "duplicate", firstKeptEntryId: "kept", tokensBefore: 1000 }) };
+  const callbackAgain = () => options!.onComplete!({ summary: "compacted", firstKeptEntryId: "kept", tokensBefore: 1000 });
+  const complete = () => { witness(); callbackAgain(); };
+  return { manager, pi, context, controller, provider, invocation, sendUserMessage, notify, witness, complete, callbackAgain,
+    fail: (message: string) => options!.onError!(new Error(message)) };
 };
+const refusals = (manager: SessionManager) => manager.getBranch().filter(e => e.type === "custom" && e.customType === "fabric-compact-resume" && (e.data as any)?.state === "cancelled");
 
-describe("compaction continuation", () => {
-  it.each(["Compact first, then start item X", "Compact. Then start item X", "Compact\nThen start item X", "Compact and start item X", "Compact afterwards start item X"])("retains explicit sequencing: %s", text => {
+describe("compaction safe floor: automatic resume disabled", () => {
+  it.each(["Compact first, then start item X", "Compact. Then start item X", "Compact\nThen start item X", "Compact and start item X", "Compact afterwards start item X"])("identifies pending work only to refuse it: %s", text => {
     expect(inferCompactResume(harness(text).context)).toBe("start item X");
   });
 
-  it.each([undefined, { id: "principal-A", binding: "herdr-client" }])("refuses restart A (%j) rather than lending fresh B's principal", principal => {
-    const h = harness();
-    const intent = h.controller.request({ resume: "Start X" });
-    beginCompactResume(h.pi, intent); h.witness();
-    // Even an old journal's unsupported principal field is not admission proof.
-    if (principal) {
-      h.manager.appendCustomEntry("fabric-compact-resume", { id: intent.resumeId, resume: "Start X", state: "pending", principal });
-      h.witness();
-    }
-    const restarted = harness("", h.manager);
-    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(1);
-    recoverCompactResume(restarted.pi, restarted.context);
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-    const fresh = "Fresh task B";
-    restarted.manager.appendMessage({ role: "user", content: fresh, timestamp: 3 });
-    expect(restarted.manager.getBranch().at(-1)).toMatchObject({ type: "message", message: { content: fresh } });
-    expect(restarted.manager.getBranch().filter(e => e.type === "custom").at(-1)).toMatchObject({
-      data: { id: intent.resumeId, state: "cancelled", reason: "restart recovery refused: original admission cannot be proven" },
-    });
-    // Durable refusal: another restart and an unrelated compaction cannot revive A.
-    const again = harness("", restarted.manager); again.witness();
-    expect(recoverCompactResume(again.pi, again.context, true)).toBe(0);
-    recoverCompactResume(again.pi, again.context);
-    expect(again.sendUserMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not deliver a foreign process's committed journal even without the startup retirement hook", () => {
-    const h = harness();
-    beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();
-    const restarted = harness("", h.manager);
-    recoverCompactResume(restarted.pi, restarted.context);
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not cancel already admitted continuation receipts at startup", () => {
-    const h = harness();
-    const intent = h.controller.request({ resume: "Start X" });
-    beginCompactResume(h.pi, intent); h.witness();
-    recoverCompactResume(h.pi, h.context); h.admit();
-    const restarted = harness("", h.manager);
-    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(0);
-    expect(restarted.manager.getBranch().filter(e => e.type === "custom" && (e.data as any)?.state === "cancelled")).toHaveLength(0);
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-  });
-
-  it("infers pending user work, resumes one user turn in the same session, and never repeats", async () => {
+  it("commits successful live compaction but durably refuses its next step once", async () => {
     const h = harness();
     await h.provider.invoke("request", { instructions: "Keep the map" }, h.invocation);
-    expect(h.controller.status().pending?.resume).toBe("start item X");
+    const intent = h.controller.status().pending!;
+    expect(intent.resume).toBe("start item X");
     const committing = h.controller.maybeCommit(h.context);
-    expect(h.sendUserMessage).not.toHaveBeenCalled();
-    h.complete(); h.callbackAgain();
-    await committing;
-    recoverCompactResume(h.pi, h.context);
+    h.complete(); h.callbackAgain(); await committing;
+    expect(h.controller.status()).toMatchObject({ last: { status: "committed", summary: "compacted" } });
+    expect(h.controller.status().pending).toBeUndefined();
+    expect(refusals(h.manager)).toHaveLength(1);
+    expect(refusals(h.manager)[0]).toMatchObject({ data: { id: intent.resumeId, resume: "start item X", reason: LIVE_COMPACT_RESUME_REFUSAL } });
+    expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("Automatic compaction resume is disabled"), "warning");
+    expect(recoverCompactResume(h.pi, h.context)).toBe(0);
     await h.controller.maybeCommit(h.context);
-    expect(h.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(h.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("Resume after compaction: start item X"), { deliverAs: "followUp" });
-    h.admit();
-    recoverCompactResume(h.pi, h.context);
-    expect(h.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(inferCompactResume(h.context)).toBeUndefined();
-  });
-
-  it.each(["Compact", "/compact", "Please compact your context first.", "Implement X", "Compact with instructions: keep the plan", "Compact. Keep the failing test name in the summary.", "Compact\nKeep the failing test name in the summary.", "Compact first.\nPreserve the plan and test names in the summary."])("plain/manual compaction stays idle: %s", async text => {
-    const h = harness(text);
-    await h.provider.invoke("request", { instructions: "Keep the failing test name in the summary" }, h.invocation);
-    const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
-    recoverCompactResume(h.pi, h.context);
     expect(h.sendUserMessage).not.toHaveBeenCalled();
-    expect(h.manager.getBranch().filter(e => e.type === "custom")).toHaveLength(0);
+    expect(h.context.compact).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["Compaction cancelled", "API quota exceeded", "Nothing to compact (session too small)"])("does not resume failed/cancelled compaction: %s", async message => {
+  it("round-5 P1: an aborted settlement with an already-cleared signal cannot start any continuation", async () => {
+    const h = harness();
+    await h.provider.invoke("request", { resume: "Work with side effects" }, h.invocation);
+    // Pi clears the low-level run before agent_settled(outcome=aborted). Main
+    // still commits pending compaction here; the floor must not start a turn.
+    expect(h.context.signal).toBeUndefined();
+    const committing = h.controller.maybeCommit(h.context);
+    h.complete(); await committing;
+    h.witness(); // Nor may a later unrelated compaction revive that work.
+    expect(recoverCompactResume(h.pi, h.context)).toBe(0);
+    expect(recoverCompactResume(h.pi, h.context, true)).toBe(0);
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+    expect(refusals(h.manager)[0]).toMatchObject({ data: { resume: "Work with side effects", reason: LIVE_COMPACT_RESUME_REFUSAL } });
+  });
+
+  it("durably refuses a pre-start abort even though onBegin never journaled pending work", async () => {
+    const h = harness();
+    const abort = new AbortController(); abort.abort();
+    Object.assign(h.context, { signal: abort.signal });
+    h.controller.request({ resume: "Start X" });
+    await h.controller.maybeCommit(h.context);
+    expect(h.context.compact).not.toHaveBeenCalled();
+    expect(h.controller.status().last?.status).toBe("failed");
+    expect(refusals(h.manager)[0]).toMatchObject({ data: { reason: LIVE_COMPACT_RESUME_REFUSAL } });
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["Compaction cancelled", "API quota exceeded", "Nothing to compact (session too small)"])("refuses failed/cancelled live compaction: %s", async message => {
     const h = harness();
     await h.provider.invoke("request", {}, h.invocation);
     const committing = h.controller.maybeCommit(h.context); h.fail(message); await committing;
-    h.witness(); // A later unrelated manual compaction cannot revive the failed request.
-    recoverCompactResume(h.pi, h.context);
+    h.witness();
+    expect(recoverCompactResume(h.pi, h.context)).toBe(0);
+    expect(refusals(h.manager)[0]).toMatchObject({ data: { reason: LIVE_COMPACT_RESUME_REFUSAL } });
     expect(h.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("uses explicit self-requested next steps and lets empty resume disable inference", async () => {
-    const h = harness("Implement X");
-    await h.provider.invoke("request", { resume: "Run the failing test" }, h.invocation);
+  it.each([undefined, { id: "principal-A", binding: "herdr-client" }])("durably refuses restart A (%j) rather than lending fresh B's principal", principal => {
+    const h = harness();
+    const intent = h.controller.request({ resume: "Start X" });
+    beginCompactResume(h.pi, intent); h.witness();
+    if (principal) h.manager.appendCustomEntry("fabric-compact-resume", { id: intent.resumeId, resume: "Start X", state: "pending", principal });
+    const restarted = harness("", h.manager);
+    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(1);
+    expect(refusals(restarted.manager)[0]).toMatchObject({ data: { id: intent.resumeId, state: "cancelled", reason: RESTART_COMPACT_RESUME_REFUSAL } });
+    const fresh = "Fresh task B";
+    restarted.manager.appendMessage({ role: "user", content: fresh, timestamp: 3 });
+    expect(restarted.manager.getBranch().at(-1)).toMatchObject({ type: "message", message: { content: fresh } });
+    restarted.witness();
+    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(0);
+    expect(recoverCompactResume(restarted.pi, restarted.context)).toBe(0);
+    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retire uncommitted legacy work durably, startup=%s", startup => {
+    const h = harness();
+    beginCompactResume(h.pi, h.controller.request({ resume: "Old interrupted work" }));
+    expect(recoverCompactResume(h.pi, h.context, startup)).toBe(1);
+    h.witness();
+    expect(recoverCompactResume(h.pi, h.context, startup)).toBe(0);
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "Transport annotation\n"])("does not change already admitted legacy receipt-bearing work: %j", prefix => {
+    const h = harness();
+    const intent = h.controller.request({ resume: "Start X" });
+    beginCompactResume(h.pi, intent); h.witness();
+    h.manager.appendMessage({ role: "user", content: prefix + compactResumeMessage({ id: intent.resumeId!, resume: intent.resume! }), timestamp: 3 });
+    expect(recoverCompactResume(h.pi, h.context, true)).toBe(0);
+    expect(refusals(h.manager)).toHaveLength(0);
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["Compact", "/compact", "Please compact your context first.", "Implement X", "Compact with instructions: keep the plan", "Compact. Keep the failing test name in the summary.", "Compact\nKeep the failing test name in the summary.", "Compact first.\nPreserve the plan and test names in the summary."])("plain/manual compaction remains main's idle behavior: %s", async text => {
+    const h = harness(text);
+    await h.provider.invoke("request", { instructions: "Keep the failing test name in the summary" }, h.invocation);
     const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
-    expect(h.queued[0]).toContain("Resume after compaction: Run the failing test");
+    expect(h.context.compact).toHaveBeenCalledWith(expect.objectContaining({ customInstructions: "Keep the failing test name in the summary" }));
+    expect(h.controller.status().last?.status).toBe("committed");
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+    expect(h.manager.getBranch().filter(e => e.type === "custom")).toHaveLength(0);
+    expect(h.notify).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit resume separate from summary instructions, and empty text opts out", async () => {
+    const h = harness("Implement X");
+    await h.provider.invoke("request", { resume: "Run the failing test", instructions: "Preserve the map" }, h.invocation);
+    const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
+    expect(h.context.compact).toHaveBeenCalledWith(expect.objectContaining({ customInstructions: "Preserve the map" }));
+    expect(refusals(h.manager)[0]).toMatchObject({ data: { resume: "Run the failing test" } });
     const idle = harness();
     await idle.provider.invoke("request", { resume: "" }, idle.invocation);
     const compact = idle.controller.maybeCommit(idle.context); idle.complete(); await compact;
+    expect(refusals(idle.manager)).toHaveLength(0);
+    expect(idle.notify).not.toHaveBeenCalled();
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
     expect(idle.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("reads the latest user/steer/followUp message, not an older compound request", () => {
+  it("uses only the latest user/steer/followUp instruction", () => {
     const h = harness();
-    h.manager.appendMessage({ role: "user", content: [{ type: "text", text: "Please compact your context first, then run the tests" }], timestamp: 2 });
+    h.manager.appendMessage({ role: "user", content: "[fabric-follow-up:12345678-1234-1234-1234-123456789abc]\nCompact first, then run the tests", timestamp: 2 });
     expect(inferCompactResume(h.context)).toBe("run the tests");
     h.manager.appendMessage({ role: "user", content: "Never mind, just compact", timestamp: 3 });
     expect(inferCompactResume(h.context)).toBeUndefined();
-  });
-
-  it("infers a tracked worker followUp despite its persisted transport envelope", async () => {
-    const h = harness("[fabric-follow-up:12345678-1234-1234-1234-123456789abc]\nCompact first, then start item X");
-    await h.provider.invoke("request", {}, h.invocation);
-    expect(h.controller.status().pending?.resume).toBe("start item X");
-    const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
-    expect(h.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   it("does not journal cancelled or replaced advisory intents", async () => {
@@ -156,88 +176,32 @@ describe("compaction continuation", () => {
     h.controller.request({ resume: "Old task" }); h.controller.cancel();
     h.controller.request({ resume: "Another old task" }); h.controller.request({});
     const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
+    expect(h.manager.getBranch().filter(e => e.type === "custom")).toHaveLength(0);
     expect(h.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("durably refuses a restart after compact commits but before resume is admitted", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-compact-resume-")); roots.push(root);
-    const h = harness(undefined, SessionManager.create(root, path.join(root, "sessions")));
-    warm(h.manager); // Pi persists a session once an assistant message exists.
-    await h.provider.invoke("request", {}, h.invocation);
-    const compact = h.controller.maybeCommit(h.context);
-    h.witness(); // Simulate a process death before onComplete can schedule its user turn.
-    const file = h.manager.getSessionFile()!;
-    const restarted = harness("", SessionManager.open(file));
-    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(1);
-    recoverCompactResume(restarted.pi, restarted.context);
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-    restarted.admit();
-    const again = harness("", SessionManager.open(file));
-    recoverCompactResume(again.pi, again.context);
-    expect(again.sendUserMessage).not.toHaveBeenCalled();
-    // Close the first process's simulated in-flight Promise; its scheduling is
-    // irrelevant to the persisted receipt but leaves no running test work.
-    h.callbackAgain(); await compact;
-  });
-
-  it("refuses a queued but unpersisted resume on restart", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-compact-queued-")); roots.push(root);
+  it.each(["live", "restart"])("persists %s refusal across a real SessionManager reopen", async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-compact-refused-")); roots.push(root);
     const h = harness(undefined, SessionManager.create(root, path.join(root, "sessions"))); warm(h.manager);
     await h.provider.invoke("request", {}, h.invocation);
-    const compact = h.controller.maybeCommit(h.context); h.complete(); await compact;
-    expect(h.sendUserMessage).toHaveBeenCalledTimes(1);
-    const restarted = harness("", SessionManager.open(h.manager.getSessionFile()!));
-    expect(recoverCompactResume(restarted.pi, restarted.context, true)).toBe(1); restarted.admit();
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-    expect(restarted.manager.getBranch().filter(e => e.type === "message" && e.message.role === "user" &&
-      typeof e.message.content === "string" && e.message.content.startsWith("Resume after compaction:"))).toHaveLength(0);
-  });
-
-  it("retires a restart before compact commits so an unrelated later compact cannot revive it", () => {
-    const h = harness();
-    const intent = h.controller.request({ resume: "Old interrupted work" });
-    beginCompactResume(h.pi, intent);
-    recoverCompactResume(h.pi, h.context, true);
-    h.witness();
-    recoverCompactResume(h.pi, h.context, true);
+    const compact = h.controller.maybeCommit(h.context);
+    if (mode === "live") { h.complete(); await compact; }
+    else h.witness(); // Simulate death after compaction and before onComplete.
+    const reopened = harness("", SessionManager.open(h.manager.getSessionFile()!));
+    expect(recoverCompactResume(reopened.pi, reopened.context, true)).toBe(mode === "live" ? 0 : 1);
+    const again = harness("", SessionManager.open(h.manager.getSessionFile()!));
+    expect(refusals(again.manager)[0]).toMatchObject({ data: { reason: mode === "live" ? LIVE_COMPACT_RESUME_REFUSAL : RESTART_COMPACT_RESUME_REFUSAL } });
+    expect(recoverCompactResume(again.pi, again.context, true)).toBe(0);
+    expect(again.sendUserMessage).not.toHaveBeenCalled();
+    if (mode === "restart") { h.callbackAgain(); await compact; }
     expect(h.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("recognizes the persisted receipt ID even when user admission adds a transport prefix", async () => {
+  it("reports restart refusal to UI only when pending work was retired", () => {
     const h = harness();
-    await h.provider.invoke("request", {}, h.invocation);
-    const compact = h.controller.maybeCommit(h.context); h.complete(); await compact;
-    h.manager.appendMessage({ role: "user", content: `Transport annotation\n${h.queued[0]}`, timestamp: 3 });
-    const restarted = harness("", h.manager);
-    recoverCompactResume(restarted.pi, restarted.context, true);
-    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
-  });
-
-  it("uses Pi's real settled deferral: no new turn starts inside remaining settled handlers", async () => {
-    const h = harness();
-    const timeline: string[] = [];
-    const session = Object.create(AgentSession.prototype) as AgentSession;
-    const internals = session as unknown as Record<string, any>;
-    Object.assign(internals, {
-      _deferredSettledActions: [], _eventListeners: [],
-      _resolveIdleWaitIfIdle: () => {},
-      _extensionRunner: { emit: async () => {
-        timeline.push("handler:start");
-        await h.controller.maybeCommit(h.context);
-        timeline.push("handler:end");
-        expect(timeline).not.toContain("user:turn");
-      } },
-      prompt: async function(this: Record<string, any>, text: string, options: unknown) {
-        if (this._isEmittingAgentSettled) return AgentSession.prototype.prompt.call(session, text, options as never);
-        timeline.push("user:turn"); h.manager.appendMessage({ role: "user", content: text, timestamp: 3 });
-      },
-    });
-    h.pi.sendUserMessage = (text, options) => { void session.sendUserMessage(text, options); };
-    await h.provider.invoke("request", {}, h.invocation);
-    const settling = internals._emitAgentSettled();
-    h.complete(); await settling;
-    expect(timeline).toEqual(["handler:start", "handler:end", "user:turn"]);
-    recoverCompactResume(h.pi, h.context);
-    expect(timeline.filter(e => e === "user:turn")).toHaveLength(1);
+    reportCompactResumeRefusal(h.context, 0, true);
+    expect(h.notify).not.toHaveBeenCalled();
+    reportCompactResumeRefusal(h.context, 1, true);
+    expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("original admission cannot be proven"), "warning");
   });
 });

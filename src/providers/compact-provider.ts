@@ -26,7 +26,7 @@ import { actionArgNormalizer } from "./arg-normalization.js";
 const requestSchema = Type.Object({
   resume: Type.Optional(Type.String({
     maxLength: MAX_COMPACT_RESUME_CHARS,
-    description: "Next step to deliver as one follow-up user turn after successful compaction. Set this for self-requested compaction with unfinished work. Defaults to the follow-on part of the last compound compact user/steer instruction; empty text disables resumption.",
+    description: "Pending next step to record and durably refuse. Automatic compaction resume is disabled (smarty-dev#5282); re-submit this work explicitly. Defaults to the follow-on part of the last compound compact instruction; empty text opts out.",
   })),
   reason: Type.Optional(Type.String({
     maxLength: 1024,
@@ -92,7 +92,7 @@ const descriptors: FabricActionDescriptor[] = [
   {
     name: "request",
     description:
-      "Request an advisory compaction of the host session's context at the next safe boundary (agent_settled). The host commits it only between turns, never mid-turn. A new request replaces any pending one. Use resume for unfinished work; compaction alone does not continue the agent.",
+      "Request an advisory compaction of the host session's context at the next safe boundary (agent_settled). The host commits it only between turns, never mid-turn. A new request replaces any pending one. Automatic resume is disabled; pending resume work is durably refused and must be re-submitted explicitly.",
     inputSchema: requestSchema as unknown as Record<string, unknown>,
     risk: "write",
   },

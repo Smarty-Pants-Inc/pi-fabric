@@ -23,7 +23,7 @@ export interface CompactRequestIntent {
   instructions?: string;
   preserve?: string[];
   requestedBy?: string;
-  /** Work to deliver as one user turn after successful compaction, not summary instructions. */
+  /** Pending work to durably refuse, not summary instructions. Automatic resume is disabled. */
   resume?: string;
 }
 

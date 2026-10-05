@@ -11,8 +11,8 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   for (const root of roots.splice(0)) await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-// Real source/dist worker with a deterministic RPC child. The delayed user
-// admission specifically spans the worker's 200ms steer-timer close check.
+// Real source/dist worker with a deterministic RPC child. Refusal must remain
+// caller-visible and must not delay main's ordinary settled shutdown.
 const fakePi = `#!/usr/bin/env node
 const emit = event => process.stdout.write(JSON.stringify(event) + '\\n');
 let model = {provider:'resume-test', id:'offline'}, buffer = '';
@@ -34,14 +34,9 @@ process.stdin.on('data', chunk => {
       if(frame.message === 'resume') {
         emit({type:'entry_appended', entry:{type:'custom', customType:'fabric-compact-resume', data:{id, resume:'start item X', state:'pending'}}});
         emit({type:'compaction_end', reason:'manual'});
+        emit({type:'entry_appended', entry:{type:'custom', customType:'fabric-compact-resume', data:{id, resume:'start item X', state:'cancelled', reason:'automatic compaction resume disabled (smarty-dev#5282)'}}});
+        emit({type:'fabric_compact_resume_refused', protocol:1, runId:process.env.PI_FABRIC_PARENT_RUN, count:1, message:'Automatic compaction resume is disabled (smarty-dev#5282). Re-submit the pending work explicitly.'});
         settled();
-        setTimeout(() => {
-          emit({type:'agent_start'});
-          const content = 'Resume after compaction: start item X\\n\\n[Fabric continuation: ' + id + ']';
-          emit({type:'message_start', message:{role:'user', content}});
-          emit({type:'message_end', message:{role:'user', content}});
-          answer('item X completed'); settled();
-        }, 550);
       } else { emit({type:'compaction_end', reason:'manual'}); settled(); }
     }
   }
@@ -62,7 +57,7 @@ const run = async (task: string, legacyRecovery = false) => {
   return { result, events };
 };
 
-describe("worker compaction resume shutdown fence", () => {
+describe("worker compaction safe-floor refusal", () => {
   it("refuses an older child's startup recovery announcement instead of bundling it with fresh work", async () => {
     const { result, events } = await run("fresh B", true);
     expect(result.status).toBe("failed");
@@ -71,13 +66,15 @@ describe("worker compaction resume shutdown fence", () => {
     expect(events.some(event => event.type === "agent_start")).toBe(false);
   }, 25_000);
 
-  it("keeps stdin open past settled and its timer until the one resume user turn finishes", async () => {
+  it("retains live refusal as a caller warning and closes after the original settled turn", async () => {
     const { result, events } = await run("resume");
     expect(result.status).toBe("completed");
-    expect(result.text).toBe("item X completed");
-    expect(events.filter(event => event.type === "agent_settled")).toHaveLength(2);
-    expect(events.filter(event => event.type === "message_start" && event.message.role === "user")).toHaveLength(1);
-    expect(result.warnings ?? []).toEqual([]);
+    expect(result.text).toBe("I will compact, then start item X");
+    expect(events.filter(event => event.type === "agent_settled")).toHaveLength(1);
+    expect(events.filter(event => event.type === "agent_start")).toHaveLength(1);
+    expect(events.filter(event => event.type === "message_start" && event.message.role === "user")).toHaveLength(0);
+    expect(result.warnings).toEqual([expect.stringContaining("Automatic compaction resume is disabled")]);
+    expect(events.some(event => event.type === "entry_appended" && event.entry.data.state === "cancelled")).toBe(true);
   }, 25_000);
 
   it("still closes a plain compacted child without a pending continuation", async () => {

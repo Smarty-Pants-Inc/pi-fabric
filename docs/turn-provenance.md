@@ -40,9 +40,11 @@ Only Pi assigns `keyboard`, `terminal`, and `voice`. Unattested pane writes are 
 
 ## Compaction continuation scope
 
-Compound compaction requests resume only in the live extension instance that
-began the compaction. Restart/reload recovery is deliberately disabled: the
-continuation journal does not establish original sender admission or the parent
+Automatic compaction resume is disabled in both live sessions and after
+restart/reload. Scope cut: smarty-dev#5282. Live settlement durably refuses
+pending work even after an explicit abort; compaction itself follows main's
+behavior. Restart/reload recovery is also refused because the continuation
+journal does not establish original sender admission or the parent
 actor's cumulative output-principal lineage. Startup durably cancels unadmitted
 continuations and reports an explicit refusal; the caller must re-submit the
 pending work. Already admitted receipts are not replayed or rewritten. Fresh

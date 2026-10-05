@@ -24,7 +24,13 @@ input.on("line", (line) => {
     } catch {
       return;
     }
-    if (command.type === "prompt" && !prompted) {
+    if (command.type === "get_state" || command.type === "get_messages") {
+      const data = command.type === "get_state"
+        ? { model: { provider: "fake", id: "fake-model", contextWindow: 128_000 }, thinkingLevel: "off", isStreaming: false, isCompacting: false }
+        : { messages: [] };
+      send({ type: "response", id: command.id, command: command.type, success: true, data });
+      record({ type: command.type, id: command.id });
+    } else if (command.type === "prompt" && !prompted) {
       prompted = true;
       send({ type: "response", command: "prompt", success: true });
       send({ type: "agent_start" });

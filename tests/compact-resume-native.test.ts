@@ -15,7 +15,7 @@ describe('native Pi compaction recovery and acceptance', () => {
     } finally { fs.rmSync(out,{recursive:true,force:true}); }
   });
 
-  it.each(['restart','restart-actor','restart-fresh-actor','restart-foreign-principal','restart-inherited','receipt','compound','plain'])('%s uses the real native lifecycle', mode => {
+  it.each(['restart','restart-actor','restart-fresh-actor','restart-foreign-principal','restart-inherited','receipt','compound','plain','abort'])('%s uses the real native lifecycle', mode => {
     const out = fs.mkdtempSync(path.join(os.tmpdir(),'compact-native-test-'));
     try {
       const result = spawnSync(process.execPath,['scripts/probe-compact-resume.mjs',mode],{env:{...process.env,COMPACT_PROBE_OUT:out,COMPACT_PROBE_SOURCE:process.env.COMPACT_PROBE_SOURCE ?? '1'},encoding:'utf8',timeout:65000,maxBuffer:4*1024*1024});

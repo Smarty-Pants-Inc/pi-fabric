@@ -12,6 +12,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
+import * as participantFiles from "../src/topology/participant-files.js";
 
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const PERIOD_MS = 5_000;
@@ -91,7 +92,7 @@ describe("resident actor participant renewal without a Main", () => {
     }
   });
 
-  it.each(["shared", "files"] as const)("stops renewing a lineage moved by fenced adoption (%s)", async (mode) => {
+  it.each(["shared", "files"] as const)("closes the predecessor before successor publication without rolling back custody (%s)", async (mode) => {
     const { root, config, host, observer } = fixture();
     const identity = { id: "resident-successor", name: "successor", kind: "agent" as const };
     const successorRoot = "session:successor";
@@ -113,10 +114,16 @@ describe("resident actor participant renewal without a Main", () => {
       // new owner's participant is visible. Old directory opinions must not win.
       now += PERIOD_MS;
       await registry.withLock(() => registry.write(registry.records().map((record) => record.id === actor.id
-        ? { ...record, rootId: successorRoot, adoptedAt: now, updatedAt: now } : record)));
+        ? { ...record, rootId: successorRoot, adoptedAt: now, adoptedFrom: [config.rootId], updatedAt: now } : record)));
+      const adopted = registry.records().find((record) => record.id === actor.id)!;
       await host.participants.refresh();
       expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
       expect(host.mesh.get(key, { fresh: true })).toBeUndefined();
+      expect.soft(host.actors.owns(actor.id)).toBe(false);
+      // Crucial ordering: no successor directory opinion can mask the predecessor's
+      // fallback ownership or close-time registry save. Custody must stand on disk.
+      await host.close();
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adopted);
       successor.registerSource(() => [{ ...(prior.value as FabricParticipantRecord),
         rootId: successorRoot, parentId: successorRoot, ownerHostId: identity.id, ownerIdentityId: identity.id }]);
       await successor.start();
@@ -129,11 +136,118 @@ describe("resident actor participant renewal without a Main", () => {
       }
       await host.close();
       expect(readParticipantFile(config.meshRoot, key)).toEqual(moved);
-      expect(registry.records().find((record) => record.id === actor.id)?.rootId).toBe(successorRoot);
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adopted);
     } finally {
       clock.mockRestore();
       await host.close(); await successor.close(); await observer.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+  it.each(["shared", "files"] as const)("fences delayed renewal against adoption at the write (%s)", async (mode) => {
+    const { root, config, host, observer } = fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const selected = new Promise<void>((resolve) => { reached = resolve; });
+    let renewal: Promise<void> | undefined, adoption: Promise<void> | undefined;
+    try {
+      if (mode === "files") await observer.mesh.put({ key: LIVENESS_POLICY_KEY,
+        value: { version: 1, hostLeases: "files", participants: "files" }, identity: observer.options.identity });
+      await host.start();
+      const actor = await host.actors.create({ name: "delayed-review", instructions: "wait", residency: "durable" });
+      await host.participants.refresh();
+      // Gate after real source selection but before a real shared/key write.
+      // Adoption must not commit while that selected renewal is waiting.
+      const batch = host.mesh.writeBatch.bind(host.mesh);
+      const writeFile = participantFiles.writeParticipantFileIf;
+      const wait = mode === "shared"
+        ? vi.spyOn(host.mesh, "writeBatch").mockImplementationOnce(async (input) => {
+          reached(); await gate; return batch(input);
+        })
+        : vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementationOnce(async (...args) => {
+          reached(); await gate; return writeFile(...args);
+        });
+      renewal = host.participants.refresh();
+      await selected;
+      const registry = new ActorRegistryStore(config.actorRoot);
+      let adopted = false;
+      adoption = registry.withLock(() => {
+        registry.write(registry.records().map((record) => record.id === actor.id
+          ? { ...record, rootId: "session:successor", adoptedAt: Date.now(), adoptedFrom: [config.rootId] } : record));
+        adopted = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(adopted).toBe(false); // source selection did not release the mutation fence
+      release(); await renewal; await adoption;
+      wait.mockRestore();
+      const adoptedRow = registry.records().find((record) => record.id === actor.id);
+      await host.participants.refresh();
+      expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toBeUndefined();
+      await host.close();
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+    } finally {
+      release(); await Promise.allSettled([renewal, adoption]);
+      await host.close(); await observer.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["moved-root", "same-root"])("rechecks an adopted generation after a management save waits for registry custody (%s)", async (move) => {
+    const { root, config, host, observer } = fixture();
+    let save: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "save-review", instructions: "wait", residency: "durable" });
+      await host.participants.refresh();
+      const registry = new ActorRegistryStore(config.actorRoot);
+      let adoptedRow: Record<string, unknown> | undefined;
+      await registry.withLock(async () => {
+        save = host.actors.setInstructions(actor.id, "predecessor edit");
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        registry.write(registry.records().map((record) => record.id === actor.id
+          ? { ...record, rootId: move === "moved-root" ? "session:successor" : config.rootId,
+            adoptedAt: Date.now(), adoptedFrom: ["session:earlier-custodian"] } : record));
+        adoptedRow = registry.records().find((record) => record.id === actor.id);
+      });
+      await save;
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+      await host.participants.refresh();
+      expect(host.actors.owns(actor.id)).toBe(false);
+      expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toBeUndefined();
+      await host.close();
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+    } finally {
+      await Promise.allSettled([save]); await host.close(); await observer.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not revoke a successor generation when removal waited for registry custody", async () => {
+    const { root, config, host, observer } = fixture();
+    let remove: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "remove-review", instructions: "wait", residency: "durable" });
+      await host.participants.refresh();
+      const registry = new ActorRegistryStore(config.actorRoot);
+      let adoptedRow: Record<string, unknown> | undefined;
+      await registry.withLock(async () => {
+        // Observe the rejection immediately: its asynchronous commit must lose to
+        // an adoption even when rootId is reused by a new registry generation.
+        remove = host.actors.remove(actor.id).catch((error) => error);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        registry.write(registry.records().map((record) => record.id === actor.id
+          ? { ...record, adoptedAt: Date.now(), adoptedFrom: ["session:earlier-custodian"] } : record));
+        adoptedRow = registry.records().find((record) => record.id === actor.id);
+      });
+      expect(await remove).toBeInstanceOf(Error);
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+      await host.close();
+      expect(registry.records().find((record) => record.id === actor.id)).toEqual(adoptedRow);
+    } finally {
+      await Promise.allSettled([remove]); await host.close(); await observer.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
 });

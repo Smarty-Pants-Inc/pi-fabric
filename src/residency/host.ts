@@ -32,6 +32,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
@@ -275,9 +276,17 @@ export class ResidentHost {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+    // Adoption takes registry then mesh custody. Use that same order and hold
+    // it from the fresh source read through shared commits and per-key copies.
+    // Otherwise a delayed heartbeat could republish after a successor adopted.
+    const registries = [...new Set(Object.values(residentActorRoots(config)))].sort()
+      .map((root) => new ActorRegistryStore(root));
+    const publishFenced = <T>(publish: () => Promise<T>, index = 0): Promise<T> =>
+      index === registries.length ? publish() : registries[index]!.withLock(() => publishFenced(publish, index + 1));
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      withPublicationFence: publishFenced,
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,

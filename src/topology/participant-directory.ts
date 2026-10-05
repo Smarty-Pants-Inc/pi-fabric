@@ -381,6 +381,8 @@ export interface ParticipantDirectoryOptions {
   enabled: boolean;
   /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
   renewActorParticipants?: boolean;
+  /** Registry -> mesh/key lock order: retain actor custody through every publication write. */
+  withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -538,7 +540,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const startedAt = Date.now();
     this.#refreshStartedAt = startedAt;
     if (!full) this.#changeRefreshAt = startedAt;
-    const operation = this.#refresh(full);
+    const operation = this.options.withPublicationFence
+      ? this.options.withPublicationFence(() => this.#refresh(full)) : this.#refresh(full);
     const settled = operation.then(() => undefined);
     settled.catch(() => undefined);                            // awaiters still see a failure
     this.#refreshing = settled;

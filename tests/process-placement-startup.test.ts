@@ -36,7 +36,9 @@ afterEach(() => {
 const raw = (command = process.execPath) => ({ default: "remote", command: [command, "{id}"], resultDirectory: "/unused/{id}", cancelCommand: [command, "--cancel", "{id}"] });
 const root = () => { const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-startup-")); roots.push(directory); return directory; };
 const contextAt = (cwd: string): ExtensionContext => ({
-  cwd, isProjectTrusted: () => false, ui: { setStatus: vi.fn() },
+  cwd, isProjectTrusted: () => false,
+  sessionManager: { getSessionId: () => "placement-startup-session" },
+  ui: { setStatus: vi.fn() },
 } as unknown as ExtensionContext);
 const stateAt = (placement: unknown, cwd: string) => {
   const profile = root();

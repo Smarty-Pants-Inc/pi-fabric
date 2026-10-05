@@ -33,6 +33,7 @@ import type {
   FabricPeerInfo,
 } from "./topology/types.js";
 import { resolveFabricIdentity } from "./fabric-provenance.js";
+import { ParticipantRoleGrant } from "./topology/project-identity.js";
 import type {
   FabricAgentMessageDelivery,
   FabricAgentMessageResult,
@@ -73,6 +74,7 @@ export class FabricState {
   #kernelReloadRequired = false;
   #placementProbeLine: string | undefined;
 
+  readonly #roleGrant = new ParticipantRoleGrant();
   #cwd: string | undefined;
   #generation = 0;
   #everActivated = false;
@@ -191,6 +193,8 @@ export class FabricState {
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
+    // Bind at session_start, not first tool use: an idle /new must not consume the launch grant.
+    if (!this.#managedHost) this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd, process.env, true);
     // A failed config load must not leak the previous session's configuration
     // into this one: clear before the read so bootstrapped stays false and
     // presentation falls back to the safe default until a load succeeds.
@@ -581,6 +585,7 @@ export class FabricState {
       this.capturedTools,
       {
         ...(this.#managedHost ? {managedHost: this.#managedHost} : {}),
+        roleGrant: this.#roleGrant,
         activity: this.activity,
         prewalk: this.prewalk,
         prewalkDrift: this.prewalkDrift,

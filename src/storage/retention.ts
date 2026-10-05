@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -571,7 +572,8 @@ function* inspectTerminalRunEvents(directory: string, options: TerminalRunCompac
       now - recordAgeReference(record, (yield* treeOwnedStat(directory))?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = yield* treeOwnedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || !(yield* inspectCompactionTree(directory, expired, scratchCoveredByAllowlist))) return false;
+  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
+      !(yield* inspectCompactionTree(directory, expired, scratchCoveredByAllowlist)))) return false;
   try {
     const fd = yield* treeOpen(file);
     let tail: Buffer;
@@ -611,6 +613,11 @@ function* inspectTerminalRunEvents(directory: string, options: TerminalRunCompac
     if (stat.size <= maxBytes && (retained.length === stat.size ||
         (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
          tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
+    // four redundant status reads for that no-op (native directory order can
+    // put the historical prefix inside the resident run phase).
+    // A real replacement still requires both independent fresh safety walks
+    // in inspectCompactionTree below, including this PR's scratch custody veto.
     // Truncation is now known to be necessary. Reserve the marker's space and
     // drop only complete prefix lines; look behind by one byte so an exactly
     // aligned final event is kept. An oversized final event leaves only a marker.

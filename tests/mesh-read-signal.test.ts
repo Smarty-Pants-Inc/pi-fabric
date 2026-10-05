@@ -36,7 +36,7 @@ const newRoot = (): string => {
   roots.push(root);
   return root;
 };
-const storeAt = (root: string, options?: MeshStoreOptions): MeshStore => new MeshStore(root, 64 * 1024, 100, options);
+const storeAt = (root: string, options?: MeshStoreOptions): MeshStore => new MeshStore(root, 64 * 1024, 100, { writeReadJournal: false, ...options }); // Exercise pre-journal/mixed-fleet signal fallback.
 
 // Real fs functions, captured before any spy, for the test's own direct file work.
 const real = {
@@ -693,10 +693,10 @@ describe("MeshStore read signal: a canonical replace racing the signal read", ()
       advance(3 * WINDOW_MS);
       expect(narrowReads(reader, SUBS)).toEqual(after);
       expect(reader.listAll(SUBS, { fresh: true })).toEqual(after);
-      // #164 Security S1: fresh canonical revalidation creates a new snapshot even when
-      // its bytes match. Token identity is a parse memo, not proof of current ownership.
+      // Fresh readers revalidate canonical physical generation. Unchanged payloads keep
+      // token identity; a changed or unavailable identity cannot waive fresh authority.
       const cachedToken = reader.stateToken();
-      expect(reader.stateToken({ fresh: true })).not.toBe(cachedToken);
+      expect(reader.stateToken({ fresh: true })).toBe(cachedToken); // Physical generation unchanged: revalidate, do not reparse.
       expect(reader.listAll(SUBS)).toEqual(after);
     });
   }

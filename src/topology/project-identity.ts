@@ -11,6 +11,42 @@ export const participantRole = (env: NodeJS.ProcessEnv = process.env): string | 
   return value || undefined;
 };
 
+/**
+ * A launch role is authority for one native session/project tuple, not for every session a
+ * long-lived Pi process opens (smarty-dev#5242). Capture once, before lazy activation, and
+ * carry the same grant through runtime replacement. Never use Fabric identity overrides here.
+ *
+ * Launchers may supply both PI_FABRIC_ROLE_SESSION (bare native session id) and
+ * PI_FABRIC_ROLE_PROJECT (exact projectOf(cwd)). Legacy launches bind their first session;
+ * recording that tuple in the process env also fences a fresh extension factory after /reload.
+ * An explicit/inherited tuple can retain the grant on a same-session process restart, but
+ * cannot grant a different history. Partial metadata fails closed. Values compare verbatim.
+ */
+export class ParticipantRoleGrant {
+  #grant: { role: string | undefined; sessionId: string; project: string } | undefined;
+
+  roleFor(sessionId: string, cwd: string, env: NodeJS.ProcessEnv = process.env, recordLaunch = false): string | undefined {
+    if (!this.#grant) {
+      const role = participantRole(env);
+      const hasBinding = env.PI_FABRIC_ROLE_SESSION !== undefined || env.PI_FABRIC_ROLE_PROJECT !== undefined;
+      const project = role ? projectOf(cwd) : "";
+      this.#grant = {
+        role,
+        sessionId: hasBinding ? env.PI_FABRIC_ROLE_SESSION ?? "" : sessionId,
+        project: hasBinding ? env.PI_FABRIC_ROLE_PROJECT ?? "" : project,
+      };
+      if (role && !hasBinding && recordLaunch) {
+        env.PI_FABRIC_ROLE_SESSION = sessionId;
+        env.PI_FABRIC_ROLE_PROJECT = project;
+      }
+    }
+    const grant = this.#grant;
+    if (!grant.role) return undefined;
+    return sessionId !== "" && sessionId === grant.sessionId && projectOf(cwd) === grant.project
+      ? grant.role : "area-lead";
+  }
+}
+
 const projects = new Map<string, string>();
 
 // One spelling per directory: Windows reports a temp or home path in 8.3 short form (RUNNER~1)

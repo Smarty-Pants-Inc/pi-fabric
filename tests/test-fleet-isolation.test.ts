@@ -93,14 +93,18 @@ const identity = { id: "session:isolated-test", name: "main", kind: "main", sess
 const directory = new ParticipantDirectory(new MeshStore(process.env.PI_FABRIC_MESH_ROOT, 65536, 1000), {
   enabled: false, hostId: identity.id, rootId: identity.id, identity,
 });
-const main = { id: identity.id, cwd: repo, status: "idle", startedAt: 1, updatedAt: 2, pendingMessages: false };
+const main = { id: identity.id, sessionId: identity.sessionId, cwd: repo, status: "idle", startedAt: 1, updatedAt: 2, pendingMessages: false };
 assert.equal(directory.root(main).role, undefined);
 assert.equal(directory.root(main).project, projectOf(repo));
-// Native role and semantic project overrides set AFTER the boundary must still work.
+// Explicit test roles set AFTER the isolation boundary work for a fresh native launch,
+// not by escalating a directory that has already bound its role-less session.
 process.env.SMARTY_ROLE = "project-agent@test";
 assert.equal(participantRole(), "project-agent");
-const native = directory.root(main);
+assert.equal(directory.root(main).role, undefined);
+const launchedDirectory = new ParticipantDirectory(directory.mesh, directory.options);
+const native = launchedDirectory.root(main);
 assert.equal(native.role, "project-agent");
+assert.equal(launchedDirectory.root({ ...main, sessionId: "replacement-test" }).role, "area-lead");
 assert.equal(native.project, projectOf(repo));
 const mirror = { ...native, id: "session:mirror", startedAt: 99, remoteHost: "forge" };
 assert.equal(resolveProjectAgent([native, mirror], participantProject(repo)).id, identity.id);

@@ -42,7 +42,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -101,6 +101,8 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
+import { retentionV2Enabled } from "../storage/retention-platform.js";
+import { boundedRunTree, RetentionReferenceScan } from "../storage/reference-scan.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
 const removeManagedRunRoot = async (root: string, managed: boolean): Promise<void> => {
@@ -738,6 +740,15 @@ export class AgentManager {
   #retentionSweep: Promise<void> | undefined;
   #budgetSummaryCache: { at: number; value: FabricBudgetSummary } | undefined;
   #claudeModelsCache: { at: number; value: ClaudeModelInfo[] } | undefined;
+  readonly #referenceScan = new RetentionReferenceScan();
+  readonly #archiveRecovery = new Map<string, Generator<number>>();
+  readonly #retentionActors = new Map<string, Set<string>>();
+  #retentionActorRuns = 0;
+  #retentionIndexUnsafe = true;
+  readonly #retentionWatermark = new Map<string, { identity: string; actorId: string | undefined; held: boolean }>();
+  #retentionWatermarkRefresh = 0;
+  #retentionRevision = 0;
+  #retentionSliceHint: { id: string; actorId: string | undefined } | undefined;
   #uiListRevision = 0;
   #uiListCache:
     | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
@@ -1690,6 +1701,7 @@ export class AgentManager {
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
     if (queued.terminal) return;
+    this.#retentionRevision++;
     const now = Date.now();
     const record: AgentRunResult = {
       ...queued.info, task: queued.task, status,
@@ -2059,10 +2071,27 @@ export class AgentManager {
     return value;
   }
 
-  /** Full ownership references for retention, never the bounded UI/status snapshot.
-   * A terminal status or abandonment is not worker-exit evidence. "*" vetoes
-   * stopped-actor exit proofs when untracked ownership cannot be determined. */
-  retentionReferences(): Set<string> {
+  /** Cached, progressing ownership preparation. Unknown/unfinished proof is a
+   * wildcard veto; terminal status never substitutes for checked worker exit.
+   * refresh is for explicit offline verification, not the resident poll. */
+  retentionReferences(options: { refresh?: boolean; now?: number; budgetMs?: number; maxEntries?: number } = {}): Set<string> {
+    if (!retentionV2Enabled()) return this.#mainRetentionReferences();
+    const now = options.now ?? Date.now();
+    if (options.refresh) this.#retentionWatermarkRefresh = 0;
+    const generation = this.#retentionGeneration();
+    const refs = this.#referenceScan.snapshot(generation, (protect, expired, retry) => this.#scanRetentionReferences(protect, expired, retry, now), options);
+    // Expose a readable owner while its tree proof is suspended, without
+    // baking a transient deadline fence into the completed snapshot.
+    if (this.#retentionSliceHint) {
+      for (const value of [this.#retentionSliceHint.id, this.#retentionSliceHint.actorId]) {
+        if (value) { if (refs.size < 1024) refs.add(value); else refs.add("*"); }
+      }
+    }
+    return refs;
+  }
+
+  // Windows scope cut: verbatim main 9387af87 implementation.
+  #mainRetentionReferences(): Set<string> {
     const refs = new Set<string>();
     const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
     for (const queued of this.#queued.values()) {
@@ -2110,6 +2139,170 @@ export class AgentManager {
     } catch { refs.add("*"); }
     finally { try { directory?.closeSync(); } catch { refs.add("*"); } }
     return refs;
+  }
+
+
+  /** Archival never discharges a live manager's result/publication custody,
+   * even if its saved status is terminal or its handle has settled. */
+  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id); }
+
+  #retentionGeneration(): string {
+    return `${this.#runs.size}:${this.#queued.size}:${this.#retentionRevision}:${RetentionReferenceScan.directoryGeneration(this.#runRoot)}`;
+  }
+
+  /** Prepared references are protective hints, NOT cached authority. Before
+   * expiring an exchange, re-evaluate the exact writer/tree under a count/time
+   * budget. In-place nested/status changes need no run-set mtime. */
+  retentionCustodyVeto(id: string): boolean {
+    if (!retentionV2Enabled()) return this.#mainRetentionReferences().has(id);
+    const started = performance.now(), expired = () => performance.now() - started >= 2;
+    const check = (runId: string): boolean => {
+      const queued = this.#queued.get(runId);
+      if (queued) return !queued.terminal || !!queued.cleanupPending ||
+        !boundedRunTree(path.join(this.#runRoot, runId), expired) || hasUnresolvedWorker(path.join(this.#runRoot, runId), 0, expired);
+      const managed = this.#runs.get(runId);
+      const directory = managed?.runDirectory ?? path.join(this.#runRoot, runId);
+      if (managed) {
+        const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
+        if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+            (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)))) return true;
+      }
+      return !boundedRunTree(directory, expired) || !!runTreeExitVeto(directory, 0, expired, true) || expired();
+    };
+    if (this.#runs.has(id) || this.#queued.has(id) || ownedStat(path.join(this.#runRoot, id))?.isDirectory()) return check(id);
+    if (this.#retentionIndexUnsafe || !this.#referenceScan.current(this.#retentionGeneration())) return true;
+    let count = 0;
+    // Admission can add an actor-owned handle after its portion of the
+    // preparation cursor passed. Check current manager ownership, not only
+    // historical actor hints; overflow/time uncertainty remains a veto.
+    for (const managed of this.#runs.values()) {
+      if (++count > 64 || expired()) return true;
+      if (managed.actorId === id && check(managed.id)) return true;
+    }
+    for (const queued of this.#queued.values()) {
+      if (++count > 64 || expired()) return true;
+      if (queued.info.actorId === id && check(queued.info.id)) return true;
+    }
+    for (const runId of this.#retentionActors.get(id) ?? []) {
+      if (++count > 64 || expired() || check(runId)) return true;
+    }
+    return expired();
+  }
+
+  *#scanRetentionReferences(protect: (id: string, actorId?: string) => void, expired: () => boolean, retry: () => void, now: number): Generator<void> {
+    // Refresh only at a factory boundary: crossing the interval while the
+    // historical walk is suspended must not erase its already-visited prefix.
+    if (now >= this.#retentionWatermarkRefresh) {
+      this.#retentionWatermark.clear(); this.#retentionWatermarkRefresh = now + this.#referenceScan.intervalMs;
+    }
+    this.#retentionSliceHint = undefined;
+    this.#retentionActors.clear(); this.#retentionActorRuns = 0; this.#retentionIndexUnsafe = false;
+    const index = (id: string, actorId?: unknown) => {
+      if (actorId === undefined) return;
+      if (typeof actorId !== "string" || !/^[A-Za-z0-9_-]+$/.test(actorId)) {
+        this.#retentionIndexUnsafe = true; protect("*"); return;
+      }
+      let ids = this.#retentionActors.get(actorId);
+      if (ids?.has(id)) return;
+      if (++this.#retentionActorRuns > 1024) { this.#retentionIndexUnsafe = true; protect("*"); return; }
+      if (!ids) this.#retentionActors.set(actorId, ids = new Set());
+      ids.add(id);
+    };
+    // Resume at the failed predicate, not at the status read for the whole
+    // unit. Slow filesystems can consume a slice in any one synchronous call.
+    // Such a timeout is a protective hint for this snapshot, never a 60-second
+    // cached ownership fact; retry it on a later completed factory/delta pass.
+    let incomplete = false;
+    function* proof(check: () => boolean): Generator<void, boolean> {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (expired()) yield;
+        const result = check();
+        if (!expired()) return result;
+        if (attempt < 2) yield;
+      }
+      incomplete = true; retry(); return false;
+    }
+    for (const queued of this.#queued.values()) {
+      incomplete = false;
+      index(queued.info.id, queued.info.actorId);
+      if (!queued.terminal || queued.cleanupPending || !(yield* proof(() => boundedRunTree(path.join(this.#runRoot, queued.info.id), expired))) ||
+          !(yield* proof(() => !hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id), 0, expired)))) {
+        protect(queued.info.id, queued.info.actorId);
+      }
+      yield;
+    }
+    for (const managed of this.#runs.values()) {
+      incomplete = false;
+      index(managed.id, managed.actorId);
+      const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
+      const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
+      if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+          unconfirmedProcess || !(yield* proof(() => boundedRunTree(managed.runDirectory, expired))) ||
+          !(yield* proof(() => !runTreeExitVeto(managed.runDirectory, 0, expired, true)))) protect(managed.id, managed.actorId);
+      yield;
+    }
+    // Reconcile activity with a persistent identity watermark. Directory
+    // enumeration may repeat, but historical status/tree preparation does not.
+    // New/replaced runs alone need expensive work until the periodic refresh.
+    let generation: string;
+    do {
+      generation = RetentionReferenceScan.directoryGeneration(this.#runRoot);
+      let directory: fs.Dir | undefined;
+      try {
+        try { fs.lstatSync(this.#runRoot); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+        if (!ownedStat(this.#runRoot)?.isDirectory()) { protect("*"); return; }
+        directory = fs.opendirSync(this.#runRoot);
+        let entry: fs.Dirent | null;
+        while ((entry = directory.readSync())) {
+          if (!(this.#managedTempRoot && entry.name === ".fabric-owner.json") && !this.#runs.has(entry.name) && !this.#queued.has(entry.name)) {
+            const run = path.join(this.#runRoot, entry.name), stat = ownedStat(run);
+            if (!entry.isDirectory() || !stat?.isDirectory()) protect("*");
+            else {
+              const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}:${stat.ctimeMs}`;
+              let prepared = this.#retentionWatermark.get(entry.name);
+              if (prepared?.identity !== identity) {
+                incomplete = false;
+                const status = ownedStat(path.join(run, "status.json"));
+                const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
+                // Keep the readable owner visible while individual proof stages
+                // yield. The fresh collection veto remains independent of this
+                // cached preparation and rechecks the exact current run tree.
+                const actorId = record?.actorId;
+                index(entry.name, actorId);
+                const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+                  ? Number(record.sessionId) : undefined;
+                this.#retentionSliceHint = { id: entry.name, actorId };
+                prepared = { identity, actorId,
+                  held: !(pid !== undefined && !processAlive(pid) &&
+                    (yield* proof(() => boundedRunTree(run, expired))) &&
+                    (yield* proof(() => !runTreeExitVeto(run, 0, expired, true))) &&
+                    (yield* proof(() => canRemoveTerminalRun(run, expired)))) };
+                this.#retentionSliceHint = undefined;
+                if (!incomplete) this.#retentionWatermark.set(entry.name, prepared);
+                index(entry.name, prepared.actorId);
+                if (prepared.held) protect(typeof prepared.actorId === "string" && /^[A-Za-z0-9_-]+$/.test(prepared.actorId) ? entry.name : "*", prepared.actorId);
+                yield;
+                continue;
+              }
+              // Index/protect each identity once per factory, not on catch-up
+              // passes; otherwise a delta inflates the actor overflow fence.
+            }
+          }
+          if (expired()) yield;
+        }
+      } catch { protect("*"); return; }
+      finally { try { directory?.closeSync(); } catch { protect("*"); } }
+      // Rebuild actor hints and protective refs from the persistent watermark.
+      // Bound this phase too; no cached entry ever authorizes collection.
+      for (const [id, prepared] of this.#retentionWatermark) {
+        index(id, prepared.actorId);
+        if (prepared.held) protect(typeof prepared.actorId === "string" && /^[A-Za-z0-9_-]+$/.test(prepared.actorId) ? id : "*", prepared.actorId);
+        if (expired()) yield;
+      }
+      // A native cursor may miss additions behind its slot, including changes
+      // during the suspended hint phase. Re-open for new identities only.
+    } while (generation !== RetentionReferenceScan.directoryGeneration(this.#runRoot));
   }
 
   runDirectory(id: string): string | undefined {
@@ -2539,6 +2732,9 @@ export class AgentManager {
   /** Fence/cancel launch preparation before a host waits for control admissions. */
   beginClose(): void {
     this.#closing = true;
+    this.#referenceScan.close();
+    for (const walk of this.#archiveRecovery.values()) walk.return(0);
+    this.#archiveRecovery.clear();
     for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
     this.#followUpTimers.clear();
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
@@ -2783,10 +2979,12 @@ export class AgentManager {
         }
         await this.#noteUnconfirmedExit(managed);
         managed.processStopPending = false;
+        this.#retentionRevision++;
         resolve();
       } catch (error) {
         this.#markLost(managed, error instanceof Error ? error.message : String(error));
         managed.processStopPending = false;
+        this.#retentionRevision++;
         delete managed.processStop; // retry exact transient custody, never immutable transport debt
         reject(error);
       }
@@ -2801,6 +2999,7 @@ export class AgentManager {
     const alive = lost === undefined && await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true);
     if (lost === undefined && !alive) {
       managed.executionExited = true;
+      this.#retentionRevision++;
       // Only this exact transport's positive exit probe discharges a transient
       // manager mark. Unknown/lost transport identity never reaches this branch.
       delete managed.lostContact;
@@ -2844,6 +3043,7 @@ export class AgentManager {
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
       managed.executionExited = true;
+      this.#retentionRevision++;
       delete managed.lostContact;
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
       managed.executionRelease?.();
@@ -3303,6 +3503,7 @@ export class AgentManager {
 
   async #finishSettlement(managed: ManagedAgent, result: AgentRunResult): Promise<void> {
     if (managed.settled) return;
+    this.#retentionRevision++;
     // Logical completion is not native close. Publish the result without
     // blocking on root exit; retain admission and scratch custody in the owned
     // close join below. Cleanup/close must join it before collecting anything.
@@ -3340,7 +3541,7 @@ export class AgentManager {
           }
         }).catch(error => {
           this.#markLost(managed, error instanceof Error ? error.message : String(error));
-        }).finally(() => { delete managed.nativeReleasePending; });
+        }).finally(() => { delete managed.nativeReleasePending; this.#retentionRevision++; });
       };
     }
     if (!beginAgentSettlement(managed)) return;
@@ -3404,7 +3605,29 @@ export class AgentManager {
   }
 
   /** Retry retained full outcomes after the original manager exited. No worker is relaunched. */
-  recoverPendingArchives(runDirectory?: string): number {
+  recoverPendingArchives(runDirectory?: string, expired: () => boolean = () => false): number {
+    if (!retentionV2Enabled()) return this.#mainRecoverPendingArchives(runDirectory);
+    if (this.#closing) return 0;
+    const root = runDirectory ?? this.#runRoot;
+    let walk = this.#archiveRecovery.get(root);
+    if (!walk) {
+      walk = this.#walkPendingArchives(root, !runDirectory);
+      this.#archiveRecovery.set(root, walk);
+    }
+    let recovered = 0;
+    // A yield is one directory entry, 64-KiB input chunk, or sink. Preserve
+    // the DFS stack and input offset across both count and time interruptions.
+    for (let entries = 0; entries < 128 && !expired(); entries++) {
+      const step = walk.next();
+      recovered += step.value ?? 0;
+      if (step.done) { this.#archiveRecovery.delete(root); break; }
+    }
+    if (recovered) this.#invalidateUiList();
+    return recovered;
+  }
+
+  // Windows scope cut: verbatim main 9387af87 implementation.
+  #mainRecoverPendingArchives(runDirectory?: string): number {
     let recovered = 0;
     const visit = (directory: string, depth: number): void => {
       if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
@@ -3439,6 +3662,85 @@ export class AgentManager {
     return recovered;
   }
 
+
+  *#walkPendingArchives(root: string, children: boolean): Generator<number> {
+    const manager = this;
+    function* visitChildren(directory: string, depth: number): Generator<number> {
+      if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      let cursor: fs.Dir | undefined;
+      try {
+        cursor = fs.opendirSync(directory);
+        let entry: fs.Dirent | null;
+        while ((entry = cursor.readSync())) {
+          yield 0;
+          if (entry.isDirectory()) yield* visit(path.join(directory, entry.name), depth);
+        }
+      } catch { /* Unknown sources retain their custody marker. */ }
+      finally { try { cursor?.closeSync(); } catch { /* retry next sweep */ } }
+    }
+    function* recover(directory: string): Generator<number> {
+      const file = path.join(directory, ARCHIVE_PENDING_FILE);
+      const ageReference = ownedStat(directory), pending = ownedStat(file);
+      if (pending?.isFile()) {
+        let fd: number | undefined;
+        try {
+          fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+          const identity = fs.fstatSync(fd);
+          if (identity.dev !== pending.dev || identity.ino !== pending.ino) return;
+          const chunks: Buffer[] = [];
+          // Read at most the snapshotted length. A growing writer cannot
+          // turn this slow-path record into an endless input stream.
+          for (let offset = 0; offset < pending.size;) {
+            const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, pending.size - offset));
+            const bytes = fs.readSync(fd, chunk, 0, chunk.length, offset);
+            if (!bytes) return;
+            chunks.push(chunk.subarray(0, bytes)); offset += bytes;
+            yield 0;
+          }
+          fs.closeSync(fd); fd = undefined;
+          const current = ownedStat(file);
+          if (!current || current.dev !== pending.dev || current.ino !== pending.ino ||
+              current.size !== pending.size || current.mtimeMs !== pending.mtimeMs || current.ctimeMs !== pending.ctimeMs) return;
+          // Protocol records have no byte limit. Reading is chunked; parsing and
+          // atomic sink discharge are one slow-path unit, never a permanent skip.
+          const archives = parsePendingRunArchives(Buffer.concat(chunks).toString("utf8"));
+          let expected: fs.Stats | undefined = current;
+          const unchanged = () => {
+            const stat = ownedStat(file);
+            return stat && expected && stat.dev === expected.dev && stat.ino === expected.ino && stat.size === expected.size &&
+              stat.mtimeMs === expected.mtimeMs && stat.ctimeMs === expected.ctimeMs;
+          };
+          for (const archive of archives) {
+            yield 0;
+            if (!unchanged()) break;
+            try {
+              if (archive.routePending || archive.result?.id !== path.basename(directory)) continue;
+              if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
+                new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
+              } else if (archive.kind === "shutdown" && manager.#onStoppedAtClose) manager.#onStoppedAtClose([archive.result]);
+              else if (archive.kind === "settlement" && manager.#onSettled) manager.#onSettled(archive.result, archive.recipient);
+              else continue;
+              if (!unchanged()) break;
+              commitRunArchive(directory, archive.kind);
+              expected = ownedStat(file);
+              const current = ownedStat(directory);
+              if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
+              yield 1;
+            } catch { /* One failed sink cannot discharge or starve the other. */ }
+          }
+        } catch { /* The persisted veto remains for the next recovery attempt. */ }
+        finally { if (fd !== undefined) fs.closeSync(fd); }
+      }
+    }
+    function* visit(directory: string, depth: number): Generator<number> {
+      if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      yield* recover(directory);
+      // A changed/malformed ancestor record does not starve its descendants.
+      yield* visitChildren(path.join(directory, "nested"), depth + 1);
+    }
+    if (children) yield* visitChildren(root, 0); else yield* visit(root, 0);
+  }
+
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
@@ -3447,6 +3749,7 @@ export class AgentManager {
       this.#onSettled?.(full);
       if (managed.routeOutcome || this.#onSettled) this.#commitArchive(managed.runDirectory, full);
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
+      if (managed.settlementSaveFailure) this.#retentionRevision++;
       delete managed.settlementSaveFailure;
       return true;
     } catch (error) {

@@ -246,50 +246,74 @@ describe("bounded retention reference preparation", () => {
     } finally { fs.readFileSync = original; budgetClock.mockRestore(); await manager.close(); }
   });
 
-  it("20,000 disk runs never restart the prefix, unchanged polls read zero statuses and the loop remains below 50 ms p99", async () => {
+  it("20,000 disk runs cap ownership work per turn, never restart the prefix and read zero statuses on unchanged polls", async () => {
     const root = temporary();
     for (let i = 0; i < 20_000; i++) run(root, `run-${String(i).padStart(5, "0")}`);
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: path.join(root, "runs") });
-    let reads = 0;
-    const original = fs.readFileSync;
+    const runRoot = path.join(root, "runs");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot });
+    let reads = 0, entries = 0;
+    const original = fs.readFileSync, originalRead = fs.Dir.prototype.readSync;
     // Count without retaining 20,000 Vitest spy call/result objects: their GC
     // would contaminate the event-loop histogram during the later archive phase.
     fs.readFileSync = ((...args: Parameters<typeof original>) => {
-      if (String(args[0]).startsWith(path.join(root, "runs") + path.sep) && path.basename(String(args[0])) === "status.json") reads++;
+      if (String(args[0]).startsWith(runRoot + path.sep) && path.basename(String(args[0])) === "status.json") reads++;
       return original(...args);
     }) as typeof original;
+    fs.Dir.prototype.readSync = function(this: fs.Dir) {
+      const entry = originalRead.call(this);
+      if (this.path === runRoot && entry) entries++;
+      return entry;
+    };
     const histogram = monitorEventLoopDelay({ resolution: 10 }); histogram.enable();
     let beat = Date.now(), maxGap = 0;
     const heartbeat = setInterval(() => { const current = Date.now(); maxGap = Math.max(maxGap, current - beat); beat = current; }, 25);
+    // Count actual disk entries, not just generator resumes. One missing yield
+    // must fail even on a fast machine, rather than depend on a shared CI clock.
+    const prepareTurn = () => {
+      const previousReads = reads, previousEntries = entries;
+      const refs = manager.retentionReferences({ now });
+      expect(reads - previousReads).toBeLessThanOrEqual(64);
+      expect(entries - previousEntries).toBeLessThanOrEqual(64);
+      return refs;
+    };
     try {
-      for (let ticks = 0; reads < 20_000 && ticks < 5000; ticks++) { manager.retentionReferences({ now }); await yieldTurn(); }
-      expect(reads).toBe(20_000);
-      manager.retentionReferences({ now });
-      const completeReads = reads;
-      for (let i = 0; i < 400; i++) { manager.retentionReferences({ now }); await yieldTurn(); }
-      expect(reads).toBe(completeReads);
+      // Prove the default count cap independently of the 2-ms time budget.
+      const budgetClock = vi.spyOn(performance, "now").mockReturnValue(0);
+      try { expect(prepareTurn().has("*")).toBe(true); expect(reads).toBe(64); expect(entries).toBe(64); }
+      finally { budgetClock.mockRestore(); }
+      let turns = 1;
+      await yieldTurn();
+      for (; reads < 20_000 && turns < 5000; turns++) { prepareTurn(); await yieldTurn(); }
+      expect(turns).toBeGreaterThanOrEqual(Math.ceil(20_000 / 64));
+      expect(reads).toBe(20_000); expect(entries).toBe(20_000);
+      prepareTurn();
+      const completeReads = reads, completeEntries = entries;
+      for (let i = 0; i < 400; i++) { prepareTurn(); await yieldTurn(); }
+      expect(reads).toBe(completeReads); expect(entries).toBe(completeEntries);
       await new Promise(resolve => setTimeout(resolve, 30));
-      expect(histogram.percentile(99) / 1e6).toBeLessThan(50);
+      // Sanity guard only: scheduler contention/GC is not archive work. The
+      // deterministic entry/read cap above is the non-blocking regression.
+      expect(histogram.percentile(99) / 1e6).toBeLessThan(500);
       expect(maxGap).toBeLessThan(15_000); // actual participant TTL, not a mock deadline
       // Same 20k fixture: 32 bounded rename-only retention slices.
       const archive = archiver(root);
       const savedEvents = Buffer.from([0, 255, 10, 65, 66]);
       for (let i = 0; i < 32; i++) await sweepArchive(archive, now, 8, 1000);
       if (process.platform === "win32") {
-        expect(histogram.percentile(99) / 1e6).toBeLessThan(50);
+        expect(histogram.percentile(99) / 1e6).toBeLessThan(500);
         expect(maxGap).toBeLessThan(15_000);
-        expect(fs.readdirSync(path.join(root, "runs"))).toHaveLength(20_000);
+        expect(fs.readdirSync(runRoot)).toHaveLength(20_000);
         expect(retiredRuns(root)).toEqual([]);
         expect(fs.existsSync(path.join(root, "runs-retired"))).toBe(false);
-        expect(fs.readFileSync(path.join(root, "runs", "run-00000", "events.jsonl"))).toEqual(savedEvents);
+        expect(fs.readFileSync(path.join(runRoot, "run-00000", "events.jsonl"))).toEqual(savedEvents);
         await archive.close();
         return;
       }
       expect(archive.health.error).toBe("");
       expect(archive.health.archived).toBe(256);
-      expect(histogram.percentile(99) / 1e6).toBeLessThan(50);
+      expect(histogram.percentile(99) / 1e6).toBeLessThan(500);
       expect(maxGap).toBeLessThan(15_000);
-      expect(fs.readdirSync(path.join(root, "runs"))).toHaveLength(19_744);
+      expect(fs.readdirSync(runRoot)).toHaveLength(19_744);
       await archive.close();
       const retired = retiredRuns(root);
       expect(retired).toHaveLength(256);
@@ -299,7 +323,7 @@ describe("bounded retention reference preparation", () => {
       for (const directory of retired) fs.renameSync(directory, path.join(restored, path.basename(directory)));
       expect(fs.readdirSync(restored)).toHaveLength(256);
       expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
-    } finally { fs.readFileSync = original; clearInterval(heartbeat); histogram.disable(); await manager.close(); }
+    } finally { fs.readFileSync = original; fs.Dir.prototype.readSync = originalRead; clearInterval(heartbeat); histogram.disable(); await manager.close(); }
   }, 90_000);
 });
 

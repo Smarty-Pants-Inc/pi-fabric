@@ -82,6 +82,7 @@ const mainLeaseFixture = async (files: boolean) => {
   if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, identity, value: { version: 1, participants: "files" } });
   const directory = new ParticipantDirectory(mesh, {
     enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+    routingLease: { waitMs: 5, pollMs: 1 },
   });
   directories.push(directory);
   await directory.refresh();
@@ -95,7 +96,7 @@ const mainLeaseFixture = async (files: boolean) => {
   };
   await mesh.put({ key: key("topology/hosts/"), identity: target, value: {
     format: 1, id: target.id, rootId: target.id, identity: target, startedAt: 1,
-    updatedAt: Date.now(), expiresAt: Date.now() - 600_000,
+    updatedAt: Date.now(), expiresAt: Date.now() - 2_000,
   } });
   const participantKey = key("topology/participants/");
   if (files) writeParticipantFile(meshRoot, { key: participantKey, value: presence, version: 1, updatedAt: Date.now(), updatedBy: target });
@@ -133,20 +134,26 @@ describe("directory availability for live Mains (#2386)", () => {
     fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
     try {
       const failure = await send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp").catch(error => error);
-      expect(failure).toMatchObject({ name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
-      expect(failure.message).toMatch(/^Fabric directory unavailable \(retry\):/);
-      expect(failure.message).toContain("Timed out waiting for the Fabric mesh lock");
+      expect(failure).toMatchObject(freshLease
+        ? { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true }
+        : { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+      expect(failure.message).toContain(freshLease ? "Timed out waiting for the Fabric mesh lock" : "lease late by");
       expect(failure.message).not.toContain("Unknown Fabric actor");
-      expect(probe).toHaveBeenCalledOnce();
+      expect(probe).toHaveBeenCalledTimes(freshLease ? 1 : 0);
       expect(request).not.toHaveBeenCalled();
       expect(send.actors.status).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
     }
-    // No heartbeat success is needed for the canonical routing read to recover.
+    // A late target renews before retry; routing still needs its ordinary canonical read.
+    if (!freshLease) {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+    }
+    // No sender heartbeat success is needed for the canonical routing read to recover.
     await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
       .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
-    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledTimes(freshLease ? 2 : 1);
     expect(request).toHaveBeenCalledOnce();
     expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
     expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
@@ -373,10 +380,10 @@ describe("Main target lineage delivery (#3686)", () => {
     [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
     [false, "steer", true], [false, "followUp", true], [true, "steer", true], [true, "followUp", true],
     [false, "steer", "name"], [false, "followUp", "name"], [true, "steer", "name"], [true, "followUp", "name"],
-  ] as const)("queues %s file presence / %s / selector=%s despite a ten-minute lease lapse", async (files, kind, selector) => {
+  ] as const)("queues %s file presence / %s / selector=%s during the bounded recent-lease grace", async (files, kind, selector) => {
     const f = await mainLeaseFixture(files);
     expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
-    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(600_000);
+    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(2_000);
     expect(f.directory.lineageAlive(f.target.id)).toBe(true);
     const sender = f.plane(identity);
     sender.start(() => ({ accepted: false }));

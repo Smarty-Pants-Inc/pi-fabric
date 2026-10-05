@@ -40,7 +40,7 @@ const host = (meshRoot: string, name: string, timing: { heartbeatMs: number; lea
 };
 
 describe("a reply to a sender whose lease lapsed (smarty-dev#447)", () => {
-  it("reaches a live sender during a lease stall, through its owner host", async () => {
+  it("waits for a live sender's lease renewal, then replies once through its exact owner", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-reply-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
@@ -56,8 +56,20 @@ describe("a reply to a sender whose lease lapsed (smarty-dev#447)", () => {
     await vi.waitFor(() => expect(replier.directory.get(sender.identity.id)).toBeDefined(), { timeout: 5_000, interval: 20 });
 
     // The sender stays live (its control plane runs), but its heartbeat stalls: the lease lapses.
-    vi.spyOn(sender.directory, "refresh").mockResolvedValue(undefined);
+    const stalledRefresh = vi.spyOn(sender.directory, "refresh").mockResolvedValue(undefined);
     await vi.waitFor(() => expect(replier.directory.get(sender.identity.id)).toBeUndefined(), { timeout: 5_000, interval: 20 });
+
+    // A lapsed live sender is not dead, but the reply must recover its lease
+    // before publication. Renew deterministically at the first file-only wait.
+    let leaseWaits = 0;
+    replier.directory.options.routingLease = {
+      lockWaiting: () => true,
+      sleep: async () => {
+        leaseWaits++;
+        stalledRefresh.mockRestore();
+        await sender.directory.refresh();
+      },
+    };
 
     const unknown = () => { throw new Error("Unknown Fabric agent"); };
     const router = new AgentMessageRouter(
@@ -74,6 +86,7 @@ describe("a reply to a sender whose lease lapsed (smarty-dev#447)", () => {
     );
     await expect(router.routeMessage(sender.identity.id, "reply to your message", undefined, "followUp"))
       .resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
+    expect(leaseWaits).toBeGreaterThan(0);
     expect(received).toEqual(["reply to your message"]);
   }, 20_000);
 });

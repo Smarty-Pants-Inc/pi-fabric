@@ -1895,6 +1895,7 @@ export class MeshStore {
     }
     let before: string;
     let beforeIdentity: string | undefined;
+    let replayFailed = false;
     try {
       const observed = fs.statSync(this.#statePath);
       if (observed.size > this.#maxStateBytes) throw new Error(`Failed to read Fabric mesh state: state exceeds ${this.#maxStateBytes} bytes`);
@@ -1924,7 +1925,8 @@ export class MeshStore {
       // A newly constructed store can replay from this process's prior snapshot too;
       // it need not parse the whole file merely because another store observed it first.
       const base = cached ?? shared;
-      if (base && identity !== undefined && typeof generation === "string") {
+      if (base && identity !== undefined && typeof generation === "string" &&
+        this.#canonicalHeader?.journalHash !== undefined) {
         const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
           this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor);
         if (replay && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity && this.#canonicalGeneration() === generation &&
@@ -1933,18 +1935,20 @@ export class MeshStore {
           rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
           return replay.state;
         }
+        replayFailed = true;
       }
     } catch (error) {
       this.#stateCache = undefined;
       if (errorCode(error) === "ENOENT") return emptyState();
       throw error;
     }
-    // Replay failure must not reuse its descriptor, header or pre-verification path
-    // identity. Windows may have replaced the canonical name while the verifier
-    // consumed the old bytes. readState always opens by path on every retry.
-    this.#canonicalHeader = undefined;
-    before = statStamp(this.#statePath) ?? before;
-    beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+    if (replayFailed) {
+      // Failed verification may have consumed a replaced Windows file. Discard its
+      // header/endpoints only on recovery, not on an ordinary canonical parse.
+      this.#canonicalHeader = undefined;
+      before = statStamp(this.#statePath) ?? before;
+      beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+    }
     // A payload is cached only under the stamp seen both before and after its read: a commit
     // landing during the parse must not label the older payload with the newer file's stamp.
     // The label is the parsed payload's own canonical readGeneration, never a separately observed

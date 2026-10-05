@@ -125,6 +125,20 @@ describe("real worker tool-call stream guard", () => {
     assertOneRetry(events, result.id);
   });
 
+  it("retries once on the exact session with Unicode separators in preserved native history", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
+    const task = "whitespace-time-success\u2028left\u2029right";
+    const { result, events } = await run(task);
+    expect(result.status, result.error).toBe("completed");
+    expect(stalls(events)).toHaveLength(1);
+    assertOneRetry(events, result.id);
+    const prompt = events.find(event => event.type === "fabric_fixture_command" && event.command === "prompt");
+    const entries = fs.readFileSync(prompt!.sessionFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(entries.filter(entry => entry.message?.role === "user" && entry.message.content === task)).toHaveLength(1);
+    expect(entries.find(entry => entry.message?.role === "toolResult").message.content[0].text).toBe("completed\u2028tool\u2029output");
+    expect(entries.find(entry => entry.message?.stopReason === "aborted").message.content[0].text).toBe("assistant\u2028text\u2029kept");
+  });
+
   it.each(["mixed", "text-whitespace"])("does not abort healthy/unaffected deltas across multiple intervals (%s)", async task => {
     vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "150");
     const { result, events } = await run(task);

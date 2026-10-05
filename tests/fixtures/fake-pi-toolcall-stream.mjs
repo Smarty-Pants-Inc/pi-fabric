@@ -53,6 +53,7 @@ process.stdin.on("data", chunk => {
       clearTimeout(finishTimer);
       if (activeMessage) {
         const message = { ...activeMessage, stopReason: "aborted", errorMessage: "fixture abort" };
+        if (prior?.task.includes("\u2028")) message.content = [{ type: "text", text: "assistant\u2028text\u2029kept" }];
         persist(message);
         if (prior?.task === "invalid-session") fs.appendFileSync(sessionFile, '{"type":\n');
         if (prior?.task === "header-only-session") fs.writeFileSync(sessionFile, fs.readFileSync(sessionFile, "utf8").split("\n")[0] + "\n");
@@ -68,6 +69,12 @@ process.stdin.on("data", chunk => {
         if (!fs.existsSync(sessionFile)) fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
         fs.writeFileSync(fixtureFile, JSON.stringify({ task, attempt }));
         persist({ role: "user", content: frame.message });
+        if (attempt === 1 && task.includes("\u2028")) {
+          persist({ role: "assistant", provider: model.provider, model: model.id, stopReason: "toolUse",
+            content: [{ type: "toolCall", id: "completed", name: "read", arguments: { path: "fixture.txt" } }] });
+          persist({ role: "toolResult", toolCallId: "completed", toolName: "read",
+            content: [{ type: "text", text: "completed\u2028tool\u2029output" }], isError: false });
+        }
       }
       prior = { task, attempt };
       const message = { role: "assistant", provider: model.provider, model: model.id, content: [] };
@@ -77,7 +84,7 @@ process.stdin.on("data", chunk => {
       const delta = text => update({ type: "toolcall_delta", contentIndex: 0, delta: text });
       emit({ type: "agent_start" });
       emit({ type: "message_start", message });
-      if (task === "whitespace-time-success" && attempt === 2) {
+      if (task.startsWith("whitespace-time-success") && attempt === 2) {
         finish(message);
         continue;
       }

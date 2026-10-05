@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createInterface } from "node:readline";
 import { parsePiSessionHeader } from "../core/pi-session-header.js";
 
 type Entry = { id: string; parentId: string | null; type: string; message?: Record<string, unknown> };
@@ -13,7 +12,23 @@ export const stalledSessionResumeError = async (
   file: string, cwd: string, model: string, sessionId?: string,
 ): Promise<string | undefined> => {
   const input = fs.createReadStream(file, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  // Native Pi writes JSON.stringify(entry) + LF. readline also treats literal
+  // U+2028/U+2029 inside valid JSON strings as delimiters, corrupting history.
+  const lines = (async function* () {
+    let pending = "";
+    for await (const chunk of input) {
+      pending += chunk;
+      let start = 0;
+      let end: number;
+      while ((end = pending.indexOf("\n", start)) !== -1) {
+        const line = pending.slice(start, end);
+        yield line.endsWith("\r") ? line.slice(0, -1) : line;
+        start = end + 1;
+      }
+      pending = pending.slice(start);
+    }
+    if (pending) yield pending.endsWith("\r") ? pending.slice(0, -1) : pending;
+  })();
   try {
     let headerSeen = false;
     const entries = new Map<string, Entry>();
@@ -54,7 +69,6 @@ export const stalledSessionResumeError = async (
   } catch (error) {
     return `native session unavailable or invalid: ${(error as Error).message}`;
   } finally {
-    lines.close();
     input.destroy();
   }
 };

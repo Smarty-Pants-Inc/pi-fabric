@@ -19,6 +19,18 @@ describe("post-drain stalled native session admission", () => {
   it("accepts preserved context with the finalized admitted abort", async () => {
     expect(await check([header, user, assistant])).toBeUndefined();
   });
+  it("round-trips Unicode separators in user, completed tool and aborted assistant history", async () => {
+    const text = "left\u2028middle\u2029right";
+    const tool = { type: "message", id: "tool", parentId: "user", message: { role: "toolResult", content: [{ type: "text", text }] } };
+    expect(await check([header, { ...user, message: { ...user.message, content: text.repeat(10_000) } }, tool,
+      { ...assistant, parentId: "tool", message: { ...assistant.message, content: [{ type: "text", text }] } }])).toBeUndefined();
+  });
+  it("accepts LF-only framing with CRLF and a final record without a newline", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stall-session-")); roots.push(root);
+    const file = path.join(root, "session.jsonl");
+    fs.writeFileSync(file, [header, user, assistant].map(entry => JSON.stringify(entry)).join("\r\n"));
+    expect(await stalledSessionResumeError(file, process.cwd(), "fixture/offline", "native")).toBeUndefined();
+  });
   it.each([
     ["header only", [header]],
     ["no user", [header, { ...assistant, parentId: null }]],

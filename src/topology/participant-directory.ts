@@ -36,7 +36,11 @@ import {
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
+import { ownProcessIncarnation } from "../core/atomic-write.js";
 import {
+  ParticipantFileLockBusyError,
+  prepareParticipantFileLocks,
+  type ParticipantFileLockOptions,
   participantFilePresent,
   participantFilesOnly,
   readParticipantFile,
@@ -416,6 +420,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
+  readonly #ownIncarnation: Promise<string | undefined>;
+  #ownIncarnationValue: string | undefined;
+  #prepareFileLocks = false;
   readonly #roleGrant = new ParticipantRoleGrant();
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
@@ -458,6 +465,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
+    // Prepare the participant-file lock receipt before any publication fence. A cold
+    // Darwin/Windows native identity read must never be awaited while registries are held.
+    this.#ownIncarnation = options.withPublicationFence
+      ? ownProcessIncarnation().then((value) => {
+          this.#ownIncarnationValue = value;
+          return value;
+        }, () => undefined)
+      : Promise.resolve(undefined);
     this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
   }
@@ -576,8 +591,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const startedAt = Date.now();
     this.#refreshStartedAt = startedAt;
     if (!full) this.#changeRefreshAt = startedAt;
-    const operation = this.options.withPublicationFence
-      ? this.options.withPublicationFence(() => this.#refresh(full)) : this.#refresh(full);
+    // Include preparation in #refreshing so a cold heartbeat coalesces and close
+    // drains it, but do not acquire any registry fence until identity is ready.
+    const operation = this.#ownIncarnation.then(async () => {
+      if (this.#closed) return false;
+      if (this.#prepareFileLocks) {
+        await prepareParticipantFileLocks(this.mesh);
+        this.#prepareFileLocks = false;
+        if (this.#closed) return false;
+      }
+      return this.options.withPublicationFence
+        ? this.options.withPublicationFence(() => this.#refresh(full)) : this.#refresh(full);
+    });
     const settled = operation.then(() => undefined);
     settled.catch(() => undefined);                            // awaiters still see a failure
     this.#refreshing = settled;
@@ -614,6 +639,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       this.#refreshError = error;
       this.#routingReadAt = 0;
+      if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
       lockTimedOut = isMeshLockTimeout(error);
       if (lockTimedOut) {
         // A change timer may predate this heartbeat and still be waiting to run.
@@ -1362,7 +1388,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         !(this.#reloadPublished && participant.kind === "root" && participant.id === this.options.rootId);
     };
     await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
-      .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own)));
+      .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own, this.#fileLockOptions())));
     const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(own);
     await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
     const legacySessionKey = this.#legacySessionKey();
@@ -1595,7 +1621,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     for (const entry of fileEntries) {
       const participant = ownParticipant(entry);
       if (participant && !desired.has(participant.id)) {
-        await this.#retryFile(() => removeParticipantFileIf(this.mesh, entry.key, (current) => ownParticipant(current) !== undefined));
+        await this.#retryFile(() => removeParticipantFileIf(this.mesh, entry.key, (current) => ownParticipant(current) !== undefined,
+          this.#fileLockOptions()));
       }
     }
     for (const { entry, participant } of existing) {
@@ -1755,7 +1782,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const participant = committed && participantFromEntry(committed);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
-    }));
+    }, this.#fileLockOptions()));
   }
 
   #renewFileLease(): number {
@@ -1817,6 +1844,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       lease.rootId === participant.rootId && effectiveLiveness(undefined, lease).expiresAt >= now;
   }
 
+  #fileLockOptions(): ParticipantFileLockOptions {
+    return this.options.withPublicationFence
+      ? { ownIncarnation: this.#ownIncarnationValue, registryFenced: true } : {};
+  }
+
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
   #writeFile(
     record: FabricParticipantRecord,
@@ -1830,7 +1862,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       version: (current?.version ?? 0) + 1,
       updatedAt: Date.now(),
       updatedBy: this.options.identity,
-    } : undefined, { durable });
+    } : undefined, { durable, ...this.#fileLockOptions() });
   }
 
   /**

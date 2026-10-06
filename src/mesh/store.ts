@@ -2286,6 +2286,10 @@ export class MeshStore {
       if (!validOwner) return false;
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
+        // Registry-fenced publication cannot start even a bounded native read.
+        // Fail closed; the ordinary outside-custody admission lane obtains fresh
+        // holder evidence/recovery, then publication selects under fresh fences.
+        if (this.#tryLockScope.getStore()?.active) return false;
         const remaining = deadline - Date.now();
         if (remaining <= 0) return false;
         let timer: ReturnType<typeof setTimeout> | undefined;

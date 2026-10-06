@@ -65,8 +65,7 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       const registryBlockedMs = performance.now() - begin;
       expect(await attempt).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       expect(registryBlockedMs).toBeLessThan(150);
-      if (budget === 0) expect(read).not.toHaveBeenCalled();
-      else { expect(read).toHaveBeenCalledOnce(); expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(50); }
+      expect(read).not.toHaveBeenCalled(); // no command-backed evidence under either custody try
       intact(mesh, held);
       await Promise.all(nativeReads); // late evidence cannot recover the holder
       intact(mesh, held);
@@ -82,7 +81,8 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const different = process.platform === "linux" ? String(BigInt(incarnation) + 1n)
       : process.platform === "win32" ? "win32:1" : "darwin:Wed Sep 30 12:00:00 2026";
     vi.spyOn(atomic, "processIncarnation").mockImplementation(() => slowRead(different));
-    await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    // Ordinary outside-custody evidence still obeys the acquisition deadline.
+    await expect(mesh.exclusive(() => undefined, 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     await Promise.all(nativeReads);
     intact(mesh, held);
   });
@@ -178,11 +178,13 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const held = holder(host.mesh, incarnation);
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
-    vi.spyOn(atomic, "processIncarnation").mockImplementation(() => {
+    const read = vi.spyOn(atomic, "processIncarnation").mockImplementation(() => slowRead(incarnation));
+    const writeBatch = host.mesh.writeBatch.bind(host.mesh);
+    vi.spyOn(host.mesh, "writeBatch").mockImplementation(input => {
       for (const actorRoot of [config.actorRoot, config.sessionActorRoot!]) {
         expect(fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner"))).toBe(true);
       }
-      entered(); return slowRead(incarnation);
+      entered(); return writeBatch(input);
     });
     const refresh = host.participants.refresh().catch(error => error);
     try {
@@ -191,6 +193,7 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       await Promise.all(rows.map(row => host.actors.setInstructions(row.id, "durably changed during native lookup")));
       const setterMs = performance.now() - begin;
       expect(await refresh).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(read).not.toHaveBeenCalled();
       for (const actorRoot of [config.actorRoot, config.sessionActorRoot!]) {
         expect(new ActorRegistryStore(actorRoot).records()[0]!.instructions).toBe("durably changed during native lookup");
       }

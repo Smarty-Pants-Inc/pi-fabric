@@ -139,9 +139,9 @@ export class ResidentActorClient {
       ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
 
-  /** Same-user operator control; the resident executor enforces dead-Main safety. */
+  /** Same-user operator control; the resident executor requires root confirmation and vetoes live leases. */
   async operatorActor(action: "stop" | "remove", id: string,
-    options: { dryRun?: boolean; forceLive?: boolean } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    options: { dryRun?: boolean; confirmDeadRoot?: string } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "operatorActor",
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }

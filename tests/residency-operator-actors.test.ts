@@ -1,61 +1,23 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { once } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { main, resolveResidentDirectory } from "../src/actors-cli.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { mainGenerationPath } from "../src/residency/handover.js";
-import { MainProcessMarker, mainMarkerPath } from "../src/residency/main-marker.js";
-import * as mainPublication from "../src/residency/main-publication-fence.js";
-import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
+import { residentProcessAlive } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
-// Census regressions use this test's real process tree, not unrelated fleet
-// Mains (or sibling Vitest workers). Production still scans all same-user PIDs.
-beforeEach(() => {
-  installInProcessResidentFence();
-  if (process.platform !== "linux") return;
-  const readdir = fs.readdirSync.bind(fs);
-  vi.spyOn(fs, "readdirSync").mockImplementation(((directory: fs.PathLike, options?: never) => {
-    const entries = readdir(directory, options);
-    if (directory !== "/proc") return entries;
-    const parents = new Map<string, string>();
-    for (const name of entries as unknown as string[]) {
-      if (!/^\d+$/.test(name)) continue;
-      try {
-        const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
-        parents.set(name, stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[1]!);
-      } catch { /* A vanished process is not part of the test census. */ }
-    }
-    const ours = (name: string): boolean => {
-      const visited = new Set<string>();
-      while (!visited.has(name)) {
-        if (name === String(process.pid)) return true;
-        visited.add(name);
-        const parent = parents.get(name);
-        if (!parent) return false;
-        name = parent;
-      }
-      return false;
-    };
-    return (entries as unknown as string[]).filter(ours);
-  }) as typeof fs.readdirSync);
-});
+beforeEach(() => installInProcessResidentFence());
 const waitFor = (predicate: () => boolean) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 15_000, interval: 30 });
-const stopChild = async (child: ChildProcess) => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const done = once(child, "exit"); child.kill("SIGTERM"); await done;
-};
 const fixture = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-operator-"));
   const meshRoot = path.join(root, "mesh");
@@ -70,12 +32,9 @@ const fixture = async () => {
   };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
-  const child = spawn(process.execPath, ["-e", "console.log('ready');setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "pipe"] });
-  await once(child.stdout!, "data");
-  fs.writeFileSync(mainGenerationPath(config.residencyRoot), JSON.stringify({ rootId: config.rootId,
-    sessionId: config.sessionId, pid: child.pid, processStartTime: processStartTime(child.pid!), nonce: "test", releaseRoot: process.cwd() }));
   const host = new ResidentHost(config, () => {});
-  try { await host.start(); } catch (error) { await stopChild(child); await host.close(); throw error; }
+  try { await host.start(); } catch (error) { await host.close(); throw error; }
+  const confirm = ["--confirm-dead-root", config.rootId];
   const cli = async (action: "stop" | "remove", actor: string, flags: string[] = [], resident = config.residencyRoot) => {
     let out = "", err = "";
     const code = await main([action, "--resident", resident, "--actor", actor, "--mesh-root", meshRoot, ...flags],
@@ -84,113 +43,15 @@ const fixture = async () => {
   };
   const create = (name: string) => host.actors.create({ name, instructions: "Run", model: "fixture/visible",
     residency: "durable", transport: "process", extensions: false });
-  return { root, host, config, child, cli, create, close: async () => {
-    await stopChild(child);
+  return { root, host, config, cli, create, confirm, close: async () => {
     for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true);
     await host.close(); fs.rmSync(root, { recursive: true, force: true });
   } };
 };
 
-describe("non-Linux resident actor operator", () => {
-  it.each(["win32", "darwin"] as const)("%s refuses without /proc evidence; native-platform mutation permits explicit force-live", async platform => {
-    const f = await fixture();
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("platform-control");
-      await stopChild(f.child);
-      spy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
-      for (const action of ["stop", "remove"] as const) {
-        const result = await f.cli(action, actor.id);
-        expect(result.code).toBe(1);
-        expect(result.err).toContain("operator dead-root control needs Linux /proc evidence; pass --force-live after confirming");
-        expect(f.host.actors.status(actor.id).status).toBe("idle");
-      }
-      // The refusal branch is platform-neutral. Actual mutation must use native
-      // I/O: mocking darwin on Windows selects POSIX directory fsync/read-only
-      // file descriptors, which Windows cannot flush. Test real force-live on
-      // every host instead of a synthetic macOS filesystem on windows-latest.
-      spy.mockRestore();
-      expect(await f.cli("stop", actor.id, ["--force-live"])).toMatchObject({ code: 0, err: "" });
-      expect(await f.cli("remove", actor.id, ["--force-live"])).toMatchObject({ code: 0, err: "" });
-    } finally { spy?.mockRestore(); await f.close(); }
-  }, 30_000);
-});
-
-describe.skipIf(process.platform !== "linux")("same-user resident actor operator", () => {
-  it.each(["target", "other", "reused PID", "unfenced", "transitioning", "unreadable", "mismatched"] as const)("unbound Pi Main with a %s marker", async binding => {
-    const f = await fixture();
-    let replacement: ChildProcess | undefined;
-    try {
-      const actor = await f.create("marked-main"); await stopChild(f.child);
-      const cli = path.join(f.root, "pi-runtime", "cli.js");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      fs.writeFileSync(cli, "process.title='pi';console.log('ready');setInterval(()=>{},1000)");
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      for (const key of ["PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID", "PI_SESSION_ID", "PI_FABRIC_ROLE_SESSION",
-        "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete env[key];
-      replacement = spawn(process.execPath, [cli], { env, stdio: ["ignore", "pipe", "pipe"] });
-      await once(replacement.stdout!, "data");
-      const pid = replacement.pid!, birth = processStartTime(pid)!;
-      const startTime = binding === "reused PID" ? String(BigInt(birth) - 1n) : birth;
-      const file = mainMarkerPath(f.config.meshRoot, pid, startTime);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ pid, startTime,
-        rootId: binding === "target" ? f.config.rootId : "session:elsewhere",
-        sessionId: binding === "target" ? f.config.sessionId : "elsewhere", createdAt: Date.now(),
-        ...(binding === "unfenced" ? {} : { fenced: true }),
-        ...(binding === "transitioning" ? { transition: true } : {}),
-        ...(binding === "mismatched" ? { pid: pid + 1 } : {}) }));
-      if (binding === "unreadable") fs.writeFileSync(file, "{invalid marker");
-      for (const action of ["stop", "remove"] as const) {
-        const result = await f.cli(action, actor.id, ["--dry-run"]);
-        if (binding === "other") expect(result).toMatchObject({ code: 0, err: "" });
-        else {
-          expect(result.code).toBe(1);
-          expect(result.err).toContain(binding === "target" ? `Fabric marker for PID ${pid}`
-            : binding === "reused PID" ? `PID ${pid}: Main without a Fabric marker`
-            : ["unfenced", "transitioning"].includes(binding) ? "transitioning or unfenced" : "unreadable or mismatched");
-        }
-      }
-      if (binding !== "other") await stopChild(replacement);
-      // Left-behind markers (including a mismatched birth) do not veto a dead process.
-      expect((await f.cli("stop", actor.id)).code).toBe(0);
-    } finally { if (replacement) await stopChild(replacement); await f.close(); }
-  }, 30_000);
-
-
-  it.each(["stop", "remove"] as const)("%s refuses throughout rebind and at the fenced commit recheck", async action => {
-    const f = await fixture(), marker = new MainProcessMarker();
-    const fence = mainPublication.withMainPublicationFence;
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("marker-rebind-race"); await stopChild(f.child);
-      await marker.publish(f.config.meshRoot, "session:elsewhere", "elsewhere");
-      // A stable, fenced other-root Main does not veto the initial check.
-      expect(await f.cli(action, actor.id, ["--dry-run"])).toMatchObject({ code: 0, err: "" });
-      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (mesh, root, operation, wait) => {
-        // Initial operator census has passed. Rebind fences the OLD marker
-        // before the operator enters the target root's publication fence.
-        await marker.beginTransition();
-        return fence(mesh, root, operation, wait);
-      });
-      expect(await f.cli(action, actor.id)).toMatchObject({ code: 1, err: expect.stringContaining("transitioning or unfenced") });
-      spy.mockRestore();
-      // Old binding transitioning, next binding known, and fully established:
-      // no interleaving after rebind admission authorizes mutation.
-      for (const step of [async () => {},
-        () => marker.beginTransition(f.config.meshRoot, f.config.rootId, f.config.sessionId),
-        () => marker.publish(f.config.meshRoot, f.config.rootId, f.config.sessionId)]) {
-        await step();
-        for (const flags of [[], ["--dry-run"]]) {
-          expect((await f.cli(action, actor.id, flags)).code).toBe(1);
-          expect(f.host.actors.status(actor.id).status).toBe("idle");
-          expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
-        }
-      }
-    } finally { spy?.mockRestore(); marker.close(); await f.close(); }
-  }, 30_000);
-
-  it("after Main exits, CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
+// These are native-platform tests: no /proc census, platform mocks or skips.
+describe("same-user resident actor operator", () => {
+  it("confirmed CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
     const f = await fixture();
     try {
       const victim = await f.create("victim"), survivor = await f.create("survivor");
@@ -202,17 +63,17 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       const runPid = Number(f.host.agents.status(runId).sessionId);
       await f.host.participants.refresh();
       expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeDefined();
-      await stopChild(f.child);
+
       const dry = await f.cli("stop", victim.name, ["--dry-run"], path.basename(f.config.residencyRoot).slice(0, 12));
       expect(dry).toMatchObject({ code: 0, err: "" });
       expect(f.host.actors.status(victim.id).status).toBe("running");
-      const stopped = await f.cli("stop", victim.name);
+      const stopped = await f.cli("stop", victim.name, f.confirm);
       expect(stopped).toMatchObject({ code: 0, err: "" });
       expect(JSON.parse(stopped.out).actor.status).toBe("stopped");
       expect(f.host.actors.status(victim.id).inFlightRun).toBeUndefined();
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
-      const removed = await f.cli("remove", victim.id);
+      const removed = await f.cli("remove", victim.id, f.confirm);
       expect(removed).toMatchObject({ code: 0, err: "" });
       await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
       await f.host.participants.refresh();
@@ -232,8 +93,8 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       const runId = f.host.actors.status(victim.id).inFlightRun!.id;
       await waitFor(() => ("turns" in f.host.agents.status(runId) && Number((f.host.agents.status(runId) as { turns?: number }).turns) > 0));
       const runPid = Number(f.host.agents.status(runId).sessionId);
-      await stopChild(f.child);
-      expect(await f.cli("remove", victim.name)).toMatchObject({ code: 0, err: "" });
+
+      expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
       await f.host.actors.removalSettled(victim.id);
       await f.host.participants.refresh();
       expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id)).toBe(false);
@@ -243,246 +104,13 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
     } finally { await f.close(); }
   }, 40_000);
 
-  it("refuses a live Main even without a lease; force-live is explicit and dry-run is non-mutating", async () => {
+  it("a live file-only root lease vetoes confirmed control", async () => {
     const f = await fixture();
     try {
-      const actor = await f.create("live-root");
-      for (const action of ["stop", "remove"] as const) {
-        const refused = await f.cli(action, actor.id);
-        expect(refused.code).toBe(1); expect(refused.err).toContain("Main process is still alive");
-      }
-      expect((await f.cli("remove", actor.id, ["--force-live", "--dry-run"])).code).toBe(0);
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-      expect((await f.cli("stop", actor.id, ["--force-live"])).code).toBe(0);
-      expect(f.host.actors.status(actor.id).status).toBe("stopped");
-      expect((await f.cli("remove", actor.id, ["--force-live"])).code).toBe(0);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("malformed recorded start times refuse stop/remove for a live PID, whether generation or inbox is the only identity", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("malformed-start");
-      const generationFile = mainGenerationPath(f.config.residencyRoot);
-      const generation = JSON.parse(fs.readFileSync(generationFile, "utf8"));
-      const inbox = path.join(f.config.meshRoot, "main-followups", `${f.config.sessionId}.owner.json`);
-      fs.mkdirSync(path.dirname(inbox), { recursive: true });
-      for (const source of ["generation", "inbox"]) {
-        for (const started of ["not-a-start-time", "123oops", " 123", "1e6", "", 123]) {
-          fs.rmSync(generationFile, { force: true }); fs.rmSync(inbox, { force: true });
-          if (source === "generation") fs.writeFileSync(generationFile, JSON.stringify({ ...generation, processStartTime: started }));
-          else fs.writeFileSync(inbox, JSON.stringify({ rootId: f.config.rootId, sessionId: f.config.sessionId,
-            pid: f.child.pid, processStartedAt: started }));
-          for (const action of ["stop", "remove"] as const) {
-            const refused = await f.cli(action, actor.id);
-            expect(refused.code).toBe(1); expect(refused.err).toContain("liveness unknown");
-            expect(refused.err).toContain("--force-live");
-            expect(f.host.actors.status(actor.id).status).toBe("idle");
-          }
-        }
-      }
-      expect((await f.cli("stop", actor.id, ["--force-live"])).code).toBe(0);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("an old dead generation cannot authorize control while a root-bound new Main has not published yet", async () => {
-    const f = await fixture();
-    let replacement: ChildProcess | undefined;
-    try {
-      const actor = await f.create("starting-main"); await stopChild(f.child);
-      const environment = { ...process.env, PI_FABRIC_SESSION_ID: f.config.sessionId, PI_FABRIC_MAIN_AGENT_ID: f.config.rootId };
-      for (const key of ["PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete environment[key as keyof typeof environment];
-      replacement = spawn(process.execPath, ["-e", "console.log('ready');setInterval(()=>{},1000)"], {
-        env: environment,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      await once(replacement.stdout!, "data");
-      for (const action of ["stop", "remove"] as const) {
-        const refused = await f.cli(action, actor.id);
-        expect(refused.code).toBe(1); expect(refused.err).toContain("current root/session binding");
-        expect(f.host.actors.status(actor.id).status).toBe("idle");
-      }
-      await stopChild(replacement);
-      expect((await f.cli("stop", actor.id)).code).toBe(0);
-    } finally { if (replacement) await stopChild(replacement); await f.close(); }
-  }, 30_000);
-
-  it.each(["unbound", "different root", "different session"] as const)("native-session Main before first publication: %s", async binding => {
-    const f = await fixture();
-    let replacement: ChildProcess | undefined;
-    try {
-      const actor = await f.create("native-starting-main"); await stopChild(f.child);
-      // A native --session resume need not expose any optional root/session env.
-      // Use the release census's Pi CLI path signature, without publishing new
-      // generation/lease evidence or inspecting the native session's contents.
-      const cli = path.join(f.root, "pi-runtime", "cli.js"), session = path.join(f.root, "native-session.jsonl");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      fs.writeFileSync(cli, "console.log('ready');setInterval(()=>{},1000)");
-      fs.writeFileSync(session, JSON.stringify({ type: "session", version: 3, id: f.config.sessionId }) + "\n");
-      const environment: NodeJS.ProcessEnv = { ...process.env };
-      for (const key of ["PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID", "PI_SESSION_ID", "PI_FABRIC_ROLE_SESSION",
-        "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete environment[key];
-      if (binding === "different root") environment.PI_FABRIC_MAIN_AGENT_ID = "session:other-root";
-      if (binding === "different session") environment.PI_SESSION_ID = "other-session";
-      replacement = spawn(process.execPath, [cli, "--session", session], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
-      await once(replacement.stdout!, "data");
-      for (const action of ["stop", "remove"] as const) {
-        const dry = await f.cli(action, actor.id, ["--dry-run"]);
-        expect(dry.code).toBe(1); expect(dry.err).toContain(`PID ${replacement.pid}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
-        const refused = await f.cli(action, actor.id);
-        expect(refused.code).toBe(1); expect(refused.err).toContain("--force-live");
-        expect(f.host.actors.status(actor.id).status).toBe("idle");
-        expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
-      }
-      expect((await f.cli("remove", actor.id, ["--force-live", "--dry-run"])).code).toBe(0);
-      await stopChild(replacement);
-      expect((await f.cli("stop", actor.id)).code).toBe(0);
-    } finally { if (replacement) await stopChild(replacement); await f.close(); }
-  }, 30_000);
-
-  it.each(["stop", "remove"] as const)("refuses %s when a new Main publishes its generation between initial check and commit", async action => {
-    const f = await fixture();
-    const fence = mainPublication.withMainPublicationFence;
-    let replacement: ChildProcess | undefined;
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("generation-race"); await stopChild(f.child);
-      replacement = spawn(process.execPath, ["-e", "console.log('ready');setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "pipe"] });
-      await once(replacement.stdout!, "data");
-      const file = mainGenerationPath(f.config.residencyRoot), old = JSON.parse(fs.readFileSync(file, "utf8"));
-      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
-        // Real Main publication takes and releases the very same lock before the
-        // operator acquires it. The old evidence already passed its first check.
-        await fence(meshRoot, rootId, () => fs.writeFileSync(file, JSON.stringify({ ...old,
-          nonce: "new-main", pid: replacement!.pid, processStartTime: processStartTime(replacement!.pid!) })));
-        return fence(meshRoot, rootId, operation, wait);
-      });
-      const refused = await f.cli(action, actor.id);
-      expect(refused.code).toBe(1); expect(refused.err).toContain("Main process is still alive");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-      expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
-    } finally { spy?.mockRestore(); if (replacement) await stopChild(replacement); await f.close(); }
-  }, 30_000);
-
-  it.each(["generation", "lease"])("rejects a newer %s even if its PID/lease is already dead at the commit recheck", async kind => {
-    const f = await fixture();
-    const fence = mainPublication.withMainPublicationFence;
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("changed-evidence"); await stopChild(f.child);
-      const file = mainGenerationPath(f.config.residencyRoot), old = JSON.parse(fs.readFileSync(file, "utf8"));
-      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
-        await fence(meshRoot, rootId, () => {
-          if (kind === "generation") fs.writeFileSync(file, JSON.stringify({ ...old, nonce: "new-but-dead" }));
-          else writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt: Date.now(), expiresAt: Date.now() - 1 });
-        });
-        return fence(meshRoot, rootId, operation, wait);
-      });
-      const refused = await f.cli("remove", actor.id);
-      expect(refused.code).toBe(1); expect(refused.err).toContain("changed before operator commit");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-    } finally { spy?.mockRestore(); await f.close(); }
-  }, 30_000);
-
-  it("the held Main startup/lease publication lock refuses an operator commit", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("startup-lock"); await stopChild(f.child);
-      await mainPublication.withMainPublicationFence(f.config.meshRoot, f.config.rootId, async () => {
-        for (const action of ["stop", "remove"] as const) {
-          const refused = await f.cli(action, actor.id);
-          expect(refused.code).toBe(1); expect(refused.err).toContain("publication/startup is in progress");
-          expect(f.host.actors.status(actor.id).status).toBe("idle");
-        }
-      });
-      expect((await f.cli("stop", actor.id)).code).toBe(0);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("unreadable current process evidence refuses even when the recorded Main PID is dead", async () => {
-    const f = await fixture();
-    const read = fs.readFileSync;
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("unknown-current-main"); await stopChild(f.child);
-      spy = vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
-        if (file === `/proc/${process.pid}/environ`) throw Object.assign(new Error("unreadable current runtime"), { code: "EACCES" });
-        return read(file, options as never);
-      });
-      const refused = await f.cli("remove", actor.id);
-      expect(refused.code).toBe(1); expect(refused.err).toContain("liveness is unknown");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-    } finally { spy?.mockRestore(); await f.close(); }
-  }, 30_000);
-
-  it("Main's real initial lease publication waits on the same fence before arming startup heartbeats", async () => {
-    const f = await fixture();
-    const identity = { id: f.config.rootId, name: "Main", kind: "main" as const, sessionId: f.config.sessionId };
-    const directory = new ParticipantDirectory(new MeshStore(f.config.meshRoot, 65536, 100), {
-      enabled: true, hostId: f.config.rootId, rootId: f.config.rootId, identity,
-    });
-    const refresh = vi.spyOn(directory, "refresh");
-    let starting: Promise<void> | undefined;
-    try {
-      await mainPublication.withMainPublicationFence(f.config.meshRoot, f.config.rootId, async () => {
-        starting = directory.start();
-        await new Promise(resolve => setTimeout(resolve, 100));
-        expect(refresh).not.toHaveBeenCalled();
-        expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(false);
-      });
-      await starting;
-      expect(refresh).toHaveBeenCalled();
-      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(true);
-    } finally { await starting?.catch(() => undefined); refresh.mockRestore(); await directory.close(); await f.close(); }
-  }, 30_000);
-
-  it("failed Main startup admission cannot let a waiting external refresh publish around the fence", async () => {
-    const f = await fixture();
-    const identity = { id: f.config.rootId, name: "Main", kind: "main" as const, sessionId: f.config.sessionId };
-    const directory = new ParticipantDirectory(new MeshStore(f.config.meshRoot, 65536, 100), {
-      enabled: true, hostId: f.config.rootId, rootId: f.config.rootId, identity,
-    });
-    const error = new Error("Main publication fence unavailable");
-    const spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockRejectedValueOnce(error);
-    try {
-      const results = await Promise.allSettled([directory.start(), directory.refresh()]);
-      expect(results).toEqual([{ status: "rejected", reason: error }, { status: "rejected", reason: error }]);
-      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(false);
-      spy.mockRestore();
-      await directory.start();
-      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(true);
-    } finally { spy.mockRestore(); await directory.close(); await f.close(); }
-  }, 30_000);
-
-  it("an unreadable exact configured worker launch is not mistaken for a Main", async () => {
-    const f = await fixture();
-    const read = fs.readFileSync;
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("known-worker");
-      f.host.actors.tell(actor.id, "HANG_WITH_PROGRESS");
-      await waitFor(() => !!f.host.actors.status(actor.id).inFlightRun);
-      const run = f.host.actors.status(actor.id).inFlightRun!.id;
-      await waitFor(() => "turns" in f.host.agents.status(run) && Number((f.host.agents.status(run) as { turns?: number }).turns) > 0);
-      const pid = Number(f.host.agents.status(run).sessionId);
-      await stopChild(f.child);
-      spy = vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
-        if (file === `/proc/${pid}/environ`) throw Object.assign(new Error("worker exec transition"), { code: "EACCES" });
-        return read(file, options as never);
-      });
-      const dry = await f.cli("remove", actor.id, ["--dry-run"]);
-      expect(dry).toMatchObject({ code: 0, err: "" });
-      expect(f.host.actors.status(actor.id).status).toBe("running");
-    } finally { spy?.mockRestore(); await f.close(); }
-  }, 30_000);
-
-  it("a live file-only root lease vetoes control after Main process exits", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("leased"); await stopChild(f.child);
+      const actor = await f.create("leased");
       writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
         updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
-      const result = await f.cli("remove", actor.id);
+      const result = await f.cli("remove", actor.id, f.confirm);
       expect(result.code).toBe(1); expect(result.err).toContain("live root lease");
       expect(f.host.actors.status(actor.id).status).toBe("idle");
     } finally { await f.close(); }
@@ -493,7 +121,7 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
     const read = fs.readFileSync;
     let spy: ReturnType<typeof vi.spyOn> | undefined;
     try {
-      const actor = await f.create("damaged-lease"); await stopChild(f.child);
+      const actor = await f.create("damaged-lease");
       const file = hostLeasePath(f.config.meshRoot, f.config.rootId);
       writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
         updatedAt: 1, expiresAt: 2 });
@@ -509,39 +137,14 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       else fs.writeFileSync(file, "{unparseable current lease");
       expect(fs.lstatSync(file).isFile()).toBe(true); expect(fs.statSync(file).isFile()).toBe(true);
       if (fault === "unreadable") expect(readHostLease(f.config.meshRoot, f.config.rootId)).toEqual(expired);
-      for (const action of ["stop", "remove"] as const) for (const flags of [[], ["--dry-run"]]) {
+      for (const action of ["stop", "remove"] as const) for (const flags of [f.confirm, ["--dry-run"]]) {
         const refused = await f.cli(action, actor.id, flags);
         expect(refused.code).toBe(1); expect(refused.err).toContain("root lease is unreadable or invalid");
-        expect(refused.err).toContain("--force-live");
+        expect(refused.err).toContain("--confirm-dead-root");
         expect(f.host.actors.status(actor.id).status).toBe("idle");
         expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
       }
     } finally { spy?.mockRestore(); await f.close(); }
-  }, 30_000);
-
-  it.each(["stop", "remove"] as const)("%s rechecks current lease readability after initial cached-expired evidence passed", async action => {
-    const f = await fixture();
-    const fence = mainPublication.withMainPublicationFence, read = fs.readFileSync;
-    let fenceSpy: ReturnType<typeof vi.spyOn> | undefined, readSpy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      const actor = await f.create("lease-read-race"); await stopChild(f.child);
-      const file = hostLeasePath(f.config.meshRoot, f.config.rootId);
-      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
-        updatedAt: 1, expiresAt: 2 });
-      expect(readHostLease(f.config.meshRoot, f.config.rootId)?.expiresAt).toBe(2);
-      fenceSpy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
-        writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
-        readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((target, options) => {
-          if (target === file) throw Object.assign(new Error("replaced lease inaccessible"), { code: "EACCES" });
-          return read(target, options as never);
-        });
-        return fence(meshRoot, rootId, operation, wait);
-      });
-      const refused = await f.cli(action, actor.id);
-      expect(refused.code).toBe(1); expect(refused.err).toContain("root lease is unreadable or invalid");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-      expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
-    } finally { fenceSpy?.mockRestore(); readSpy?.mockRestore(); await f.close(); }
   }, 30_000);
 
   it("live shared-state root presence is independently checked by the executor", async () => {
@@ -555,9 +158,9 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       runner: "pi", transport: "host", capabilities: ["fabric"], sessionId: f.config.sessionId, cwd: f.config.cwd,
       startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
     try {
-      const actor = await f.create("shared-lease"); await mainDirectory.start(); await stopChild(f.child);
+      const actor = await f.create("shared-lease"); await mainDirectory.start();
       fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId), { force: true });
-      const result = await f.cli("stop", actor.id);
+      const result = await f.cli("stop", actor.id, f.confirm);
       expect(result.code).toBe(1); expect(result.err).toContain("live root lease");
     } finally { await mainDirectory.close(); await f.close(); }
   }, 30_000);
@@ -569,52 +172,11 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       enabled: true, hostId: f.config.rootId, rootId: f.config.rootId, identity,
     });
     try {
-      const actor = await f.create("bare-shared-lease"); await directory.start(); await stopChild(f.child);
+      const actor = await f.create("bare-shared-lease"); await directory.start();
       fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId), { force: true });
       expect(f.host.participants.get(f.config.rootId, Date.now(), { fresh: true })).toBeUndefined();
-      expect((await f.cli("remove", actor.id)).err).toContain("live root lease");
+      expect((await f.cli("remove", actor.id, f.confirm)).err).toContain("live root lease");
     } finally { await directory.close(); await f.close(); }
-  }, 30_000);
-
-  it("inbox PID evidence, malformed safety data and symlinked channels fail closed", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("inbox-owner");
-      const inbox = path.join(f.config.meshRoot, "main-followups", `${f.config.sessionId}.owner.json`);
-      fs.mkdirSync(path.dirname(inbox), { recursive: true });
-      fs.writeFileSync(inbox, JSON.stringify({ rootId: f.config.rootId, sessionId: f.config.sessionId,
-        pid: f.child.pid, processStartedAt: processStartTime(f.child.pid!) }));
-      fs.rmSync(mainGenerationPath(f.config.residencyRoot));
-      expect((await f.cli("stop", actor.id)).err).toContain("Main process is still alive");
-      await stopChild(f.child);
-      fs.writeFileSync(inbox, "{bad JSON");
-      expect((await f.cli("remove", actor.id)).code).toBe(1);
-      fs.writeFileSync(inbox, JSON.stringify({ rootId: f.config.rootId, sessionId: f.config.sessionId, pid: f.child.pid }));
-      const requestDir = path.join(f.config.residencyRoot, "requests");
-      fs.renameSync(requestDir, requestDir + "-real");
-      fs.symlinkSync(requestDir + "-real", requestDir, "dir");
-      expect((await f.cli("remove", actor.id)).err).toContain("not owned by this OS user");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("packaged bin enforces live-Main refusal, dead-Main removal and clean unknown-id exit", async () => {
-    const f = await fixture();
-    const run = promisify(execFile);
-    const argv = (action: string, id: string) => [path.resolve("bin/fabric-actors"), action,
-      "--resident", f.config.residencyRoot, "--actor", id, "--mesh-root", f.config.meshRoot];
-    try {
-      const actor = await f.create("bin-target");
-      await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1,
-        stderr: expect.stringContaining("Main process is still alive") });
-      await stopChild(f.child);
-      const result = await run(process.execPath, argv("remove", actor.name));
-      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
-      await f.host.participants.refresh();
-      expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();
-      await expect(run(process.execPath, argv("stop", "unknown-id"))).rejects.toMatchObject({ code: 1,
-        stderr: expect.stringContaining("Unknown Fabric actor") });
-    } finally { await f.close(); }
   }, 30_000);
 
   it.each(["directory", "symlink"] as const)("a same-name CWD %s never redirects packaged stop/remove to another valid resident", async kind => {
@@ -624,7 +186,7 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
     try {
       other = await fixture();
       const target = await f.create("same-name"), wrongRoot = await other.create("same-name");
-      await stopChild(f.child); await stopChild(other.child);
+
       const selector = path.basename(f.config.residencyRoot);
       let cwd = path.dirname(other.config.residencyRoot);
       if (kind === "symlink") {
@@ -633,7 +195,7 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       }
       for (const action of ["stop", "remove"] as const) {
         const result = await run(process.execPath, [path.resolve("bin/fabric-actors"), action,
-          "--resident", selector, "--actor", target.name], {
+          "--resident", selector, "--actor", target.name, ...f.confirm], {
           cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
         });
         expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
@@ -645,32 +207,113 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       const ambiguous = path.join(f.config.meshRoot, "residency", selector + "0");
       fs.mkdirSync(ambiguous);
       await expect(run(process.execPath, [path.resolve("bin/fabric-actors"), "remove",
-        "--resident", selector, "--actor", target.name], {
+        "--resident", selector, "--actor", target.name, ...f.confirm], {
         cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
       })).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Ambiguous resident prefix") });
       expect(other.host.actors.status(wrongRoot.id).status).toBe("idle");
     } finally { if (other) await other.close(); await f.close(); }
   }, 40_000);
 
-  it("unknown actor, invalid flags, missing process evidence and ambiguous resident prefixes fail cleanly", async () => {
+  it.each(["stop", "remove"] as const)("%s requires missing/mismatched/matching exact root confirmation", async action => {
     const f = await fixture();
     try {
-      const actor = await f.create("known"); await stopChild(f.child);
-      const unknown = await f.cli("remove", "not-an-actor");
-      expect(unknown.code).toBe(1); expect(unknown.err).toContain("Unknown Fabric actor");
+      const actor = await f.create("confirm-target");
+      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+        updatedAt: 1, expiresAt: 2 });
+      const dry = await f.cli(action, actor.id, ["--dry-run"]);
+      expect(dry).toMatchObject({ code: 0, err: "" });
+      const evidence = JSON.parse(dry.out).operatorEvidence;
+      expect(evidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId,
+        lastLeaseTime: 1, leaseExpiresAt: 2, liveLease: false, operatorCheck: expect.stringContaining("herdr agent list / ps") });
+      for (const flags of [[], ["--confirm-dead-root", "session:wrong"], ["--confirm-dead-root", f.config.rootId + " "]]) {
+        const refused = await f.cli(action, actor.id, flags);
+        expect(refused.code).toBe(1);
+        expect(refused.err).toContain(flags.length ? "Mismatched --confirm-dead-root" : "Missing --confirm-dead-root");
+        expect(refused.err).toContain(JSON.stringify(evidence));
+        expect(f.host.actors.status(actor.id).status).toBe("idle");
+      }
+      expect(await f.cli(action, actor.id, ["--dry-run", "--confirm-dead-root", "session:wrong"]))
+        .toMatchObject({ code: 1, err: expect.stringContaining("Mismatched --confirm-dead-root") });
+      expect(await f.cli(action, actor.name, f.confirm)).toMatchObject({ code: 0, err: "" });
+      if (action === "stop") expect(f.host.actors.status(actor.id).status).toBe("stopped");
+      else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(false);
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it.each(["stop", "remove"] as const)("%s refuses an unexpired lease even when confirmed; dry-run reports it", async action => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("live-lease");
+      const updatedAt = Date.now(), expiresAt = updatedAt + 60_000;
+      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId, updatedAt, expiresAt });
+      expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("live root lease") });
+      const dry = await f.cli(action, actor.id, ["--dry-run"]);
+      expect(dry.code).toBe(0);
+      expect(JSON.parse(dry.out).operatorEvidence).toMatchObject({ lastLeaseTime: updatedAt, leaseExpiresAt: expiresAt, liveLease: true });
       expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it.each(["stop", "remove"] as const)("%s rechecks the current lease immediately before actor commit", async action => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("lease-race"), stop = f.host.actors.stop.bind(f.host.actors);
+      vi.spyOn(f.host.actors, "stop").mockImplementationOnce((...args) => {
+        writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+          updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+        return stop(...args);
+      });
+      expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("live root lease") });
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("symlinked resident request channels refuse before dispatch", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("channel-symlink"), requests = path.join(f.config.residencyRoot, "requests");
+      fs.renameSync(requests, requests + "-real");
+      fs.symlinkSync(requests + "-real", requests, "dir");
+      for (const action of ["stop", "remove"] as const) {
+        expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("not owned by this OS user") });
+      }
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("unknown actor, invalid wire flags, removed override and old hosts fail cleanly", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("known");
+      expect(await f.cli("remove", actor.id.slice(0, 8), f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("Unknown Fabric actor") });
+      expect(await f.cli("stop", actor.id, ["--force-live"])).toMatchObject({ code: 1, err: expect.stringContaining("Usage:") });
       const client = new ResidentActorClient(f.config.meshRoot, f.config.rootId);
-      await expect(client.operatorActor("remove", actor.id, { forceLive: "yes" as unknown as boolean })).rejects.toThrow("Invalid resident operator");
-      const ownerPath = path.join(f.config.residencyRoot, "owner.json");
-      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+      await expect(client.operatorActor("remove", actor.id, { confirmDeadRoot: 1 as unknown as string })).rejects.toThrow("Invalid resident operator");
+      await expect(client.operatorActor("stop", actor.id)).rejects.toThrow("Missing --confirm-dead-root");
+      await expect(client.operatorActor("remove", actor.id, { confirmDeadRoot: "session:wrong" })).rejects.toThrow("Mismatched --confirm-dead-root");
+      const ownerPath = path.join(f.config.residencyRoot, "owner.json"), owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
       fs.writeFileSync(ownerPath, JSON.stringify({ ...owner, commands: owner.commands.filter((op: string) => op !== "operatorActor") }));
-      await expect(client.operatorActor("remove", actor.id)).rejects.toThrow("older release");
+      await expect(client.operatorActor("remove", actor.id, { confirmDeadRoot: f.config.rootId })).rejects.toThrow("older release");
       expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
-      fs.writeFileSync(ownerPath, JSON.stringify(owner));
-      fs.rmSync(mainGenerationPath(f.config.residencyRoot));
-      expect((await f.cli("remove", actor.id)).err).toContain("no recorded identity");
-      fs.mkdirSync(path.join(f.config.meshRoot, "residency", path.basename(f.config.residencyRoot).slice(0, 12) + "0"));
-      expect(() => resolveResidentDirectory(path.basename(f.config.residencyRoot).slice(0, 12), f.config.meshRoot)).toThrow("Ambiguous");
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("packaged bin requires confirmation, supports dry-run and normal removal, and exits cleanly for unknown ids", async () => {
+    const f = await fixture(), run = promisify(execFile);
+    const argv = (action: string, id: string) => [path.resolve("bin/fabric-actors"), action,
+      "--resident", f.config.residencyRoot, "--actor", id, "--mesh-root", f.config.meshRoot];
+    try {
+      const actor = await f.create("bin-target");
+      await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
+      const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run"]);
+      expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
+      const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
+      await f.host.participants.refresh();
+      expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();
+      await expect(run(process.execPath, [...argv("stop", "unknown-id"), ...f.confirm])).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Unknown Fabric actor") });
     } finally { await f.close(); }
   }, 30_000);
 });
@@ -723,7 +366,7 @@ describe("resident selector boundary", () => {
     let other: Awaited<ReturnType<typeof fixture>> | undefined;
     try {
       other = await fixture();
-      const actor = await other.create("wrong-root"); await stopChild(other.child);
+      const actor = await other.create("wrong-root");
       const link = path.join(f.config.meshRoot, "residency", "link");
       fs.symlinkSync(other.config.residencyRoot, link, "dir");
       const validLink = path.join(f.config.meshRoot, "residency", "valid-link");

@@ -33,7 +33,6 @@ const stable = [
 ];
 const lazy = [
   "residency/launcher-owner.js",
-  "residency/main-publication-fence.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",

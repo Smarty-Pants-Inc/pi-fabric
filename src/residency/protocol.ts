@@ -556,7 +556,7 @@ export interface ResidentOperatorActorCommand {
   action: "stop" | "remove";
   id: string;
   dryRun?: boolean;
-  forceLive?: boolean;
+  confirmDeadRoot?: string;
   requestId: string;
   rootId: string;
   createdAt: number;
@@ -643,6 +643,7 @@ export interface ResidentCommandResponse {
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
+  operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;

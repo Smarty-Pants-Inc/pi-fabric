@@ -1,6 +1,4 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { MainProcessMarker } from "./residency/main-marker.js";
-import { loadGlobalFabricConfig } from "./config.js";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
@@ -243,19 +241,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
-  // First Fabric action: fence this process before registration or any runtime
-  // activity. Pi has no native session context at factory load, so publish an
-  // explicitly unbound starting marker; bootstrap binds it before activation.
-  const mainMarker = process.platform === "linux" && !options.managedHost && !process.env.PI_FABRIC_PARENT_RUN &&
-    !process.env.PI_FABRIC_ACTOR_ID && !process.env.PI_FABRIC_RESIDENT_CONFIG
-    ? new MainProcessMarker() : undefined;
-  if (mainMarker) {
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? process.cwd();
-    const config = loadGlobalFabricConfig(resolveAgentDir());
-    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (config.mesh.root
-      ? path.resolve(projectRoot, config.mesh.root) : path.join(projectRoot, ".pi", "fabric", "mesh"));
-    await mainMarker.publish(meshRoot, "", "");
-  }
   registerFabricPrincipalCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
@@ -269,7 +254,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const proxyContract = new ProxyContractLedger();
   const state = new FabricState(pi, capturedTools, {
     paths: FABRIC_RUNTIME_PATHS,
-    ...(mainMarker ? { mainMarker } : {}),
     ...(FABRIC_ENTRY_IDENTITY ? { entryIdentity: FABRIC_ENTRY_IDENTITY } : {}),
     ...(options.managedHost ? {managedHost: options.managedHost} : {}),
   });
@@ -1280,7 +1264,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     try {
       await state.shutdown(reason, event?.targetSessionFile);
     } finally {
-      mainMarker?.close();
       uninstallHaltOnEscape();
       uninstallShellHangKeys();
       fabricUi.stop();

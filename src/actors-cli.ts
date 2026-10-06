@@ -4,7 +4,7 @@ import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--force-live]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>]";
 
 /** Resolve exactly one resident under the configured residency directory, never the CWD. */
 export function resolveResidentDirectory(selector: string, meshRoot: string): string {
@@ -40,12 +40,11 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const [action, ...rest] = argv;
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};
-    let dryRun = false, forceLive = false;
+    let dryRun = false;
     for (let index = 0; index < rest.length; index++) {
       const option = rest[index]!;
       if (option === "--dry-run") { dryRun = true; continue; }
-      if (option === "--force-live") { forceLive = true; continue; }
-      if (!["--resident", "--actor", "--mesh-root"].includes(option) || values[option] !== undefined ||
+      if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root"].includes(option) || values[option] !== undefined ||
           !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
       values[option] = rest[++index]!;
     }
@@ -74,8 +73,8 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const keepAlive = setInterval(() => {}, 30_000);
     try {
       const response = await new ResidentActorClient(config.meshRoot, config.rootId).operatorActor(action,
-        values["--actor"], { dryRun, forceLive });
-      io.out(JSON.stringify({ resident: directory, action, dryRun, forceLive, ...response }) + "\n");
+        values["--actor"], { dryRun, ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}) });
+      io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;
     } finally { clearInterval(keepAlive); }
   } catch (error) {

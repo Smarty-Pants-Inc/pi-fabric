@@ -24,7 +24,6 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
-import { withMainPublicationFence } from "./main-publication-fence.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
@@ -245,11 +244,9 @@ export class ResidencyClient {
     // while the OS process remains alive. Never invalidate a newer runtime.
     if (this.#generationRecorded) {
       try {
-        await withMainPublicationFence(this.options.config.meshRoot, this.options.config.rootId, () => {
-          const recorded = readHandoverJson<ResidentMainGeneration>(mainGenerationPath(this.options.config.residencyRoot));
-          if (recorded?.nonce === this.#runtimeNonce) writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot),
-            { ...recorded, nonce: `closed:${this.#runtimeNonce}` }, { durable: true });
-        });
+        const recorded = readHandoverJson<ResidentMainGeneration>(mainGenerationPath(this.options.config.residencyRoot));
+        if (recorded?.nonce === this.#runtimeNonce) writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot),
+          { ...recorded, nonce: `closed:${this.#runtimeNonce}` }, { durable: true });
       } catch (error) { this.#deferRelease(error); }
     }
     this.#releaseAbort.abort();
@@ -413,12 +410,8 @@ export class ResidencyClient {
       processStartTime: processStartTime(process.pid) ?? "", rootId: this.options.config.rootId,
       sessionId: this.options.config.sessionId, releaseRoot };
     if (!this.#generationRecorded) {
-      await withMainPublicationFence(this.options.config.meshRoot, this.options.config.rootId, () => {
-        if (this.#closed || this.#generationRecorded) return;
-        writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot), main, { durable: true });
-        this.#generationRecorded = true;
-      });
-      if (this.#closed) return;
+      writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot), main, { durable: true });
+      this.#generationRecorded = true;
     }
     if (!owner || handoverActive(state) || this.#releaseOwners.has(owner.token)) return;
     this.#releaseOwners.add(owner.token);

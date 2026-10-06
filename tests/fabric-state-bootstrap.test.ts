@@ -6,9 +6,6 @@ import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricState } from "../src/fabric-state.js";
 import type { FabricComponentDefinition, FabricProvider } from "../src/protocol.js";
-import { MainProcessMarker } from "../src/residency/main-marker.js";
-import { readMainMarker } from "../src/residency/operator-safety.js";
-import { processStartTime } from "../src/residency/process-identity.js";
 
 const contextAt = (cwd: string, sessionId = "session-1"): ExtensionContext => ({
   cwd,
@@ -67,74 +64,6 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
-  it("an early ensure waits for Main marker publication before loading a runtime", async () => {
-    const cwd = project({ mesh: { enabled: false } });
-    const harness = runtimeHarness();
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    const marker = { beginTransition: vi.fn(() => gate), publish: vi.fn(async () => {}) };
-    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { runtimeLoader: harness.loader, mainMarker: marker });
-    const context = contextAt(cwd);
-    const bootstrap = state.bootstrap(context), ensure = state.ensure(context);
-    try {
-      await Promise.resolve();
-      expect(harness.loader).not.toHaveBeenCalled();
-      release(); await Promise.all([bootstrap, ensure]);
-      expect(harness.loader).toHaveBeenCalledOnce();
-    } finally { release(); await Promise.allSettled([bootstrap, ensure]); await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
-  });
-
-
-  it("fences the Main transition before runtime activation and stabilizes only afterwards", async () => {
-    const cwd = project({ mesh: { enabled: false } });
-    const harness = runtimeHarness();
-    const marker = { beginTransition: vi.fn(async () => {}), publish: vi.fn(async () => {}) };
-    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { runtimeLoader: harness.loader, mainMarker: marker });
-    try {
-      await state.bootstrap(contextAt(cwd, "one"));
-      expect(marker.publish).toHaveBeenLastCalledWith(expect.any(String), "session:one", "one");
-      expect(harness.loader).not.toHaveBeenCalled();
-      await state.ensure(contextAt(cwd, "one"));
-      expect(marker.publish.mock.invocationCallOrder[0]).toBeLessThan((harness.loader as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!);
-      await state.bootstrap(contextAt(cwd, "two"));
-      expect(marker.publish).toHaveBeenLastCalledWith(expect.any(String), "session:two", "two");
-      expect(marker.beginTransition.mock.invocationCallOrder[2]).toBeLessThan(harness.instances[0]!.initialize.mock.invocationCallOrder[1]!);
-      expect(marker.publish.mock.invocationCallOrder[1]).toBeGreaterThan(harness.instances[0]!.initialize.mock.invocationCallOrder[1]!);
-    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
-  });
-
-
-  it.skipIf(process.platform !== "linux")("keeps the real marker transitioning until rebind finishes, including failed config and activation", async () => {
-    const cwd = project({ mesh: { enabled: false } });
-    const mesh = path.join(cwd, "mesh"), birth = processStartTime(process.pid)!;
-    vi.stubEnv("PI_FABRIC_MESH_ROOT", mesh);
-    const harness = runtimeHarness(), marker = new MainProcessMarker();
-    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { runtimeLoader: harness.loader, mainMarker: marker });
-    let switching: Promise<void> | undefined;
-    try {
-      await marker.publish(mesh, "", "");
-      await state.bootstrap(contextAt(cwd, "one"));
-      await state.ensure(contextAt(cwd, "one"));
-      harness.block();
-      switching = state.bootstrap(contextAt(cwd, "two"));
-      await vi.waitFor(() => expect(harness.instances[0]!.initialize).toHaveBeenCalledTimes(2));
-      expect(readMainMarker(mesh, process.pid, birth)).toMatchObject({ transition: true, rootId: "session:two", rootIds: ["session:one", "session:two"] });
-      harness.release(); await switching;
-      expect(readMainMarker(mesh, process.pid, birth)?.transition).toBeUndefined();
-      const broken = contextAt(cwd, "three");
-      broken.isProjectTrusted = () => { throw new Error("config admission failed"); };
-      await expect(state.bootstrap(broken)).rejects.toThrow("config admission failed");
-      expect(readMainMarker(mesh, process.pid, birth)).toMatchObject({ transition: true, rootId: "session:two" });
-      harness.failInitialize();
-      await expect(state.bootstrap(contextAt(cwd, "three"))).rejects.toThrow("initialize failed");
-      expect(readMainMarker(mesh, process.pid, birth)).toMatchObject({ transition: true, rootId: "session:three" });
-    } finally {
-      harness.release(); await switching?.catch(() => undefined);
-      await state.shutdown(); marker.close(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true });
-    }
-  });
-
-
   it.each(["reload", "initialize", "session-switch"] as const)(
     "stops activation timers before %s invalidates the runtime", async (boundary) => {
       vi.useFakeTimers();

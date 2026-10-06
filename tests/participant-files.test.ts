@@ -176,19 +176,13 @@ describe("participant files", () => {
     const write = participantFiles.writeParticipantFileIf;
     let resume!: () => void;
     const gate = new Promise<void>((resolve) => { resume = resolve; });
-    let entered!: () => void;
-    const publishing = new Promise<void>((resolve) => { entered = resolve; });
     vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementationOnce(async (...args) => {
-      entered();
       await gate;
       return write(...args);
     });
     const alpha = directory(root, "alpha", () => [record("alpha")]);
     const starting = alpha.start();
     try {
-      // Main now admits startup through a real asynchronous flock helper. Wait
-      // for the first file work, not an arbitrary fake-clock delay before admission.
-      await publishing;
       await vi.advanceTimersByTimeAsync(3_000);
       expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
     } finally {

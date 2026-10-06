@@ -47,7 +47,6 @@ import type {
   FabricProvider,
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
-import type { MainProcessMarker } from "./residency/main-marker.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
@@ -55,7 +54,6 @@ import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
 export interface FabricStateOptions {
-  mainMarker?: Pick<MainProcessMarker, "publish" | "beginTransition">;
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
@@ -69,7 +67,6 @@ export class FabricState {
   #runtime: FabricRuntimeState | undefined;
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
-  #markerPublication: Promise<void> | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
@@ -195,13 +192,6 @@ export class FabricState {
   async bootstrap(context: ExtensionContext): Promise<void> {
     this.#shutDown = false;
     const generation = ++this.#generation;
-    // Fence the OLD binding before configuration, role, or runtime state changes.
-    // A failed/superseded rebind must never leave an apparently stable old marker.
-    if (this.#options.mainMarker) {
-      this.#markerPublication = this.#options.mainMarker.beginTransition();
-      await this.#markerPublication;
-      if (generation !== this.#generation) return;
-    }
     this.#cwd = context.cwd;
     // Bind at session_start, not first tool use: an idle /new must not consume the launch grant.
     if (!this.#managedHost) this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd, process.env, true);
@@ -215,17 +205,6 @@ export class FabricState {
       projectTrusted: context.isProjectTrusted(),
     });
     this.#config = config;
-    let markerBinding: [string, string, string] | undefined;
-    if (this.#options.mainMarker) {
-      const sessionId = context.sessionManager.getSessionId();
-      const { mainAgentId } = resolveFabricIdentity(sessionId);
-      const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-      const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (config.mesh.root
-        ? path.resolve(projectRoot, config.mesh.root) : path.join(projectRoot, ".pi", "fabric", "mesh"));
-      markerBinding = [meshRoot, mainAgentId, sessionId];
-      this.#markerPublication = this.#options.mainMarker.beginTransition(...markerBinding);
-      await this.#markerPublication;
-    }
     this.#probePlacement(config, context.cwd, true);
     this.#kernelReloadRequired = false;
     this.prewalk.cancel();
@@ -239,12 +218,6 @@ export class FabricState {
     if (pending) await pending.catch(() => undefined);
     if (generation !== this.#generation) return;
     if (this.#everActivated) await this.#activate(context, true);
-    if (generation !== this.#generation) return;
-    // Clear the veto only after the new idle binding or active runtime is ready.
-    if (markerBinding && this.#options.mainMarker) {
-      this.#markerPublication = this.#options.mainMarker.publish(...markerBinding);
-      await this.#markerPublication;
-    }
   }
 
   async initialize(context: ExtensionContext): Promise<void> {
@@ -522,7 +495,6 @@ export class FabricState {
   }
 
   async #activate(context: ExtensionContext, reinitialize: boolean): Promise<FabricRuntimeState> {
-    if (this.#markerPublication) await this.#markerPublication;
     if (this.#activation) {
       if (this.#activationGeneration === this.#generation) return this.#activation;
       await this.#activation.catch(() => undefined);

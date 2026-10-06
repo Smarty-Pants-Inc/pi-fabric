@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
-import { canRemoveTerminalRun, pruneActorRunArchiveSlices, runTreeExitVeto } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, pruneActorRunArchives, pruneActorRunArchiveSlices, runTreeExitVeto } from "../src/storage/retention.js";
 import { JOINED_SCRATCH_FILE, NEVER_STARTED_FILE, RUN_TMP_DIRECTORY, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
 
 // Count synchronous fs API crossings rather than wall-clock thresholds: NTFS
@@ -75,17 +75,16 @@ describe("actor archive slice fs cost", () => {
         scratchCallsPerRun: scratchCalls / count, largestCalls, largestDeletes, longestSliceMs: longest }) + "\n");
       expect(removed).toHaveLength(count);
       expect(largestDeletes).toBe(1);
-      // Both platforms reuse only this uninterrupted slice's checked status
-      // and metadata: 5 lstat + 3 exists + 1 read + 1 readdir + 1 rm = 11.
-      // Windows adds zero scratch probes; POSIX additionally checks the fence
-      // for disposal and the fence/tmp veto (3 lstat) = 14 crossings.
-      // This tightens main's 20-crossing Windows budget without caching custody
-      // across a yield. Recursive rmSync traversal is excluded in both modes.
-      const exact = platform === "win32" ? 11 : 14;
+      // Windows reuses only this uninterrupted slice's census/status/metadata:
+      // 4 lstat + 1 read + 1 readdir + 1 rm = 7, with no negative-name probes.
+      // POSIX retains 8 lstat + 3 exists + 1 read + 1 readdir + 1 rm = 14.
+      // Main used 20 Windows crossings; the previous lane used 11. No custody
+      // evidence survives a yield. Recursive rmSync traversal is excluded.
+      const exact = platform === "win32" ? 7 : 14;
       expect(largestCalls).toBe(exact);
       expect((total() - 2) / count).toBe(exact); // Only root lstat/census are outside run slices.
-      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 5 : 8) * count + 1,
-        readdirSync: count + 1, existsSync: 3 * count,
+      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 4 : 8) * count + 1,
+        readdirSync: count + 1, ...(platform === "win32" ? {} : { existsSync: 3 * count }),
         readFileSync: count, rmSync: count });
       expect(scratchCalls).toBe(platform === "win32" ? 0 : 3 * count);
       // A forced win32 branch on Linux proves work counts, not native NTFS
@@ -130,7 +129,7 @@ describe("actor archive slice fs cost", () => {
     },
   );
 
-  it.each(["status", "scratch", "latest"] as const)("does not reuse Windows collection evidence across a %s change between slices", fence => {
+  it.each(["status", "scratch", "latest", "archive-pending.json", "actor-run-archive-pending.json", "unresolved-worker.json", "nested"] as const)("does not reuse Windows collection evidence across a %s change between slices", fence => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-fresh-slice-"));
     const run = path.join(root, "run"); terminal(run);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
@@ -143,6 +142,11 @@ describe("actor archive slice fs cost", () => {
       }));
       if (fence === "scratch") fs.mkdirSync(path.join(run, RUN_TMP_DIRECTORY));
       if (fence === "latest") latest = true;
+      if (fence.endsWith(".json")) fs.writeFileSync(path.join(run, fence), "{}");
+      if (fence === "nested") {
+        const child = path.join(run, "nested", "child"); terminal(child);
+        fs.mkdirSync(path.join(child, RUN_TMP_DIRECTORY));
+      }
       const step = slices.next();
       expect(step.done).toBe(true); expect(step.value).toEqual([]);
       expect(fs.existsSync(run)).toBe(true);
@@ -161,13 +165,47 @@ describe("actor archive slice fs cost", () => {
         return Reflect.apply(lstat, fs, [target, ...args]);
       }) as never);
       expect(canRemoveTerminalRun(run)).toBe(false);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0 })).toEqual([]);
       metadata.mockRestore();
       vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...args: unknown[]) => {
         if (String(target) === run) throw Object.assign(new Error("access denied"), { code: "EACCES" });
         return Reflect.apply(readdir, fs, [target, ...args]);
       }) as never);
       expect(canRemoveTerminalRun(run)).toBe(false);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0 })).toEqual([]);
       expect(fs.existsSync(run)).toBe(true);
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("stops a slow Windows metadata walk at its deadline and retries with fresh evidence", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-deadline-"));
+    const run = path.join(root, "run"); terminal(run);
+    for (let i = 0; i < 100; i++) fs.writeFileSync(path.join(run, `oversized-event-prefix-${i}.txt`), "event");
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const lstat = fs.lstatSync;
+    let clock = 0, stats = 0;
+    try {
+      // Virtual metadata latency avoids scheduler-sensitive work assertions.
+      vi.spyOn(performance, "now").mockImplementation(() => clock);
+      const metadata = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+        stats++; clock += 10;
+        return Reflect.apply(lstat, fs, args);
+      }) as never);
+      const drain = () => {
+        const slices = pruneActorRunArchiveSlices({ runsDirectory: root, retentionMs: 0 });
+        for (;;) { const step = slices.next(); if (step.done) return step.value; }
+      };
+      const remove = vi.spyOn(fs, "rmSync");
+      expect(drain()).toEqual([]);
+      expect(stats).toBeLessThanOrEqual(4); // Root census + at most three candidate stats.
+      expect(remove).not.toHaveBeenCalled();
+      expect(fs.existsSync(run)).toBe(true);
+      metadata.mockRestore();
+      fs.mkdirSync(path.join(run, RUN_TMP_DIRECTORY));
+      expect(drain()).toEqual([]); // No partial proof retained after the deadline.
+      expect(remove).not.toHaveBeenCalled();
+      fs.rmdirSync(path.join(run, RUN_TMP_DIRECTORY));
+      expect(drain()).toEqual([run]); // A later fresh sweep can finish.
     } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

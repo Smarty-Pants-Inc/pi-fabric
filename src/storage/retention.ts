@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { logWindowsScratchScopeCut, runScratchExitVeto } from "./run-scratch.js";
@@ -140,6 +141,9 @@ function* inspectRunTree(
   // scratch receipts. Never used by the public exit/resource predicates.
   scratchCoveredByAllowlist = false,
   inspections?: Map<string, RunInspection>,
+  // Only the synchronous archive collector may reuse this census. Async IO
+  // and public exit/resource proofs must keep their independent observations.
+  reuseCensus = false,
 ): TreeWalk<string | undefined> {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -156,16 +160,18 @@ function* inspectRunTree(
     const ownedRoot = mainWindows ? yield* treeOwnedStat(directory) : rootStat;
     if (!ownedRoot || !isOwnedStat(ownedRoot) || !ownedRoot.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (preserveArchives && (yield* treeExists(path.join(directory, "archive-pending.json")))) return "terminal result archive is pending";
+    const names = reuseCensus ? yield* treeList(directory) : undefined;
+    if (preserveArchives && (names ? names.includes("archive-pending.json") : yield* treeExists(path.join(directory, "archive-pending.json")))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (preserveArchives && (yield* treeExists(path.join(directory, "actor-run-archive-pending.json")))) return "actor run receipt archive is pending";
+    if (preserveArchives && (names ? names.includes("actor-run-archive-pending.json") : yield* treeExists(path.join(directory, "actor-run-archive-pending.json")))) return "actor run receipt archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if ((yield* treeExists(path.join(directory, UNRESOLVED_WORKER_FILE)))) return "its worker may still be running (unresolved worker marker)";
+    if (names ? names.includes(UNRESOLVED_WORKER_FILE) : yield* treeExists(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
     let statusStat: fs.Stats | undefined;
     try { statusStat = yield* treeStat(statusFile); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusExists = statusStat !== undefined;
     let record: RunRecordSummary | undefined;
     if (statusStat && isOwnedStat(statusStat) && statusStat.isFile() && statusStat.size <= 1024 * 1024) {
@@ -226,17 +232,19 @@ function* inspectRunTree(
     const nested = path.join(directory, "nested");
     let hasNested = false;
     let nestedStat: fs.Stats | undefined;
-    try { nestedStat = yield* treeStat(nested); hasNested = true; }
+    try {
+      if (!names || names.includes("nested")) { nestedStat = yield* treeStat(nested); hasNested = true; }
+    }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (hasNested) {
       if (!nestedStat || !isOwnedStat(nestedStat) || !nestedStat.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
       for (const name of (yield* treeList(nested))) {
         const reason = yield* inspectRunTree(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit,
-          { disposeScratch: options.disposeScratch !== false }, scratchCoveredByAllowlist, inspections);
+          { disposeScratch: options.disposeScratch !== false }, scratchCoveredByAllowlist, inspections, reuseCensus);
         if (reason) return reason;
       }
     }
-    inspections?.set(directory, { root: rootStat, record, statusStat });
+    inspections?.set(directory, { root: rootStat, record, statusStat, ...(names ? { names } : {}) });
     // Report a known worker/descendant obligation before the independent
     // scratch fence. Both still have to pass; native exit never bypasses it.
     if (!scratchCoveredByAllowlist) {
@@ -318,18 +326,18 @@ function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, 
     if (!(yield* treeOwnedStat(path.join(root, "task.txt")))?.isFile()) return false;
   }
   try {
-    const names = yield* treeList(root);
+    const names = inspection?.names ?? (yield* treeList(root));
     if (inspection) inspection.names = names;
     for (const name of names) {
       if (expired()) return false;
       const file = path.join(root, name);
       const stat = name === "status.json" && inspection ? inspection.statusStat : yield* treeOwnedStat(file);
-      if (!stat) return false;
+      if (!stat || expired()) return false;
       if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         for (const child of yield* treeList(file)) {
-          if (!child.endsWith(".jsonl") || !(yield* treeOwnedStat(path.join(file, child)))?.isFile()) return false;
+          if (expired() || !child.endsWith(".jsonl") || !(yield* treeOwnedStat(path.join(file, child)))?.isFile()) return false;
         }
         continue;
       }
@@ -705,6 +713,12 @@ interface ActorRunArchivePruneOptions {
   now?: number;
 }
 
+// Cooperatively cap Windows metadata walks, including large descendant trees.
+// A timed-out candidate is retained and retried by a later sweep, with fresh
+// evidence. A single native synchronous IO call cannot be preempted here; the
+// production Windows queue below awaits IO rather than blocking the RPC turn.
+const WINDOWS_ARCHIVE_INSPECTION_BUDGET_MS = 25;
+
 /** One run-tree inspection/deletion per resume. The caller must refresh its
  * ownership/publication fence before each next(), never carry it across a yield. */
 export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions): Generator<void, string[]> {
@@ -724,13 +738,15 @@ export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions
     // Windows' recursive allowlist rejects every scratch artifact, so it needs
     // no scratch inspection/disposal (including negative stats). Public exit
     // and resource predicates keep their independent fresh observations.
+    const deadline = windows ? performance.now() + WINDOWS_ARCHIVE_INSPECTION_BUDGET_MS : Infinity;
+    const expired = windows ? () => performance.now() >= deadline : noDeadline;
     const inspections = new Map<string, RunInspection>();
-    if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, windows, inspections)) ||
-        !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
+    if (inspectTreeSync(inspectRunTree(directory, 0, expired, true, true, true, {}, windows, inspections, windows)) ||
+        !inspectTreeSync(inspectSafeRunTree(directory, false, 0, expired, {}, inspections)) || expired()) continue;
     const { record, root } = inspections.get(directory)!;
     if (!record?.status || !TERMINAL_STATUSES.has(record.status)) continue;
     if (now - recordAgeReference(record, root?.mtimeMs ?? now) < options.retentionMs) {
-      compactTerminalRunEvents(directory, { ...options, now, isRetained: () => options.retainRun?.(entry.name) ?? false });
+      compactTerminalRunEvents(directory, { ...options, now, expired, isRetained: () => options.retainRun?.(entry.name) ?? false });
       continue;
     }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}

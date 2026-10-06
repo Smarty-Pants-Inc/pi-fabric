@@ -1632,12 +1632,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
       changed = true;
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
+    const deferredFileWrites: Array<() => Promise<void>> = [];
+    const publishDeferredFiles = async (): Promise<void> => {
+      for (const publish of deferredFileWrites) await publish();
+    };
     if (filesOnly) {
       if (activityWrites.length > 0 && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) {
         fileWrites.push(...activityWrites);
         this.#recordsWrittenAt = now;
       }
-      // Written before the state removals below commit, so a reader always finds each record.
+      // Migrations must publish durable files BEFORE deleting their shared copies;
+      // first publication/takeover also keeps its files-first ownership ordering.
+      // Already-owned file renewals have no shared copy to remove: defer them until
+      // after the batch/confirmation so slow file I/O cannot consume a mesh gap.
+      // Both phases still run under the same fresh actor-registry publication fence.
       for (const record of fileWrites) {
         // Under the key's lock, the file as it is now: absent, ours, or its owner gone by a fresh
         // (uncached) read of that owner's liveness. A live owner keeps it (review/astra F1 on #142).
@@ -1645,18 +1653,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
         // hold it (review/astra round 4 on #142).
         const key = keyFor(PARTICIPANT_PREFIX, record.id);
         const migrating = existingById.get(record.id)?.entry;
-        const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
-          const taken = (entry: MeshStateEntry | undefined): boolean => {
-            if (!entry || ownParticipant(entry) !== undefined) return false;
-            const holder = participantFromEntry(entry);
-            return holder !== undefined && holder.remoteHost === undefined && this.#ownerLive(holder);
-          };
-          return !taken(current) && !taken(this.mesh.get(key, { fresh: true }));
-        }, migrating !== undefined));
-        if (migrating && published === true) {
-          changed = true;
-          ops.push({ kind: "delete", key, ifVersion: migrating.version, onConflict: "skip" });
-        }
+        const publish = async (): Promise<void> => {
+          const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
+            const taken = (entry: MeshStateEntry | undefined): boolean => {
+              if (!entry || ownParticipant(entry) !== undefined) return false;
+              const holder = participantFromEntry(entry);
+              return holder !== undefined && holder.remoteHost === undefined && this.#ownerLive(holder);
+            };
+            return !taken(current) && !taken(this.mesh.get(key, { fresh: true }));
+          }, migrating !== undefined));
+          if (migrating && published === true) {
+            changed = true;
+            ops.push({ kind: "delete", key, ifVersion: migrating.version, onConflict: "skip" });
+          }
+        };
+        if (migrating || !ownParticipant(filesByKey.get(key))) await publish();
+        else deferredFileWrites.push(publish);
       }
     }
     if (!filesOnly) {
@@ -1668,7 +1680,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
     }
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
-    if (!full && !changed) return false;                       // nothing to publish
+    if (!full && !changed) {
+      await publishDeferredFiles();
+      return false;                                          // nothing shared to publish
+    }
     // Liveness stays in the matching per-host file on every tick. Old directory readers
     // already use that host lease for native sessions, so the explicit policy never
     // renews a legacy session. Without the policy, retain the fixed 7.5 s fallback
@@ -1709,7 +1724,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
           await this.mesh.confirmWritable(at => { acquiredAt = at; });
           // Re-check after the lock: the threshold may have elapsed while confirming.
           decision = decideRenewal(this.#renewFileLease());
-          if (decision.skip) return acquiredAt;
+          if (decision.skip) {
+            await publishDeferredFiles();
+            return acquiredAt;
+          }
           renewHost ||= decision.host;
           renewSession ||= decision.session;
         }
@@ -1743,6 +1761,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
       afterCommit: () => { committedAt = Date.now(); publication?.committed(); } });
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
+    await publishDeferredFiles();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {
       if (result.applied && statePuts.has(result.key)) await this.#copyCommitted(result.key, result.version);

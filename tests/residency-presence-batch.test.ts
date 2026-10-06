@@ -14,10 +14,12 @@ import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol
 import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
+const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const roots: string[] = [], hosts: ResidentHost[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(hosts.splice(0).map(host => host.close()));
+  Object.defineProperty(process, "platform", nativePlatform);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
@@ -53,10 +55,12 @@ const fixture = async (files = false) => {
 
 describe("#4383 resident host presence batch", () => {
   it.each([
-    { hold: 4_900, gap: 100, phase: 650, files: false },
-    { hold: 4_900, gap: 100, phase: 50, files: true },
-    { hold: 9_000, gap: 1_000, phase: 650, files: false },
-  ])("renews and dispatches actor events during periodic mesh holds (%j)", async ({ hold, gap, phase, files }) => {
+    { hold: 4_900, gap: 100, phase: 650, files: false, platform: "native" },
+    { hold: 4_900, gap: 100, phase: 50, files: true, platform: "native" },
+    { hold: 9_000, gap: 1_000, phase: 650, files: false, platform: "native" },
+    { hold: 4_900, gap: 100, phase: 50, files: true, platform: "win32" },
+  ])("renews and dispatches actor events during periodic mesh holds (%j)", async ({ hold, gap, phase, files, platform }) => {
+    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const { host, config, records, heartbeatStartedAt } = await fixture(files);
     const actor = records[0]!;
     // A skip filter records real ActorManager delivery without launching a worker.
@@ -76,6 +80,31 @@ describe("#4383 resident host presence batch", () => {
       expect(host.actors.status(actor.id).filteredCount ?? 0).toBe(0);
       expect(host.participants.confirmedAt()).toBe(prior);
       expect(host.participants.canConsumeMesh()).toBe(false);
+      const admissions: number[] = [], batchAttempts: number[] = [];
+      const admission = host.participants.options.waitForPublicationRetry!;
+      vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(async () => {
+        await admission(); admissions.push(Date.now() - started);
+      });
+      const writeBatch = host.mesh.writeBatch.bind(host.mesh);
+      vi.spyOn(host.mesh, "writeBatch").mockImplementation(input => {
+        batchAttempts.push(Date.now() - started); return writeBatch(input);
+      });
+      if (platform === "win32") {
+        // Retain the native case above; additionally reproduce slow Windows file I/O
+        // on every CI host. Forty 4 ms renames exceed the unchanged 100 ms mesh gap.
+        // Start after the first failed heartbeat so its assertions stay unmodified.
+        const setTimer = globalThis.setTimeout;
+        vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, ms, ...args) =>
+          setTimer(callback, Math.max(16, Number(ms ?? 0)), ...args));
+        const wait = new Int32Array(new SharedArrayBuffer(4));
+        const rename = fs.renameSync;
+        vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          if (String(target).startsWith(path.join(config.meshRoot, "participants") + path.sep) && String(target).endsWith(".json")) {
+            Atomics.wait(wait, 0, 0, 4);
+          }
+          return rename(source, target);
+        });
+      }
       let progressedAt = 0;
       while (Date.now() - started < 15_000) {
         const renewed = host.participants.confirmedAt() > started && records.every(row =>
@@ -86,11 +115,16 @@ describe("#4383 resident host presence batch", () => {
         }
         await delay(25);
       }
+      console.log(JSON.stringify({ regression: "periodic-mesh-predicates", platform: process.platform, hold, gap, phase, files,
+        admissions, batchAttempts, eventId: event.id, progressMs: progressedAt ? progressedAt - started : 0,
+        elapsedMs: Date.now() - started, confirmedAt: host.participants.confirmedAt(), started,
+        renewedParticipants: records.filter(row => (readParticipantFile(config.meshRoot, participantKey(row.id))?.updatedAt ?? 0) > started).length,
+        renewedEnvelopes: records.filter(row => (host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })?.updatedAt ?? 0) > started).length,
+        filteredCount: host.actors.status(actor.id).filteredCount ?? 0, canConsume: host.participants.canConsumeMesh(),
+        leaseAt: readHostLease(config.meshRoot, host.hostId)?.updatedAt, holderStillRunning: !holderExited }));
       expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three periods").toBeGreaterThan(0);
       expect(holderExited, "recovery must happen while the periodic holder continues").toBe(false);
       expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(started);
-      console.log(JSON.stringify({ regression: "periodic-mesh-progress", hold, gap, phase, files,
-        progressMs: progressedAt - started, actors: 40, eventId: event.id, filteredCount: 1, holderStillRunning: !holderExited }));
     } finally { gate.mockRestore(); await exited; }
     expect(await exited).toBe(0);
   }, 30000);

@@ -93,6 +93,8 @@ interface MeshStateFile {
 export interface MeshReadOptions {
   /** Revalidate canonical commit/physical identity now, bypassing the idle age window. */
   fresh?: boolean;
+  /** Opt in only for background display observations; never authority, routing or admission. */
+  background?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
 }
@@ -117,7 +119,9 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
-  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  /** Background-only idle window. Ordinary reads stay exact unless readCacheMs is explicitly set. */
+  backgroundReadCacheMs?: number;
+  /** A live turn/pending operation bypasses explicit ordinary TTL and bounds background TTL to 1 s. */
   readActive?: () => boolean;
   /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
   writeReadJournal?: boolean;
@@ -147,14 +151,15 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 // commands are rejected once past their deadline.
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 /**
- * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
- * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
- * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
- * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * Background-only read-cache age in a Fabric runtime and its resident host. Ordinary reads
+ * are exact on change; only explicitly opted-in display observations reuse a recent parse.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs), active observers for
+ * 1 s. Fresh protocol decisions always bypass both age windows (smarty-dev#2355/#4383).
  * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
 export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
+/** Floor for runtime background observations, including active turns (smarty-dev#4383). */
+export const MIN_BACKGROUND_MESH_READ_CACHE_MS = 1_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -640,6 +645,7 @@ export class MeshStore {
   readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #backgroundReadCacheMs: number | undefined;
   readonly #readActive: (() => boolean) | undefined;
   readonly #writeReadJournal: boolean;
   #requireCanonicalRead = false;
@@ -699,6 +705,8 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#backgroundReadCacheMs = options.backgroundReadCacheMs === undefined ? undefined
+      : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, Math.floor(options.backgroundReadCacheMs));
     this.#readActive = options.readActive;
     this.#writeReadJournal = options.writeReadJournal !== false;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -713,9 +721,15 @@ export class MeshStore {
     return this.#readActive?.() ? 0 : this.#readCacheMs;
   }
 
+  /** Opt-in background observations only; absence preserves legacy explicit TTL behavior. */
+  get backgroundReadCacheMs(): number {
+    if (this.#backgroundReadCacheMs === undefined) return this.readCacheMs;
+    return this.#readActive?.() ? MIN_BACKGROUND_MESH_READ_CACHE_MS : this.#backgroundReadCacheMs;
+  }
+
   /** Time until an idle observer may revalidate; hits do not slide this deadline. */
   get readCacheRemainingMs(): number {
-    return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
+    return this.#stateCache ? Math.max(0, this.backgroundReadCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
   }
 
   #dedupePath(dedupeKey: string, suffix: string): string {
@@ -1499,17 +1513,17 @@ export class MeshStore {
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
     const state = options.fresh === true || options.snapshot === undefined
-      ? this.#readCachedState(options.fresh === true)
+      ? this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true)
       : options.snapshot as MeshStateFile;
     const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
-  list(prefix = "", limit = 100): MeshStateEntry[] {
+  list(prefix = "", limit = 100, options: MeshReadOptions = {}): MeshStateEntry[] {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
     // Clone only the page: the dashboard lists the first 200 of the whole fleet state, and
     // cloning every entry to keep 200 was a large share of an idle Pi's CPU (smarty-dev#557).
-    return this.#select(prefix, {}).slice(0, boundedLimit).map((entry) => jsonClone(entry));
+    return this.#select(prefix, options).slice(0, boundedLimit).map((entry) => jsonClone(entry));
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
@@ -1523,7 +1537,7 @@ export class MeshStore {
    * while the token is unchanged (smarty-dev#557).
    */
   stateToken(options: MeshReadOptions = {}): object {
-    return this.#readCachedState(options.fresh === true);
+    return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true);
   }
 
   /**
@@ -1540,7 +1554,8 @@ export class MeshStore {
     const fresh = options.fresh === true;
     const state = options.snapshot !== undefined && !fresh
       ? options.snapshot as MeshStateFile
-      : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
+      : (!fresh && this.#signalledState(prefix, options.background === true)) ||
+        this.#readCachedState(fresh, fresh, options.background === true);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {
@@ -1562,10 +1577,10 @@ export class MeshStore {
   // The cached parse, when the reuse window expired, the canonical generation changed, and the read signal bound
   // to the file's exact current stat shows this prefix's namespace unchanged. Otherwise undefined:
   // the caller re-reads as before. Never used by fresh reads or with readCacheMs 0.
-  #signalledState(prefix: string): MeshStateFile | undefined {
+  #signalledState(prefix: string, background: boolean): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    const readCacheMs = this.readCacheMs;
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
     if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
@@ -1944,8 +1959,8 @@ export class MeshStore {
 
   /**
    * The stamp of the state payload that reads now return, from this store's cache. With fresh,
-   * revalidate through the ordinary read-cache window, not authoritative payload freshness.
-   * This UI observer may lag remote changes by readCacheMs; observing a cached payload does
+   * revalidate through the background read-cache window, not authoritative payload freshness.
+   * This UI observer may lag remote changes by backgroundReadCacheMs; observing a cached payload does
    * not extend its age window. Expired reads use ordinary metadata/header validation and fallback.
    * An explicit remote rebuild may opt into revalidateGeneration: a new canonical UUID bypasses
    * even a warm window. Matching/copied, missing or unreadable markers keep ordinary TTL behavior;
@@ -1957,11 +1972,11 @@ export class MeshStore {
       try {
         const cached = this.#stateCache;
         let changed = false;
-        if (revalidateGeneration && cached && this.#readCacheMs > 0 && Date.now() - cached.parsedAt < this.#readCacheMs) {
+        if (revalidateGeneration && cached && this.backgroundReadCacheMs > 0 && Date.now() - cached.parsedAt < this.backgroundReadCacheMs) {
           const generation = this.#canonicalGeneration();
           changed = typeof generation === "string" && generation !== cached.generation;
         }
-        this.#readCachedState(changed, false); // observer only; public fresh payload reads stay canonical
+        this.#readCachedState(changed, false, true); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }
@@ -1970,11 +1985,11 @@ export class MeshStore {
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
-  #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
+  #readCachedState(fresh = false, canonical = fresh, background = false): MeshStateFile {
     const confirmed = this.#requireCanonicalRead;
     if (confirmed) { fresh = true; canonical = true; this.#requireCanonicalRead = false; }
     const recent = this.#stateCache;
-    const readCacheMs = this.readCacheMs;
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
     if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }

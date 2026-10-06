@@ -112,14 +112,14 @@ export const createDashboardSnapshot = (
   // Observe externally owned domains on every poll, including remote lease
   // expiry and model/usage updates that need not emit a local manager event.
   const participants = typeof state.participantInfos === "function"
-    ? state.participantInfos({ scope: "project" }) : [];
+    ? state.participantInfos({ scope: "project", background: true }) : [];
   const actorRecords = state.actors.list();
   const main = state.mainAgentInfo(context);
-  const peers = typeof state.peerInfos === "function" ? state.peerInfos() : [];
+  const peers = typeof state.peerInfos === "function" ? state.peerInfos({ background: true }) : [];
   const globalActors = state.globalActors.list();
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
-  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200) : [];
+  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true }) : [];
   const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };

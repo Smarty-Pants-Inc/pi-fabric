@@ -46,6 +46,28 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
 // A live-name journal derives its recipient even when pending() finds no results.
 // That metadata must not invoke lastKnown's fresh full-fleet scan every idle poll.
 describe("ResidencyClient completion recipient metadata", () => {
+  it("limits empty delivery state scans to 1 s despite actorPollMs 20, and closes both timers", async () => {
+    vi.useFakeTimers();
+    const { client } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
+    const reads = vi.spyOn(client.options.mesh, "listAll");
+    const polls = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(polls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(polls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(polls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(polls()).toBe(4);
+      await client.close();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(polls()).toBe(4);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { await client.close(); }
+  });
+
   it("does not scan the directory during empty idle polls, and keeps live Main renames", async () => {
     vi.useFakeTimers();
     let name = "initial lane";

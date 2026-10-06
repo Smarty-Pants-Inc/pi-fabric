@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+// Credential-free, network-free native Pi + actual worker/Fabric acceptance lane.
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { spawn, spawnSync } from 'node:child_process';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+const mode = process.argv[2] ?? 'compound';
+const out = path.resolve(process.env.COMPACT_PROBE_OUT ?? fs.mkdtempSync(path.join(os.tmpdir(),'compact-native-')));
+fs.mkdirSync(out,{recursive:true});
+const cwd = path.join(out,mode);
+if (fs.existsSync(cwd)) throw new Error('Lane output already exists; choose a fresh COMPACT_PROBE_OUT: ' + cwd);
+fs.mkdirSync(cwd);
+const profile = path.join(cwd,'profile'); fs.mkdirSync(profile,{recursive:true});
+fs.writeFileSync(path.join(profile,'settings.json'),JSON.stringify({extensions:[path.resolve('tests/fixtures/compact-resume-native-provider.ts')], compaction:{enabled:false,keepRecentTokens:128,reserveTokens:1024}, defaultProvider:'compact-proof', defaultModel:'offline', packages:[]}));
+fs.mkdirSync(path.join(cwd,'.pi'),{recursive:true});
+fs.writeFileSync(path.join(cwd,'.pi','fabric.json'),JSON.stringify({enabled:true}));
+const transcript = path.join(cwd,'transcript.jsonl'); fs.writeFileSync(transcript,'');
+const fresh = mode === 'restart-fresh-actor' || mode === 'restart-foreign-principal';
+const freshTask = 'Fresh mailbox task B: write item-B.txt containing B completed';
+const task = fresh ? freshTask : mode === 'plain' ? 'Compact. Keep the failing test name in the summary.' : mode.startsWith('restart') || mode === 'receipt' ? 'Continue the task from the existing session. Do not repeat completed work.' : 'Compact first, then start item X';
+fs.writeFileSync(path.join(cwd,'task.txt'),task);
+// Fresh B has its own private worker admission. A's old journal must never be
+// bundled into this envelope, regardless of an unsupported principal field.
+if(fresh) fs.writeFileSync(path.join(cwd,'task.txt.provenance.json'),JSON.stringify({v:1,channel:'fabric',sender:{id:'actor:requester',kind:'actor',verified:'mesh'},via:'actor',principal:{id:'principal-B',binding:'herdr-client'}}));
+const manager = SessionManager.create(cwd,path.join(cwd,'sessions'));
+manager.appendMessage({role:'user',content:'Inspect failing test test_X; pause before implementation.\n' + 'Historical inspection evidence; no runnable work here. '.repeat(200),timestamp:Date.now()});
+manager.appendMessage({role:'assistant',content:[{type:'text',text:'Inspected test_X; work remains.'}], api:'compact-proof-api',provider:'compact-proof',model:'offline',timestamp:Date.now(),stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}});
+if(mode.startsWith('restart') || mode === 'receipt') {
+  manager.appendCustomEntry('fabric-compact-resume',{id:'12345678-1234-1234-1234-123456789abc',resume:'start item X',state:'pending', ...(mode === 'restart-foreign-principal' ? {principal:{id:'principal-A',binding:'herdr-client'}} : {})});
+  manager.appendCompaction('Committed; continuation not admitted',manager.getBranch()[0].id,1000);
+  fs.appendFileSync(transcript,JSON.stringify({type:'seed-committed',at:Date.now()})+'\n');
+  if(mode === 'receipt') manager.appendMessage({role:'user',content:'Resume after compaction: already admitted\n\n[Fabric continuation: 12345678-1234-1234-1234-123456789abc]',timestamp:Date.now()});
+}
+const source = process.env.COMPACT_PROBE_SOURCE === '1';
+const worker = path.resolve(source ? 'src/worker.ts' : 'dist/worker.js');
+const fabric = path.resolve(source ? 'src/index.ts' : 'dist/index.js');
+const pi = process.env.COMPACT_PROBE_PI ?? process.env.PI ?? path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/cli.js');
+for(const input of [worker,fabric,pi]) if(!fs.existsSync(input)) throw new Error('Missing local input: '+input);
+const flags = {'id':'compact-native-'+mode,'runner':'pi','name':'compact-native-proof','task-file':path.join(cwd,'task.txt'),'status-file':path.join(cwd,'status.json'),'lifecycle-file':path.join(cwd,'lifecycle.jsonl'),'log-file':path.join(cwd,'events.jsonl'),'cwd':cwd,'pi-binary':pi,'claude-binary':'unused','veda-binary':'unused','veda-backend':'unused','veda-persona':'unused','timeout-ms':'45000','depth':'1','full-code-mode':'true','extensions':'true','tools':'["fabric_exec","write"]','granted-risks':'["read","write","exec"]','transport':'process','fabric-extension':fabric,'model':'compact-proof/offline','thinking':'off','session-file':manager.getSessionFile(),'budget-usd':'0'};
+if(mode === 'restart-actor' || fresh) flags['actor-id'] = 'compact-proof-actor';
+// No Fabric selector: inherit Pi's configured native model, with no actor/probe fence.
+if(mode === 'restart-inherited') delete flags.model;
+const env = {PATH:process.env.PATH, HOME:cwd, TMPDIR:process.env.TMPDIR ?? cwd, PI_CODING_AGENT_DIR:profile, PI_OFFLINE:'1', PI_SKIP_VERSION_CHECK:'1', PI_TELEMETRY:'0', COMPACT_PROBE_TRANSCRIPT:transcript, COMPACT_PROBE_INHERITED:mode === 'restart-inherited' ? '1' : '0'};
+// The abort lane drives native Pi directly so a real RPC abort can arrive
+// after compact.request records its intent but before native settlement. No
+// mocked ExtensionContext or fabricated settlement event participates.
+const runAbort = () => new Promise(resolve => {
+  const child = spawn(process.execPath, [pi, '--mode', 'rpc', '--session', manager.getSessionFile(),
+    '--no-extensions', '--extension', path.resolve('tests/fixtures/compact-resume-native-provider.ts'),
+    '--extension', fabric, '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files',
+    '--provider', 'compact-proof', '--model', 'offline', '--thinking', 'off', '--tools', 'fabric_exec,write'],
+    {cwd, env: {...env, PI_FABRIC_FULL_CODE_MODE:'true', COMPACT_PROBE_ABORT:'1'}});
+  let stdout = '', stderr = '', buffer = '', aborted = false, closeTimer;
+  const send = frame => child.stdin.write(JSON.stringify(frame)+'\n');
+  const timeout = setTimeout(() => { stderr += '\nNative abort probe timed out'; child.kill('SIGKILL'); }, 55000);
+  child.stdout.on('data', chunk => {
+    stdout += chunk; buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0,newline); buffer = buffer.slice(newline+1);
+      let event; try { event = JSON.parse(line); } catch { continue; }
+      if (event.type === 'response' && event.id === 'abort-startup' && event.success) send({id:'abort-prompt',type:'prompt',message:task});
+      if (event.type === 'tool_execution_end' && event.toolCallId === 'compact-proof-call' && !aborted) {
+        if (event.isError || event.result?.details?.success === false) {
+          stderr += '\nRequest tool failed: '+JSON.stringify(event.result);
+        }
+        // Abort even a failed request so fixture failures fail promptly rather
+        // than hanging in post-tool inference. The durable-refusal oracle below
+        // independently requires proof that the request really executed.
+        aborted = true;
+        fs.appendFileSync(transcript,JSON.stringify({type:'rpc-abort-sent',at:Date.now()})+'\n');
+        send({id:'real-abort',type:'abort'});
+      }
+      if (event.type === 'response' && event.id === 'real-abort' && event.success) {
+        // Keep stdin open long enough to observe any illicit deferred fresh
+        // turn; end only after native abort has awaited compaction/settlement.
+        closeTimer = setTimeout(() => child.stdin.end(), 1200);
+      }
+    }
+  });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.on('error', error => { stderr += error.message; });
+  child.on('close', code => {
+    clearTimeout(timeout); clearTimeout(closeTimer);
+    fs.writeFileSync(flags['log-file'],stdout);
+    resolve({status:code,stdout,stderr});
+  });
+  child.stdin.on('error', error => { stderr += error.message; });
+  send({id:'abort-startup',type:'get_state'});
+});
+const result = mode === 'abort' ? await runAbort() : spawnSync(source ? 'bun' : process.execPath,[worker,...Object.entries(flags).flatMap(([key,value])=>['--'+key,value])],{cwd:process.cwd(),env,encoding:'utf8',timeout:55000,maxBuffer:4*1024*1024});
+fs.writeFileSync(path.join(cwd,'worker-output.log'),(result.stdout??'')+'\nSTDERR\n'+(result.stderr??''));
+const status = fs.existsSync(flags['status-file']) ? JSON.parse(fs.readFileSync(flags['status-file'],'utf8')) : null;
+const events = fs.readFileSync(transcript,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+const x = events.filter(e=>e.type === 'X-start');
+const complete = events.find(e=>e.type === 'compaction-complete' || e.type === 'seed-committed');
+const startup = events.find(e=>e.type === 'delayed-startup-finished');
+const prompts = events.filter(e=>e.type === 'native-prompt');
+const wire = fs.existsSync(flags['log-file']) ? fs.readFileSync(flags['log-file'],'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line)) : [];
+const contextIndex = wire.findIndex(e=>e.type === 'response' && e.command === 'get_messages' && e.success && String(e.id).startsWith('fabric-context:'));
+const assistantIndex = wire.findIndex(e=>e.type === 'message_start' && e.message?.role === 'assistant');
+const contextAdmitted = contextIndex >= 0 && contextIndex < assistantIndex;
+const errors = [];
+if((mode === 'restart-actor' || fresh) && !contextAdmitted) errors.push('native actor context admission must precede the first assistant');
+if(result.status !== 0 || (mode !== 'abort' && status?.status !== 'completed')) errors.push('native run failed: '+(status?.error ?? result.stderr ?? result.error));
+if(mode === 'compound' || mode === 'abort') {
+  if(x.length || prompts.length !== 1 || fs.existsSync(path.join(cwd,'item-X.txt'))) errors.push('automatic continuation must never start, including after abort');
+  if(!complete) errors.push('the safe floor must preserve successful native compaction');
+  const refusal = wire.find(e=>e.type === 'fabric_compact_resume_refused');
+  if(refusal?.count !== 1 || !refusal.message.includes('Automatic compaction resume is disabled')) errors.push('live refusal must be explicit and caller-visible');
+  if(mode === 'compound' && !status?.warnings?.some(warning=>warning.includes('Automatic compaction resume is disabled'))) errors.push('worker result must retain the live refusal warning');
+  const branch = SessionManager.open(manager.getSessionFile()).getBranch();
+  if(!branch.some(e=>e.type === 'custom' && e.customType === 'fabric-compact-resume' && e.data.state === 'cancelled' && e.data.reason?.includes('automatic compaction resume disabled'))) errors.push('live refusal must be durable');
+  if(mode === 'abort') {
+    const abort = events.find(e=>e.type === 'rpc-abort-sent');
+    const settled = events.find(e=>e.type === 'native-settled');
+    if(!abort || !settled || abort.at > settled.at || abort.at > complete?.at) errors.push('real RPC abort must precede native compaction and settlement');
+    if(settled?.signalPresent !== false) errors.push('regression must exercise the cleared boundary signal');
+    if(!wire.some(e=>e.type === 'message_end' && e.message?.stopReason === 'aborted')) errors.push('native inference must have been explicitly aborted');
+    if(!wire.some(e=>e.type === 'response' && e.id === 'real-abort' && e.success)) errors.push('native abort must settle successfully');
+  }
+}
+if(mode === 'receipt' && (x.length || prompts.length !== 1)) errors.push('persisted receipt must not replay its continuation');
+if(mode === 'plain' && (x.length || prompts.length !== 1 || !complete)) errors.push('plain compaction must stay idle after its initial prompt');
+if(mode.startsWith('restart') && (prompts.length !== 1 || events.some(e=>e.type === 'input-preflight' && e.at < startup?.at))) errors.push('restart preflight must follow delayed startup with only one admitted prompt');
+if(mode.startsWith('restart')) {
+  const refusal = wire.find(e=>e.type === 'fabric_compact_resume_refused');
+  if(refusal?.count !== 1 || !refusal.message.includes('original admission cannot be proven')) errors.push('startup must explicitly refuse unprovable recovery');
+  if(!status?.warnings?.some(warning=>warning.includes('restart recovery refused'))) errors.push('caller-visible worker result must retain the refusal warning');
+  if(x.length || fs.existsSync(path.join(cwd,'item-X.txt'))) errors.push('refused A must never run');
+  if(prompts.some(e=>e.prompt.includes('Resume after compaction:') || e.prompt.includes('[Fabric continuation:'))) errors.push('fresh input must not coalesce refused A');
+  const branch = SessionManager.open(manager.getSessionFile()).getBranch();
+  if(!branch.some(e=>e.type === 'custom' && e.customType === 'fabric-compact-resume' && e.data.state === 'cancelled' && e.data.reason?.includes('original admission cannot be proven'))) errors.push('refusal must be durable');
+}
+if(fresh) {
+  if(prompts[0]?.prompt !== freshTask || status?.text !== 'B completed') errors.push('only fresh B must reach native input and run');
+  if(!fs.existsSync(path.join(cwd,'item-B.txt')) || fs.readFileSync(path.join(cwd,'item-B.txt'),'utf8') !== 'B completed') errors.push('fresh task B must execute its real write tool');
+  const persisted = SessionManager.open(manager.getSessionFile()).getBranch().filter(e=>e.type === 'message' && e.message.role === 'user').map(e=>JSON.stringify(e.message));
+  if(persisted.filter(text=>text.includes(freshTask)).length !== 1 || persisted.some(text=>text.includes('[Fabric continuation:'))) errors.push('one durable native input must retain B alone');
+}
+if(mode === 'restart-inherited') {
+  if(prompts[0]?.model !== 'offline') errors.push('native configured default model must be inherited');
+  const recoveryIndex = wire.findIndex(e=>e.type === 'fabric_compact_resume_refused');
+  const startupIndex = wire.findIndex(e=>e.type === 'response' && e.command === 'get_state' && e.success && String(e.id).startsWith('fabric-model:'));
+  if(recoveryIndex < 0 || startupIndex <= recoveryIndex || startupIndex >= assistantIndex) errors.push('inherited model refusal must precede native startup admission and inference');
+}
+const summary = {mode,pi,worker,fabric,freshTaskAdmitted: fresh ? prompts[0]?.prompt.includes(freshTask) : undefined, fabricModelSelector: flags.model ?? null,actorContextAdmitted: contextAdmitted,exitCode:result.status,status:status?.status,text:status?.text,error:status?.error,compactionCompletionAt:complete?.at,xStartAt:x[0]?.at,latencyMs:x[0]&&complete ? x[0].at-complete.at : null,prompts:prompts.length,continuations:x.length,errors,transcript};
+fs.writeFileSync(path.join(cwd,'result.json'),JSON.stringify(summary,null,2)+'\n'); console.log(JSON.stringify(summary,null,2));
+if(errors.length) process.exitCode=1;

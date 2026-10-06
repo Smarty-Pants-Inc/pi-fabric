@@ -41,6 +41,22 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
+  it("completes correlated native startup admission before dispatching an inherited-model task", async () => {
+    vi.stubEnv("FAKE_PI_BEHAVIOR", "success");
+    const result = await run("admission regression", 8_000);
+    expect(result.status, result.error).toBe("completed");
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const request = events.find(e => e.type === "fake_received" && e.frame.type === "get_state");
+    expect(request.frame.id).toMatch(/^fabric-model:/);
+    const response = events.findIndex(e => e.type === "response" && e.id === request.frame.id && e.command === "get_state" && e.success);
+    const prompt = events.findIndex(e => e.type === "fake_received" && e.frame.type === "prompt");
+    const assistant = events.findIndex(e => e.type === "message_end" && e.message.role === "assistant");
+    expect(response).toBeGreaterThanOrEqual(0);
+    expect(prompt).toBeGreaterThan(response);
+    expect(assistant).toBeGreaterThan(prompt);
+    expect(events[prompt].frame.message).toBe("admission regression");
+  });
+
   it("persists the spawn-selected compatible installed release in the real worker record", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-installed-e2e-"));
     roots.push(root);

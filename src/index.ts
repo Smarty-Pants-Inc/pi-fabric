@@ -54,6 +54,7 @@ import {
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
+import { recoverCompactResume, reportCompactResumeRefusal } from "./core/compact-resume.js";
 import {
   createToolOwnershipReassertion,
   FabricToolLifecycle,
@@ -745,6 +746,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Hold the lease through activation, actor re-arm and reporting, even on failure.
       releaseSlot?.();
     }
+    reportCompactResumeRefusal(context, recoverCompactResume(pi, context, true), true);
   });
 
   // Keep activation/reload startup first; the renderer's session_start hook
@@ -765,10 +767,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("input", async (event, context) => {
     if (!state.initialized) return;
-    state.prewalk.observeTask(
-      context.sessionManager.getSessionId(),
-      event.text,
-    );
+    state.prewalk.observeTask(context.sessionManager.getSessionId(), event.text);
     await state.publishHostLifecycle("pi.input", event);
   });
 

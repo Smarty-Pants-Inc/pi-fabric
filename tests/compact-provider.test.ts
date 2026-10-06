@@ -26,6 +26,13 @@ const setup = (): { controller: CompactController; provider: CompactProvider } =
 };
 
 describe("CompactProvider", () => {
+  it("accepts a bounded explicit resume instruction independently of summary instructions", async () => {
+    const { controller, provider } = setup();
+    await provider.invoke("request", { instructions: "Keep the map", resume: "Start item X" }, context);
+    expect(controller.status().pending).toMatchObject({ instructions: "Keep the map", resume: "Start item X" });
+    await expect(provider.invoke("request", { resume: "x".repeat(16_385) }, context)).rejects.toThrow();
+  });
+
   it("exposes request (write), status (read), and cancel (write) descriptors", async () => {
     const { provider } = setup();
     const listed = await provider.list({}, context);

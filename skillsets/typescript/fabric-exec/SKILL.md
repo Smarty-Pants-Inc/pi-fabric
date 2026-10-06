@@ -90,7 +90,7 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `components.status({id})` | `FabricComponentInfo` with state, requirements, provisions, targetDigest?, error?, cleanupErrors? |
 | `components.graph()` | `{components:FabricComponentInfo[],edges:Array<{from,to,ref}>,cycles:string[][]}` |
 | `components.reload({id?}?)` | `{components:FabricComponentInfo[]}`; rolls back activation failure when cleanup succeeds |
-| `compact.request(args?)` | `{requested:true,intent:{reason?,instructions?,preserve?,requestedBy,requestedAt}}` |
+| `compact.request({reason?,instructions?,preserve?,resume?,requestedBy?}?)` | `{requested:true,intent:{reason?,instructions?,preserve?,resume?,resumeId?,requestedBy,requestedAt}}`; automatic resume is disabled (smarty-dev#5282). Pending `resume` work is durably refused with a UI/RPC warning; re-submit it explicitly. Compaction stays idle. |
 | `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?}}` |
 | `compact.cancel()` | `{cancelled:true}` |
 | `cache.status({target?}?)` | Local session cache observations, live leases, capability/cleanup diagnostics; observations do not prove residency |

@@ -54,6 +54,22 @@ const committed = (tokensBefore = 1000): Parameters<CapturedCompact["onComplete"
 });
 
 describe("CompactController", () => {
+  it("resumes pending work exactly once after successful compaction", async () => {
+    const onSettled = vi.fn();
+    const controller = new CompactController({ onSettled } as ConstructorParameters<typeof CompactController>[0]);
+    const capture: CompactCapture = { current: undefined };
+    const intent = controller.request({ resume: "Start item X" } as Parameters<typeof controller.request>[0]);
+    const commit = controller.maybeCommit(fakeContext(capture));
+    expect(onSettled).not.toHaveBeenCalled();
+    capture.current!.onComplete(committed());
+    capture.current!.onComplete(committed());
+    await commit;
+    await controller.maybeCommit(fakeContext(capture));
+    expect(onSettled).toHaveBeenCalledTimes(1);
+    expect(onSettled).toHaveBeenCalledWith(expect.objectContaining({ resume: "Start item X" }), "committed", expect.any(Object));
+    expect(intent).toHaveProperty("resumeId");
+  });
+
   it("records a pending intent and reports it via status", () => {
     const controller = new CompactController();
     const intent = controller.request({

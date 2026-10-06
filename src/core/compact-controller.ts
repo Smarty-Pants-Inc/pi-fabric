@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   compactionRequestBoundsError,
@@ -22,6 +23,8 @@ export interface CompactRequestIntent {
   instructions?: string;
   preserve?: string[];
   requestedBy?: string;
+  /** Pending work to durably refuse, not summary instructions. Automatic resume is disabled. */
+  resume?: string;
 }
 
 export interface CompactPendingIntent {
@@ -30,6 +33,8 @@ export interface CompactPendingIntent {
   preserve?: string[];
   requestedBy: string;
   requestedAt: number;
+  resume?: string;
+  resumeId?: string;
 }
 
 type CompactCommitStatus = "committed" | "cancelled" | "failed";
@@ -59,9 +64,12 @@ export interface CompactControllerHooks {
   // small)" (the intent is still cleared; the raw pi message is kept in
   // `error`), and "failed" for any other error.
   onCommit?: (info: CompactLastCommit) => void;
+  onBegin?: (intent: CompactPendingIntent, context: ExtensionContext) => void;
+  onSettled?: (intent: CompactPendingIntent, status: CompactCommitStatus, context: ExtensionContext) => void;
 }
 
 const DEFAULT_REQUESTED_BY = "model";
+export const MAX_COMPACT_RESUME_CHARS = 16_384;
 
 // Pi rejects a manual compaction with these exact messages when there is
 // nothing to do: the user cancelled it, the session is already compacted, or
@@ -100,6 +108,11 @@ export class CompactController {
   // Record a pending compaction intent. A single slot: a new request replaces
   // any pending one, keeping the latest instructions.
   request(intent: CompactRequestIntent): CompactPendingIntent {
+    if (intent.resume !== undefined &&
+      (typeof intent.resume !== "string" || intent.resume.length > MAX_COMPACT_RESUME_CHARS)) {
+      throw new Error(`compact resume must be a string of at most ${MAX_COMPACT_RESUME_CHARS} characters`);
+    }
+    const resume = intent.resume?.trim();
     const preserve = checkedPreserve(intent.preserve);
     const request = {
       ...(intent.instructions !== undefined ? { instructions: intent.instructions } : {}),
@@ -111,6 +124,7 @@ export class CompactController {
     const pending: CompactPendingIntent = {
       requestedBy: isString(intent.requestedBy) ? intent.requestedBy! : DEFAULT_REQUESTED_BY,
       requestedAt: Date.now(),
+      ...(resume ? { resume, resumeId: randomUUID() } : {}),
       ...(isString(intent.reason) ? { reason: intent.reason } : {}),
       ...(isString(intent.instructions) ? { instructions: intent.instructions } : {}),
       ...(preserve !== undefined ? { preserve } : {}),
@@ -164,6 +178,7 @@ export class CompactController {
       callbackSettled = true;
       try {
         apply();
+        this.#hooks.onSettled?.(committing, this.#last!.status, context);
       } finally {
         settle();
       }
@@ -182,6 +197,7 @@ export class CompactController {
           this.#hooks.onCommit?.(this.#last);
         });
       } else {
+        this.#hooks.onBegin?.(committing, context);
         context.compact({
           ...(instructions ? { customInstructions: instructions } : {}),
           onComplete: (result) => finish(() => {

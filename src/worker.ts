@@ -704,6 +704,8 @@ const main = async (): Promise<void> => {
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
+  const initialPiMessage = (): string => resumePrompt
+    ? "Continue the task from the existing session. Do not repeat completed work." : task;
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -884,7 +886,7 @@ const main = async (): Promise<void> => {
   let contextAdmission: InstanceType<NonNullable<typeof admissionModule>["ActorContextAdmission"]> | undefined;
   const dispatchPiPrompt = (): void => {
     if (terminalStatus) return;
-    const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
+    const message = initialPiMessage();
     if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
     else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
     // ctx.isIdle() remains true during asynchronous prompt preflight. Do not
@@ -936,7 +938,7 @@ const main = async (): Promise<void> => {
       }
       if (admissionModule && estimateActorInput) {
         contextAdmission = new admissionModule.ActorContextAdmission(options.id,
-          resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task,
+          initialPiMessage(),
           options.systemPrompt ?? "", estimateActorInput, {
             send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
@@ -957,7 +959,9 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
+  // Even an inherited model must wait for native RPC session_start handlers
+  // and the correlated startup admission response before input opens.
+  }, activationWindow, true, Boolean(options.routeHeader));
   let modelControl = createModelControl();
 
   // Attributed token telemetry. Every usage-bearing child event emits one
@@ -1391,6 +1395,21 @@ const main = async (): Promise<void> => {
         if (!record.runnerSessionIds.includes(sessionId)) record.runnerSessionIds.push(sessionId);
         update();
       }
+      return;
+    }
+    if (event.type === "fabric_compact_resume_refused") {
+      if (event.protocol === 1 && event.runId === options.id && Number.isSafeInteger(event.count) && Number(event.count) > 0) {
+        const warning = typeof event.message === "string" && event.message.length <= 1024
+          ? event.message : "Automatic compaction resume is disabled; re-submit pending work explicitly (smarty-dev#5282).";
+        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        update();
+      }
+      return;
+    }
+    if (event.type === "fabric_compact_resume_ready") {
+      // Fail closed when an older child generation attempts startup bundling.
+      // Its journal cannot prove an original sender or parent output lineage.
+      modelControl.fail("compaction restart recovery refused: original admission cannot be proven; re-submit pending work explicitly");
       return;
     }
     compactControl.observe(event);

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { beginCompactResume, settleCompactResume } from "./core/compact-resume.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
@@ -700,6 +701,8 @@ export class FabricRuntimeState {
     }));
     this.#identity = identity;
     this.#compact = new CompactController({
+      onBegin: (intent) => beginCompactResume(this.pi, intent),
+      onSettled: (intent, status, boundary) => settleCompactResume(this.pi, intent, status, boundary),
       onRequest: (intent) => void this.#publishCompactEvent("requested", intent),
       onCommit: (info) => void this.#publishCompactEvent(info.status, info),
     });

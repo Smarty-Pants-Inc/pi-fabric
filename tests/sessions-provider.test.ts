@@ -91,6 +91,53 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(await call("status", { id })).toMatchObject({ state: "cancelled" });
   });
 
+  it("bounds confirmed compensating-stop authority without evicting unconfirmed custody", async () => {
+    const { provider, call, root } = setup();
+    let sequence = 0;
+    let abort: AbortController;
+    let unconfirmed = true;
+    const request = vi.fn(async (name: string, args: Record<string, unknown>) => {
+      if (name === "spawn") {
+        const id = `s-bounded-${sequence++}`;
+        abort.abort(new Error("launch cancelled"));
+        return { id, state: "running" };
+      }
+      if (name === "stop") return { id: args.job, state: args.job === "s-bounded-0" && unconfirmed ? "running" : "cancelled" };
+      throw new Error(`Unexpected request: ${name}`);
+    });
+    const open = vi.spyOn(JevFabricServe, "open").mockResolvedValue({
+      request, exited: new Promise(() => {}), close: async () => {},
+    } as unknown as JevFabricServe);
+    try {
+      // One unconfirmed stop remains in #opened and on disk, while 257 terminal
+      // receipts exceed the 256-entry cache and evict the oldest terminal one.
+      for (let index = 0; index < 258; index++) {
+        abort = new AbortController();
+        await expect(provider.invoke("open", { argv: ["true"] }, {
+          parentToolCallId: "bounded-owner", signal: abort.signal,
+        } as unknown as FabricInvocationContext)).rejects.toThrow(index === 0 ? /stop is unconfirmed/ : /launch cancelled/);
+      }
+      expect(await call("list", {})).toEqual([expect.objectContaining({ id: "s-bounded-0", stopRequired: true })]);
+      const custodyRoot = path.join(root, "home", ".fabric-launch-custody");
+      const records = fs.readdirSync(custodyRoot);
+      expect(records).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(path.join(custodyRoot, records[0]!), "utf8")))
+        .toMatchObject({ id: "s-bounded-0", state: "stop-required" });
+      const callsBeforeForeignStop = request.mock.calls.length;
+      await expect(call("stop", { id: "s-bounded-1" })).rejects.toThrow(/trusted external control authority/);
+      expect(request).toHaveBeenCalledTimes(callsBeforeForeignStop);
+      await expect(call("write", { id: "s-bounded-257", text: "x" })).rejects.toThrow(/trusted external control authority/);
+      // Exactly the most recent 256 terminal receipts retain stop authority.
+      for (let index = 2; index < 258; index++) {
+        expect(await call("stop", { id: `s-bounded-${index}` })).toMatchObject({ state: "cancelled" });
+      }
+      unconfirmed = false;
+      expect(await call("stop", { id: "s-bounded-0" })).toMatchObject({ state: "cancelled" });
+      expect(await call("list", {})).toEqual([]);
+      expect(fs.readdirSync(custodyRoot)).toHaveLength(0);
+    } finally { await provider.close(); open.mockRestore(); }
+  });
+
   it("SR-7 ends a Jev invocation before acknowledgement without losing its session child", async () => {
     const { provider, call, root } = setup({ launchDelayMs: 250 });
     const pending = call("open", { argv: ["sleep", "30"] }, "jev:delayed-owner");

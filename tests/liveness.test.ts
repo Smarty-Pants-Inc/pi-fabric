@@ -77,6 +77,18 @@ describe("ownerLiveness", () => {
     })).toBe("alive");
   });
 
+  it.each(["alive", "dead", "unknown"] as const)("without procfs incarnation evidence, recovery follows confirmed signal evidence (%s)", answer => {
+    const bare: OwnerIdentity = { pid: self.pid, hostname: self.hostname, startedAt: self.startedAt };
+    const started = vi.fn(() => undefined);
+    const record = { pid: 42, identity: { hostname: bare.hostname, startedAt: bare.startedAt - 30_000 } };
+    expect(recordOwnerLiveness(record, { probes: probes({
+      self: () => bare, signal: () => answer, processStartedAt: started,
+    }) })).toBe(answer);
+    // Windows cannot turn a stale timestamp into PID-reuse evidence. Only the
+    // signal's confirmed-dead answer permits recovery; alive/unknown retain it.
+    expect(started).not.toHaveBeenCalled();
+  });
+
   it.each(["namespace", "host"])("security round: a missed %s heartbeat is unknown, not confirmed death", kind => {
     const foreign = { ...local, ...(kind === "namespace" ? { pidNamespace: "pid:[foreign]" } : { hostname: "node-b" }) };
     const signal = vi.fn(() => "dead" as const);

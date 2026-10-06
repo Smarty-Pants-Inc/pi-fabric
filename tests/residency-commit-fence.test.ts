@@ -992,6 +992,11 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // The 250 ms create budget above injects uncertainty, not a latency SLO
+      // for the resumed Main's real status/stop requests under CI contention.
+      // Restore a normal reconciliation budget only after the original execution
+      // and held response have settled; its immutable receipt is unchanged.
+      state.client.options.commandTimeoutMs = 8_000;
       // Simulate the resumed wall clock for new reconciliation generations, not
       // the original execution deadline. The expiry watermark never rolls back.
       const realNow = Date.now.bind(Date);

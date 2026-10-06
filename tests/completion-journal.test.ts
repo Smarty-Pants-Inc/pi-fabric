@@ -395,15 +395,16 @@ describe("completion journal idle scans", () => {
     }
     const expected = pendingCompletions(h.meshRoot, h.root).map(envelope => envelope.result.id);
     const enqueue = vi.fn();
-    const read = fs.promises.readFile.bind(fs.promises);
+    const read = fs.promises.readFile;
     let reads = 0;
-    // Do not retain every large body in a spy's result history: the latency probe
-    // should measure the journal's real reads/parsing, not instrumentation GC.
-    const asyncRead = vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
+    // A spy retains every returned Promise (and its resolved body) in mock.results,
+    // even when its implementation is otherwise plain. Keep only a count so this
+    // probe does not measure instrumentation retention/GC alongside the scan.
+    fs.promises.readFile = (async (target: any, ...args: any[]) => {
       reads++;
       await new Promise(resolve => setTimeout(resolve, 2.3)); // Windows-like per-read latency.
       return read(target, ...args);
-    }) as typeof fs.promises.readFile);
+    }) as typeof fs.promises.readFile;
     const sync = vi.spyOn(fs, "fsyncSync");
     try {
       const measured = await measureIdlePass(state, () => {
@@ -424,7 +425,7 @@ describe("completion journal idle scans", () => {
         }
       });
       assertIdleLatency(measured);
-    } finally { asyncRead.mockRestore(); }
+    } finally { fs.promises.readFile = read; }
     if (state === "consumed leftovers") {
       const envelopes = fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"));
       expect(envelopes).toHaveLength(132); // Still cap destructive pruning at 128 per pass.
@@ -432,12 +433,52 @@ describe("completion journal idle scans", () => {
     }
   }, 15_000);
 
+  it.each([false, true])("idle pruning awaits slow unlinks after the receipt/CAS barrier without synchronous removal (claim=%s)", async withClaim => {
+    const h = setup(); const result = h.seed(1);
+    consumeCompletion(h.meshRoot, result.id, h.recipient.sessionId);
+    const claimKey = `residency/completion-claims/${path.basename(h.file(result.id), ".json")}`;
+    if (withClaim) await h.mesh.put({ key: claimKey,
+      identity: { id: h.recipient.rootId, name: "main", kind: "main" },
+      value: { rootId: h.recipient.rootId, sessionId: h.recipient.sessionId, recipient: h.recipient } });
+    const rm = fs.promises.rm;
+    let started!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const unlink = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
+      if (String(target) === h.file(result.id)) {
+        expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+        expect(h.mesh.get(claimKey)).toBeUndefined();
+        started(); await gate;
+      }
+      await rm(target, options);
+    });
+    const synchronous = vi.spyOn(fs, "rmSync").mockImplementation(() => { throw new Error("Idle pruning must not unlink synchronously"); });
+    const enqueue = vi.fn();
+    const drain = h.journal(enqueue).drain();
+    try {
+      await Promise.race([entered, drain.then(() => { throw new Error("Drain finished without entering async unlink"); })]);
+      // The unlink is still held, but Main's timer gets a real turn, and the
+      // source/receipt remain intact until asynchronous OS cleanup completes.
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(fs.existsSync(h.file(result.id))).toBe(true);
+      expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+      expect(synchronous).not.toHaveBeenCalled();
+      expect(unlink).toHaveBeenCalled();
+    } finally {
+      release();
+      try { await drain; } finally { synchronous.mockRestore(); unlink.mockRestore(); }
+    }
+    expect(fs.existsSync(h.file(result.id))).toBe(false);
+    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
   it("recovers a crash after the receipt barrier but before envelope unlink without redelivery", async () => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
-    const rm = fs.rmSync;
-    const unlink = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const rm = fs.promises.rm;
+    const unlink = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
       if (String(target) === h.file(result.id)) throw new Error("crash before unlink");
-      rm(target, options);
+      await rm(target, options);
     });
     expect(journal.acknowledge(result.id)).toBe(true); // Consumption fences synchronously; cleanup is async.
     await vi.waitFor(() => expect(unlink.mock.calls.some(([target]) => String(target) === h.file(result.id))).toBe(true));

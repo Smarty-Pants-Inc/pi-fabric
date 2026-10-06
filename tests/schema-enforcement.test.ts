@@ -591,27 +591,51 @@ describe("Schema transactions", () => {
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(lockPath), journals[0]!), "utf8"))).toMatchObject({ status: "applying" });
   });
 
-  it.each(["gone", "reused", "denied"])("incarnation recovery: %s requires confirmed death", kind => {
+  it.each(["gone", "reused", "denied", "unobservable"])("incarnation recovery: %s requires confirmed death", kind => {
     const setup = fixture();
     const target = path.join(setup.cwd, "a.txt");
     fs.writeFileSync(target, "mutated\n");
     const journalRoot = path.join(setup.mesh.root, "schema-transactions");
     const owner = currentOwnerIdentity();
-    const pid = kind === "reused" ? process.pid : 2147483647;
-    const lock = `${pid}\n0\n${JSON.stringify({ ...owner, startedAt: owner.startedAt - (kind === "reused" ? 30_000 : 0) })}\n`;
+    const shiftedIncarnation = kind === "reused" || kind === "unobservable";
+    const pid = shiftedIncarnation ? process.pid : 2147483647;
+    const lock = `${pid}\n0\n${JSON.stringify({ ...owner, startedAt: owner.startedAt - (shiftedIncarnation ? 30_000 : 0) })}\n`;
     fs.writeFileSync(path.join(journalRoot, ".commit.lock"), lock);
-    fs.writeFileSync(path.join(journalRoot, "incarnation.json"), JSON.stringify({ format: 1, id: "incarnation", status: "applying", before: [{
+    const journalPath = path.join(journalRoot, "incarnation.json");
+    const journal = JSON.stringify({ format: 1, id: "incarnation", status: "applying", before: [{
       path: "a.txt", absolute: target, existed: true, content: Buffer.from("before\n").toString("base64"), mode: 0o644,
-    }], createdAt: 0 }));
+    }], createdAt: 0 });
+    fs.writeFileSync(journalPath, journal);
     const kill = process.kill.bind(process);
     const probe = vi.spyOn(process, "kill").mockImplementation((candidate, signal) => {
       if (candidate === 2147483647) throw Object.assign(new Error(kind), { code: kind === "gone" ? "ESRCH" : "EPERM" });
       return kill(candidate, signal);
     });
+    // Exercise the real recovery/liveness path with an unavailable native start
+    // reader too: neither Linux procfs failure nor Windows' absent procfs can
+    // turn a stale timestamp plus a live PID into confirmed incarnation death.
+    const read = fs.readFileSync;
+    const nativeStart = vi.spyOn(fs, "readFileSync").mockImplementation(((file: any, ...args: any[]) => {
+      if (kind === "unobservable" && String(file) === `/proc/${process.pid}/stat`) {
+        throw Object.assign(new Error("native start unavailable"), { code: "ENOENT" });
+      }
+      return (read as any)(file, ...args);
+    }) as typeof fs.readFileSync);
     try { new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state); }
-    finally { probe.mockRestore(); }
-    expect(fs.readFileSync(target, "utf8")).toBe(kind === "denied" ? "mutated\n" : "before\n");
-    expect(fs.existsSync(path.join(journalRoot, ".commit.lock"))).toBe(kind === "denied");
+    finally { nativeStart.mockRestore(); probe.mockRestore(); }
+    // A stale wall-clock timestamp alone is not native incarnation evidence.
+    // Windows (and Linux without procfs identity) must retain the live lock:
+    // there is no comparable boot/start pair for proving this PID was reused.
+    const confirmedDeath = kind === "gone" || (kind === "reused" && owner.bootId !== undefined);
+    expect(fs.readFileSync(target, "utf8")).toBe(confirmedDeath ? "before\n" : "mutated\n");
+    const lockPath = path.join(journalRoot, ".commit.lock");
+    expect(fs.existsSync(lockPath)).toBe(!confirmedDeath);
+    if (confirmedDeath) {
+      expect(JSON.parse(fs.readFileSync(journalPath, "utf8"))).toMatchObject({ status: "rolled_back" });
+    } else {
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(lock);
+      expect(fs.readFileSync(journalPath, "utf8")).toBe(journal);
+    }
   });
 
   it("recovers an applying crash journal before accepting new transactions", () => {

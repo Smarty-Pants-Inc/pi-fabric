@@ -9,6 +9,8 @@ import type { DurableShellBridge } from "../jev-fabric/bridge.js";
 import type { JevFabricServe } from "../jev-fabric/serve.js";
 
 const DAY_MS = 24 * 3_600_000;
+// Confirmed terminal jobs need only a bounded retry window, never launch custody.
+const STOPPED_OWNED_JOBS_LIMIT = 256;
 const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime) or a durable jev-fabric job ID." };
 const idOnly = { type: "object", properties: { id }, required: ["id"], additionalProperties: false };
 const waitMs = { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling; ready evidence returns at once. Never stops the child." };
@@ -256,8 +258,14 @@ export class SessionsProvider implements FabricProvider {
     if (result.id !== opened.id || !["cancelled", "timed_out", "exited", "failed"].includes(String(result.state))) {
       throw new Error("jev-fabric did not confirm a terminal stop receipt");
     }
-    // Keep owner authority for idempotent cleanup after a compensating stop.
+    // Keep recent owner authority for idempotent cleanup after a compensating
+    // stop. Evict only confirmed terminal receipts; #opened and durable uncertain
+    // launch records retain every still-unconfirmed cleanup obligation.
+    this.#stoppedOwnedJobs.delete(opened.id);
     this.#stoppedOwnedJobs.add(opened.id);
+    if (this.#stoppedOwnedJobs.size > STOPPED_OWNED_JOBS_LIMIT) {
+      this.#stoppedOwnedJobs.delete(this.#stoppedOwnedJobs.values().next().value!);
+    }
     this.#opened.delete(opened.id);
     if (opened.custodyFile) fs.unlinkSync(opened.custodyFile);
     return result;

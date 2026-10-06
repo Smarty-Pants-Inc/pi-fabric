@@ -80,8 +80,8 @@ describe("resident watchdog", () => {
   });
 
   it("keeps watchdog restart independent of mesh delivery outage backoff", async () => {
-    // Near-ceiling full jitter preserves the 100/200/400 ms polling schedule
-    // this test probes, without relying on production randomness.
+    // Pin retry jitter; the 1 s delivery floor dominates these early retry delays.
+    // Watchdog recovery retains its independent original cadence.
     const random = vi.spyOn(Math, "random").mockReturnValue(0.999999);
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
@@ -99,11 +99,15 @@ describe("resident watchdog", () => {
       await vi.advanceTimersByTimeAsync(50);
       expect(start).toHaveBeenCalledOnce();
       expect(read).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(949);
+      expect(read).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(read).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_000);
       expect(read).toHaveBeenCalledTimes(3);
       expect(warn).toHaveBeenCalledOnce();
       read.mockReturnValue([]);
-      await vi.advanceTimersByTimeAsync(400);
+      await vi.advanceTimersByTimeAsync(1_000);
       // Successor completion reconciliation also scans claims after a successful delivery pass.
       // Count delivery polls, not that separate scan, to keep the backoff assertion unchanged.
       expect(read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/"))).toHaveLength(4);

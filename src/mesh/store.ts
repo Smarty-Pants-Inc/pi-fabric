@@ -1,5 +1,6 @@
 import { createCommitStats } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -100,6 +101,8 @@ interface MeshStateFile {
 export interface MeshReadOptions {
   /** Revalidate canonical commit/physical identity now, bypassing the idle age window. */
   fresh?: boolean;
+  /** Opt in only for background display observations; never authority, routing or admission. */
+  background?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
 }
@@ -124,7 +127,9 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
-  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  /** Background-only idle window. Ordinary reads stay exact unless readCacheMs is explicitly set. */
+  backgroundReadCacheMs?: number;
+  /** A live turn/pending operation bypasses explicit ordinary TTL and bounds background TTL to 1 s. */
   readActive?: () => boolean;
   /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
   writeReadJournal?: boolean;
@@ -154,14 +159,15 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 // commands are rejected once past their deadline.
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 /**
- * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
- * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
- * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
- * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * Background-only read-cache age in a Fabric runtime and its resident host. Ordinary reads
+ * are exact on change; only explicitly opted-in display observations reuse a recent parse.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs), active observers for
+ * 1 s. Fresh protocol decisions always bypass both age windows (smarty-dev#2355/#4383).
  * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
 export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
+/** Floor for runtime background observations, including active turns (smarty-dev#4383). */
+export const MIN_BACKGROUND_MESH_READ_CACHE_MS = 1_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -631,6 +637,10 @@ export class MeshStore {
   readonly #generationPath: string;
   readonly #lockPath: string;
   readonly #lockProtocol: MeshLockProtocol;
+  readonly #ownIncarnation: Promise<string | undefined> | undefined;
+  #ownIncarnationReady = false;
+  #ownStartTime: string | undefined;
+  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
@@ -647,6 +657,7 @@ export class MeshStore {
   readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #backgroundReadCacheMs: number | undefined;
   readonly #readActive: (() => boolean) | undefined;
   readonly #writeReadJournal: boolean;
   #requireCanonicalRead = false;
@@ -679,6 +690,17 @@ export class MeshStore {
     const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
     if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
     this.#lockProtocol = lockProtocol;
+    // Prepare this immutable process identity once, at store construction rather
+    // than inside a registry-fenced acquisition. A cold bounded try fails closed
+    // until preparation finishes; the ordinary outside-custody recovery lane can
+    // wait for it. UNKNOWN still publishes the conservative three-line receipt.
+    if (lockProtocol === 2) {
+      this.#ownIncarnation = ownProcessIncarnation().then(start => {
+        this.#ownStartTime = start;
+        this.#ownIncarnationReady = true;
+        return start;
+      }, () => { this.#ownIncarnationReady = true; return undefined; });
+    }
     this.#writeAbortSignal = options.writeSignal;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
@@ -708,6 +730,8 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#backgroundReadCacheMs = options.backgroundReadCacheMs === undefined ? undefined
+      : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, Math.floor(options.backgroundReadCacheMs));
     this.#readActive = options.readActive;
     this.#writeReadJournal = options.writeReadJournal !== false;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -722,9 +746,15 @@ export class MeshStore {
     return this.#readActive?.() ? 0 : this.#readCacheMs;
   }
 
+  /** Opt-in background observations only; absence preserves legacy explicit TTL behavior. */
+  get backgroundReadCacheMs(): number {
+    if (this.#backgroundReadCacheMs === undefined) return this.readCacheMs;
+    return this.#readActive?.() ? MIN_BACKGROUND_MESH_READ_CACHE_MS : this.#backgroundReadCacheMs;
+  }
+
   /** Time until an idle observer may revalidate; hits do not slide this deadline. */
   get readCacheRemainingMs(): number {
-    return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
+    return this.#stateCache ? Math.max(0, this.backgroundReadCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
   }
 
   #dedupePath(dedupeKey: string, suffix: string): string {
@@ -1508,17 +1538,17 @@ export class MeshStore {
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
     const state = options.fresh === true || options.snapshot === undefined
-      ? this.#readCachedState(options.fresh === true)
+      ? this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true)
       : options.snapshot as MeshStateFile;
     const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
-  list(prefix = "", limit = 100): MeshStateEntry[] {
+  list(prefix = "", limit = 100, options: MeshReadOptions = {}): MeshStateEntry[] {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
     // Clone only the page: the dashboard lists the first 200 of the whole fleet state, and
     // cloning every entry to keep 200 was a large share of an idle Pi's CPU (smarty-dev#557).
-    return this.#select(prefix, {}).slice(0, boundedLimit).map((entry) => jsonClone(entry));
+    return this.#select(prefix, options).slice(0, boundedLimit).map((entry) => jsonClone(entry));
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
@@ -1532,7 +1562,7 @@ export class MeshStore {
    * while the token is unchanged (smarty-dev#557).
    */
   stateToken(options: MeshReadOptions = {}): object {
-    return this.#readCachedState(options.fresh === true);
+    return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true);
   }
 
   /**
@@ -1549,7 +1579,8 @@ export class MeshStore {
     const fresh = options.fresh === true;
     const state = options.snapshot !== undefined && !fresh
       ? options.snapshot as MeshStateFile
-      : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
+      : (!fresh && this.#signalledState(prefix, options.background === true)) ||
+        this.#readCachedState(fresh, fresh, options.background === true);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {
@@ -1571,10 +1602,10 @@ export class MeshStore {
   // The cached parse, when the reuse window expired, the canonical generation changed, and the read signal bound
   // to the file's exact current stat shows this prefix's namespace unchanged. Otherwise undefined:
   // the caller re-reads as before. Never used by fresh reads or with readCacheMs 0.
-  #signalledState(prefix: string): MeshStateFile | undefined {
+  #signalledState(prefix: string, background: boolean): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    const readCacheMs = this.readCacheMs;
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
     if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
@@ -1843,10 +1874,23 @@ export class MeshStore {
     return removed;
   }
 
-  /**
-   * Runs an operation under the mesh lock without touching the state: for a rare step that must
-   * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
-   */
+  /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
+   * Registry -> mesh publication retains custody through source selection and copies,
+   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * release registry fences and retry the whole step. This acquires NO lock itself.
+   * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
+  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
+    // Nested helpers retain the surrounding try budget and its lifetime.
+    const inherited = this.#tryLockScope.getStore();
+    if (inherited?.active) return operation();
+    const scope = { active: true, timeoutMs: Math.max(0, timeoutMs) };
+    return this.#tryLockScope.run(scope, async () => {
+      try { return await operation(); }
+      finally { scope.active = false; }
+    });
+  }
+
+  /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return this.#withLock(operation, lockTimeoutMs);
   }
@@ -2024,8 +2068,8 @@ export class MeshStore {
 
   /**
    * The stamp of the state payload that reads now return, from this store's cache. With fresh,
-   * revalidate through the ordinary read-cache window, not authoritative payload freshness.
-   * This UI observer may lag remote changes by readCacheMs; observing a cached payload does
+   * revalidate through the background read-cache window, not authoritative payload freshness.
+   * This UI observer may lag remote changes by backgroundReadCacheMs; observing a cached payload does
    * not extend its age window. Expired reads use ordinary metadata/header validation and fallback.
    * An explicit remote rebuild may opt into revalidateGeneration: a new canonical UUID bypasses
    * even a warm window. Matching/copied, missing or unreadable markers keep ordinary TTL behavior;
@@ -2037,11 +2081,11 @@ export class MeshStore {
       try {
         const cached = this.#stateCache;
         let changed = false;
-        if (revalidateGeneration && cached && this.#readCacheMs > 0 && Date.now() - cached.parsedAt < this.#readCacheMs) {
+        if (revalidateGeneration && cached && this.backgroundReadCacheMs > 0 && Date.now() - cached.parsedAt < this.backgroundReadCacheMs) {
           const generation = this.#canonicalGeneration();
           changed = typeof generation === "string" && generation !== cached.generation;
         }
-        this.#readCachedState(changed, false); // observer only; public fresh payload reads stay canonical
+        this.#readCachedState(changed, false, true); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }
@@ -2050,11 +2094,11 @@ export class MeshStore {
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
-  #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
+  #readCachedState(fresh = false, canonical = fresh, background = false): MeshStateFile {
     const confirmed = this.#requireCanonicalRead;
     if (confirmed) { fresh = true; canonical = true; this.#requireCanonicalRead = false; }
     const recent = this.#stateCache;
-    const readCacheMs = this.readCacheMs;
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
     if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
@@ -2170,11 +2214,21 @@ export class MeshStore {
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const waitingAt = Date.now();
-    const deadline = waitingAt + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
-    const token = randomUUID();
+    // A registry-fenced publisher gets only a short try, never the ordinary wait.
+    // Async-local scope leaves concurrent ordinary callers on their own budget.
+    const scope = this.#tryLockScope.getStore();
+    const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
+    if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
+      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+    }
+    const startTime = this.#lockProtocol === 2
+      ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
+      : undefined;
+    const waitingAt = Date.now();
+    const deadline = waitingAt + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const token = randomUUID();
     let ownerRecord = "";
     const receipt = (): string => `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
@@ -2266,7 +2320,7 @@ export class MeshStore {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath)) continue;
+          if (await this.#clearStaleLock(ownerPath, deadline)) continue;
           if (Date.now() >= deadline) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs, Date.now() - waitingAt);
           }
@@ -2294,7 +2348,7 @@ export class MeshStore {
   // directories recover only after the grace, using atomic rmdir (never recursive removal
   // or rename): an owner published after our last comparison makes rmdir fail closed.
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  async #clearStaleLock(ownerPath: string): Promise<boolean> {
+  async #clearStaleLock(ownerPath: string, deadline: number): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -2331,8 +2385,24 @@ export class MeshStore {
       if (!validOwner) return false;
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
-        const actualStart = await processIncarnation(pid);
-        if (!actualStart || actualStart === recordedStart) return false;
+        // Registry-fenced publication cannot start even a bounded native read.
+        // Fail closed; the ordinary outside-custody admission lane obtains fresh
+        // holder evidence/recovery, then publication selects under fresh fences.
+        if (this.#tryLockScope.getStore()?.active) return false;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let actualStart: string | undefined;
+        try {
+          // Race only the evidence read, NEVER the recovery operation. A reader
+          // ignoring its native timeout cannot leave an escaped rename behind.
+          // The native reader also receives this budget so its child is aborted.
+          actualStart = await Promise.race([
+            processIncarnation(pid, remaining),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
+          ]);
+        } finally { clearTimeout(timer); }
+        if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);

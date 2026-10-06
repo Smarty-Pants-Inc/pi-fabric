@@ -288,18 +288,26 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     // Global order: actor registries (sorted path), then mesh, for publication,
     // adoption and controls. Retain registry custody from the fresh source read
-    // through shared commits AND per-key copies: releasing it before the mesh
-    // wait would let a delayed heartbeat republish a successor's adopted actor.
+    // through shared commits AND per-key copies. Mesh acquisition has a 50 ms try:
+    // contention unwinds these fences; one host-level retry waits for mesh admission
+    // OUTSIDE custody, then re-selects its source under fresh fences.
+    // Never move a selected snapshot outside custody: a delayed heartbeat could
+    // otherwise republish a successor's adopted actor.
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
     const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
-      ActorRegistryStore.withLocks(registries, publish);
+      ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      // Legacy list observations may lag; authority snapshots explicitly request fresh.
+      listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
+      // Acquire/release only: never carry a selected snapshot or mesh custody into
+      // registry acquisition. FIFO waiting gets us into periodic free windows.
+      waitForPublicationRetry: () => this.mesh.exclusive(() => undefined),
       publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
@@ -784,7 +792,7 @@ export class ResidentHost {
           command.data,
           signal,
           { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id)?.rootId) },
+            this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -808,7 +816,7 @@ export class ResidentHost {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
       const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-        this.participants.get(from.id)?.rootId);
+        this.participants.get(from.id, undefined, { fresh: true })?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
@@ -860,7 +868,7 @@ export class ResidentHost {
     } catch {
       // Route through the current remote owner below.
     }
-    const target = this.participants.get(subscription.to);
+    const target = this.participants.get(subscription.to, undefined, { fresh: true });
     if (!target) throw new Error(`Unknown Fabric lifecycle target: ${subscription.to}`);
     await this.control.request(
       target.ownerHostId,

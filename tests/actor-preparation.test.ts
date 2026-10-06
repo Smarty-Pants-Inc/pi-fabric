@@ -475,6 +475,13 @@ describe("actor preparation (#3167)", () => {
     expect(actors.status(actor.id).inFlightRun).toBeUndefined();
     await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
     expect(run).toHaveBeenCalledTimes(1);
+    expect(actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+    // Resolving abandoned acquisitions must not commit an old preparation or
+    // duplicate the accepted activation after recovery has already succeeded.
+    gate.resolve();
+    await pause(150);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
   });
 
   it("re-arms after a rejected preparation await as well as a timeout", async () => {

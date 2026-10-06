@@ -47,6 +47,11 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined, cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
     turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: task.includes("HANG_WITH_PROGRESS_CACHE") ? 5 : 0, cacheWrite: task.includes("HANG_WITH_PROGRESS_CACHE") ? 7 : 0, cost: 0.001 },
   }));
+  // The resident monitor forwards this only after the progress status above is on disk.
+  // Tests can await the forwarded event instead of racing worker boot with an abort.
+  if (lifecycleFile) fs.writeFileSync(lifecycleFile, JSON.stringify({
+    version: 1, event: "pi.turn_end", occurredAt: Date.now(), data: { turnIndex: 2 },
+  }) + "\n");
   const stay = () => setTimeout(stay, 1_000);
   stay();
   process.on("SIGTERM", () => process.exit(0));

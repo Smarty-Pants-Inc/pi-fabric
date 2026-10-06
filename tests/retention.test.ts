@@ -620,15 +620,17 @@ describe("run-root owner identity", () => {
     expect(readOwner(root)).toMatchObject({ pid: process.pid, heartbeatAt: 6, closedAt: 6, identity: { hostname: os.hostname() } });
   });
 
-  it("treats a foreign-namespace owner with a stale heartbeat as dead, even when its PID is live here", () => {
+  it("preserves a foreign-namespace owner with a stale heartbeat until incarnation death is confirmed", () => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "foreign-stale");
     // process.pid answers the signal probe here, but it is not the foreign owner.
     writeOwner(root, { pid: process.pid, startedAt: 1, heartbeatAt: 1, identity: foreignIdentity });
     const detectedAt = 1 + RUN_ROOT_HEARTBEAT_TTL_MS + 1;
     expect(sweep(tempRoot, detectedAt).removedRoots).toEqual([]);
-    expect(readOwner(root).orphanedAt).toBe(detectedAt);
-    expect(sweep(tempRoot, detectedAt + 6 * HOUR).removedRoots).toEqual([root]);
+    expect(readOwner(root).orphanedAt).toBeUndefined();
+    expect(sweep(tempRoot, detectedAt + 6 * HOUR).removedRoots).toEqual([]);
+    expect(fs.existsSync(root)).toBe(true);
+    expect(readOwner(root).orphanedAt).toBeUndefined();
   });
 
   it("keeps a foreign-namespace owner with a fresh heartbeat, even when its PID is absent here", () => {

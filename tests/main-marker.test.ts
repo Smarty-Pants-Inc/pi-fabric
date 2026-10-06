@@ -26,8 +26,14 @@ describe.skipIf(process.platform !== "linux")("Main process markers", () => {
       await marker.publish(first, "session:one", "one");
       expect(readMainMarker(first, process.pid, birth)).toMatchObject({ rootId: "session:one", sessionId: "one" });
       roots.length = 0;
-      await marker.publish(second, "session:two", "two");
+      await marker.beginTransition();
+      expect(readMainMarker(first, process.pid, birth)).toMatchObject({ fenced: true, transition: true, rootIds: ["session:one"] });
+      roots.length = 0;
+      await marker.beginTransition(second, "session:two", "two");
       expect(roots.sort()).toEqual(["session:one", "session:two"]);
+      expect(readMainMarker(second, process.pid, birth)).toMatchObject({ transition: true, rootIds: ["session:one", "session:two"] });
+      await marker.publish(second, "session:two", "two");
+      expect(readMainMarker(second, process.pid, birth)?.transition).toBeUndefined();
       expect(fs.existsSync(mainMarkerPath(first, process.pid, birth))).toBe(false);
       expect(readMainMarker(second, process.pid, birth)).toMatchObject({ rootId: "session:two", sessionId: "two" });
       expect(fs.readdirSync(path.join(second, "main-markers"))).toEqual([`${process.pid}-${birth}.json`]);

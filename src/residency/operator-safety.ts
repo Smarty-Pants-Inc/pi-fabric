@@ -47,6 +47,18 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
         if (close < 0 || fields.length < 20 || !/^\d+$/.test(fields[19]!)) refuse(config, "current Main process liveness is unknown (invalid /proc identity)");
         if (fields[0] === "Z" || fields[0] === "X") continue;
         const marker = readMainMarker(config.meshRoot, Number(name), fields[19]!);
+        if (marker && (marker.transition !== undefined || marker.fenced !== true)) {
+          refuse(config, `Main marker is transitioning or unfenced (PID ${name})`);
+        }
+        if (!marker) {
+          const file = path.join(config.meshRoot, "main-markers", `${name}-${fields[19]}.json`);
+          try {
+            fs.lstatSync(file);
+            refuse(config, `Main marker is unreadable or mismatched (PID ${name})`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }
         if (marker?.rootId && marker.sessionId) {
           if (marker.rootId === config.rootId || marker.sessionId === config.sessionId) {
             refuse(config, `Main process is still alive (Fabric marker for PID ${name})`);
@@ -95,8 +107,9 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
         const args = fs.readFileSync(path.join(directory, "cmdline"), "utf8").split("\0").filter(Boolean);
         const pi = args.slice(0, 2).map(arg => arg.replace(/\\/g, "/")).some(arg =>
           path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));
-        const boundElsewhere = (rootId && rootId !== config.rootId) || sessions.some(id => id && id !== config.sessionId);
-        if (pi && !boundElsewhere) refuse(config, `PID ${name}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
+        // Launch environment can remain bound to the previous session after /new.
+        // Only a stable, fenced marker may establish that a Pi is bound elsewhere.
+        if (pi) refuse(config, `PID ${name}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
       } catch (error) {
         if (error instanceof ResidentActorAuthorizationError) throw error;
         const code = (error as NodeJS.ErrnoException).code ?? "unknown";

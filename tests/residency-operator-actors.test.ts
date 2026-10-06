@@ -11,7 +11,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { mainGenerationPath } from "../src/residency/handover.js";
-import { mainMarkerPath } from "../src/residency/main-marker.js";
+import { MainProcessMarker, mainMarkerPath } from "../src/residency/main-marker.js";
 import * as mainPublication from "../src/residency/main-publication-fence.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -92,7 +92,7 @@ const fixture = async () => {
 };
 
 describe("non-Linux resident actor operator", () => {
-  it.each(["win32", "darwin"] as const)("%s refuses without /proc evidence but permits explicit force-live", async platform => {
+  it.each(["win32", "darwin"] as const)("%s refuses without /proc evidence; native-platform mutation permits explicit force-live", async platform => {
     const f = await fixture();
     let spy: ReturnType<typeof vi.spyOn> | undefined;
     try {
@@ -105,14 +105,19 @@ describe("non-Linux resident actor operator", () => {
         expect(result.err).toContain("operator dead-root control needs Linux /proc evidence; pass --force-live after confirming");
         expect(f.host.actors.status(actor.id).status).toBe("idle");
       }
-      expect((await f.cli("stop", actor.id, ["--force-live"])).code).toBe(0);
-      expect((await f.cli("remove", actor.id, ["--force-live"])).code).toBe(0);
+      // The refusal branch is platform-neutral. Actual mutation must use native
+      // I/O: mocking darwin on Windows selects POSIX directory fsync/read-only
+      // file descriptors, which Windows cannot flush. Test real force-live on
+      // every host instead of a synthetic macOS filesystem on windows-latest.
+      spy.mockRestore();
+      expect(await f.cli("stop", actor.id, ["--force-live"])).toMatchObject({ code: 0, err: "" });
+      expect(await f.cli("remove", actor.id, ["--force-live"])).toMatchObject({ code: 0, err: "" });
     } finally { spy?.mockRestore(); await f.close(); }
   }, 30_000);
 });
 
 describe.skipIf(process.platform !== "linux")("same-user resident actor operator", () => {
-  it.each(["target", "other", "reused PID"] as const)("unbound Pi Main with a %s marker", async binding => {
+  it.each(["target", "other", "reused PID", "unfenced", "transitioning", "unreadable", "mismatched"] as const)("unbound Pi Main with a %s marker", async binding => {
     const f = await fixture();
     let replacement: ChildProcess | undefined;
     try {
@@ -131,13 +136,19 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify({ pid, startTime,
         rootId: binding === "target" ? f.config.rootId : "session:elsewhere",
-        sessionId: binding === "target" ? f.config.sessionId : "elsewhere", createdAt: Date.now() }));
+        sessionId: binding === "target" ? f.config.sessionId : "elsewhere", createdAt: Date.now(),
+        ...(binding === "unfenced" ? {} : { fenced: true }),
+        ...(binding === "transitioning" ? { transition: true } : {}),
+        ...(binding === "mismatched" ? { pid: pid + 1 } : {}) }));
+      if (binding === "unreadable") fs.writeFileSync(file, "{invalid marker");
       for (const action of ["stop", "remove"] as const) {
         const result = await f.cli(action, actor.id, ["--dry-run"]);
         if (binding === "other") expect(result).toMatchObject({ code: 0, err: "" });
         else {
           expect(result.code).toBe(1);
-          expect(result.err).toContain(binding === "target" ? `Fabric marker for PID ${pid}` : `PID ${pid}: Main without a Fabric marker`);
+          expect(result.err).toContain(binding === "target" ? `Fabric marker for PID ${pid}`
+            : binding === "reused PID" ? `PID ${pid}: Main without a Fabric marker`
+            : ["unfenced", "transitioning"].includes(binding) ? "transitioning or unfenced" : "unreadable or mismatched");
         }
       }
       if (binding !== "other") await stopChild(replacement);
@@ -146,6 +157,38 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
     } finally { if (replacement) await stopChild(replacement); await f.close(); }
   }, 30_000);
 
+
+  it.each(["stop", "remove"] as const)("%s refuses throughout rebind and at the fenced commit recheck", async action => {
+    const f = await fixture(), marker = new MainProcessMarker();
+    const fence = mainPublication.withMainPublicationFence;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("marker-rebind-race"); await stopChild(f.child);
+      await marker.publish(f.config.meshRoot, "session:elsewhere", "elsewhere");
+      // A stable, fenced other-root Main does not veto the initial check.
+      expect(await f.cli(action, actor.id, ["--dry-run"])).toMatchObject({ code: 0, err: "" });
+      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (mesh, root, operation, wait) => {
+        // Initial operator census has passed. Rebind fences the OLD marker
+        // before the operator enters the target root's publication fence.
+        await marker.beginTransition();
+        return fence(mesh, root, operation, wait);
+      });
+      expect(await f.cli(action, actor.id)).toMatchObject({ code: 1, err: expect.stringContaining("transitioning or unfenced") });
+      spy.mockRestore();
+      // Old binding transitioning, next binding known, and fully established:
+      // no interleaving after rebind admission authorizes mutation.
+      for (const step of [async () => {},
+        () => marker.beginTransition(f.config.meshRoot, f.config.rootId, f.config.sessionId),
+        () => marker.publish(f.config.meshRoot, f.config.rootId, f.config.sessionId)]) {
+        await step();
+        for (const flags of [[], ["--dry-run"]]) {
+          expect((await f.cli(action, actor.id, flags)).code).toBe(1);
+          expect(f.host.actors.status(actor.id).status).toBe("idle");
+          expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+        }
+      }
+    } finally { spy?.mockRestore(); marker.close(); await f.close(); }
+  }, 30_000);
 
   it("after Main exits, CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
     const f = await fixture();
@@ -285,16 +328,14 @@ describe.skipIf(process.platform !== "linux")("same-user resident actor operator
       await once(replacement.stdout!, "data");
       for (const action of ["stop", "remove"] as const) {
         const dry = await f.cli(action, actor.id, ["--dry-run"]);
-        if (binding === "unbound") {
-          expect(dry.code).toBe(1); expect(dry.err).toContain(`PID ${replacement.pid}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
-          const refused = await f.cli(action, actor.id);
-          expect(refused.code).toBe(1); expect(refused.err).toContain("--force-live");
-        } else expect(dry).toMatchObject({ code: 0, err: "" });
+        expect(dry.code).toBe(1); expect(dry.err).toContain(`PID ${replacement.pid}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
+        const refused = await f.cli(action, actor.id);
+        expect(refused.code).toBe(1); expect(refused.err).toContain("--force-live");
         expect(f.host.actors.status(actor.id).status).toBe("idle");
         expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
       }
       expect((await f.cli("remove", actor.id, ["--force-live", "--dry-run"])).code).toBe(0);
-      if (binding === "unbound") await stopChild(replacement);
+      await stopChild(replacement);
       expect((await f.cli("stop", actor.id)).code).toBe(0);
     } finally { if (replacement) await stopChild(replacement); await f.close(); }
   }, 30_000);

@@ -8,6 +8,10 @@ export interface MainMarker {
   rootId: string;
   sessionId: string;
   createdAt: number;
+  /** Published by the root-scoped Main fence, including both bindings on rebind. */
+  fenced: true;
+  transition?: true;
+  rootIds?: string[];
 }
 export const mainMarkerPath = (meshRoot: string, pid: number, startTime: string): string =>
   path.join(meshRoot, "main-markers", `${pid}-${startTime}.json`);
@@ -43,12 +47,27 @@ export class MainProcessMarker {
     return publication;
   }
 
-  async #publish(meshRoot: string, rootId: string, sessionId: string): Promise<void> {
+  /** Await before changing any session state. Unknown next binding keeps the old
+   * marker transitioning; config/activation failures deliberately leave it so. */
+  beginTransition(meshRoot?: string, rootId?: string, sessionId?: string): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("Fabric Main marker is closed"));
+    const publication = this.#pending.catch(() => undefined).then(() => {
+      const current = this.#current;
+      if (!meshRoot && !current) throw new Error("Fabric Main marker has no starting binding");
+      return this.#publish(meshRoot ?? current!.meshRoot, rootId ?? current?.marker.rootId ?? "",
+        sessionId ?? current?.marker.sessionId ?? "", true);
+    });
+    this.#pending = publication;
+    return publication;
+  }
+
+  async #publish(meshRoot: string, rootId: string, sessionId: string, transition = false): Promise<void> {
     if (process.platform !== "linux") return;
     const { withMainPublicationFence } = await import("./main-publication-fence.js");
     if (!this.#startTime) throw new Error("Cannot publish Fabric Main marker without Linux process birth evidence");
     const previous = this.#current;
-    const marker: MainMarker = { pid: process.pid, startTime: this.#startTime, rootId, sessionId, createdAt: this.#createdAt };
+    const marker: MainMarker = { pid: process.pid, startTime: this.#startTime, rootId, sessionId, createdAt: this.#createdAt, fenced: true,
+      ...(transition ? { transition: true, rootIds: [...new Set([previous?.marker.rootId, rootId].filter((id): id is string => !!id))] } : {}) };
     const write = () => {
       if (this.#closed) return;
       const file = mainMarkerPath(meshRoot, marker.pid, marker.startTime);

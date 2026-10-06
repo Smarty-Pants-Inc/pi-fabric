@@ -3,8 +3,9 @@ import fs from "node:fs";
 import { expect, it } from "vitest";
 import { availablePythonBackends } from "./fixtures/python-backends.js";
 
+// Decode stdin bytes explicitly: Python's -I ignores PYTHON* encoding overrides.
 const parser = `import ast, json, sys, textwrap
-for example in json.load(sys.stdin):
+for example in json.loads(sys.stdin.buffer.read().decode("utf-8")):
     ast.parse("async def example():\\n" + textwrap.indent(example["code"], "    "), filename=example["label"])
 `;
 const syntaxCheck = (examples: Array<{ label: string; code: string }>) => spawnSync("python3", ["-I", "-B", "-c", parser], {

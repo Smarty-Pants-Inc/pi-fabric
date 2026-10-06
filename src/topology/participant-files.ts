@@ -190,7 +190,7 @@ const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Prom
     renameAtomic(lock, tombstone);
     if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
     else renameAtomic(tombstone, lock);
-  }).catch(() => undefined);                                // a busy mesh: the waiter retries
+  }); // A mesh timeout unwinds the publication fence; retry on the next refresh.
 };
 
 const deepFreeze = <T>(value: T): T => {

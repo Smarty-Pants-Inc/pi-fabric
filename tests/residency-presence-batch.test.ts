@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -51,6 +52,67 @@ const fixture = async (files = false) => {
 };
 
 describe("#4383 resident host presence batch", () => {
+  it.each([false, true])("releases registry custody during a 3 s external mesh hold (files=%s)", async files => {
+    const { host, config, records } = await fixture(files);
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const exited = new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject); child.once("close", code => resolve(code));
+    });
+    let refresh: Promise<unknown> | undefined, mutation: Promise<unknown> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.stdout.once("data", () => resolve());
+        child.once("error", reject); child.once("exit", () => reject(new Error(`holder exited: ${stderr}`)));
+      });
+      // Observe real registry custody at the actual batch call, without pausing it.
+      const owner = path.join(config.actorRoot, "actors.json.lock", "owner");
+      let entered!: () => void;
+      const selected = new Promise<void>(resolve => { entered = resolve; });
+      const batch = host.mesh.writeBatch.bind(host.mesh);
+      vi.spyOn(host.mesh, "writeBatch").mockImplementationOnce(input => {
+        expect(fs.existsSync(owner)).toBe(true); entered(); return batch(input);
+      });
+      refresh = host.participants.refresh().catch(error => error);
+      await selected;
+      const started = performance.now();
+      mutation = host.actors.setInstructions(records[0]!.id, "changed while mesh is busy");
+      await mutation;
+      const mutationMs = performance.now() - started;
+      console.log(JSON.stringify({ regression: "external-mesh-hold", files, mutationMs }));
+      expect(mutationMs).toBeLessThan(1000);
+      expect(await refresh).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(await exited, stderr).toBe(0);
+      await host.participants.refresh(); // pending change survives, then commits on recovery
+      expect(new ActorRegistryStore(config.actorRoot).records()[0]).toMatchObject({ instructions: "changed while mesh is busy" });
+    } finally {
+      await exited; await refresh; await mutation;
+    }
+  }, 10000);
+
+  it("unwinds registry custody when dead participant-key recovery finds a busy mesh", async () => {
+    const { host, config, records } = await fixture(true);
+    const keyLock = path.join(config.meshRoot, "participants", ".locks", createHash("sha256").update(records[0]!.id).digest("hex"));
+    fs.mkdirSync(keyLock, { recursive: true });
+    fs.writeFileSync(path.join(keyLock, "owner"), "2147483647\n\ndead-key\n");
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const started = performance.now();
+      await expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      await new ActorRegistryStore(config.actorRoot).withLock(() => undefined);
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(fs.existsSync(keyLock)).toBe(true); // no recovery without mesh custody
+      expect(await exited).toBe(0);
+      await host.participants.refresh();
+      expect(fs.existsSync(keyLock)).toBe(false);
+    } finally { await exited; }
+  }, 10000);
+
   it.each([false, true])("renews 40 actors across both scopes in one host batch without a Main (files=%s)", async files => {
     const { host, config, records } = await fixture(files);
     let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);

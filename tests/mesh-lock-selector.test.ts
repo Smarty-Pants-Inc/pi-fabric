@@ -99,7 +99,7 @@ describe("startup mesh lock selector", () => {
     const pending = mesh.exclusive(() => { throw new Error("must not enter"); }).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(100);
     expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect(timers.mock.calls.map(([, wait]) => wait)).toEqual([19, 39, 42]);
+    expect(timers.mock.calls.map(([, wait]) => wait)).toEqual([...Array(8).fill(10), 19, 1]);
     expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(live);
   });
 

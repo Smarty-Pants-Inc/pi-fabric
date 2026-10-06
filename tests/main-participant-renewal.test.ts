@@ -99,6 +99,67 @@ it.each([false, true])("a lapsed Main lease re-publishes its unchanged root once
   expect(s.writes).toHaveBeenCalledTimes(count); expect(s.warning).toHaveBeenCalledTimes(1);
 });
 
+it.each([false, true])("next renewal restores just the missing participant file with a healthy lease (files-only=%s)", async filesOnly => {
+  const s = await setup(filesOnly);
+  await removeParticipantFileIf(s.mesh, s.participantKey, () => true);
+  expect(readHostLease(s.root, s.identity.id)?.expiresAt).toBeGreaterThan(Date.now());
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(readParticipantFile(s.root, s.participantKey)?.value).toMatchObject({ id: s.identity.id });
+  expect(s.observer.get(s.identity.id, Date.now(), { fresh: true })).toMatchObject({ stale: false });
+  expect(s.warning).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/Main participant re-published.*missing/));
+});
+
+it.each([false, true])("recovery does not take a root key from a live replacement owner (files-only=%s)", async filesOnly => {
+  const s = await setup(filesOnly);
+  const record = readParticipantFile(s.root, s.participantKey)!.value as FabricParticipantRecord;
+  vi.setSystemTime(Date.now() + 20_000); // successor legitimately takes an expired key
+  const identity: MeshIdentity = { id: "session:successor", name: "main", kind: "main", sessionId: "successor" };
+  const successor = new ParticipantDirectory(new MeshStore(s.root, 65_536, 100), {
+    enabled: true, identity, rootId: record.rootId, hostId: identity.id, reapDeadHosts: false,
+  }); directories.push(successor);
+  const startedAt = Date.now();
+  successor.registerSource(() => [{ ...record, startedAt, updatedAt: Date.now() }]);
+  await successor.start();
+  const replacement = readParticipantFile(s.root, s.participantKey)!;
+  expect(replacement.value).toMatchObject({ ownerHostId: identity.id });
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(readParticipantFile(s.root, s.participantKey)).toEqual(replacement);
+  expect(s.observer.get(s.identity.id, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: identity.id, stale: false });
+  expect(s.warning).not.toHaveBeenCalled();
+});
+
+it.each([false, true])("a failed recovery remains pending after its file lease renews (files-only=%s)", async filesOnly => {
+  const s = await setup(filesOnly);
+  const before = readParticipantFile(s.root, s.participantKey)!;
+  vi.setSystemTime(Date.now() + 20_000);
+  s.writes.mockRejectedValueOnce(new Error("recovery publication unavailable"));
+  await expect(s.directory.refresh()).rejects.toThrow("recovery publication unavailable");
+  expect(readHostLease(s.root, s.identity.id)?.expiresAt).toBeGreaterThan(Date.now());
+  expect(readParticipantFile(s.root, s.participantKey)!.version).toBe(before.version);
+  expect(s.warning).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(readParticipantFile(s.root, s.participantKey)!.version).toBeGreaterThan(before.version);
+  expect(s.observer.get(s.identity.id, Date.now(), { fresh: true })).toMatchObject({ stale: false });
+  expect(s.warning).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/Main participant re-published.*lapsed/));
+});
+
+it.each(["close", "quiesce"] as const)("a %s Main cannot recover active control after its lease lapses", async operation => {
+  const s = await setup(true);
+  await s.directory[operation]();
+  vi.setSystemTime(Date.now() + 20_000);
+  await vi.advanceTimersByTimeAsync(5_000);
+  await s.directory.refresh();
+  const published = readParticipantFile(s.root, s.participantKey);
+  if (operation === "close") {
+    expect(published).toBeUndefined();
+    expect(readHostLease(s.root, s.identity.id)).toBeUndefined();
+  } else {
+    expect(published?.value).toMatchObject({ status: "stopping", capabilities: [] });
+    expect(readHostLease(s.root, s.identity.id)!.expiresAt).toBeLessThan(Date.now());
+  }
+  expect(s.warning).not.toHaveBeenCalled();
+});
+
 it("the fixed Main session lease lapses even with a longer host lease", async () => {
   const s = await setup(true, 120_000);
   const before = readParticipantFile(s.root, s.participantKey)!;

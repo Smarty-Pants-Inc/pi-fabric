@@ -158,8 +158,8 @@ describe("resident actor participant renewal without a Main", () => {
       await host.start();
       const actor = await host.actors.create({ name: "delayed-review", instructions: "wait", residency: "durable" });
       await host.participants.refresh();
-      // Gate after real source selection but before a real shared/key write.
-      // Adoption must not commit while that selected renewal is waiting.
+      // Gate before the actual write. Shared publication retains custody;
+      // independent file renewal permits adoption and must recheck its token.
       const batch = host.mesh.writeBatch.bind(host.mesh);
       const writeFile = participantFiles.writeParticipantFileIf;
       const wait = mode === "shared"
@@ -179,8 +179,13 @@ describe("resident actor participant renewal without a Main", () => {
         adopted = true;
       });
       await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(adopted).toBe(false); // source selection did not release the mutation fence
+      expect(adopted).toBe(mode === "files"); // only shared publication retains registry custody
       release(); await renewal; await adoption;
+      if (mode === "files") {
+        // The resumed independent write cannot refresh a predecessor after
+        // adoption, even though no successor participant has appeared yet.
+        expect(readParticipantFile(config.meshRoot, participantKey(actor.id))).toBeUndefined();
+      }
       wait.mockRestore();
       const adoptedRow = registry.records().find((record) => record.id === actor.id);
       await host.participants.refresh();

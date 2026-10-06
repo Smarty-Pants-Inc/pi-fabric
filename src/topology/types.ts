@@ -73,6 +73,8 @@ export interface FabricParticipantRecord {
   turns?: number;
   toolCalls?: number;
   usage?: AgentUsage;
+  /** Registry lineage selected by an actor publisher; not an authority grant. */
+  actorOwnershipToken?: string;
   actorQueued?: number;
   actorMessages?: number;
   /** Accepted activation preparation or AgentManager admission receipt, before worker launch. */

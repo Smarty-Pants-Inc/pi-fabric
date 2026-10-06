@@ -30,7 +30,8 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
   const bad = "b".repeat(32), good = "a".repeat(32);
   registry.write([row(bad, "big", topics), row(good, "ok", [])]);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-  const registryWrites = vi.spyOn(ActorRegistryStore.prototype, "write");
+  // Optimistic writes prepare outside custody; write() is the legacy writer.
+  const registryWrites = vi.spyOn(ActorRegistryStore.prototype, "prepare");
   let host = new ResidentHost(config);
   try {
     for (let recovery = 0; recovery < 2; recovery++) {
@@ -44,6 +45,7 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
       expect(host.actors.status(bad).lastError).toContain("Actor presence omitted: Actor presence exceeds 1024 bytes");
       expect(host.mesh.get(`actors/s/${bad}`)).toBeUndefined();
       expect(host.mesh.get(`actors/s/${good}`)?.value).toMatchObject({ id: good });
+      expect(host.mesh.get(`actors/s/${good}`)?.value).not.toHaveProperty("ownershipToken");
       // Exercise the actual store limit, not an injected writeBatch rejection.
       await expect(host.mesh.put({ key: "proof/oversize", identity: host.identity,
         value: host.actors.status(bad) })).rejects.toThrow("Mesh state value exceeds 1024 bytes");
@@ -78,7 +80,10 @@ it("rejects oversize create and configurable updates before committing actor sta
     format: 1, project: "", rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "m"), actorRoot: path.join(root, "a"), residencyRoot: path.join(root, "r"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    // The separate test above exercises the exact 1024-byte legacy boundary.
+    // Creation includes session/log paths; leave room for long isolated TMPDIRs
+    // here while still exercising real over-limit create/update rejection.
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 2048, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   const host = new ResidentHost(config);
@@ -87,13 +92,13 @@ it("rejects oversize create and configurable updates before committing actor sta
     await host.start();
     const onCommit = vi.fn(), beforeCommit = vi.fn();
     await expect(host.actors.create({ name: "big", instructions: "wait", residency: "durable",
-      topics: Array.from({ length: 12 }, (_, i) => `fleet.work.project-${String(i).padStart(2, "0")}.observation`) },
-      { asRegistryOwner: true, onCommit, beforeCommit })).rejects.toThrow("Actor presence exceeds 1024 bytes");
+      topics: Array.from({ length: 40 }, (_, i) => `fleet.work.project-${String(i).padStart(2, "0")}.observation`) },
+      { asRegistryOwner: true, onCommit, beforeCommit })).rejects.toThrow("Actor presence exceeds 2048 bytes");
     expect(onCommit).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
     expect(registry.records()).toEqual([]);
     const actor = await host.actors.create({ name: "ok", instructions: "wait", residency: "durable" }, { asRegistryOwner: true });
     const before = registry.records();
-    await expect(host.actors.setTools(actor.id, ["x".repeat(1024)])).rejects.toThrow("Actor presence exceeds 1024 bytes");
+    await expect(host.actors.setTools(actor.id, ["x".repeat(config.mesh.maxEventBytes)])).rejects.toThrow("Actor presence exceeds 2048 bytes");
     expect(registry.records()).toEqual(before);
     expect(host.actors.status(actor.id).tools).toBeUndefined();
   } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }

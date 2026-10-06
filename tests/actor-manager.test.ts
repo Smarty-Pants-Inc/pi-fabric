@@ -212,7 +212,7 @@ describe("ActorManager idle registry writes (#4383)", () => {
     await state.actors.close();
     const file = path.join(state.root, "actors", "actors.json");
     const before = fs.readFileSync(file, "utf8");
-    const saves = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
     try {
       const reloaded = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
         actorRoot: path.join(state.root, "actors"), persistent: true,
@@ -3451,8 +3451,8 @@ describe("ActorManager", () => {
       .filter((message) => message.direction === "out" && message.runId)
       .map((message) => String((message as { text?: string }).text ?? "") + " " + message.source);
     await waitFor(() => ran().length >= 3, 20_000);
-    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in").length;
-    expect(inbound).toBe(3);
+    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in");
+    expect(inbound, JSON.stringify(inbound)).toHaveLength(3);
     expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
   }, 30_000);
 
@@ -4736,6 +4736,9 @@ describe("ActorManager removal behind an in-flight run", () => {
       else replacements.at(-1)?.directories.push(file);
     });
     const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      // The prepared inode may have been renamed from its data-fsynced temp.
+      // Carry the receipt through that rename; do not require fsync to occur in custody.
+      if (syncedFiles.has(String(from))) syncedFiles.add(String(to));
       if (String(to) === registry) {
         const records = JSON.parse(fs.readFileSync(from, "utf8")).actors as Array<{ removal?: unknown }>;
         replacements.push({ pending: records.some((record) => !!record.removal),
@@ -5052,7 +5055,11 @@ describe("#169 round 2 removal coordination", () => {
     const actor = await actors.create({ name: "uncommitted", instructions: "Work." });
     await actors.stop(actor.id);
     const dir = path.join(root, "actors", actor.id);
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => {});
+    const prepare = ActorRegistryStore.prototype.prepare;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementation(function (this: ActorRegistryStore, ...args) {
+      const prepared = prepare.apply(this, args);
+      return { ...prepared, commit: () => {} };
+    });
     try {
       await expect(actors.remove(actor.id)).rejects.toThrow("registry revocation did not commit");
       expect(fs.existsSync(dir)).toBe(true);

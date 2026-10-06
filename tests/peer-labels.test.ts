@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { publicationGeneration } from "../src/topology/publication-generation.js";
+import { readParticipantFiles } from "../src/topology/participant-files.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -86,6 +88,36 @@ afterEach(async () => {
 });
 
 describe("peer labels", () => {
+  it.each([false, true])("publishes a fresh root with one sequence claim across generation retry (race=%s)", async race => {
+    const meshRoot = tmpRoot(), identity = mainIdentity("fresh");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    let attempts = 0;
+    const prepare = vi.fn(() => {
+      // Include state.json, so the label CAS itself would invalidate a late claim.
+      const generation = publicationGeneration(meshRoot);
+      return () => generation === publicationGeneration(meshRoot);
+    });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 60_000, reapDeadHosts: false, preparePublicationFence: prepare,
+      withPublicationFence: async publish => {
+        if (++attempts === 1 && race) await mesh.put({ key: "test/race", value: true, identity });
+        return mesh.withTryLock(publish, 50);
+      },
+    });
+    directories.push(directory);
+    directory.registerSource(() => [rootRecord(identity.id, "fresh", "/repo/project")]);
+    await directory.start();
+    expect(attempts).toBe(race ? 2 : 1);
+    expect(prepare).toHaveBeenCalledTimes(attempts);
+    expect(mesh.get("topology/peer-seq")).toMatchObject({ version: 1, value: { next: 1 } });
+    expect(directory.self().label).toBe("PRO-1");
+    expect(directory.canConsumeMesh()).toBe(true);
+    expect(mesh.listAll("topology/hosts/")).toHaveLength(1);
+    expect(readParticipantFiles(meshRoot).map(entry => entry.value)).toContainEqual(expect.objectContaining({ id: identity.id, label: "PRO-1" }));
+    await directory.refresh();
+    expect(mesh.get("topology/peer-seq")).toMatchObject({ version: 1, value: { next: 1 } });
+  });
   it("mints sequential Linear-style labels from the project basename", async () => {
     const meshRoot = tmpRoot();
     const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", () => [

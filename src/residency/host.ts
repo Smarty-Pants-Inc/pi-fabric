@@ -19,6 +19,7 @@ interface ResidentHostLaunchContext {
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { assertDeadResidentMain } from "./operator-safety.js";
+import { withMainPublicationFence } from "./main-publication-fence.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -1410,10 +1411,14 @@ export class ResidentHost {
             (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
           throw new Error("Invalid resident operator actor request");
         }
+        const initialEvidence = command.forceLive === true ? undefined
+          : assertDeadResidentMain(this.config, this.participants, this.mesh);
         const check = () => {
-          if (command.forceLive !== true) assertDeadResidentMain(this.config, this.participants, this.mesh);
+          if (command.forceLive === true) return;
+          if (assertDeadResidentMain(this.config, this.participants, this.mesh) !== initialEvidence) {
+            throw new ResidentActorAuthorizationError("Main generation or root lease changed before operator commit; use --force-live only for an intentional override");
+          }
         };
-        check();
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
@@ -1423,15 +1428,27 @@ export class ResidentHost {
         if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, completedAt: Date.now() };
         } else {
-          // A bare caller abort can detach a progressed worker. Terminal stop explicitly
-          // ends that owned worker and joins its activation before removal is attempted.
-          const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
-          boundaryAdmitted?.();
-          const stopped = await pending;
-          response = command.action === "stop"
-            ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            // Normal removal retains custody, presence cleanup, registry revocation and recovery.
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+          const operate = async (): Promise<ResidentCommandResponse> => {
+            // Recheck after acquiring Main's initial-lease/generation fence and
+            // immediately before commit. Retain it through drain and removal:
+            // no new Main may publish while this mutation is still in progress.
+            check();
+            // A bare caller abort can detach a progressed worker. Terminal stop
+            // explicitly ends and joins that worker before normal removal.
+            const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
+            boundaryAdmitted?.();
+            const stopped = await pending;
+            return command.action === "stop"
+              ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
+              : await this.#removeResidentActor(actor.id, requestId, () => check());
+          };
+          try {
+            response = command.forceLive === true ? await operate()
+              : await withMainPublicationFence(this.config.meshRoot, this.config.rootId, operate, 0);
+          } catch (error) {
+            if (error instanceof FileLockBusy) throw new ResidentActorAuthorizationError("Main publication/startup is in progress; use --force-live only for an intentional override");
+            throw error;
+          }
         }
       } else if (command.operation === "actors") {
         response = {

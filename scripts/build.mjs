@@ -39,6 +39,7 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
+  "src/residency/main-publication-fence.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",

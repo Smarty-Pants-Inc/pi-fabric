@@ -11,6 +11,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { mainGenerationPath } from "../src/residency/handover.js";
+import * as mainPublication from "../src/residency/main-publication-fence.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
@@ -127,6 +128,190 @@ describe("same-user resident actor operator", () => {
       expect(f.host.actors.status(actor.id).status).toBe("stopped");
       expect((await f.cli("remove", actor.id, ["--force-live"])).code).toBe(0);
     } finally { await f.close(); }
+  }, 30_000);
+
+  it("malformed recorded start times refuse stop/remove for a live PID, whether generation or inbox is the only identity", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("malformed-start");
+      const generationFile = mainGenerationPath(f.config.residencyRoot);
+      const generation = JSON.parse(fs.readFileSync(generationFile, "utf8"));
+      const inbox = path.join(f.config.meshRoot, "main-followups", `${f.config.sessionId}.owner.json`);
+      fs.mkdirSync(path.dirname(inbox), { recursive: true });
+      for (const source of ["generation", "inbox"]) {
+        for (const started of ["not-a-start-time", "123oops", " 123", "1e6", "", 123]) {
+          fs.rmSync(generationFile, { force: true }); fs.rmSync(inbox, { force: true });
+          if (source === "generation") fs.writeFileSync(generationFile, JSON.stringify({ ...generation, processStartTime: started }));
+          else fs.writeFileSync(inbox, JSON.stringify({ rootId: f.config.rootId, sessionId: f.config.sessionId,
+            pid: f.child.pid, processStartedAt: started }));
+          for (const action of ["stop", "remove"] as const) {
+            const refused = await f.cli(action, actor.id);
+            expect(refused.code).toBe(1); expect(refused.err).toContain("liveness unknown");
+            expect(refused.err).toContain("--force-live");
+            expect(f.host.actors.status(actor.id).status).toBe("idle");
+          }
+        }
+      }
+      expect((await f.cli("stop", actor.id, ["--force-live"])).code).toBe(0);
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("an old dead generation cannot authorize control while a root-bound new Main has not published yet", async () => {
+    const f = await fixture();
+    let replacement: ChildProcess | undefined;
+    try {
+      const actor = await f.create("starting-main"); await stopChild(f.child);
+      const environment = { ...process.env, PI_FABRIC_SESSION_ID: f.config.sessionId, PI_FABRIC_MAIN_AGENT_ID: f.config.rootId };
+      for (const key of ["PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete environment[key as keyof typeof environment];
+      replacement = spawn(process.execPath, ["-e", "console.log('ready');setInterval(()=>{},1000)"], {
+        env: environment,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await once(replacement.stdout!, "data");
+      for (const action of ["stop", "remove"] as const) {
+        const refused = await f.cli(action, actor.id);
+        expect(refused.code).toBe(1); expect(refused.err).toContain("current root/session binding");
+        expect(f.host.actors.status(actor.id).status).toBe("idle");
+      }
+      await stopChild(replacement);
+      expect((await f.cli("stop", actor.id)).code).toBe(0);
+    } finally { if (replacement) await stopChild(replacement); await f.close(); }
+  }, 30_000);
+
+  it.each(["stop", "remove"] as const)("refuses %s when a new Main publishes its generation between initial check and commit", async action => {
+    const f = await fixture();
+    const fence = mainPublication.withMainPublicationFence;
+    let replacement: ChildProcess | undefined;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("generation-race"); await stopChild(f.child);
+      replacement = spawn(process.execPath, ["-e", "console.log('ready');setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "pipe"] });
+      await once(replacement.stdout!, "data");
+      const file = mainGenerationPath(f.config.residencyRoot), old = JSON.parse(fs.readFileSync(file, "utf8"));
+      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
+        // Real Main publication takes and releases the very same lock before the
+        // operator acquires it. The old evidence already passed its first check.
+        await fence(meshRoot, rootId, () => fs.writeFileSync(file, JSON.stringify({ ...old,
+          nonce: "new-main", pid: replacement!.pid, processStartTime: processStartTime(replacement!.pid!) })));
+        return fence(meshRoot, rootId, operation, wait);
+      });
+      const refused = await f.cli(action, actor.id);
+      expect(refused.code).toBe(1); expect(refused.err).toContain("Main process is still alive");
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+    } finally { spy?.mockRestore(); if (replacement) await stopChild(replacement); await f.close(); }
+  }, 30_000);
+
+  it.each(["generation", "lease"])("rejects a newer %s even if its PID/lease is already dead at the commit recheck", async kind => {
+    const f = await fixture();
+    const fence = mainPublication.withMainPublicationFence;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("changed-evidence"); await stopChild(f.child);
+      const file = mainGenerationPath(f.config.residencyRoot), old = JSON.parse(fs.readFileSync(file, "utf8"));
+      spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
+        await fence(meshRoot, rootId, () => {
+          if (kind === "generation") fs.writeFileSync(file, JSON.stringify({ ...old, nonce: "new-but-dead" }));
+          else writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt: Date.now(), expiresAt: Date.now() - 1 });
+        });
+        return fence(meshRoot, rootId, operation, wait);
+      });
+      const refused = await f.cli("remove", actor.id);
+      expect(refused.code).toBe(1); expect(refused.err).toContain("changed before operator commit");
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { spy?.mockRestore(); await f.close(); }
+  }, 30_000);
+
+  it("the held Main startup/lease publication lock refuses an operator commit", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("startup-lock"); await stopChild(f.child);
+      await mainPublication.withMainPublicationFence(f.config.meshRoot, f.config.rootId, async () => {
+        for (const action of ["stop", "remove"] as const) {
+          const refused = await f.cli(action, actor.id);
+          expect(refused.code).toBe(1); expect(refused.err).toContain("publication/startup is in progress");
+          expect(f.host.actors.status(actor.id).status).toBe("idle");
+        }
+      });
+      expect((await f.cli("stop", actor.id)).code).toBe(0);
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("unreadable current process evidence refuses even when the recorded Main PID is dead", async () => {
+    const f = await fixture();
+    const read = fs.readFileSync;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("unknown-current-main"); await stopChild(f.child);
+      spy = vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+        if (file === `/proc/${process.pid}/environ`) throw Object.assign(new Error("unreadable current runtime"), { code: "EACCES" });
+        return read(file, options as never);
+      });
+      const refused = await f.cli("remove", actor.id);
+      expect(refused.code).toBe(1); expect(refused.err).toContain("liveness is unknown");
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { spy?.mockRestore(); await f.close(); }
+  }, 30_000);
+
+  it("Main's real initial lease publication waits on the same fence before arming startup heartbeats", async () => {
+    const f = await fixture();
+    const identity = { id: f.config.rootId, name: "Main", kind: "main" as const, sessionId: f.config.sessionId };
+    const directory = new ParticipantDirectory(new MeshStore(f.config.meshRoot, 65536, 100), {
+      enabled: true, hostId: f.config.rootId, rootId: f.config.rootId, identity,
+    });
+    const refresh = vi.spyOn(directory, "refresh");
+    let starting: Promise<void> | undefined;
+    try {
+      await mainPublication.withMainPublicationFence(f.config.meshRoot, f.config.rootId, async () => {
+        starting = directory.start();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(refresh).not.toHaveBeenCalled();
+        expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(false);
+      });
+      await starting;
+      expect(refresh).toHaveBeenCalled();
+      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(true);
+    } finally { await starting?.catch(() => undefined); refresh.mockRestore(); await directory.close(); await f.close(); }
+  }, 30_000);
+
+  it("failed Main startup admission cannot let a waiting external refresh publish around the fence", async () => {
+    const f = await fixture();
+    const identity = { id: f.config.rootId, name: "Main", kind: "main" as const, sessionId: f.config.sessionId };
+    const directory = new ParticipantDirectory(new MeshStore(f.config.meshRoot, 65536, 100), {
+      enabled: true, hostId: f.config.rootId, rootId: f.config.rootId, identity,
+    });
+    const error = new Error("Main publication fence unavailable");
+    const spy = vi.spyOn(mainPublication, "withMainPublicationFence").mockRejectedValueOnce(error);
+    try {
+      const results = await Promise.allSettled([directory.start(), directory.refresh()]);
+      expect(results).toEqual([{ status: "rejected", reason: error }, { status: "rejected", reason: error }]);
+      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(false);
+      spy.mockRestore();
+      await directory.start();
+      expect(fs.existsSync(hostLeasePath(f.config.meshRoot, f.config.rootId))).toBe(true);
+    } finally { spy.mockRestore(); await directory.close(); await f.close(); }
+  }, 30_000);
+
+  it("an unreadable exact configured worker launch is not mistaken for a Main", async () => {
+    const f = await fixture();
+    const read = fs.readFileSync;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("known-worker");
+      f.host.actors.tell(actor.id, "HANG_WITH_PROGRESS");
+      await waitFor(() => !!f.host.actors.status(actor.id).inFlightRun);
+      const run = f.host.actors.status(actor.id).inFlightRun!.id;
+      await waitFor(() => "turns" in f.host.agents.status(run) && Number((f.host.agents.status(run) as { turns?: number }).turns) > 0);
+      const pid = Number(f.host.agents.status(run).sessionId);
+      await stopChild(f.child);
+      spy = vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+        if (file === `/proc/${pid}/environ`) throw Object.assign(new Error("worker exec transition"), { code: "EACCES" });
+        return read(file, options as never);
+      });
+      const dry = await f.cli("remove", actor.id, ["--dry-run"]);
+      expect(dry).toMatchObject({ code: 0, err: "" });
+      expect(f.host.actors.status(actor.id).status).toBe("running");
+    } finally { spy?.mockRestore(); await f.close(); }
   }, 30_000);
 
   it("a live file-only root lease vetoes control after Main process exits", async () => {

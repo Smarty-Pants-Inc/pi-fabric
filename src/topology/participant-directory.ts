@@ -435,6 +435,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
+  #starting: Promise<void> | undefined;
+  #startupAdmission: Promise<void> | undefined;
   #refreshing: Promise<void> | undefined;
   #refreshScheduled = false;
   #refreshAgain = false;
@@ -489,10 +491,39 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async start(): Promise<void> {
+    if (this.#starting) return this.#starting;
     if (this.#timer) return;
-    // Restarting this directory is activation too, even if its last local view held a root.
+    // Reactivate read-only recovery routing synchronously, as before. Lease
+    // publication and heartbeat arming still wait for Main startup admission.
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
+    if (this.options.enabled && this.options.hostId === this.options.rootId &&
+        this.options.identity.id === this.options.rootId && this.options.identity.kind === "main") {
+      let admit!: () => void, deny!: (error: unknown) => void;
+      let admitted = false;
+      this.#startupAdmission = new Promise<void>((resolve, reject) => { admit = resolve; deny = reject; });
+      this.#startupAdmission.catch(() => undefined);
+      const starting = (async () => {
+        // Optional residency edge stays lazy for non-Main and idle imports.
+        const { withMainPublicationFence } = await import("../residency/main-publication-fence.js");
+        await withMainPublicationFence(this.mesh.root, this.options.rootId, () => {
+          admitted = true;
+          admit();
+          return this.#closed ? undefined : this.#start();
+        });
+      })();
+      this.#starting = starting;
+      try { await starting; }
+      catch (error) {
+        if (!admitted) { this.#closed = true; deny(error); }
+        throw error;
+      } finally { this.#startupAdmission = undefined; this.#starting = undefined; }
+    } else {
+      await this.#start();
+    }
+  }
+
+  async #start(): Promise<void> {
     this.#refreshError = undefined;
     this.#publicationRetryDelay = 750;
     this.#routingReadAt = 0;
@@ -585,6 +616,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async #runRefresh(full: boolean): Promise<void> {
+    // External change/heartbeat calls during asynchronous Main startup must not
+    // publish around the fence. Routing reads remain available during recovery.
+    if (this.#startupAdmission) await this.#startupAdmission;
     if (this.#closed) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;

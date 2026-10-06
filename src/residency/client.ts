@@ -173,6 +173,7 @@ export class ResidencyClient {
   readonly #hostPath: string;
   readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
+  #watchdogTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
@@ -223,13 +224,14 @@ export class ResidencyClient {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
-      () => {
-        void this.#backgroundDelivery.run(() => this.#drainDeliveries());
-        void this.#watchdog().catch(() => undefined);
-      },
-      Math.max(20, this.options.config.mesh.actorPollMs),
+      () => { void this.#backgroundDelivery.run(() => this.#drainDeliveries()); },
+      Math.max(1_000, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
+    // File-only recovery stays independent of the state-reading delivery cadence/backoff.
+    this.#watchdogTimer = setInterval(() => { void this.#watchdog().catch(() => undefined); },
+      Math.max(20, this.options.config.mesh.actorPollMs));
+    this.#watchdogTimer.unref();
     void this.#backgroundDelivery.run(() => this.#drainDeliveries());
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
@@ -250,6 +252,8 @@ export class ResidencyClient {
     this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
+    if (this.#watchdogTimer) clearInterval(this.#watchdogTimer);
+    this.#watchdogTimer = undefined;
     // Await the owned pass itself, not a timer polling its state. Real async file
     // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
     await this.#deliveryPass?.catch(() => undefined);

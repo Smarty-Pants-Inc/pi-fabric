@@ -1500,7 +1500,7 @@ describe("ParticipantDirectory", () => {
       expect(writes).not.toHaveBeenCalled();
     });
 
-    it("preserves backoff and one warning across unchanged refreshes until real lock recovery", async () => {
+    it("defers change refreshes during a lock outage and preserves backoff until real heartbeat recovery", async () => {
       vi.useFakeTimers();
       // Exercise near-ceiling full-jitter draws: the fixed 200 ms tick below
       // must not consume the second outage's doubled backoff before checking it.
@@ -1546,13 +1546,15 @@ describe("ParticipantDirectory", () => {
         const recovered = vi.spyOn(retry, "success");
         await vi.advanceTimersByTimeAsync(retry.waitMs);
 
-        const readsBefore = source.mock.calls.length;
-        status = "idle"; // matches the last durable snapshot: this change-refresh is a no-op
+        const readsBefore = source.mock.calls.length, attemptsBefore = runs.mock.calls.length;
+        status = "idle"; // matches the last durable snapshot: an unchanged change-refresh proves nothing
         directory.scheduleRefresh();
-        await Promise.resolve(); // run the queued change-only refresh
-        expect(await runs.mock.results.at(-1)!.value).toBe("done");
-        expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
-        expect(attempts).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        await Promise.resolve();
+        // #4383: a lock outage defers even unchanged change refreshes to the next
+        // heartbeat, without another fleet read, lock attempt, or false recovery.
+        expect(runs.mock.calls.length).toBe(attemptsBefore);
+        expect(source.mock.calls.length).toBe(readsBefore);
+        expect(attempts).toHaveBeenCalledOnce();
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);

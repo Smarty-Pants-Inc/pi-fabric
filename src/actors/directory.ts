@@ -99,6 +99,11 @@ export class ActorDirectory extends ActorManager {
   }
   override list(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
   override listOwned(): FabricActorInfo[] { return [...super.listOwned(), ...this.#secondary.listOwned()]; }
+  override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
+  override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
+    const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);
+    return { ops: [...first.ops, ...second.ops], committed: () => { first.committed(); second.committed(); } };
+  }
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
   override reclaim(...args: Parameters<ActorManager["reclaim"]>): ReturnType<ActorManager["reclaim"]> { return this.#isPrimary(args[0]) ? super.reclaim(...args) : this.#secondary.reclaim(...args); }
   override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }

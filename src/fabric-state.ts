@@ -316,6 +316,9 @@ export class FabricState {
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  reportMainProviderError(message: string): Promise<unknown> {
+    return this.#required().reportMainProviderError(message);
+  }
   stopParticipant(targetId: string): Promise<unknown> { return this.#required().stopParticipant(targetId); }
   claimHandoff(execution: FabricExecutionResult, sessionId: string, resultFormat: FabricResultFormat, outerToolCallId: string): Promise<PendingFabricHandoff | undefined> {
     return this.#required().claimHandoff(execution, sessionId, resultFormat, outerToolCallId);

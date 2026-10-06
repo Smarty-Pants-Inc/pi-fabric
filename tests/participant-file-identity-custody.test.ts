@@ -93,8 +93,11 @@ it.each(cases)("cold ResidentHost files=$files protocol=$protocol reader=$platfo
   expect(bothFences).toBe(true);
   expect(receipts.every(receipt => receipt.prepared && receipt.incarnation === (outcome === "known" ? `${platform}:${nativeValue}` : undefined))).toBe(true);
   expect(run).toHaveBeenCalledOnce();
-  expect(setterMs).toBeLessThan(150);
-  expect(Math.max(...custodyMs)).toBeLessThan(150);
+  // ponytail: 600 ms, half the injected 1,200 ms native read. A read awaited under custody costs >= 1,200 ms
+  // and still fails here (nativeUnderCustody above is the direct check); hosted Windows NTFS file replacement
+  // inside the fence measured 195 ms on CI, so the old 150 ms bound timed the runner's disk, not the defect.
+  expect(setterMs).toBeLessThan(600);
+  expect(Math.max(...custodyMs)).toBeLessThan(600);
   expect(participantFiles.readParticipantFiles(s.config.meshRoot)).toHaveLength(2);
 }, 15000);
 

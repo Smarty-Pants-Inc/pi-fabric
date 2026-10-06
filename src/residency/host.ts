@@ -279,7 +279,8 @@ export class ResidentHost {
     // Global order: actor registries (sorted path), then mesh, for publication,
     // adoption and controls. Retain registry custody from the fresh source read
     // through shared commits AND per-key copies. Mesh acquisition gets a 50 ms try:
-    // contention unwinds the fences and pending presence retries next heartbeat.
+    // contention unwinds the fences; one host-level retry waits for mesh admission
+    // OUTSIDE custody, then re-selects its source under fresh fences.
     // Never publish a selected snapshot outside custody: a delayed heartbeat could
     // otherwise republish a successor's adopted actor (#504).
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
@@ -289,6 +290,8 @@ export class ResidentHost {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
       withPublicationFence: publishFenced,
+      // Acquire/release only: no selected snapshot or mesh custody crosses this wait.
+      waitForPublicationRetry: () => this.mesh.exclusive(() => undefined),
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,

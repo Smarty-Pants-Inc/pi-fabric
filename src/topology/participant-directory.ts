@@ -384,6 +384,9 @@ export interface ParticipantDirectoryOptions {
   renewActorParticipants?: boolean;
   /** Registry -> mesh/key lock order: retain actor custody through every publication write. */
   withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
+  /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
+   * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
+  waitForPublicationRetry?: () => Promise<void>;
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -425,6 +428,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshScheduled = false;
   #refreshAgain = false;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  #publicationRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #publicationRetrying: Promise<void> | undefined;
+  #publicationRetryDelay = 750;
   /** When the last change-driven refresh started (the throttle's reference). */
   #changeRefreshAt = 0;
   /** Whether the refresh in flight renews the lease (a heartbeat) or only publishes changes. */
@@ -469,6 +475,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
     this.#refreshError = undefined;
+    this.#publicationRetryDelay = 750;
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
@@ -488,7 +495,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#backgroundRefresh.failure(error);
           return;
         }
-        void this.#backgroundRefresh.run(() => this.refresh(), false);
+        if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
+          void this.#backgroundRefresh.run(() => this.refresh(), false);
+        }
       }, this.#heartbeatMs);
       this.#timer.unref();
     }
@@ -498,7 +507,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed) return;
+    if (this.#closed || (this.options.waitForPublicationRetry && isMeshLockTimeout(this.#refreshError))) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -506,6 +515,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshScheduled) return;
     this.#refreshScheduled = true;
     const run = (): void => {
+      if (!this.#refreshScheduled || this.#closed) return;
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
       void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
@@ -528,7 +538,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) this.#renewFileLease();
       if (this.#refreshingFull) return this.#refreshing;
       // A change-only refresh may skip its write; renew the lease right after it.
-      return this.#refreshing.catch(() => undefined).then(() => this.refresh());
+      return this.#refreshing.catch(error => {
+        if (isMeshLockTimeout(error)) throw error;
+      }).then(() => this.refresh());
     }
     return this.#runRefresh(true);
   }
@@ -548,6 +560,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     settled.catch(() => undefined);                            // awaiters still see a failure
     this.#refreshing = settled;
     this.#refreshingFull = full;
+    let lockTimedOut = false;
     try {
       const committed = await operation;
       if (!committed) return;
@@ -558,6 +571,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshedAt = committed;
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
+      this.#cancelPublicationRetry();
+      this.#publicationRetryDelay = 750;
       this.#routingError = undefined;
       if (full) {
         this.#sweepDeadHosts();
@@ -577,14 +592,60 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       this.#refreshError = error;
       this.#routingReadAt = 0;
+      lockTimedOut = isMeshLockTimeout(error);
+      if (lockTimedOut) {
+        // Cancel older change timers too: all pending state rides one host recovery.
+        if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+        this.#refreshTimer = undefined;
+        this.#refreshScheduled = false;
+      }
       throw error;
     } finally {
       this.#refreshing = undefined;
       this.#refreshStartedAt = undefined;
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
-        this.scheduleRefresh();
+        if (!lockTimedOut) this.scheduleRefresh();
       }
+      if (lockTimedOut) this.#schedulePublicationRetry();
+    }
+  }
+
+  #cancelPublicationRetry(): void {
+    if (this.#publicationRetryTimer) clearTimeout(this.#publicationRetryTimer);
+    this.#publicationRetryTimer = undefined;
+  }
+
+  #schedulePublicationRetry(): void {
+    if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+      !isMeshLockTimeout(this.#refreshError) || this.#publicationRetryTimer || this.#publicationRetrying) return;
+    // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
+    const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
+    this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
+    this.#publicationRetryTimer = setTimeout(() => {
+      this.#publicationRetryTimer = undefined;
+      const work = this.#retryPublication();
+      this.#publicationRetrying = work;
+      void work.finally(() => {
+        this.#publicationRetrying = undefined;
+        this.#schedulePublicationRetry();
+      });
+    }, wait);
+    this.#publicationRetryTimer.unref?.();
+  }
+
+  async #retryPublication(): Promise<void> {
+    try {
+      // The failed fence has fully unwound. A FIFO mesh ticket now waits without
+      // occupying either registry; admission is not itself a heartbeat receipt.
+      await this.options.waitForPublicationRetry!();
+      if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+      // Release mesh BEFORE taking registries. Re-select actors under fresh custody
+      // so a successor's adopted actor cannot be republished (#504).
+      await this.refresh();
+    } catch (error) {
+      if (!isMeshLockTimeout(error)) this.#refreshError = error;
+      this.#backgroundRefresh.failure(error);
     }
   }
 
@@ -1096,7 +1157,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
     // This never grants admission: refresh still needs the real mesh lock.
-    if (!confirmed && !this.#closed && !this.#quiescing && this.#timer) {
+    // A typed timeout already has one host recovery lane; idle consumer polls
+    // must not multiply attempts while waiting outside registry custody.
+    if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
       void this.#backgroundRefresh.run(() => this.refresh(), false);
     }
     return confirmed;
@@ -1223,6 +1286,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async quiesce(reason?: string): Promise<void> {
     if (this.#closed || this.#quiescing) return;
     this.#quiescing = true;
+    this.#cancelPublicationRetry();
+    await this.#publicationRetrying;
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
       this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
     }
@@ -1257,6 +1322,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#cancelPublicationRetry();
+    await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
@@ -1497,6 +1564,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
         },
       });
     }
+    // RC3.1 copies file-only records sequentially. Prove writability BEFORE those
+    // copies: otherwise 40 file writes can consume a periodic holder's free window
+    // and phase-lock the confirmation despite outside-custody mesh admission. Keep
+    // registry custody throughout; the receipt is this acquisition's time, never
+    // the later copy completion time. State mutations below still need their lock.
+    let fileOnlyAcquiredAt = 0;
+    if (filesOnly && full) await this.mesh.confirmWritable(at => { fileOnlyAcquiredAt = at; });
     // Renew before ANY per-key cleanup/write/copy, including migration and retry copies.
     // Heartbeat calls keep renewing while #retryFile is waiting on a contended key.
     if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
@@ -1586,8 +1660,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // The file shows only that this host is alive. A committed heartbeat also certifies
           // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
           // take the lock once without a write: a stalled mesh still stops confirmation.
-          let acquiredAt = 0;
-          await this.mesh.confirmWritable(at => { acquiredAt = at; });
+          let acquiredAt = fileOnlyAcquiredAt;
+          if (!acquiredAt) await this.mesh.confirmWritable(at => { acquiredAt = at; });
           // Re-check after the lock: the threshold may have elapsed while confirming.
           decision = decideRenewal(this.#renewFileLease());
           if (decision.skip) return acquiredAt;

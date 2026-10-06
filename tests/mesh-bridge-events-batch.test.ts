@@ -67,6 +67,11 @@ describe("bounded durable bridge event batches", () => {
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
     const sync = vi.spyOn(fs, "fsyncSync");
+    // A complete namespace barrier scales with TMPDIR depth, not event count.
+    const reference = new StoreBridgeSide(store(), "forge");
+    await reference.publishBatch([{ event: event("reference") }]);
+    const singleEventBarriers = sync.mock.calls.length;
+    sync.mockClear();
     const events = Array.from({ length: 256 }, (_, index) => ({ event: event(String(index)) }));
     const first = await side.publishBatch(events);
     expect(first).toHaveLength(256);
@@ -74,7 +79,8 @@ describe("bounded durable bridge event batches", () => {
     expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
     // One event-file sync and namespace confirmation, not receipts per event.
-    expect(sync.mock.calls.length).toBeLessThan(8);
+    expect(singleEventBarriers).toBeGreaterThan(0);
+    expect(sync.mock.calls.length).toBe(singleEventBarriers);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");
   }, 30000);

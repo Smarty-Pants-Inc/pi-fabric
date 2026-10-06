@@ -5309,6 +5309,22 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["x"], scope: "global" }, context)).rejects.toThrow("Unknown activationFilter preset");
   });
 
+  it("returns native P0 receipts and readback, and rejects mixed/global lifecycle controls", async () => {
+    const { provider, actors } = setup();
+    const actor = await actors.create({ name: "p0-control", instructions: "x" });
+    const createdAt = Date.now();
+    const reservation = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt, expiresAt: createdAt + 60_000, requiredSecurity: ["security"] };
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], reservation }, context))
+      .resolves.toMatchObject({ activationFilterReservation: reservation, activationFilterExpiresAt: reservation.expiresAt });
+    const observation = { ...reservation, reviewTerminal: true, securityTerminal: ["security"] };
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null, observation }, context)).rejects.toThrow("cannot replace");
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], reservation, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
+    const receipt = await provider.invoke("setActivationFilter", { id: actor.id, observation }, context);
+    expect(receipt).toMatchObject({ activationFilterRelease: { reason: "verdicts-terminal", reservation: { ...reservation, reviewTerminal: true, securityTerminal: ["security"] } } });
+    await expect(provider.invoke("actorStatus", { id: actor.id }, context)).resolves.toEqual(receipt);
+    expect(actors.status(actor.id).activationFilter).toBeUndefined();
+  });
+
   it("setSteeringMode routes to a local agent", async () => {
     const { provider, root } = setup();
     const handle = (await provider.invoke(
@@ -6094,6 +6110,17 @@ describe("own-root resident setters and authoritative status", () => {
     const expiresAt = Date.now() + 60000;
     await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
     expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+  });
+
+  it("forwards P0 reservations and exact-identity observations to the resident owner", async () => {
+    const state = await remoteState();
+    const createdAt = Date.now();
+    const reservation = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt, expiresAt: createdAt + 60_000, requiredSecurity: [] };
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], reservation }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], reservation });
+    const observation = { repository: reservation.repository, pr: reservation.pr, head: reservation.head, createdAt, prState: "merged" };
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, observation }, context);
+    expect(state.setActor.mock.calls[1]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, observation });
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {

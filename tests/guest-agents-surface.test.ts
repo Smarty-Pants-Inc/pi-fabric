@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
+import { validationMessage } from "../src/core/action-arguments.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
 import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import { GUEST_SETUP, QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
@@ -68,6 +69,37 @@ describe("guest agents surface", () => {
     const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
     expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
   });
+  it.each([false, true])("types scoped P0 reservation/observation and release readback (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const createdAt = Date.now();
+      const identity = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt };
+      await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], reservation: { ...identity, expiresAt: createdAt + 60000, requiredSecurity: ["security"] } });
+      const receipt = await agents.setActivationFilter({ id: "reviewer", observation: { ...identity, reviewTerminal: true, securityTerminal: ["security"] } });
+      const actor = await agents.actorStatus({ id: "reviewer" });
+      const head: string | undefined = actor.activationFilterReservation?.head;
+      const releasedAt: number | undefined = receipt.activationFilterRelease?.at;
+      const reason: string | undefined = actor.activationFilterRelease?.reason;
+      return { head, reason, releasedAt };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const invalid = `await agents.setActivationFilter({ id: "reviewer", activationFilter: null, observation: { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: 0, prState: "closed" } });`;
+    expect(typeCheckFabricCode(invalid, guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+  });
+  it("validates the native P0 set/observe union and terminal evidence schema", () => {
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!.inputSchema;
+    const identity = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: 10 };
+    const reservation = { ...identity, expiresAt: 20, requiredSecurity: ["security"] };
+    expect(validationMessage(schema, { id: "reviewer", activationFilter: ["hold"], reservation })).toBeUndefined();
+    expect(validationMessage(schema, { id: "reviewer", observation: { ...identity, reviewTerminal: true } })).toBeUndefined();
+    expect(validationMessage(schema, { id: "reviewer", observation: { ...identity, runId: "run", runStatus: "timed_out" } })).toBeUndefined();
+    for (const invalid of [{ id: "reviewer" },
+      { id: "reviewer", activationFilter: null, observation: { ...identity, prState: "closed" } },
+      { id: "reviewer", observation: identity },
+      { id: "reviewer", observation: { ...identity, runStatus: "timed_out" } },
+      { id: "reviewer", observation: { ...identity, prState: "open", runId: "run" } },
+      { id: "reviewer", activationFilter: ["hold"], reservation: { ...reservation, head: "short" } }]) {
+      expect(validationMessage(schema, invalid)).toBeDefined();
+    }
+  });
+
   it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
     const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
     for (const fullCodeMode of [false, true]) {

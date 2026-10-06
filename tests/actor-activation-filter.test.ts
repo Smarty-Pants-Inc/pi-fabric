@@ -4,10 +4,17 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
+import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import {
   activationFilterSkip,
   normalizeActorActivationFilter,
+  normalizeActorActivationReservation,
+  normalizeActorActivationObservation,
+  activationPrInvalidReason,
+  ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS,
+  type ActorActivationFilterReservation,
+  type ActorActivationFilterObservation,
   type FabricActorActivationFilter,
 } from "../src/actors/activation-filter.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -428,6 +435,219 @@ describe("actor activation filter in ActorManager", () => {
     const reset = await again.setActivationFilter(actor.id, []);
     expect(reset.activationFilterExpiresAt).toBeUndefined();
     expect(reset.filterSkipped.count).toBe(0);
+  });
+});
+
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+const p0Reservation = (changes: Partial<ActorActivationFilterReservation> = {}): ActorActivationFilterReservation => {
+  const createdAt = Date.now();
+  return { repository: "smarty/demo", pr: 7, head: HEAD_A, createdAt, expiresAt: createdAt + 60_000,
+    requiredSecurity: ["security", "dependencies"], ...changes };
+};
+const observeP0 = (actors: ActorManager, id: string, reservation: ActorActivationFilterReservation,
+  evidence: Partial<ActorActivationFilterObservation>) =>
+  actors.setActivationFilter(id, undefined, undefined, undefined, undefined, { ...reservation, ...evidence });
+const prEvent = (head: string, extra: Record<string, unknown> = {}) => ({
+  event: "pull_request", payload: { repository: { full_name: "smarty/demo" }, number: 7,
+    pull_request: { number: 7, head: { sha: head } }, ...extra },
+});
+
+// smarty-dev#4440: P0 state is native, exact-identity fenced and independently bounded.
+describe("native P0 activation reservations", () => {
+  it("rejects unbounded, expired, abbreviated and forged verdict reservations", async () => {
+    const reservation = p0Reservation();
+    expect(normalizeActorActivationReservation({ ...reservation, repository: "Smarty/Demo" })).toEqual(reservation);
+    for (const changes of [{ head: "abc" }, { pr: 0 }, { repository: "demo" },
+      { createdAt: reservation.createdAt + 100_000 }, { expiresAt: reservation.createdAt },
+      { expiresAt: reservation.createdAt + ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS + 1 }]) {
+      expect(() => normalizeActorActivationReservation({ ...reservation, ...changes }, reservation.createdAt)).toThrow();
+    }
+    expect(() => normalizeActorActivationReservation(reservation, reservation.expiresAt)).toThrow("hard TTL");
+    expect(() => normalizeActorActivationObservation(reservation)).toThrow("lifecycle evidence");
+    const { actors } = setup();
+    const actor = await actors.create({ name: "bounded", instructions: "x" });
+    await expect(actors.setActivationFilter(actor.id, [], undefined, undefined, reservation)).rejects.toThrow("non-empty");
+    await expect(actors.setActivationFilter(actor.id, BOTH, undefined, reservation.expiresAt + 1, reservation)).rejects.toThrow("matching expiresAt");
+    await expect(actors.setActivationFilter(actor.id, BOTH, undefined, undefined, { ...reservation, reviewTerminal: true })).rejects.toThrow("observation");
+    await expect(observeP0(actors, actor.id, reservation, { runId: "run", runStatus: "running" as never })).rejects.toThrow("terminal run evidence");
+  });
+
+  it("reproduces s2: three ordinary heads skipped until exact review AND every required security verdict", async () => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "s2", instructions: "x", topics: ["github.demo"], coalesceKey: "payload.number" });
+    const reservation = p0Reservation();
+    await actors.setActivationFilter(actor.id, [{ id: "p0", topic: ["github.demo"] }], undefined, undefined, reservation);
+    for (const head of [HEAD_B, "c".repeat(40), "d".repeat(40)]) {
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(head) });
+    }
+    await waitFor(() => actors.status(actor.id).filterSkipped.count === 3);
+    expect(runDirs(root, actor.id)).toHaveLength(0);
+    expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 3,
+      lastKey: JSON.stringify(["mesh", "github.demo", 7]), lastAt: expect.any(Number) });
+    // Older head, another PR/repository, or earlier generation cannot clear.
+    for (const stale of [{ head: HEAD_B }, { pr: 8 }, { repository: "smarty/other" }, { createdAt: reservation.createdAt - 1 }]) {
+      await observeP0(actors, actor.id, reservation, { ...stale, reviewTerminal: true, securityTerminal: ["security", "dependencies"] });
+      expect(actors.status(actor.id).activationFilterReservation).toEqual(reservation);
+    }
+    await expect(observeP0(actors, actor.id, reservation, { securityTerminal: ["unknown"] })).rejects.toThrow("required security");
+    await observeP0(actors, actor.id, reservation, { securityTerminal: ["security"] });
+    await observeP0(actors, actor.id, reservation, { reviewTerminal: true });
+    expect(actors.status(actor.id).activationFilterReservation).toMatchObject({ reviewTerminal: true, securityTerminal: ["security"] });
+    const receipt = await observeP0(actors, actor.id, reservation, { securityTerminal: ["dependencies"] });
+    expect(receipt.activationFilter).toBeUndefined();
+    expect(receipt.activationFilterRelease).toMatchObject({ reason: "verdicts-terminal", reservation: {
+      ...reservation, reviewTerminal: true, securityTerminal: ["security", "dependencies"] } });
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_B) });
+    await waitFor(() => runDirs(root, actor.id).length === 1 && actors.status(actor.id).status === "idle");
+    expect(actors.status(actor.id).filterSkipped.count).toBe(0);
+    expect(actors.status(actor.id).filteredCount).toBe(3);
+    // A delayed receipt must also not clear a successor at the same head.
+    const successor = { ...reservation, createdAt: reservation.createdAt + 1 };
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, successor);
+    await observeP0(actors, actor.id, reservation, { reviewTerminal: true, securityTerminal: ["security", "dependencies"] });
+    expect(actors.status(actor.id).activationFilterReservation).toEqual(successor);
+  });
+
+  it.each(["closed", "merged", "head-changed"] as const)("drops queued PR work on %s, but keeps unrelated PRs eligible", async change => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "queued-pr", instructions: "x", topics: ["github.demo"], coalesce: false });
+    const reservation = p0Reservation();
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    await mesh.publish({ topic: "github.demo", from, text: "LIVE_WITH_PROGRESS" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    const receipt = await observeP0(actors, actor.id, reservation, change === "head-changed" ? { currentHead: HEAD_B } : { prState: change });
+    expect(receipt.activationFilterRelease?.reason).toBe(change === "head-changed" ? "head-changed" : "pr-closed");
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0);
+    expect(runDirs(root, actor.id)).toHaveLength(1); // only the earlier unrelated run
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: change === "head-changed" ? "PR head changed" : "PR closed or merged" }));
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A, { number: 8, pull_request: { number: 8, head: { sha: HEAD_A } } }) });
+    await waitFor(() => runDirs(root, actor.id).length === 2);
+  });
+
+  it("drops a result when the current PR head changes while its run is in flight", async () => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "inflight-pr", instructions: "x", topics: ["github.demo"] });
+    const reservation = p0Reservation();
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    const releasePath = path.join(root, "release-worker");
+    await mesh.publish({ topic: "github.demo", from, text: "LIVE_WITH_PROGRESS", data: prEvent(HEAD_A, { fakeWorkerReleasePath: releasePath }) });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await observeP0(actors, actor.id, reservation, { currentHead: HEAD_B });
+    fs.writeFileSync(releasePath, "release");
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed", runId: expect.any(String) }));
+    expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+  });
+
+  it("validates known PR identity without network or registry reads and never guesses missing identity", () => {
+    const reservation = p0Reservation();
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: prEvent(HEAD_B) })).toBe("PR head changed");
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: prEvent(HEAD_A) })).toBeUndefined();
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: { payload: { number: 7 } } })).toBeUndefined();
+    expect(activationPrInvalidReason(reservation, undefined, "host:tool_error", { data: prEvent(HEAD_B) })).toBeUndefined();
+  });
+
+  it.each(["completed", "failed", "stopped", "timed_out", "throw"] as const)("releases a matching native run on %s", async outcome => {
+    const { actors, agents } = setup();
+    const actor = await actors.create({ name: "terminal", instructions: "x", responseMode: "directive" });
+    let finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    const runId = `terminal-${outcome}`;
+    const run = vi.spyOn(agents, "run").mockImplementation(async (_request, _signal, launched) => {
+      launched?.({ id: runId, status: "running" } as AgentHandleInfo);
+      await done;
+      if (outcome === "throw") throw new Error("transport failed after launch");
+      return { id: runId, status: outcome, text: "", toolCalls: 0, turns: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } as AgentRunResult;
+    });
+    try {
+      actors.tell(actor.id, "run");
+      await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+      const reservation = p0Reservation({ runId });
+      await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+      finish();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();
+      expect(actors.status(actor.id).activationFilterRelease).toMatchObject({ reason: "run-terminal", reservation, runStatus: outcome === "throw" ? "failed" : outcome });
+    } finally { finish(); run.mockRestore(); }
+  });
+
+  it("polls external run claims, ignores non-terminal/unknown and wrong-run evidence, and releases timeout", async () => {
+    const { actors, agents } = setup();
+    const actor = await actors.create({ name: "external-claim", instructions: "x" });
+    const reservation = p0Reservation({ runId: "external" });
+    const status = vi.spyOn(agents, "status").mockImplementation(() => { throw new Error("unknown run"); });
+    try {
+      await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+      await observeP0(actors, actor.id, reservation, { runId: "old", runStatus: "completed" });
+      expect(actors.status(actor.id).activationFilterReservation?.runId).toBe("external");
+      for (const nonterminal of ["running", "queued"] as const) {
+        status.mockReturnValue({ id: "external", status: nonterminal } as AgentHandleInfo);
+        await new Promise(resolve => setTimeout(resolve, 60));
+        expect(actors.status(actor.id).activationFilterReservation).toBeDefined();
+      }
+      status.mockReturnValue({ id: "external", status: "timed_out" } as AgentHandleInfo);
+      await waitFor(() => actors.status(actor.id).activationFilterReservation === undefined);
+      expect(actors.status(actor.id).activationFilterRelease).toMatchObject({ reason: "run-terminal", runStatus: "timed_out" });
+    } finally { status.mockRestore(); }
+  });
+
+  it("retries an uncertain clear with retained exact evidence and one release audit", async () => {
+    const { actors, root } = setup();
+    const actor = await actors.create({ name: "retry", instructions: "x" });
+    const reservation = p0Reservation({ requiredSecurity: [] });
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    try {
+      await expect(observeP0(actors, actor.id, reservation, { reviewTerminal: true })).rejects.toThrow("disk unavailable");
+      const receipt = actors.status(actor.id).activationFilterRelease;
+      expect(receipt).toMatchObject({ reason: "verdicts-terminal", observation: { reviewTerminal: true } });
+      write.mockRestore();
+      const retry = await observeP0(actors, actor.id, reservation, { reviewTerminal: true });
+      expect(retry.activationFilterRelease).toEqual(receipt);
+      expect(actors.messages(actor.id).filter(message => message.reason === "activationFilter cleared: verdicts-terminal")).toHaveLength(1);
+      const row = JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors.find((row: { id: string }) => row.id === actor.id);
+      expect(row.activationFilterRelease).toEqual(receipt);
+      expect(row.activationFilterReservation).toBeUndefined();
+    } finally { write.mockRestore(); }
+  });
+
+  it("enforces the reservation deadline after restart without new events", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "restart-p0", instructions: "x" });
+    const reservation = p0Reservation({ expiresAt: Date.now() + 500 });
+    await first.actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+    const again = setup(first.root).actors;
+    expect(again.status(actor.id).activationFilterReservation).toEqual(reservation);
+    await waitFor(() => again.status(actor.id).activationFilterReservation === undefined);
+    expect(Date.now()).toBeGreaterThanOrEqual(reservation.expiresAt);
+    expect(again.status(actor.id).activationFilterRelease).toMatchObject({ reason: "expired", reservation });
+    expect(again.status(actor.id).activationFilterExpiresAt).toBeUndefined();
+  });
+
+  it("expires before a synchronous event dispatch, with no additional per-event registry lock", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "hot-p0", instructions: "x", events: ["tool_error"] });
+    const reservation = p0Reservation();
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock");
+    const now = vi.spyOn(Date, "now");
+    try {
+      for (let i = 0; i < 30; i++) actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+      expect(actors.status(actor.id).filterSkipped.count).toBe(30);
+      expect(lock).not.toHaveBeenCalled();
+      now.mockReturnValue(reservation.expiresAt);
+      actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+      expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();
+      expect(actors.status(actor.id).activationFilterRelease?.reason).toBe("expired");
+      expect(actors.status(actor.id).filterSkipped.count).toBe(0);
+    } finally { now.mockRestore(); lock.mockRestore(); }
   });
 });
 

@@ -218,7 +218,9 @@ describe("resident activation filter telemetry", () => {
       await host.start();
       const actor = await host.actors.create({ name: "claimed-review", instructions: "x", residency: "durable", topics: ["github.demo"], coalesceKey: "payload.number" });
       const expiresAt = Date.now() + 30_000;
-      await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt }, undefined, caller);
+      const reservation = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: Date.now(), expiresAt, requiredSecurity: ["security"] };
+      const receipt = await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, reservation }, undefined, caller);
+      expect(receipt).toMatchObject({ activationFilterReservation: reservation });
       const event = await new MeshStore(config.meshRoot, 65536, 1000).publish({ topic: "github.demo", from: caller.identity, data: { payload: { number: 7 } } });
       const deadline = Date.now() + 5000;
       while (host.actors.status(actor.id).filterSkipped.count !== 1) {
@@ -227,8 +229,16 @@ describe("resident activation filter telemetry", () => {
       }
       expect(await client.actorStatus(actor.id)).toMatchObject({
         activationFilterExpiresAt: expiresAt,
+        activationFilterReservation: reservation,
         filterSkipped: { count: 1, lastKey: JSON.stringify(["mesh", event.topic, 7]), lastTopic: event.topic, lastAt: expect.any(Number) },
       });
+      await client.setActor({ operation: "setActivationFilter", id: actor.id, observation: { ...reservation, reviewTerminal: true } }, undefined, caller);
+      expect((await client.actorStatus(actor.id)).activationFilterReservation).toMatchObject({ reviewTerminal: true });
+      const released = await client.setActor({ operation: "setActivationFilter", id: actor.id, observation: { ...reservation, securityTerminal: ["security"] } }, undefined, caller);
+      expect(released.activationFilter).toBeUndefined();
+      expect(released.activationFilterRelease).toMatchObject({ reason: "verdicts-terminal", reservation: { ...reservation, reviewTerminal: true, securityTerminal: ["security"] } });
+      expect((await client.actorStatus(actor.id)).activationFilterRelease).toEqual(released.activationFilterRelease);
+
       await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt: Date.now() - 1 }, undefined, caller);
       while (host.actors.status(actor.id).activationFilter) {
         if (Date.now() > deadline) throw new Error("Resident expiry did not clear");

@@ -8,6 +8,7 @@ import { BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, S
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { syncPathNamespace } from "../src/core/atomic-write.js";
 
 const roots: string[] = [];
 const closes: Array<() => Promise<unknown>> = [];
@@ -67,6 +68,10 @@ describe("bounded durable bridge event batches", () => {
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
     const sync = vi.spyOn(fs, "fsyncSync");
+    // Ancestor depth (and symlink paths) varies with the task TMPDIR.
+    syncPathNamespace(mesh.root);
+    const namespaceBarriers = sync.mock.calls.length;
+    sync.mockClear();
     const events = Array.from({ length: 256 }, (_, index) => ({ event: event(String(index)) }));
     const first = await side.publishBatch(events);
     expect(first).toHaveLength(256);
@@ -74,7 +79,7 @@ describe("bounded durable bridge event batches", () => {
     expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
     // One event-file sync and namespace confirmation, not receipts per event.
-    expect(sync.mock.calls.length).toBeLessThan(8);
+    expect(sync.mock.calls.length).toBe(namespaceBarriers + 1);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");
   }, 30000);

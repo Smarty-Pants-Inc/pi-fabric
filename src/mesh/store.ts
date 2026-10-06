@@ -625,6 +625,9 @@ export class MeshStore {
   readonly #generationPath: string;
   readonly #lockPath: string;
   readonly #lockProtocol: MeshLockProtocol;
+  readonly #ownIncarnation: Promise<string | undefined> | undefined;
+  #ownIncarnationReady = false;
+  #ownStartTime: string | undefined;
   readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
@@ -672,6 +675,17 @@ export class MeshStore {
     const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
     if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
     this.#lockProtocol = lockProtocol;
+    // Prepare this immutable process identity once, at store construction rather
+    // than inside a registry-fenced acquisition. A cold bounded try fails closed
+    // until preparation finishes; the ordinary outside-custody recovery lane can
+    // wait for it. UNKNOWN still publishes the conservative three-line receipt.
+    if (lockProtocol === 2) {
+      this.#ownIncarnation = ownProcessIncarnation().then(start => {
+        this.#ownStartTime = start;
+        this.#ownIncarnationReady = true;
+        return start;
+      }, () => { this.#ownIncarnationReady = true; return undefined; });
+    }
     this.#writeAbortSignal = options.writeSignal;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
@@ -2109,10 +2123,16 @@ export class MeshStore {
     // Async-local scope leaves concurrent ordinary callers on their own budget.
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
+    const ownerPath = path.join(this.#lockPath, "owner");
+    if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
+      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+    }
+    const startTime = this.#lockProtocol === 2
+      ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
+      : undefined;
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
-    const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
@@ -2201,7 +2221,7 @@ export class MeshStore {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath)) continue;
+          if (await this.#clearStaleLock(ownerPath, deadline)) continue;
           if (Date.now() >= deadline) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
@@ -2229,7 +2249,7 @@ export class MeshStore {
   // directories recover only after the grace, using atomic rmdir (never recursive removal
   // or rename): an owner published after our last comparison makes rmdir fail closed.
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  async #clearStaleLock(ownerPath: string): Promise<boolean> {
+  async #clearStaleLock(ownerPath: string, deadline: number): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -2266,8 +2286,20 @@ export class MeshStore {
       if (!validOwner) return false;
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
-        const actualStart = await processIncarnation(pid);
-        if (!actualStart || actualStart === recordedStart) return false;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let actualStart: string | undefined;
+        try {
+          // Race only the evidence read, NEVER the recovery operation. A reader
+          // ignoring its native timeout cannot leave an escaped rename behind.
+          // The native reader also receives this budget so its child is aborted.
+          actualStart = await Promise.race([
+            processIncarnation(pid, remaining),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
+          ]);
+        } finally { clearTimeout(timer); }
+        if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);

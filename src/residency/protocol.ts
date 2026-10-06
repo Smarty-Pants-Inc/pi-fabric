@@ -550,6 +550,18 @@ interface ResidentActorStatusCommand {
   createdAt: number;
 }
 
+export interface ResidentOperatorActorCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "operatorActor";
+  action: "stop" | "remove";
+  id: string;
+  dryRun?: boolean;
+  forceLive?: boolean;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+}
+
 type LegacyResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
@@ -558,6 +570,7 @@ type LegacyResidentCommand =
   | ResidentCreateActorCommand
   | ResidentActorMutationCommand
   | ResidentActorStatusCommand
+  | ResidentOperatorActorCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
       requestId: string; rootId: string; createdAt: number });
 
@@ -574,7 +587,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "operatorActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>

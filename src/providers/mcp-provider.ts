@@ -1,3 +1,4 @@
+import { fabricWarn } from "../core/diagnostics.js";
 import path from "node:path";
 import type {
   Runtime,
@@ -563,7 +564,7 @@ export class McpProvider implements FabricProvider {
             this.#servers.set(name, this.#toWorking(parsed, false));
           }
         }
-        console.warn(
+        fabricWarn(
           "[pi-fabric] MCP config could not be parsed; serving last-known cached MCP tools.",
         );
       }

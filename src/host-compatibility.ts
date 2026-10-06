@@ -1,3 +1,4 @@
+import { fabricWarn } from "./core/diagnostics.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
@@ -261,7 +262,7 @@ export const fabricProvenanceOptions = <Options extends object | undefined>(
   const diagnostics = globalThis as typeof globalThis & { [key: symbol]: unknown };
   if (diagnostics[WARNING_KEY] !== true) {
     diagnostics[WARNING_KEY] = true;
-    console.warn("[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.");
+    fabricWarn("[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.");
   }
   return options;
 };

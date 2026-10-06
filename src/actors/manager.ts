@@ -1,3 +1,4 @@
+import { fabricWarn } from "../core/diagnostics.js";
 import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -3724,7 +3725,7 @@ export class ActorManager {
         actor.presenceError = diagnostic;
         this.#scheduleRegistrySave(true);
         this.#emitChange();
-        console.warn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+        fabricWarn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
       }
       return undefined;
     }
@@ -3744,7 +3745,7 @@ export class ActorManager {
       catch (error) {
         // The failed acquisition wrote nothing. The host's next heartbeat carries
         // every pending id, with no per-actor timer, extra retry, or warning storm.
-        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+        if (!isMeshLockTimeout(error)) fabricWarn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
       }
       return;
     }
@@ -3803,7 +3804,7 @@ export class ActorManager {
         }
       })().catch(error => {
         // Keep the owned timer contained even if a non-mesh presence precondition fails.
-        console.warn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        fabricWarn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
         this.#schedulePresenceRetry();
       });
     }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
@@ -3945,7 +3946,7 @@ export class ActorManager {
       const durable = this.#registrySaveDurable;
       this.#registrySaveDurable = false;
       this.#registrySavePending = this.#saveActors(new Set(), { flush: true, durable }).catch((error) => {
-        console.warn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
+        fabricWarn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
         // Preserve dirty state and retry after the same bounded window.
         this.#lastRegistrySaveAt = Date.now();
         this.#scheduleRegistrySave(durable);

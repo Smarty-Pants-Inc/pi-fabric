@@ -1,3 +1,4 @@
+import { fabricWarn } from "../core/diagnostics.js";
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
@@ -1610,7 +1611,7 @@ export class AgentManager {
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { fabricWarn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -1745,7 +1746,7 @@ export class AgentManager {
       } catch (error) { failure = error; }
     }
     const warning = `Routing outcome save failed; queued run retained: ${String(failure)}`;
-    if (!queued.routeSaveFailure) console.warn(`[pi-fabric] ${warning}`);
+    if (!queued.routeSaveFailure) fabricWarn(`[pi-fabric] ${warning}`);
     queued.terminal.warnings = [...(queued.terminal.warnings ?? []).filter(item => item !== queued.routeSaveFailure), warning];
     queued.routeSaveFailure = warning;
     this.#invalidateUiList();

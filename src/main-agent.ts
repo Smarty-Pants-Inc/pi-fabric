@@ -1,3 +1,4 @@
+import { fabricWarn } from "./core/diagnostics.js";
 import { randomUUID } from "node:crypto";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
@@ -758,8 +759,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (pending && !pending.warned) {
         pending.warned = true;
         const message = `Cannot persist Main halt index ${this.#consumedPath()}; keeping Main halted across reload and retrying at the next opportunity`;
-        console.warn(`[pi-fabric] ${message}`, error);
-        try { if (this.#context?.hasUI) this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
+        fabricWarn(`[pi-fabric] ${message}`, error);
+        try { if (this.#context?.hasUI && this.#context.mode === "rpc") this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
       }
     }
   }
@@ -919,7 +920,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       if ((error as { code?: unknown } | null)?.code !== "ENOENT") {
         this.#halted = true;
         this.#haltIndexUnknown = true;
-        console.warn(`[pi-fabric] cannot read halt index ${this.#consumedPath()}; keeping Main halted until user input`, error);
+        fabricWarn(`[pi-fabric] cannot read halt index ${this.#consumedPath()}; keeping Main halted until user input`, error);
       }
     }
     let items: HeldAgentMessage[] = [];
@@ -930,7 +931,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         for (const item of parsed.items as HeldAgentMessage[]) {
           const sender = senderIdentity(item?.from);
           if (typeof item?.id !== "string" || typeof item.message !== "string" || typeof item.sentAt !== "number" || !sender) {
-            console.warn(`[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
+            fabricWarn(`[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
             continue;
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
@@ -1261,7 +1262,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       } catch (error) {
         this.#consume(this.#held.splice(index, 1)[0]!);
         count--;
-        console.warn(
+        fabricWarn(
           `[pi-fabric] dropped undeliverable followUp ${item.id} from ${String(item.from?.id)}: ` +
             (error instanceof Error ? error.message : String(error)),
         );

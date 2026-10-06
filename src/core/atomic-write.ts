@@ -1,3 +1,4 @@
+import { fabricWarn } from "./diagnostics.js";
 import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
@@ -617,7 +618,7 @@ export class MeshBackgroundRetry {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
       this.success();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
+      fabricWarn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -628,7 +629,7 @@ export class MeshBackgroundRetry {
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
+      fabricWarn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
     return transient;
@@ -668,7 +669,7 @@ export class MeshBackgroundQueue {
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
       this.#failed = true;
-      console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
+      fabricWarn("[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
     const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));

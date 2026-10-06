@@ -384,7 +384,7 @@ describe("same-user resident actor operator", () => {
     const f = await fixture();
     const run = promisify(execFile);
     const argv = (action: string, id: string) => [path.resolve("bin/fabric-actors"), action,
-      "--resident", f.config.residencyRoot, "--actor", id];
+      "--resident", f.config.residencyRoot, "--actor", id, "--mesh-root", f.config.meshRoot];
     try {
       const actor = await f.create("bin-target");
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1,
@@ -398,6 +398,41 @@ describe("same-user resident actor operator", () => {
         stderr: expect.stringContaining("Unknown Fabric actor") });
     } finally { await f.close(); }
   }, 30_000);
+
+  it.each(["directory", "symlink"] as const)("a same-name CWD %s never redirects packaged stop/remove to another valid resident", async kind => {
+    const f = await fixture();
+    let other: Awaited<ReturnType<typeof fixture>> | undefined;
+    const run = promisify(execFile);
+    try {
+      other = await fixture();
+      const target = await f.create("same-name"), wrongRoot = await other.create("same-name");
+      await stopChild(f.child); await stopChild(other.child);
+      const selector = path.basename(f.config.residencyRoot);
+      let cwd = path.dirname(other.config.residencyRoot);
+      if (kind === "symlink") {
+        cwd = path.join(f.root, "cwd"); fs.mkdirSync(cwd);
+        fs.symlinkSync(other.config.residencyRoot, path.join(cwd, selector), "dir");
+      }
+      for (const action of ["stop", "remove"] as const) {
+        const result = await run(process.execPath, [path.resolve("bin/fabric-actors"), action,
+          "--resident", selector, "--actor", target.name], {
+          cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
+        });
+        expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
+        expect(other.host.actors.status(wrongRoot.id).status).toBe("idle");
+        expect(new ActorRegistryStore(other.config.actorRoot).records().some(row => row.id === wrongRoot.id)).toBe(true);
+        if (action === "stop") expect(f.host.actors.status(target.id).status).toBe("stopped");
+        else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === target.id)).toBe(false);
+      }
+      const ambiguous = path.join(f.config.meshRoot, "residency", selector + "0");
+      fs.mkdirSync(ambiguous);
+      await expect(run(process.execPath, [path.resolve("bin/fabric-actors"), "remove",
+        "--resident", selector, "--actor", target.name], {
+        cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
+      })).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Ambiguous resident prefix") });
+      expect(other.host.actors.status(wrongRoot.id).status).toBe("idle");
+    } finally { if (other) await other.close(); await f.close(); }
+  }, 40_000);
 
   it("unknown actor, invalid flags, missing process evidence and ambiguous resident prefixes fail cleanly", async () => {
     const f = await fixture();
@@ -416,8 +451,75 @@ describe("same-user resident actor operator", () => {
       fs.writeFileSync(ownerPath, JSON.stringify(owner));
       fs.rmSync(mainGenerationPath(f.config.residencyRoot));
       expect((await f.cli("remove", actor.id)).err).toContain("no recorded identity");
-      fs.mkdirSync(path.join(f.config.meshRoot, "residency", path.basename(f.config.residencyRoot).slice(0, 12) + "-other"));
+      fs.mkdirSync(path.join(f.config.meshRoot, "residency", path.basename(f.config.residencyRoot).slice(0, 12) + "0"));
       expect(() => resolveResidentDirectory(path.basename(f.config.residencyRoot).slice(0, 12), f.config.meshRoot)).toThrow("Ambiguous");
     } finally { await f.close(); }
+  }, 30_000);
+});
+
+describe("resident selector boundary", () => {
+  it.each(["directory", "symlink"] as const)("bare prefixes ignore a same-name CWD %s and fail closed on ambiguity or no match", kind => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-resident-selector-"));
+    const meshRoot = path.join(root, "mesh"), parent = path.join(meshRoot, "residency");
+    const cwd = path.join(root, "cwd"), outside = path.join(root, "outside"), prefix = "ab";
+    const resident = path.join(parent, prefix + "0".repeat(62));
+    fs.mkdirSync(resident, { recursive: true }); fs.mkdirSync(cwd); fs.mkdirSync(outside);
+    if (kind === "directory") fs.mkdirSync(path.join(cwd, prefix));
+    else fs.symlinkSync(outside, path.join(cwd, prefix), "dir");
+    const spy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      expect(resolveResidentDirectory(prefix, meshRoot)).toBe(fs.realpathSync(resident));
+      const second = path.join(parent, prefix + "1".repeat(62)); fs.mkdirSync(second);
+      expect(() => resolveResidentDirectory(prefix, meshRoot)).toThrow("Ambiguous resident prefix");
+      fs.rmSync(second, { recursive: true }); fs.rmSync(resident, { recursive: true });
+      expect(() => resolveResidentDirectory(prefix, meshRoot)).toThrow("Unknown resident");
+      expect(() => resolveResidentDirectory("not-hex", meshRoot)).toThrow("must be hexadecimal");
+    } finally { spy.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("explicit paths accept only non-symlink directories whose realpath is a direct residency child", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-resident-selector-"));
+    const meshRoot = path.join(root, "mesh"), parent = path.join(meshRoot, "residency");
+    const resident = path.join(parent, "ab".repeat(32)), outside = path.join(root, "outside");
+    fs.mkdirSync(resident, { recursive: true }); fs.mkdirSync(outside);
+    const nested = path.join(resident, "nested"); fs.mkdirSync(nested);
+    const link = path.join(parent, "link"); fs.symlinkSync(resident, link, "dir");
+    const outsideLink = path.join(root, "outside-link"); fs.symlinkSync(resident, outsideLink, "dir");
+    const file = path.join(parent, "file"); fs.writeFileSync(file, "not a directory");
+    const spy = vi.spyOn(process, "cwd").mockReturnValue(root);
+    try {
+      expect(resolveResidentDirectory(resident, meshRoot)).toBe(fs.realpathSync(resident));
+      expect(resolveResidentDirectory(path.join(".", "mesh", "residency", path.basename(resident)), meshRoot)).toBe(fs.realpathSync(resident));
+      for (const selector of [outside, nested, `.${path.sep}outside`]) {
+        expect(() => resolveResidentDirectory(selector, meshRoot)).toThrow("direct child of the configured residency directory");
+      }
+      for (const selector of [link, link + path.sep, outsideLink]) {
+        expect(() => resolveResidentDirectory(selector, meshRoot)).toThrow("must not be a symlink");
+      }
+      expect(() => resolveResidentDirectory(file, meshRoot)).toThrow("not a directory");
+    } finally { spy.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("stop/remove refuse another valid resident's explicit path or a selector symlink before sending a request", async () => {
+    const f = await fixture();
+    let other: Awaited<ReturnType<typeof fixture>> | undefined;
+    try {
+      other = await fixture();
+      const actor = await other.create("wrong-root"); await stopChild(other.child);
+      const link = path.join(f.config.meshRoot, "residency", "link");
+      fs.symlinkSync(other.config.residencyRoot, link, "dir");
+      const validLink = path.join(f.config.meshRoot, "residency", "valid-link");
+      fs.symlinkSync(f.config.residencyRoot, validLink, "dir");
+      for (const action of ["stop", "remove"] as const) {
+        const outside = await f.cli(action, actor.name, [], other.config.residencyRoot);
+        expect(outside.code).toBe(1); expect(outside.err).toContain("direct child of the configured residency directory");
+        for (const selector of [link, validLink]) {
+          const symlink = await f.cli(action, actor.name, [], selector);
+          expect(symlink.code).toBe(1); expect(symlink.err).toContain("must not be a symlink");
+        }
+        expect(other.host.actors.status(actor.id).status).toBe("idle");
+        expect(fs.readdirSync(path.join(other.config.residencyRoot, "requests"))).toHaveLength(0);
+      }
+    } finally { if (other) await other.close(); await f.close(); }
   }, 30_000);
 });

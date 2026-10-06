@@ -6,16 +6,31 @@ import { residentProcessAlive } from "./residency/process-identity.js";
 
 const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--force-live]";
 
-/** Resolve exactly one resident directory; never choose the first ambiguous match. */
+/** Resolve exactly one resident under the configured residency directory, never the CWD. */
 export function resolveResidentDirectory(selector: string, meshRoot: string): string {
-  const absolute = path.resolve(selector);
-  if (fs.existsSync(absolute)) return fs.realpathSync(absolute);
-  const parent = selector.includes(path.sep) ? path.dirname(absolute) : path.join(meshRoot, "residency");
-  const prefix = path.basename(selector);
-  const matches = fs.readdirSync(parent).filter(name => name.startsWith(prefix) &&
-    fs.lstatSync(path.join(parent, name)).isDirectory());
-  if (matches.length !== 1) throw new Error(matches.length ? `Ambiguous resident prefix: ${selector}` : `Unknown resident: ${selector}`);
-  return fs.realpathSync(path.join(parent, matches[0]!));
+  const explicitPath = path.isAbsolute(selector) || /[/\\]/.test(selector);
+  if (!explicitPath && !/^[0-9a-f]+$/.test(selector)) {
+    throw new Error(`Resident prefix must be hexadecimal: ${selector}`);
+  }
+  const parent = fs.realpathSync(path.join(meshRoot, "residency"));
+  let candidate: string;
+  if (explicitPath) {
+    candidate = path.resolve(selector);
+  } else {
+    const matches = fs.readdirSync(parent).filter(name => /^[0-9a-f]+$/.test(name) && name.startsWith(selector) &&
+      fs.lstatSync(path.join(parent, name)).isDirectory());
+    if (matches.length !== 1) throw new Error(matches.length ? `Ambiguous resident prefix: ${selector}` : `Unknown resident: ${selector}`);
+    candidate = path.join(parent, matches[0]!);
+  }
+  // Check the selector before realpath so a link cannot hide behind its valid target.
+  const stat = fs.lstatSync(candidate);
+  if (stat.isSymbolicLink()) throw new Error(`Resident path must not be a symlink: ${selector}`);
+  if (!stat.isDirectory()) throw new Error(`Resident path is not a directory: ${selector}`);
+  const directory = fs.realpathSync(candidate);
+  if (path.dirname(directory) !== parent) {
+    throw new Error(`Resident path must be a direct child of the configured residency directory: ${selector}`);
+  }
+  return directory;
 }
 
 export async function main(argv: string[], io: { out: (text: string) => void; err: (text: string) => void } = { out: (text: string) => process.stdout.write(text),

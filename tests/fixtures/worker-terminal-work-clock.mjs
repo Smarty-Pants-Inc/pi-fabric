@@ -12,7 +12,7 @@ export const importWorkerWithFrozenTerminalClock = async (workerUrl, receiptFile
       const source = typeof loaded.source === "string" ? loaded.source : Buffer.from(loaded.source).toString("utf8");
       // Bundling can suffix the local function name, but this boundary must stay
       // unique. Fail loudly if the built worker no longer exposes it.
-      const boundary = /const logCompaction = (compactTerminalRunLog\d*\(options\.logFile, record\.status\));/g;
+      const boundary = /const logCompaction = (compactTerminalRunLog\d*\(options\.logFile, record\d*\.status\));/g;
       if ([...source.matchAll(boundary)].length !== 1) throw new Error("Expected one worker terminal-compaction boundary");
       const scoped = source.replace(boundary, (_match, call) => `const logCompaction = (() => {
         const clock = globalThis.performance;

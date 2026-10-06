@@ -469,6 +469,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #routingReadAt = 0;
   #routingError: unknown;
   #leaseConfirmed = false;
+  /** Keep recovery pending across failed publication even if its file lease renewed. */
+  #mainRecovery: "missing presence" | "lapsed lease" | undefined;
   #deadHostSweepAt = Date.now();
   #presencePassAt = Date.now();
   #quiescing = false;
@@ -511,6 +513,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#publicationRetryDelay = 750;
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
+    this.#mainRecovery = undefined;
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
@@ -1512,7 +1515,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Pin one exact-on-change snapshot for preparation. This includes migration policy,
     // not pure observation, so it must NOT opt into the background cache floor.
     // CAS/ownership ports below and the post-lock skip check stay fresh.
-    const snapshot = this.mesh.stateToken();
+    const snapshot = this.mesh.stateToken({ fresh: full && this.#leaseConfirmed && this.options.identity.kind === "main" });
     const read = { snapshot };
     // A live pre-capability reader temporarily vetoes that migration.
     // An explicit participant-file policy must not hide our legacy advertisement from
@@ -1577,6 +1580,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const stateByKey = new Map(stateEntries.map((entry) => [entry.key, entry]));
     const fileEntries = readParticipantFiles(this.mesh.root);
     const filesByKey = new Map(fileEntries.map((entry) => [entry.key, entry]));
+    // A live Main can outlast lease starvation/reaping. Inspect BEFORE renewing
+    // its lease; recovery uses this ordinary publication's CAS/key/registry fences,
+    // never the independent existing-actor renewal lane. Initial joins are not recovery.
+    let mainRecovery: "missing presence" | "lapsed lease" | undefined;
+    if (full && this.#leaseConfirmed && !this.#quiescing && this.options.identity.kind === "main" && root) {
+      const rootKey = keyFor(PARTICIPANT_PREFIX, root.id);
+      const rootFile = readParticipantFile(this.mesh.root, rootKey);
+      if (rootFile) filesByKey.set(rootKey, rootFile);
+      else filesByKey.delete(rootKey);
+      const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), read);
+      const host = hostEntry && hostFromEntry(hostEntry);
+      const lease = readHostLease(this.mesh.root, this.options.hostId);
+      const missing = !ownParticipant(rootFile) || (!filesOnly && !ownParticipant(stateByKey.get(rootKey))) || !host;
+      const lapsed = !lease || lease.expiresAt < now ||
+        (root.sessionId !== undefined && (!lease.session || lease.session.expiresAt < now));
+      mainRecovery = this.#mainRecovery ?? (missing ? "missing presence" : lapsed ? "lapsed lease" : undefined);
+      this.#mainRecovery = mainRecovery;
+      if (mainRecovery) changed = true; // publish host + legacy session in the same batch
+    }
     const existing = stateEntries.flatMap((entry) => {
       const participant = ownParticipant(entry);
       return participant ? [{ entry, participant }] : [];
@@ -1619,10 +1641,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // in the value, and do not turn change-only refreshes into heartbeats (#5128).
       // Shared compatibility readers still need their heartbeat envelopes;
       // files-only actors use the independent lane instead of duplicate writes.
+      const recoverMain = mainRecovery !== undefined && record.id === root?.id;
       const renewActor = full && this.options.renewActorParticipants === true &&
         (!filesOnly || !this.options.actorRenewalAllowed) && !this.#quiescing &&
         record.kind === "actor" && record.rootId === this.options.rootId;
-      if (!renewActor && (filesOnly
+      if (!recoverMain && !renewActor && (filesOnly
         ? !current && currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
         : current && JSON.stringify(current.participant) === JSON.stringify(record))) continue;
       const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key, read));
@@ -1644,11 +1667,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ) continue;
       if (filesOnly) {
         // A file write does not take the mesh lock, so it does not count as a shared change.
-        if (renewActor || current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
+        if (recoverMain || renewActor || current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
         else if (activityOf(currentFile, record)) activityWrites.push(record);
         continue;
       }
-      if (renewActor || !current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
+      if (recoverMain || renewActor || !current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
       else if (activityOf(current.participant, record)) activity = true;
       // Liveness belongs to the host lease. A host renewal or another participant's real
       // change must not republish this record just because its source stamped updatedAt.
@@ -1839,6 +1862,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // the same key before changing lineage. New/changed actor files therefore
     // need no registry custody, keeping first publication of 50 actors bounded.
     for (const copy of actorCopies) await this.#copyCommitted(copy.key, copy.version);
+    if (committed && mainRecovery && !this.#closed && !this.#quiescing && root) {
+      const published = ownParticipant(readParticipantFile(this.mesh.root, keyFor(PARTICIPANT_PREFIX, root.id)));
+      if (published?.kind === "root" && published.startedAt === root.startedAt) {
+        this.#mainRecovery = undefined;
+        console.warn(`[pi-fabric] Main participant re-published: ${root.id} (${mainRecovery}).`);
+      }
+    }
     return committed;
   }
 

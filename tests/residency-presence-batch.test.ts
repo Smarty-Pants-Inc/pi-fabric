@@ -66,6 +66,15 @@ describe("#4383 resident host presence batch", () => {
     // A skip filter records real ActorManager delivery without launching a worker.
     await host.actors.setActivationFilter(actor.id, [{ id: "probe", topic: ["fleet.phase-lock"], kind: ["skip"] }]);
     const gate = vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(false);
+    let heartbeatFailed = false;
+    const refresh = host.participants.refresh.bind(host.participants);
+    const heartbeat = vi.spyOn(host.participants, "refresh").mockImplementation(async () => {
+      try { await refresh(); }
+      catch (error) {
+        if (error instanceof MeshLockTimeoutError) heartbeatFailed = true;
+        throw error;
+      }
+    });
     const event = await host.mesh.publish({ topic: "fleet.phase-lock", kind: "skip", to: actor.id, from: host.identity });
     await delay(Math.max(0, heartbeatStartedAt + 5_000 - phase - Date.now()));
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot,
@@ -75,7 +84,10 @@ describe("#4383 resident host presence batch", () => {
     try {
       await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
       const started = Date.now(), prior = host.participants.confirmedAt();
-      await delay(phase + 150); // first automatic heartbeat's 50 ms attempt must fail
+      // Startup, Windows rename retries and timer dispatch can shift the first
+      // automatic heartbeat. Wait for its actual failed 50 ms attempt, not an
+      // assumed phase; do not manually drive refresh or relax any predicates.
+      await vi.waitFor(() => expect(heartbeatFailed).toBe(true), { timeout: 6_000 });
       gate.mockRestore();
       expect(host.actors.status(actor.id).filteredCount ?? 0).toBe(0);
       expect(host.participants.confirmedAt()).toBe(prior);
@@ -125,7 +137,7 @@ describe("#4383 resident host presence batch", () => {
       expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three periods").toBeGreaterThan(0);
       expect(holderExited, "recovery must happen while the periodic holder continues").toBe(false);
       expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(started);
-    } finally { gate.mockRestore(); await exited; }
+    } finally { gate.mockRestore(); heartbeat.mockRestore(); await exited; }
     expect(await exited).toBe(0);
   }, 30000);
 

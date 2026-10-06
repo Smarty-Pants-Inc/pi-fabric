@@ -207,6 +207,9 @@ describe("entropy background scheduler", () => {
     expect(warn).not.toHaveBeenCalled();
     fs.rmSync(lock, { recursive: true });
     await vi.waitFor(async () => expect((await poolStore.loadObservationPoolAsync(harness.agentDir)).file).toBeDefined(), { timeout: 3_000 });
+    // The pool file is committed before compilation begins on the retry.
+    // Observe both outcomes before shutdown aborts the remaining work.
+    await vi.waitFor(() => expect(compile).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     await harness.shutdown();
     expect(compile).toHaveBeenCalledTimes(2);
     expect(warn).not.toHaveBeenCalled();

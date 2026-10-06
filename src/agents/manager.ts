@@ -2527,7 +2527,9 @@ export class AgentManager {
   #observedWork(managed: ManagedAgent): boolean {
     const { turns, toolCalls } = managed.observedProgress;
     if (turns > 0 || toolCalls > 0) return true;
-    const record = managed.latestRecord ?? readRecord(managed.statusFile);
+    // Caller abort may arrive between status polls. A stale zero-progress UI
+    // snapshot must not discard work the worker has already durably reported.
+    const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     return record !== undefined && (record.turns > 0 || record.toolCalls > 0);
   }
 
@@ -4197,6 +4199,15 @@ export class AgentManager {
       // An uncertain Windows tree can still contain untracked native descendants.
       managed.release = () => {};
     }
+    // Logical settlement and Windows native close can both discharge image
+    // custody. Delete this handoff only once: a replay can create a new file at
+    // the same path before the old process's close callback runs.
+    let imagesRemoved = false;
+    const removeImages = (): void => {
+      if (imagesRemoved) return;
+      fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+      imagesRemoved = true;
+    };
     if (managed.transport.kind === "process" && process.platform === "win32" &&
         managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {
       // The logical result can precede native close. Keep its permit while a
@@ -4209,7 +4220,7 @@ export class AgentManager {
           await managed.processStop;
           await this.#noteUnconfirmedExit(managed);
           if (!managed.lostContact) {
-            fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+            removeImages();
             release();
           }
         }).catch(error => {
@@ -4225,7 +4236,7 @@ export class AgentManager {
     // every terminal outcome even when retainRuns keeps the rest of the run.
     if (this.#executionExited(managed) || (process.platform === "win32" && managed.transport.waitForClose &&
         !managed.launchCancelled && !managed.transport.lostContact?.() && !managed.lostContact)) {
-      fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+      removeImages();
     }
     this.#emitLifecycle(managed, `run.${result.status}`, result.finishedAt ?? Date.now(), {
       status: result.status,

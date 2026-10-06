@@ -2306,6 +2306,15 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
       await waitFor(() => state.participants.get(actor.id, undefined, { fresh: true })?.actorRun !== undefined, 30_000);
       const runId = state.participants.get(actor.id, undefined, { fresh: true })!.actorRun!.id;
+      // Admission precedes worker launch. This removal must be behind a worker
+      // that has actually made progress, not a cancellable zero-work startup.
+      const statusFile = path.join(state.config.residencyRoot, "runs", runId, "status.json");
+      await waitFor(() => {
+        try {
+          const status = JSON.parse(fs.readFileSync(statusFile, "utf8")) as { turns: number; toolCalls: number };
+          return status.turns > 0 && status.toolCalls > 0;
+        } catch { return false; }
+      }, 30_000);
 
       const started = Date.now();
       const removed = await client.removeActor(actor.id);

@@ -14,7 +14,7 @@ import { mainGenerationPath } from "../src/residency/handover.js";
 import * as mainPublication from "../src/residency/main-publication-fence.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
@@ -178,6 +178,41 @@ describe("same-user resident actor operator", () => {
     } finally { if (replacement) await stopChild(replacement); await f.close(); }
   }, 30_000);
 
+  it.each(["unbound", "different root", "different session"] as const)("native-session Main before first publication: %s", async binding => {
+    const f = await fixture();
+    let replacement: ChildProcess | undefined;
+    try {
+      const actor = await f.create("native-starting-main"); await stopChild(f.child);
+      // A native --session resume need not expose any optional root/session env.
+      // Use the release census's Pi CLI path signature, without publishing new
+      // generation/lease evidence or inspecting the native session's contents.
+      const cli = path.join(f.root, "pi-runtime", "cli.js"), session = path.join(f.root, "native-session.jsonl");
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, "console.log('ready');setInterval(()=>{},1000)");
+      fs.writeFileSync(session, JSON.stringify({ type: "session", version: 3, id: f.config.sessionId }) + "\n");
+      const environment: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of ["PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID", "PI_SESSION_ID", "PI_FABRIC_ROLE_SESSION",
+        "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete environment[key];
+      if (binding === "different root") environment.PI_FABRIC_MAIN_AGENT_ID = "session:other-root";
+      if (binding === "different session") environment.PI_SESSION_ID = "other-session";
+      replacement = spawn(process.execPath, [cli, "--session", session], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
+      await once(replacement.stdout!, "data");
+      for (const action of ["stop", "remove"] as const) {
+        const dry = await f.cli(action, actor.id, ["--dry-run"]);
+        if (binding === "unbound") {
+          expect(dry.code).toBe(1); expect(dry.err).toContain("possible unbound owner");
+          const refused = await f.cli(action, actor.id);
+          expect(refused.code).toBe(1); expect(refused.err).toContain("--force-live");
+        } else expect(dry).toMatchObject({ code: 0, err: "" });
+        expect(f.host.actors.status(actor.id).status).toBe("idle");
+        expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+      }
+      expect((await f.cli("remove", actor.id, ["--force-live", "--dry-run"])).code).toBe(0);
+      if (binding === "unbound") await stopChild(replacement);
+      expect((await f.cli("stop", actor.id)).code).toBe(0);
+    } finally { if (replacement) await stopChild(replacement); await f.close(); }
+  }, 30_000);
+
   it.each(["stop", "remove"] as const)("refuses %s when a new Main publishes its generation between initial check and commit", async action => {
     const f = await fixture();
     const fence = mainPublication.withMainPublicationFence;
@@ -324,6 +359,62 @@ describe("same-user resident actor operator", () => {
       expect(result.code).toBe(1); expect(result.err).toContain("live root lease");
       expect(f.host.actors.status(actor.id).status).toBe("idle");
     } finally { await f.close(); }
+  }, 30_000);
+
+  it.each(["unreadable", "unparseable"] as const)("a cached expired lease cannot authorize stop/remove/dry-run when current data is %s", async fault => {
+    const f = await fixture();
+    const read = fs.readFileSync;
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("damaged-lease"); await stopChild(f.child);
+      const file = hostLeasePath(f.config.meshRoot, f.config.rootId);
+      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+        updatedAt: 1, expiresAt: 2 });
+      const expired = readHostLease(f.config.meshRoot, f.config.rootId);
+      expect(expired?.expiresAt).toBe(2);
+      // Replacement changes the inode; lstat/stat still succeed. A peer reader
+      // may retain the old lease on EACCES, but operator authority must not.
+      writeHostLease(f.config.meshRoot, { ...expired!, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+      if (fault === "unreadable") spy = vi.spyOn(fs, "readFileSync").mockImplementation((target, options) => {
+        if (target === file) throw Object.assign(new Error("current lease inaccessible"), { code: "EACCES" });
+        return read(target, options as never);
+      });
+      else fs.writeFileSync(file, "{unparseable current lease");
+      expect(fs.lstatSync(file).isFile()).toBe(true); expect(fs.statSync(file).isFile()).toBe(true);
+      if (fault === "unreadable") expect(readHostLease(f.config.meshRoot, f.config.rootId)).toEqual(expired);
+      for (const action of ["stop", "remove"] as const) for (const flags of [[], ["--dry-run"]]) {
+        const refused = await f.cli(action, actor.id, flags);
+        expect(refused.code).toBe(1); expect(refused.err).toContain("root lease is unreadable or invalid");
+        expect(refused.err).toContain("--force-live");
+        expect(f.host.actors.status(actor.id).status).toBe("idle");
+        expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+      }
+    } finally { spy?.mockRestore(); await f.close(); }
+  }, 30_000);
+
+  it.each(["stop", "remove"] as const)("%s rechecks current lease readability after initial cached-expired evidence passed", async action => {
+    const f = await fixture();
+    const fence = mainPublication.withMainPublicationFence, read = fs.readFileSync;
+    let fenceSpy: ReturnType<typeof vi.spyOn> | undefined, readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("lease-read-race"); await stopChild(f.child);
+      const file = hostLeasePath(f.config.meshRoot, f.config.rootId);
+      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+        updatedAt: 1, expiresAt: 2 });
+      expect(readHostLease(f.config.meshRoot, f.config.rootId)?.expiresAt).toBe(2);
+      fenceSpy = vi.spyOn(mainPublication, "withMainPublicationFence").mockImplementationOnce(async (meshRoot, rootId, operation, wait) => {
+        writeHostLease(meshRoot, { id: rootId, rootId, identityId: rootId, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+        readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((target, options) => {
+          if (target === file) throw Object.assign(new Error("replaced lease inaccessible"), { code: "EACCES" });
+          return read(target, options as never);
+        });
+        return fence(meshRoot, rootId, operation, wait);
+      });
+      const refused = await f.cli(action, actor.id);
+      expect(refused.code).toBe(1); expect(refused.err).toContain("root lease is unreadable or invalid");
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
+    } finally { fenceSpy?.mockRestore(); readSpy?.mockRestore(); await f.close(); }
   }, 30_000);
 
   it("live shared-state root presence is independently checked by the executor", async () => {

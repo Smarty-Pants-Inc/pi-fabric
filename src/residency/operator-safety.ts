@@ -6,7 +6,7 @@ import { residentProcessAlive } from "./process-identity.js";
 import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import type { MeshStore } from "../mesh/store.js";
-import { hostEntryLiveness, hostLeasePath, readHostLease } from "../topology/host-leases.js";
+import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
 
 const refuse = (config: ResidentHostConfig, reason: string): never => {
   throw new ResidentActorAuthorizationError(`Resident root ${config.rootId}: ${reason}; use --force-live only for an intentional override`);
@@ -66,10 +66,19 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
           if (selected.has(key)) env[key] = pair.slice(equal + 1);
         }
         if (env.PI_FABRIC_PARENT_RUN || env.PI_FABRIC_ACTOR_ID || env.PI_FABRIC_RESIDENT_CONFIG) continue;
-        if (env.PI_FABRIC_MAIN_AGENT_ID === config.rootId ||
-            [env.PI_FABRIC_SESSION_ID, env.PI_SESSION_ID, env.PI_FABRIC_ROLE_SESSION].includes(config.sessionId)) {
+        const sessions = [env.PI_FABRIC_SESSION_ID, env.PI_SESSION_ID, env.PI_FABRIC_ROLE_SESSION].map(value => value?.trim());
+        const rootId = env.PI_FABRIC_MAIN_AGENT_ID?.trim();
+        if (rootId === config.rootId || sessions.includes(config.sessionId)) {
           refuse(config, "Main process is still alive (current root/session binding)");
         }
+        // Match collectHostReleases' Pi argv signature without importing the
+        // reporting/profile graph. Native --session resumes may start with no
+        // optional env bindings and before any generation/lease publication.
+        const args = fs.readFileSync(path.join(directory, "cmdline"), "utf8").split("\0").filter(Boolean);
+        const pi = args.slice(0, 2).map(arg => arg.replace(/\\/g, "/")).some(arg =>
+          path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));
+        const boundElsewhere = (rootId && rootId !== config.rootId) || sessions.some(id => id && id !== config.sessionId);
+        if (pi && !boundElsewhere) refuse(config, "Main process is still alive (possible unbound owner)");
       } catch (error) {
         if (error instanceof ResidentActorAuthorizationError) throw error;
         const code = (error as NodeJS.ErrnoException).code ?? "unknown";
@@ -111,7 +120,7 @@ export function assertDeadResidentMain(config: ResidentHostConfig, participants:
   let leasePresent = false;
   try { fs.lstatSync(leaseFile); leasePresent = true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") refuse(config, "root lease is unreadable"); }
-  const lease = leasePresent ? readHostLease(config.meshRoot, config.rootId) : undefined;
+  const lease = leasePresent ? readHostLeaseCurrent(config.meshRoot, config.rootId) : undefined;
   if (leasePresent) {
     if (!lease || lease.rootId !== config.rootId || lease.identityId !== config.rootId) refuse(config, "root lease is unreadable or invalid");
     if (lease!.expiresAt >= Date.now()) refuse(config, "Main has a live root lease");

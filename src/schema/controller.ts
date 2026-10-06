@@ -10,8 +10,10 @@ import {
   writeJsonAtomic,
   ownerHeartbeatFields,
   recordOwnerLiveness,
+  decodeOwnerIdentityLine,
   startOwnerHeartbeat,
 } from "../core/atomic-write.js";
+import { FileLockTimeoutError, withExclusiveFileLock, withExclusiveFileLockAsync } from "../core/file-lock.js";
 import type { FabricSchemaConfig, FabricSchemaTrustedCommand } from "../config.js";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
@@ -316,7 +318,7 @@ export class SchemaController {
       throw new Error(`Schema transaction exceeds ${this.config.maxFiles} postconditions`);
     }
     this.#assertPayloadBound(input);
-    const release = this.#acquireCommitLock();
+    const lock = this.#acquireCommitLock();
     const transactionId = randomUUID();
     const journalPath = path.join(this.#journalRoot, `${transactionId}.json`);
     let journal: TransactionJournal | undefined;
@@ -374,26 +376,30 @@ export class SchemaController {
         throw new Error(`Schema transaction exceeds ${this.config.maxBytes} bytes`);
       }
       journal = { format: 1, id: transactionId, status: "prepared", before, createdAt: Date.now() };
-      atomicJsonWrite(journalPath, journal);
+      lock.mutate(() => atomicJsonWrite(journalPath, journal));
 
-      await this.mesh.put({
+      await lock.mutateAsync(() => this.mesh.put({
         key: certificateEntry.key,
         value: { ...certificate, status: consumption.snd ? "active" : "consumed", consumedAt: Date.now() },
         ifVersion: certificateEntry.version,
         identity: this.identity,
-      });
+      }));
       consumed = true;
+      lock.assertOwned();
       journal.status = "applying";
-      atomicJsonWrite(journalPath, journal);
+      lock.mutate(() => atomicJsonWrite(journalPath, journal));
       const afterConsume = snapshotWorkspace(this.cwd, [this.mesh.root]);
       if (afterConsume.fingerprint !== certificate.fingerprint) {
         throw new Error("Schema workspace drifted while consuming the certificate");
       }
 
-      for (const operation of input.operations) this.#applyOperation(operation);
+      lock.mutate(() => {
+        for (const operation of input.operations) this.#applyOperation(operation);
+      });
       const applied = snapshotWorkspace(this.cwd, [this.mesh.root]);
       this.#assertNoOutsideDrift(baseline, applied, new Set(declared.keys()));
       const postconditionResults = await this.#verifyEvidence(input.postconditions, context);
+      lock.assertOwned();
       const afterPostconditions = snapshotWorkspace(this.cwd, [this.mesh.root]);
       if (applied.fingerprint !== afterPostconditions.fingerprint) {
         throw new Error("Schema workspace changed while postconditions ran");
@@ -402,9 +408,10 @@ export class SchemaController {
         throw new Error("Schema commit postconditions were not all confirmed");
       }
 
+      lock.assertOwned();
       const workspaceEntry = this.#workspaceEntry();
       const nextGeneration = certificate.generation + 1;
-      await this.mesh.put({
+      await lock.mutateAsync(() => this.mesh.put({
         key: WORKSPACE_KEY,
         value: {
           generation: nextGeneration,
@@ -414,11 +421,11 @@ export class SchemaController {
         } satisfies SchemaWorkspaceRecord,
         ifVersion: workspaceEntry?.version ?? 0,
         identity: this.identity,
-      });
+      }));
       committed = true;
       journal.status = "committed";
       try {
-        atomicJsonWrite(journalPath, journal);
+        lock.mutate(() => atomicJsonWrite(journalPath, journal));
       } catch {
         // Recovery cross-checks the authoritative committed workspace record.
       }
@@ -426,7 +433,7 @@ export class SchemaController {
       let stateTransition: unknown = null;
       try {
         stateTransition = this.state
-          ? await this.state.transition(
+          ? await lock.mutateAsync(() => this.state!.transition(
               {
                 label: `schema:${hypothesis.label}`,
                 ...(certificate.state ? { from: certificate.state.to } : {}),
@@ -435,23 +442,23 @@ export class SchemaController {
               },
               this.identity,
               this.cwd,
-            )
+            ))
           : null;
       } catch (error) {
         stateTransition = { error: errorMessage(error) };
       }
       try {
-        await this.mesh.put({
+        await lock.mutateAsync(() => this.mesh.put({
           key: hypothesisEntry.key,
           value: { ...hypothesis, status: "committed", updatedAt: Date.now() },
           ifVersion: hypothesisEntry.version,
           identity: this.identity,
-        });
+        }));
       } catch {
         // The committed workspace generation and outcome remain authoritative.
       }
       try {
-        await this.#publish("committed", {
+        await lock.mutateAsync(() => this.#publish("committed", {
           transactionId,
           hypothesisId: hypothesis.id,
           generation: nextGeneration,
@@ -463,7 +470,7 @@ export class SchemaController {
           })),
           complexityReductionCertified: hypothesis.complexityReduction,
           stateTransition,
-        });
+        }));
       } catch {
         // schema/workspace is the authoritative durable committed outcome.
       }
@@ -482,7 +489,9 @@ export class SchemaController {
     } catch (error) {
       if (!consumed) throw error;
       if (committed) throw error;
-      const rollbackError = journal ? this.#restoreBeforeImages(journal.before) : undefined;
+      // Ownership loss fences rollback too: retain the journal for a confirmed-death recovery.
+      lock.assertOwned();
+      const rollbackError = journal ? lock.mutate(() => this.#restoreBeforeImages(journal!.before)) : undefined;
       const outcome = rollbackError ? "quarantined" : "rolled_back";
       if (journal) {
         journal.status = outcome;
@@ -490,12 +499,12 @@ export class SchemaController {
           ? `${errorMessage(error)}; rollback failed: ${rollbackError}`
           : errorMessage(error);
         try {
-          atomicJsonWrite(journalPath, journal);
+          lock.mutate(() => atomicJsonWrite(journalPath, journal));
         } catch {
           // The mesh outcome record below remains the durable fallback.
         }
       }
-      await this.#recordFailedOutcome(outcome, transactionId, errorMessage(error), rollbackError);
+      await lock.mutateAsync(() => this.#recordFailedOutcome(outcome, transactionId, errorMessage(error), rollbackError));
       context.update(`Schema transaction ${outcome}`);
       return {
         outcome,
@@ -504,7 +513,7 @@ export class SchemaController {
         ...(rollbackError ? { rollbackError } : {}),
       };
     } finally {
-      release();
+      lock.release();
     }
   }
 
@@ -818,67 +827,90 @@ export class SchemaController {
     return this.mesh.publish({ topic: SCHEMA_TOPIC, kind, from: this.identity, data });
   }
 
-  // `pid\ncreated\n{identity, heartbeatAt}\n`: the third line is additive and
-  // refreshed while the transaction runs, since postconditions can be slow.
-  #acquireCommitLock(): () => void {
-    fs.mkdirSync(this.#journalRoot, { recursive: true, mode: 0o700 });
+  // Every commit-lock mutation and the entire recovery share this short guard.
+  // Recovery cannot expose an unlocked workspace while restoring before-images.
+  #commitGuardOptions() {
+    return {
+      directory: this.#journalRoot, lockName: ".commit.guard",
+      timeoutMessage: "Another Schema transaction is in progress",
+      requireDeadOwner: true, staleMs: 0,
+    };
+  }
+
+  #withCommitGuard<T>(operation: () => T): T {
+    return withExclusiveFileLock(this.#commitGuardOptions(), operation);
+  }
+
+  // Keep the pid-first format readable by older versions; token is additive.
+  #acquireCommitLock() {
     const lockPath = this.#lockPath;
+    const token = randomUUID();
     const prefix = `${process.pid}\n${Date.now()}\n`;
     const { identity, heartbeatAt } = ownerHeartbeatFields();
-    const contents = (beat: number): string => `${prefix}${JSON.stringify({ ...identity, heartbeatAt: beat })}\n`;
-    try {
-      const descriptor = fs.openSync(lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, contents(heartbeatAt));
-      fs.closeSync(descriptor);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        throw new Error("Another Schema transaction is in progress");
+    const contents = (beat: number): string => `${prefix}${JSON.stringify({ ...identity, token, heartbeatAt: beat })}\n`;
+    this.#withCommitGuard(() => {
+      let descriptor: number | undefined;
+      try {
+        descriptor = fs.openSync(lockPath, "wx", 0o600);
+        fs.writeFileSync(descriptor, contents(heartbeatAt));
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+          throw new Error("Another Schema transaction is in progress");
+        }
+        throw error;
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
       }
-      throw error;
-    }
-    const stopHeartbeat = startOwnerHeartbeat((beat) => {
-      if (fs.readFileSync(lockPath, "utf8").startsWith(prefix)) writeFileAtomic(lockPath, contents(beat));
     });
-    return () => {
-      stopHeartbeat();
-      fs.rmSync(lockPath, { force: true });
+    const owns = (): boolean => {
+      try { return JSON.parse(fs.readFileSync(lockPath, "utf8").split("\n")[2]!).token === token; }
+      catch { return false; }
+    };
+    const assertOwned = (): void => {
+      if (!owns()) throw new Error("Schema transaction ownership lost; journal retained for fenced recovery");
+    };
+    const mutate = <T>(operation: () => T): T => this.#withCommitGuard(() => {
+      assertOwned();
+      return operation();
+    });
+    const mutateAsync = <T>(operation: () => Promise<T>): Promise<T> =>
+      withExclusiveFileLockAsync(this.#commitGuardOptions(), () => {
+        assertOwned();
+        return operation();
+      });
+    const stopHeartbeat = startOwnerHeartbeat((beat) => this.#withCommitGuard(() => {
+      if (owns()) writeFileAtomic(lockPath, contents(beat));
+    }));
+    return {
+      assertOwned,
+      mutate,
+      mutateAsync,
+      release: (): void => {
+        stopHeartbeat();
+        this.#withCommitGuard(() => { if (owns()) fs.rmSync(lockPath); });
+      },
     };
   }
 
   #recoverJournals(): void {
-    fs.mkdirSync(this.#journalRoot, { recursive: true, mode: 0o700 });
+    try { this.#withCommitGuard(() => this.#recoverJournalsLocked()); }
+    catch (error) {
+      if (!(error instanceof FileLockTimeoutError)) throw error;
+      // A competing commit/recovery owns the guard; do not inspect or restore.
+    }
+  }
+
+  #recoverJournalsLocked(): void {
     try {
       const [pidText, , ownerLine] = fs.readFileSync(this.#lockPath, "utf8").split("\n");
       const pid = Number(pidText);
-      if (Number.isSafeInteger(pid) && pid > 0) {
-        let owner: unknown;
-        try {
-          owner = ownerLine && ownerLine.length <= 2_048 ? JSON.parse(ownerLine) : undefined;
-        } catch {
-          owner = undefined;
-        }
-        // An owner in another PID namespace is judged by its heartbeat;
-        // "unknown" is not death, so its journal is left alone.
-        const liveness = recordOwnerLiveness({
-          pid,
-          identity: owner,
-          ...(typeof owner === "object" && owner !== null && "heartbeatAt" in owner
-            ? { heartbeatAt: owner.heartbeatAt }
-            : {}),
-        }, {
-          legacyAlive: (candidate) => {
-            try {
-              process.kill(candidate, 0);
-              return true;
-            } catch {
-              return false;
-            }
-          },
-        });
-        if (liveness !== "dead") return;
-        // The owner is gone; recover its applying journal below.
-      }
-      fs.rmSync(this.#lockPath, { force: true });
+      // Unknown location/identity is not incarnation death. Legacy or damaged
+      // locks need operator fencing, never an age-based or EPERM takeover.
+      const owner = decodeOwnerIdentityLine(ownerLine);
+      if (!Number.isSafeInteger(pid) || pid <= 0 || !owner) return;
+      if (recordOwnerLiveness({ pid, identity: owner }) !== "dead") return;
+      // Confirmed death and the guard make this removal/recovery exclusive.
+      fs.rmSync(this.#lockPath);
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }

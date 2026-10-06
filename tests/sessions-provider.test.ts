@@ -60,6 +60,21 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(await owner.call("status", { id: opened.id })).toMatchObject({ state: "running" });
   });
 
+  it("security round: refuses foreign stop but preserves owner and trusted cleanup", async () => {
+    const owner = setup();
+    const opened = await owner.call("open", { cmd: "cat", durable: true });
+    const confined = setup({ root: owner.root, trustedExternalControl: () => false,
+      writePolicy: () => ({ readOnly: true, writableRoots: [], shell: "deny" as const }) });
+    try {
+      await expect(confined.call("stop", { id: opened.id })).rejects.toThrow(/trusted external control authority/);
+      expect(await owner.call("status", { id: opened.id })).toMatchObject({ state: "running" });
+      expect(await owner.call("stop", { id: opened.id })).toMatchObject({ state: "cancelled" });
+      const second = await owner.call("open", { cmd: "cat", durable: true });
+      const trusted = setup({ root: owner.root, trustedExternalControl: () => true });
+      expect(await trusted.call("stop", { id: second.id })).toMatchObject({ state: "cancelled" });
+    } finally { await owner.call("stop", { id: opened.id }); }
+  });
+
   it.each([false, true])("SR-7 retains delayed launch receipts and stops cancelled children (durable=%s)", async durable => {
     const { provider, call, root } = setup({ launchDelayMs: 250 });
     const abort = new AbortController();

@@ -978,11 +978,12 @@ export const ownerLiveness = (
     return "alive";
   }
   // Another namespace, host, or boot: the signal answer means nothing here.
+  // A missed heartbeat is only absence of evidence, never confirmed death.
   if (options.heartbeatAt !== undefined) {
     const now = (probes.now ?? Date.now)();
     return now - options.heartbeatAt <= (options.heartbeatTtlMs ?? OWNER_HEARTBEAT_TTL_MS)
       ? "alive"
-      : "dead";
+      : "unknown";
   }
   // No process outlives its kernel boot (containers share the host's boot id).
   if (
@@ -1015,8 +1016,8 @@ export const lockOwnerLiveness = (
 
 /**
  * Runs `refresh(now)` on an unref'd interval until the returned stop function
- * is called. Refresh failures are swallowed: a missed beat only ages the
- * record toward the TTL.
+ * is called. Refresh failures are swallowed: an expired remote heartbeat
+ * makes the owner unknown, not dead.
  */
 export const startOwnerHeartbeat = (
   refresh: (heartbeatAt: number) => void,
@@ -1026,7 +1027,7 @@ export const startOwnerHeartbeat = (
     try {
       refresh(Date.now());
     } catch {
-      // The next beat retries; a stale heartbeat is the failure signal.
+      // The next beat retries; a stale remote heartbeat cannot prove death.
     }
   }, intervalMs);
   timer.unref?.();

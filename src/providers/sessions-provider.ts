@@ -79,6 +79,7 @@ export class SessionsProvider implements FabricProvider {
   readonly description = "Interactive jev-fabric children: open, write, read, wait and stop";
   #serve: Promise<JevFabricServe> | undefined;
   readonly #opened = new Map<string, Opened>();
+  readonly #stoppedOwnedJobs = new Set<string>();
   #closed = false;
   #closePromise: Promise<void> | undefined;
   readonly #launches = new Set<PendingLaunch>();
@@ -128,9 +129,12 @@ export class SessionsProvider implements FabricProvider {
     if (name === "list") return [...this.#opened.values()].map(opened => ({ ...opened }));
     if (name === "open") return this.#open(args, context);
     const job = args.id as string;
-    if (name === "write" || name === "closeInput") {
-      this.#assertShellControl(name);
-      if (!this.#opened.has(job) && !this.options.trustedExternalControl?.()) {
+    if (name === "write" || name === "closeInput") this.#assertShellControl(name);
+    // Stop is an effect too. A durable store ID is not a control capability.
+    // Unlike launching/writing, owned stop must remain available for cleanup
+    // after confinement or shell policy changes.
+    if (name === "write" || name === "closeInput" || name === "stop") {
+      if (!this.#opened.has(job) && !(name === "stop" && this.#stoppedOwnedJobs.has(job)) && !this.options.trustedExternalControl?.()) {
         throw new Error("Interactive job control requires explicit trusted external control authority; a store ID is not authority");
       }
     }
@@ -252,6 +256,8 @@ export class SessionsProvider implements FabricProvider {
     if (result.id !== opened.id || !["cancelled", "timed_out", "exited", "failed"].includes(String(result.state))) {
       throw new Error("jev-fabric did not confirm a terminal stop receipt");
     }
+    // Keep owner authority for idempotent cleanup after a compensating stop.
+    this.#stoppedOwnedJobs.add(opened.id);
     this.#opened.delete(opened.id);
     if (opened.custodyFile) fs.unlinkSync(opened.custodyFile);
     return result;
@@ -284,6 +290,7 @@ export class SessionsProvider implements FabricProvider {
     const serve = await connection?.catch(() => undefined);
     if (serve) await Promise.allSettled([...this.#opened.values()].filter(opened => opened.stopRequired).map(opened => this.#stopOpened(serve, opened)));
     this.#opened.clear();
+    this.#stoppedOwnedJobs.clear();
     // Ending the connection stops its session children; durable jobs stay in their store.
     await serve?.close();
   }

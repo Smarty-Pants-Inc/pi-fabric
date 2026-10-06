@@ -253,6 +253,46 @@ describe("ApprovalController", () => {
     expect(session.approvedRisks.size).toBe(0);
   });
 
+  it.each(["tui", "rpc"] as const)("security round: fences a late %s session grant and releases a cancelled queue slot", async mode => {
+    let finish!: (choice: string) => void;
+    const prompt = vi.fn((..._args: unknown[]) => new Promise<string>(resolve => { finish = resolve; }));
+    const session = new FabricSessionApprovals();
+    const context = { hasUI: true, mode, ui: { custom: prompt, select: prompt, notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new ApprovalController(policies, context, session);
+    const abort = new AbortController();
+    const pending = controller.approve(action, {}, abort.signal);
+    const outcome = pending.then(() => undefined, error => error as Error);
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+    abort.abort(new Error("execution ended"));
+    const drained = vi.fn(async () => {});
+    const slot = session.serialize(drained);
+    try {
+      await vi.waitFor(() => expect(drained).toHaveBeenCalledOnce(), { timeout: 200 });
+    } finally {
+      finish(mode === "tui" ? "allow-session" : "Allow write access for this session");
+      await Promise.allSettled([pending, slot]);
+    }
+    expect(await outcome).toMatchObject({ message: "execution ended" });
+    expect(session.approvedRisks.size).toBe(0);
+    expect(context.ui.notify).not.toHaveBeenCalledWith("Allowed write access for this Pi session", "info");
+    if (mode === "rpc") expect(prompt.mock.calls[0]?.[2]).toMatchObject({ signal: abort.signal });
+  });
+
+  it("security round: dismisses the custom dialog through its completion callback on abort", async () => {
+    const abort = new AbortController();
+    const done = vi.fn();
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory({ requestRender() {} }, { fg: (_: string, text: string) => text, bold: (text: string) => text }, {}, done);
+      abort.abort(new Error("dialog cancelled"));
+      component.dispose?.();
+      return "allow-session";
+    });
+    const session = new FabricSessionApprovals();
+    await expect(new ApprovalController(policies, tuiContext(custom), session).approve(action, {}, abort.signal)).rejects.toThrow("dialog cancelled");
+    expect(done).toHaveBeenCalledWith("deny");
+    expect(session.approvedRisks.size).toBe(0);
+  });
+
   it("denies actions blocked by policy without prompting", async () => {
     const custom = vi.fn(async () => "allow-once");
     const controller = new ApprovalController(policies, tuiContext(custom));

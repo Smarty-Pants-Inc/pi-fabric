@@ -77,12 +77,19 @@ describe("ownerLiveness", () => {
     })).toBe("alive");
   });
 
+  it.each(["namespace", "host"])("security round: a missed %s heartbeat is unknown, not confirmed death", kind => {
+    const foreign = { ...local, ...(kind === "namespace" ? { pidNamespace: "pid:[foreign]" } : { hostname: "node-b" }) };
+    const signal = vi.fn(() => "dead" as const);
+    expect(ownerLiveness(foreign, { heartbeatAt: NOW - 120_000, probes: probes({ signal }) })).toBe("unknown");
+    expect(signal).not.toHaveBeenCalled();
+  });
+
   it("relies on the heartbeat across PID namespaces and never probes the PID", () => {
     const signal = vi.fn(() => "dead" as const);
     const foreign = { ...local, pidNamespace: "pid:[4026532999]" };
     const options = { probes: probes({ signal }), heartbeatTtlMs: 45_000 };
     expect(ownerLiveness(foreign, { ...options, heartbeatAt: NOW - 10_000 })).toBe("alive");
-    expect(ownerLiveness(foreign, { ...options, heartbeatAt: NOW - 46_000 })).toBe("dead");
+    expect(ownerLiveness(foreign, { ...options, heartbeatAt: NOW - 46_000 })).toBe("unknown");
     expect(ownerLiveness(foreign, options)).toBe("unknown");
     expect(signal).not.toHaveBeenCalled();
   });
@@ -152,7 +159,7 @@ describe("owner identity records", () => {
     const line = JSON.stringify({ ...local, pid: undefined, pidNamespace: "pid:[foreign]" });
     const options = { probes: probes(), maxHoldMs: 60_000 };
     expect(lockOwnerLiveness(42, NOW - 30_000, line, options)).toBe("alive");
-    expect(lockOwnerLiveness(42, NOW - 61_000, line, options)).toBe("dead");
+    expect(lockOwnerLiveness(42, NOW - 61_000, line, options)).toBe("unknown");
     expect(lockOwnerLiveness(42, Number.NaN, line, options)).toBe("unknown");
     expect(lockOwnerLiveness(42, NOW - 61_000, undefined, { ...options, legacyAlive: () => true })).toBe("alive");
     expect(SHORT_LOCK_MAX_HOLD_MS).toBeGreaterThan(OWNER_HEARTBEAT_TTL_MS);
@@ -162,7 +169,7 @@ describe("owner identity records", () => {
     const { pid: _pid, ...identity } = { ...local, pidNamespace: "pid:[foreign]" };
     const record = { pid: 42, identity, heartbeatAt: NOW - 1_000 };
     expect(recordOwnerLiveness(record, { probes: probes() })).toBe("alive");
-    expect(recordOwnerLiveness({ ...record, heartbeatAt: NOW - 50_000 }, { probes: probes() })).toBe("dead");
+    expect(recordOwnerLiveness({ ...record, heartbeatAt: NOW - 50_000 }, { probes: probes() })).toBe("unknown");
     expect(recordOwnerLiveness({ pid: 42, identity: { hostname: 3 } }, { legacyAlive: () => false })).toBe("dead");
     expect(recordOwnerLiveness({ pid: "42" })).toBe("dead");
     expect(recordOwnerLiveness(null)).toBe("dead");
@@ -194,16 +201,18 @@ describe("callers", () => {
   const foreignLine = (): string =>
     JSON.stringify({ ...decodeOwnerIdentityLine(encodeOwnerIdentityLine()), pidNamespace: "pid:[foreign-container]" });
 
-  it("file-lock takes over a foreign lock whose implicit heartbeat is stale", () => {
+  it("file-lock refuses a foreign lock whose implicit heartbeat is stale", () => {
     const directory = tempRoot();
     const lock = path.join(directory, "test.lock");
     fs.mkdirSync(lock);
     // Our own (live) PID: only the namespace mismatch makes the probe untrusted.
     const created = Date.now() - SHORT_LOCK_MAX_HOLD_MS - 60_000;
     fs.writeFileSync(path.join(lock, "owner"), `token\n${process.pid}\n${created}\n${foreignLine()}\n`);
-    expect(withExclusiveFileLock({ directory, lockName: "test.lock", timeoutMessage: "busy", attempts: 3, delayMs: 1 }, () => "taken"))
-      .toBe("taken");
-    expect(fs.existsSync(lock)).toBe(false);
+    const operation = vi.fn(() => "taken");
+    expect(() => withExclusiveFileLock({ directory, lockName: "test.lock", timeoutMessage: "busy", attempts: 3, delayMs: 1 }, operation))
+      .toThrow(FileLockTimeoutError);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(lock)).toBe(true);
   });
 
   it("file-lock refuses a foreign lock whose heartbeat is still fresh, even if the PID looks dead", () => {
@@ -246,7 +255,7 @@ describe("callers", () => {
     write(NOW - 5_000);
     expect(liveOwnerPid(ownerPath, probes({ signal }))).toBe(4242);
     write(NOW - OWNER_HEARTBEAT_TTL_MS - 1);
-    expect(liveOwnerPid(ownerPath, probes({ signal }))).toBeUndefined();
+    expect(liveOwnerPid(ownerPath, probes({ signal }))).toBe(4242);
     // No heartbeat from another namespace: unknown, which is not death.
     write();
     expect(liveOwnerPid(ownerPath, probes({ signal }))).toBe(4242);

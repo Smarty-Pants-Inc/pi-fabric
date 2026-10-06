@@ -8,6 +8,7 @@ import {
   type SelectItem,
 } from "@earendil-works/pi-tui";
 import { FabricTraceSafeError } from "../audit/trace.js";
+import { runAbortable } from "../async-settlement.js";
 
 type ThemeColorApplicator = (name: string, text: string) => string;
 
@@ -137,13 +138,14 @@ export class ApprovalController {
       }
       let decision: FabricAutoApprovalDecision;
       try {
-        decision = await this.classifier.classify(
+        decision = await runAbortable(signal, () => this.classifier.classify(
           action,
           args,
           this.context,
           this.config.model,
-        );
+        ));
       } catch (error) {
+        signal?.throwIfAborted();
         const message = error instanceof Error ? error.message : String(error);
         this.onAutoDecision?.({
           action: action.ref,
@@ -198,9 +200,11 @@ export class ApprovalController {
       ? `Fabric auto mode needs approval: ${action.ref} · ${escalationReason}`
       : `Fabric permission requested: ${action.ref} needs ${action.risk} access`;
     this.context.ui.notify(notification, "warning");
-    const choice = this.context.mode === "tui"
-      ? await this.#requestTuiApproval(action, escalationReason)
-      : await this.#requestDialogApproval(action, escalationReason);
+    const choice = await runAbortable(signal, () => this.context.mode === "tui"
+      ? this.#requestTuiApproval(action, escalationReason, signal)
+      : this.#requestDialogApproval(action, escalationReason, signal));
+    // A late dialog result can never widen permissions after its execution ends.
+    signal?.throwIfAborted();
 
     if (choice === "deny") {
       this.context.ui.notify(`Denied ${action.risk} access for ${action.ref}`, "warning");
@@ -220,6 +224,7 @@ export class ApprovalController {
   async #requestDialogApproval(
     action: ResolvedFabricAction,
     escalationReason?: string,
+    signal?: AbortSignal,
   ): Promise<ApprovalChoice> {
     const session = sessionLabel(action.risk);
     const picked = await this.context.ui.select(
@@ -228,6 +233,7 @@ export class ApprovalController {
         escalationReason,
       ].filter(Boolean).join(" · "),
       [onceLabel, session, "Deny"],
+      ...(signal ? [{ signal }] : []),
     );
     if (picked === onceLabel) return "allow-once";
     if (picked === session) return "allow-session";
@@ -237,74 +243,86 @@ export class ApprovalController {
   async #requestTuiApproval(
     action: ResolvedFabricAction,
     escalationReason?: string,
+    signal?: AbortSignal,
   ): Promise<ApprovalChoice> {
-    const choice = await this.context.ui.custom<ApprovalChoice>((tui, theme, _keybindings, done) => {
-      const container = new Container();
-      container.addChild(new DynamicBorder((text: string) => theme.fg("warning", text)));
-      container.addChild(new Spacer(1));
-      container.addChild(
-        new Text(theme.fg("warning", theme.bold("🛡  Pi Fabric permission request")), 1, 0),
-      );
-      container.addChild(new Spacer(1));
-      container.addChild(
-        new Text(
-          theme.fg("text", `${action.ref} requests ${action.risk} access.`),
-          1,
-          0,
-        ),
-      );
-      container.addChild(new Text(theme.fg("muted", action.description), 1, 0));
-      if (escalationReason) {
+    let dismiss: (() => void) | undefined;
+    const onAbort = (): void => { dismiss?.(); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const choice = await this.context.ui.custom<ApprovalChoice>((tui, theme, _keybindings, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((text: string) => theme.fg("warning", text)));
         container.addChild(new Spacer(1));
         container.addChild(
-          new Text(theme.fg("warning", escalationReason), 1, 0),
+          new Text(theme.fg("warning", theme.bold("🛡  Pi Fabric permission request")), 1, 0),
         );
-      }
-      container.addChild(new Spacer(1));
-      container.addChild(
-        new Text(
-          theme.fg("dim", "Choose whether to allow only this call or this risk class for the session."),
-          1,
-          0,
-        ),
-      );
-      container.addChild(new Spacer(1));
-      const items: SelectItem[] = [
-        {
-          value: "allow-once",
-          label: onceLabel,
-          description: "Run only this requested action",
-        },
-        {
-          value: "allow-session",
-          label: sessionLabel(action.risk),
-          description: "Do not ask again for this risk class until the Pi session ends",
-        },
-        {
-          value: "deny",
-          label: "Deny",
-          description: "Block the requested action",
-        },
-      ];
-      const list = new SelectList(items, items.length, selectListThemeFor(theme));
-      list.onSelect = (item) => done(item.value as ApprovalChoice);
-      list.onCancel = () => done("deny");
-      container.addChild(list);
-      container.addChild(new Spacer(1));
-      container.addChild(
-        new Text(theme.fg("dim", "↑↓ navigate · enter select · esc deny"), 1, 0),
-      );
-      container.addChild(new Spacer(1));
-      container.addChild(new DynamicBorder((text: string) => theme.fg("warning", text)));
-      return {
-        render: (width: number) => container.render(width),
-        invalidate: () => container.invalidate(),
-        handleInput: (data: string) => {
-          list.handleInput(data);
-          tui.requestRender();
-        },
-      };
-    });
-    return choice ?? "deny";
+        container.addChild(new Spacer(1));
+        container.addChild(
+          new Text(
+            theme.fg("text", `${action.ref} requests ${action.risk} access.`),
+            1,
+            0,
+          ),
+        );
+        container.addChild(new Text(theme.fg("muted", action.description), 1, 0));
+        if (escalationReason) {
+          container.addChild(new Spacer(1));
+          container.addChild(
+            new Text(theme.fg("warning", escalationReason), 1, 0),
+          );
+        }
+        container.addChild(new Spacer(1));
+        container.addChild(
+          new Text(
+            theme.fg("dim", "Choose whether to allow only this call or this risk class for the session."),
+            1,
+            0,
+          ),
+        );
+        container.addChild(new Spacer(1));
+        const items: SelectItem[] = [
+          {
+            value: "allow-once",
+            label: onceLabel,
+            description: "Run only this requested action",
+          },
+          {
+            value: "allow-session",
+            label: sessionLabel(action.risk),
+            description: "Do not ask again for this risk class until the Pi session ends",
+          },
+          {
+            value: "deny",
+            label: "Deny",
+            description: "Block the requested action",
+          },
+        ];
+        const list = new SelectList(items, items.length, selectListThemeFor(theme));
+        list.onSelect = (item) => done(item.value as ApprovalChoice);
+        list.onCancel = () => done("deny");
+        container.addChild(list);
+        container.addChild(new Spacer(1));
+        container.addChild(
+          new Text(theme.fg("dim", "↑↓ navigate · enter select · esc deny"), 1, 0),
+        );
+        container.addChild(new Spacer(1));
+        container.addChild(new DynamicBorder((text: string) => theme.fg("warning", text)));
+        dismiss = () => done("deny");
+        if (signal?.aborted) dismiss();
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          dispose: () => signal?.removeEventListener("abort", onAbort),
+          handleInput: (data: string) => {
+            if (signal?.aborted) return;
+            list.handleInput(data);
+            tui.requestRender();
+          },
+        };
+      });
+      return choice ?? "deny";
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 }

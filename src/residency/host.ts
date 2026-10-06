@@ -300,6 +300,7 @@ export class ResidentHost {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
       withPublicationFence: publishFenced,
+      publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
@@ -508,6 +509,7 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+        presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,
         snapshotActorOwnership,
@@ -1024,8 +1026,7 @@ export class ResidentHost {
 
   #checkIdle(): void {
     if (this.#closed || this.#staged || this.#handover) return;
-    const ownedActors = this.actors.listOwned();
-    const activeActor = ownedActors.some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+    const activeActor = this.actors.hasActiveDurableActor();
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");

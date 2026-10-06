@@ -38,11 +38,14 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
-  it.skipIf(process.platform === "win32").each([250, 1_600])("bounds watch bursts to max(1 s, actorPollMs=%i) and retains the trailing change", async actorPollMs => {
+  it.skipIf(process.platform === "win32").each([250, 1_600])("leads watch bursts and retains one trailing poll per max(1 s, actorPollMs=%i) window", async actorPollMs => {
     const s = setup();
     s.monitor.config.actorPollMs = actorPollMs;
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    const interval = vi.spyOn(globalThis, "setInterval");
     s.monitor.start(); await flush();
+    // Isolate watch coalescing from the independent idle reconciliation timer.
+    clearInterval(interval.mock.results[0]!.value);
     const call = vi.mocked(fs.watch).mock.calls[0]! as unknown[];
     const notify = call.at(-1) as (event: string, filename: string | null) => void;
     const window = Math.max(1_000, actorPollMs);
@@ -50,33 +53,56 @@ describe("ActorMeshMonitor", () => {
       for (let elapsed = 0; elapsed < window; elapsed += 100) {
         notify("change", elapsed === 0 ? null : "events.jsonl");
         notify("rename", "state.read-signal.json"); // unrelated files do not schedule polls
+        await flush();
+        // Startup/previous trailing polls never suppress the leading event.
+        expect(s.mesh.tail).toHaveBeenCalledTimes(2 + burst * 2);
         await vi.advanceTimersByTimeAsync(Math.min(100, window - elapsed));
       }
-      expect(s.mesh.tail).toHaveBeenCalledTimes(burst + 2);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(3 + burst * 2);
     }
-    // A final, isolated change inside the next window must be consumed without another notification.
-    const final = { topic: "last" } as MeshEvent;
+    const leading = { topic: "first" } as MeshEvent;
+    s.mesh.tail.mockReturnValue({ events: [leading], nextOffset: 20 });
+    notify("change", "events.jsonl"); await flush();
+    expect(s.onEvent).toHaveBeenCalledExactlyOnceWith(leading);
+    s.onEvent.mockClear();
     await vi.advanceTimersByTimeAsync(100);
-    s.mesh.tail.mockReturnValue({ events: [final], nextOffset: 20 });
+    const final = { topic: "last" } as MeshEvent;
+    s.mesh.tail.mockReturnValue({ events: [final], nextOffset: 30 });
     notify("change", "events.jsonl");
+    // Explicit polls are prompt but cannot slide away the trailing notification.
+    s.monitor.schedule(); await flush(); s.onEvent.mockClear();
     await vi.advanceTimersByTimeAsync(window - 101);
     expect(s.onEvent).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(s.onEvent).toHaveBeenCalledExactlyOnceWith(final);
+    notify("change", "events.jsonl"); await flush();
     notify("change", "events.jsonl"); // close cancels the pending trailing wake
+    const delivered = s.onEvent.mock.calls.length;
     s.monitor.close();
     await vi.advanceTimersByTimeAsync(window * 2);
-    expect(s.onEvent).toHaveBeenCalledOnce();
+    expect(s.onEvent).toHaveBeenCalledTimes(delivered);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("uses the same 1 s floor on the Windows polling path", async () => {
+  it.skipIf(process.platform === "win32")("does not delay isolated events after a quiet actor cadence", async () => {
+    const s = setup(); s.monitor.start(); await flush();
+    const call = vi.mocked(fs.watch).mock.calls[0]! as unknown[];
+    const notify = call.at(-1) as (event: string, filename: string | null) => void;
+    s.mesh.tail.mockClear();
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(80);
+      notify("change", "events.jsonl"); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(i + 1);
+    }
+  });
+
+  it("preserves main's actorPollMs cadence on the Windows polling path", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
       const s = setup(); s.monitor.start(); await flush();
       expect(fs.watch).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(999);
+      await vi.advanceTimersByTimeAsync(49);
       expect(s.mesh.tail).toHaveBeenCalledOnce();
       await vi.advanceTimersByTimeAsync(1);
       expect(s.mesh.tail).toHaveBeenCalledTimes(2);
@@ -131,7 +157,7 @@ describe("ActorMeshMonitor", () => {
     await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(49);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
@@ -264,7 +290,7 @@ describe("ActorMeshMonitor", () => {
     s.monitor.start();
     await flush();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(49);
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);

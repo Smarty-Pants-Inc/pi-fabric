@@ -740,9 +740,13 @@ with a 1000 ms background-only runtime floor). Ordinary runtime reads remain exa
 change, regardless of invocation activity. File changes and UI remote-generation checks
 do not bypass the background window while Main is idle. A running turn or pending Main
 message shortens only the background window to 1000 ms; explicit fresh reads, including
-Schema state bindings, always bypass it. Actor watch/fallback polling and
-residency delivery drains run at most once per `max(1000, mesh.actorPollMs)` ms, retaining
-a trailing wake for the last change in a burst; explicit scheduling/catch-up stays prompt.
+Schema state bindings, always bypass it. Resident participant-file lists retain their
+configured legacy observation TTL without a floor; fresh ownership/maintenance lists
+bypass it, and resident shared-state/routing reads remain exact on change.
+Actor watches poll immediately after a quiet actor cadence, then retain one trailing
+poll per `max(1000, mesh.actorPollMs)` ms for continuous bursts. Windows and unsupported
+watchers retain `mesh.actorPollMs` polling. Residency delivery drains use the 1000 ms
+floor; explicit scheduling/catch-up stays prompt.
 Listings can lag by this window; expiration does not slide on cache hits.
 Fresh readers revalidate canonical physical generation instead of parsing an unchanged file
 again. Stores share parsed reader snapshots within a process, and a bounded optional read

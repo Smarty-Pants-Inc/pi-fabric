@@ -299,6 +299,8 @@ export class ResidentHost {
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      // Legacy list observations may lag; authority snapshots explicitly request fresh.
+      listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
       hostId: this.hostId,
       rootId: config.rootId,
@@ -782,7 +784,7 @@ export class ResidentHost {
           command.data,
           signal,
           { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id)?.rootId) },
+            this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -806,7 +808,7 @@ export class ResidentHost {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
       const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-        this.participants.get(from.id)?.rootId);
+        this.participants.get(from.id, undefined, { fresh: true })?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
@@ -858,7 +860,7 @@ export class ResidentHost {
     } catch {
       // Route through the current remote owner below.
     }
-    const target = this.participants.get(subscription.to);
+    const target = this.participants.get(subscription.to, undefined, { fresh: true });
     if (!target) throw new Error(`Unknown Fabric lifecycle target: ${subscription.to}`);
     await this.control.request(
       target.ownerHostId,

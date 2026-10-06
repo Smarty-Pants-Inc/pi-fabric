@@ -22,7 +22,8 @@ export class ActorMeshMonitor {
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   #watchTimer: NodeJS.Timeout | undefined;
-  #lastPollAt = Number.NEGATIVE_INFINITY;
+  #lastWatchAt = Number.NEGATIVE_INFINITY;
+  #watchPending = false;
   #offset: number;
   #scheduled = false;
   #polling = false;
@@ -83,7 +84,7 @@ export class ActorMeshMonitor {
     if (this.#started || this.#closed || !this.config.enabled) return;
     this.#started = true;
     if (process.platform === "win32") {
-      this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
+      this.#startTimer(this.config.actorPollMs);
       this.schedule();
       return;
     }
@@ -96,7 +97,7 @@ export class ActorMeshMonitor {
       watcher.on("error", () => this.#fallback(watcher));
       this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
     } catch {
-      this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
+      this.#startTimer(this.config.actorPollMs);
     }
     this.schedule();
   }
@@ -131,20 +132,29 @@ export class ActorMeshMonitor {
     });
   }
 
-  // One trailing wake per fixed window, not a resetting debounce: a continuous burst
-  // cannot postpone the last change forever. Explicit schedule()/catch-up stays prompt.
+  // Lead after a quiet actor cadence, then retain one trailing wake for a burst.
+  // The window belongs to watch notifications, not startup/explicit/idle polls:
+  // none of those may delay the first new event. Continuous notifications never
+  // slide the trailing deadline; isolated events retain their original latency.
   #scheduleBackground(): void {
-    if (this.#watchTimer || this.#closed || !this.config.enabled) return;
-    const wait = this.#lastPollAt + Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs) - Date.now();
-    if (wait <= 0) {
-      this.schedule();
+    if (this.#closed || !this.config.enabled) return;
+    const now = Date.now();
+    const quiet = now - this.#lastWatchAt >= this.config.actorPollMs;
+    this.#lastWatchAt = now;
+    if (this.#watchTimer && !quiet) {
+      this.#watchPending = true;
       return;
     }
+    if (this.#watchTimer) clearTimeout(this.#watchTimer);
+    this.#watchPending = false;
+    this.schedule();
     this.#watchTimer = setTimeout(() => {
       this.#watchTimer = undefined;
-      // An explicit poll may have run while waiting; retain the trailing notification.
-      this.#scheduleBackground();
-    }, wait);
+      if (this.#watchPending) {
+        this.#watchPending = false;
+        this.schedule();
+      }
+    }, Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
     this.#watchTimer.unref();
   }
 
@@ -152,19 +162,18 @@ export class ActorMeshMonitor {
     if (this.#closed || this.#watcher !== watcher) return;
     watcher.close();
     this.#watcher = undefined;
-    this.#startTimer(Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
-    this.#scheduleBackground();
+    this.#startTimer(this.config.actorPollMs);
+    this.schedule();
   }
 
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
-    this.#timer = setInterval(() => this.#scheduleBackground(), delay);
+    this.#timer = setInterval(() => this.schedule(), delay);
     this.#timer.unref();
   }
 
   async #poll(): Promise<void> {
     if (this.#polling || this.#closed || !this.config.enabled) return;
-    this.#lastPollAt = Date.now();
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
     this.#polling = true;
     try {

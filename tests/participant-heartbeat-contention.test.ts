@@ -76,12 +76,13 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get(participantKey)).toEqual(participant);
     advance(15_001); // a crashed Main's session still lapses at the original fixed TTL
     if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
-    await directory.refresh(); // lock-confirmed re-acquisition, without another identity rewrite
+    await directory.refresh(); // A genuinely lapsed Main re-publishes once (#5840).
     if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
-    expect(writes).not.toHaveBeenCalled();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(mesh.get(participantKey)!.version).toBeGreaterThan(participant.version);
   });
 
-  it("cached sessions and peers follow fresh file liveness, lapse at 15 s and re-acquire without state writes", async () => {
+  it("cached sessions and peers follow file liveness, then a lapsed Main re-publishes once", async () => {
     const { root, directory, identity, writes, advance } = await setup(false);
     const observerIdentity: MeshIdentity = { id: "session:observer", name: "main", kind: "main", sessionId: "observer" };
     const observer = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 100, { readCacheMs: 60_000 }), {
@@ -89,8 +90,7 @@ describe("#3752 participant heartbeat contention", () => {
     });
     directories.push(observer);
     expect(observer.sessions().map(root => root.id)).toEqual([identity.id]); // cache the identity
-    advance(20_000);
-    await directory.refresh();
+    for (let tick = 0; tick < 4; tick++) { advance(5_000); await directory.refresh(); }
     expect(observer.sessions().map(root => root.id)).toEqual([identity.id]);
     expect(observer.peers().map(peer => peer.id)).toEqual([identity.id]);
     expect(writes).not.toHaveBeenCalled();
@@ -99,13 +99,12 @@ describe("#3752 participant heartbeat contention", () => {
     expect(observer.peers()).toEqual([]);
     await directory.refresh();
     expect(observer.sessions().map(root => root.id)).toEqual([identity.id]);
-    expect(writes).not.toHaveBeenCalled();
+    expect(writes).toHaveBeenCalledOnce();
   });
 
   it("re-enters legacy mode on an old peer joining, then stops state renewal when it lapses", async () => {
     const { directory, mesh, writes, advance } = await setup(false);
-    advance(20_000);
-    await directory.refresh();
+    for (let tick = 0; tick < 4; tick++) { advance(5_000); await directory.refresh(); }
     expect(writes).not.toHaveBeenCalled();
     const peer: MeshIdentity = { id: "session:legacy", name: "main", kind: "main", sessionId: "legacy" };
     await mesh.put({ key: "sessions/legacy", identity: peer, value: {
@@ -354,8 +353,8 @@ describe("#3752 participant heartbeat contention", () => {
   it("unchanged participants stay live to directory, lineage, reaper and bridge, then expire", async () => {
     const { directory, mesh, hostKey, participantKey, identity, writes, advance, now } = await setup(true);
     const participant = mesh.get(participantKey)!;
-    advance(20_000); // state lease has lapsed, but the independent file lease renews
-    await directory.refresh();
+    // Let the shared envelope lapse while healthy ticks keep the file lease live.
+    for (let tick = 0; tick < 4; tick++) { advance(5_000); await directory.refresh(); }
     expect(writes).not.toHaveBeenCalled();
     expect(mesh.get(participantKey)!.version).toBe(participant.version);
     expect(directory.get(identity.id)).toMatchObject({ stale: false });

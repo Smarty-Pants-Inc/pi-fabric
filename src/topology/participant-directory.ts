@@ -448,6 +448,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #closed = false;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
+  /** A successful sequence claim survives discarded preparations for this root. */
+  #claimedPeerLabel: string | undefined;
   #refreshScheduled = false;
   #refreshAgain = false;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1441,6 +1443,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Return the actual shared commit/acquisition time, not the completion time
   // of fallible post-commit file copies. An unchanged change-only refresh proves nothing.
   async #refresh(full: boolean): Promise<number | false> {
+    // Claim before capturing a publication generation, but reselect ALL sources
+    // afterwards: neither a label's mesh write nor an awaited claim may leave
+    // actor ownership observations selected against an older generation.
+    if (this.options.enabled && !this.#claimedPeerLabel && !this.#localRecords.get(this.options.rootId)?.label) {
+      for (const source of this.#sources) {
+        const root = source().find(record => record.kind === "root" && record.id === this.options.rootId);
+        if (root) { await this.#ensurePeerLabels(new Map([[root.id, { ...root }]])); break; }
+      }
+    }
     const validPublication = this.options.preparePublicationFence?.();
     const now = Date.now();
     const desired = new Map<string, FabricParticipantRecord>();
@@ -2006,7 +2017,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled) return;
     for (const record of desired.values()) {
       if (record.kind !== "root" || record.id !== this.options.rootId || record.label) continue;
-      const published = this.#localRecords.get(record.id)?.label;
+      const published = this.#localRecords.get(record.id)?.label ?? this.#claimedPeerLabel;
       if (published) {
         record.label = published;
         continue;
@@ -2019,7 +2030,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         continue;
       }
       const seq = await this.#claimPeerSeq();
-      if (seq !== undefined) record.label = `${peerLabelPrefix(record.cwd)}-${seq}`;
+      if (seq !== undefined) record.label = this.#claimedPeerLabel = `${peerLabelPrefix(record.cwd)}-${seq}`;
     }
   }
 

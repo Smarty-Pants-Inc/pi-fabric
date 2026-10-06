@@ -504,6 +504,7 @@ export class ActorManager {
   #registrySaveDurable = false;
   #registrySaveRevision = 0;
   #registrySaveChain: Promise<void> = Promise.resolve();
+  readonly #registrySaveControllers = new Set<AbortController>();
   readonly #registryRowEncodings = new Map<string, { instructions: unknown; metadata: string; encoded: string }>();
   #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
@@ -2640,8 +2641,17 @@ export class ActorManager {
     }
     this.#emitChange();
     // Preparation is an admission boundary, not a coalescible worker status pulse.
-    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
-      ...(requireCommit ? { requiredActor: actor } : {}) }));
+    try {
+      await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
+        ...(requireCommit ? { requiredActor: actor } : {}) }));
+    } catch (error) {
+      if (error instanceof ActorPreparationTimeoutError) {
+        // Release only process-local serialization. An abandoned acquisition
+        // may settle later, but its preparation must never become commit authority.
+        for (const controller of this.#registrySaveControllers) controller.abort(error);
+      }
+      throw error;
+    }
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
@@ -3713,7 +3723,10 @@ export class ActorManager {
   }
 
   #assertPresenceValue(value: FabricActorInfo): void {
-    const serialized = JSON.stringify(value);
+    // The lineage token belongs to native participant renewal, not the legacy
+    // actors/ wire value. Keep the historical byte limit on the actual payload.
+    const { ownershipToken: _token, ...legacy } = value;
+    const serialized = JSON.stringify(legacy);
     if (serialized === undefined) throw new Error("Actor presence must be JSON-serializable");
     if (Buffer.byteLength(serialized, "utf8") > this.mesh.maxEventBytes) {
       throw new Error(`Actor presence exceeds ${this.mesh.maxEventBytes} bytes; reduce actor metadata`);
@@ -3725,7 +3738,8 @@ export class ActorManager {
     let value: FabricActorInfo;
     try {
       // Exclude our own diagnostic so a repaired value can fit again.
-      value = this.#publicInfo(actor, false);
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false);
+      value = legacy;
       this.#assertPresenceValue(value);
     } catch (error) {
       const diagnostic = `Actor presence omitted: ${error instanceof Error ? error.message : String(error)}`;
@@ -4020,17 +4034,32 @@ export class ActorManager {
     // Serialization is process-local and OUTSIDE custody. A later preparation
     // must not select unacknowledged additions from an earlier accepted commit.
     // Other processes still race via the optimistic generation protocol.
-    const saved = this.#registrySaveChain.then(() => this.#saveActorsNow(removedIds, options));
+    const controller = new AbortController();
+    this.#registrySaveControllers.add(controller);
+    let cancel!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", cancel, { once: true });
+    });
+    const operation = this.#registrySaveChain.then(() => {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      return this.#saveActorsNow(removedIds, options, controller.signal);
+    });
+    const saved = Promise.race([operation, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", cancel);
+      this.#registrySaveControllers.delete(controller);
+    });
     this.#registrySaveChain = saved.catch(() => undefined);
     return saved;
   }
 
   async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-  }): Promise<void> {
+  }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
     const committed = await this.#registry.update(current => {
+      if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
       const ownershipGeneration = publicationGeneration(this.mesh.root);
       return this.#withOwnershipRead(() => {
@@ -4057,7 +4086,7 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),

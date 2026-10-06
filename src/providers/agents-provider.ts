@@ -1628,6 +1628,13 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
+  /** Host-authored terminal lane report: use only a recorded return address, never elect a lead. */
+  async reportMainProviderError(message: string): Promise<FabricAgentMessageResult | undefined> {
+    const target = this.#taskReturnAddress?.spawnerId ?? this.#router.spawner?.id ?? this.#projectLeadId;
+    if (!target || this.mainAgent.matches(target)) return undefined;
+    return this.routeMessage(target, message, undefined, "followUp");
+  }
+
   async routeMessage(
     id: string,
     message: string,

@@ -664,17 +664,25 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it.each(["main spawn", "main create"] as const)("%s aborted during participant publication retains the confirmed ID", async (kind) => {
-    const state = await harness(false);
+    // This case cancels publication, not cold command preparation. The shared
+    // 500 ms timeout can win before the response is acknowledged on busy CI.
+    const state = await harness(false, undefined, 5_000);
     const original = state.participants.get.bind(state.participants);
     const get = vi.spyOn(state.participants, "get").mockImplementation((id) => id === state.config.rootId ? original(id) : undefined);
     const controller = new AbortController();
+    let commandError: Error | undefined;
     try {
-      const outcome = send(state, kind, controller.signal).catch((error: Error) => error);
-      await waitFor(() => entries(state.residencyRoot, "decisions").length === 1 &&
-        entries(state.residencyRoot, "processing").length === 0 && entries(state.residencyRoot, "responses").length === 0);
+      const outcome = send(state, kind, controller.signal).catch((error: Error) => { commandError = error; return error; });
+      await waitFor(() => {
+        if (commandError) throw commandError;
+        return entries(state.residencyRoot, "decisions").length === 1 &&
+          entries(state.residencyRoot, "processing").length === 0 && entries(state.residencyRoot, "responses").length === 0;
+      });
       controller.abort();
       const error = await outcome;
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: expect.any(String), id: expect.stringMatching(/^[0-9a-f]{32}$/) });
+      expect((error as Error).message).toMatch(/aborted/i);
+      expect((error as Error).message).not.toMatch(/Timed out/);
       get.mockRestore();
       const id = (error as Error & { id: string }).id;
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
@@ -2031,6 +2039,7 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
+    // Keep cold creation separate from the deliberately short removal deadline.
     // This case proves NO activation/compensation attempt, not a 200 ms native
     // publication SLA. Main Windows eebea382 passed; PR369's native log instead
     // exhausted that client wait during successful create publication. Keep a
@@ -2195,7 +2204,8 @@ describe("round 1 public cancellation contract", () => {
           await waitFor(() => state.participants.get(knownId)?.ownerHostId === residentHostId(state.config.rootId));
           expect(state.participants.list({ scope: "lineage" }).filter((p) => p.id === knownId)).toHaveLength(1);
           expect(await main.invoke(operation === "spawn" ? "agents.status" : "agents.actorStatus", { id: knownId })).toMatchObject({ id: knownId });
-          await main.invoke("agents.stop", { id: knownId });
+          // The fake worker can already be terminal (and no longer stoppable).
+          // state.close() below owns stop/join cleanup regardless of that race.
         }
       } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });

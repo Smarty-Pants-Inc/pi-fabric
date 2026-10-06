@@ -739,11 +739,20 @@ Native `new`/`resume` session replacement records its explicit `targetSessionFil
 
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
 
-Idle observations of shared state and participant files reuse a snapshot for at most
-`mesh.idleReadCoalesceMs` (default 5000 ms; range 0–10000, 0 disables reuse). File changes and
-UI remote-generation checks do not bypass that window while Main is idle. A running turn or
-pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
-always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
+Explicit background display observations of shared state and participant files reuse a
+snapshot for at most `mesh.idleReadCoalesceMs` (default 5000 ms; accepted range 0–10000,
+with a 1000 ms background-only runtime floor). Ordinary runtime reads remain exact on
+change, regardless of invocation activity. File changes and UI remote-generation checks
+do not bypass the background window while Main is idle. A running turn or pending Main
+message shortens only the background window to 1000 ms; explicit fresh reads, including
+Schema state bindings, always bypass it. Resident participant-file lists retain their
+configured legacy observation TTL without a floor; fresh ownership/maintenance lists
+bypass it, and resident shared-state/routing reads remain exact on change.
+Actor watches poll immediately after a quiet actor cadence, then retain one trailing
+poll per `max(1000, mesh.actorPollMs)` ms for continuous bursts. Windows and unsupported
+watchers retain `mesh.actorPollMs` polling. Residency delivery drains use the 1000 ms
+floor; explicit scheduling/catch-up stays prompt.
+Listings can lag by this window; expiration does not slide on cache hits.
 Fresh readers revalidate canonical physical generation instead of parsing an unchanged file
 again. Stores share parsed reader snapshots within a process, and a bounded optional read
 journal advances changed snapshots incrementally. Missing/legacy/invalid journals fall back

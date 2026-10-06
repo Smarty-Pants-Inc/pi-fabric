@@ -816,7 +816,7 @@ export class FabricUiController {
         local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
         (remote === this.#builtRemote || (
           this.state.mesh.readCacheRemainingMs !== 0 && now - this.#builtAt < Math.min(REMOTE_REFRESH_MS,
-            this.state.config.mesh.enabled ? this.state.mesh.readCacheMs ?? REMOTE_REFRESH_MS : REMOTE_REFRESH_MS)
+            this.state.config.mesh.enabled ? (this.state.mesh.backgroundReadCacheMs ?? this.state.mesh.readCacheMs) ?? REMOTE_REFRESH_MS : REMOTE_REFRESH_MS)
         ));
       if (unchanged) {
         this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
@@ -828,7 +828,7 @@ export class FabricUiController {
         const readActive = main.status === "running" || main.pendingMessages;
         if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(readActive, readActive);
         if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot, {
-          maxAgeMs: readActive ? 0 : this.state.mesh.readCacheMs,
+          maxAgeMs: readActive ? 0 : (this.state.mesh.backgroundReadCacheMs ?? this.state.mesh.readCacheMs),
         });
         this.#builtLocal = local;
         this.#builtAt = now;

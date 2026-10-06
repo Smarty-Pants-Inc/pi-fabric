@@ -382,8 +382,12 @@ export interface ParticipantDirectoryOptions {
   enabled: boolean;
   /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
   renewActorParticipants?: boolean;
+  /** Explicit legacy list observation TTL, without a floor. Authority must request fresh. */
+  listReadCacheMs?: number;
   /** Registry -> mesh/key lock order: retain actor custody through every publication write. */
   withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
+  /** Extra presence writes share this host's one fenced heartbeat acquisition. */
+  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void };
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -498,7 +502,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed) return;
+    if (this.#closed || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -506,6 +510,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshScheduled) return;
     this.#refreshScheduled = true;
     const run = (): void => {
+      if (!this.#refreshScheduled || this.#closed) return;
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
       void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
@@ -519,6 +524,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer.unref?.();
   }
 
+  /** Actor mutations publish changes, not a full heartbeat or a lock-outage retry. */
+  async refreshPresence(): Promise<void> {
+    if (isMeshLockTimeout(this.#refreshError)) return;
+    // A setter may finish saving after an in-flight heartbeat selected its source.
+    // Wait for that round, then flush the pending revision under a fresh registry
+    // fence. Coalescing with it could acknowledge presence it never committed.
+    while (this.#refreshing) {
+      try { await this.#refreshing; }
+      catch (error) {
+        if (isMeshLockTimeout(error)) return;
+        throw error;
+      }
+    }
+    if (isMeshLockTimeout(this.#refreshError)) return;
+    // Do not call refresh(): mutation callers must not masquerade as automatic
+    // heartbeats. The next full round still renews every actor envelope (#5128)
+    // and its host lease in the same single batch.
+    await this.#runRefresh(false);
+  }
+
   /** A heartbeat: publishes the records and renews this host's lease. */
   async refresh(): Promise<void> {
     if (this.#closed) return;
@@ -528,7 +553,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) this.#renewFileLease();
       if (this.#refreshingFull) return this.#refreshing;
       // A change-only refresh may skip its write; renew the lease right after it.
-      return this.#refreshing.catch(() => undefined).then(() => this.refresh());
+      return this.#refreshing.catch(error => {
+        if (isMeshLockTimeout(error)) throw error;
+      }).then(() => this.refresh());
     }
     return this.#runRefresh(true);
   }
@@ -548,6 +575,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     settled.catch(() => undefined);                            // awaiters still see a failure
     this.#refreshing = settled;
     this.#refreshingFull = full;
+    let lockTimedOut = false;
     try {
       const committed = await operation;
       if (!committed) return;
@@ -577,13 +605,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       this.#refreshError = error;
       this.#routingReadAt = 0;
+      lockTimedOut = isMeshLockTimeout(error);
+      if (lockTimedOut) {
+        // A change timer may predate this heartbeat and still be waiting to run.
+        // Cancel it too: all pending state rides the next natural round.
+        if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+        this.#refreshTimer = undefined;
+        this.#refreshScheduled = false;
+      }
       throw error;
     } finally {
       this.#refreshing = undefined;
       this.#refreshStartedAt = undefined;
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
-        this.scheduleRefresh();
+        // Acquisition timeouts have a natural next heartbeat, not a follow-up
+        // refresh for every change received while this round was waiting.
+        if (!lockTimedOut) this.scheduleRefresh();
       }
     }
   }
@@ -599,12 +637,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (options.kinds && !options.kinds.includes(participant.kind)) continue;
         byId.set(participant.id, { ...participant, local: true, stale: false });
       }
-      const self = this.self(now);
+      const self = this.self(now, options);
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
       return [...byId.values()];
     }
-    const read = { fresh: options.fresh === true };
-    const parsed = this.#parsed(read);
+    const read = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}) };
+    const parsed = this.#parsed(read, this.options.listReadCacheMs);
     const hosts = this.#liveHosts(parsed.hosts);
     const byId = new Map<string, FabricParticipantInfo>();
     const refused: string[] = [];
@@ -658,7 +696,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     }
-    const self = this.self(now);
+    const self = this.self(now, options);
     if (
       (!options.kinds || options.kinds.includes(self.kind)) &&
       options.scope !== "project" &&
@@ -677,9 +715,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // and host record of the fleet state: most of an idle Pi's CPU (smarty-dev#557). A new parse
   // copies only the entries whose version moved; the fleet state is rewritten several times a
   // second, but by a few writers. The copies are frozen, since every caller now shares them.
-  #parsed(read: { fresh: boolean }): ParsedDirectory {
+  #parsed(read: MeshReadOptions, listReadCacheMs?: number): ParsedDirectory {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
-      const merged = mergeParticipantEntries(this.#participantFiles(read), this.mesh.listAll(PARTICIPANT_PREFIX, read));
+      const merged = mergeParticipantEntries(this.#participantFiles(read, listReadCacheMs), this.mesh.listAll(PARTICIPANT_PREFIX, read));
       return {
         hosts: this.mesh.listAll(HOST_PREFIX, read),
         participants: this.#participantsOf(merged.entries),
@@ -694,7 +732,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const snapshot = { snapshot: token };
     // Participant files are a second source (smarty-dev#2004): their listing is the same array
     // while no file changed, so it keys the cache with the state token.
-    const files = this.#participantFiles(read);
+    const files = this.#participantFiles(read, listReadCacheMs);
     const cached = this.#parsedCache;
     if (cached?.token === token && cached.files === files) return cached.value;
     const previous = this.#parsedEntries;
@@ -1096,7 +1134,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
     // This never grants admission: refresh still needs the real mesh lock.
-    if (!confirmed && !this.#closed && !this.#quiescing && this.#timer) {
+    // A typed lock timeout already has a natural heartbeat retry. Idle consumers
+    // call this gate as often as every 100 ms; they must not multiply attempts.
+    if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
       void this.#backgroundRefresh.run(() => this.refresh(), false);
     }
     return confirmed;
@@ -1122,10 +1162,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return lapsed;
   }
 
-  self(now = Date.now()): FabricParticipantInfo {
+  self(now = Date.now(), read: MeshReadOptions = {}): FabricParticipantInfo {
     const existing =
       this.#localRecords.get(this.options.identity.id) ??
-      this.#parsed({ fresh: false }).participants
+      this.#parsed(read).participants
         .find((participant) => participant.id === this.options.identity.id && participant.remoteHost === undefined);
     if (existing) {
       return {
@@ -1162,8 +1202,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return this.list({ scope: "project", kinds: ["root"] }, now);
   }
 
-  peers(now = Date.now()): FabricPeerInfo[] {
-    return this.sessions(now)
+  peers(now = Date.now(), options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
+    return this.list({ ...options, scope: "project", kinds: ["root"] }, now)
       .filter((participant) => participant.id !== this.options.rootId)
       .flatMap((participant) => {
         const peer = peerFromParticipant(participant);
@@ -1337,14 +1377,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
     // Every write of this heartbeat goes into ONE locked state write (smarty-dev#367):
     // each separate put rewrote the whole shared state file under the mesh lock.
-    const ops: MeshBatchOperation[] = [];
-    let changed = false;
+    const publication = this.options.publicationBatch?.(full);
+    const ops: MeshBatchOperation[] = [...(publication?.ops ?? [])];
+    let changed = ops.length > 0;
     // Before the fleet owner's switch to files, the shared state stays the record every runtime
     // reads, and each committed record is also written to its file. After it, records are written
     // only to their files, and this host removes its records from the shared state, and its
     // pre-directory session entry too: every runtime then reads the records (smarty-dev#2004).
-    // One coalesced snapshot for read-only preparation, even if the fixed cache deadline
-    // passes mid-refresh. CAS/ownership ports below and the post-lock skip check stay fresh.
+    // Pin one exact-on-change snapshot for preparation. This includes migration policy,
+    // not pure observation, so it must NOT opt into the background cache floor.
+    // CAS/ownership ports below and the post-lock skip check stay fresh.
     const snapshot = this.mesh.stateToken();
     const read = { snapshot };
     // A live pre-capability reader temporarily vetoes that migration.
@@ -1622,7 +1664,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     let committedAt = 0;
     const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
       prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
-      afterCommit: () => { committedAt = Date.now(); } });
+      afterCommit: () => { committedAt = Date.now(); publication?.committed(); } });
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {
@@ -1800,8 +1842,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return mergeParticipantEntries(this.#participantFiles(read), this.mesh.listAll(PARTICIPANT_PREFIX, read));
   }
 
-  #participantFiles(read: { fresh?: boolean }): readonly MeshStateEntry[] {
-    return readParticipantFiles(this.mesh.root, { maxAgeMs: read.fresh ? 0 : this.mesh.readCacheMs });
+  #participantFiles(read: MeshReadOptions, listReadCacheMs?: number): readonly MeshStateEntry[] {
+    // The resident's legacy list TTL belongs only to this observation. Mutation/
+    // migration preparation calls without it, and fresh ownership lists bypass it.
+    const maxAgeMs = read.fresh ? 0 : read.background ? this.mesh.backgroundReadCacheMs
+      : listReadCacheMs ?? this.mesh.readCacheMs;
+    return readParticipantFiles(this.mesh.root, { maxAgeMs });
   }
 
   #participantsOf(entries: readonly MeshStateEntry[]): FabricParticipantRecord[] {

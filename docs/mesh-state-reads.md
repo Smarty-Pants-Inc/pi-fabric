@@ -9,9 +9,33 @@ routing validation use a process-local canonical snapshot. Stores at the same re
 state path share parsed reader snapshots; abandoned roots use weak references and the
 root-name index is capped at 64. Write transactions never mutate a shared reader snapshot.
 
-Ordinary idle reads retain the existing fixed `mesh.idleReadCoalesceMs` window (default
-5 seconds). Fresh reads and active/pending-message observations bypass that age window,
-not the physical-generation gate. Unchanged canonical metadata reuses the parse instead
+Ordinary runtime reads are exact on change, including during live invocations. Resident
+host participant-file lists preserve their explicitly configured legacy observation TTL
+without a floor; resident shared-state reads remain exact on change;
+ownership, pruning, registry merges, routing and admission use canonical fresh reads.
+No background floor applies to state bindings, ownership, routing, admission or delivery.
+Only explicit `{ background: true }` display observations use `backgroundReadCacheMs`,
+configured from `mesh.idleReadCoalesceMs` (default 5 seconds), with a 1-second floor.
+Active turns and pending messages shorten that background-only window to 1 second.
+Schema hypothesis, verification and commit state bindings explicitly request `{ fresh: true }`.
+Fresh reads bypass the age window, not the physical-generation gate. The existing explicit
+`MeshStoreOptions.readCacheMs` TTL remains supported for callers that choose it; it has
+no new floor. Runtime/resident stores do not opt into it. Resident participant-file
+list observations retain a separate explicit TTL; fresh authority lists bypass it.
+
+The opt-in consumers are dashboard participant/peer listings, dashboard mesh entries and
+UI cached-state stamp observation. Directory namespaces and participant files inherit the
+opt-in only for those display listings. Heartbeat/publication preparation does **not** opt
+in: migration policy, legacy reader compatibility and ownership affect decisions, even
+though the refresh runs in the background.
+Actor mesh watches poll on the leading event after a quiet actor cadence, and continuous
+notifications inside a fixed `max(1000, mesh.actorPollMs)` window collapse into one
+trailing poll. Startup, explicit and idle polls never suppress a new leading event or
+slide the trailing deadline. Windows and unsupported-watcher fallback polling retain
+`mesh.actorPollMs`, as on main. Explicit scheduling and paged catch-up remain prompt.
+Residency delivery drains use the same interval floor; participant change refreshes already coalesce for 1 second.
+
+Unchanged canonical metadata reuses the parse instead
 of repeatedly opening/decoding megabytes. Metadata includes device, inode, size and
 nanosecond mtime/ctime. One bounded 192-byte header observes the UUID and optional journal
 hash when that physical identity changes. Namespace signal indexes also reuse their

@@ -288,7 +288,7 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     // Global order: actor registries (sorted path), then mesh, for publication,
     // adoption and controls. Retain registry custody from the fresh source read
     // through shared commits AND per-key copies: releasing it before the mesh
@@ -299,7 +299,10 @@ export class ResidentHost {
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      // Legacy list observations may lag; authority snapshots explicitly request fresh.
+      listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
+      publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
@@ -508,6 +511,7 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+        presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,
         snapshotActorOwnership,
@@ -785,7 +789,7 @@ export class ResidentHost {
           command.data,
           signal,
           { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id)?.rootId) },
+            this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -809,7 +813,7 @@ export class ResidentHost {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
       const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-        this.participants.get(from.id)?.rootId);
+        this.participants.get(from.id, undefined, { fresh: true })?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
@@ -861,7 +865,7 @@ export class ResidentHost {
     } catch {
       // Route through the current remote owner below.
     }
-    const target = this.participants.get(subscription.to);
+    const target = this.participants.get(subscription.to, undefined, { fresh: true });
     if (!target) throw new Error(`Unknown Fabric lifecycle target: ${subscription.to}`);
     await this.control.request(
       target.ownerHostId,
@@ -1027,8 +1031,7 @@ export class ResidentHost {
 
   #checkIdle(): void {
     if (this.#closed || this.#staged || this.#handover) return;
-    const ownedActors = this.actors.listOwned();
-    const activeActor = ownedActors.some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+    const activeActor = this.actors.hasActiveDurableActor();
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");

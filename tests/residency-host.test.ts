@@ -99,6 +99,37 @@ describe("watchdog custody at host admission", () => {
 });
 
 describe("fresh startup ownership batches", () => {
+  it.each([0, 5_000])("keeps shared state exact and the explicit list TTL un-floored (%i ms)", async ttl => {
+    const { root, config, host } = fixture();
+    config.mesh = { ...config.mesh, idleReadCoalesceMs: ttl };
+    const identity = { id: "session:peer-writer", name: "peer", kind: "main" as const };
+    try {
+      await host.start();
+      expect(host.mesh.readCacheMs).toBe(0);
+      expect(host.mesh.backgroundReadCacheMs).toBe(Math.max(1_000, ttl));
+      expect(host.participants.options.listReadCacheMs).toBe(ttl);
+      const peer = new MeshStore(config.meshRoot, 65536, 100);
+      await peer.put({ key: "test/exact-state", value: "before", identity });
+      expect(host.mesh.get("test/exact-state")?.value).toBe("before");
+      await peer.put({ key: "test/exact-state", value: "after", identity });
+      expect(host.mesh.get("test/exact-state")?.value).toBe("after");
+      const actor = await host.actors.create({ name: "before", instructions: "idle", residency: "durable" });
+      await host.participants.refresh();
+      host.participants.list({ scope: "project", fresh: true });
+      const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
+      const file = path.join(config.meshRoot, "participants", key.split("/").at(-1)! + ".json");
+      const entry = JSON.parse(fs.readFileSync(file, "utf8"));
+      entry.updatedAt += 1_000; entry.value.name = "after";
+      // A file-only external replacement does not invalidate the reader's process cache.
+      fs.writeFileSync(file + ".new", JSON.stringify(entry)); fs.renameSync(file + ".new", file);
+      expect(host.participants.list({ scope: "project" }).find(row => row.id === actor.id)?.name)
+        .toBe(ttl === 0 ? "after" : "before");
+      expect(host.participants.list({ scope: "project", fresh: true }).find(row => row.id === actor.id)?.name).toBe("after");
+    } finally {
+      await host.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
     const { root, config, host } = fixture();
     const peerIdentity = { id: "session:peer-owner", name: "peer", kind: "main" as const };

@@ -9,6 +9,7 @@ export type {
   MeshBatchView,
   MeshEvent,
   MeshIdentity,
+  MeshReadOptions,
   MeshStateEntry,
   MeshStoreOptions,
   MeshTailResult,

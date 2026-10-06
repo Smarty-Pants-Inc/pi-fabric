@@ -108,6 +108,20 @@ describe("settled Pi exit grace", () => {
     expect(result.warnings ?? []).toEqual([]);
   });
 
+  it("keeps a process task that never settles failed despite recorded text and an 8s lifetime", async () => {
+    const { manager, result } = await run("never-settles");
+    expect(result.status).toBe("failed");
+    expect(result.text).toBe("durable final result");
+    expect(result.error).toContain("Pi exited with code 1");
+    expect(result.warnings ?? []).toEqual([]);
+    const events = readEvents(result.logFile!);
+    expect(events.some(event => event.type === "agent_settled")).toBe(false);
+    expect(events.some(event => event.type === "fake_stdin_eof")).toBe(false);
+    expect(fs.existsSync(path.join(path.dirname(result.logFile!), "settlement.json"))).toBe(false);
+    expect(manager.listForUi()[0]).toMatchObject({status: "failed"});
+    for (const event of events.filter(event => event.type === "fake_child_pid")) expect(isRunning(event.pid)).toBe(false);
+  }, 45_000);
+
   it("still validates a structured result after slow-exit cleanup", async () => {
     const { result } = await run("slow-exit", { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] });
     expect(result.status).toBe("failed");

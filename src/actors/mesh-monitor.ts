@@ -6,6 +6,7 @@ import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
 const MESH_WATCH_RECONCILE_MS = 2_000;
+const MESH_BACKGROUND_POLL_MS = 1_000;
 const CURSOR_CHECKPOINT_MS = 10_000;
 type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
@@ -20,6 +21,9 @@ export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
+  #watchTimer: NodeJS.Timeout | undefined;
+  #lastWatchAt = Number.NEGATIVE_INFINITY;
+  #watchPending = false;
   #offset: number;
   #scheduled = false;
   #polling = false;
@@ -87,7 +91,7 @@ export class ActorMeshMonitor {
     try {
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (filename !== null && path.basename(filename.toString()) !== "events.jsonl") return;
-        this.schedule();
+        this.#scheduleBackground();
       });
       this.#watcher = watcher;
       watcher.on("error", () => this.#fallback(watcher));
@@ -111,6 +115,8 @@ export class ActorMeshMonitor {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#watchTimer) clearTimeout(this.#watchTimer);
+    this.#watchTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     if (this.#started) this.#persistCursor(true);
@@ -124,6 +130,32 @@ export class ActorMeshMonitor {
       if (this.#closed) return;
       void this.#backgroundPoll.run(() => this.#poll());
     });
+  }
+
+  // Lead after a quiet actor cadence, then retain one trailing wake for a burst.
+  // The window belongs to watch notifications, not startup/explicit/idle polls:
+  // none of those may delay the first new event. Continuous notifications never
+  // slide the trailing deadline; isolated events retain their original latency.
+  #scheduleBackground(): void {
+    if (this.#closed || !this.config.enabled) return;
+    const now = Date.now();
+    const quiet = now - this.#lastWatchAt >= this.config.actorPollMs;
+    this.#lastWatchAt = now;
+    if (this.#watchTimer && !quiet) {
+      this.#watchPending = true;
+      return;
+    }
+    if (this.#watchTimer) clearTimeout(this.#watchTimer);
+    this.#watchPending = false;
+    this.schedule();
+    this.#watchTimer = setTimeout(() => {
+      this.#watchTimer = undefined;
+      if (this.#watchPending) {
+        this.#watchPending = false;
+        this.schedule();
+      }
+    }, Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
+    this.#watchTimer.unref();
   }
 
   #fallback(watcher: FSWatcher): void {

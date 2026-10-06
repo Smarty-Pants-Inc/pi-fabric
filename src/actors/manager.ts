@@ -33,7 +33,7 @@ import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./chil
 import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
-import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { activationFilterSkip, activationPrInvalidReason, normalizeActorActivationFilter, normalizeActorActivationReservation, normalizeActorActivationObservation, sameActorActivationIdentity, type FabricActorActivationFilter, type ActorActivationFilterReservation, type ActorActivationFilterObservation, type ActorActivationFilterRelease } from "./activation-filter.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -134,6 +134,8 @@ interface ManagedActor {
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
   activationFilterExpiresAt?: number;
+  activationFilterReservation?: ActorActivationFilterReservation;
+  activationFilterRelease?: ActorActivationFilterRelease;
   filterSkipped?: FabricActorInfo["filterSkipped"];
   /** A stored filter that cannot be read: kept as stored and written back, never applied. */
   invalidActivationFilter?: { value: unknown; error: string };
@@ -621,7 +623,7 @@ export class ActorManager {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership(undefined, false);
         for (const actor of this.#actors.values()) {
-          if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
+          if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor, true);
         }
         this.#flushFilterState();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -1125,23 +1127,67 @@ export class ActorManager {
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
    * queued work from the next item on. Per-filter telemetry resets; legacy lifetime count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null | undefined, beforeCommit?: (id: string) => void, expiresAt?: number, reservation?: ActorActivationFilterReservation, observation?: ActorActivationFilterObservation): Promise<FabricActorInfo> {
+    if (observation !== undefined) {
+      if (activationFilter !== undefined || reservation !== undefined || expiresAt !== undefined) throw new Error("activationFilter observation cannot replace a filter");
+      return this.#observeActivationFilter(id, normalizeActorActivationObservation(observation), beforeCommit);
+    }
+    if (activationFilter === undefined) throw new Error("activationFilter is required (or provide observation)");
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
     if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
+    const scoped = reservation === undefined ? undefined : normalizeActorActivationReservation(reservation, Date.now());
+    if (scoped && (!filter.length || (expiresAt !== undefined && expiresAt !== scoped.expiresAt))) throw new Error("activationFilter reservation requires a non-empty filter and matching expiresAt");
+    if (scoped?.reviewTerminal || scoped?.securityTerminal?.length) throw new Error("Set verdict evidence through activationFilter observation, not reservation");
+    expiresAt = scoped?.expiresAt ?? expiresAt;
     this.#assertPresenceValue(this.#presencePreview(actor, { activationFilter: filter.length ? filter : undefined,
       invalidActivationFilter: undefined, activationFilterExpiresAt: filter.length ? expiresAt : undefined,
+      activationFilterReservation: scoped,
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } }));
     beforeCommit?.(actor.id);
+    const released = !filter.length && actor.activationFilterReservation !== undefined;
+    if (released) this.#releaseActivationFilter(actor, "explicit");
+    if (scoped) actor.activationFilterReservation = scoped;
+    else delete actor.activationFilterReservation;
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
     delete actor.activationFilterExpiresAt;
     if (filter.length && expiresAt !== undefined) actor.activationFilterExpiresAt = expiresAt;
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
-    if (!filter.length) this.#recordFilterClear(actor, "explicit");
+    if (!filter.length && !released) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor, true);
+    try { await this.#publishPresence(actor, true); } catch (error) {
+      this.#filterStateDirty = true;
+      throw error;
+    }
+    return this.#publicInfo(actor);
+  }
+
+  async #observeActivationFilter(id: string, observation: ActorActivationFilterObservation, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const reservation = actor.activationFilterReservation;
+    // A retry after an uncertain commit republishes the retained receipt; an old
+    // generation never modifies a successor, even when repository/PR/head repeat.
+    if (!reservation || !sameActorActivationIdentity(reservation, observation)) {
+      if (!reservation && actor.activationFilterRelease && sameActorActivationIdentity(actor.activationFilterRelease.reservation, observation)) {
+        beforeCommit?.(actor.id);
+        try { await this.#publishPresence(actor, true); } catch (error) { this.#filterStateDirty = true; throw error; }
+      }
+      return this.#publicInfo(actor);
+    }
+    if (observation.securityTerminal?.some(name => !reservation.requiredSecurity.includes(name))) throw new Error("Unknown activationFilter required security verdict");
+    beforeCommit?.(actor.id);
+    const next = { ...reservation,
+      ...(observation.reviewTerminal ? { reviewTerminal: true as const } : {}),
+      securityTerminal: [...new Set([...(reservation.securityTerminal ?? []), ...(observation.securityTerminal ?? [])])] };
+    actor.activationFilterReservation = next;
+    if (observation.prState === "closed" || observation.prState === "merged") this.#releaseActivationFilter(actor, "pr-closed", observation);
+    else if (observation.currentHead !== undefined && observation.currentHead !== reservation.head) this.#releaseActivationFilter(actor, "head-changed", observation);
+    else if (observation.runId === next.runId && observation.runStatus) this.#releaseActivationFilter(actor, "run-terminal", observation, observation.runStatus);
+    else if (next.reviewTerminal && next.requiredSecurity.every(name => next.securityTerminal.includes(name))) this.#releaseActivationFilter(actor, "verdicts-terminal", observation);
+    actor.updatedAt = Date.now();
+    try { await this.#publishPresence(actor, true); } catch (error) { this.#filterStateDirty = true; throw error; }
     return this.#publicInfo(actor);
   }
 
@@ -2823,6 +2869,7 @@ export class ActorManager {
             } },
           );
           runId = result.id;
+          this.#releaseFilterForRun(actor, result.id, result.status);
           // Error-only turns and a spawned handle do not prove inference consumed context.
           handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
           // Captured before any check that can throw: a completed run is never parked and
@@ -2988,6 +3035,11 @@ export class ActorManager {
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0);
         } finally {
+          // A thrown transport/runtime error is terminal too. Fence by run id:
+          // an older run finishing must not release a replacement reservation.
+          if (actor.inFlightRun && this.#canManageCached(actor.id)) {
+            this.#releaseFilterForRun(actor, actor.inFlightRun.id, abortController.signal.aborted ? "stopped" : "failed");
+          }
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
               .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
@@ -3312,6 +3364,10 @@ export class ActorManager {
     actor: ManagedActor,
     item: ActorQueueItem,
   ): Promise<{ valid: boolean; reason?: string }> {
+    const live = this.#liveActor(actor);
+    this.#expireActivationFilter(live);
+    const prReason = activationPrInvalidReason(live.activationFilterReservation, live.activationFilterRelease, item.source, item.payload);
+    if (prReason) return { valid: false, reason: prReason };
     if (!actor.validWhile) return { valid: true };
     try {
       return await evaluateActorValidWhile(actor.validWhile, {
@@ -3356,23 +3412,47 @@ export class ActorManager {
     return true;
   }
 
-  #recordFilterClear(actor: ManagedActor, reason: "explicit" | "expired"): void {
+  #recordFilterClear(actor: ManagedActor, reason: ActorActivationFilterRelease["reason"]): void {
     this.#recordMessage(actor, {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
       source: "actor:activation-filter", createdAt: Date.now(), reason: `activationFilter cleared: ${reason}`,
     });
   }
 
-  #expireActivationFilter(actor: ManagedActor): void {
-    if (actor.activationFilterExpiresAt === undefined || Date.now() < actor.activationFilterExpiresAt) return;
+  #releaseFilterForRun(actor: ManagedActor, runId: string, status: ActorActivationFilterRelease["runStatus"]): void {
+    const live = this.#liveActor(actor);
+    if (live.activationFilterReservation?.runId !== runId || !this.#canManageCached(actor.id)) return;
+    this.#releaseActivationFilter(live, "run-terminal", undefined, status);
+  }
+
+  #releaseActivationFilter(actor: ManagedActor, reason: ActorActivationFilterRelease["reason"], observation?: ActorActivationFilterObservation, runStatus?: ActorActivationFilterRelease["runStatus"]): void {
+    if (actor.activationFilterReservation) {
+      actor.activationFilterRelease = { reservation: structuredClone(actor.activationFilterReservation), reason, at: Date.now(),
+        ...(observation ? { observation: structuredClone(observation) } : {}), ...(runStatus ? { runStatus } : {}) };
+    }
+    delete actor.activationFilterReservation;
     delete actor.activationFilter;
     delete actor.invalidActivationFilter;
     delete actor.activationFilterExpiresAt;
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     actor.updatedAt = Date.now();
-    this.#recordFilterClear(actor, "expired");
+    this.#recordFilterClear(actor, reason);
     this.#filterStateDirty = true;
     this.#emitChange();
+  }
+
+  #expireActivationFilter(actor: ManagedActor, maintenance = false): void {
+    const deadline = actor.activationFilterReservation?.expiresAt ?? actor.activationFilterExpiresAt;
+    if (deadline !== undefined && Date.now() >= deadline) { this.#releaseActivationFilter(actor, "expired"); return; }
+    // Maintenance only: a claim may name another local run. No status lookup or
+    // registry/mesh lock is added to per-event dispatch. Unknown (including after
+    // restart/cleanup) is not terminal evidence; keep the claim until its TTL.
+    if (maintenance && actor.activationFilterReservation?.runId) {
+      try {
+        const { id, status } = this.agents.status(actor.activationFilterReservation.runId);
+        if (status !== "running" && status !== "queued") this.#releaseFilterForRun(actor, id, status);
+      } catch { /* no known run: TTL remains the hard bound */ }
+    }
   }
 
   #flushFilterState(): void {
@@ -3879,6 +3959,8 @@ export class ActorManager {
       // Untouched actors need no new registry field; older rollback hosts omit it too.
       ...(actor.filterSkipped ? { filterSkipped: { ...actor.filterSkipped } } : {}),
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
+      ...(actor.activationFilterReservation ? { activationFilterReservation: structuredClone(actor.activationFilterReservation) } : {}),
+      ...(actor.activationFilterRelease ? { activationFilterRelease: structuredClone(actor.activationFilterRelease) } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
@@ -4243,6 +4325,8 @@ export class ActorManager {
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
           ? { coalesceKey: record.coalesceKey }
           : {}),
+        ...(record.activationFilterReservation ? { activationFilterReservation: normalizeActorActivationReservation(record.activationFilterReservation) } : {}),
+        ...(record.activationFilterRelease ? { activationFilterRelease: record.activationFilterRelease as unknown as ActorActivationFilterRelease } : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
         ...loadedActivationFilter((record as { activationFilter?: unknown }).activationFilter, { id: record.id, name: record.name }),
         ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
@@ -4701,6 +4785,8 @@ export class ActorManager {
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
+      ...(actor.activationFilterReservation ? { activationFilterReservation: structuredClone(actor.activationFilterReservation) } : {}),
+      ...(actor.activationFilterRelease ? { activationFilterRelease: structuredClone(actor.activationFilterRelease) } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       ...(actor.invalidActivationFilter ? { activationFilterError: actor.invalidActivationFilter.error } : {}),

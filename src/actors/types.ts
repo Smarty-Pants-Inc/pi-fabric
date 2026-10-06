@@ -6,7 +6,7 @@ import type { FabricLogLine, AgentRunRecord, AgentUsage } from "../agents/types.
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
-import type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { FabricActorActivationFilter, ActorActivationFilterReservation, ActorActivationFilterRelease } from "./activation-filter.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
 
@@ -293,6 +293,9 @@ export interface FabricActorInfo {
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;
+  activationFilterReservation?: ActorActivationFilterReservation;
+  /** Last release evidence/receipt; retained for retry and watchdog readback. */
+  activationFilterRelease?: ActorActivationFilterRelease;
   /** Lifetime events the activation filter skipped without a model run (legacy). */
   filteredCount?: number;
   lastFilteredAt?: number;

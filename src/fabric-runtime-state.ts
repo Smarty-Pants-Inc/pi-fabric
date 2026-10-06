@@ -456,7 +456,7 @@ export class FabricRuntimeState {
     this.#speculation?.reset();
     this.#speculation = undefined;
     this.activity.reset();
-    this.sessionApprovals.approvedRisks.clear();
+    this.sessionApprovals.reset();
     this.#cwd = context.cwd;
     const projectTrusted = this.#managedHost ? false : context.isProjectTrusted();
     this.#managedHost?.seal();
@@ -1668,6 +1668,7 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    this.sessionApprovals.reset();
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
     // behind the shared mesh lock before local teardown stops its timers (#5256).

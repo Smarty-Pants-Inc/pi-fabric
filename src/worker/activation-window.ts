@@ -3,7 +3,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
 import { getCurrentSystemMessage, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
-import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
@@ -167,7 +167,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     // Reinstall per request so refresh/registration during a transform is covered.
     // No private host fields, alternate AI runtime, auth or provider composition.
     const guarded = new Map<Provider, () => void>();
-    let contextNow: import("@earendil-works/pi-coding-agent").ExtensionContext | undefined;
+    let contextNow: ExtensionContext | undefined;
     const lifetime = new AbortController();
     pi.on("session_shutdown", () => {
       // ModelRuntime survives native reload; its providers must not retain this

@@ -210,7 +210,7 @@ export class FabricState {
     this.prewalk.cancel();
     this.prewalkDrift.clear();
     this.activity.reset();
-    this.sessionApprovals.approvedRisks.clear();
+    this.sessionApprovals.reset();
     this.#widgetDismissedAt = 0;
     context.ui.setStatus("fabric-prewalk", undefined);
 
@@ -467,6 +467,7 @@ export class FabricState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
+    this.sessionApprovals.reset();
     this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;

@@ -33,7 +33,7 @@ const harness = () => {
     { halted: () => halted, report });
   return {
     emit: async (name: string) => handlers.get(name)!({ outcome: "error" }, context),
-    report,
+    report, context,
     idle: () => { idle = true; },
     settling: (value: boolean) => { settling = value; },
     abort: () => { owner.abort(); },
@@ -46,6 +46,19 @@ beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("Main provider recovery waiting for settlement compaction", () => {
+  it("drops a late report failure after session shutdown without touching the stale ctx (#5962)", async () => {
+    const h = harness(); h.idle();
+    await h.emit("agent_settled"); await vi.advanceTimersByTimeAsync(1_000);
+    let entered!: () => void; let reject!: (error: Error) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    h.report.mockImplementation(() => { entered(); return new Promise((_yes, no) => { reject = no; }); });
+    const reporting = h.emit("agent_settled"); await started;
+    await h.emit("session_shutdown");
+    Object.defineProperty(h.context, "ui", { get() { throw new Error("stale ctx"); } });
+    reject(new Error("retired report"));
+    await expect(reporting).resolves.toBeUndefined();
+  });
+
   it("keeps the wake pending while busy, then retries once and reports once without a third attempt", async () => {
     const h = harness();
     await h.emit("agent_settled");

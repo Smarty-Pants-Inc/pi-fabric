@@ -10,6 +10,7 @@ import { expect, it, vi } from "vitest";
 import piFabric from "../src/index.js";
 import { FabricState } from "../src/fabric-state.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
@@ -44,8 +45,12 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
   vi.stubEnv("PI_FABRIC_MESH_ROOT", config.meshRoot);
   vi.stubEnv("PI_FABRIC_RESIDENT_CONFIG", configPath);
-  vi.resetModules();
   const { default: residentEntry } = await import("../src/residency/pi-entry.js");
+  const residentHosts: ResidentHost[] = [];
+  const startHost = ResidentHost.prototype.start;
+  vi.spyOn(ResidentHost.prototype, "start").mockImplementation(async function (this: ResidentHost) {
+    residentHosts.push(this); return startHost.call(this);
+  });
   const states: FabricState[] = [];
   const ensure = FabricState.prototype.ensure;
   vi.spyOn(FabricState.prototype, "ensure").mockImplementation(async function (this: FabricState, ctx) {
@@ -101,6 +106,9 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
       return fs.existsSync(ownerFile);
     });
     const oldOwner = JSON.parse(fs.readFileSync(ownerFile, "utf8")).token;
+    const actor = await residentHosts[0]!.actors.create({ name: "review-actor", instructions: "Review offline", residency: "durable",
+      model: `${faux.getModel().provider}/${faux.getModel().id}`, tools: [] });
+    const actorSession = actor.sessionFile;
     await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("activate", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext());
     const before = states[0]!;
     const retired = session.extensionRunner!;
@@ -116,6 +124,8 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
     await session.reload();
     await waitFor(() => fs.existsSync(ownerFile) && JSON.parse(fs.readFileSync(ownerFile, "utf8")).token !== oldOwner);
     expect(shutdown).not.toHaveBeenCalled(); // Reload itself owns teardown, not the retired resident callback.
+    expect(residentHosts).toHaveLength(2);
+    expect(residentHosts[1]!.actors.status(actor.id)).toMatchObject({ id: actor.id, name: "review-actor", status: "idle", sessionFile: actorSession });
     expect(await pending).toMatchObject({ error: { message: expect.stringMatching(/closed|abort/i) } });
     children[0]!.process.send("release");
     await children[0]!.closed;

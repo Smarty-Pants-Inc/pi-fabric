@@ -31,6 +31,36 @@ const context = {
 };
 
 describe("CapturedToolsProvider", () => {
+  it("cancels direct in-flight and queued child calls on close without a caller signal (#5962)", async () => {
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let retired = false;
+    const execute = vi.fn(async () => { entered(); await gate; return { content: [{ type: "text" as const, text: "late result" }], details: {} }; });
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }),
+      getActiveTools: vi.fn(() => { if (retired) throw new Error("stale ctx"); return ["browser_child"]; }),
+      emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined), emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{ definition: defineTool({ name: "browser_child", label: "Child", description: "IPC child",
+      executionMode: "sequential", parameters: Type.Object({}), execute }),
+      sourceInfo: createSyntheticSourceInfo("/extensions/browser.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/fabric.ts");
+    const provider = new CapturedToolsProvider(catalog);
+    const direct = { ...context, signal: undefined };
+    const first = provider.invoke("browser_child", {}, direct).catch(error => error);
+    await started;
+    const queued = provider.invoke("browser_child", {}, direct).catch(error => error);
+    await provider.close(); retired = true;
+    expect(await first).toMatchObject({ message: "Captured extension tool session closed" });
+    expect(await queued).toMatchObject({ message: "Captured extension tool session closed" });
+    await expect(provider.invoke("browser_child", {}, direct)).rejects.toThrow("session closed");
+    release(); await new Promise(resolve => setImmediate(resolve));
+    expect(execute).toHaveBeenCalledOnce();
+    expect(runner.getActiveTools).toHaveBeenCalledOnce();
+    expect(runner.emitToolResult).not.toHaveBeenCalled();
+  });
+
   it("attaches final captured images after result hooks without changing the tool result", async () => {
     const originalImage = { type: "image" as const, data: "original", mimeType: "image/png" };
     const finalImage = { type: "image" as const, data: "final", mimeType: "image/png" };

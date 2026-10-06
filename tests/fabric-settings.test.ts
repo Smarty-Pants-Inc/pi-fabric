@@ -873,6 +873,29 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("drops background settings model failures after session replacement (#5962)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-settings-stale-"));
+    const agentDir = path.join(root, "agent"); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    let reject!: (error: Error) => void;
+    const sessionApprovals = { generation: 1 };
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.agents.runner = "claude";
+    const state = { config, sessionApprovals, ensure: async () => {}, agents: {
+      claudeModels: () => new Promise((_yes, no) => { reject = no; }),
+    } } as unknown as FabricState;
+    let staleReads = 0;
+    const context = { mode: "tui", cwd: root, isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async () => {} },
+    } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      sessionApprovals.generation++;
+      Object.defineProperty(context, "ui", { get() { staleReads++; throw new Error("stale ctx"); } });
+      reject(new Error("old discovery failed"));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(staleReads).toBe(0);
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
     const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");

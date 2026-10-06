@@ -37,8 +37,9 @@ export const createProcessIncarnationReader = (options: {
 }) => {
   const { platform, systemRoot, run = runIncarnationCommand, timeoutMs = 2_000 } = options;
   let own: Promise<string | undefined> | undefined;
-  const read = async (pid: number): Promise<string | undefined> => {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const read = async (pid: number, remainingMs = timeoutMs): Promise<string | undefined> => {
+    const budgetMs = Math.max(0, Math.min(timeoutMs, remainingMs));
+    if (!Number.isSafeInteger(pid) || pid <= 0 || budgetMs <= 0) return undefined;
     try {
       if (platform === "linux") {
         const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -60,11 +61,11 @@ export const createProcessIncarnationReader = (options: {
       // Independent deadline also bounds injected/broken runners. Abort kills the native
       // child; late output never becomes evidence. No synchronous spawn on this path.
       const timeout = new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => { abort.abort(); resolve(undefined); }, timeoutMs);
+        timer = setTimeout(() => { abort.abort(); resolve(undefined); }, budgetMs);
       });
       try {
         const start = await Promise.race([run(executable, args, {
-          timeout: timeoutMs, maxBuffer: 4_096, windowsHide: true, signal: abort.signal,
+          timeout: budgetMs, maxBuffer: 4_096, windowsHide: true, signal: abort.signal,
           ...(platform === "darwin" ? { env: { ...process.env, LC_ALL: "C", TZ: "UTC" } } : {}),
         }), timeout]);
         if (start === undefined) return undefined;
@@ -92,8 +93,9 @@ const nativeReader = () => {
   return reader;
 };
 
-/** Fresh holder evidence; macOS second-resolution reuse stays conservative. */
-export const processIncarnation = (pid: number): Promise<string | undefined> => nativeReader().read(pid);
+/** Fresh holder evidence, optionally bounded by remaining acquisition time.
+ * macOS second-resolution reuse stays conservative; timeout aborts the native child. */
+export const processIncarnation = (pid: number, timeoutMs?: number): Promise<string | undefined> => nativeReader().read(pid, timeoutMs);
 /** Memoized lazily, not at import/registration/session start. */
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
 

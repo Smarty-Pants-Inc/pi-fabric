@@ -77,6 +77,32 @@ describe("#4383 resident host presence batch", () => {
     }
   });
 
+  it.each([false, true])("flushes only changed presence before the next full renewal (files=%s)", async files => {
+    const { host, config, records } = await fixture(files);
+    let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
+    const full = vi.spyOn(host.participants, "refresh");
+    const batch = vi.spyOn(host.mesh, "writeBatch");
+    const sibling = records[1]!;
+    const prior = readParticipantFile(config.meshRoot, participantKey(sibling.id))!.updatedAt;
+    // Disable only the scheduled duplicate: the setter's awaited production flush runs.
+    vi.spyOn(host.participants, "scheduleRefresh").mockImplementation(() => {});
+    now += 5_000;
+    await host.actors.setInstructions(records[0]!.id, "new persona");
+    expect(full).not.toHaveBeenCalled();
+    expect(batch).toHaveBeenCalledOnce();
+    expect(batch.mock.calls[0]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(1);
+    expect(readParticipantFile(config.meshRoot, participantKey(sibling.id))!.updatedAt).toBe(prior);
+    batch.mockClear(); now += 5_000;
+    await host.participants.refresh();
+    expect(full).toHaveBeenCalledOnce();
+    expect(batch).toHaveBeenCalledOnce();
+    expect(batch.mock.calls[0]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
+    for (const row of records) {
+      expect(readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt).toBe(now);
+    }
+    expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBe(now);
+  });
+
   it("does not spawn per-actor or change-triggered retries after a timed-out heartbeat", async () => {
     const { host, records } = await fixture();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

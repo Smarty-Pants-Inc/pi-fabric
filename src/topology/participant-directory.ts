@@ -522,10 +522,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer.unref?.();
   }
 
-  /** Actor mutations share the host round, but cannot retry an existing lock outage. */
+  /** Actor mutations publish changes, not a full heartbeat or a lock-outage retry. */
   async refreshPresence(): Promise<void> {
     if (isMeshLockTimeout(this.#refreshError)) return;
-    await this.refresh();
+    // A setter may finish saving after an in-flight heartbeat selected its source.
+    // Wait for that round, then flush the pending revision under a fresh registry
+    // fence. Coalescing with it could acknowledge presence it never committed.
+    while (this.#refreshing) {
+      try { await this.#refreshing; }
+      catch (error) {
+        if (isMeshLockTimeout(error)) return;
+        throw error;
+      }
+    }
+    if (isMeshLockTimeout(this.#refreshError)) return;
+    // Do not call refresh(): mutation callers must not masquerade as automatic
+    // heartbeats. The next full round still renews every actor envelope (#5128)
+    // and its host lease in the same single batch.
+    await this.#runRefresh(false);
   }
 
   /** A heartbeat: publishes the records and renews this host's lease. */

@@ -75,19 +75,18 @@ describe("actor archive slice fs cost", () => {
         scratchCallsPerRun: scratchCalls / count, largestCalls, largestDeletes, longestSliceMs: longest }) + "\n");
       expect(removed).toHaveLength(count);
       expect(largestDeletes).toBe(1);
-      // Windows uses main's original 11 lstat + 4 exists + 3 read +
-      // 1 readdir + 1 rm = 20 crossings, with zero scratch probes. POSIX
-      // retains the PR's reused custody snapshot (11 crossings) plus fence
-      // lstat for disposal and fence/tmp veto lstat (3) = 14.
-      // Reproduced with fv2-369-wincut's 2,000-run syscall-counts method:
-      // main and the cut both have 20 public crossings/run, zero scratch probes.
-      // Recursive rmSync's internal traversal is excluded in both runtime modes.
-      const exact = platform === "win32" ? 20 : 14;
+      // Both platforms reuse only this uninterrupted slice's checked status
+      // and metadata: 5 lstat + 3 exists + 1 read + 1 readdir + 1 rm = 11.
+      // Windows adds zero scratch probes; POSIX additionally checks the fence
+      // for disposal and the fence/tmp veto (3 lstat) = 14 crossings.
+      // This tightens main's 20-crossing Windows budget without caching custody
+      // across a yield. Recursive rmSync traversal is excluded in both modes.
+      const exact = platform === "win32" ? 11 : 14;
       expect(largestCalls).toBe(exact);
       expect((total() - 2) / count).toBe(exact); // Only root lstat/census are outside run slices.
-      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 11 : 8) * count + 1,
-        readdirSync: count + 1, existsSync: (platform === "win32" ? 4 : 3) * count,
-        readFileSync: (platform === "win32" ? 3 : 1) * count, rmSync: count });
+      expect(calls).toEqual({ lstatSync: (platform === "win32" ? 5 : 8) * count + 1,
+        readdirSync: count + 1, existsSync: 3 * count,
+        readFileSync: count, rmSync: count });
       expect(scratchCalls).toBe(platform === "win32" ? 0 : 3 * count);
       // A forced win32 branch on Linux proves work counts, not native NTFS
       // latency: Ubuntu CI already had exactly 20 crossings but a 290 ms
@@ -130,6 +129,25 @@ describe("actor archive slice fs cost", () => {
       } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
     },
   );
+
+  it.each(["status", "scratch", "latest"] as const)("does not reuse Windows collection evidence across a %s change between slices", fence => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-fresh-slice-"));
+    const run = path.join(root, "run"); terminal(run);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    let latest = false;
+    try {
+      const slices = pruneActorRunArchiveSlices({ runsDirectory: root, retentionMs: 0, retainRun: () => latest });
+      expect(slices.next().done).toBe(false); // Enumeration has yielded; no run proof is cached.
+      if (fence === "status") fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({
+        status: "running", transport: "process", sessionId: "2147483646", finishedAt: 1,
+      }));
+      if (fence === "scratch") fs.mkdirSync(path.join(run, RUN_TMP_DIRECTORY));
+      if (fence === "latest") latest = true;
+      const step = slices.next();
+      expect(step.done).toBe(true); expect(step.value).toEqual([]);
+      expect(fs.existsSync(run)).toBe(true);
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   it("Windows collection still fails closed for unreadable directory and file metadata", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-unreadable-"));

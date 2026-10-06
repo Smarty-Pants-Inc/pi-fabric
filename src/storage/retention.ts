@@ -717,19 +717,17 @@ export function* pruneActorRunArchiveSlices(options: ActorRunArchivePruneOptions
     yield; // Also bound scans of latest, malformed and live entries.
     if (!entry.isDirectory() || entry.name === options.latestRunId || options.retainRun?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
-    let record: RunRecordSummary | undefined, root: fs.Stats | undefined;
-    if (process.platform === "win32") {
-      logWindowsScratchScopeCut();
-      record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-      if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
-      root = ownedStat(directory);
-    } else {
-      // POSIX behavior is unchanged by the Windows cut.
-      const inspections = new Map<string, RunInspection>();
-      if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, false, inspections)) ||
-          !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
-      ({ record, root } = inspections.get(directory)!);
-    }
+    const windows = process.platform === "win32";
+    if (windows) logWindowsScratchScopeCut();
+    // Reuse metadata/status only within this uninterrupted collection slice,
+    // never across the generator yield or an asynchronous filesystem crossing.
+    // Windows' recursive allowlist rejects every scratch artifact, so it needs
+    // no scratch inspection/disposal (including negative stats). Public exit
+    // and resource predicates keep their independent fresh observations.
+    const inspections = new Map<string, RunInspection>();
+    if (inspectTreeSync(inspectRunTree(directory, 0, noDeadline, true, true, true, {}, windows, inspections)) ||
+        !inspectTreeSync(inspectSafeRunTree(directory, false, 0, noDeadline, {}, inspections))) continue;
+    const { record, root } = inspections.get(directory)!;
     if (!record?.status || !TERMINAL_STATUSES.has(record.status)) continue;
     if (now - recordAgeReference(record, root?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, { ...options, now, isRetained: () => options.retainRun?.(entry.name) ?? false });

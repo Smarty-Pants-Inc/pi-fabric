@@ -170,9 +170,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
         statusProbes++;
         // Controlled metadata latency, independent of whether this host has NTFS.
-        // Eight actors share 72 candidates: four status probes/run at 2 ms each
-        // exceed the existing heartbeat bound. One actor still does identical work.
-        const until = performance.now() + 2;
+        // A Windows actor slice shares one checked status observation per
+        // candidate between the exit and allowlist proofs; no cross-turn cache.
+        // At 4 ms/probe, eight actors still exceed the 250 ms heartbeat gate.
+        const until = performance.now() + 4;
         while (performance.now() < until) { /* slow filesystem metadata */ }
       }
       return Reflect.apply(lstat, fs, [file, ...args]);
@@ -190,7 +191,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
       process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
-      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
+      expect(statusProbes).toBe(17 * 9); // One status metadata probe per candidate; tighter than main.
       expect(longest).toBeLessThan(250);
       for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { active = false; clearImmediate(heartbeat!); }

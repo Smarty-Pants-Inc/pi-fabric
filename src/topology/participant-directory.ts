@@ -1631,14 +1631,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return committedAt;
   }
 
-  // One failed key does not abort other keys or the shared host heartbeat. No decision or
-  // cleanup is replayed outside its lock: the next refresh rereads and retries that key.
+  // A single-key fault does not abort other keys; a shared mesh timeout unwinds the round.
+  // No decision/cleanup is replayed outside its lock: the next refresh rereads that key.
   async #retryFile<T>(operation: () => Promise<T>): Promise<T | undefined> {
     this.#fileWork += 1;
     try {
       if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
       return await operation();
-    } catch { return undefined; /* retry on the next refresh */ }
+    } catch (error) {
+      // Shared mesh contention must unwind registry custody, not multiply waits
+      // across keys while retaining it. Ordinary per-key faults retry next refresh.
+      if (isMeshLockTimeout(error)) throw error;
+      return undefined;
+    }
     finally {
       this.#fileWork -= 1;
       // Renew between keys too: already-resolved promises can monopolize microtasks,

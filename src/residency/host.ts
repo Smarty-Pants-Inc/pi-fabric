@@ -278,11 +278,13 @@ export class ResidentHost {
       { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     // Global order: actor registries (sorted path), then mesh, for publication,
     // adoption and controls. Retain registry custody from the fresh source read
-    // through shared commits AND per-key copies: releasing it before the mesh
-    // wait would let a delayed heartbeat republish a successor's adopted actor.
+    // through shared commits AND per-key copies. Mesh acquisition gets a 50 ms try:
+    // contention unwinds the fences and pending presence retries next heartbeat.
+    // Never publish a selected snapshot outside custody: a delayed heartbeat could
+    // otherwise republish a successor's adopted actor (#504).
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
     const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
-      ActorRegistryStore.withLocks(registries, publish);
+      ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main

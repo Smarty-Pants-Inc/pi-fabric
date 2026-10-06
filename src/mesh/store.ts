@@ -1,4 +1,5 @@
 import { createCommitStats } from "./commit-stats.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -587,6 +588,7 @@ export class MeshStore {
   readonly #generationPath: string;
   readonly #lockPath: string;
   readonly #lockProtocol: MeshLockProtocol;
+  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
@@ -1686,10 +1688,21 @@ export class MeshStore {
     });
   }
 
-  /**
-   * Runs an operation under the mesh lock without touching the state: for a rare step that must
-   * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
-   */
+  /** Bound mesh acquisitions in this async step without acquiring a lock here.
+   * Registry-fenced publishers retain custody through source selection and copies,
+   * but contention throws the existing typed timeout so they can release registry
+   * fences and retry the whole step. Concurrent ordinary callers keep their budget. */
+  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
+    const inherited = this.#tryLockScope.getStore();
+    if (inherited?.active) return operation();
+    const scope = { active: true, timeoutMs: Math.max(0, timeoutMs) };
+    return this.#tryLockScope.run(scope, async () => {
+      try { return await operation(); }
+      finally { scope.active = false; } // escaped async work must not inherit the budget
+    });
+  }
+
+  /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return this.#withLock(operation, lockTimeoutMs);
   }
@@ -2004,7 +2017,9 @@ export class MeshStore {
   // here or wrap resident async controls in this second/innermost lock.
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
+    const scope = this.#tryLockScope.getStore();
+    const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
+    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;

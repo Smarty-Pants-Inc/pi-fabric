@@ -46,12 +46,91 @@ const fixture = async (files = false) => {
   }
   if (files) await new MeshStore(config.meshRoot, 256 * 1024, 500).put({ key: LIVENESS_POLICY_KEY,
     value: { version: 1, hostLeases: "files", participants: "files" }, identity: { id: "policy", name: "policy", kind: "agent" } });
-  const host = new ResidentHost(config); hosts.push(host); await host.start();
+  const host = new ResidentHost(config); hosts.push(host); const heartbeatStartedAt = Date.now(); await host.start();
   await delay(20); await host.participants.refresh();
-  return { root, config, host, records };
+  return { root, config, host, records, heartbeatStartedAt };
 };
 
 describe("#4383 resident host presence batch", () => {
+  it.each([
+    { hold: 4_900, gap: 100, phase: 650, files: false },
+    { hold: 4_900, gap: 100, phase: 50, files: true },
+    { hold: 9_000, gap: 1_000, phase: 650, files: false },
+  ])("renews and dispatches actor events during periodic mesh holds (%j)", async ({ hold, gap, phase, files }) => {
+    const { host, config, records, heartbeatStartedAt } = await fixture(files);
+    const actor = records[0]!;
+    // A skip filter records real ActorManager delivery without launching a worker.
+    await host.actors.setActivationFilter(actor.id, [{ id: "probe", topic: ["fleet.phase-lock"], kind: ["skip"] }]);
+    const gate = vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(false);
+    const event = await host.mesh.publish({ topic: "fleet.phase-lock", kind: "skip", to: actor.id, from: host.identity });
+    await delay(Math.max(0, heartbeatStartedAt + 5_000 - phase - Date.now()));
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot,
+      String(hold), String(gap), "16000"], { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    let holderExited = false; void exited.then(() => { holderExited = true; });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const started = Date.now(), prior = host.participants.confirmedAt();
+      await delay(phase + 150); // first automatic heartbeat's 50 ms attempt must fail
+      gate.mockRestore();
+      expect(host.actors.status(actor.id).filteredCount ?? 0).toBe(0);
+      expect(host.participants.confirmedAt()).toBe(prior);
+      expect(host.participants.canConsumeMesh()).toBe(false);
+      let progressedAt = 0;
+      while (Date.now() - started < 15_000) {
+        const renewed = host.participants.confirmedAt() > started && records.every(row =>
+          readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt > started &&
+          host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.updatedAt > started);
+        if (renewed && host.actors.status(actor.id).filteredCount === 1 && host.participants.canConsumeMesh()) {
+          progressedAt = Date.now(); break;
+        }
+        await delay(25);
+      }
+      expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three periods").toBeGreaterThan(0);
+      expect(holderExited, "recovery must happen while the periodic holder continues").toBe(false);
+      expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(started);
+      console.log(JSON.stringify({ regression: "periodic-mesh-progress", hold, gap, phase, files,
+        progressMs: progressedAt - started, actors: 40, eventId: event.id, filteredCount: 1, holderStillRunning: !holderExited }));
+    } finally { gate.mockRestore(); await exited; }
+    expect(await exited).toBe(0);
+  }, 30000);
+
+  it("reselects adopted actors after the out-of-custody admission wait", async () => {
+    const { host, config, records } = await fixture();
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "2000"],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const prior = host.participants.confirmedAt(), id = records[0]!.id, key = `actors/${config.sessionId}/${id}`;
+      const presence = host.mesh.get(key, { fresh: true });
+      const waitForAdmission = host.participants.options.waitForPublicationRetry!;
+      let entered!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => {
+        for (const root of [config.actorRoot, config.sessionActorRoot!]) {
+          expect(fs.existsSync(path.join(root, "actors.json.lock", "owner"))).toBe(false);
+        }
+        entered(); return waitForAdmission();
+      });
+      await expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      await waiting;
+      expect(host.participants.confirmedAt()).toBe(prior);
+      expect(host.participants.canConsumeMesh()).toBe(false);
+      const registry = new ActorRegistryStore(config.actorRoot);
+      const started = Date.now();
+      await registry.withLock(() => registry.write(registry.records().map(row => row.id === id
+        ? { ...row, rootId: "session:successor", adoptedAt: Date.now(), adoptedFrom: [config.rootId] } : row)));
+      expect(Date.now() - started).toBeLessThan(500);
+      await exited;
+      for (let i = 0; i < 200 && host.participants.confirmedAt() === prior; i++) await delay(25);
+      expect(host.participants.confirmedAt()).toBeGreaterThan(prior);
+      expect(host.participants.canConsumeMesh()).toBe(true);
+      expect(host.mesh.get(key, { fresh: true })).toEqual(presence);
+      expect(host.actors.owns(id)).toBe(false);
+    } finally { await exited; }
+  }, 10000);
+
   it.each([false, true])("releases registry custody during a 3 s external mesh hold (files=%s)", async files => {
     const { host, config, records } = await fixture(files);
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
@@ -167,6 +246,9 @@ describe("#4383 resident host presence batch", () => {
 
   it("does not spawn per-actor or change-triggered retries after a timed-out heartbeat", async () => {
     const { host, records } = await fixture();
+    let releaseRecovery!: () => void;
+    const recoveryGate = new Promise<void>(resolve => { releaseRecovery = resolve; });
+    const recovery = vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => recoveryGate);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let entered!: () => void, release!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
@@ -176,25 +258,32 @@ describe("#4383 resident host presence batch", () => {
     });
     const refreshing = host.participants.refresh();
     const rejected = expect(refreshing).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    await started;
-    for (let actor = 0; actor < 40; actor++) host.participants.scheduleRefresh();
-    release(); await rejected;
-    // Even fresh actor writes and idle gates do not turn an outage into 40 retries.
-    await Promise.all(records.map(row => host.actors.setInstructions(row.id, "changed during outage")));
-    for (let poll = 0; poll < 40; poll++) {
-      host.participants.scheduleRefresh();
-      expect(host.participants.canConsumeMesh()).toBe(false);
-    }
-    await delay(1_100); // Past change-refresh throttle, before the next 5 s heartbeat.
-    expect(batch).toHaveBeenCalledOnce();
-    expect(warn.mock.calls.flat().join("\n")).not.toContain("actor presence");
-    await host.participants.refresh();
-    expect(batch).toHaveBeenCalledTimes(2);
-    expect(batch.mock.calls[1]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
+    try {
+      await started;
+      for (let actor = 0; actor < 40; actor++) host.participants.scheduleRefresh();
+      release(); await rejected;
+      // Even fresh actor writes and idle gates do not turn an outage into 40 retries.
+      await Promise.all(records.map(row => host.actors.setInstructions(row.id, "changed during outage")));
+      for (let poll = 0; poll < 40; poll++) {
+        host.participants.scheduleRefresh();
+        expect(host.participants.canConsumeMesh()).toBe(false);
+      }
+      await delay(1_100); // Past change-refresh throttle, before the next 5 s heartbeat.
+      expect(batch).toHaveBeenCalledOnce();
+      expect(recovery).toHaveBeenCalledOnce();
+      releaseRecovery();
+      expect(warn.mock.calls.flat().join("\n")).not.toContain("actor presence");
+      await host.participants.refresh();
+      expect(batch).toHaveBeenCalledTimes(2);
+      expect(batch.mock.calls[1]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
+    } finally { release(); releaseRecovery(); await refreshing.catch(() => undefined); }
   });
 
   it("does not turn a failed change round into a second full heartbeat for its waiters", async () => {
     const { host, records } = await fixture();
+    let releaseRecovery!: () => void;
+    const recoveryGate = new Promise<void>(resolve => { releaseRecovery = resolve; });
+    vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => recoveryGate);
     const mutationRefresh = vi.spyOn(host.participants, "refreshPresence").mockResolvedValue();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let entered!: () => void, release!: () => void;
@@ -212,7 +301,7 @@ describe("#4383 resident host presence batch", () => {
       expect(batch).toHaveBeenCalledOnce(); expect(warn).toHaveBeenCalledOnce();
       await host.participants.refresh();
       expect(batch).toHaveBeenCalledTimes(2);
-    } finally { release(); mutationRefresh.mockRestore(); }
+    } finally { releaseRecovery(); release(); mutationRefresh.mockRestore(); }
   });
 
   it("retains newer pending presence when an older batch commits", async () => {

@@ -2766,6 +2766,7 @@ export class ActorManager {
         let committedRefs: string[] | undefined;
         let preLaunch = true;
         let workerLaunched = false;
+        let prLaunchReason: string | undefined;
         const preparationAbort = new AbortController();
         try {
           await this.#publishDrainPresence(actor);
@@ -2830,6 +2831,13 @@ export class ActorManager {
             model: routeDecision.mode === "live" ? routeDecision.model : routeDecision.pin.model,
             thinking: routeDecision.mode === "live" ? routeDecision.effort : routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
+          // Binding/capability preparation may have yielded past a PR change.
+          // Recheck only cached native facts, before allocating a run or writer.
+          prLaunchReason = this.#prInvalidReason(actor, item);
+          if (prLaunchReason) {
+            this.#recordStale(this.#liveActor(actor), item, prLaunchReason);
+            continue;
+          }
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
@@ -2854,7 +2862,8 @@ export class ActorManager {
             () => !this.#closing && !abortController.signal.aborted &&
               this.#runningActor(actor.id)?.abortController === abortController &&
               actor.status !== "stopped" && this.#actors.has(actor.id) &&
-              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
+              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id) &&
+              (prLaunchReason = this.#prInvalidReason(actor, item)) === undefined,
             () => this.#downgradeOutputPrincipal(actor, item),
             (handle) => {
               actor.status = "waiting";
@@ -2892,6 +2901,10 @@ export class ActorManager {
           }
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved during run: ${actor.id}`);
+          }
+          if (!workerLaunched && prLaunchReason) {
+            this.#recordStale(this.#liveActor(actor), item, prLaunchReason, result.id);
+            continue;
           }
           // A failed queue receipt is terminal, but is not an executed activation.
           // Preserve typed, confirmed-unlaunched evidence before directive/text handling.
@@ -2999,6 +3012,10 @@ export class ActorManager {
             if (runCompleted) this.#drop(actor, [item], message);
             else this.#park(actor, [item], message);
             this.#scheduleRestoreParked();
+            continue;
+          }
+          if (!workerLaunched && prLaunchReason) {
+            this.#recordStale(this.#liveActor(actor), item, prLaunchReason);
             continue;
           }
           // A finite unavailable-model error remains terminal, as before. Only a hung
@@ -3360,13 +3377,17 @@ export class ActorManager {
     return { kind: "direct", id, source, sequence, createdAt };
   }
 
+  #prInvalidReason(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    const live = this.#liveActor(actor);
+    this.#expireActivationFilter(live);
+    return activationPrInvalidReason(live.activationFilterReservation, live.activationFilterRelease, item.source, item.payload);
+  }
+
   async #validity(
     actor: ManagedActor,
     item: ActorQueueItem,
   ): Promise<{ valid: boolean; reason?: string }> {
-    const live = this.#liveActor(actor);
-    this.#expireActivationFilter(live);
-    const prReason = activationPrInvalidReason(live.activationFilterReservation, live.activationFilterRelease, item.source, item.payload);
+    const prReason = this.#prInvalidReason(actor, item);
     if (prReason) return { valid: false, reason: prReason };
     if (!actor.validWhile) return { valid: true };
     try {

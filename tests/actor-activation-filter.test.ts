@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import {
   activationFilterSkip,
@@ -226,14 +227,15 @@ afterEach(async () => {
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-"))) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-")),
+  actorOptions: NonNullable<ConstructorParameters<typeof ActorManager>[6]> = {}, maxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-    actorRoot: path.join(root, "actors"), persistent: true,
+    actorRoot: path.join(root, "actors"), persistent: true, ...actorOptions,
   });
   closers.push(async () => { await actors.close(); await agents.close(); });
   return { root, mesh, agents, actors };
@@ -540,6 +542,50 @@ describe("native P0 activation reservations", () => {
     await waitFor(() => actors.status(actor.id).status === "idle");
     expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed", runId: expect.any(String) }));
     expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+  });
+
+  it("rechecks PR freshness after asynchronous model preparation, before allocating a run", async () => {
+    let stalled = false, preparing = false, finish!: () => void;
+    const binding = new Promise<void>(resolve => { finish = resolve; });
+    const { actors, agents, mesh } = setup(undefined, { resolvePiModel: model => {
+      if (!stalled) return model;
+      preparing = true;
+      return binding.then(() => model);
+    } });
+    const actor = await actors.create({ name: "late-preparation", instructions: "x", topics: ["github.demo"], model: "provider/test" });
+    const reservation = p0Reservation();
+    await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+    const run = vi.spyOn(agents, "run");
+    try {
+      stalled = true;
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+      await waitFor(() => preparing);
+      await observeP0(actors, actor.id, reservation, { currentHead: HEAD_B });
+      finish();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(run).not.toHaveBeenCalled();
+      expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed" }));
+    } finally { stalled = false; finish(); run.mockRestore(); }
+  });
+
+  it("rechecks PR freshness after waiting for a native admission permit, before launching a worker", async () => {
+    const { actors, agents, mesh, root } = setup(undefined, {}, 1);
+    const releasePath = path.join(root, "release-permit");
+    const blocker = await agents.spawn({ task: `LIVE_WITH_PROGRESS ${JSON.stringify({ fakeWorkerReleasePath: releasePath })}` });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const actor = await actors.create({ name: "late-admission", instructions: "x", topics: ["github.demo"] });
+      const reservation = p0Reservation();
+      await actors.setActivationFilter(actor.id, BOTH, undefined, undefined, reservation);
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+      await waitFor(() => actors.status(actor.id).status === "waiting");
+      await observeP0(actors, actor.id, reservation, { prState: "closed" });
+      fs.writeFileSync(releasePath, "release");
+      await agents.wait(blocker.id);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(launch).not.toHaveBeenCalled();
+      expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR closed or merged" }));
+    } finally { fs.writeFileSync(releasePath, "release"); launch.mockRestore(); }
   });
 
   it("validates known PR identity without network or registry reads and never guesses missing identity", () => {

@@ -11,6 +11,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { mainGenerationPath } from "../src/residency/handover.js";
+import { mainMarkerPath } from "../src/residency/main-marker.js";
 import * as mainPublication from "../src/residency/main-publication-fence.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -19,7 +20,37 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
-beforeEach(() => installInProcessResidentFence());
+// Census regressions use this test's real process tree, not unrelated fleet
+// Mains (or sibling Vitest workers). Production still scans all same-user PIDs.
+beforeEach(() => {
+  installInProcessResidentFence();
+  if (process.platform !== "linux") return;
+  const readdir = fs.readdirSync.bind(fs);
+  vi.spyOn(fs, "readdirSync").mockImplementation(((directory: fs.PathLike, options?: never) => {
+    const entries = readdir(directory, options);
+    if (directory !== "/proc") return entries;
+    const parents = new Map<string, string>();
+    for (const name of entries as unknown as string[]) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
+        parents.set(name, stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[1]!);
+      } catch { /* A vanished process is not part of the test census. */ }
+    }
+    const ours = (name: string): boolean => {
+      const visited = new Set<string>();
+      while (!visited.has(name)) {
+        if (name === String(process.pid)) return true;
+        visited.add(name);
+        const parent = parents.get(name);
+        if (!parent) return false;
+        name = parent;
+      }
+      return false;
+    };
+    return (entries as unknown as string[]).filter(ours);
+  }) as typeof fs.readdirSync);
+});
 const waitFor = (predicate: () => boolean) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 15_000, interval: 30 });
 const stopChild = async (child: ChildProcess) => {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -60,7 +91,62 @@ const fixture = async () => {
   } };
 };
 
-describe("same-user resident actor operator", () => {
+describe("non-Linux resident actor operator", () => {
+  it.each(["win32", "darwin"] as const)("%s refuses without /proc evidence but permits explicit force-live", async platform => {
+    const f = await fixture();
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const actor = await f.create("platform-control");
+      await stopChild(f.child);
+      spy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+      for (const action of ["stop", "remove"] as const) {
+        const result = await f.cli(action, actor.id);
+        expect(result.code).toBe(1);
+        expect(result.err).toContain("operator dead-root control needs Linux /proc evidence; pass --force-live after confirming");
+        expect(f.host.actors.status(actor.id).status).toBe("idle");
+      }
+      expect((await f.cli("stop", actor.id, ["--force-live"])).code).toBe(0);
+      expect((await f.cli("remove", actor.id, ["--force-live"])).code).toBe(0);
+    } finally { spy?.mockRestore(); await f.close(); }
+  }, 30_000);
+});
+
+describe.skipIf(process.platform !== "linux")("same-user resident actor operator", () => {
+  it.each(["target", "other", "reused PID"] as const)("unbound Pi Main with a %s marker", async binding => {
+    const f = await fixture();
+    let replacement: ChildProcess | undefined;
+    try {
+      const actor = await f.create("marked-main"); await stopChild(f.child);
+      const cli = path.join(f.root, "pi-runtime", "cli.js");
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, "process.title='pi';console.log('ready');setInterval(()=>{},1000)");
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of ["PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID", "PI_SESSION_ID", "PI_FABRIC_ROLE_SESSION",
+        "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_RESIDENT_CONFIG"]) delete env[key];
+      replacement = spawn(process.execPath, [cli], { env, stdio: ["ignore", "pipe", "pipe"] });
+      await once(replacement.stdout!, "data");
+      const pid = replacement.pid!, birth = processStartTime(pid)!;
+      const startTime = binding === "reused PID" ? String(BigInt(birth) - 1n) : birth;
+      const file = mainMarkerPath(f.config.meshRoot, pid, startTime);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ pid, startTime,
+        rootId: binding === "target" ? f.config.rootId : "session:elsewhere",
+        sessionId: binding === "target" ? f.config.sessionId : "elsewhere", createdAt: Date.now() }));
+      for (const action of ["stop", "remove"] as const) {
+        const result = await f.cli(action, actor.id, ["--dry-run"]);
+        if (binding === "other") expect(result).toMatchObject({ code: 0, err: "" });
+        else {
+          expect(result.code).toBe(1);
+          expect(result.err).toContain(binding === "target" ? `Fabric marker for PID ${pid}` : `PID ${pid}: Main without a Fabric marker`);
+        }
+      }
+      if (binding !== "other") await stopChild(replacement);
+      // Left-behind markers (including a mismatched birth) do not veto a dead process.
+      expect((await f.cli("stop", actor.id)).code).toBe(0);
+    } finally { if (replacement) await stopChild(replacement); await f.close(); }
+  }, 30_000);
+
+
   it("after Main exits, CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
     const f = await fixture();
     try {
@@ -200,7 +286,7 @@ describe("same-user resident actor operator", () => {
       for (const action of ["stop", "remove"] as const) {
         const dry = await f.cli(action, actor.id, ["--dry-run"]);
         if (binding === "unbound") {
-          expect(dry.code).toBe(1); expect(dry.err).toContain("possible unbound owner");
+          expect(dry.code).toBe(1); expect(dry.err).toContain(`PID ${replacement.pid}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
           const refused = await f.cli(action, actor.id);
           expect(refused.code).toBe(1); expect(refused.err).toContain("--force-live");
         } else expect(dry).toMatchObject({ code: 0, err: "" });

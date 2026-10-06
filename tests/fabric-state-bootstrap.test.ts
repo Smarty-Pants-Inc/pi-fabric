@@ -64,6 +64,42 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
+  it("an early ensure waits for Main marker publication before loading a runtime", async () => {
+    const cwd = project({ mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const marker = { publish: vi.fn(() => gate) };
+    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { runtimeLoader: harness.loader, mainMarker: marker });
+    const context = contextAt(cwd);
+    const bootstrap = state.bootstrap(context), ensure = state.ensure(context);
+    try {
+      await Promise.resolve();
+      expect(harness.loader).not.toHaveBeenCalled();
+      release(); await Promise.all([bootstrap, ensure]);
+      expect(harness.loader).toHaveBeenCalledOnce();
+    } finally { release(); await Promise.allSettled([bootstrap, ensure]); await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+
+  it("publishes and switches the Main marker before runtime activation", async () => {
+    const cwd = project({ mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const marker = { publish: vi.fn(async () => {}) };
+    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { runtimeLoader: harness.loader, mainMarker: marker });
+    try {
+      await state.bootstrap(contextAt(cwd, "one"));
+      expect(marker.publish).toHaveBeenLastCalledWith(expect.any(String), "session:one", "one");
+      expect(harness.loader).not.toHaveBeenCalled();
+      await state.ensure(contextAt(cwd, "one"));
+      expect(marker.publish.mock.invocationCallOrder[0]).toBeLessThan((harness.loader as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!);
+      await state.bootstrap(contextAt(cwd, "two"));
+      expect(marker.publish).toHaveBeenLastCalledWith(expect.any(String), "session:two", "two");
+      expect(marker.publish.mock.invocationCallOrder[1]).toBeLessThan(harness.instances[0]!.initialize.mock.invocationCallOrder[1]!);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+
   it.each(["reload", "initialize", "session-switch"] as const)(
     "stops activation timers before %s invalidates the runtime", async (boundary) => {
       vi.useFakeTimers();

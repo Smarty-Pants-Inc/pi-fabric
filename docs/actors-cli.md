@@ -21,6 +21,22 @@ invalid identities, and unreadable safety data fail closed. `--force-live`
 is the explicit override; it does not bypass target ownership checks.
 `--dry-run` performs the same checks but changes no actor state.
 
+Dead-root control without an override requires Linux `/proc` evidence. On
+Windows, macOS, or other platforms it refuses with:
+`operator dead-root control needs Linux /proc evidence; pass --force-live after confirming`.
+
+Linux Main startup atomically publishes
+`<meshRoot>/main-markers/<pid>-<linuxStartTime>.json` under the same root
+publication fence as operator commits, before any actor/resident activation.
+Before Pi supplies a native session context, the marker is explicitly unbound
+(still starting); bootstrap binds it to the current root/session, including
+same-process switches and resumes. Clean shutdown removes it. The census
+ignores a live Main only when its exact PID/birth marker or existing positive
+bindings place it elsewhere. A target-root/session marker vetoes control;
+stale PID/birth markers do not bind a new process. An unmarked, unbound Pi Main
+refuses with its PID and `Main without a Fabric marker (older release or still
+starting); retry after it publishes, or confirm and pass --force-live`.
+
 Stop cancels queued work and drains the actor's run, retaining its stopped
 registry record. Remove first performs the same terminal stop/drain (so a
 progressed worker cannot detach on caller abort), then uses the host's normal

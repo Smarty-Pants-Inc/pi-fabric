@@ -47,6 +47,7 @@ import type {
   FabricProvider,
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
+import type { MainProcessMarker } from "./residency/main-marker.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
@@ -54,6 +55,7 @@ import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
 export interface FabricStateOptions {
+  mainMarker?: Pick<MainProcessMarker, "publish">;
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
@@ -67,6 +69,7 @@ export class FabricState {
   #runtime: FabricRuntimeState | undefined;
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
+  #markerPublication: Promise<void> | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
@@ -205,6 +208,15 @@ export class FabricState {
       projectTrusted: context.isProjectTrusted(),
     });
     this.#config = config;
+    if (this.#options.mainMarker) {
+      const sessionId = context.sessionManager.getSessionId();
+      const { mainAgentId } = resolveFabricIdentity(sessionId);
+      const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+      const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (config.mesh.root
+        ? path.resolve(projectRoot, config.mesh.root) : path.join(projectRoot, ".pi", "fabric", "mesh"));
+      this.#markerPublication = this.#options.mainMarker.publish(meshRoot, mainAgentId, sessionId);
+      await this.#markerPublication;
+    }
     this.#probePlacement(config, context.cwd, true);
     this.#kernelReloadRequired = false;
     this.prewalk.cancel();
@@ -495,6 +507,7 @@ export class FabricState {
   }
 
   async #activate(context: ExtensionContext, reinitialize: boolean): Promise<FabricRuntimeState> {
+    if (this.#markerPublication) await this.#markerPublication;
     if (this.#activation) {
       if (this.#activationGeneration === this.#generation) return this.#activation;
       await this.#activation.catch(() => undefined);

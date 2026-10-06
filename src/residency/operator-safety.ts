@@ -2,11 +2,22 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { mainGenerationPath, type ResidentMainGeneration } from "./handover.js";
+import type { MainMarker } from "./main-marker.js";
 import { residentProcessAlive } from "./process-identity.js";
 import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import type { MeshStore } from "../mesh/store.js";
 import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
+
+export function readMainMarker(meshRoot: string, pid: number, startTime: string): MainMarker | undefined {
+  try {
+    const file = path.join(meshRoot, "main-markers", `${pid}-${startTime}.json`);
+    const value = JSON.parse(fs.readFileSync(file, "utf8")) as MainMarker;
+    return value && value.pid === pid && value.startTime === startTime &&
+      typeof value.rootId === "string" && typeof value.sessionId === "string" &&
+      Number.isFinite(value.createdAt) ? value : undefined;
+  } catch { return undefined; }
+}
 
 const refuse = (config: ResidentHostConfig, reason: string): never => {
   throw new ResidentActorAuthorizationError(`Resident root ${config.rootId}: ${reason}; use --force-live only for an intentional override`);
@@ -35,6 +46,13 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
         const fields = stat.slice(close + 2).trim().split(/\s+/);
         if (close < 0 || fields.length < 20 || !/^\d+$/.test(fields[19]!)) refuse(config, "current Main process liveness is unknown (invalid /proc identity)");
         if (fields[0] === "Z" || fields[0] === "X") continue;
+        const marker = readMainMarker(config.meshRoot, Number(name), fields[19]!);
+        if (marker?.rootId && marker.sessionId) {
+          if (marker.rootId === config.rootId || marker.sessionId === config.sessionId) {
+            refuse(config, `Main process is still alive (Fabric marker for PID ${name})`);
+          }
+          continue;
+        }
         let environment: string;
         try { environment = fs.readFileSync(path.join(directory, "environ"), "utf8"); }
         catch (error) {
@@ -78,7 +96,7 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
         const pi = args.slice(0, 2).map(arg => arg.replace(/\\/g, "/")).some(arg =>
           path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));
         const boundElsewhere = (rootId && rootId !== config.rootId) || sessions.some(id => id && id !== config.sessionId);
-        if (pi && !boundElsewhere) refuse(config, "Main process is still alive (possible unbound owner)");
+        if (pi && !boundElsewhere) refuse(config, `PID ${name}: Main without a Fabric marker (older release or still starting); retry after it publishes, or confirm and pass --force-live`);
       } catch (error) {
         if (error instanceof ResidentActorAuthorizationError) throw error;
         const code = (error as NodeJS.ErrnoException).code ?? "unknown";
@@ -106,6 +124,7 @@ function assertNoCurrentMain(config: ResidentHostConfig): void {
  * operator can reject any intervening publication under Main's startup fence.
  */
 export function assertDeadResidentMain(config: ResidentHostConfig, participants: Pick<FabricParticipantSource, "get">, mesh: Pick<MeshStore, "get">): string {
+  if (process.platform !== "linux") throw new ResidentActorAuthorizationError("operator dead-root control needs Linux /proc evidence; pass --force-live after confirming");
   const root = participants.get(config.rootId, Date.now(), { fresh: true });
   if (root && !root.stale) refuse(config, "Main has a live root lease");
   const key = "topology/hosts/" + createHash("sha256").update(config.rootId).digest("hex");

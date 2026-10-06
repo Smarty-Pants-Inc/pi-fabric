@@ -1,5 +1,6 @@
 import { createCommitStats } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -629,6 +630,10 @@ export class MeshStore {
   readonly #generationPath: string;
   readonly #lockPath: string;
   readonly #lockProtocol: MeshLockProtocol;
+  readonly #ownIncarnation: Promise<string | undefined> | undefined;
+  #ownIncarnationReady = false;
+  #ownStartTime: string | undefined;
+  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
@@ -676,6 +681,17 @@ export class MeshStore {
     const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
     if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
     this.#lockProtocol = lockProtocol;
+    // Prepare this immutable process identity once, at store construction rather
+    // than inside a registry-fenced acquisition. A cold bounded try fails closed
+    // until preparation finishes; the ordinary outside-custody recovery lane can
+    // wait for it. UNKNOWN still publishes the conservative three-line receipt.
+    if (lockProtocol === 2) {
+      this.#ownIncarnation = ownProcessIncarnation().then(start => {
+        this.#ownStartTime = start;
+        this.#ownIncarnationReady = true;
+        return start;
+      }, () => { this.#ownIncarnationReady = true; return undefined; });
+    }
     this.#writeAbortSignal = options.writeSignal;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
@@ -1786,10 +1802,23 @@ export class MeshStore {
     });
   }
 
-  /**
-   * Runs an operation under the mesh lock without touching the state: for a rare step that must
-   * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
-   */
+  /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
+   * Registry -> mesh publication retains custody through source selection and copies,
+   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * release registry fences and retry the whole step. This acquires NO lock itself.
+   * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
+  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
+    // Nested helpers retain the surrounding try budget and its lifetime.
+    const inherited = this.#tryLockScope.getStore();
+    if (inherited?.active) return operation();
+    const scope = { active: true, timeoutMs: Math.max(0, timeoutMs) };
+    return this.#tryLockScope.run(scope, async () => {
+      try { return await operation(); }
+      finally { scope.active = false; }
+    });
+  }
+
+  /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return this.#withLock(operation, lockTimeoutMs);
   }
@@ -2105,10 +2134,20 @@ export class MeshStore {
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
-    const token = randomUUID();
+    // A registry-fenced publisher gets only a short try, never the ordinary wait.
+    // Async-local scope leaves concurrent ordinary callers on their own budget.
+    const scope = this.#tryLockScope.getStore();
+    const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
+    if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
+      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+    }
+    const startTime = this.#lockProtocol === 2
+      ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
+      : undefined;
+    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
@@ -2197,7 +2236,7 @@ export class MeshStore {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath)) continue;
+          if (await this.#clearStaleLock(ownerPath, deadline)) continue;
           if (Date.now() >= deadline) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
@@ -2225,7 +2264,7 @@ export class MeshStore {
   // directories recover only after the grace, using atomic rmdir (never recursive removal
   // or rename): an owner published after our last comparison makes rmdir fail closed.
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  async #clearStaleLock(ownerPath: string): Promise<boolean> {
+  async #clearStaleLock(ownerPath: string, deadline: number): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -2262,8 +2301,24 @@ export class MeshStore {
       if (!validOwner) return false;
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
-        const actualStart = await processIncarnation(pid);
-        if (!actualStart || actualStart === recordedStart) return false;
+        // Registry-fenced publication cannot start even a bounded native read.
+        // Fail closed; the ordinary outside-custody admission lane obtains fresh
+        // holder evidence/recovery, then publication selects under fresh fences.
+        if (this.#tryLockScope.getStore()?.active) return false;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let actualStart: string | undefined;
+        try {
+          // Race only the evidence read, NEVER the recovery operation. A reader
+          // ignoring its native timeout cannot leave an escaped rename behind.
+          // The native reader also receives this budget so its child is aborted.
+          actualStart = await Promise.race([
+            processIncarnation(pid, remaining),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
+          ]);
+        } finally { clearTimeout(timer); }
+        if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -46,11 +46,21 @@ export interface ParticipantFileMesh {
   exclusive<T>(operation: () => T): Promise<T>;
 }
 
+/** Prepared unknown is distinct from an absent (lazy) identity. */
+export interface ParticipantFileLockOptions {
+  ownIncarnation?: string | undefined;
+  registryFenced?: boolean;
+}
+
+export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
+  constructor(lock: string) { super(` participant file lock ${lock}`, 1, 0); }
+}
+
 export const writeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
   decide: (current: MeshStateEntry | undefined) => MeshStateEntry | undefined,
-  options: { durable?: boolean } = {},
+  options: ParticipantFileLockOptions & { durable?: boolean } = {},
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
@@ -59,13 +69,14 @@ export const writeParticipantFileIf = async (
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
     // Presence lapses/rebuilds after a crash; migration callers still request barriers.
-    new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }), options);
+    new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }),
+      options.durable === undefined ? {} : { durable: options.durable });
     if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
       throw new Error(`Participant migration verification failed: ${key}`);
     }
     rescan(path.dirname(file));
     return true;
-  });
+  }, options);
 };
 
 /** Removes a record's file if `decide` accepts its current entry; under the same per-key lock. */
@@ -73,6 +84,7 @@ export const removeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
   decide: (current: MeshStateEntry) => boolean,
+  options: ParticipantFileLockOptions = {},
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) return false;
@@ -82,7 +94,7 @@ export const removeParticipantFileIf = async (
     fs.rmSync(file, { force: true });
     rescan(path.dirname(file));
     return true;
-  });
+  }, options);
 };
 
 /** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf). */
@@ -112,7 +124,7 @@ const readFresh = (file: string): MeshStateEntry | undefined => {
 
 const LOCK_WAIT_MS = 5_000;
 
-const holderAlive = async (owner: string): Promise<boolean> => {
+const holderAlive = async (owner: string, lock: string, registryFenced = false): Promise<boolean> => {
   const [pidText, startTime, token] = owner.split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -124,6 +136,7 @@ const holderAlive = async (owner: string): Promise<boolean> => {
   }
   // Read once: an unreadable or foreign/torn identity proves nothing about PID reuse.
   if (!owner.endsWith("\n") || !token || !validProcessIncarnation(startTime)) return true;
+  if (registryFenced) throw new ParticipantFileLockBusyError(lock);
   const actual = await processIncarnation(pid);
   return actual === undefined || actual === startTime;
 };
@@ -134,11 +147,21 @@ const holderAlive = async (owner: string): Promise<boolean> => {
 // out and its refresh retries. A dead holder's lock is removed under the mesh lock, after reading
 // its owner again, so concurrent recoveries cannot remove a successor's lock (review/astra round 3
 // on #142). Recovery is rare; routine writes never take the mesh lock.
-const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation: () => T): Promise<T> => {
+const withKeyLock = async <T>(
+  mesh: ParticipantFileMesh,
+  file: string,
+  operation: () => T,
+  options: ParticipantFileLockOptions = {},
+): Promise<T> => {
   const locks = path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
-  const token = `${process.pid}\n${await ownProcessIncarnation() ?? ""}\n${randomUUID()}\n`;
+  const prepared = Object.prototype.hasOwnProperty.call(options, "ownIncarnation");
+  // A future fenced caller that forgets preparation must unwind, never fall
+  // through to a native self read. Explicit prepared UNKNOWN is still safe.
+  if (options.registryFenced && !prepared) throw new ParticipantFileLockBusyError(lock);
+  const incarnation = prepared ? options.ownIncarnation : await ownProcessIncarnation();
+  const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
@@ -151,7 +174,8 @@ const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation
       fs.rmSync(staging, { recursive: true, force: true });
       const code = (error as { code?: unknown }).code;
       if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
-      await recoverDeadKeyLock(mesh, lock);
+      await recoverDeadKeyLock(mesh, lock, options.registryFenced);
+      if (options.registryFenced && fs.existsSync(lock)) throw new ParticipantFileLockBusyError(lock);
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for the participant file lock ${lock}`);
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -177,9 +201,9 @@ const readOwner = (lock: string): string | undefined => {
   }
 };
 
-const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Promise<void> => {
+const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, registryFenced = false): Promise<void> => {
   const seen = readOwner(lock);
-  if (seen === undefined || await holderAlive(seen)) return;
+  if (seen === undefined || await holderAlive(seen, lock, registryFenced)) return;
   await mesh.exclusive(() => {
     // Compare, then delete by a rename to a unique name and a second compare: a lock that is not
     // the one judged dead goes back (it cannot be, while recoveries share the mesh lock).
@@ -190,7 +214,20 @@ const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Prom
     renameAtomic(lock, tombstone);
     if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
     else renameAtomic(tombstone, lock);
-  }).catch(() => undefined);                                // a busy mesh: the waiter retries
+  }); // A mesh timeout unwinds the publication fence; retry on the next refresh.
+};
+
+/** Retry preparation only: fresh native key-holder evidence/recovery occurs outside
+ * registry custody. Recovery compares the exact receipt under mesh custody;
+ * no participant/source selection crosses this wait. */
+export const prepareParticipantFileLocks = async (mesh: ParticipantFileMesh): Promise<void> => {
+  const locks = path.join(mesh.root, DIR, ".locks");
+  let names: fs.Dirent[];
+  try { names = fs.readdirSync(locks, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  for (const name of names) {
+    if (name.isDirectory() && /^[0-9a-f]{64}$/.test(name.name)) await recoverDeadKeyLock(mesh, path.join(locks, name.name));
+  }
 };
 
 const deepFreeze = <T>(value: T): T => {

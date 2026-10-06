@@ -77,6 +77,8 @@ import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
+import { retentionV2Enabled } from "../storage/retention-platform.js";
+import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
@@ -223,6 +225,8 @@ export class ResidentHost {
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
+  #maintenanceTimer: NodeJS.Timeout | undefined;
+  #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
   readonly #boundaryRequests = new Map<string, Promise<void>>();
@@ -269,24 +273,42 @@ export class ResidentHost {
     this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
       [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
-      (directory) => { this.agents.recoverPendingArchives(directory); });
+      (directory, expired = () => false) => {
+        if (!retentionV2Enabled()) { this.agents.recoverPendingArchives(directory); return; }
+        if (!this.agents.hasRunCustody(path.basename(directory)) && this.agents.recoverPendingArchives(directory, expired)) this.#requestRetention.resample();
+      }, retentionV2Enabled() ? {
+        // A checked exit clears exchange debt, not the manager's run-directory
+        // custody. Deleting a still-managed tree destroys the next fresh exit
+        // proof and can pin a deferred stopped-actor exchange indefinitely.
+        run: id => this.agents.hasRunCustody(id),
+        reference: id => this.agents.retentionCustodyVeto(id),
+      } : undefined);
   }
 
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     // Global order: actor registries (sorted path), then mesh, for publication,
     // adoption and controls. Retain registry custody from the fresh source read
-    // through shared commits AND per-key copies: releasing it before the mesh
-    // wait would let a delayed heartbeat republish a successor's adopted actor.
+    // through shared commits AND per-key copies. Mesh acquisition has a 50 ms try:
+    // contention unwinds these fences; one host-level retry waits for mesh admission
+    // OUTSIDE custody, then re-selects its source under fresh fences.
+    // Never move a selected snapshot outside custody: a delayed heartbeat could
+    // otherwise republish a successor's adopted actor.
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
     const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
-      ActorRegistryStore.withLocks(registries, publish);
+      ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      // Legacy list observations may lag; authority snapshots explicitly request fresh.
+      listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
+      // Acquire/release only: never carry a selected snapshot or mesh custody into
+      // registry acquisition. FIFO waiting gets us into periodic free windows.
+      waitForPublicationRetry: () => this.mesh.exclusive(() => undefined),
+      publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
@@ -495,6 +517,7 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+        presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,
         snapshotActorOwnership,
@@ -637,6 +660,16 @@ export class ResidentHost {
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      // Retention is not part of request admission/heartbeat/claim. A bounded
+      // preparation cursor progresses even between request-retention samples.
+      if (retentionV2Enabled()) {
+        this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
+        this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
+          actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
+          isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
+        });
+        this.#legacyArchive.start();
+      }
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
         this.actors.resumeAfterRelease();
@@ -658,7 +691,10 @@ export class ResidentHost {
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
+    this.#maintenanceTimer = undefined;
     this.#requestRetention.close();
+    await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
     while (this.#pollingRequests || this.#admissions) await delay(10);
@@ -756,7 +792,7 @@ export class ResidentHost {
           command.data,
           signal,
           { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id)?.rootId) },
+            this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -780,7 +816,7 @@ export class ResidentHost {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
       const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-        this.participants.get(from.id)?.rootId);
+        this.participants.get(from.id, undefined, { fresh: true })?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
@@ -832,7 +868,7 @@ export class ResidentHost {
     } catch {
       // Route through the current remote owner below.
     }
-    const target = this.participants.get(subscription.to);
+    const target = this.participants.get(subscription.to, undefined, { fresh: true });
     if (!target) throw new Error(`Unknown Fabric lifecycle target: ${subscription.to}`);
     await this.control.request(
       target.ownerHostId,
@@ -967,19 +1003,21 @@ export class ResidentHost {
       }
     } finally {
       this.#pollingRequests = false;
-      this.#maintainRequests();
+      if (!retentionV2Enabled()) this.#maintainRequests();
       this.#checkIdle();
     }
   }
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() || !this.#requestRetention.due(now)) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() ||
+        (!retentionV2Enabled() && !this.#requestRetention.due(now))) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
     Object.assign(this.#retention, this.#effectiveConfig?.().retention ?? this.config.retention);
-    const live = this.agents.retentionReferences();
+    const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
+    if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {
@@ -996,8 +1034,7 @@ export class ResidentHost {
 
   #checkIdle(): void {
     if (this.#closed || this.#staged || this.#handover) return;
-    const ownedActors = this.actors.listOwned();
-    const activeActor = ownedActors.some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+    const activeActor = this.actors.hasActiveDurableActor();
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");

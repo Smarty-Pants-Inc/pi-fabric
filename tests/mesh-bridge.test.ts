@@ -819,13 +819,18 @@ describe("mesh bridge", () => {
     for (const op of ["bridgedIds", "mirror", "publish"] as const) {
       let side!: StoreBridgeSide;
       const wrap = (store: MeshStore, peer: string): StoreBridgeSide => (side = new StoreBridgeSide(store, peer));
-      const { hub, far, bridge, logs } = setup(undefined, {
+      const { hub, far, bridge, logs, remote } = setup(undefined, {
         pollMs: 5, stopMs: 100,
         ...(where === "local" ? { local: wrap } : { agent: (store: MeshStore) => wrap(store, "dev1") }),
       });
       const lane = await addRoot(hub, "lane");
       const forge = await addRoot(far, "forge-main");
       await bridge.start();
+      // Exercise the negotiated legacy single-event path; batched prefixes have separate coverage.
+      if (op === "publish") {
+        Object.defineProperty(side, "publishBatch", { value: undefined });
+        delete remote.publishBatch;
+      }
       const original = side[op].bind(side) as (...args: unknown[]) => Promise<unknown>;
       let calls = 0;
       const failAt = op === "publish" ? 2 : 1; // A committed prefix must not replay after retry.
@@ -1587,16 +1592,13 @@ describe("mesh bridge", () => {
     expect(hub.get(`topology/participants/${hash(x.identity.id)}`)!.value).toMatchObject({ remoteHost: "forge" });
     await far.publish({ topic: "fleet.work.x.1", kind: "ask", from: y.identity, to: lane.identity.id, text: "from y" });
     await far.publish({ topic: "fleet.work.x.2", kind: "ask", from: x.identity, to: lane.identity.id, text: "from x" });
-    // Hold the first hub publish; a native X registers meanwhile.
-    const publish = hub.publish.bind(hub);
-    let first = true;
-    hub.publish = async (input) => {
-      if (first) {
-        first = false;
-        await addRoot(hub, "x");
-      }
-      return publish(input);
-    };
+    // Hold the first hub batch admission; a native X registers before its commit.
+    // The batch must still check each sender, not merely its first event.
+    const publishBatch = hub.publishBatch.bind(hub);
+    vi.spyOn(hub, "publishBatch").mockImplementationOnce(async (inputs) => {
+      await addRoot(hub, "x");
+      return publishBatch(inputs);
+    });
     await bridge.step();
     expect(hub.read({ after: 0, limit: 100 }).map((e) => e.text)).toEqual(["from y"]);
     expect(hub.get(`topology/participants/${hash(x.identity.id)}`)!.value).not.toHaveProperty("remoteHost");

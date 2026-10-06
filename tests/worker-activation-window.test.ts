@@ -335,7 +335,7 @@ describe("native activation window (offline; opted-in success needs exact native
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
     api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false, runtimeTool = false,
-    contextWindow = fabric || runtimeTool ? 128000 : 8000) => {
+    contextWindow = fabric || runtimeTool ? 128000 : 8000, finalText = "useful current result") => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -365,7 +365,7 @@ describe("native activation window (offline; opted-in success needs exact native
             ? { code: "return 1" } : { path: path.join(dir, toolRounds ? `task-${round}.txt` : "task.txt") }) } }] });
           chunk({}, "tool_calls");
         } else {
-          chunk({ role: "assistant", content: "useful current result" });
+          chunk({ role: "assistant", content: finalText });
           chunk({}, "stop");
         }
         response.end("data: [DONE]\n\n");
@@ -1309,6 +1309,106 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(result.warnings ?? [], explain(result)).toEqual([]);
     expect(s.requests).toHaveLength(2); // Fabric execution initialized its real runtime.
     expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({ held: true });
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each([false, true])("5256 process task keeps its full settlement under an 8s mesh holder (slow exit: %s)", async slowExit => {
+    const finalText = "Full task result:\n" + "durable line with full-text sentinel\n".repeat(800) + "TASK_FINAL_END";
+    const s = await setup(0, 0, undefined, "openai-completions", false, true, undefined, finalText);
+    const meshRoot = path.join(s.dir, "mesh");
+    const lock = path.join(meshRoot, ".lock");
+    const requested = path.join(s.dir, "hold-requested");
+    const admitted = path.join(s.dir, "hold-admitted");
+    const marker = path.join(s.dir, "task-shutdown.json");
+    const termMarker = path.join(s.dir, "task-term.json");
+    fs.mkdirSync(meshRoot);
+    fs.writeFileSync(path.join(s.dir, "agent", "fabric.json"), JSON.stringify({
+      fullCodeMode: true, schema: { mode: "off" }, mesh: { enabled: true },
+      entropy: { compile: false }, jev: { enabled: false }, autoReload: false,
+    }));
+    // A separate live process, outside the task's execution tree, owns an 8s
+    // lock hold. Neither cancellation nor TERM/KILL may remove its lock early.
+    const holder = spawn(process.execPath, ["-e", `
+      const fs = require('node:fs');
+      const timer = setInterval(() => {
+        if (!fs.existsSync(${JSON.stringify(requested)})) return;
+        clearInterval(timer);
+        const lock = ${JSON.stringify(lock)};
+        const owner = 'task-eof-holder\\n' + process.pid + '\\n' + Date.now() + '\\n';
+        fs.mkdirSync(lock); fs.writeFileSync(lock + '/owner', owner);
+        fs.writeFileSync(${JSON.stringify(admitted)}, owner);
+        setTimeout(() => {
+          if (fs.readFileSync(lock + '/owner', 'utf8') !== owner) process.exit(2);
+          fs.rmSync(lock, {recursive:true});
+        }, 8_000);
+      }, 10);
+    `], { cwd: s.dir, stdio: "ignore" });
+    const holderClosed = new Promise<number | null>((resolve, reject) => {
+      holder.once("error", reject); holder.once("close", resolve);
+    });
+    const extension = path.resolve(process.env.FABRIC_ACTIVATION_TEST_EXTENSION ?? "dist/index.js");
+    fs.writeFileSync(path.join(s.dir, "noop.ts"), `
+      import fs from 'node:fs';
+      import fabric from ${JSON.stringify(extension)};
+      export default async function(pi) {
+        ${slowExit ? `process.on('SIGTERM', () => {
+          const directory = ${JSON.stringify(path.join(s.dir, "runs"))} + '/' + process.env.PI_FABRIC_PARENT_RUN;
+          fs.writeFileSync(${JSON.stringify(termMarker)}, JSON.stringify({
+            receipt: JSON.parse(fs.readFileSync(directory + '/settlement.json', 'utf8')),
+            status: JSON.parse(fs.readFileSync(directory + '/status.json', 'utf8')).status
+          }));
+        });` : ""}
+        pi.on('session_shutdown', async () => {
+          fs.writeFileSync(${JSON.stringify(requested)}, 'hold');
+          while (!fs.existsSync(${JSON.stringify(admitted)})) await new Promise(resolve => setTimeout(resolve, 10));
+        });
+        await fabric(pi);
+        pi.on('session_shutdown', async () => {
+          const held = fs.existsSync(${JSON.stringify(lock)}) &&
+            fs.readFileSync(${JSON.stringify(path.join(lock, "owner"))}, 'utf8') === fs.readFileSync(${JSON.stringify(admitted)}, 'utf8');
+          fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({held, pid:process.pid}));
+          ${slowExit ? "await new Promise(resolve => setTimeout(resolve, 20_000));" : ""}
+        });
+      }
+    `);
+    try {
+      const handle = await s.manager.spawn({ task: "Activate Fabric, then finish with a full result.", model: "window-test/offline",
+        extensions: true, tools: ["fabric_exec"], transport: "process", meshRoot });
+      const result = await s.manager.wait(handle.id);
+      const evidence = process.env.FABRIC_TASK_EXIT_EVIDENCE_DIR;
+      if (evidence) {
+        fs.mkdirSync(evidence, {recursive:true});
+        const prefix = slowExit ? "task-slow-exit" : "task-mesh-cancel";
+        fs.writeFileSync(path.join(evidence, prefix + "-result.json"), JSON.stringify(result, null, 2));
+        fs.copyFileSync(result.logFile!, path.join(evidence, prefix + "-events.jsonl"));
+        if (fs.existsSync(marker)) fs.copyFileSync(marker, path.join(evidence, prefix + "-shutdown.json"));
+        if (fs.existsSync(termMarker)) fs.copyFileSync(termMarker, path.join(evidence, prefix + "-term.json"));
+        for (const file of ["settlement.json", "status.json"]) {
+          fs.copyFileSync(path.join(path.dirname(result.logFile!), file), path.join(evidence, prefix + "-" + file));
+        }
+      }
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: finalText });
+      expect(result.error, explain(result)).toBeUndefined();
+      expect(s.requests).toHaveLength(2); // Real task SDK entry initialized Fabric, then inferred a final answer.
+      expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toMatchObject({held: true});
+      const directory = path.dirname(result.logFile!);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "settlement.json"), "utf8")))
+        .toMatchObject({runId: handle.id, outcome: "completed", text: result.text});
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+        .toMatchObject({status: "completed", text: result.text});
+      expect(s.manager.listForUi().find(agent => agent.id === handle.id)).toMatchObject({status: "completed"});
+      if (slowExit) {
+        expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
+        if (process.platform !== "win32") {
+          expect(JSON.parse(fs.readFileSync(termMarker, "utf8"))).toMatchObject({
+            status: "running", receipt: {outcome: "completed", runId: handle.id, text: finalText},
+          });
+        }
+      } else expect(result.warnings ?? [], explain(result)).toEqual([]);
+      expect(await holderClosed).toBe(0);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+      await holderClosed;
+    }
   }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("3704 journals and replays full Fabric guidance during real actor activations", async () => {

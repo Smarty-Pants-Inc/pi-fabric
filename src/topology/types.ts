@@ -103,6 +103,8 @@ export interface FabricParticipantListOptions {
   includeStale?: boolean;
   /** Read the current mesh state, not a recent cached parse (for protocol decisions). */
   fresh?: boolean;
+  /** Display/background observation only; never use for routing or ownership decisions. */
+  background?: boolean;
 }
 
 export interface FabricPeerInfo {

@@ -156,7 +156,7 @@ export class SchemaController {
       evidence: input.evidence,
       complexityReduction: input.complexityReduction === true,
       parentToolCallId: context.parentToolCallId,
-      state: stateBinding(this.state?.getHead() ?? null),
+      state: stateBinding(this.state?.getHead({ fresh: true }) ?? null),
       fingerprint: snapshot.fingerprint,
       generation,
       status: "active",
@@ -197,7 +197,7 @@ export class SchemaController {
     } catch (error) {
       return this.#failedVerification(record, [], `workspace snapshot failed: ${errorMessage(error)}`);
     }
-    const currentState = stateBinding(this.state?.getHead() ?? null);
+    const currentState = stateBinding(this.state?.getHead({ fresh: true }) ?? null);
     if (!sameBinding(record.state, currentState)) {
       return this.#failedVerification(record, [], "state head changed since hypothesis");
     }
@@ -331,7 +331,7 @@ export class SchemaController {
         { valid: certificate.parentToolCallId === context.parentToolCallId, error: "Schema artifact belongs to a different fabric_exec invocation" },
         { valid: Number.isFinite(certificate.expiresAt) && Date.now() <= certificate.expiresAt, error: "Schema certificate expired" },
         { valid: hypothesis.status === "verified", error: `Schema hypothesis is not verified: ${hypothesis.status}` },
-        { valid: sameBinding(certificate.state, stateBinding(this.state?.getHead() ?? null)), error: "Schema state head changed after verification" },
+        { valid: sameBinding(certificate.state, stateBinding(this.state?.getHead({ fresh: true }) ?? null)), error: "Schema state head changed after verification" },
         { valid: certificate.generation === this.#generation(), error: "Schema workspace generation is stale" },
         { valid: baseline.fingerprint === certificate.fingerprint, error: "Schema workspace fingerprint is stale" },
       ]);

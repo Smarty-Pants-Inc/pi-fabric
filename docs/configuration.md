@@ -572,6 +572,10 @@ The `veda` runner drives the [Veda CLI](https://github.com/kennyfrc/veda) as the
 
 A JS runtime launches each Fabric worker module. Fabric reuses the current runtime when `process.execPath` names `node` or `bun`. For a Bun-compiled Pi binary, `process.execPath` names the `pi` executable. Fabric then uses `PI_FABRIC_NODE_BINARY` or the first `node` or `bun` on `PATH`. The resolved runtime launches the workers. `PI_FABRIC_NODE_BINARY` overrides this choice for the current process. The Node-process executor (`executor.runtime: "node-process"`) requires Node.js because it uses `--eval` and `--input-type=module`; the Bun-process executor (`executor.runtime: "bun-process"`) requires Bun because it uses `--eval`.
 
+Pi worker tool-call streams have an independent stall guard: a consecutive interval of only whitespace argument deltas is bounded to **90 seconds**, even when tokens keep arriving. Any non-whitespace argument delta resets that interval; text/thinking deltas and tool execution are unaffected. `PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS` overrides the interval in the worker environment (positive integer milliseconds, at most `2147483647`; invalid values use 90000). The existing 64 KiB all-whitespace argument-prefix cap remains; real JSON content exempts only that byte cap, not the time bound.
+
+On the first stall, the worker aborts and drains its owned Pi child, then retries once from the **exact durable session** with the same admitted model and effort, not the original task or a fallback model. A second stall fails with `errorCode: "RUNAWAY_TOOL_CALL_STREAM"` and an explicit repeated-stall error. A missing durable session/model admission or active compaction fails safely rather than replaying completed work. Both attempts emit `stall.whitespace-toolcall` in the event log and lifecycle telemetry with `taskId`/`runId`. The overall child timeout and failed-provider recovery limits still apply.
+
 Other agent settings:
 
 - `modelPolicy.requireReason`: trusted-host-only model prefixes requiring a named `modelReason` on explicit `agents.spawn`, `run`, `create` and actor `setModel` requests. Defaults to `["gpt-6-astra"]` (any provider); provider-qualified entries restrict that provider/model prefix. Reasons must be non-blank and at most 200 characters, and are recorded on run/actor records and `run.spawned` lifecycle events. Omitted models/defaults are unchanged; no silent fallback. Workspace configuration cannot override this list. Set `[]` in the host agent directory's `fabric.json` to roll back. See [explicit model exceptions](agents.md#explicit-model-exceptions-3134).
@@ -730,11 +734,20 @@ Native `new`/`resume` session replacement records its explicit `targetSessionFil
 
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
 
-Idle observations of shared state and participant files reuse a snapshot for at most
-`mesh.idleReadCoalesceMs` (default 5000 ms; range 0–10000, 0 disables reuse). File changes and
-UI remote-generation checks do not bypass that window while Main is idle. A running turn or
-pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
-always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
+Explicit background display observations of shared state and participant files reuse a
+snapshot for at most `mesh.idleReadCoalesceMs` (default 5000 ms; accepted range 0–10000,
+with a 1000 ms background-only runtime floor). Ordinary runtime reads remain exact on
+change, regardless of invocation activity. File changes and UI remote-generation checks
+do not bypass the background window while Main is idle. A running turn or pending Main
+message shortens only the background window to 1000 ms; explicit fresh reads, including
+Schema state bindings, always bypass it. Resident participant-file lists retain their
+configured legacy observation TTL without a floor; fresh ownership/maintenance lists
+bypass it, and resident shared-state/routing reads remain exact on change.
+Actor watches poll immediately after a quiet actor cadence, then retain one trailing
+poll per `max(1000, mesh.actorPollMs)` ms for continuous bursts. Windows and unsupported
+watchers retain `mesh.actorPollMs` polling. Residency delivery drains use the 1000 ms
+floor; explicit scheduling/catch-up stays prompt.
+Listings can lag by this window; expiration does not slide on cache hits.
 Fresh readers revalidate canonical physical generation instead of parsing an unchanged file
 again. Stores share parsed reader snapshots within a process, and a bounded optional read
 journal advances changed snapshots incrementally. Missing/legacy/invalid journals fall back

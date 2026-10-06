@@ -449,6 +449,8 @@ describe("Fabric configuration", () => {
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
       terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 256 * 1024,
+      legacyRunArchiveEnabled: true,
+      legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
     });
     expect(
       normalizeFabricConfig({
@@ -466,6 +468,8 @@ describe("Fabric configuration", () => {
       actorRunArchiveMs: 30 * 24 * 60 * 60 * 1_000,
       terminalRunEventsAgeMs: 48 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 128 * 1024,
+      legacyRunArchiveEnabled: true,
+      legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
     });
     expect(
       normalizeFabricConfig({ retention: { orphanedTempRunMs: 1 } }).retention.orphanedTempRunMs,

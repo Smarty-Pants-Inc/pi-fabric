@@ -1,7 +1,14 @@
 import { assistantStreamEvent } from "./assistant-stream-event.js";
 
-export const TOOL_CALL_WHITESPACE_TIMEOUT_MS = 60_000;
+export const TOOL_CALL_WHITESPACE_TIMEOUT_MS = 90_000;
 export const TOOL_CALL_WHITESPACE_MAX_BYTES = 64 * 1024;
+
+/** Worker environment override; invalid/disabled values must not remove the bound. */
+export const toolCallWhitespaceTimeoutMs = (): number => {
+  const value = Number(process.env.PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS);
+  return Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647
+    ? value : TOOL_CALL_WHITESPACE_TIMEOUT_MS;
+};
 
 export class RunawayToolCallStreamError extends Error {
   readonly code = "RUNAWAY_TOOL_CALL_STREAM" as const;
@@ -28,7 +35,7 @@ interface CallStream {
   timer?: ReturnType<typeof setTimeout>;
 }
 
-/** Only an all-whitespace argument prefix is bounded, never legitimate JSON or tool execution. */
+/** Bound consecutive whitespace argument deltas, never text or tool execution. */
 export class ToolCallStreamGuard {
   #calls = new Map<number, CallStream>();
   #disposed = false;
@@ -37,7 +44,12 @@ export class ToolCallStreamGuard {
   constructor(
     private readonly fail: (error: RunawayToolCallStreamError) => void,
     private readonly attribution: () => { model: string; effort: string },
-  ) {}
+    private readonly timeoutMs = toolCallWhitespaceTimeoutMs(),
+  ) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+      throw new RangeError("Tool-call whitespace timeout must be a positive timer-safe integer");
+    }
+  }
 
   observe(event: EventRecord): void {
     if (this.#disposed) return;
@@ -83,30 +95,33 @@ export class ToolCallStreamGuard {
   }
 
   #append(index: number, call: CallStream, text: string): void {
-    if (this.#disposed || call.meaningful) return;
+    if (this.#disposed) return;
     if (/\S/.test(text)) {
-      // Permanently exempt this call: later whitespace cannot erase the JSON prefix.
       call.meaningful = true;
       if (call.timer) clearTimeout(call.timer);
       delete call.timer;
+      delete call.startedAt;
+      call.bytes = 0;
       return;
     }
     call.bytes += Buffer.byteLength(text, "utf8");
     if (call.startedAt === undefined) {
       call.startedAt = performance.now();
-      this.#armTimer(index, call, TOOL_CALL_WHITESPACE_TIMEOUT_MS);
+      this.#armTimer(index, call, this.timeoutMs);
     }
     const elapsedMs = performance.now() - call.startedAt;
-    if (call.bytes >= TOOL_CALL_WHITESPACE_MAX_BYTES ||
-        elapsedMs >= TOOL_CALL_WHITESPACE_TIMEOUT_MS) this.#abort(index, call, elapsedMs);
+    // Preserve the prefix byte cap. Large whitespace embedded in real JSON is
+    // legal; after real content, only a sustained whitespace interval stalls.
+    if ((!call.meaningful && call.bytes >= TOOL_CALL_WHITESPACE_MAX_BYTES) ||
+        elapsedMs >= this.timeoutMs) this.#abort(index, call, elapsedMs);
   }
 
   #armTimer(index: number, call: CallStream, delayMs: number): void {
     call.timer = setTimeout(() => {
       const elapsedMs = performance.now() - call.startedAt!;
       // Timers can wake early: only the monotonic elapsed time authorizes a timeout.
-      if (elapsedMs >= TOOL_CALL_WHITESPACE_TIMEOUT_MS) this.#abort(index, call, elapsedMs);
-      else this.#armTimer(index, call, TOOL_CALL_WHITESPACE_TIMEOUT_MS - elapsedMs);
+      if (elapsedMs >= this.timeoutMs) this.#abort(index, call, elapsedMs);
+      else this.#armTimer(index, call, this.timeoutMs - elapsedMs);
     }, delayMs);
     call.timer.unref?.();
   }

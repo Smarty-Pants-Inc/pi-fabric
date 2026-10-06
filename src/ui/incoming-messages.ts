@@ -12,7 +12,7 @@ export const INCOMING_MESSAGE_TYPES = [
 ] as const;
 
 type IncomingMessage = Parameters<MessageRenderer>[0];
-type Row = { sender: string; body: string; attributes: Record<string, string> };
+type Row = { sender: string; body: string; kind: string; full: boolean; attributes: Record<string, string> };
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const decodeXml = (text: string): string => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, name: string) =>
@@ -35,18 +35,29 @@ export const incomingMessagesCollapsed = (
 ): boolean => mode === "collapsed" || (mode === "auto" &&
   ["org", "org-agent"].includes((environment.PI_FABRIC_ROLE ?? environment.SMARTY_ROLE ?? "").split("@")[0]!.trim()));
 
+// These are display labels, not authority checks. Do not infer a destination
+// from an originating `principal` receipt or from a mention in the body.
+const orgSender = (name: string): boolean => ["org", "org-agent"].includes(name.split("@")[0]!);
 const rows = (message: IncomingMessage): Row[] => {
   const text = contentText(message);
-  const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
-  if (matches.length) return matches.map(match => {
-    const attrs = attributes(match[2]!);
-    return { sender: attrs.from_name ?? attrs.name ?? "Fabric", attributes: attrs,
-      body: decodeXml(match[3]!.replace(/\n<data>[\s\S]*?<\/data>\s*$/, "").trim()) };
-  });
   const details = record(message.details);
-  const from = record(details.from);
-  const actor = record(details.actor);
-  return [{ sender: String(from.name ?? actor.name ?? "Fabric"), body: text, attributes: {} }];
+  const items = Array.isArray(details.items) ? details.items : [details];
+  const row = (body: string, attrs: Record<string, string>, index: number): Row => {
+    const item = record(items[index]);
+    const from = record(item.from);
+    const actor = record(item.actor);
+    const data = record(item.data);
+    const sender = String(attrs.from_name ?? attrs.name ?? from.name ?? actor.name ?? "Fabric");
+    const delivery = attrs.delivery ?? (typeof item.delivery === "string" ? item.delivery : record(item.delivery).mode);
+    const kind = /^mail\.inbound\b/.test(body) ? "mail.inbound" : String(attrs.kind ?? delivery ??
+      (message.customType === "pi-fabric-actor" ? "actor" : message.customType === "pi-fabric-inbox-summary" ? "inbox" : "agent"));
+    return { sender, body, kind, attributes: attrs,
+      full: orgSender(sender) || (attrs.to ?? item.to ?? data.to) === "principal" };
+  };
+  const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
+  return matches.length ? matches.map((match, index) => row(
+    decodeXml(match[3]!.replace(/\n<data>[\s\S]*?<\/data>\s*$/, "").trim()), attributes(match[2]!), index,
+  )) : [row(text, {}, 0)];
 };
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
@@ -122,10 +133,16 @@ export const registerIncomingMessageRenderers = (
       if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
       const visible = unseenRows(message, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
       if (!visible.length) return { render: () => [], invalidate() {} };
+      // A native carrier is the burst boundary. If it mixes a principal reply
+      // with chatter, preserve the entire native rendering rather than clip it.
+      if (visible.some(row => row.full)) return undefined;
       const first = visible[0]!;
       const body = Array.from(safeText(first.body));
       const preview = body.length > 80 ? `${body.slice(0, 80).join("")}…` : body.join("");
-      const summary = `↳ ${safeText(first.sender)}: ${preview}${visible.length > 1 ? ` (+${visible.length - 1} more)` : ""}`;
+      const senders = new Set(visible.map(row => row.attributes.from_id ?? safeText(row.sender))).size;
+      const kinds = [...new Set(visible.map(row => safeText(row.kind)))].join("/");
+      const sender = `${safeText(first.sender)}${senders > 1 ? ` +${senders - 1} sender${senders > 2 ? "s" : ""}` : ""}`;
+      const summary = `↳ ${sender}: [${visible.length} ${kinds}] ${preview}`;
       return {
         render: width => [truncateToWidth(theme.fg("dim", `${" ".repeat(Math.min(options.outputPad, Math.max(0, width - 1)))}${summary}`), width)],
         invalidate() {},

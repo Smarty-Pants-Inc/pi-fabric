@@ -48,14 +48,14 @@ describe("incoming Fabric display projection", () => {
     const lines = harness().render(message())!;
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("\x1b[2m");
-    expect(plain(lines[0]!)).toBe(" ↳ Build & Test: first second third & <safe>");
+    expect(plain(lines[0]!)).toBe(" ↳ Build & Test: [1 agent] first second third & <safe>");
     expect(lines[0]).not.toContain("internal");
   });
 
   it("bounds body previews and terminal width without wrapping or control injection", () => {
     const h = harness(); const value = message("😀".repeat(90) + "\x1b[31m\nnew line");
     const full = plain(h.render(value)![0]!);
-    expect(full).toBe(" ↳ Build & Test: " + "😀".repeat(80) + "…");
+    expect(full).toBe(" ↳ Build & Test: [1 agent] " + "😀".repeat(80) + "…");
     for (const width of [0, 1, 5, 35, 80]) {
       const lines = h.render(value, false, width)!;
       expect(lines).toHaveLength(1);
@@ -66,19 +66,19 @@ describe("incoming Fabric display projection", () => {
   it("previews batched agent messages once and reports the other messages", () => {
     const first = message(); const second = message("another body");
     const value = { ...first, content: `2 follow-ups released at a boundary\n\n${first.content}\n\n${second.content}` };
-    expect(plain(harness().render(value)![0]!)).toBe(" ↳ Build & Test: first second third & <safe> (+1 more)");
+    expect(plain(harness().render(value)![0]!)).toBe(" ↳ Build & Test: [2 agent] first second third & <safe>");
   });
 
   it("collapses mail notices, actor steers, summaries, and content block carriers", () => {
     const h = harness();
     expect(plain(h.render(message("mail.inbound: new mail for you on the mesh"))![0]!))
-      .toContain("↳ Build & Test: mail.inbound:");
+      .toContain("↳ Build & Test: [1 mail.inbound]");
     const actor = { ...message(), customType: "pi-fabric-actor", content: '<fabric-actor name="actor\\\"name" id="a">\nActor reply\n</fabric-actor>', details: {} };
-    expect(plain(h.render(actor)![0]!)).toBe(' ↳ actor"name: Actor reply');
+    expect(plain(h.render(actor)![0]!)).toBe(' ↳ actor"name: [1 actor] Actor reply');
     expect(plain(h.render({ ...message(), customType: "pi-fabric-inbox-summary", content: "Fabric inbox: skipped 45" })![0]!))
       .toContain("skipped 45");
     expect(plain(h.render({ ...message(), content: [{ type: "text", text: "plain body" }] })![0]!))
-      .toBe(" ↳ Build & Test: plain body");
+      .toBe(" ↳ Build & Test: [1 agent] plain body");
   });
 
   it("identifies a mixed-sender burst and its delivery kinds without changing the carrier", () => {
@@ -130,6 +130,39 @@ describe("incoming Fabric display projection", () => {
     expect(plain(actual.render(100).join("\n"))).not.toContain("[pi-fabric-agent-message]");
   });
 
+  it("snapshots the native transcript before collapse, after collapse, and after expansion", () => {
+    initTheme("dark", false);
+    const h = harness();
+    const value = { ...message(), content: [
+      '<fabric-agent-message from_name="Builder" delivery="followUp">Build ready\nCompiler log stays in model context.</fabric-agent-message>',
+      '<fabric-agent-message from_name="Reviewer" delivery="followUp">Tests green\nReview detail stays in model context.</fabric-agent-message>',
+    ].join("\n\n") };
+    const bytes = JSON.stringify(convertToLlm([value]));
+    const native = new CustomMessageComponent(value);
+    const actual = new CustomMessageComponent(value, h.renderers.get(value.customType));
+    const lines = (component: CustomMessageComponent) => component.render(120).map(plain).map(line => line.trim()).filter(Boolean);
+    const before = lines(native);
+    const collapsed = lines(actual);
+    expect({ before, collapsed }).toMatchInlineSnapshot(`
+      {
+        "before": [
+          "[pi-fabric-agent-message]",
+          "<fabric-agent-message from_name="Builder" delivery="followUp">Build ready",
+          "Compiler log stays in model context.</fabric-agent-message>",
+          "<fabric-agent-message from_name="Reviewer" delivery="followUp">Tests green",
+          "Review detail stays in model context.</fabric-agent-message>",
+        ],
+        "collapsed": [
+          "↳ Builder +1 sender: [2 followUp] Build ready Compiler log stays in model context.",
+        ],
+      }
+    `);
+    expect(collapsed).toHaveLength(1);
+    actual.setExpanded(true); expect(lines(actual)).toEqual(before);
+    actual.setExpanded(false); expect(lines(actual)).toEqual(collapsed);
+    expect(JSON.stringify(convertToLlm([value]))).toBe(bytes);
+  });
+
   it.each(INCOMING_MESSAGE_TYPES)("keeps exact native expanded rendering for %s", customType => {
     initTheme("dark", false);
     const h = harness(); const value = { ...message("full original body\nsecond detail"), customType };
@@ -143,7 +176,7 @@ describe("incoming Fabric display projection", () => {
     const h = harness(); h.setBranch([entry(message())]);
     expect(h.render(inbox([event("shadow-1", "duplicate")]))).toEqual([]);
     const mixed = inbox([event("shadow-1", "duplicate"), event("unseen", "new work", { key: "different" })]);
-    expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: new work");
+    expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
     const delivery = { ...message(), details: { id: "native-2", from: sender, data: { deliveryId: "D1", key: "same-work" } } };
     h.setBranch([entry(message()), entry(delivery)]);
     expect(h.render(inbox([event("d1", "duplicate D1", { deliveryId: "D1" })]))).toEqual([]);

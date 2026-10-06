@@ -43,6 +43,7 @@ import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifec
 import { removeTree } from "./rm.js";
 import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
+import { ActorArchiveIndex } from "./actor-archive-index.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
@@ -706,6 +707,7 @@ export class AgentManager {
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onResultAbandoned: ((id: string) => void) | undefined;
+  readonly #actorArchiveIndex: ActorArchiveIndex;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
@@ -800,6 +802,7 @@ export class AgentManager {
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
+    this.#actorArchiveIndex = new ActorArchiveIndex(this.#runRoot);
     this.#retention = options.retention ?? DEFAULT_FABRIC_CONFIG.retention;
     this.#workerPath =
       options.workerPath ?? fileURLToPath(new URL("../worker.js", import.meta.url));
@@ -1228,6 +1231,7 @@ export class AgentManager {
       if (routedActor && request.sessionFile) {
         writeJsonAtomic(path.join(runDirectory, ACTOR_RUN_ARCHIVE_PENDING_FILE), { format: 1, runId: id,
           actorId: request.actorId, sessionFile: request.sessionFile }, { durable: true });
+        this.#actorArchiveIndex.refreshRun(id);
       }
       if (this.#managedTempRoot && !this.#retentionTimer) {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
@@ -2296,9 +2300,10 @@ export class AgentManager {
 
   /** Discharge actor-log custody only after the owning archive succeeded. */
   async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
-    const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
+    const directory = this.#actorArchiveIndex.confirmedSource(runId, actorId, sessionFile);
     if (!directory) return;
     fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
+    this.#actorArchiveIndex.refreshRun(runId);
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
@@ -2306,20 +2311,7 @@ export class AgentManager {
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
-    const sources = new Map<string, string>();
-    if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
-    for (const runId of fs.readdirSync(this.#runRoot)) {
-      if (!/^[a-f0-9]{32}$/.test(runId)) continue;
-      const directory = path.join(this.#runRoot, runId);
-      const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
-      if (!ownedStat(directory)?.isDirectory() || !ownedStat(file)?.isFile()) continue;
-      try {
-        if (fs.statSync(file).size > 4096) continue;
-        const marker = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (marker.format === 1 && marker.runId === runId && marker.actorId === actorId && marker.sessionFile === sessionFile) sources.set(runId, directory);
-      } catch { /* Unreadable custody stays a collection veto, never authority. */ }
-    }
-    return sources;
+    return this.#actorArchiveIndex.sources(actorId, sessionFile);
   }
 
   worktreeGitRoot(id: string): string | undefined {

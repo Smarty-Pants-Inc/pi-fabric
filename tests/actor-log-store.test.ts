@@ -101,6 +101,20 @@ describe("ActorLogStore", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
   });
 
+  it("retains one run without scanning the full archive and leaves pruning to bounded maintenance", async () => {
+    const { root, actor, store } = setup();
+    for (let n = 0; n < 100; n++) {
+      const directory = path.join(root, "actor", "runs", `old-${n}`); fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
+    }
+    const source = path.join(root, "source"); fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, "status.json"), JSON.stringify({ id: "latest", status: "completed", finishedAt: 900, transport: "process", sessionId: "2147483647" }));
+    const read = vi.spyOn(fs, "readdirSync"); await store.retainRun(actor, "latest", source);
+    expect(read).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, "actor", "runs", "old-0"))).toBe(true);
+    store.pruneRuns(actor, 1000);
+    expect(store.retainedRunIds(actor)).toEqual(["latest"]); // Fresh normal retention fences still collect expired archives.
+  });
   it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
     const { root, actor, store } = setup();
     await store.retainRun(actor, "missing", undefined);

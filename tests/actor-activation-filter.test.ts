@@ -661,7 +661,7 @@ describe("native P0 activation reservations", () => {
     } finally { write.mockRestore(); }
   });
 
-  it("enforces the reservation deadline after restart without new events", async () => {
+  it.each([false, true])("enforces the reservation deadline after restart (expired while offline: %s)", async expiredWhileOffline => {
     const first = setup();
     const actor = await first.actors.create({ name: "restart-p0", instructions: "x" });
     const reservation = p0Reservation({ expiresAt: Date.now() + 500 });
@@ -669,6 +669,7 @@ describe("native P0 activation reservations", () => {
     await first.actors.close();
     closers.length = 0;
     await first.agents.close();
+    if (expiredWhileOffline) await waitFor(() => Date.now() >= reservation.expiresAt);
     const again = setup(first.root).actors;
     expect(again.status(actor.id).activationFilterReservation).toEqual(reservation);
     await waitFor(() => again.status(actor.id).activationFilterReservation === undefined);

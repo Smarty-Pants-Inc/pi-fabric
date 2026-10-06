@@ -18,7 +18,16 @@ do {
   finally {
     if (fs.readFileSync(owner, "utf8") !== receipt) throw new Error("Holder lost lock custody");
     const released = `${lock}.released.${token}`;
-    fs.renameSync(lock, released); fs.rmSync(released, { recursive: true });
+    // Windows refuses to rename a directory while another process (the resident host polling owner) has it open:
+    // EPERM/EBUSY/EACCES. Production release retries these (atomic-write RETRYABLE_RENAME_CODES); so does the fixture.
+    for (let attempt = 1; ; attempt++) {
+      try { fs.renameSync(lock, released); break; }
+      catch (error) {
+        if (attempt >= 200 || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
+        await pause(5);
+      }
+    }
+    fs.rmSync(released, { recursive: true, maxRetries: 20, retryDelay: 5 });
   }
   if (gapMs) await pause(gapMs);
 } while (Date.now() < until);

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { syncDirectoryChain } from "../core/atomic-write.js";
 
 /** Host-owned send identity, retained with the receiver's durable queue, never user data. */
 export interface DeliverySend {
@@ -36,6 +37,7 @@ export const appendDeliveryOutcome = (
     if (fs.writeSync(fd, line) !== line.length) throw new Error("Short delivery outcome append");
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
+  syncDirectoryChain(directory);
   const cutoff = day(at - 6 * 24 * 60 * 60_000);
   for (const name of fs.readdirSync(directory)) {
     if (/^\d{8}\.jsonl$/.test(name) && name.slice(0, 8) < cutoff) fs.rmSync(path.join(directory, name), { force: true });

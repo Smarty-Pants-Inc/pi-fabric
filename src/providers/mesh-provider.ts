@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -209,6 +211,11 @@ export class MeshProvider implements FabricProvider {
           topic === FABRIC_PARTICIPANT_LIFECYCLE_TOPIC
         ) {
           throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
+        }
+        if (typeof args.to === "string" && !this.participants.get(args.to, undefined, { fresh: true })) {
+          const reason = `Unknown Fabric target: ${args.to}`;
+          appendDeliveryOutcome(this.store.root, { eventId: randomUUID(), to: args.to, from: this.identity.id, mode: "publish" }, "failed", reason);
+          throw new Error(reason);
         }
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
         const publish = (text?: string) => {

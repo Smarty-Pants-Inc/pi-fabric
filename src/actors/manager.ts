@@ -1,3 +1,4 @@
+import { appendDeliveryOutcome, deliverySend, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -75,9 +76,12 @@ export interface ActorMessageBindingOptions {
   binding?: FabricActorRunBinding;
   /** Host-only ASK policy: Main's program ceiling ends observation, not accepted activation. */
   detachOnMainCeiling?: boolean;
+  outcomeSend?: DeliverySend;
 }
 
 interface ActorQueueItem {
+  outcomeSend?: DeliverySend;
+  supersededSends?: DeliverySend[];
   provenance?: FabricTurnProvenance | undefined;
   id: string;
   source: string;
@@ -2489,6 +2493,9 @@ export class ActorManager {
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
+        existing.supersededSends = [...(existing.supersededSends ?? []), ...(existing.outcomeSend ? [existing.outcomeSend] : [])];
+        if (options.outcomeSend) existing.outcomeSend = options.outcomeSend;
+        else delete existing.outcomeSend;
         existing.payload = structuredClone(payload);
         existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
@@ -2501,6 +2508,8 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
+        this.#persistQueue(actor.id);
+        this.#recordSuperseded(existing);
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -2515,6 +2524,7 @@ export class ActorManager {
     const itemId = options.id ?? randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
+      ...(options.outcomeSend ? { outcomeSend: options.outcomeSend } : {}),
       ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
       payload: structuredClone(payload),
@@ -2536,6 +2546,9 @@ export class ActorManager {
       const overflow = this.#overflow.get(actor.id) ?? [];
       if (overflow.length >= this.#overflowCap()) {
         if (options.holdWhenFull) {
+          throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
+        }
+        if (options.outcomeSend?.mode !== "publish" && options.outcomeSend) {
           throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
         }
         this.#recordDropped(actor, item, `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`);
@@ -3459,6 +3472,7 @@ export class ActorManager {
             principal: event.principal,
             message,
             delivery: kind,
+            outcomeSend: { eventId: event.id, to: target, from: event.from.id, mode: kind },
             ...(event.data === undefined ? {} : { data: event.data }),
           });
         } catch {
@@ -3479,7 +3493,8 @@ export class ActorManager {
     }
     try {
       const actor = this.#requireActor(target);
-      this.tell(actor.id, message, event.data, { provenance });
+      this.tell(actor.id, message, event.data, { provenance,
+        outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: kind } });
     } catch {
       /* target lives in another process or is unknown — best-effort drop */
     }
@@ -3541,8 +3556,9 @@ export class ActorManager {
             ...(event.verification === "mesh" || event.verification === "bridge"
               ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
             ownershipChecked: true,
+            ...(addressed ? { outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: "publish" as const } } : {}),
             // Work waits for room; the monitor offers it again (smarty-dev#754).
-            ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+            ...((addressed || event.topic.startsWith("fleet.")) ? { holdWhenFull: true } : {}),
             ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
           });
         }
@@ -4380,6 +4396,8 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
+            ...(item.outcomeSend ? { outcomeSend: item.outcomeSend } : {}),
+            ...(item.supersededSends?.length ? { supersededSends: item.supersededSends } : {}),
             activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
             principalLineageVersion: 1,
             ...(item.provenance ? { provenance: item.provenance } : {}),
@@ -4413,7 +4431,22 @@ export class ActorManager {
     return true;
   }
 
+  #recordSuperseded(item: ActorQueueItem): void {
+    const pending = item.supersededSends ?? [];
+    while (pending.length) {
+      try { appendDeliveryOutcome(this.mesh.root, pending[0]!, "superseded", "replaced by a newer message for the same key before delivery"); }
+      catch { return; }
+      pending.shift();
+    }
+    delete item.supersededSends;
+  }
+
   #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
+    this.#recordSuperseded(item);
+    if (consumed && item.outcomeSend) {
+      appendDeliveryOutcome(this.mesh.root, item.outcomeSend, "delivered", "consumed by actor inference as itself");
+      delete item.outcomeSend;
+    }
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
     const actor = this.#actors.get(actorId);
     const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
@@ -4545,6 +4578,8 @@ export class ActorManager {
       if (provenance && value.principalLineageVersion !== 1) delete provenance.principal;
       const item = {
         id: value.id,
+        ...(deliverySend(value.outcomeSend) ? { outcomeSend: deliverySend(value.outcomeSend) } : {}),
+        ...(Array.isArray(value.supersededSends) ? { supersededSends: value.supersededSends.flatMap(send => deliverySend(send) ? [deliverySend(send)!] : []) } : {}),
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
@@ -5090,7 +5125,12 @@ export class ActorManager {
         kept.set(key, item);
         continue;
       }
-      if (this.#newerEvent(item, first)) {
+      const newer = this.#newerEvent(item, first);
+      const replaced = newer ? first.outcomeSend : item.outcomeSend;
+      first.supersededSends = [...(first.supersededSends ?? []), ...(item.supersededSends ?? []), ...(replaced ? [replaced] : [])];
+      if (newer) {
+        if (item.outcomeSend) first.outcomeSend = item.outcomeSend;
+        else delete first.outcomeSend;
         first.payload = item.payload;
         first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;
@@ -5114,7 +5154,11 @@ export class ActorManager {
       else this.#overflow.delete(actor.id);
       this.#refill(actor);
     }
-    if (changed) this.#persistQueue(actor.id);
+    if (changed) {
+      this.#persistQueue(actor.id);
+      for (const item of kept.values()) this.#recordSuperseded(item);
+      this.#persistQueue(actor.id);
+    }
   }
 
   // The queue and its overflow, emptied, in run order.

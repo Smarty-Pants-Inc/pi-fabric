@@ -85,6 +85,20 @@ class DeliveredDisplayIndex {
   }
 }
 
+/** Only earlier inbox carriers count; rendering the first carrier must not hide itself. */
+const priorInboxReceipts = (entries: readonly unknown[], message: IncomingMessage): Set<string> => {
+  const seen = new Set<string>();
+  for (const raw of entries) {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") continue;
+    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
+    if (entry.details === message.details || (entry.content === message.content && at === message.timestamp)) break;
+    const ids = record(entry.details).ids;
+    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") seen.add(receipt("", "event", id));
+  }
+  return seen;
+};
+
 const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): Row[] => {
   const all = rows(message);
   if (message.customType !== "pi-fabric-inbox") return all;
@@ -93,7 +107,11 @@ const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): R
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
   // This lets mixed batches hide only duplicates, including deliveryId-only shadows.
   const boundaries = all.map(row => row.attributes.id ? receipts.indexOf(receipt("", "event", row.attributes.id)) : -1);
+  const seen = new Set<string>();
   return all.filter((row, index) => {
+    const id = row.attributes.id;
+    if (id && (seen.has(id) || delivered.has(receipt("", "event", id)))) return false;
+    if (id) seen.add(id);
     const start = boundaries[index]!;
     if (start >= 0) {
       const next = boundaries.slice(index + 1).find(value => value > start) ?? receipts.length;
@@ -101,8 +119,8 @@ const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): R
       // work key when a distinct deliveryId/messageId says this is unseen work.
       return !receipts.slice(start + 1, next).some(value => delivered.has(value));
     }
-    const { from_id: from, id, key, ref } = row.attributes;
-    return !from || ![["id", id], ["key", key], ["ref", ref]].some(([kind, value]) =>
+    const { from_id: from, id: rowId, key, ref } = row.attributes;
+    return !from || ![["id", rowId], ["key", key], ["ref", ref]].some(([kind, value]) =>
       value && delivered.has(receipt(from, kind!, value)));
   });
 };
@@ -120,7 +138,10 @@ export const registerIncomingMessageRenderers = (
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
       if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
-      const visible = unseenRows(message, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
+      const history = type === "pi-fabric-inbox" ? entries() : [];
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history) : []);
+      for (const id of priorInboxReceipts(history, message)) receipts.add(id);
+      const visible = unseenRows(message, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
       const first = visible[0]!;
       const body = Array.from(safeText(first.body));

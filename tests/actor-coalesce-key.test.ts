@@ -75,6 +75,24 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks[2]).toContain("rev-other");
   }, 30_000);
 
+  it("records targeted publishes only after inference and supersedes replaced event identities", async () => {
+    const { root, mesh, actors } = setup();
+    const actor = await actors.create({ name: "outcomes", instructions: "Review.", topics: [], coalesce: false, coalesceKey: "key" });
+    actors.tell(actor.id, "LIVE_WITH_PROGRESS");
+    await waitFor(() => actors.status(actor.id).status === "running");
+    const publish = (text: string) => mesh.publish({ topic: "work", to: actor.id, from, text, data: { key: "same" } });
+    const first = await publish("old"); await waitFor(() => actors.status(actor.id).queued === 1);
+    const second = await publish("new");
+    const directory = path.join(mesh.root, "delivery-outcomes");
+    const outcomes = () => fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+    await waitFor(() => outcomes().some(row => row.eventId === first.id));
+    expect(outcomes().map(row => [row.eventId, row.outcome])).toEqual([[first.id, "superseded"]]);
+    await waitFor(() => outcomes().some(row => row.eventId === second.id && row.outcome === "delivered"));
+    expect(outcomes().map(row => [row.eventId, row.outcome])).toEqual([[first.id, "superseded"], [second.id, "delivered"]]);
+    expect(outcomes()[1]).toMatchObject({ to: actor.id, from: from.id, mode: "publish" });
+  }, 30_000);
+
   // review/astra on #61: a ':'-joined key merged topic "work" with value "review:string:42" and
   // topic "work:string:review" with value "42", and lost the first event.
   it("never merges subjects of different topics or of different value types", async () => {

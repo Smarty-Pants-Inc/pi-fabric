@@ -40,8 +40,12 @@ export class ActorRegistryStore {
   readonly #actorRoot: string;
   readonly #writer: AtomicFileWriter;
   readonly #payloads: ActorRegistryPayloads;
+  readonly #ownProcessStart: string | undefined;
 
   constructor(actorRoot: string) {
+    // Capture immutable self identity before multi-registry acquisition, never
+    // reread it while holding the earlier fence. No work at module import.
+    this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
     this.#registryPath = path.join(actorRoot, "actors.json");
     this.#writer = new AtomicFileWriter(this.#registryPath);
@@ -128,7 +132,7 @@ export class ActorRegistryStore {
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
     const token = randomUUID();
-    const started = processStartTime(process.pid);
+    const started = this.#ownProcessStart;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
     fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
     while (true) {

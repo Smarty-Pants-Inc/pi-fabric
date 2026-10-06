@@ -448,6 +448,7 @@ export class ActorManager {
   readonly #displacedLineages = new Set<string>();
   // In-flight fenced adoption attempts, one per actor.
   readonly #adoptionPending = new Map<string, Promise<void>>();
+  readonly #adoptionRetryAt = new Map<string, number>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
@@ -4831,6 +4832,10 @@ export class ActorManager {
       this.#directoryLineages?.set(actor.rootId, alive);
     }
     if (alive) return;
+    // Live foreign lineages take the unchanged shared-read fast path above. Only
+    // a confirmed-dead orphan with a failed attempt needs per-actor clock work.
+    const retryAt = this.#adoptionRetryAt.get(actor.id);
+    if (retryAt !== undefined && Date.now() < retryAt) return;
     // Only against a disk view we are in sync with.
     if (this.#persistedRoots.get(actor.id) !== actor.rootId) return;
     // A lineage adopted this recently has a live adopter that may simply be
@@ -4851,6 +4856,8 @@ export class ActorManager {
       // Global order: actor registries (sorted path), then mesh, matching resident
       // publication and mutation. Resume invalidates death proof under the mesh
       // lock; retain both fences from the fresh recheck through custody commit.
+      // Try mesh custody without waiting under the registry fence; contention
+      // retries the WHOLE fresh check on a later ownership poll.
       const adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() => {
         // Both custody waits may outlive this owner. No mutation is authorized
         // once close begins, even when the previous lineage is provably dead.
@@ -4887,7 +4894,8 @@ export class ActorManager {
         this.#registry.write([...preserved, this.#serializedActor(actor)], { durable: true });
         this.#registryFingerprint = this.#registry.fingerprint();
         return true;
-      }));
+      }, 0));
+      this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release
       // resumes us. Do not take over queues or resync/notify a disposed owner.
       if (this.#closing) return;
@@ -4910,7 +4918,9 @@ export class ActorManager {
         }
       }
     } catch {
-      // Lock timeout or IO failure: state untouched; a later refresh retries.
+      // Lock timeout or IO failure: state untouched. Back off outside custody;
+      // the ownership refresh below must not immediately launch the same claim.
+      this.#adoptionRetryAt.set(actor.id, Date.now() + 1_000);
     } finally {
       this.#adoptionPending.delete(actor.id);
     }

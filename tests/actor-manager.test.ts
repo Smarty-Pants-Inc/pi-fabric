@@ -1,5 +1,6 @@
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -2517,6 +2518,44 @@ describe("ActorManager", () => {
     expect(created.name).toBe("via-owner-channel");
     expect(created.id).toBeTruthy();
   });
+
+  it("backs off whole adoption attempts outside registry custody while mesh is held", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "contended-orphan", instructions: "Wait.", residency: "session" });
+    await state.actors.close();
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), state.mesh.root, "3000"],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    let successor: ActorManager | undefined;
+    const registry = new ActorRegistryStore(path.join(state.root, "actors"));
+    const exclusive = state.mesh.exclusive.bind(state.mesh);
+    const attempts = vi.spyOn(state.mesh, "exclusive").mockImplementation((operation, timeout) => {
+      expect(fs.existsSync(path.join(state.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+      expect(timeout).toBe(0);
+      return exclusive(operation, timeout);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const identity: MeshIdentity = { id: "session:contended-successor", name: "main", kind: "main", sessionId: "contended-successor" };
+      successor = new ActorManager(identity.sessionId!, identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session", rootId: identity.id,
+        canManageActor: () => undefined, lineageAlive: () => false,
+      });
+      actorManagers.push(successor);
+      await waitFor(() => attempts.mock.calls.length > 0);
+      const started = performance.now();
+      await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent mutation" }))));
+      expect(performance.now() - started).toBeLessThan(1000);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(attempts).toHaveBeenCalledOnce(); // not an immediate retry storm
+      expect(registry.records()[0]!.rootId).toBe(state.identity.id);
+      expect(await exited).toBe(0);
+      await waitFor(() => successor!.owns(actor.id), 5000);
+      expect(registry.records()[0]!.rootId).toBe(identity.id);
+    } finally {
+      await exited; attempts.mockRestore(); await successor?.close();
+    }
+  }, 10000);
 
   it("settles exactly one adopter when concurrent starters race an orphan", async () => {
     const state = setup(true);

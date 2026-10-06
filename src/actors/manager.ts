@@ -20,7 +20,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -176,6 +176,8 @@ interface ManagedActor {
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
+  /** Persistent, deduplicated publication diagnostic; does not stop actor execution. */
+  presenceError?: string;
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
   ownershipAbort?: AbortController;
@@ -452,6 +454,9 @@ export class ActorManager {
   #retentionSweep: Promise<void> | undefined;
   #initialRetentionPending = true;
   readonly #pendingPresence = new Set<string>();
+  /** Residents publish both scopes through their one registry-fenced host heartbeat. */
+  readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
+  readonly #presenceRevisions = new Map<string, object>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -493,6 +498,7 @@ export class ActorManager {
   readonly #resetMessages = new WeakSet<ManagedActor>();
   #registrySaveTimer: NodeJS.Timeout | undefined;
   #registrySavePending: Promise<void> | undefined;
+  #registrySaveDurable = false;
   #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
 
@@ -530,6 +536,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Host publication/lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
+      /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
+      presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -578,6 +586,7 @@ export class ActorManager {
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
+    this.#presencePublisher = options.presencePublisher;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -757,20 +766,7 @@ export class ActorManager {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
-    // Fence after async validation/model preparation, before even predecessor removal.
-    await beforeCommit?.(id);
-    // The async directory/predecessor hook may outlive cancellation. The local
-    // invocation fence must run synchronously next to each persistent effect.
-    checkActive?.();
-    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
-    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
-    checkActive?.();
-    // Local creation commits here: directory creation and runnable/subscribed insertion
-    // cannot yield before the caller has registered the actual ID's cancellation outcome.
-    // Preserve the pre-commit fences above, including an awaited predecessor removal.
-    onCommit?.(id);
     const actorDirectory = path.join(this.#actorRoot, id);
-    fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {
       id,
       name,
@@ -812,6 +808,15 @@ export class ActorManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    // Validate the complete public value before any directory, predecessor or registry effect.
+    this.#assertPresenceValue(this.#publicInfo(actor, false));
+    await beforeCommit?.(id);
+    checkActive?.();
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
+    checkActive?.();
+    // Receipt registration and insertion cannot yield after the cancellation fence.
+    onCommit?.(id);
+    fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     this.#actors.set(id, actor);
     this.#locallyCreated.add(id);
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
@@ -849,6 +854,47 @@ export class ActorManager {
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor));
+  }
+
+  /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
+  hasActiveDurableActor(): boolean {
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    return [...this.#actors.values()].some(actor =>
+      this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped");
+  }
+
+  /** Called inside the host's registry -> mesh publication fence, without an await. */
+  presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void } {
+    this.#syncActorsFromRegistry();
+    return this.#withOwnershipRead(() => {
+      const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
+      const ids = new Set(pending.keys());
+      if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
+      const ops: MeshBatchOperation[] = [];
+      for (const id of ids) {
+        const actor = this.#actors.get(id);
+        if (actor) {
+          if (this.#ownershipDecision(id)) {
+            const value = this.#presenceValue(actor);
+            if (value) ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+          }
+        } else {
+          const fence = this.#orphanPresence.get(id);
+          ops.push({ kind: "delete", key: this.#presenceKey(id),
+            ...(fence !== undefined ? { ifVersion: fence, onConflict: "skip" as const } : {}) });
+        }
+      }
+      return { ops, committed: () => {
+        for (const [id, revision] of pending) {
+          // A mutation while the shared write waited belongs to the next refresh.
+          if (this.#presenceRevisions.get(id) !== revision) continue;
+          this.#pendingPresence.delete(id);
+          this.#presenceRevisions.delete(id);
+          this.#orphanPresence.delete(id);
+        }
+      } };
+    });
   }
 
   async cede(id: string): Promise<FabricActorInfo> {
@@ -944,6 +990,22 @@ export class ActorManager {
       if (fallback) await this.#resolvedModel(actor.runner, fallback, actor.routeClass !== undefined);
       else await this.agents.prepareModelForAdmission(undefined, actor.runner);
     }
+    // Validate both the effective view and duplicated binding/default metadata before commit.
+    const preview = scope === "project"
+      ? this.#presencePreview(actor, { model: resolved, modelReason: resolved ? modelReason : undefined })
+      : this.#publicInfo(actor, false);
+    if (scope === "session") {
+      const effectiveModel = resolved ?? actor.model;
+      if (effectiveModel) preview.model = effectiveModel; else delete preview.model;
+      const reason = resolved ? modelReason : actor.modelReason;
+      if (reason !== undefined) preview.modelReason = reason; else delete preview.modelReason;
+      const binding: NonNullable<FabricActorInfo["binding"]> = { ...preview.binding!, updatedAt: Date.now() };
+      if (resolved) binding.model = resolved; else delete binding.model;
+      if (resolved && modelReason !== undefined) binding.modelReason = modelReason; else delete binding.modelReason;
+      if (!binding.model && !binding.thinking) delete binding.updatedAt;
+      preview.binding = binding;
+    }
+    this.#assertPresenceValue(preview);
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
       await this.#bindings.setModel(actor.id, resolved, beforeCommit, modelReason);
@@ -981,11 +1043,20 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
+      const preview = this.#publicInfo(actor, false);
+      const thinking = next ?? actor.thinking;
+      if (thinking) preview.thinking = thinking; else delete preview.thinking;
+      const binding: NonNullable<FabricActorInfo["binding"]> = { ...preview.binding!, updatedAt: Date.now() };
+      if (next) binding.thinking = next; else delete binding.thinking;
+      if (!binding.model && !binding.thinking) delete binding.updatedAt;
+      preview.binding = binding;
+      this.#assertPresenceValue(preview);
       await this.#bindings.setThinking(actor.id, next, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    this.#assertPresenceValue(this.#presencePreview(actor, { thinking: next }));
     beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
@@ -1004,6 +1075,7 @@ export class ActorManager {
   async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    this.#assertPresenceValue(this.#presencePreview(actor, { tools: next }));
     beforeCommit?.(actor.id);
     actor.tools = next;
     actor.updatedAt = Date.now();
@@ -1016,6 +1088,7 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
+    this.#assertPresenceValue(this.#presencePreview(actor, { inferenceContext }));
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor, true);
@@ -1026,6 +1099,7 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     const parsed = parseAgentNice(nice);
     if (parsed === undefined) throw new Error("nice is required");
+    this.#assertPresenceValue(this.#presencePreview(actor, { nice: parsed }));
     actor.nice = parsed;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor, true);
@@ -1034,6 +1108,7 @@ export class ActorManager {
   /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
   async setCoalesceKey(id: string, coalesceKey: string | null): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertPresenceValue(this.#presencePreview(actor, { coalesceKey: coalesceKey ?? undefined }));
     if (coalesceKey === null) delete actor.coalesceKey;
     else {
       validateActorCoalesceKey(coalesceKey);
@@ -1053,6 +1128,9 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
     if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
+    this.#assertPresenceValue(this.#presencePreview(actor, { activationFilter: filter.length ? filter : undefined,
+      invalidActivationFilter: undefined, activationFilterExpiresAt: filter.length ? expiresAt : undefined,
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } }));
     beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
@@ -1078,6 +1156,7 @@ export class ActorManager {
     for (const event of next) {
       if (!HOST_EVENTS.has(event)) throw new Error(`Unsupported Fabric actor event: ${event}`);
     }
+    this.#assertPresenceValue(this.#presencePreview(actor, { events: next }));
     actor.events = next;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor, true);
@@ -1095,6 +1174,7 @@ export class ActorManager {
   ): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const policy = resolveActorDeliveryPolicy(delivery, triggerTurn);
+    this.#assertPresenceValue(this.#presencePreview(actor, policy));
     actor.delivery = policy.delivery;
     actor.triggerTurn = policy.triggerTurn;
     actor.updatedAt = Date.now();
@@ -1285,6 +1365,7 @@ export class ActorManager {
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    this.#assertPresenceValue(this.#presencePreview(actor, { instructions }));
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
@@ -3610,7 +3691,63 @@ export class ActorManager {
     return this.#notifications.enqueue(() => this.mesh.publish(request));
   }
 
+  #presencePreview(actor: ManagedActor, changes: { [K in keyof ManagedActor]?: ManagedActor[K] | undefined }): FabricActorInfo {
+    // Preserve accessor descriptors: spreading an actor would eagerly load its journal.
+    const preview = Object.create(Object.getPrototypeOf(actor), Object.getOwnPropertyDescriptors(actor)) as ManagedActor;
+    Object.assign(preview, { updatedAt: Date.now() }, changes);
+    const history = this.#lazyMessages.get(actor);
+    if (history) this.#lazyMessages.set(preview, history);
+    for (const key of Object.keys(changes) as Array<keyof ManagedActor>) {
+      if (changes[key] === undefined) delete preview[key];
+    }
+    return this.#publicInfo(preview, false);
+  }
+
+  #assertPresenceValue(value: FabricActorInfo): void {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new Error("Actor presence must be JSON-serializable");
+    if (Buffer.byteLength(serialized, "utf8") > this.mesh.maxEventBytes) {
+      throw new Error(`Actor presence exceeds ${this.mesh.maxEventBytes} bytes; reduce actor metadata`);
+    }
+  }
+
+  /** Permanent actor-local publication failures must never poison the shared heartbeat. */
+  #presenceValue(actor: ManagedActor): FabricActorInfo | undefined {
+    let value: FabricActorInfo;
+    try {
+      // Exclude our own diagnostic so a repaired value can fit again.
+      value = this.#publicInfo(actor, false);
+      this.#assertPresenceValue(value);
+    } catch (error) {
+      const diagnostic = `Actor presence omitted: ${error instanceof Error ? error.message : String(error)}`;
+      if (actor.presenceError !== diagnostic) {
+        actor.presenceError = diagnostic;
+        this.#scheduleRegistrySave(true);
+        this.#emitChange();
+        console.warn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+      }
+      return undefined;
+    }
+    if (actor.presenceError) {
+      delete actor.presenceError;
+      this.#scheduleRegistrySave(true);
+      this.#emitChange();
+    }
+    return value;
+  }
+
   async #writePresenceNow(id: string): Promise<void> {
+    if (this.#presencePublisher) {
+      this.#pendingPresence.add(id);
+      this.#presenceRevisions.set(id, {});
+      try { await this.#presencePublisher.refresh(); }
+      catch (error) {
+        // The failed acquisition wrote nothing. The host's next heartbeat carries
+        // every pending id, with no per-actor timer, extra retry, or warning storm.
+        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
       retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
@@ -3629,7 +3766,9 @@ export class ActorManager {
     const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
-        await this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+        const value = this.#presenceValue(actor);
+        if (value) await this.mesh.put({ key: this.#presenceKey(id), value, identity: this.identity });
+        // An omitted permanent failure is settled, not a per-actor retry obligation.
       } else {
         await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
       }
@@ -3650,6 +3789,10 @@ export class ActorManager {
   }
 
   #schedulePresenceRetry(): void {
+    if (this.#presencePublisher) {
+      if (!this.#closing && this.#pendingPresence.size > 0) this.#presencePublisher.schedule();
+      return;
+    }
     if (this.#presenceTimer || this.#closing || this.#pendingPresence.size === 0) return;
     this.#presenceTimer = setTimeout(() => {
       this.#presenceTimer = undefined;
@@ -3753,6 +3896,7 @@ export class ActorManager {
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
       ...(actor.removal ? { removal: actor.removal } : {}),
+      ...(actor.presenceError ? { presenceError: actor.presenceError } : {}),
     };
   }
 
@@ -3793,15 +3937,18 @@ export class ActorManager {
       ({ ...record, stopped: status === "stopped" })));
   }
 
-  #scheduleRegistrySave(): void {
+  #scheduleRegistrySave(durable = false): void {
+    this.#registrySaveDurable ||= durable;
     if (this.#registrySaveTimer || this.#closing) return;
     this.#registrySaveTimer = setTimeout(() => {
       this.#registrySaveTimer = undefined;
-      this.#registrySavePending = this.#saveActors(new Set(), { flush: true }).catch((error) => {
+      const durable = this.#registrySaveDurable;
+      this.#registrySaveDurable = false;
+      this.#registrySavePending = this.#saveActors(new Set(), { flush: true, durable }).catch((error) => {
         console.warn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
         // Preserve dirty state and retry after the same bounded window.
         this.#lastRegistrySaveAt = Date.now();
-        this.#scheduleRegistrySave();
+        this.#scheduleRegistrySave(durable);
       }).finally(() => { this.#registrySavePending = undefined; });
     }, Math.max(1, 5_000 - (Date.now() - this.#lastRegistrySaveAt)));
     this.#registrySaveTimer.unref?.();
@@ -3846,6 +3993,8 @@ export class ActorManager {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
   }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
+    // Diagnostic changes share the bounded save, but require the durable write barrier.
+    if (this.#registrySaveDurable) options = { ...options, durable: true };
     if (removedIds.size === 0 && !options?.durable && !options?.requiredActor && this.#savedActors) {
       const owned = [...this.#actors.values()].filter((actor) =>
         !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
@@ -3884,7 +4033,8 @@ export class ActorManager {
       const actors = [...preserved, ...rows.map((row, index) => ({ ...row,
         registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
       }))];
-      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
+      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable });
+      this.#registrySaveDurable = false;
       this.#registryFingerprint = this.#registry.fingerprint();
       for (const actor of owned) {
         this.#unarchivedMessages.delete(actor);
@@ -4125,6 +4275,7 @@ export class ActorManager {
         messages: [],
         createdAt: record.createdAt,
         updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
+        ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
@@ -4487,7 +4638,7 @@ export class ActorManager {
     };
   }
 
-  #publicInfo(actor: ManagedActor): FabricActorInfo {
+  #publicInfo(actor: ManagedActor, includePresenceError = true): FabricActorInfo {
     const session = this.#bindings.get(actor.id);
     const effective = this.#runBinding(actor);
     return {
@@ -4575,7 +4726,8 @@ export class ActorManager {
       ...(actor.removal
         ? { removal: { ...actor.removal, state: this.#removalState(actor) } }
         : {}),
-      ...(actor.lastError ? { lastError: actor.lastError } : {}),
+      ...(includePresenceError && actor.presenceError
+        ? { lastError: actor.presenceError } : actor.lastError ? { lastError: actor.lastError } : {}),
       sessionFile: actor.sessionFile,
       logDir: path.join(path.dirname(actor.sessionFile), "runs"),
     };

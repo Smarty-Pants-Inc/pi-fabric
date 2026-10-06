@@ -758,6 +758,8 @@ export class AgentManager {
     readonly config: FabricAgentConfig,
     options: {
       workerPath?: string;
+      /** Opt-in host-only live placement; managed hosts keep their sealed policy. */
+      placementConfigPath?: string;
       /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
       sweepPath?: string;
       fabricExtensionPath?: string;
@@ -852,7 +854,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice, config.placement),
+      new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),

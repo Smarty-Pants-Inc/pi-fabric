@@ -1,4 +1,5 @@
 import type { ExtensionRunner, RegisteredTool, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { throwIfAborted } from "../async-settlement.js";
 
 // Local mirror of wrapRegisteredTool/wrapToolDefinition (pi 0.84.2,
 // core/extensions/wrapper.js and core/tools/tool-definition-wrapper.js).
@@ -56,8 +57,13 @@ export const wrapRegisteredToolForCapture = (
   return {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate, ctx): Promise<any> => {
+      const invocationSignal = signal as AbortSignal | undefined;
+      throwIfAborted(invocationSignal);
       const activeBefore = runner.getActiveTools();
       const result = await execute(toolCallId, params, signal, onUpdate, ctx);
+      // A browser/process tool can settle after reload canceled its caller. Never
+      // read the retired runner or merge its tools into a successor (#5962).
+      throwIfAborted(invocationSignal);
       const activeAfter = runner.getActiveTools();
       const activeAfterNames = new Set(activeAfter);
       const removedToolNames = activeBefore.filter((name) => !activeAfterNames.has(name));

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { runAbortable, throwIfAborted } from "../async-settlement.js";
+import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
@@ -94,9 +94,14 @@ export class CapturedToolsProvider implements FabricProvider {
     "Tools captured from other Pi extensions and invoked lazily through Fabric";
 
   readonly #scheduler = new CapturedToolScheduler();
+  readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
   constructor(readonly catalog: CapturedToolCatalog) {}
+
+  async close(): Promise<void> {
+    this.#lifetime.abort(new Error("Captured extension tool session closed"));
+  }
 
   async list(
     request: FabricProviderListRequest,
@@ -138,6 +143,12 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<CapturedToolInvocationResult> {
     this.#assertAllowed(actionName);
+    // Include provider custody even for host-direct calls without a turn signal.
+    // Queued work and non-cooperative late results cannot use a retired runner.
+    context = { ...context, signal: shareCancellationEffects(AbortSignal.any([
+      this.#lifetime.signal, ...(context.signal ? [context.signal] : []),
+    ]), context.signal) };
+    throwIfAborted(context.signal);
     const entry = this.catalog.require(actionName);
     return this.#scheduler.run(entry.definition.executionMode, () =>
       runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),

@@ -67,7 +67,8 @@ describe("CapturedToolsProvider", () => {
       code: 'await tools.call({ ref: "extensions.screenshot", args: {} }); await tools.call({ ref: "extensions.screenshot", args: {} }); return "done";',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+      tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+    } as unknown as import("@earendil-works/pi-coding-agent").ExtensionToolContext);
     expect(output).not.toMatchObject({ isError: true });
     expect(output.content.filter((part) => part.type === "image")).toEqual([finalImage, finalImage]);
     vi.mocked(runner.emitToolResult).mockResolvedValueOnce({ content: [text, finalImage], isError: true });
@@ -75,7 +76,8 @@ describe("CapturedToolsProvider", () => {
       code: 'return await tools.call({ ref: "extensions.screenshot", args: {} });',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+      tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+    } as unknown as import("@earendil-works/pi-coding-agent").ExtensionToolContext);
     expect(failedOutput).toMatchObject({ isError: true });
     expect(failedOutput.content.filter((part) => part.type === "image")).toEqual([finalImage]);
   });
@@ -159,6 +161,8 @@ describe("CapturedToolsProvider", () => {
       expect.objectContaining({ ref: "extensions.compat_tool", risk: "execute" }),
       // The trusted interceptor changes its private invocation copy, not the approval record.
       { value: "hello" },
+      // A9 carries registry-effective cancellation into every approval hook.
+      expect.any(AbortSignal),
     );
     expect(context.update).toHaveBeenCalledWith("compat_tool: halfway");
     expect(lifecycleEvents).toEqual([

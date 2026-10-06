@@ -24,7 +24,7 @@ describe.runIf(process.env.FABRIC_754_REAL_CLI === "1")("compiled Fabric public 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cli-754-"));
     const clients: RpcClient[] = [];
     let bridge: ChildProcess | undefined;
-    let prompt: Promise<void> | undefined;
+    let prompt: ReturnType<RpcClient["prompt"]> | undefined;
     let bridgeLog = "";
     const records: Record<string, RpcAgentSessionEvent[]> = { receiver: [], sender: [] };
     const entries: Record<string, unknown> = {};
@@ -105,7 +105,9 @@ describe.runIf(process.env.FABRIC_754_REAL_CLI === "1")("compiled Fabric public 
         await send("checksum correction");
         release("tool");
       }
-      await prompt; // RpcClient.prompt discards the RPC success/error envelope; verify admission below.
+      const disposition = await prompt;
+      if (mode === "handled") expect(disposition).toBe("handled");
+      if (mode === "success") expect(disposition).toBe("started");
       // Handled/invalid input has NO turn_end/settle to rescue admission. With no extra input or
       // deliveries, the acknowledged HANDOFF must cause its own receiving run.
       await wait(() => records.receiver!.some(event => event.type === "agent_settled"));

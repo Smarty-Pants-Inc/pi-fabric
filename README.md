@@ -1,20 +1,25 @@
 <div align="center">
 
-# 🧵 pi-fabric
+<p>
+  <img src="https://raw.githubusercontent.com/fabric-runtime/pi-fabric/main/media/opencollective/fabric-runtime/fa-avatar.png" alt="Pi Fabric logo" width="96" height="96">
+</p>
+
+# pi-fabric
 
 **A programmable tool and agent runtime for [Pi](https://github.com/earendil-works/pi-coding-agent)**
 
 _One program for tools, MCP, agents, workflows, actors, mesh, councils, and recursion._
 
 <p>
-  <img src="https://raw.githubusercontent.com/monotykamary/pi-fabric/main/media/banner.svg" alt="Animated banner: one checked TypeScript program weaving pi core tools, MCP servers, agents, and mesh into a single result" width="100%">
+  <img src="https://raw.githubusercontent.com/fabric-runtime/pi-fabric/main/media/banner.svg" alt="Animated banner: one checked TypeScript program weaving pi core tools, MCP servers, agents, and mesh into a single result" width="100%">
 </p>
 
 [![npm version](https://img.shields.io/npm/v/pi-fabric?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/pi-fabric)
 [![ARC-AGI-3 scorecard](https://img.shields.io/badge/ARC--AGI--3-100%25%20across%2025%20envs-16a34a?style=for-the-badge)](https://arcprize.org/scorecards/d4c56c67-136b-4643-b648-62ae28fe2a54)
-[![checks](https://img.shields.io/github/actions/workflow/status/monotykamary/pi-fabric/test.yml?branch=main&style=for-the-badge&label=checks)](https://github.com/monotykamary/pi-fabric/actions/workflows/test.yml)
+[![checks](https://img.shields.io/github/actions/workflow/status/fabric-runtime/pi-fabric/test.yml?branch=main&style=for-the-badge&label=checks)](https://github.com/fabric-runtime/pi-fabric/actions/workflows/test.yml)
 [![pi extension](https://img.shields.io/badge/pi-extension-8b5cf6?style=for-the-badge)](https://github.com/earendil-works/pi-coding-agent)
 [![license](https://img.shields.io/badge/license-MIT-f4c430?style=for-the-badge)](LICENSE)
+[![Open Collective](https://img.shields.io/badge/Open_Collective-support-151515?style=for-the-badge&logo=opencollective&logoColor=white)](https://opencollective.com/pi-fabric)
 
 <p align="center">
   🏆 <strong><a href="https://arcprize.org/scorecards/d4c56c67-136b-4643-b648-62ae28fe2a54">100% on ARC-AGI-3</a></strong>. A Fabric-powered agent won <strong>all 25 environments</strong> in one 22.4-hour session with 4 minutes of human time ($1,349 in model spend).
@@ -67,9 +72,19 @@ To select Python, put this in `~/.pi/agent/fabric.json` or a trusted project's `
 
 Python defaults to [Monty](https://github.com/pydantic/monty), a sandboxed Python subset with VM resource limits and no ambient filesystem, network, or process access. It is **not CPython**: arbitrary imports, third-party packages, and some Python features are unavailable. Full **CPython 3.10+** requires explicit `executor.pythonRuntime: "cpython"` and runs trusted native code with full OS privileges outside schema enforce, like TypeScript's Node/Bun escape hatches. CPython enforcement additionally requires macOS `sandbox-exec` or Linux `bwrap`, failing closed without isolation. Missing Monty dependencies never trigger a native fallback. `executor.runtime` only affects TypeScript. See [the kernel guide](docs/kernels.md).
 
+Pi's native MCP can optionally supply selected servers beneath the same Fabric API: set `mcp.nativeServers` to exact server names already configured in Pi. Other servers stay on mcporter; failed native calls never switch transports. See [MCP ownership and compatibility](docs/configuration.md#opt-in-pi-owned-servers).
+
 ## Install
 
-Requires Node.js 24+ and Pi 0.80.6+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric also checks a detectable Pi host version at startup and warns when an older host may ignore continuation APIs such as actor `triggerTurn`.
+Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric warns when a detectable host is older than the required native loadout and nested-execution contracts.
+
+**0.103.1: Pi 1.0 compatibility.** Full-code and Schema enforce loadouts own declarations through native `prepareLoadout`, including built-in codemode, tool search, MCP, late activation, and reload. Captured dispatch and core overrides retain native middleware; capture patches restore on the final shutdown lease without recursive wrapping. Run `bun run test:pi1` for public-contract, compiled SDK, and bundled-CLI regressions. Optional/audit mode retains the host loadout.
+
+**0.103.0: daemon primitives.** Headless, restart-safe sessions get small composable building blocks: a [runner contract](docs/agents.md#custom-runners) with hosted runs that persist a locator before start and never relaunch (`pi-fabric/runners`); durable [decisions](docs/decisions.md) with escalation chains, headless approvals, and routed child dialogs; mesh timers, scoped external grants, and the `pi-fabric` CLI; [saved programs](docs/programs.md) with host-invoked runs; host-issued principal and scope (`pi-fabric/scope`) that children only narrow; write confinement, context-inheriting spawn, and worktree results; provider participants, a foreground-tool policy, compaction pressure and carry-forward focus, [thinking control](docs/thinking.md), heartbeat liveness across PID namespaces, and incarnation-fenced control commands. New behavior is opt-in or additive. A configured `agents.runner` id that no extension registers is kept and warned about once per session, without falling back to `pi`.
+
+**0.102.0: opt-in Pi-owned MCP.** Select native servers with `mcp.nativeServers` while keeping Fabric's API, policy pipeline, names/descriptions, and result normalization. Existing defaults remain unchanged. Native identities are indexed by registration snapshot, with live exposure and schema checks; SDK reload and settings-save guards are included.
+
+**0.101.1: Pi 0.99 compatibility.** Full-code and Schema enforce modes declare only `fabric_exec`, including with native codemode, tool search, MCP, late registrations, and active-tool changes. Captured tools remain available as `extensions.<name>(...)` inside Fabric, with host middleware applied. Pi packages and TypeBox are host-supplied peers, never bundled. The same compiled package also passes an isolated Pi 0.99.1 SDK/CLI gate; development pins at that release were 0.99.0.
 
 ```bash
 pi install npm:pi-fabric
@@ -81,14 +96,14 @@ pi install npm:pi-fabric
 From GitHub:
 
 ```bash
-pi install git:github.com/monotykamary/pi-fabric
+pi install git:github.com/fabric-runtime/pi-fabric
 ```
 
 From a local checkout:
 
 ```bash
-pnpm install
-pnpm build
+bun install
+bun run build
 pi install /absolute/path/to/pi-fabric
 ```
 
@@ -117,6 +132,7 @@ Pi loads advanced patterns after direct user invocation. Run `/skill:fabric-guid
 | Multi-model compare-not-merge deliberation or act mode | `/skill:fabric-fusion Deliberate this design across models.` |
 | One command that chooses advisor or supervisor | `/skill:fabric-ambient advisor Focus on migration correctness.` |
 | A durable team coordinating through versioned tasks | `/skill:fabric-swarm Coordinate this migration across owned task partitions.` |
+| A step graph that survives restarts, with human approval nodes | `/skill:fabric-graph Run fetch, test, and an approval gate before release as a resumable graph.` |
 | Evidence-gated edits with postconditions | `/skill:fabric-schema Make this parser change only if focused tests stay green.` |
 | Typed semantic judgments or bounded reactive loops | `/skill:fabric-jev Build a ticket triage loop with an explicit review path and evaluation budget.` |
 
@@ -150,6 +166,10 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Execution kernels](docs/kernels.md): exclusive TypeScript/Python selection, Monty sandboxing, CPython escape hatch, agent inheritance, and examples.
 - [Prompt cache](docs/prompt-cache.md): honest cache observations and optional, time-bounded native warming leases.
 - [Records](docs/records.md): the org's append-only record in its own PostgreSQL, with idempotent appends, cursor reads, mesh nudges and archive admission.
+- [Thinking control](docs/thinking.md): scoped host-session reasoning effort with configured bounds that children inherit and never widen.
+- [Optional durable Pi runner](docs/durable-pi.md): explicit hosted-backend registration, persistent submissions, recovery boundaries, and unchanged default runner behavior.
+- [Durable decisions](docs/decisions.md): pending approvals and questions in the project mesh, headless approvals, routed child dialogs, `/fabric decisions`, and the `pi-fabric decisions` CLI.
+- [Saved programs](docs/programs.md): content-addressed programs, nested `programs.run` with the caller's capabilities, `/fabric programs`, and host runs through `/fabric run` or an event.
 - [Memory & recall](docs/memory-recall.md): compact ranked hits, uniform follow calls, lossless expansion, and guest-local `memory.walk` computation.
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
 - [Shadow task model routing](docs/model-routing.md): opt-in `model: "auto"`, required role pins, decision/outcome ledger, and provider attribution (never changes the launched model).
@@ -171,10 +191,10 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 ## Development
 
 ```bash
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm build
+bun install
+bun run check:fast
+bun run test:smoke
+bun run build
 ```
 
 The test suite covers:
@@ -185,6 +205,23 @@ The test suite covers:
 - workflows, durable mesh state, actor mailboxes, subscriptions, and actor restoration
 
 Claude and Veda fixtures use local test processes with zero billable requests.
+
+## Support Pi Fabric
+
+If Fabric helps you build or run agent workflows, consider [supporting the project on Open Collective](https://opencollective.com/pi-fabric). Contributions help fund maintenance, bug fixes, documentation, testing infrastructure, and model/API costs for integration testing and reproducible evaluations.
+
+| Contribution | Monthly support | Helps sustain |
+| --- | --- | --- |
+| Backer | From $5 USD | Everyday maintenance and documentation |
+| Supporter | $25 USD | Integration tests and reproducible evaluations |
+| Sponsor | From $100 USD | Long-term development and project infrastructure |
+| Custom donation | Any amount, one-time or recurring | The work that needs it most |
+
+[Contribute →](https://opencollective.com/pi-fabric/contribute) · [View finances and contributors](https://opencollective.com/pi-fabric)
+
+Contributions are voluntary support, not a purchase of priority support, feature delivery, or influence over the roadmap. The collective page shows current fiscal-host status, available contribution options, and financial contributors.
+
+Code, documentation, bug reports, and examples are just as welcome. Thank you to everyone helping keep Fabric open and sustainable.
 
 ## Acknowledgments
 

@@ -177,7 +177,9 @@ const targetForParticipant = (
   parentId: string | undefined,
 ): FabricConversationTarget => {
   const kind =
-    participant.kind === "agent" ? "agent" : participant.kind === "actor" ? "actor" : "peer";
+    participant.kind === "agent" || participant.kind === "provider"
+      ? "agent"
+      : participant.kind === "actor" ? "actor" : "peer";
   return {
     id: participant.id,
     name: participant.name,
@@ -191,7 +193,7 @@ const targetForParticipant = (
     updatedAt: participant.updatedAt,
     ...eligibilityFor({
       status: participant.status,
-      runner: participant.runner,
+      runner: participant.runner ?? "",
       caps: [...participant.capabilities],
       ...(participant.stale ? { stale: true } : {}),
       gateVeda: participant.kind === "agent",

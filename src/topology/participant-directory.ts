@@ -125,10 +125,18 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const participantKind = (value: unknown): FabricParticipantKind | undefined =>
-  value === "root" || value === "agent" || value === "actor" ? value : undefined;
+  value === "root" || value === "agent" || value === "actor" || value === "provider"
+    ? value
+    : undefined;
+
+// Inlined RUNNER_ID_PATTERN (src/agents/runner-registry.ts).
+const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const isRunnerId = (value: unknown): value is string =>
+  typeof value === "string" && value.length <= 64 && RUNNER_ID_PATTERN.test(value);
 
 const transports = new Set([
   "host",
+  "hosted",
   "auto",
   "process",
   "tmux",
@@ -191,9 +199,15 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     typeof value.ownerHostId !== "string" ||
     typeof value.ownerIdentityId !== "string" ||
     entry.updatedBy.id !== value.ownerIdentityId ||
+    (value.ownerIncarnation !== undefined &&
+      (typeof value.ownerIncarnation !== "string" ||
+        value.ownerIncarnation.length === 0 ||
+        value.ownerIncarnation.length > 128)) ||
     typeof value.name !== "string" ||
     typeof value.status !== "string" ||
-    (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
+    (kind === "provider"
+      ? value.runner !== undefined || typeof value.provider !== "string"
+      : !isRunnerId(value.runner)) ||
     typeof value.transport !== "string" ||
     !transports.has(value.transport) ||
     !Array.isArray(value.capabilities) ||
@@ -335,7 +349,7 @@ const legacyActorFromEntry = (
   if (
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
-    (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
+    !isRunnerId(value.runner) ||
     typeof value.status !== "string"
   ) {
     return undefined;
@@ -401,6 +415,8 @@ export interface ParticipantDirectoryOptions {
   onRootCollision?: (collision: FabricRootCollision) => void;
   selfOwnerHostId?: string;
   selfOwnerIdentityId?: string;
+  /** This host's control-plane incarnation, stamped on every record it writes. */
+  ownerIncarnation?: string;
   heartbeatMs?: number;
   leaseMs?: number;
   /** Resolution-only grace; clock/lock/sleep injection keeps contention tests deterministic. */
@@ -1258,6 +1274,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       ownerHostId: this.options.selfOwnerHostId ?? this.options.hostId,
       ownerIdentityId: this.options.selfOwnerIdentityId ?? this.options.identity.id,
+      ...(!this.options.selfOwnerHostId && this.options.ownerIncarnation
+        ? { ownerIncarnation: this.options.ownerIncarnation }
+        : {}),
       ...(kind === "root" ? {} : { parentId: this.options.rootId }),
       name: this.options.identity.name,
       status: "running",
@@ -1298,6 +1317,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
+      ...(this.options.ownerIncarnation ? { ownerIncarnation: this.options.ownerIncarnation } : {}),
       name: rootParticipantName(sessionName),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
@@ -1416,14 +1436,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const desired = new Map<string, FabricParticipantRecord>();
     for (const source of this.#sources) {
       for (const candidate of source()) {
-        const { task: _task, text: _text, error: _error, ...operational } = candidate as
+        const {
+          task: _task,
+          text: _text,
+          error: _error,
+          ownerIncarnation: _incarnation,
+          ...operational
+        } = candidate as
           FabricParticipantRecord & { task?: unknown; text?: unknown; error?: unknown };
         const record: FabricParticipantRecord = {
           ...operational,
           format: 1,
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
-          // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
+          ...(this.options.ownerIncarnation ? { ownerIncarnation: this.options.ownerIncarnation } : {}),
+          // Reload retains its bounded lease; terminal quiescence advertises no capabilities.
           ...(this.#quiescing
             ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId
               ? { status: "reloading", reloadUntil: this.#reloadUntil }

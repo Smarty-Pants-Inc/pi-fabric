@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
+import { liveOwnerPid, observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -299,7 +299,8 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   };
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
-    const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
+    const live = owner ? (owner.identity ? liveOwnerPid(path.join(root, "owner.json")) :
+      residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined) : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }

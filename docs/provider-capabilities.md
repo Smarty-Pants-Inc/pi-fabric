@@ -167,6 +167,28 @@ and managed or third-party implementations retain their native authority.
 See [verified policy kernels](verified-kernels.md) for additional subsystem laws
 and their precise host assumptions.
 
+### Principal and scope
+
+The host-issued [principal and scope](providers.md#principal-and-scope) is trusted
+host adapter code in `src/scope.ts`. No Bend kernel checks it. Grammar parsing,
+digest canonicalization, issuance sealing, registry injection, child derivation and
+cache keying are tested JavaScript. Capability views and scopes are independent: a
+view limits which actions a caller can dispatch, and a scope tells providers which
+resources the principal may touch. Fabric does not intersect them, and a provider that
+ignores `context.scope` keeps its native authority.
+
+### Future verified extension
+
+A verified version would add a scope reducer beside the authority kernel and prove
+a narrowing law: for every derived scope `C` of parent `P`, every grant in `C` is
+covered by one grant in `P` (resource-pattern subset under the `/*` and `/**` rules
+and action subset), `C.principal = P.principal`, and `C.parentDigest = P.digest`.
+Then every resource-action pair `C` allows, `P` also allows, transitively along the
+lineage. A positive completeness law would show that every covered request is accepted.
+The pattern-cover relation and the canonical digest codec would remain the reviewed
+specification boundary. Until then, these properties hold only for the host
+implementation and its tests.
+
 ## Checks and performance
 
 Use targeted checks, never the full suite:
@@ -186,7 +208,7 @@ bun run benchmark:provider-dispatch
 bun run benchmark:startup . ../pi-fovea ../pi-contour
 ```
 
-The contributor toolchain pins Bend 2.0.26. `BEND_BIN` can select a trusted
+The contributor toolchain pins Bend 2.0.35. `BEND_BIN` can select a trusted
 compiler executable. Normal builds verify artifact hashes without Bend.
 
 The dispatch benchmark measures first use and warm full-registry read calls

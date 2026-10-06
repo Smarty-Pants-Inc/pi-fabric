@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutoCompactionTrigger } from "../compaction/threshold.js";
 import {
   compactionRequestBoundsError,
   encodeCompactionRequest,
@@ -45,9 +46,18 @@ export interface CompactLastCommit {
   error?: string;
 }
 
+// Host-initiated compaction at a settled boundary: the output-reserve
+// headroom trigger or a configured model threshold.
+export interface CompactAutoTrigger {
+  at: number;
+  trigger: AutoCompactionTrigger;
+  committed: boolean;
+}
+
 export interface CompactStatus {
   pending?: CompactPendingIntent;
   last?: CompactLastCommit;
+  lastAuto?: CompactAutoTrigger;
 }
 
 export interface CompactControllerHooks {
@@ -90,6 +100,7 @@ const checkedPreserve = (value: unknown): string[] | undefined => {
 export class CompactController {
   #pending: CompactPendingIntent | undefined;
   #last: CompactLastCommit | undefined;
+  #lastAuto: CompactAutoTrigger | undefined;
   #inFlight: Promise<void> | undefined;
   readonly #hooks: CompactControllerHooks;
 
@@ -126,10 +137,16 @@ export class CompactController {
     this.#pending = undefined;
   }
 
+  // Recorded by the host after a threshold or headroom compaction attempt.
+  noteAutoCompaction(trigger: AutoCompactionTrigger, committed: boolean): void {
+    this.#lastAuto = { at: Date.now(), trigger, committed };
+  }
+
   status(): CompactStatus {
     return {
       ...(this.#pending ? { pending: this.#pending } : {}),
       ...(this.#last ? { last: this.#last } : {}),
+      ...(this.#lastAuto ? { lastAuto: this.#lastAuto } : {}),
     };
   }
 

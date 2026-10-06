@@ -326,13 +326,13 @@ describe("FabricUiController dashboard wiring", () => {
     state.config.ui.refreshMs = 500;
     vi.mocked(state.actors.list).mockReturnValue([]);
     const remoteAgent = {
-      format: 1, id: "agent:remote", kind: "agent", rootId: "session:other", ownerHostId: "session:other",
+      format: 1, id: "agent:remote", kind: "agent", rootId: "session:test", ownerHostId: "session:other",
       ownerIdentityId: "session:other", name: "remote", status: "running", runner: "pi", transport: "host",
       capabilities: [], startedAt: 1, updatedAt: 1, local: false, stale: false,
     };
     Object.assign(state, {
       peerInfos: vi.fn(() => [{ id: "session:other", name: "other", kind: "main", status: "idle" }]),
-      participantInfos: vi.fn(() => [remoteAgent]),
+      participantInfos: vi.fn(() => [remoteAgent, { ...remoteAgent, id: "agent:foreign", rootId: "session:foreign" }]),
     });
     const context = {
       mode: "tui",
@@ -342,6 +342,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       expect(controller.snapshot().agents.map((agent) => agent.id)).toContain("agent:remote");
+      expect(controller.snapshot().agents.map((agent) => agent.id)).not.toContain("agent:foreign");
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(4_999);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);          // no 500 ms poll for peers
@@ -831,7 +832,7 @@ describe("FabricUiController dashboard wiring", () => {
     vi.mocked(state.actors.list).mockReturnValue([]);
     const activity = new FabricActivityStore();
     const participantInfos = () => readParticipantFiles(root, { maxAgeMs: 2_000 }).map((entry) => ({
-      ...(entry.value as object), kind: "agent", name: "peer", rootId: "peer", ownerHostId: "h", startedAt: 1, updatedAt: 1,
+      ...(entry.value as object), kind: "agent", name: "peer", rootId: "session:test", ownerHostId: "h", startedAt: 1, updatedAt: 1,
       runner: "pi", transport: "process", capabilities: [], local: false, stale: false,
     }));
     Object.assign(state, { activity, participantInfos, config: { ...state.config, mesh: { enabled: true } }, mesh });
@@ -856,44 +857,52 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("rebuilds topology on lease-only re-acquisition without a state or participant record change", async () => {
-    vi.useFakeTimers();
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-leases-"));
-    const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 60_000 });
-    const host = { id: "session:peer", rootId: "session:peer", identity: { id: "session:peer" },
-      startedAt: 1, updatedAt: 1, expiresAt: 2 };
-    const renew = (updatedAt: number) => writeHostLease(root, { id: host.id, rootId: host.rootId,
-      identityId: host.identity.id, startedAt: host.startedAt, updatedAt, expiresAt: updatedAt + 15_000 });
-    renew(Date.now() - 20_000); // a previously advertised owner is stale
-    await mesh.put({ key: "status", value: "unchanged", identity: { id: "observer", name: "main", kind: "main" } });
-    const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
-    const state = stubState();
-    state.config.ui.refreshMs = 500;
-    vi.mocked(state.actors.list).mockReturnValue([]);
-    const activity = new FabricActivityStore();
-    const participantInfos = () => hostLiveness(readHostLeases(root), host).expiresAt >= Date.now() ? [{
-      format: 1, id: "peer-agent", kind: "agent", name: "peer", status: "idle", rootId: host.rootId,
-      ownerHostId: host.id, ownerIdentityId: host.identity.id, startedAt: 1, updatedAt: 1,
-      runner: "pi", transport: "process", capabilities: [], local: false, stale: false,
-    }] : [];
-    Object.assign(state, { activity, participantInfos, config: { ...state.config, mesh: { enabled: true } }, mesh });
-    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
-    const controller = new FabricUiController(state);
-    try {
-      controller.start(context);
-      activity.start("live", { name: "local work" });
-      await vi.advanceTimersByTimeAsync(4_700);
-      expect(controller.snapshot().agents).toEqual([]);
-      renew(Date.now());
-      await vi.advanceTimersByTimeAsync(1_000); // next 5 s remote refresh, not the 15 s ceiling
-      expect(controller.snapshot().agents.map(agent => agent.id)).toEqual(["peer-agent"]);
-      expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
-    } finally {
-      controller.stop();
-      vi.useRealTimers();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
+  it.each(["session:test", "session:peer"])(
+    "rebuilds %s topology on lease-only re-acquisition without a state or participant record change",
+    async (rootId) => {
+      vi.useFakeTimers();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-leases-"));
+      const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 60_000 });
+      // A resident host can publish this session's agents; a peer host can publish
+      // another session's. Both become live through the same shared freshness helper,
+      // but only the former belongs in this session's agent rows.
+      const host = { id: "session:peer", rootId, identity: { id: "session:peer" },
+        startedAt: 1, updatedAt: 1, expiresAt: 2 };
+      const renew = (updatedAt: number) => writeHostLease(root, { id: host.id, rootId: host.rootId,
+        identityId: host.identity.id, startedAt: host.startedAt, updatedAt, expiresAt: updatedAt + 15_000 });
+      renew(Date.now() - 20_000); // a previously advertised owner is stale
+      await mesh.put({ key: "status", value: "unchanged", identity: { id: "observer", name: "main", kind: "main" } });
+      const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
+      const state = stubState();
+      state.config.ui.refreshMs = 500;
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      const activity = new FabricActivityStore();
+      const participantInfos = () => hostLiveness(readHostLeases(root), host).expiresAt >= Date.now() ? [{
+        format: 1, id: "peer-agent", kind: "agent", name: "peer", status: "idle", rootId: host.rootId,
+        ownerHostId: host.id, ownerIdentityId: host.identity.id, startedAt: 1, updatedAt: 1,
+        runner: "pi", transport: "process", capabilities: [], local: false, stale: false,
+      }] : [];
+      Object.assign(state, { activity, participantInfos, config: { ...state.config, mesh: { enabled: true } }, mesh });
+      const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+      const controller = new FabricUiController(state);
+      try {
+        controller.start(context);
+        activity.start("live", { name: "local work" });
+        await vi.advanceTimersByTimeAsync(4_700);
+        expect(controller.snapshot().agents).toEqual([]);
+        renew(Date.now());
+        await vi.advanceTimersByTimeAsync(1_000); // next 5 s remote refresh, not the 15 s ceiling
+        const snapshot = controller.snapshot();
+        expect(snapshot.participants?.map(participant => participant.id)).toEqual(["peer-agent"]);
+        expect(snapshot.agents.map(agent => agent.id)).toEqual(rootId === "session:test" ? ["peer-agent"] : []);
+        expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
+      } finally {
+        controller.stop();
+        vi.useRealTimers();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
     vi.useFakeTimers();

@@ -114,7 +114,7 @@ describe("legacy routes and durable mesh delivery", () => {
     };
     const remote = (id: string, kind: FabricParticipantInfo["kind"], legacy = false) => ({ id, kind, local: false,
       capabilities: ["steer", "followUp"], ownerHostId: "owner", ownerIdentityId: "owner-id", controlProtocol: legacy ? "legacy" : "v1" }) as FabricParticipantInfo;
-    const participants = [remote("remote-root", "root"), remote("remote-child", "agent"), remote("remote-actor", "actor"), remote("legacy-root", "root", true)];
+    const participants = [remote("remote-root", "root"), remote("remote-child", "agent"), remote("remote-actor", "actor"), remote("legacy-actor", "actor", true), remote("legacy-root", "root", true)];
     const provider = new AgentsProvider({
       status: (id: string) => { if (id !== "child") throw new Error(`Unknown Fabric agent: ${id}`); return { id, name: "Child" }; },
       steer: (_id: string, message: string, data: unknown) => deliver("child", message, data),
@@ -123,7 +123,7 @@ describe("legacy routes and durable mesh delivery", () => {
       identity: { id: "sender", name: "Sender", kind: "main" }, validateDirectMessage() {},
       status: (id: string) => { if (id !== "actor") throw new Error(`Unknown Fabric actor: ${id}`); return { id, name: "Actor", runner: "pi" }; },
       tell: (_id: string, message: string, data: unknown) => deliver("actor", message, data),
-      steerRemote: (_id: string, message: string, _kind: string, data: unknown) => deliver("legacy-root", message, data),
+      steerRemote: (_id: string, message: string, _kind: string, data: unknown) => deliver("legacy-actor", message, data),
     } as unknown as Ports[1], {} as Ports[2], {
       id: "main", local: true, matches: (id: string) => id === "main",
       deliverAgent: ({ message, data }: { message: string; data: unknown }) => deliver("main", message, data),
@@ -132,10 +132,11 @@ describe("legacy routes and durable mesh delivery", () => {
     } as unknown as Ports[5], {} as Ports[6]);
     const context = invocation(session());
     const data = { untouched: "head def5678" };
-    for (const id of ["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]) {
+    for (const id of ["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-actor"]) {
       expect(await provider.invoke(action, { id, message: "head abc1234", data }, context)).toHaveProperty("notice", "unverified ids: abc1234");
     }
-    expect(sent.map(({ route }) => route)).toEqual(["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]);
+    await expect(provider.invoke(action, { id: "legacy-root", message: "head abc1234", data }, context)).rejects.toThrow("no control channel");
+    expect(sent.map(({ route }) => route)).toEqual(["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-actor"]);
     expect(sent.every(item => item.message === "head abc1234\n\nunverified ids: abc1234" && item.data === data)).toBe(true);
     const bypass = await provider.routeMessage("main", "head def5678", data, action); // Host lifecycle; no model sender context.
     expect(bypass).not.toHaveProperty("notice");

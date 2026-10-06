@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { PiNativeMcpTools } from "./pi-native-mcp.js";
 import type {
   Runtime,
   ServerDefinition,
@@ -97,7 +98,7 @@ const normalizeSchema = (schema: unknown): Record<string, unknown> =>
     ? (schema as Record<string, unknown>)
     : emptyObjectSchema;
 
-const normalizeMcpResult = (result: unknown): unknown => {
+export const normalizeMcpResult = (result: unknown): unknown => {
   if (typeof result !== "object" || result === null || Array.isArray(result)) return result;
   const record = result as Record<string, unknown>;
   if (!Array.isArray(record.content)) return result;
@@ -145,10 +146,21 @@ export interface HostedMcpSource {
   close?(server?: string): Promise<void>;
 }
 
+export const mcpToolDescriptor = (server: string, tool: HostedMcpTool): FabricActionDescriptor => ({
+  name: `${server}.${tool.name}`,
+  description: tool.description ?? `${tool.name} on MCP server ${server}`,
+  inputSchema: normalizeSchema(tool.inputSchema),
+  ...(tool.outputSchema ? { outputSchema: normalizeSchema(tool.outputSchema) } : {}),
+  risk: "network",
+  namespace: server,
+  ...(tool.annotations ? { annotations: { ...tool.annotations } } : {}),
+});
+
 type ToolRuntime = Pick<Runtime, "listServers" | "listTools" | "callTool" | "close"> | HostedMcpSource;
 
 export interface McpProviderOptions {
   source?: HostedMcpSource;
+  native?: PiNativeMcpTools;
   cache?: McpDescriptorCacheStore;
   hooks?: McpProviderHooks;
 }
@@ -195,7 +207,7 @@ const withTimeout = <T>(
 
 export class McpProvider implements FabricProvider {
   readonly name = "mcp";
-  readonly description = "External MCP tools discovered and pooled by mcporter";
+  readonly description: string;
   #runtime: Runtime | undefined;
   #runtimeCreation: { generation: number; promise: Promise<Runtime> } | undefined;
   readonly #toolMetadata = new Map<
@@ -204,6 +216,8 @@ export class McpProvider implements FabricProvider {
   >();
 
   readonly #source: HostedMcpSource | undefined;
+  readonly #native: PiNativeMcpTools | undefined;
+  #preservedNativeCache: Record<string, CachedMcpServer> = {};
   readonly #store: McpDescriptorCacheStore | undefined;
   readonly #hooks: McpProviderHooks;
   #generation = 0;
@@ -227,9 +241,41 @@ export class McpProvider implements FabricProvider {
     readonly config: FabricMcpConfig,
     options: McpProviderOptions = {},
   ) {
+    if (!options.source && config.nativeServers?.length && !options.native) {
+      throw new Error("mcp.nativeServers requires the Pi native MCP adapter; refusing mcporter fallback");
+    }
     this.#source = options.source;
+    this.#native = options.source ? undefined : options.native;
+    this.description = this.#native
+      ? "External MCP tools with explicit Pi-owned servers and mcporter discovery and pooling for the rest"
+      : "External MCP tools discovered and pooled by mcporter";
     this.#store = options.source ? undefined : options.cache;
     this.#hooks = options.hooks ?? {};
+  }
+
+  get #management(): FabricActionDescriptor[] {
+    if (!this.#native) return managementDescriptors;
+    return managementDescriptors.map(descriptor => {
+      const descriptions: Record<string, string> = {
+        $servers: "List MCP servers owned by mcporter or Pi without credentials",
+        $reload: "Close mcporter connections and reload its configuration; manage Pi-owned servers with /mcp",
+        $register: "Register an ephemeral MCP server in mcporter; Pi-owned names cannot be registered here",
+      };
+      return { ...descriptor, description: descriptions[descriptor.name] ?? descriptor.description };
+    });
+  }
+
+  async #nativeServer(requested: string): Promise<string | undefined> {
+    const server = this.#native?.resolveServer(requested);
+    if (!server || server === requested) return server;
+    // Sanitized aliases share a namespace with legacy servers. Check config
+    // names only (never connect) so an exact legacy name cannot be shadowed.
+    const legacy = (await this.#getRuntime()).listServers().filter(name => !this.#native?.owns(name));
+    if (legacy.includes(requested)) return undefined;
+    if (legacy.some(name => sanitizeMcpRefPart(name) === requested)) {
+      throw new Error(`Ambiguous MCP server alias: ${requested}; use exact server names with mcp.call`);
+    }
+    return server;
   }
 
   get #cacheOn(): boolean {
@@ -241,6 +287,8 @@ export class McpProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor[]> {
     if (!this.config.enabled) return [];
+    if (this.#closed) throw new Error("MCP provider is closed");
+    if (this.#native && request.namespace && await this.#nativeServer(request.namespace)) return this.#native.list(request);
     if (!this.#cacheOn) return this.#listLegacy(request, context);
     await this.#hydrate();
     this.#kickRevalidation();
@@ -264,7 +312,7 @@ export class McpProvider implements FabricProvider {
       return filterQuery(entry.tools.map((tool) => this.#toolDescriptor(server, tool)));
     }
     return [
-      ...managementDescriptors,
+      ...this.#management,
       ...filterQuery(this.sliceDescriptors()),
     ];
   }
@@ -273,12 +321,16 @@ export class McpProvider implements FabricProvider {
     actionName: string,
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    const management = managementDescriptors.find((descriptor) => descriptor.name === actionName);
+    const management = this.#management.find((descriptor) => descriptor.name === actionName);
     if (management) {
       if (this.#source) throw new Error("MCP management is unavailable for a hosted source");
       return management;
     }
     if (!this.config.enabled) return undefined;
+    if (this.#closed) throw new Error("MCP provider is closed");
+    const nativeName = this.#parseToolName(actionName);
+    const nativeServer = this.#native && nativeName ? await this.#nativeServer(nativeName.server) : undefined;
+    if (nativeName && nativeServer) return this.#native!.describe(nativeServer, nativeName.tool);
     if (!this.#cacheOn) {
       const descriptor = await this.#describeLegacy(actionName, context);
       // Hosted identities are authority, not spelling suggestions. Prevent registry repair
@@ -301,18 +353,48 @@ export class McpProvider implements FabricProvider {
     return tool ? this.#toolDescriptor(server, tool) : undefined;
   }
 
+  /** Pin $call's policy identity before the registry asks for approval. */
+  async prepareArguments(actionName: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (actionName !== "$call" || typeof args.server !== "string" || typeof args.tool !== "string") return args;
+    const nativeServer = this.#native ? await this.#nativeServer(args.server) : undefined;
+    if (nativeServer) {
+      const descriptor = this.#native!.describe(nativeServer, args.tool);
+      return { ...args, server: nativeServer, tool: descriptor.name.slice(nativeServer.length + 1) };
+    }
+    if (!this.#cacheOn) {
+      const runtime = await this.#getToolRuntime();
+      const server = this.#resolveServerName(runtime, args.server);
+      if (!server) throw new Error(`Unknown MCP server: ${args.server}`);
+      const tool = await this.#findToolLegacy(runtime, server, args.tool);
+      if (!tool) throw new Error(`Unknown MCP tool: ${args.server}.${args.tool}`);
+      return { ...args, server, tool: tool.name };
+    }
+    await this.#hydrate();
+    const server = await this.#resolveKnownServer(args.server);
+    if (!server) throw new Error(`Unknown MCP server: ${args.server}`);
+    let entry = this.#servers.get(server);
+    let tool = entry ? this.#resolveTool(entry.tools, args.tool) : undefined;
+    if (!tool) {
+      entry = await this.#fetchServerTools(server).catch(() => undefined);
+      tool = entry ? this.#resolveTool(entry.tools, args.tool) : undefined;
+    }
+    if (!tool) throw new Error(`Unknown MCP tool: ${args.server}.${args.tool}`);
+    return { ...args, server, tool: tool.name };
+  }
+
   async invoke(
     actionName: string,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
     if (!this.config.enabled) throw new Error("MCP support is disabled in Fabric configuration");
+    if (this.#closed) throw new Error("MCP provider is closed");
     if (this.#source && actionName.startsWith("$")) {
       throw new Error("MCP management is unavailable for a hosted source");
     }
     if (actionName === "$servers") {
       const runtime = await this.#getRuntime();
-      return runtime.listServers().map((server) => {
+      const servers = runtime.listServers().filter(server => !this.#native?.owns(server)).map((server) => {
         const definition = runtime.getDefinition(server);
         if (!this.#cacheOn) {
           return {
@@ -330,6 +412,7 @@ export class McpProvider implements FabricProvider {
           stale: entry === undefined || entry.stale,
         };
       });
+      return [...servers, ...(this.#native?.serverInfo() ?? [])];
     }
     if (actionName === "$reload") {
       await this.#resetRuntime();
@@ -341,13 +424,14 @@ export class McpProvider implements FabricProvider {
         await this.#hydrate();
         this.#kickRevalidation(true);
       }
-      return { servers: (await this.#getRuntime()).listServers() };
+      return { servers: [...(await this.#getRuntime()).listServers().filter(server => !this.#native?.owns(server)), ...(this.#native?.servers ?? [])] };
     }
     if (actionName === "$register") {
       if (!this.config.allowDynamicServers) {
         throw new Error("Dynamic MCP server registration is disabled in Fabric configuration");
       }
       const definition = this.#serverDefinition(args);
+      if (this.#native?.owns(definition.name)) throw new Error(`MCP server ${definition.name} is owned by Pi; use /mcp`);
       const runtime = await this.#getRuntime();
       runtime.registerDefinition(definition, { overwrite: args.overwrite === true });
       this.#toolMetadata.delete(definition.name);
@@ -375,16 +459,24 @@ export class McpProvider implements FabricProvider {
         typeof args.args === "object" && args.args !== null && !Array.isArray(args.args)
           ? (args.args as Record<string, unknown>)
           : {};
-      return this.#call(server, tool, toolArgs, context.signal);
+      const nativeServer = this.#native ? await this.#nativeServer(server) : undefined;
+      if (nativeServer) {
+        if (nativeServer !== server) throw new Error("MCP $call requires a prepared canonical identity");
+        return this.#native!.invoke(nativeServer, tool, toolArgs, context, true);
+      }
+      return this.#call(server, tool, toolArgs, context.signal, true);
     }
     const parsed = this.#parseToolName(actionName);
     if (!parsed) throw new Error(`Invalid MCP action: ${actionName}`);
+    const nativeServer = this.#native ? await this.#nativeServer(parsed.server) : undefined;
+    if (nativeServer) return this.#native!.invoke(nativeServer, parsed.tool, args, context);
     return this.#call(parsed.server, parsed.tool, args, context.signal);
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#native?.close();
     await this.#source?.close?.();
     this.#revalidateQueue.length = 0;
     this.#revalidateQueued.clear();
@@ -408,7 +500,7 @@ export class McpProvider implements FabricProvider {
   // Provider-fidelity descriptors for everything currently known, cached or
   // ephemeral.
   sliceDescriptors(): FabricActionDescriptor[] {
-    const descriptors: FabricActionDescriptor[] = [];
+    const descriptors: FabricActionDescriptor[] = this.#native?.list() ?? [];
     for (const [server, entry] of this.#servers) {
       for (const tool of entry.tools) descriptors.push(this.#toolDescriptor(server, tool));
     }
@@ -437,8 +529,9 @@ export class McpProvider implements FabricProvider {
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    canonicalOnly = false,
   ): Promise<unknown> {
-    if (!this.#cacheOn) return this.#callLegacy(serverName, toolName, args, signal);
+    if (!this.#cacheOn) return this.#callLegacy(serverName, toolName, args, signal, canonicalOnly);
     if (signal?.aborted) throw new Error("MCP call cancelled");
     await this.#hydrate();
     const server = await this.#resolveKnownServer(serverName);
@@ -451,6 +544,9 @@ export class McpProvider implements FabricProvider {
     }
     if (signal?.aborted) throw new Error("MCP call cancelled");
     if (!tool) throw new Error(`Unknown MCP tool: ${serverName}.${toolName}`);
+    if (canonicalOnly && (server !== serverName || tool.name !== toolName)) {
+      throw new Error("MCP $call canonical identity changed; refusing to retarget an approved call");
+    }
     const runtime = await this.#getRuntime();
     const firstContact = !this.#recontacted.has(server);
     if (firstContact) this.#recontacted.add(server);
@@ -517,6 +613,14 @@ export class McpProvider implements FabricProvider {
   async #hydrateInternal(): Promise<void> {
     const generation = this.#generation;
     const snapshot = this.#store ? await this.#store.load().catch(() => undefined) : undefined;
+    this.#preservedNativeCache = {};
+    if (this.#native) {
+      for (const [name, raw] of Object.entries(snapshot?.servers ?? {})) {
+        if (!this.#native.owns(name)) continue;
+        const parsed = parseCachedServer(raw);
+        if (parsed) this.#preservedNativeCache[name] = parsed;
+      }
+    }
     this.#layerStats = await statConfigLayers(this.cwd, this.config.configPath);
     if (generation !== this.#generation) return;
     if (snapshot && sameConfigLayers(snapshot.layers, this.#layerStats)) {
@@ -524,7 +628,7 @@ export class McpProvider implements FabricProvider {
       // without even constructing the mcporter runtime.
       for (const [name, raw] of Object.entries(snapshot.servers)) {
         const parsed = parseCachedServer(raw);
-        if (parsed) this.#servers.set(name, this.#toWorking(parsed, false));
+        if (parsed && !this.#native?.owns(name)) this.#servers.set(name, this.#toWorking(parsed, false));
       }
       this.#scheduleNotify();
       return;
@@ -534,7 +638,13 @@ export class McpProvider implements FabricProvider {
       // connecting — and keep cached tools for servers whose definition is
       // byte-identical to the one that produced the cache entry.
       const runtime = await this.#getRuntime();
-      for (const definition of runtime.getDefinitions()) {
+      const definitions = runtime.getDefinitions();
+      for (const [name, entry] of Object.entries(this.#preservedNativeCache)) {
+        const definition = definitions.find(candidate => candidate.name === name);
+        if (!definition || hashServerDefinition(definition) !== entry.definitionHash) delete this.#preservedNativeCache[name];
+      }
+      for (const definition of definitions) {
+        if (this.#native?.owns(definition.name)) continue;
         const hash = hashServerDefinition(definition);
         const recorded = snapshot?.servers[definition.name];
         const parsed = recorded ? parseCachedServer(recorded) : undefined;
@@ -559,7 +669,7 @@ export class McpProvider implements FabricProvider {
       if (snapshot) {
         for (const [name, raw] of Object.entries(snapshot.servers)) {
           const parsed = parseCachedServer(raw);
-          if (parsed && !this.#servers.has(name)) {
+          if (parsed && !this.#native?.owns(name) && !this.#servers.has(name)) {
             this.#servers.set(name, this.#toWorking(parsed, false));
           }
         }
@@ -599,7 +709,7 @@ export class McpProvider implements FabricProvider {
   #scheduleRevalidate(servers: Iterable<string>): void {
     if (this.#closed || !this.#cacheOn) return;
     for (const server of servers) {
-      if (this.#revalidateQueued.has(server)) continue;
+      if (this.#native?.owns(server) || this.#revalidateQueued.has(server)) continue;
       this.#revalidateQueued.add(server);
       this.#revalidateQueue.push(server);
     }
@@ -654,6 +764,7 @@ export class McpProvider implements FabricProvider {
   // copy and persistence. Used by the background revalidator and by explicit
   // single-server fetches.
   async #fetchServerTools(server: string, timeoutMs?: number): Promise<WorkingServer> {
+    if (this.#native?.owns(server)) throw new Error(`MCP server ${server} is owned by Pi`);
     const generation = this.#generation;
     const runtime = await this.#getRuntime();
     const listing = runtime.listTools(server, {
@@ -705,7 +816,7 @@ export class McpProvider implements FabricProvider {
     const matches = known.filter((name) => sanitizeMcpRefPart(name) === requested);
     if (matches.length === 1) return matches[0];
     const runtime = await this.#getRuntime();
-    const servers = runtime.listServers();
+    const servers = runtime.listServers().filter(server => !this.#native?.owns(server));
     if (servers.includes(requested)) return requested;
     const sanitized = servers.filter((name) => sanitizeMcpRefPart(name) === requested);
     return sanitized.length === 1 ? sanitized[0] : undefined;
@@ -725,7 +836,7 @@ export class McpProvider implements FabricProvider {
   #persistNow(): Promise<void> {
     this.#dirtyPersist = false;
     if (!this.#store) return Promise.resolve();
-    const servers: Record<string, CachedMcpServer> = {};
+    const servers: Record<string, CachedMcpServer> = { ...this.#preservedNativeCache };
     for (const [name, entry] of this.#servers) {
       if (entry.ephemeral) continue;
       servers[name] = {
@@ -872,7 +983,7 @@ export class McpProvider implements FabricProvider {
   }
 
   #resolveServerName(runtime: ToolRuntime, requested: string): string | undefined {
-    const servers = runtime.listServers();
+    const servers = runtime.listServers().filter(server => !this.#native?.owns(server));
     if (servers.includes(requested)) return requested;
     const matches = servers.filter((server) => sanitizeMcpRefPart(server) === requested);
     return matches.length === 1 ? matches[0] : undefined;
@@ -892,18 +1003,7 @@ export class McpProvider implements FabricProvider {
   }
 
   #toolDescriptor(server: string, tool: ServerToolInfo): FabricActionDescriptor {
-    // mcporter's ServerToolInfo does not declare annotations yet; read them
-    // structurally so a runtime that surfaces them flows straight through.
-    const annotations = (tool as { annotations?: FabricToolAnnotations }).annotations;
-    return {
-      name: `${server}.${tool.name}`,
-      description: tool.description ?? `${tool.name} on MCP server ${server}`,
-      inputSchema: normalizeSchema(tool.inputSchema),
-      ...(tool.outputSchema ? { outputSchema: normalizeSchema(tool.outputSchema) } : {}),
-      risk: "network",
-      namespace: server,
-      ...(annotations ? { annotations: { ...annotations } } : {}),
-    };
+    return mcpToolDescriptor(server, tool as HostedMcpTool);
   }
 
   // Live-everything path preserved for mcp.cache.enabled: false — the
@@ -914,7 +1014,8 @@ export class McpProvider implements FabricProvider {
   ): Promise<FabricActionDescriptor[]> {
     const runtime = await this.#getToolRuntime();
     const selected = request.namespace ? this.#resolveServerName(runtime, request.namespace) : undefined;
-    const servers = request.namespace ? (selected ? [selected] : []) : runtime.listServers();
+    const servers = (request.namespace ? (selected ? [selected] : []) : runtime.listServers())
+      .filter(server => !this.#native?.owns(server));
     const settled = await Promise.allSettled(
       servers.map(async (server) => {
         const tools = await this.#listToolsLegacy(runtime, server);
@@ -930,7 +1031,7 @@ export class McpProvider implements FabricProvider {
           `${descriptor.name} ${descriptor.description}`.toLowerCase().includes(query),
         )
       : descriptors;
-    return request.namespace || this.#source ? filtered : [...managementDescriptors, ...filtered];
+    return request.namespace || this.#source ? filtered : [...this.#management, ...filtered, ...(this.#native?.list(request) ?? [])];
   }
 
   async #describeLegacy(
@@ -951,6 +1052,7 @@ export class McpProvider implements FabricProvider {
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    canonicalOnly = false,
   ): Promise<unknown> {
     if (signal?.aborted) throw new Error("MCP call cancelled");
     const runtime = await this.#getToolRuntime();
@@ -959,6 +1061,9 @@ export class McpProvider implements FabricProvider {
     const tool = await this.#findToolLegacy(runtime, server, toolName);
     if (signal?.aborted) throw new Error("MCP call cancelled");
     if (!tool) throw new Error(`Unknown MCP tool: ${serverName}.${toolName}`);
+    if (canonicalOnly && (server !== serverName || tool.name !== toolName)) {
+      throw new Error("MCP $call canonical identity changed; refusing to retarget an approved call");
+    }
     const operation = runtime.callTool(server, tool.name, {
       args,
       ...(this.#source && signal ? { signal } : {}),

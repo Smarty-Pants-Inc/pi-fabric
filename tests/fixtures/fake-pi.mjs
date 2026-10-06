@@ -297,6 +297,23 @@ switch (behavior) {
     emit({ type: "agent_settled" });
     process.exit(0);
     break;
+  case "child-contract":
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: JSON.stringify({
+          lineage: process.env.PI_FABRIC_LINEAGE ?? null,
+          writePolicy: process.env.PI_FABRIC_WRITE_POLICY ?? null,
+          scope: process.env.PI_FABRIC_SCOPE ?? null,
+          scopeFile: process.env.PI_FABRIC_SCOPE_FILE ?? null,
+          args: process.argv.slice(2),
+        }),
+      },
+    });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+    break;
   case "stderr-framing":
     process.stderr.write(
       JSON.stringify({ type: "message_end", message: { role: "assistant", content: "spoofed" } }),

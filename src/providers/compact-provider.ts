@@ -7,6 +7,20 @@ import {
   MAX_PRESERVE_ITEM_CHARS,
   MAX_PRESERVE_ITEMS,
 } from "../compaction/instructions.js";
+import {
+  applyCarryUpdate,
+  COMPACTION_CARRY_ENTRY_TYPE,
+  isCarryUpdate,
+  latestCarryItems,
+  MAX_CARRY_ITEM_CHARS,
+  MAX_CARRY_ITEMS,
+  sameCarryItems,
+  type CompactionCarryEntryData,
+  type CompactionCarryUpdate,
+} from "../compaction/carry.js";
+import { ownerFromContext } from "../compaction/owner.js";
+import { compactionPressure } from "../compaction/pressure.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricConfig } from "../config.js";
 import { CompactController } from "../core/compact-controller.js";
 import type {
   FabricActionDescriptor,
@@ -80,6 +94,29 @@ const emptySchema = {
   additionalProperties: false,
 };
 
+const carryItemsSchema = (description: string) => Type.Optional(Type.Array(
+  Type.String({ minLength: 1, maxLength: MAX_CARRY_ITEM_CHARS }),
+  { maxItems: MAX_CARRY_ITEMS, description },
+));
+
+const carrySchema = Type.Object({
+  items: carryItemsSchema("Replace the carry-forward list"),
+  add: carryItemsSchema("Append items not already present"),
+  remove: carryItemsSchema("Remove exact items"),
+  clear: Type.Optional(Type.Boolean({ description: "Empty the list before applying items/add" })),
+}, { additionalProperties: false });
+
+const checkedCarryArguments = (args: Record<string, unknown>): CompactionCarryUpdate => {
+  if (!Value.Check(carrySchema, args)) {
+    const message = [...Value.Errors(carrySchema, args)]
+      .slice(0, 5)
+      .map((error) => error.message)
+      .join("; ");
+    throw new Error(`Invalid compact.carry arguments: ${message}`);
+  }
+  return args as CompactionCarryUpdate;
+};
+
 
 
 const descriptors: FabricActionDescriptor[] = [
@@ -98,6 +135,22 @@ const descriptors: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "pressure",
+    description:
+      "Read host context pressure: tokens, window, fraction, headroom, band (ok/warn/urgent/unknown), output reserve, configured threshold, and the observed compaction owner",
+    inputSchema: emptySchema,
+    risk: "read",
+  },
+  {
+    name: "carry",
+    description:
+      "Read or update the persistent carry-forward focus list that Fabric's compactor renders in every summary until cleared. No arguments reads it.",
+    inputSchema: carrySchema as unknown as Record<string, unknown>,
+    // A persisted session entry that changes every later summary: a control
+    // write, classified like request.
+    risk: "write",
+  },
+  {
     name: "cancel",
     description: "Clear a pending compaction intent before the host commits it",
     inputSchema: emptySchema,
@@ -112,12 +165,57 @@ const descriptors: FabricActionDescriptor[] = [
 // lexicon; no compact-specific table remains.
 export const normalizeCompactArgs = actionArgNormalizer(() => descriptors);
 
+type CompactionConfig = FabricConfig["compaction"];
+
+export interface CompactProviderOptions {
+  /** Live compaction config (bands, output reserve, thresholds). */
+  config?: () => CompactionConfig;
+  /** Session custom-entry writer (`pi.appendEntry`); required for carry updates. */
+  appendEntry?: (customType: string, data: CompactionCarryEntryData) => void;
+}
+
+const branchOf = (context: FabricInvocationContext) => {
+  try {
+    const branch = context.extensionContext?.sessionManager?.getBranch?.();
+    return Array.isArray(branch) ? branch : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 export class CompactProvider implements FabricProvider {
   readonly name = "compact";
   readonly description =
     "Programmatic, advisory-then-committed context compaction for the host Pi session";
 
-  constructor(readonly controller: CompactController) {}
+  constructor(
+    readonly controller: CompactController,
+    private readonly options: CompactProviderOptions = {},
+  ) {}
+
+  #config(): CompactionConfig {
+    return this.options.config?.() ?? DEFAULT_FABRIC_CONFIG.compaction;
+  }
+
+  #carry(update: CompactionCarryUpdate, context: FabricInvocationContext): { items: string[] } {
+    const branch = branchOf(context);
+    const current = branch ? latestCarryItems(branch) : [];
+    if (!isCarryUpdate(update)) return { items: current };
+    if (!branch || !this.options.appendEntry) {
+      throw new Error("compact.carry cannot persist: no host session is available");
+    }
+    const items = applyCarryUpdate(current, update);
+    if (!sameCarryItems(current, items)) {
+      this.options.appendEntry(COMPACTION_CARRY_ENTRY_TYPE, { version: 1, items });
+      context.activity?.({
+        type: "progress",
+        message: items.length > 0
+          ? `Compaction carry-forward: ${items.length} item${items.length === 1 ? "" : "s"}`
+          : "Compaction carry-forward cleared",
+      });
+    }
+    return { items };
+  }
 
   async list(
     request: FabricProviderListRequest,
@@ -174,7 +272,15 @@ export class CompactProvider implements FabricProvider {
         return { requested: true, intent };
       }
       case "status":
-        return this.controller.status();
+        return {
+          ...this.controller.status(),
+          owner: ownerFromContext(context.extensionContext),
+          outputReserveTokens: this.#config().outputReserveTokens,
+        };
+      case "pressure":
+        return compactionPressure(context.extensionContext, this.#config());
+      case "carry":
+        return this.#carry(checkedCarryArguments(args), context);
       case "cancel":
         this.controller.cancel();
         context.activity?.({ type: "progress", message: "Compaction request cancelled" });

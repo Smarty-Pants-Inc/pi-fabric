@@ -47,6 +47,7 @@ import {
   type FabricNamedActionTypeSource,
   type FabricProvider,
   type FabricProviderListRequest,
+  type FabricScope,
   type FabricScopedProviderResult,
 } from "../protocol.js";
 import {
@@ -146,12 +147,16 @@ export interface FabricRegistryInvocationContext extends FabricInvocationContext
   approve(
     action: ResolvedFabricAction,
     args: Record<string, unknown>,
+    /** Effective cancellation includes registry view, binding and shutdown revocation. */
+    signal?: AbortSignal,
   ): Promise<void>;
   audits: FabricCallAudit[];
   maxResultChars: number;
   trace?: FabricExecutionTraceRecorder;
   traceOperation?: FabricExecutionTraceOperationHandle;
   observeInvocation?(event: FabricRegistryActivityEvent): void;
+  /** Host-owned settlement accounting, before proxies or bounded guest projection. Not a delivery receipt. */
+  observeResult?(value: unknown): void;
 }
 
 /**
@@ -166,6 +171,8 @@ export interface FabricRegistryInvocationContext extends FabricInvocationContext
 export const NESTED_TOOL_CALL_ID_PREFIX = FABRIC_NESTED_TOOL_CALL_ID_PREFIX;
 
 const providerNamePattern = /^[a-z][a-z0-9_-]*$/;
+/** Process-wide issuance record owned by src/scope.ts. */
+const SCOPE_HOLDER = Symbol.for("pi-fabric:scope:v1");
 
 /** structuredClone detaches ordinary nested references, but deliberately shares
  * SharedArrayBuffer backing memory. Such payloads cannot be approved as stable
@@ -380,8 +387,11 @@ export class ActionRegistry {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  unregister(name: string): FabricProvider | undefined {
-    return this.#providerBindings.unregister(name);
+  unregister(
+    name: string,
+    options?: { provider?: FabricProvider; generation?: number | string; keepProviderOpen?: boolean },
+  ): FabricProvider | undefined {
+    return this.#providerBindings.unregister(name, options);
   }
 
   providers(context?: FabricInvocationContext): Array<{ name: string; description: string }> {
@@ -821,7 +831,7 @@ export class ActionRegistry {
       );
       if (catalog.invalid) throw new Error(`Invalid arguments for ${ref}: ${catalog.invalid}`);
       if (context.approve) {
-        await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args)));
+        await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args), context.signal));
       }
       throwIfExecutionExpired(context);
       const acquired = await runAbortable(context.signal, () =>
@@ -983,7 +993,7 @@ export class ActionRegistry {
       }
 
       failureStage = "approve";
-      await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args)));
+      await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args), context.signal));
 
       failureStage = "invoke";
       throwIfExecutionExpired(context);
@@ -1038,7 +1048,7 @@ export class ActionRegistry {
       try {
       if (this.#speculation && action.risk === "read" && effect.kind === "none") {
         const served = await runAbortable(context.signal, () =>
-          this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null])));
+          this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null, context.scope?.digest ?? null])));
         if (served.hit) {
           providerValue = await runAbortable(context.signal, () => this.#runPlanned(binding, providerActionName, authority, "replay", catalog.args, context, served.value));
           throwIfExecutionExpired(context);
@@ -1130,6 +1140,7 @@ export class ActionRegistry {
       } finally {
         if (!providerInvoked) this.#activeEffects.delete(nestedToolCallId);
       }
+      context.observeResult?.(providerValue);
       throwIfExecutionExpired(context);
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({
@@ -1276,7 +1287,7 @@ export class ActionRegistry {
       }));
       return {
         get preparedArgs() { return snapshotArguments(repairedArgs); },
-        bindingToken: JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null]),
+        bindingToken: JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null, context.scope?.digest ?? null]),
         execute: async signal => {
           const combined = AbortSignal.any([context.signal!, ...(signal ? [signal] : [])]);
           const actual = execute(combined);
@@ -1564,7 +1575,13 @@ export class ActionRegistry {
     const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
     throwIfAborted(context.signal);
     if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
-    return snapshotFabricInvocation({ ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) });
+    // Host-issued scope replaces caller input; failed issuance refuses every call.
+    const issued = (globalThis as Record<symbol, { scope?: FabricScope; error?: string } | undefined>)[SCOPE_HOLDER];
+    if (issued?.error) throw new FabricResolutionError(`Fabric scope issuance failed; provider calls are refused: ${issued.error}`);
+    const scoped = { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) };
+    if (issued?.scope) scoped.scope = issued.scope;
+    else delete scoped.scope;
+    return snapshotFabricInvocation(scoped);
   }
 
   #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {

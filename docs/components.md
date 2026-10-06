@@ -46,6 +46,7 @@ fabric.provider.state
 fabric.provider.schema
 fabric.provider.compact
 fabric.provider.cache
+fabric.provider.thinking
 fabric.provider.agents
 fabric.provider.memory
 fabric.provider.jev

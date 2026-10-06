@@ -584,16 +584,31 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
     { session: contextResult.session.id },
     invocationContext(cwd),
   );
-  const expandedAddresses = await provider.invoke(
-    "expand",
-    {
+  // Preserve every address while respecting memory.expand's 100-selector cap.
+  // Each batch must independently match the same integrity-bound source hash.
+  const expandedBatches = [];
+  const expandedById = new Map();
+  for (let offset = 0; offset < emittedIds.length; offset += 100) {
+    let request = {
       session: contextResult.session.id,
       expectedSourceHash: contextPointer.sourceHash,
-      entryIds: emittedIds,
-    },
-    invocationContext(cwd),
-  );
-  const expandedById = new Map(expandedAddresses.entries.map((entry) => [entry.entryId, entry.text]));
+      entryIds: emittedIds.slice(offset, offset + 100),
+    };
+    const seenPages = new Set();
+    while (request) {
+      const key = JSON.stringify(request);
+      if (seenPages.has(key)) throw new Error("memory.expand returned a non-advancing certification cursor");
+      seenPages.add(key);
+      const page = await provider.invoke("expand", request, invocationContext(cwd));
+      expandedBatches.push(page);
+      for (const entry of page.entries) {
+        const previous = expandedById.get(entry.entryId) ?? "";
+        if (entry.textRange.start !== previous.length) throw new Error("memory.expand returned a discontinuous source range");
+        expandedById.set(entry.entryId, previous + entry.text);
+      }
+      request = page.next?.args;
+    }
+  }
   const expandedCorrectly = emittedIds.filter((id) => expandedById.get(id) === sourceById.get(id)).length;
   const rareTier = rareHit?.tier ?? "missing";
   const sourceRoot = path.join(agentDir, "sessions");
@@ -626,7 +641,7 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
     addressExpansionRate: emittedIds.length === 0 ? 0 : expandedCorrectly / emittedIds.length,
     integrityBoundExpansion: typeof contextPointer.sourceHash === "string"
       && contextPointer.sourceHash.length === 64
-      && expandedAddresses.sourceHash === contextPointer.sourceHash,
+      && expandedBatches.every((batch) => batch.error === undefined && batch.sourceHash === contextPointer.sourceHash),
     cacheVersionBehavior: "V6 sourceHash checked for hydration/expansion; exact capability postings checked by cold structural recall",
     cacheBytes: directoryBytes(indexDir),
     sourceBytes: directoryBytes(sourceRoot),

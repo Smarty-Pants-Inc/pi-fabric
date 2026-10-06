@@ -49,8 +49,18 @@ Older hosts without that optional flag retain their existing readiness contract.
 The default usable-start observation budget includes the mandatory 30-second
 empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
 budgets remain unchanged. A client attaching between owner publication and the
-maintenance receipt waits for that existing generation instead of launching
+maintenance receipt waits for that existing generation without launching
 a competitor.
+
+Scope travels with each request. The host has no session scope of its own, so
+a scoped session puts the full derived scope in a durable spawn
+(`inheritedScope`) or actor create (`principalScope`). The host checks the
+digest and refuses a malformed scope. It records the scope in the agent's
+`agents/<id>.json` and in the actor registry, and launches every child and
+actor turn with it. Hosted-run recovery checks the persisted scope again.
+Requests are files writable by the same OS user, so this keeps the
+single-user boundary of the mesh; see
+[principal and scope](providers.md#principal-and-scope).
 
 ## Context and lifecycle
 
@@ -78,7 +88,7 @@ A file-only heartbeat is liveness, not permission to consume mesh work. Control,
 actor mesh, and lifecycle consumers require a confirmed shared-lock renewal.
 An overdue consumer requests a prompt renewal attempt, but stays fenced until
 that real acquisition succeeds. Initial publication failure keeps the same
-host start pending rather than publishing a usable owner prematurely.
+host start pending and does not publish a usable owner prematurely.
 
 Control admission checks the lease under both the shared claim lock and the
 host-local claim lock. The resident rechecks after awaited binding resolution,
@@ -96,6 +106,59 @@ not pick up queued resident requests before the start succeeds. Restored actor
 queues stay release-paused, and control/lifecycle delivery gates remain closed,
 until owner publication commits. A failed start after confirmed lease publication
 therefore also preserves accepted, unlaunched work.
+[Scheduled mesh events](agents.md#scheduled-events) add one rule, computed by the
+pure `residentIdleDecision`: pending schedules on any topic keep the host alive
+while it owns at least one durable participant, and every idle check re-arms a
+wake timer to the earliest due time. At that time the host releases due schedules
+under the mesh lock, and its actor monitor delivers them. Pending schedules alone,
+with no durable participant, do not keep the host running; Fabric adds no system
+daemon, so such a schedule is released the next time any Fabric process touches
+the mesh root.
+
+### Stale commands after restart
+
+A restarted host keeps its `residentHostId(rootId)` and replays the control log
+from offset 0, so a stop or ask meant for the previous process could otherwise
+reach a durable actor's next turn. Each host process publishes its participant
+records with a fresh `ownerIncarnation`, and requesters stamp that value on each
+command. The new host refuses an unclaimed command for an earlier incarnation
+with an immediate rejection and does not execute it; the caller re-resolves the
+participant and decides whether to resend. See
+[stale commands after restart](agents.md#stale-commands-after-restart).
+
+## Containers and PID namespaces
+
+`kill(pid, 0)` only answers within the caller's PID namespace and boot. In a
+container, the same number can name an unrelated process or nothing, and after
+PID reuse it names a stranger. Fabric owners therefore record an identity:
+`hostname`, the Linux PID namespace (`/proc/self/ns/pid`), the boot id, and the
+process start time. The owner-liveness section of `src/core/atomic-write.ts`
+judges an owner as follows:
+
+- Same host, namespace and boot: the signal probe decides (`ESRCH` dead,
+  `EPERM` alive). On Linux, a different `/proc/<pid>/stat` start time for the
+  same PID means reuse, so the owner is dead.
+- Another namespace, host or boot: only a heartbeat decides. A fresh heartbeat
+  is alive, a stale one is dead, and none is `unknown`. On the same host, a
+  different boot id with no heartbeat is dead, since no process outlives its
+  boot.
+- Records without identity fields keep the earlier signal-probe behaviour.
+
+`unknown` is never treated as death. A lock whose owner might be alive is not
+stolen.
+
+The resident host is a long-lived owner. Its start lock and `owner.json` carry
+additive `identity` and `heartbeatAt` fields, and the format stays `1`. The
+heartbeat refreshes every 10 s, and a heartbeat older than 45 s is stale. The
+Schema commit lock heartbeats the same way while a transaction runs. Short
+mesh, actor-store and file locks carry an identity line only. Across
+namespaces, their creation time serves as the heartbeat, with a 10-minute hold
+ceiling (or the lock's stale window, if longer). Scratch markers record
+identity and no heartbeat, so the sweeper leaves a foreign owner's scratch
+alone.
+
+Hosts and containers that share `.pi/fabric` need clocks that agree within the
+heartbeat TTL.
 
 ## Validation
 

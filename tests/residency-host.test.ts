@@ -1073,10 +1073,10 @@ describe("resident host ownership", () => {
       await expect(handler(command, from, signal, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
       const options = { overrides: { model: "provider/pinned" } };
       const provenance = expect.objectContaining({ principal });
-      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, { ...options, provenance });
+      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, { ...options, provenance, sender: null });
       else {
         expect(binding).toHaveBeenCalledWith("actor", options);
-        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance });
+        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance, sender: null });
       }
       await expect(handler(command, { ...from, id: "session:foreign" }, signal)).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
       expect(operation === "ask" ? ask : tell).toHaveBeenCalledOnce();
@@ -1084,10 +1084,10 @@ describe("resident host ownership", () => {
       for (const foreignBinding of [undefined, {}, { thinking: "medium" as const }]) {
         await expect(handler({ ...resolved, ...(foreignBinding ? { binding: foreignBinding } : {}) }, { ...from, id: "session:foreign" }, signal, "bridge")).resolves.toMatchObject({ accepted: true });
         const foreignOptions = { binding: foreignBinding ?? {} };
-        if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, { ...foreignOptions, provenance });
+        if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, { ...foreignOptions, provenance, sender: null });
         else {
           expect(binding).toHaveBeenLastCalledWith("actor", foreignOptions);
-          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance });
+          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance, sender: null });
         }
       }
     } finally {

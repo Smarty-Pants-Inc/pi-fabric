@@ -49,8 +49,8 @@ latest instructions.
 ### Host session: the `compact` provider
 
 The provider is always available, with no config guard. Fabric exposes it
-through `fabric_exec` as `compact.request`, `compact.status`, and
-`compact.cancel`.
+through `fabric_exec` as `compact.request`, `compact.status`,
+`compact.pressure`, `compact.carry`, and `compact.cancel`.
 
 ```ts
 // Record an advisory intent. Replaces any pending one and returns
@@ -66,14 +66,63 @@ await compact.request({
 const status = await compact.status();
 // { pending?: { reason?, instructions?, preserve?, requestedBy, requestedAt },
 //   last?:   { at, requestedBy, status: "committed"|"cancelled"|"failed",
-//             summary?, tokensBefore?, estimatedTokensAfter?, error? } }
+//             summary?, tokensBefore?, estimatedTokensAfter?, error? },
+//   lastAuto?: { at, trigger: "headroom"|"tokens"|"ratio", committed },
+//   owner: "fabric"|"pi"|"external"|"none",
+//   outputReserveTokens }
+
+// Read context pressure. Never compacts; the program decides what to do.
+const pressure = await compact.pressure();
+// { tokens, contextWindow, fraction, headroomTokens,
+//   band: "ok"|"warn"|"urgent"|"unknown", outputReserveTokens,
+//   thresholdFraction?, thresholdTokens?, owner }
+
+// Keep a bounded focus list in every Fabric summary until it is cleared.
+await compact.carry({ add: ["Auth regression is still open"] });
+await compact.carry({ remove: ["Auth regression is still open"] });
+await compact.carry({ clear: true });
+const { items } = await compact.carry(); // no arguments reads
 
 // Clear a pending intent before the host commits it.
 await compact.cancel();
 ```
 
-Risk classes: `request` is `write` (it mutates host session state). `status`
-and `cancel` are `read`.
+Risk classes: `request`, `carry`, and `cancel` are `write` (they change host
+session state). `status` and `pressure` are `read`, carry no effect, and are
+eligible for speculative pre-launch and for Schema enforce mode.
+
+#### Pressure
+
+`compact.pressure()` reads Pi's `getContextUsage()` and the active model.
+`fraction` is `tokens / contextWindow`, and `headroomTokens` is
+`contextWindow - tokens`. `band` compares `fraction` with
+`compaction.pressureBands` (default `{ warn: 0.6, urgent: 0.8 }`). The band is
+also `urgent` whenever `compaction.outputReserveTokens` is set and the
+headroom is below it. When Pi has no token count, for example right after a
+compaction and before the next response, the numeric fields are `null` and
+the band is `unknown`. `thresholdTokens` or `thresholdFraction` reports the
+active model's configured Fabric threshold; the token threshold wins when
+both exist. `owner` is the [observed compaction owner](compaction.md#compaction-ownership).
+
+#### Carry-forward focus
+
+`compact.carry` maintains a list that Fabric's deterministic compactor renders
+under `[Carry Forward]` in **every** summary until it is cleared. It is the
+persistent counterpart of the one-shot `preserve` field. Arguments apply in
+this order: `clear` empties the list, `items` replaces it, `remove` drops exact
+matches, and `add` appends items that are not already present. The result must
+fit the `preserve` limits: at most 16 non-empty items of 2048 characters and
+2048 UTF-8 bytes each. A violation rejects the call and leaves the list
+unchanged.
+
+Fabric persists each change as a `pi-fabric-compact-carry` session custom
+entry. The latest entry on the active branch is the current list, so reload,
+restart, and tree navigation restore it without extra state, and a branch
+keeps its own list. A malformed latest entry reads as an empty list. Custom
+entries never enter the model context. The rendered block is bounded to
+3 KiB like the request block; compaction details record
+`carry: { count, renderedOmittedBytes }`. With `compaction.engine: "pi"` or
+another compaction owner, the list is stored but not rendered.
 
 With only `instructions` present, Fabric forwards it as ordinary Pi
 `customInstructions`. Manual `/compact` text and programmatic requests then
@@ -194,24 +243,31 @@ return await agents.wait({ id: handle.id });
   and peer sessions, can subscribe to observe compaction transitions.
   Activity-only sessions with the mesh disabled silently skip this step.
 - **Status query**: `compact.status()` gives the context-independent,
-  in-memory record of the pending intent and the last commit for the current
-  initialized extension session. The record survives compaction itself.
-  Extension reload, session replacement, process restart, and shutdown clear
-  it.
+  in-memory record of the pending intent, the last commit, and the last
+  threshold or headroom compaction (`lastAuto`) for the current initialized
+  extension session. The record survives compaction itself. Extension
+  reload, session replacement, process restart, and shutdown clear it.
+  `owner` and the carry list are derived from the session log and survive
+  all of these.
 
 ## Configuration
 
 None required. Programmatic compaction is a first-principles primitive and
 always available. Fabric defines no `compact` config block. The
 model decides when and how to ask, and the host decides when to commit, so
-safety needs no configuration.
+safety needs no configuration. The optional `compaction.pressureBands` and
+`compaction.outputReserveTokens` keys tune what `compact.pressure()` reports;
+see [compaction](compaction.md#headroom-trigger).
 
 ## Files
 
 | File | Role |
 | --- | --- |
 | `src/core/compact-controller.ts` | Pending-intent controller with `request`, `cancel`, `status`, and `maybeCommit`. Uses a single replaceable slot, typed preserve encoding, an in-flight guard, and a quiet clear on benign no-op outcomes (cancelled, already compacted, or session too small). |
-| `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), and `cancel` (read). Registered always, with activity audit. |
+| `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), `pressure` (read), `carry` (write), and `cancel` (write). Registered always, with activity audit. |
+| `src/compaction/pressure.ts` | Pure pressure projection from Pi's context usage, the active model, and config. |
+| `src/compaction/carry.ts` | Carry-forward entry codec, update semantics, and summary lines. |
+| `src/compaction/owner.ts` | Compaction owner classification and the once-per-session ownership warning. |
 | `src/fabric-state.ts` | Constructs the controller with mesh-publish hooks, registers the provider, and resets on re-init or shutdown. |
 | `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler. |
 | `src/agents/types.ts` | Extends `AgentSteerEntry["type"]` with `"compact"` and adds the optional `instructions` field. |

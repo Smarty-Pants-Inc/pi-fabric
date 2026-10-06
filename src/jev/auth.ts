@@ -1,20 +1,15 @@
 import {
   createAssistantMessageEventStream,
-  createProvider,
   envApiKeyAuth,
   type Api,
   type Model,
-  type ProviderStreams,
+  type Provider,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const JEV_NOT_A_CHAT_PROVIDER =
-  "Jev (TypeSafe) is a login-only provider for Fabric's safety classifier; it has no chat models.";
-
-// Newer Pi requires every provider to carry at least one api/images/classifiers
-// implementation. Jev is auth-only and publishes no models, so this stream is
-// unreachable in practice; if anything ever calls it, it ends with an error.
-const failWithoutModels = (model: Model<Api>) => {
+/** Invalid chat calls fail locally; the auth-only provider never generates text. */
+const noChat = (model: Model<Api>) => {
+  if (!model) throw new Error("Jev supplies typed judgments, not chat generation");
   const stream = createAssistantMessageEventStream();
   const error = {
     role: "assistant" as const,
@@ -27,7 +22,7 @@ const failWithoutModels = (model: Model<Api>) => {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason: "error" as const,
-    errorMessage: JEV_NOT_A_CHAT_PROVIDER,
+    errorMessage: "Jev (TypeSafe) is a login-only provider for Fabric's safety classifier; it has no chat models.",
     timestamp: Date.now(),
   };
   stream.push({ type: "error", reason: "error", error });
@@ -35,19 +30,15 @@ const failWithoutModels = (model: Model<Api>) => {
   return stream;
 };
 
-const JEV_LOGIN_ONLY_API: ProviderStreams = {
-  stream: (model) => failWithoutModels(model),
-  streamSimple: (model) => failWithoutModels(model),
-};
-
-/** Auth-only provider: available to /login, never advertised as a chat model. */
-export const createJevAuthProvider = () => createProvider({
+/** Native auth-only Provider: /login support without inventing an operation API. */
+export const createJevAuthProvider = (): Provider => ({
   id: "jev",
   name: "Jev (TypeSafe System One)",
   baseUrl: "https://api.typesafe.ai/v1",
   auth: { apiKey: envApiKeyAuth("TypeSafe API key", ["TYPESAFE_API_KEY"]) },
-  models: [],
-  api: JEV_LOGIN_ONLY_API,
+  getModels: () => [],
+  stream: noChat,
+  streamSimple: noChat,
 });
 export function registerJevAuth(pi: ExtensionAPI): void {
   // Keep lightweight test/managed adapters without provider registration usable.

@@ -20,6 +20,34 @@ branch navigation discards delivery from old-frontier jobs. Session shutdown/rel
 closes the inbox before aborting jobs, so cleanup cannot start a new turn.
 Print-mode processes do not stay alive indefinitely just to receive late events.
 
+## Extension timing bridge
+
+Fabric emits `pi-fabric:shell:timing:v1` on the owning session's `pi.events` bus.
+`FABRIC_SHELL_TIMING_EVENT` and `FabricShellTimingV1` are exported from
+`pi-fabric/protocol`; optional consumers may mirror the contract without importing
+Fabric. The payload contains only:
+
+```text
+{ version: 1, sessionId, taskId, tool: "bash" | "powershell",
+  phase: "started" | "finished", timestamp }
+```
+
+`started` is emitted synchronously at background handoff (explicit, hang threshold,
+manual, or monitor), not process creation. `finished` is emitted at terminal
+observation for any outcome, or before runtime teardown closes the job store.
+Timestamps are observation times in epoch milliseconds, not backdated process
+start/exit times. Foreground-only jobs emit neither event. No command, output,
+path, credentials, or model message is included. Acknowledgements and output
+monitor batches do not change timing, and UI-only jobs are included.
+
+Consumers must filter by session, deduplicate task transitions, and union these
+intervals with foreground tool calls without adding full job durations to
+already-metered calls. pi-ledger records only the additional background union as
+agent tool time, including between turns. No polling, model wakeup, or new setting
+is involved. Shutdown/reload closes live spans; processes and clocks are not
+restored on restart. Billing consumers should also flush at their own shutdown
+before sealing their log, regardless of extension shutdown order.
+
 ## Agent awareness and yielding
 
 Before each model request, Fabric projects one bounded live-task reminder into
@@ -50,6 +78,11 @@ works without a terminal and does not restore processes across Pi restarts.
 - The widget shows up to three tasks, elapsed time, and the command or short
   description. It stays alive after the Fabric program returns. Completion hints
   expire after 30 seconds; retained jobs remain in the inspector.
+- The rounded, theme-aware inspector groups tasks into **Active**, **Needs
+  attention** (failed/timed out), and **Finished**. Purpose/command labels lead;
+  IDs, elapsed time, exit codes and monitor delivery sit beneath each task.
+  Live tasks use Fabric's activity spinner; completed tasks have fixed status icons.
+  Arrows/PageUp/PageDown navigate the list without selecting group headings.
 - Enter opens detail; arrows/PageUp/PageDown scroll the bounded output tail; G
   follows the tail; x twice within three seconds stops; Esc backs out/closes.
 - Elapsed time and time since last output are separate. A quiet shell is not
@@ -70,7 +103,8 @@ return task;
 `get` returns metadata and an 8KB output tail and acknowledges pending agent delivery.
 `stop` targets a stored job's abort controller, never an arbitrary or recycled PID.
 Stopping a task does not wake the agent. Tasks are local to this runtime; IDs and
-live processes are not restored across Pi restarts. Up to 256 completed handles
+live processes are not restored across Pi restarts, except
+[durable tasks](#durable-tasks-through-jev-fabric). Up to 256 completed handles
 are retained for at most 24 hours. Logs use Fabric's private scratch retention.
 The 1MiB in-memory tail and 8MiB disk log limits remain unchanged: a log is **not a
 full-output archive**, and truncation is disclosed.
@@ -88,11 +122,112 @@ return {receipt,batch};
 ```
 
 - `wait` returns `{task,output,timedOut}`. It waits for terminal metadata, then reads the bounded tail; inspect `task.status` and `task.exitCode`. A successful terminal read acknowledges pending delivery like `get`. A timeout returns the current snapshot, not a failed-process verdict.
-- `watch` requires an opt-in monitor. The launch-time `monitor.match` is the case-sensitive literal filter. It returns `{task,reason,lines,omitted,nextCursor}` when a new batch exists, the task finishes, or the observation ceiling expires. `reason` is `event`, `finished`, or `timeout`; a final event may precede `finished` on the next call.
-- Start `after` at 0; pass the returned `nextCursor` on later calls. Only the latest batch (at most eight previews) is retained. `omitted` counts matching previews lost since the supplied cursor, including intermediate overwritten batches. A cursor from the future is rejected. Truncation markers and monitor filtering/deduplication still apply: this is not a lossless stdout/RPC channel.
+- `watch` requires an opt-in monitor. The launch-time `monitor.match` is the case-sensitive literal filter. It returns `{task,reason,lines,losses,omitted,more,nextCursor}` when a new batch exists, the task finishes, or the observation ceiling expires. `reason` is `event`, `finished`, or `timeout`; a final event may precede `finished` on the next call.
+- Every accepted monitor line has a monotonic cursor, after jev-fabric's retained events. Start `after` at 0 and pass the returned `nextCursor` on later calls. The newest 256 lines are replayable from any cursor, at most 64 per call; while `more` is true, call again immediately. A cursor from the future is rejected.
+- Missing positions are disclosed, never joined: `losses` lists `(after, next]` cursor ranges with reason `burst` (more than 256 lines within one delivery interval, oldest coalesced) or `evicted` (aged out of the ring before this cursor read them), and `omitted` is their total. Truncation markers and monitor filtering/deduplication still apply: this is not a lossless stdout/RPC channel.
+- Agent-facing `wake` events still carry only the eight newest previews per batch; replay is for code-owned controllers.
 - Defaults: wait 30 seconds, watch 5 seconds; each accepts `timeoutMs` from 1 to 300000. Ready evidence returns immediately. Neither timeout nor cancellation stops or renews the task. Store shutdown rejects pending observations and removes their subscriptions.
 - No polling, inference, or extra wakeups are performed by wait/watch. Ordinary background tasks and wake-enabled monitors retain their existing notification behavior. Main usually yields for those notifications; a controller can use UI-only monitors and wait/watch without a model turn per event.
 - A detached task belongs to the Pi session, not the observing Jev program. Stopping that program cancels its pending wait/watch, not the task. Preserve IDs, set finite process deadlines, and explicitly call `tasks.stop` when required.
+
+## Durable tasks through jev-fabric
+
+`pi.bash({cmd, durable: true})` hands the process to an external
+[jev-fabric](https://github.com/fabric-runtime/jev-fabric) store, outside this Pi
+process. It is for dev servers, watchers and long builds that must outlive the
+session. macOS and Linux only. Fabric uses your own compatible `jev-fabric`
+outside the workspace, else the bundled npm package (see
+[which jev-fabric](shell-composition.md#which-jev-fabric)). It never downloads
+one: without a suitable binary the call fails with install/update guidance for
+the user, never a silent fallback to a local process.
+
+```ts
+return await pi.bash({cmd: "bun run dev", durable: true, description: "Dev server"});
+```
+
+- `durable` implies background; `background: false` is rejected, and the call is
+  bash-only. Approvals, extension hooks, cooperative
+  [bash middleware](shell-middleware.md) (environment and output filters) and
+  the explicit `timeout` still apply: middleware wraps the jev-fabric operations
+  exactly as it wraps the local backend. Opaque shell overrides and managed hosts
+  cannot use it.
+- The command runs from a private `0600` script with the call's cwd and
+  (spawn-hooked) environment, so argv limits and quoting never apply. The
+  description becomes the jev-fabric job label.
+- Output reaches the task through `jev-fabric follow`, a live stream of the
+  job's retained events: no Node-side polling, and no model turn. jev-fabric
+  retains bounded previews, so dropped bytes and aged-out events are written
+  into the task output as disclosures, never silently joined.
+- Completion notifies the owning session like any background task. `tasks.stop`
+  (or `x` twice in the inspector) stops the job through `jev-fabric stop`,
+  never by PID. Monitors work while the session is attached.
+- **Session shutdown, reload or Pi exit detaches, never kills.** The job keeps
+  running in its store. Fabric records the session binding in
+  `<agentDir>/fabric/durable-tasks/` (one private file per task) and, on the owning session's next model
+  request, `tasks.*` call or inspector open, reattaches the same task ID from
+  the start of the job's retained events. A job that finished while Pi was away
+  delivers its completion then. Another session never reattaches it
+  automatically, and monitors are not restored.
+- Reattached output passes through the currently active middleware. If a task
+  was filtered at launch and no middleware is active now, its output is withheld.
+
+### Completion notify through the mesh
+
+```ts
+return await pi.bash({cmd: "bun run build", durable: true, description: "Build", notify: {topic: "builds"}});
+```
+
+`notify: {topic, kind?}` (durable only) publishes one event when the command exits:
+`{kind: kind ?? "task.completed", data: {taskId, exitCode, description?}}` on that
+[mesh topic](agents.md#scheduled-events), even when no Pi session is attached.
+Subscribed actors, including durable actors on the resident host, wake on it.
+
+- At launch, Fabric mints a single-use [external grant](agents.md#external-grants)
+  for the topic and kind, valid for 7 days (the longest durable job is 24 hours). The
+  private `0600` launch script runs the command in a subshell, then runs
+  `pi-fabric mesh post` with the token in its environment and re-exits with the
+  command's own status. A failed or impossible post never changes the task result.
+- The event is posted by the job's own shell, so it carries `origin: "external"` and
+  `untrusted: true` like any grant post. `exitCode` is the subshell status, so a
+  signal-terminated command reports `128 + signal`.
+- Delivery happens when the shell reaches its trailer. A task stopped through
+  `tasks.stop` or killed at its timeout usually does not reach it and publishes
+  nothing; its session still records the terminal state. The mesh must be enabled,
+  and the topic must not be host-reserved. An unused grant expires on its own.
+
+### Jobs from other harnesses
+
+The default store is `<cwd>/.jev-fabric-native`, the same one Claude Code,
+Codex or a shell uses for `jev-fabric` in that project, so it doubles as a
+process registry across harnesses. `tasks.external` lists jobs there that no
+task of this session tracks (id, state, label, start time). `tasks.adopt({jobId,
+description?})` attaches one as a durable task of this session: output,
+completion notification, wait/watch/stop and an inspector row. Adoption never
+restarts or signals the process; stopping it afterwards does.
+
+```ts
+const {jobs} = await tools.call({ref: "tasks.external", args: {}});
+return await tools.call({ref: "tasks.adopt", args: {jobId: jobs[0].id}});
+```
+
+Boundaries are jev-fabric's: trusted native execution, not a sandbox; no restart
+of the machine is survived; no exactly-once execution or rollback.
+
+## Reading output and watching without a monitor
+
+Any background task, including durable and adopted ones, can be read and filtered after launch, with jev-fabric's records:
+
+```ts
+const id = "task-id-from-the-launch-result";
+const page = await tools.call({ref: "tasks.read", args: {id, offset: 0, waitMs: 5000}});
+// {id, stream:"output", offset, bytes, omittedBytes, text, next, eof, state}
+const seen = await tools.call({ref: "tasks.watch", args: {id, match: "listening on", after: 0, timeoutMs: 30000}});
+// {reason, lines, omittedBytes, more, nextCursor}: nextCursor is a byte offset
+```
+
+- `tasks.read` offsets count every byte of combined output since launch and never reset. The live window is the 1 MiB tail; after exit 32 KiB stays readable. Older bytes are disclosed in `omittedBytes`. Text pages never split a UTF-8 character; `encoding:"base64"` is byte-exact. `waitMs` long-polls for new bytes or exit.
+- `tasks.watch` with `match` scans complete lines after a byte cursor for a case-sensitive literal chosen at watch time, like `jev-fabric watch <id> <literal>`. The cursor stops at line boundaries, so an unfinished line is matched once it ends or the task exits. Up to 64 lines per call; call again while `more` is true.
+- Neither consumes, acknowledges, wakes the agent, or stops the task. Without `match`, `tasks.watch` keeps reading a launch-time monitor as below.
 
 ## Opt-in monitors
 

@@ -39,7 +39,7 @@ describe("code preview startup", () => {
     const packageJson = JSON.parse(
       fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
     ) as { dependencies?: Record<string, string> };
-    const indexSource = fs.readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8");
+    const indexSource = fs.readFileSync(path.join(process.cwd(), "src", "extension.ts"), "utf8");
     const toolSource = fs.readFileSync(
       path.join(process.cwd(), "src", "fabric-exec-tool.ts"),
       "utf8",

@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.97.0",
+  "version": "0.105.0",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,9 +18,21 @@
       "types": "./dist/agents.d.ts",
       "import": "./dist/agents.js"
     },
+    "./runners": {
+      "types": "./dist/runners.d.ts",
+      "import": "./dist/runners.js"
+    },
+    "./durable": {
+      "types": "./dist/durable.d.ts",
+      "import": "./dist/durable.js"
+    },
     "./mcp": {
       "types": "./dist/mcp.d.ts",
       "import": "./dist/mcp.js"
+    },
+    "./assessment": {
+      "types": "./dist/assessment.d.ts",
+      "import": "./dist/assessment.js"
     },
     "./jev": {
       "types": "./dist/jev.d.ts",
@@ -33,9 +45,14 @@
     "./mesh": {
       "types": "./dist/mesh.d.ts",
       "import": "./dist/mesh.js"
+    },
+    "./scope": {
+      "types": "./dist/scope.d.ts",
+      "import": "./dist/scope.js"
     }
   },
   "bin": {
+    "pi-fabric": "./dist/cli/index.js",
     "fabric-participants": "./bin/fabric-participants",
     "fabric-judge": "./bin/fabric-judge",
     "mesh-bridge": "./bin/mesh-bridge",
@@ -64,11 +81,12 @@
     "proof:dist": "node scripts/smoke-verified-kernels.mjs",
     "build": "bun run proof:artifact && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && bun run assert:build-artifacts",
     "typecheck": "tsc --noEmit",
+    "test:pi1": "bun run build && vitest run tests/pi1-sdk.test.ts tests/pi1-public-contract.test.ts",
     "test:jev:live": "PI_FABRIC_JEV_LIVE=1 vitest run tests/jev-live.test.ts",
     "test:jev:dist": "node scripts/smoke-jev.mjs",
     "test:changed": "node scripts/test-affected.mjs",
     "test:affected": "node scripts/test-affected.mjs --base $PI_TEST_BASE",
-    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/conversation-native-reader-suspension.test.ts",
+    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/worker-installation.test.ts tests/conversation-native-reader-suspension.test.ts",
     "test:related": "vitest related --run",
     "check:fast": "bun run typecheck && bun run test:changed",
     "certify:context": "bun run build && node scripts/certify-context.mjs",
@@ -77,6 +95,7 @@
     "benchmark:memory-heads": "bun run build && node scripts/benchmark-memory-heads.mjs",
     "benchmark:memory-recall": "bun run build && node scripts/benchmark-memory-recall.mjs",
     "benchmark:conversation": "bun run build && node --expose-gc scripts/benchmark-conversation.mjs",
+    "benchmark:kitty": "bun scripts/benchmark-kitty.mjs",
     "benchmark:provider-dispatch": "node scripts/benchmark-provider-dispatch.mjs",
     "benchmark:activity": "node --expose-gc scripts/benchmark-activity.mjs",
     "benchmark:turn-cpu": "node scripts/benchmark-turn-cpu.mjs",
@@ -102,24 +121,28 @@
     "orchestration"
   ],
   "license": "MIT",
+  "funding": {
+    "type": "opencollective",
+    "url": "https://opencollective.com/pi-fabric"
+  },
   "author": "monotykamary",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/monotykamary/pi-fabric.git"
+    "url": "git+https://github.com/fabric-runtime/pi-fabric.git"
   },
-  "homepage": "https://github.com/monotykamary/pi-fabric#readme",
+  "homepage": "https://github.com/fabric-runtime/pi-fabric#readme",
   "bugs": {
-    "url": "https://github.com/monotykamary/pi-fabric/issues"
+    "url": "https://github.com/fabric-runtime/pi-fabric/issues"
   },
   "engines": {
     "node": ">=24"
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/extension-bootstrap.js"
     ],
     "skills": [],
-    "image": "https://raw.githubusercontent.com/monotykamary/pi-fabric/main/media/banner.svg"
+    "image": "https://raw.githubusercontent.com/fabric-runtime/pi-fabric/main/media/banner.svg"
   },
   "dependencies": {
     "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
@@ -138,22 +161,31 @@
     "yaml": "^2.9.0"
   },
   "peerDependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
     "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/chord": { "optional": true },
+    "@earendil-works/pi-durable": { "optional": true }
+  },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.87.0",
-    "@earendil-works/pi-ai": "0.87.0",
-    "@earendil-works/pi-coding-agent": "0.87.0",
-    "@earendil-works/pi-tui": "0.87.0",
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
+    "typebox": "1.3.27",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^26.1.2",
     "@types/pg": "^8.23.1",
     "esbuild": "^0.25.12",
     "knip": "^6.29.0",
-    "typebox": "1.3.8",
     "vitest": "^4.1.10"
   },
   "workspaces": [
@@ -163,5 +195,8 @@
     "ajv": {
       "fast-uri": "^3.1.6"
     }
+  },
+  "optionalDependencies": {
+    "jev-fabric": "0.5.0"
   }
 }

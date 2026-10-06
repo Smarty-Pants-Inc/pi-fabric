@@ -15,7 +15,7 @@ Use these helpers:
 - Use `workflow.pipeline(items, ...stages)` or `pipeline(...)` to run sequential stages for each item with concurrency across items.
 - Use `workflow.configure({ name, description })` to name the activity surface.
 - Use `workflow.phase(name, { id?, description?, total? })` or `phase(...)` to define progress groups.
-- Use `workflow.item(...)` for non-agent work items that change status over time.
+- Use `workflow.item(...)` for non-agent work items that change status over time. An optional stable `id` (1–128 characters of `[A-Za-z0-9._:/-]`) keeps one item across updates; without one, each call creates `item-<n>` in invocation order. An optional `meta` plain JSON object (at most 2 KiB serialized) rides only on the host [`pi-fabric:workflow-item:v1`](providers.md#workflow-item-events) event. Invalid ids, statuses, or meta fail the call.
 - Use `workflow.event(...)` to record important milestones in the dashboard feed.
 - Use `workflow.log(...)` to add short progress notes.
 - Read `workflow.budget` for token-budget observations.
@@ -59,19 +59,19 @@ Durable spawns use the same inbox. Undelivered envelopes survive disconnects; re
 
 Inbox delivery receipts require the completion carrier in Pi's actual session JSONL, with a matching session header and successful file/namespace durability barriers. Pi's in-memory entry list, a failed append, a fresh unflushed session, and tree navigation are not receipts; the durable source stays unread. In-memory-only hosts cannot confirm durable inbox delivery.
 
-Completion recovery keeps worker-attempt candidates separate from the supervisor's settled logical-run outcome. A failed startup or recoverable stop is not delivered or returned by a durable wait while its pinned supervisor can still retry it. An orphan candidate becomes eligible only after that supervisor process is gone; a settled outcome takes precedence. Legacy launch manifests without a supervisor identity cannot prove orphan settlement, so their worker status stays retained rather than being automatically promoted.
+Completion recovery keeps worker-attempt candidates separate from the supervisor's settled logical-run outcome. A failed startup or recoverable stop is not delivered or returned by a durable wait while its pinned supervisor can still retry it. An orphan candidate becomes eligible only after that supervisor process is gone; a settled outcome takes precedence. Legacy launch manifests without a supervisor identity cannot prove orphan settlement, so their worker status stays retained and is not automatically promoted.
 
 Full journal results are readable only by the original recipient session or its validated, claimed exact-lane successor (same project root, cwd, name and role). Other sessions see bounded status metadata and the pending/addressed-to state, never private task, text, error, structured value, usage or log/session details; their reads do not acknowledge the recipient's result. Receipted outcomes do not replay to later successors; a successor cannot clean up or read logs for predecessor-owned runs. Journal result availability is not durable-run operational ownership: ordinary local runs continue to use their local manager for log and cleanup. Durable receipts fence replay. An unreadable, malformed, or identity-mismatched fence fails closed: no successor claim, private body access, delivery, or replacement receipt; the source is retained and a storage diagnostic is surfaced until repaired. Their live mesh claims are retired with ownership/version checks and crash leftovers are reconciled even when notifications are disabled.
 
 ### Actor children and reply targets
 
-A child's immediate spawner is distinct from its lineage root. `agents.spawner()` returns `{ id, kind, runId? }`; `agents.followUp({ id: "spawner", message })` and `agents.steer` accept that bound target. Inside an actor-spawned task, it names the actor and its spawning activation run, not the implementing lead's Main. `agents.main()` / `id: "main"` still deliberately address the root Main. An absent spawner binding fails rather than falling back to the root; old workers must be respawned to get the new binding.
+A child's immediate spawner is distinct from its lineage root. `agents.spawner()` returns `{ id, kind, runId? }`; `agents.followUp({ id: "spawner", message })` and `agents.steer` accept that bound target. Inside an actor-spawned task, it names the actor and its spawning activation run, not the implementing lead's Main. For process tasks, `agents.main()` / `id: "main"` also use the immutable immediate-spawner return address described below; the root topology fields stay unchanged. An absent spawner binding fails without falling back to the root; old workers must be respawned to get the new binding.
 
 Automatic completion goes to the spawning actor's live run inbox. If that activation ends before consumption, a write-ahead result is transferred once to that actor's persisted mailbox for its next activation. Wait/status consumption or live-inbox delivery suppresses a later mailbox copy. The mailbox envelope includes `data.resultFile`, an actor-local JSON file containing the full result (including structured value), so a later activation can read more than the bounded notification. Consumed foreground/live results leave no full-result archive; a mailbox handoff retains its result until that activation consumes it. Unread results and receipt tombstones are bounded by `retention.actorRunArchiveMs` on the existing owner sweep (pending mailbox items are protected). Stopped actors retain unread results within that retention window; Fabric never silently delivers them to Main as Main-owned children. A session-owned child still stops when its spawning worker shuts down; that stopped outcome is preserved, not a promise that the child survives shutdown.
 
 Live preparation never consumes individual outcomes: only a completely prepared batch gets one atomic pre-send receipt, and its full results remain until delivery cleanup. As with any uncertain `sendMessage` outcome, a committed pre-send claim chooses at-most-once delivery. Foreground `run`/`wait`/terminal `status` commits durable consumption **before returning the value to the actor program**, not in a best-effort post-delivery receipt. A transient receipt failure is retried once; persistent failure rejects the observation without returning an unrecorded result. Archive unlink failure does not undo consumption or fail a returned result. A mailbox activation refused by `validWhile`, unable to start its worker, or failing without actual model output/tool execution retains the full result in a persisted deferred-handoff side store, outside the runnable FIFO. The next valid activation receives labelled unread-child context with the original activation facts and `data.resultFile`; it does not retry the stale handoff as the current activation. Owner restart restores this side store but does not independently launch a retry. Successful inference consumes the attached snapshot and removes its full archives. Deferred handoffs expire with `retention.actorRunArchiveMs`.
 
-**Review-role mitigation for older installations — synthetic (unit-tested), not independently native-Pi verified:** this mitigation's evidence is separate from the native actor-child routing proof; do not attribute that proof to this workaround. For bounded subtasks, keep the result in the same `fabric_exec` program and wait before deciding the verdict:
+**Review-role mitigation for older installations: synthetic (unit-tested), not independently native-Pi verified:** this mitigation's evidence is separate from the native actor-child routing proof; do not attribute that proof to this workaround. For bounded subtasks, keep the result in the same `fabric_exec` program and wait before deciding the verdict:
 
 ```ts
 const result = await agents.run({
@@ -176,7 +176,7 @@ The manager snapshots the list and propagates it unchanged to recursive process
 children, so later ambient changes cannot retarget a running child's sends.
 Stop/respawn children to apply a changed binding or allowlist.
 
-Fabric—not the external helper—sets `PI_FABRIC_SPAWNER_ID`,
+Fabric, not the external helper, sets `PI_FABRIC_SPAWNER_ID`,
 `PI_FABRIC_SPAWNER_SESSION_ID` (the actual native Pi session, not a PID),
 `PI_FABRIC_SPAWNER_CHAIN` (JSON exact ancestor ids), and
 `PI_FABRIC_TASK_PROCESS_CHILD=1` through the manager-owned launch snapshot. Do not
@@ -260,6 +260,8 @@ is emitted after actual worker registration (not queue admission) with
 ### Requested models are authoritative
 
 For Pi workers, Fabric reapplies the resolved `provider/model` over RPC **after startup extensions finish**, reapplies the requested thinking level, and independently reads `get_state` before sending the task. A successful `set_model` response alone is insufficient: it can echo the requested model even when an extension switches away during `model_select`. Thinking is reported at Pi's effective, capability-clamped level.
+
+With `thinking.bounds` configured, Fabric clamps each run's level into the bounds before launch and reports the original as `requestedThinking`. `agents.run` and `agents.spawn` also accept `thinkingBounds: {min?, max?}` inside the caller's bounds; children inherit the effective bounds and never widen them. See [thinking control](thinking.md#child-runs).
 
 Startup waits for a correlated RPC readiness response. Startup, model admission, and task execution share the run's configured `timeoutMs`; there is no separate 15-second admission cap. RPC readiness does not guarantee a fast `set_model`: authentication checks and async `model_select` hooks can still wait on provider initialization or shared resources during concurrent launches. A slow handshake may use the remaining run budget, but it never resets or extends the overall deadline.
 
@@ -433,6 +435,31 @@ This fallback is available once per executor run, with a persisted receipt that 
 
 **Trajectory compaction.** Set `compact` to give the executor a compacted transcript in place of the full raw branch. A value of `true` applies the default summary. Use `{ instructions?, preserve? }` to add compaction instructions of up to 8K characters and as many as 16 explicit preserve facts of up to 2K characters each. These limits match `compact.request`. Fabric budgets the complete inherited context, including the finalized outer `fabric_exec` result and any thinking-transfer digest, before appending the compaction marker. The executor sees the projected summary plus a bounded, tool-pair-safe raw tail; an oversized outer call/result pair is summarized together to avoid leaving an orphan result. When available, the destination model window and its Pi compaction settings apply, including trusted project/model overrides. Source-model usage is not treated as destination calibration. Without model metadata, the raw tail is still bounded (20K estimated tokens by default). The append-only child file retains the full raw trajectory. Fabric records the successful outcome under `compaction` in the child's `pi-fabric-handoff` custom entry, including sections, tokens, and cut point. If requested compaction cannot produce a valid result, the handoff fails; the unbounded fork is never silently launched. Omit `compact` to keep the fork verbatim.
 
+### Context-inheriting spawn
+
+`agents.run()` and `agents.spawn()` accept `seed: "task" | "branch" | "snippet"` for Pi children. The default `"task"` keeps the historical behavior: the child receives the task alone. Other runners fail before launch when `seed` is not `"task"`.
+
+`seed: "branch"` starts the child from a copy of the caller's current session branch, with the task appended as a new user turn. Unlike `agents.handoff()`, it never blocks Main or waits for the `fabric_exec` boundary; the caller keeps running and can `wait` later. The copy ends at the caller's last completed turn: Fabric drops the in-flight assistant turn that holds the outer `fabric_exec` call (the newest assistant entry after the latest user message with an unresolved tool call), so the child never sees a dangling tool call. Fabric materializes the copy with the same session machinery as handoff, applies thinking transfer when the child model's reasoning channel differs, and records a `pi-fabric-fork` custom entry with `boundary: "last_completed_turn"`. The seed works with `worktree: true`. Durable `agents.spawn()` refuses `seed: "branch"` because the resident host accepts no session seeds; use `"snippet"` there.
+
+`seed: "snippet"` prefixes the task with the last `seedMessages` user and assistant messages (1 to 50, default 12) inside an `<inherited-conversation>` block. Only text survives: tool calls, tool results, thinking, and images are dropped, and each message is truncated to 4,000 characters. The cut is deterministic and works with durable residency.
+
+A supervised fork pairs a mailbox actor with a branch-seeded worker. The worker inherits the conversation; the supervisor reviews each result:
+
+```ts
+const supervisor = await agents.create({
+  name: "fork-supervisor",
+  instructions: "Review a worker result. Reply APPROVE or a concrete correction.",
+});
+let task = "Implement the plan we just agreed on.";
+for (let round = 0; round < 3; round++) {
+  const worker = await agents.run({ task, seed: "branch", worktree: true });
+  const verdict = await agents.ask({ id: supervisor.id, message: worker.text, data: worker.worktreeResult });
+  if (verdict.text?.includes("APPROVE")) return worker;
+  task = `Revise the previous attempt in a fresh fork: ${verdict.text}`;
+}
+return "Supervisor did not approve after 3 rounds";
+```
+
 ### Automatic Fabric-boundary prewalk
 
 `/fabric prewalk` adapts Can Bölük's [Prewalk research](https://stencil.so/blog/prewalk) for Fabric. OMP changes models inside one live agent loop at the first edit or write that a todo gates. Fabric uses a coarser atomic boundary. The first successful monitored mutation marks the current outer `fabric_exec`. All remaining nested calls settle before prewalk continues. This behavior preserves programmable sequential and parallel Fabric semantics.
@@ -523,6 +550,85 @@ Each run gets an isolated `fabric-<run-id>` Veda session through `-S` and `--no-
 
 Veda children do not have recursive Fabric capabilities. Fabric rejects `recursive: true`. Veda does not support steering, so steer and follow-up calls throw when called. It also cannot run persistent actors because each invocation executes one headless prompt. Use `runner: "pi"` when you need recursive Fabric or persistent coordination.
 
+### Custom runners
+
+For an opt-in implementation backed by the experimental Pi durable harness, see [Durable Pi runner](durable-pi.md). It uses this hosted-runner contract; importing it does not replace the default Pi runner or make arbitrary `fabric_exec` programs replay-safe.
+
+A Pi extension can add a runner through the `pi-fabric/runners` subpath. The subpath is never loaded by the Fabric extension at startup.
+
+```ts host
+import { registerAgentRunner, listAgentRunners, getAgentRunner } from "pi-fabric/runners";
+
+const unregister = registerAgentRunner(adapter); // FabricWorkerRunner | FabricHostedRunner
+```
+
+Every adapter has an `id` (`/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/`, at most 64 characters; `pi`, `claude`, and `veda` cannot be replaced), a `label`, and a `capabilities` object in which every flag is a required boolean: `recursiveFabric`, `steer`, `followUp`, `persistentSessions`, `kernels`, `handoff`, `modelDiscovery`, `imageInput`, `compaction`, `questions`, `sleep`, `writePolicy`. Optional hooks are `models()`, `defaultModel()`, `normalizeModel()`, and `mapTools()`. The built-in runners declare their flags in the same table, so every capability check is uniform. Fabric refuses a request that needs an undeclared capability before admission, budget, or worktree side effects: `recursive: true` needs `recursiveFabric`, an explicit `kernel` needs `kernels`, `images` need `imageInput`, session seeds (trajectory handoff, `seed: "branch"`) need `handoff`, `readOnly`/`writableRoots`/`shell` or an inherited confinement need `writePolicy`, routed child dialogs need `questions`, `agents.compact` needs `compaction`, and actors need `persistentSessions`. A runner that declares `writePolicy` receives the effective policy in its launch context and must enforce it. In a scoped session, every launch context also carries `scope`: the host-issued [scope](providers.md#principal-and-scope) narrowed for that run. Runners pass it on to any provider that reads data for the run.
+
+Two kinds exist:
+
+- `kind: "worker"`: `launch(context)` returns `{ workerPath, workerArguments }`. Fabric runs that script under the selected transport and reads the [worker protocol](#worker-protocol) files. The context carries the run files, the task and launch facts, and `fabricWorker`, the launch Fabric would use for its own worker, so an adapter can wrap it. The optional `stop()` runs before the transport kills the process. A worker that dies before any progress is relaunched with the same launch (startup retry); Fabric never re-prompts a custom worker mid-run.
+- `kind: "hosted"`: no Fabric process. The adapter owns execution, for example in a daemon. `prepare(context)` must be pure and returns a JSON locator of at most 8 KiB. Fabric writes it to the run record (`hosted.locator`) and `hosted.json` before it calls `start(locator, context, reporter)`. `context.idempotencyKey` is the Fabric run id, so a second submission with the same key must not start a second run. `liveness(locator)` answers `running`, `sleeping`, `settled`, `cancelled`, `interrupted`, or `unknown`. `stop(locator, reason)` is required and returns `{ confirmed }`. `abort`, `sleep`/`wake` (with the `sleep` capability), `steer`, and `followUp` are optional. The adapter delivers steer and follow-up messages itself; a delivery failure lands in the run transcript.
+
+The hosted `reporter` has `progress({ turns, toolCalls, currentTool, text })`, `usage(total)` with the cumulative run usage (Fabric records the increase, which feeds budgets and `tokens.usage` lifecycle events), `transcript(event)`, `question(q)`, `finish({ status, output, structured? })`, and `fail({ error, retryable })`. `question` routes like a Pi child dialog: direct UI when the parent has one, otherwise a [decision](decisions.md#routed-child-questions), and only with `agents.childQuestions: "route"`. The run record shows `blockedOn` while it waits.
+
+A hosted adapter returns `{ confirmed: true }` from `stop` only after execution has ceased and its workers no longer use the run's files. An accepted stop request, terminal result, or liveness response does not establish custody release. Fabric durably records an explicit confirmation in `hosted-exit.json`, bound to the run, runner, directory, start time, and prepared locator. Collection still checks native descendants and retains indeterminate, missing, changed, or linked receipts. Completed hosted runs without this explicit confirmation remain retained.
+
+Fabric never relaunches or re-prompts a hosted run. A `sleeping` run stays `running` with `sleeping: true`. When liveness reports `interrupted` or `unknown` (or `settled` without a result), the run settles `failed` with `outcome: "indeterminate"`. The same outcome marks a stop the adapter did not confirm, and a durable spawn request the resident host was processing when it restarted. Hosted runs work with `agents.run`, `spawn`, `wait`, `status`, `stop`, `steer`, `followUp`, the dashboard, budgets, and `residency: "durable"`. Persistent actors need a worker runner.
+
+Registration is process-local. The resident host runs Pi with `--no-extensions`, so a durable run of a custom runner requires `residentModule`: an absolute path to an ES module that registers the adapter when imported. Fabric refuses a durable spawn without it. The resident host imports the module before launch. On restart it imports it again and calls `attach(locator, context, reporter)` for every unfinished hosted run; a run whose runner cannot be loaded settles indeterminate. When the resident host shuts down, durable hosted runs are detached; they keep running and are re-attached on the next start. Session hosted runs are stopped with the session.
+
+An illustrative daemon-backed adapter:
+
+```ts host
+import { registerAgentRunner, type FabricHostedRunner } from "pi-fabric/runners";
+
+const daemon = "http://127.0.0.1:7777"; // hypothetical job daemon
+const call = async (path: string, body?: unknown) =>
+  (await fetch(`${daemon}${path}`, { method: body ? "POST" : "GET", body: JSON.stringify(body) })).json();
+
+const runner: FabricHostedRunner = {
+  kind: "hosted",
+  id: "jobd",
+  label: "Job daemon",
+  residentModule: new URL(import.meta.url).pathname,
+  capabilities: {
+    recursiveFabric: false, steer: true, followUp: false, persistentSessions: false,
+    kernels: false, handoff: false, modelDiscovery: false, imageInput: false,
+    compaction: false, questions: false, sleep: false, writePolicy: false,
+  },
+  prepare: (context) => ({ job: context.idempotencyKey }),
+  start: async ({ job }: any, context, reporter) => {
+    await call("/jobs", { id: job, task: context.task, cwd: context.cwd }); // idempotent by id
+    void follow(job, reporter);
+  },
+  attach: async ({ job }: any, _context, reporter) => void follow(job, reporter),
+  liveness: async ({ job }: any) => (await call(`/jobs/${job}`)).state ?? "unknown",
+  stop: async ({ job }: any) => ({ confirmed: (await call(`/jobs/${job}/stop`, {})).stopped === true }),
+  steer: async ({ job }: any, message) => void (await call(`/jobs/${job}/input`, { message })),
+};
+
+async function follow(job: string, reporter: Parameters<FabricHostedRunner["start"]>[2]) {
+  const result = await call(`/jobs/${job}/wait`); // replays the result after a restart
+  reporter.usage(result.usage);
+  reporter.finish({ status: result.ok ? "completed" : "failed", output: result.text });
+}
+
+registerAgentRunner(runner);
+```
+
+### Worker protocol
+
+A worker runner process talks to Fabric through four files named in `context.files`. `pi-fabric/runners` exports a JSON Schema for each (`AgentRunRecordSchema`, `LifecycleLineSchema`, `TranscriptEventSchema`, `SteerCommandSchema`, protocol version `FABRIC_WORKER_PROTOCOL_VERSION = 1`). Readers ignore unknown fields.
+
+| File | Direction | Content |
+| --- | --- | --- |
+| `statusFile` | worker writes | The run record, replaced atomically (write a temporary file, then rename). `status` moves from `running` to `completed`, `failed`, `stopped`, or `timed_out`; `text`, `value`, `error`, `turns`, `toolCalls`, `usage` (cumulative), `currentTool`, and `blockedOn` are the public fields. |
+| `lifecycleFile` | worker appends | One `{ version: 1, event, occurredAt, data }` line per event: `tokens.usage` (a per-event increase), `question` (a dialog to route), and the `pi.*` lifecycle events. |
+| `logFile` | worker appends | Transcript events for logs and the dashboard: `message_end` with a `user` or `assistant` message, `tool_execution_start`, `tool_execution_end`, and `extension_error`. |
+| `steerFile` | Fabric appends | Commands with `id` and `ts`: `steer`, `follow_up`, `set_steering_mode`, `set_follow_up_mode`, `compact`, and `ui_response` (`requestId` plus `value`, `confirmed`, or `cancelled`) answering a routed `question`. |
+
+A worker that exits without a terminal record is treated as a dead transport: it is relaunched only when it made no progress, and otherwise settles failed.
+
 ### Switching Main's session model
 
 `agents.switchModel` changes the live Pi session model in place and keeps it there:
@@ -550,7 +656,7 @@ const effort = await agents.setThinking({ id: main.id, thinking: "high" });
 This call uses Pi's synchronous thinking setter: the in-flight inference stays
 unchanged, and the next model turn consumes the new effort. It returns Main's
 native read-back state plus `previous: { model?, thinking? }` and `caller` (the
-exact calling Main ID); Pi's capability clamp is reflected in `thinking`.
+exact calling Main ID); `thinking` reports Pi's capability clamp.
 Cancellation, deadline, authority and liveness are checked after the serialized
 queue wait, with no await between the final fence and native state/journal commit.
 Only session scope is supported; a Main thinking binding cannot be cleared.
@@ -603,7 +709,7 @@ keep working files. Unknown process/group identity is never permission to signal
 a recycled numeric ID or to discard custody. Worker crash publication waits for
 execution drain; on Linux surviving same-birth group members remain cleanup
 anchors after the leader exits. Portable POSIX leaderless groups without such
-anchors remain unresolved rather than being signaled blindly.
+anchors remain unresolved; no signal is sent without an owned cleanup anchor.
 
 **Windows scope cut:** the new execution-tree custody/exit receipt is unsupported
 on Windows. Ordinary process workers preserve the pre-PR native-child cleanup
@@ -619,10 +725,10 @@ cleanup or a product-owner risk acceptance.
 | Transport   | Operation                                                     | Command to attach            |
 | ----------- | ------------------------------------------------------------- | ---------------------------- |
 | `process`   | Runs a detached local worker process with the lowest overhead. This is the default transport | none |
-| `tmux`      | Disabled pending execution-custody support                    | —                           |
-| `screen`    | Disabled pending execution-custody support                    | —                           |
-| `localterm` | Disabled pending execution-custody support                    | —                           |
-| `herdr`     | Disabled pending execution-custody support                    | —                           |
+| `tmux`      | Disabled pending execution-custody support                    | unavailable                 |
+| `screen`    | Disabled pending execution-custody support                    | unavailable                 |
+| `localterm` | Disabled pending execution-custody support                    | unavailable                 |
+| `herdr`     | Disabled pending execution-custody support                    | unavailable                 |
 | `auto`      | Selects `process` only                                        | none                        |
 
 The following session-transport integration notes describe the disabled adapters
@@ -643,6 +749,43 @@ localterm start
 `/fabric agents` lists the children. Run `/fabric attach <id>` to show the correct attach command. A caller abort stops a run that never produced progress and detaches a run that already did: the child keeps working to its own terminal state and reports it, so a returned program or a cancelled tool call cannot discard a long participant's work. A worker that catches an external signal mid-run, or whose transport dies after doing work, is resumed, so an interruption the run can recover from never becomes a terminal stop. The manager relaunches the same run in the same directory, hands the child a continuation of the task, keeps the stopped attempt's turns and token usage in the run record, and emits `run.resumed`. An explicit stop, a run deadline, and the `agents.maxTokensPerChild` limit stay terminal. Three resumes bound one run, and the run deadline covers every attempt. When a program uses orchestration entry points such as `agent`/`workflow.agent`, `agents.run`/`agents.wait`/`agents.ask`, `council.run`, or `rlm.query`, Fabric increases the whole-program `executor.timeoutMs` to at least `agents.timeoutMs`. The same increase applies to `agents.*` refs called through `tools.call()` and to refs calculated at runtime. The parent deadline then cannot stop a child that remains within its own agent budget.
 
 Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-<id>` branch from the repository containing the selected `cwd`. Fabric writes that worktree at `<repo>/.pi/fabric/worktrees/<id>` so copy-on-write cloning can keep ignored build artifacts on the same volume, and it records the path in the repository `.git/info/exclude` file. Simple `git worktree add` commands run through `pi.bash` take the same clone-first path. Fabric retains worktrees for inspection until you call `agents.cleanup()`. When the selected cwd is a repository subdirectory, Fabric uses the matching subdirectory in the generated worktree when it exists; otherwise it uses the worktree root. The reported effective cwd is the generated worktree path, and Pi evaluates that generated path as its own canonical cwd. The caller's project and mesh roots remain unchanged, so a child targeting another repository still belongs to the orchestrating Fabric topology. A recursive child in a worktree stays in the same participant directory and does not create another `.pi/fabric/mesh` inside that worktree.
+
+At settlement, a `worktree: true` result and status carry `worktreeResult: { path, branch?, baseRef?, changedFiles, diffstat: { files, insertions, deletions }, kept, diffError? }` beside the existing `worktree` path string. `baseRef` is the commit the branch started from. `changedFiles` is the sorted union of tracked changes against `baseRef` (committed or not) and untracked, non-ignored files, capped at 500 entries; `diffstat.files` counts all of them. Untracked text files up to 1 MiB count their lines as insertions. Fabric computes the summary with two bounded Git calls (15 second timeout each); a Git failure leaves the counts at zero and sets `diffError`. `kept` reports whether the worktree still exists; worktrees stay until `agents.cleanup()`.
+
+Set `agents.worktree.setup` in [configuration](configuration.md#agents) or `worktreeSetup` on one request (which wins) to run a shell command in the new worktree root before the child starts, for example `"bun install --frozen-lockfile"`. The command runs through `/bin/sh -c` (`cmd /c` on Windows) with a 10 minute limit. A non-zero exit or timeout fails the launch with the last 2,000 characters of output and removes the worktree and its branch.
+
+### Write confinement
+
+`agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates a write policy:
+
+- `readOnly: true` refuses every `write` and `edit`.
+- `writableRoots` (at most 32) resolve against the child's cwd, including a generated worktree. Omitted roots default to that cwd. A root must exist or be creatable inside the cwd; Fabric creates missing ones. `write` and `edit` outside the roots fail. Fabric checks the lexical absolute path and the real path of the nearest existing ancestor, so a symlink cannot escape a root, and an unresolvable path fails closed.
+- `bash` and `powershell` are refused under any write policy unless the request sets `shell: "unconfined"`. Fabric does not parse shell commands: an unconfined shell can write anywhere the process can, so it is not a sandbox.
+
+The child Pi process enforces the policy. The worker passes it as `PI_FABRIC_WRITE_POLICY` and loads a small guard extension with `-e`, so it applies even with `extensions: false`. The guard blocks top-level tool calls through Pi's `tool_call` hook and nested `pi.write`, `pi.edit`, and `pi.bash` calls inside `fabric_exec`. It covers tools named `write`, `edit`, `bash`, and `powershell`, including captured overrides with those names; other extension tools and MCP servers are outside it. Native Fabric executors (CPython, `node-process`, `bun-process`) run outside the hook: a confined launch that would use one fails before launch, and a confined child refuses to run one, unless `shell: "unconfined"`. QuickJS and Monty stay available.
+
+Confinement is inherited and only narrows. A confined agent's own children inherit its policy when they request none; an explicit request must keep `readOnly`, cannot switch to `shell: "unconfined"`, and must name roots inside the caller's roots. Claude and Veda runners fail before launch under any policy because Fabric cannot enforce it there. A confined agent cannot start durable agents or actors, since the shared resident host does not inherit its confinement.
+
+### Scope narrowing
+
+In a session with a host-issued [principal and scope](providers.md#principal-and-scope), every child inherits that scope. `agents.run()` and `agents.spawn()` accept `scope: { grants: [{ resource, actions }] }` to narrow it: each grant must be covered by one parent grant, or the launch fails before admission. The principal always stays the parent's. An unscoped session refuses `scope`. Durable spawns and actors keep the scope: the session sends it to the resident host with the request, so the durable child launches with the same scope it would get locally.
+
+```ts
+await agents.run({ task: "Summarize build logs", scope: { grants: [{ resource: "mesh:jobs/build", actions: ["read"] }] } });
+```
+
+### Child environment contract
+
+Fabric children may read these environment variables. They are stable and versioned where noted; every other `PI_FABRIC_*` variable is internal and may change.
+
+| Variable | Contents |
+| --- | --- |
+| `PI_FABRIC_LINEAGE` | JSON `{ version: 1, rootSessionId, parentSessionId?, parentRunId?, runId, depth, childIndex, worker: true }`. `childIndex` is the launch ordinal within the parent process. `agents.self()` adds the same object as `lineage` inside a child. |
+| `PI_FABRIC_WRITE_POLICY` | JSON `{ readOnly, writableRoots, shell }` with canonical absolute roots. Present only for confined children. Malformed values fail closed to read-only with shell denied. |
+| `PI_FABRIC_THINKING_BOUNDS` | JSON `{ min?, max? }` thinking bounds; see [thinking](thinking.md). |
+| `PI_FABRIC_SCOPE` | JSON `FabricScope` `{ version: 1, principal, grants, digest, parentDigest? }`. Present only when the parent is scoped: the inherited or narrowed scope. The worker always clears `PI_FABRIC_SCOPE_FILE`. A child Fabric reads it as its root scope and fails closed when it is malformed. See [principal and scope](providers.md#principal-and-scope). |
+| `PI_FABRIC_DEPTH` | Recursion depth of the child (the root is 0). |
+| `PI_FABRIC_AGENT_NAME` | The child's display name. |
 
 [Model-guidance components](components.md#model-facing-guidance-components) can target participants by canonical provider/model. Direct agents and actors retain their role prompt and receive matching append guidance after it. Recursive Pi children load the project components and resolve their own replaceable Fabric execution slot, so the parent does not duplicate guidance. Durable owners use the latest atomically committed guidance snapshot for each launch. Guidance changes prompts only; it cannot widen tools, approvals, or committed capabilities. Task text, message envelopes, run IDs, and timestamps stay out of the guidance system prompt, so repeated runs with the same role, model, and component projection retain a byte-stable prefix.
 
@@ -670,7 +813,7 @@ code already running with the host process's privileges.
 
 ## Unified participants and steering
 
-Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, or `actor`. It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
+Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, `actor`, or `provider` (work a provider registered as a [participant](providers.md#provider-participants), with `provider` set and no `runner`). It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
 
 `agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. A root publishes its `role` (`PI_FABRIC_ROLE`, else `SMARTY_ROLE` without its `@` stamp) and its `project`: the checkout that owns its git common directory, so every linked worktree of one repository shares its main checkout's project. A root whose cwd is in another repository (a lead working from a worktree of a shared repository) sets `PI_FABRIC_PROJECT` to its own checkout, or any path in it; the root's actors and resident host use that project too. Roots also publish `repository`, their normalized Git origin identity, so moved lanes on other hosts can match the same repository despite different checkout paths. `agents.projectAgent()` uses that identity and the lead id captured at provider launch from `SMARTY_LEAD_SESSION` or the lane's `.local/lead` (a file containing the exact `session:<id>`). The recorded id wins when several same-origin roots exist and permits that exact bridge mirror; an unrecorded mirror cannot claim leadership. Without a recorded id, a single native `project-agent` is selected; multiple candidates throw `FabricProjectAgentAmbiguousError`, and an unavailable or wrong-repository recorded lead throws `FabricProjectAgentUnresolvedError` and does not choose another session. Legacy native records retain checkout-path matching, including an untagged root whose cwd is exactly the project checkout. Print/JSON roots publish `interactive: false`: they remain discoverable but cannot receive `followUp`/`steer`/`tell` or become project leads. A worktree agent reports to its project lead because `agents.main()` returns the worktree agent's own root. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
@@ -687,6 +830,8 @@ const lineage = await agents.list({ scope: "lineage" });
 return { self: await agents.self(), lineage };
 ```
 
+Child dialogs (`select`, `confirm`, `input`, `editor`) are cancelled by default. With `agents.childQuestions: "route"` they reach the parent's UI, or a root-held [durable decision](decisions.md#routed-child-questions) when the parent is headless; the run record shows `blockedOn` while one waits.
+
 For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles, or, for a busy Main, until the next tool boundary after it has waited `mesh.followUpFlushMs` (2 minutes by default). Each delivered message header carries `delivery` and `sent_at` (ISO UTC). A followUp to Main returns `pendingFollowUps` and `oldestAgeS`: how many of the caller's own followUps Fabric still holds for that Main, and the age of the oldest; switch to `steer` when they grow. When Main is idle and its oldest held followUp, from any sender, is older than `mesh.followUpStallSeconds` (10 minutes by default), the queue is stalled: the followUp (or `tell`) throws `Fabric followUp to <target> was accepted but is not being delivered: ...`, and the message stays held. A busy Main admits at most 50 held followUps or 256 KiB per sender, and 200 or 1 MiB in total; past that, the followUp is rejected with the reason. Held followUps are journalled under the mesh root until the session holds them, so a restart does not lose them. A followUp whose `data.coalesceKey` is a non-empty string (at most 200 characters) replaces a followUp from the same sender with the same key that Main still holds unread: the newest message and data take its place in the queue, the result reports `coalesced: true` and `replacedMessageId`, and the replaced one is never delivered, also after a restart. A replacement does not count twice against the quota. A followUp without a key, with another key, or from another sender is held as before, and one already handed to Main is never replaced. `agents.tell` to Main is a followUp and coalesces the same way. This is the Main parallel of an actor's mailbox `coalesceKey`; judging whether a notice is stale stays the sender's job. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
 
 Main message receipts include `triggered: true | false` when the owner can report it. `true` means delivery requested a new turn from an idle Main at admission; it is not a completion receipt. A normal `followUp` (including `tell` to Main) carries the same wake permission across mesh bridges as local delivery. A busy Main reports `false` while holding the followUp for the next eligible boundary, without starting an extra run. Passive, halted, provider-backoff-held, reload-held, and duplicate admissions also report `false`.
@@ -698,6 +843,10 @@ Exact-id `followUp`, `steer`, and `tell` use the same participant directory and 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The owner records each command it admits, so a replayed command is answered from the record and not run again. Each host keeps these records and their outcomes in its own store under the mesh root (`control-seen/`) until the command has expired and left the event log. Each claim is also made in the shared state, so owners that run an older Fabric version for the same host cannot run the command again. That shared copy is kept while the command is in the retained event log, unless the fleet owner has ended support for runtimes before Fabric B8 (see [architecture](architecture.md)). The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
 A root session stays reachable for 5 minutes after its lease lapses, because a late heartbeat under mesh lock contention does not mean the session ended. Fabric sends the command to that root's last owner host, which acknowledges it when the session is alive. After 5 minutes, or when the target has no record on this mesh root, the `Unknown Fabric participant` error states the reason.
+
+#### Stale commands after restart
+
+An owner keeps its host ID across restarts (a Pi session's Main ID, or a resident host's root-derived ID), and a durable actor keeps its participant ID. Each control plane process therefore has a random `incarnation`, and every participant record it publishes carries it as `ownerIncarnation`. Requesters copy that value onto `steer`, `followUp`, `stop`, and `ask` commands. A restarted owner replays the retained control log. It refuses an unclaimed command that names an earlier incarnation and never executes it. The caller receives this error without change: `Fabric control command targets a previous owner incarnation; the owner restarted. Re-resolve the participant and retry.` Fabric does not retry. Read the participant again and decide whether to resend. A command claimed by the earlier process before it stopped still reports its recorded outcome, or an indeterminate one. Acknowledgements carry the acknowledging incarnation, and a requester ignores an acknowledgement from any other incarnation than the one it targeted, except the fencing refusal above. Commands and records without an incarnation, from older Fabric versions, behave as before. Fencing assumes one live process per owner host ID at a time.
 
 ### Peer labels and queue gates
 
@@ -788,6 +937,8 @@ return agents.create({
 
 Claude actors can keep context and use mapped Claude Code tools to inspect or edit. They consume host events and mesh messages that Fabric delivers, then return text or directives. They cannot directly call `fabric_exec`, `agents.*`, or `mesh.*`. Use a Pi actor when the actor must coordinate recursively through Fabric.
 
+In a scoped session, every actor is bound to the principal that created it. Actor info reports `principal: { id, digest }`, and every turn, durable ones included, launches with that scope. Fabric delivers a message whose sender does not cover the actor's scope as untrusted data from a different or narrower principal, so a narrower session cannot borrow the actor's authority. An unscoped actor treats any scoped sender this way. See [principal and scope](providers.md#principal-and-scope) for the trust table.
+
 ### Shared actors and session bindings
 
 A project-scoped actor stores one definition for the project. Select storage per actor with `agents.create({ scope: "project" | "session", ... })`; omitted scope uses `mesh.actorScope` as a compatibility default. Fabric keeps three pieces of state:
@@ -840,7 +991,7 @@ independent of the run timeout and legitimate permit waiting. A timeout logs
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
 not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
 Each activation allows three preparation requeues; a further retryable preparation failure
-reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
+reaches terminal exhaustion and does not requeue again. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.
@@ -992,9 +1143,9 @@ await agents.setInferenceContext({ id: actor.id, inferenceContext: "full-history
 
 Only the owner can change a live actor. The setting persists on the same ID and applies when the next activation starts; running work keeps its snapshot. `scope: "global"` changes a template. Export/import retains the policy but never imports history. The setting does not change instructions, model, effort, tools, subscriptions, checkpoints, delivery, quiet/hold rules, or retained task references.
 
-Before starting Pi, the worker gives an activation-mode actor a header-only inference session. Preflight hooks therefore see no carried conversation either; a late context projection alone cannot protect preflight window checks. The native context hook remains a fail-closed boundary. After the child exits, the worker appends its complete audit to the actor's full session journal before publishing terminal status, linking its new root to the previous journal leaf. Activation-local compaction and context-edit records are retained inside non-message `custom` audit entries (`fabric-activation-context`, with their original records and activation ID), not as durable inference checkpoints. Restoring `full-history` therefore includes earlier activations and original tool outputs; genuine full-history native compactions still apply. No existing journal entries are rewritten or deleted. The full session journal remains available. User directions and assistant decisions remain in model input; earlier tool results may be compacted inside the activation, while the latest complete tool-call/result batch remains verbatim. Unmerged `.activation-<run id>.jsonl` files live beside the actor journal until retention succeeds, so a hard worker crash or retention error preserves recovery evidence instead of letting disposable run cleanup erase it. This bounds prior-activation accumulation, and in-run tool compaction reclaims context before the next inference request. `extensions: false` still excludes Fabric and project extensions; the worker adds only the projection hook, with no tools or trust expansion.
+Before starting Pi, the worker gives an activation-mode actor a header-only inference session. Preflight hooks therefore see no carried conversation either; a late context projection alone cannot protect preflight window checks. The native context hook remains a fail-closed boundary. After the child exits, the worker appends its complete audit to the actor's full session journal before publishing terminal status, linking its new root to the previous journal leaf. Activation-local compaction and context-edit records are retained inside non-message `custom` audit entries (`fabric-activation-context`, with their original records and activation ID), not as durable inference checkpoints. Restoring `full-history` therefore includes earlier activations and original tool outputs; genuine full-history native compactions still apply. No existing journal entries are rewritten or deleted. The full session journal remains available. User directions and assistant decisions remain in model input; earlier tool results may be compacted inside the activation, while the latest complete tool-call/result batch remains verbatim. Unmerged `.activation-<run id>.jsonl` files live beside the actor journal until retention succeeds, so a hard worker crash or retention error preserves recovery evidence beyond disposable run cleanup. This bounds prior-activation accumulation, and in-run tool compaction reclaims context before the next inference request. `extensions: false` still excludes Fabric and project extensions; the worker adds only the projection hook, with no tools or trust expansion.
 
-Activation mode requires a Pi CLI with the process-local `--no-auto-compaction` option and its explicit `get_state` readback: `autoCompactionDisabledForProcess: true` and `autoCompactionEnabled: false`. This avoids old-history preflight compaction even with a large retained journal. Fabric never uses the persistent `set_auto_compaction` RPC setter. Unsupported runners/binaries, missing or mismatched hook readiness, and projection failure reject before inference. Manual compaction, unexpected threshold/overflow compaction, and session replacement are not supported during this mode. Compaction cannot bypass the projection to send historical context to a summarizer. A fatal projection/compaction error exits only the bound disposable child; the owner and retained journals remain intact. At a completed `turn_end`, Fabric estimates the last final provider payload plus the new assistant/tool results. At 80% of that dispatch model's window, it appends Pi native compaction and context-edit entries to bound **earlier** tool results to 1,024-character excerpts with original journal-entry references. This deterministic compaction makes no summarization model request and does not rewrite original entries. User directions, assistant decisions, call IDs, and the latest complete tool batch are retained; the checkpoint and every retained message are witnessed before accepting the next context. Idle registration does not load the compaction helper. A latest batch or fixed context that still cannot fit after compaction fails once, without truncating that batch or silently falling back to full history. After this turn-end compaction, the worker wraps native provider dispatch's awaited `onPayload` callback, then checks the final request after all `context`, `context_with_system`, and `before_provider_request` handlers. It uses the selected Pi AI's `estimateTextTokens` on the entire serialized JSON request, including system/messages, tool schemas, API-specific fields, and JSON framing, without trusting earlier assistant usage. This deliberately conservative estimate may reject near-limit requests or large encoded media. It dispatches the admitted JSON snapshot so retained references or stateful serializers cannot enlarge it after admission; unsupported non-JSON payloads fail closed. Custom providers must honor Pi's `onPayload` instrumentation contract before network dispatch. A late expansion cannot bypass admission, and a late reduction is not refused using its earlier raw size. A window overflow exits the disposable child once; neither native retry nor Fabric startup/resume recovery relaunches that refusal. Fabric resolves a discovered or configured Pi launcher to its physical artifact before the first launch and reuses that selection on recoverable retries, so retargeting a launcher symlink cannot change the retry's host capabilities. The owning host immediately records and publishes `actor.alarm` on `ops.owner` and sends Main a `followUp` with `triggerTurn: true`, even for mailbox actors. Repeated failures in the same streak do not spam the owner; a successful activation clears the streak. Full-history mode retains its native history/compaction policy rather than discarding it as activation history.
+Activation mode requires a Pi CLI with the process-local `--no-auto-compaction` option and its explicit `get_state` readback: `autoCompactionDisabledForProcess: true` and `autoCompactionEnabled: false`. This avoids old-history preflight compaction even with a large retained journal. Fabric never uses the persistent `set_auto_compaction` RPC setter. Unsupported runners/binaries, missing or mismatched hook readiness, and projection failure reject before inference. Manual compaction, unexpected threshold/overflow compaction, and session replacement are not supported during this mode. Compaction cannot bypass the projection to send historical context to a summarizer. A fatal projection/compaction error exits only the bound disposable child; the owner and retained journals remain intact. At a completed `turn_end`, Fabric estimates the last final provider payload plus the new assistant/tool results. At 80% of that dispatch model's window, it appends Pi native compaction and context-edit entries to bound **earlier** tool results to 1,024-character excerpts with original journal-entry references. This deterministic compaction makes no summarization model request and does not rewrite original entries. User directions, assistant decisions, call IDs, and the latest complete tool batch are retained; the checkpoint and every retained message are witnessed before accepting the next context. Idle registration does not load the compaction helper. A latest batch or fixed context that still cannot fit after compaction fails once, without truncating that batch or silently falling back to full history. After this turn-end compaction, the worker wraps native provider dispatch's awaited `onPayload` callback, then checks the final request after all `context`, `context_with_system`, and `before_provider_request` handlers. It uses the selected Pi AI's `estimateTextTokens` on the entire serialized JSON request, including system/messages, tool schemas, API-specific fields, and JSON framing, without trusting earlier assistant usage. This deliberately conservative estimate may reject near-limit requests or large encoded media. It dispatches the admitted JSON snapshot so retained references or stateful serializers cannot enlarge it after admission; unsupported non-JSON payloads fail closed. Custom providers must honor Pi's `onPayload` instrumentation contract before network dispatch. A late expansion cannot bypass admission, and a late reduction is not refused using its earlier raw size. A window overflow exits the disposable child once; neither native retry nor Fabric startup/resume recovery relaunches that refusal. Fabric resolves a discovered or configured Pi launcher to its physical artifact before the first launch and reuses that selection on recoverable retries, so retargeting a launcher symlink cannot change the retry's host capabilities. The owning host immediately records and publishes `actor.alarm` on `ops.owner` and sends Main a `followUp` with `triggerTurn: true`, even for mailbox actors. Repeated failures in the same streak do not spam the owner; a successful activation clears the streak. Full-history mode retains its native history/compaction policy and does not discard it as activation history.
 
 The actor cannot change delivery from its response. The owner can update a live actor or global template and keep its history:
 
@@ -1102,7 +1253,7 @@ return rlm.query({
 });
 ```
 
-`rlm.query()` calls `agents.run({ runner: "pi", recursive: true })` with Fabric enabled in the child; it accepts `cwd?: string` and `worktree?: boolean`, just like one-shot agent runs. Recursive spawning means Fabric agent composition, not recursive filesystem traversal. Fabric rejects Claude runners for recursive use. It also rejects recursion at `agents.maxDepth`. This setting accepts any non-negative safe integer, and `0` disables child spawning. Approval for the initial recursive call delegates only the `agent` risk capability to recursive children. It does not delegate approvals for network access, execution, or writes. Each Fabric process applies its own configured concurrency and timeout limits. When `agents.budgetUsd` is set, a shared append-only cost ledger limits total spending across the recursion tree. Each node writes the cost of its children to one ledger file that it receives through the environment. A node rejects a new child when accumulated spending reaches the budget. This check is best effort. Concurrent children can pass the check before another child records cost, so the tree can exceed the limit slightly. Use `agents.maxPerExecution` as the race-free ceiling. Results and live status for each recursive child include a `budget` summary with `limit`, `spent`, `remaining`, and `tokens`. Fabric keeps the latest bounded nested-agent status tree in memory. Completed recursive leaves remain visible in **Topology · Run** after the child process deletes its temporary nested run directories. Fabric releases the snapshot when the parent run is cleaned up or the Fabric session shuts down.
+`rlm.query()` calls `agents.run({ runner: "pi", recursive: true })` with Fabric enabled in the child; it accepts `cwd?: string` and `worktree?: boolean`, just like one-shot agent runs. Recursive spawning means Fabric agent composition, not recursive filesystem traversal. Fabric rejects Claude runners for recursive use. It also rejects recursion at `agents.maxDepth`. This setting accepts any non-negative safe integer, and `0` disables child spawning. Approval for the initial recursive call delegates only the `agent` risk capability to recursive children. It does not delegate approvals for network access, execution, or writes. Each Fabric process applies its own configured concurrency and timeout limits. When `agents.budgetUsd` is set, a shared append-only cost ledger limits total spending across the recursion tree. Each node writes the cost of its children to one ledger file that it receives through the environment. A node rejects a new child when accumulated spending reaches the budget. This check is best effort. Concurrent children can pass the check before another child records cost, so the tree can exceed the limit slightly. Use `agents.maxPerExecution` as the race-free ceiling. Results and live status for each recursive child include a `budget` summary with `limit`, `spent`, `remaining`, and `tokens`. Fabric keeps the latest bounded nested-agent status tree in memory. Session-owned nested agents stop when their owning Pi child exits; a detached spawn does not outlive that owner. The child manager leaves nested status and transcript files with the enclosing run so completed leaves remain inspectable in **Topology · Run** and `/fabric chat`. The enclosing run's cleanup, retention, or root-session shutdown removes those artifacts. Every terminal path refreshes the nested tree. A descendant without a retained terminal result is shown as failed with an owner-ended diagnostic, not indefinitely running; Fabric does not invent a successful result or rewrite the worker's status file. Independently durable descendants retain their own lifecycle. Fabric releases the snapshot when the parent run is cleaned up or the Fabric session shuts down.
 
 `agents.nice` (0-19, default `0`) lowers the CPU priority of every child agent, and its IO priority on Linux (`ionice -c2 -n7`). The child's bash tools inherit it. A per-call `nice` on `agents.run`/`agents.spawn`, `agents.create({ nice })` or `agents.setNice({ id, nice })` for an actor can only raise it above the configured value, never lower it; it is clamped to 19. Details: [configuration](configuration.md).
 
@@ -1137,3 +1288,47 @@ return { event, claimed };
 Topics provide durable channels and direct messages with sequence cursors. `mesh.members({ scope?, kinds? })` returns the same combined directory of roots, agents, and actors as `agents.members()`. Versioned `get`, `put`, and `delete` operations provide compare-and-swap state for task claims, leases, reservations, and decisions. You can combine these operations with persistent actors to implement messenger-style swarms in Fabric code. Messenger-style swarms need no fixed planner and worker roles or user-managed daemon. When guest code requests durable residency, Fabric starts the hidden resident host described earlier. See [`/skill:fabric-swarm`](../skillsets/typescript/fabric-swarm/SKILL.md) for the pattern and [`references/mesh.md`](../skillsets/typescript/fabric-exec/references/mesh.md) for the complete API.
 
 Host scripts that run outside Pi, such as schedulers and maintenance tools, import `MeshStore` from `pi-fabric/mesh`. It uses the same lock, revision clock and event log as Fabric, and it loads no extension or agent runtime. Point it at the same mesh root as the Fabric sessions it works with.
+Each event carries a host-set `sender` with the publishing session's authority: `{ authority: "host" }` when unscoped, or its principal and scope digest. A scheduled event keeps the stamp from scheduling time. Events from older builds and grant posts have none. Actors use the stamp for the [principal trust rule](providers.md#principal-and-scope).
+
+A headless resident host can also be woken by time and by an outside process. Both primitives are small: recurrence, retries and routing stay in actor code.
+
+### Scheduled events
+
+```ts
+const pending = await mesh.publish({
+  topic: "jobs.nightly",
+  kind: "tick",
+  notBefore: "2030-01-01T02:00:00Z", // or epoch ms, or afterMs: 3_600_000
+  key: "nightly",                    // optional: replace or cancel by key
+});
+await mesh.unschedule({ key: "nightly" });       // { removed: boolean }
+return await mesh.scheduled({ topic: "jobs.nightly" });
+```
+
+- `notBefore` (epoch milliseconds or an ISO 8601 date-time) or `afterMs` stores the event as a pending schedule and returns it with `scheduled: true`. A due time in the past is appended at once. Due times may be at most 366 days ahead, and a mesh root holds at most 1000 pending schedules.
+- `key` (at most 128 characters) makes a schedule replaceable: publishing again with the same key replaces the pending one in the same locked write, so concurrent publishers never leave two. `mesh.unschedule({ key })` cancels it. `mesh.scheduled({ topic?, limit? })` lists pending schedules by due time; it is a read and is speculation-eligible.
+- Release: whichever Fabric process polls the mesh first after the due time appends the event, under the mesh store lock, so two releasers cannot append it twice. Every actor mesh monitor checks for due schedules on each poll and arms a timer to the next due time; `mesh.publish`, `mesh.read` and `pi-fabric mesh post` release due schedules too. The released event keeps the schedule's id as its event id and carries `scheduled: { dueAt, key? }`. Fabric appends the events before it shrinks the schedule file, so a crash between those two writes re-appends with the same id: consumers that must be exactly-once deduplicate by event id.
+- Recurrence stays in user code: an actor subscribed to the topic reschedules on each wake.
+- The resident host stays alive while it owns a live durable participant, re-arms its wake timer to the next due time, and releases due schedules itself. **Limitation:** Fabric adds no system daemon. If no Fabric process for the project is running when a schedule falls due, the event is released the next time any Fabric process touches that mesh root, then delivered to subscribers as usual.
+- Pending schedules live in `schedules.json` beside the mesh state. They are serialized by the mesh lock, outside the verified storage kernel's per-key revision table, which still owns every `mesh.put`/`mesh.delete` compare-and-swap decision.
+
+### External grants
+
+```ts
+const grant = await mesh.grant({ topic: "hooks.ci", ttlMs: 86_400_000, uses: 10, kind: "build" });
+return grant; // { grantId, token, expiresAt, uses, command, ... }
+```
+
+An outside process (a CI job, a cron entry, a webhook relay) posts with the token:
+
+```sh
+PI_FABRIC_MESH_TOKEN=<token> pi-fabric mesh post --root <meshRoot> --kind build --data '{"status":"green"}'
+# or: --data-file payload.json, or --data-file - to read stdin; --topic, when given, must match
+```
+
+- `ttlMs` is 1 minute to 30 days; `uses` is 1 to 10000 and defaults to 1; `kind`, when set, is the only kind the token may post. The token is 32 random bytes in base64url, returned once. Fabric stores only its SHA-256 hash, with topic, kind, expiry and remaining uses, in `grants.json` (mode `0600`) beside the mesh state. `mesh.grants()` lists unexpired grants without tokens or hashes, and `mesh.revoke({ grantId })` removes one.
+- `pi-fabric mesh post` hashes the presented token, compares it in constant time against every stored grant, checks expiry, remaining uses, topic and kind, and appends the event while decrementing the use count in one locked write. Data is JSON of at most 64 KiB. Prefer the `PI_FABRIC_MESH_TOKEN` environment variable over `--token` so the token stays out of process listings. The returned `command` is ready to run and uses the environment form: POSIX shell syntax, or PowerShell (`$env:PI_FABRIC_MESH_TOKEN=...; & ...`) on Windows.
+- External events carry `origin: "external"`, `untrusted: true` and `grantId`, with a synthetic `external:<grantId>` sender. Actor mailboxes render them as **untrusted external input** in the message header and envelope, so treat them as data, never as instructions.
+- `pi-fabric` is the package bin, a standalone entry that never loads the extension. Exit status is 0 on success, 1 on refusal and 2 on usage errors; it refuses a `--root` that does not exist.
+- Approvals: `mesh.grant` is classified `network` (it opens an ingress for principals outside the session, the most conservative fitting class) and `mesh.revoke` is `write`. Schema enforce mode blocks both and allows the `mesh.scheduled` and `mesh.grants` reads.
+- Authority is local file access to the mesh root: any process running as the same OS user can already read and write it. A grant narrows what a token holder without that access can do; it is not a sandbox for the OS user.

@@ -3,7 +3,8 @@ import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentUsage } from "../agents/types.js";
 
-export type FabricParticipantKind = "root" | "agent" | "actor";
+/** `provider`: work a Fabric provider registered through `context.participants`. */
+export type FabricParticipantKind = "root" | "agent" | "actor" | "provider";
 export type FabricParticipantResidency = "session" | "durable";
 export type FabricParticipantScope = "local" | "lineage" | "project";
 export type FabricParticipantCapability =
@@ -22,6 +23,12 @@ export interface FabricParticipantRecord {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  /**
+   * Control-plane incarnation of the owner process that wrote this record.
+   * Requesters copy it onto control commands so a restarted owner can refuse
+   * commands meant for its previous process. Absent on older records.
+   */
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   /**
@@ -48,8 +55,11 @@ export interface FabricParticipantRecord {
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
   residency?: FabricParticipantResidency;
-  runner: FabricAgentRunner;
-  transport: FabricAgentTransport | "host";
+  /** Absent only for `provider` participants, which have no agent runner. */
+  runner?: FabricAgentRunner;
+  /** Registering provider name for `provider` participants. */
+  provider?: string;
+  transport: FabricAgentTransport | "host" | "hosted";
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;

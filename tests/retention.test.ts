@@ -19,6 +19,7 @@ import {
   pruneActorRunArchives,
   compactTerminalRunEvents,
   RUN_ROOT_SWEEP_MARKER,
+  RUN_ROOT_HEARTBEAT_TTL_MS,
   sweepTempRunRoots,
 } from "../src/storage/retention.js";
 
@@ -597,6 +598,57 @@ describe("terminal run event log retention", () => {
       expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
       expect(fs.readdirSync(dir).sort()).toEqual(["events.jsonl", "reply.json", "status.json"]);
     } finally { rename.mockRestore(); }
+  });
+});
+
+describe("run-root owner identity", () => {
+  const sweep = (tempRoot: string, now: number) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
+  // A PID namespace this process is not in: the signal probe means nothing for it.
+  const foreignIdentity = { hostname: os.hostname(), pidNamespace: "pid:[4026599999]", startedAt: 1 };
+  const writeOwner = (root: string, owner: Record<string, unknown>): void => {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify(owner));
+  };
+  const readOwner = (root: string): Record<string, unknown> =>
+    JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8")) as Record<string, unknown>;
+
+  it("records this process's identity on the owner marker", () => {
+    const root = path.join(temporaryDirectory(), FABRIC_RUN_ROOT_PREFIX + "self");
+    markRunRootActive(root, 5);
+    expect(readOwner(root)).toMatchObject({ pid: process.pid, heartbeatAt: 5, identity: { hostname: os.hostname() } });
+    markRunRootClosed(root, 6, true);
+    expect(readOwner(root)).toMatchObject({ pid: process.pid, heartbeatAt: 6, closedAt: 6, identity: { hostname: os.hostname() } });
+  });
+
+  it("treats a foreign-namespace owner with a stale heartbeat as dead, even when its PID is live here", () => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "foreign-stale");
+    // process.pid answers the signal probe here, but it is not the foreign owner.
+    writeOwner(root, { pid: process.pid, startedAt: 1, heartbeatAt: 1, identity: foreignIdentity });
+    const detectedAt = 1 + RUN_ROOT_HEARTBEAT_TTL_MS + 1;
+    expect(sweep(tempRoot, detectedAt).removedRoots).toEqual([]);
+    expect(readOwner(root).orphanedAt).toBe(detectedAt);
+    expect(sweep(tempRoot, detectedAt + 6 * HOUR).removedRoots).toEqual([root]);
+  });
+
+  it("keeps a foreign-namespace owner with a fresh heartbeat, even when its PID is absent here", () => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "foreign-fresh");
+    writeOwner(root, { pid: 2_147_483_647, startedAt: 1, heartbeatAt: DAY, identity: foreignIdentity });
+    expect(sweep(tempRoot, DAY + RUN_ROOT_HEARTBEAT_TTL_MS).removedRoots).toEqual([]);
+    expect(readOwner(root).orphanedAt).toBeUndefined();
+  });
+
+  it("keeps a child run whose PID lives in the dead owner's foreign namespace", () => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "foreign-child");
+    writeOwner(root, { pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1, identity: foreignIdentity });
+    const child = path.join(root, "child");
+    // Absent from this namespace, so a bare signal probe would call it dead.
+    writeStatus(child, { status: "running", transport: "process", sessionId: "2147483647" });
+    fs.writeFileSync(path.join(child, "task.txt"), "foreign worker");
+    expect(sweep(tempRoot, 100 * DAY).removedRoots).toEqual([]);
+    expect(fs.existsSync(child)).toBe(true);
   });
 });
 

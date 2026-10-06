@@ -52,9 +52,11 @@ A source implements interface version `1`, has an opaque stable `id`, and
 provides `listSessions({ limit, signal? })` and
 `loadSession(sessionKey, { signal? })`. Session descriptors have an opaque
 `sessionKey` and content-sensitive `revision`; snapshots add standard Pi
-`records`. Optional `authorize(action, sessionKey)` is rechecked around
-asynchronous reads. Bind principals and permissions in the host, never in
-model-supplied arguments. The host also owns sanitization and retention.
+`records`. Optional `authorize(action, sessionKey, scope?)` is rechecked around
+asynchronous reads. In a scoped session, `scope` is the caller's host-issued
+[principal and grants](providers.md#principal-and-scope), so a source can refuse
+before content enters context; client calls accept `{ scope }` too. Bind principals
+and permissions in the host, never in model-supplied arguments. The host also owns sanitization and retention.
 
 Lists may return a descriptor array or `{ sessions, coverage }`; snapshots
 also support `coverage: { complete: false, reason }`. Report every partial
@@ -66,6 +68,27 @@ Client `recall`, `expand`, and `sessions` calls require `args.source` and accept
 never implicit filesystem discovery. Provider actions accept the same optional
 `source` argument; omitting it preserves the normal filesystem behavior.
 Source-qualified follow pointers and guest `memory.walk` retain this binding.
+
+Hosts that only need a local directory of session JSONL files (a synced
+laptop archive, a copied agent tree) do not have to write an adapter:
+declare it in `fabric.json` and the runtime registers a built-in `fs`
+source before installing the provider.
+
+```json
+{
+  "memory": {
+    "sources": [{ "id": "laptop", "kind": "fs", "root": "/home/me/pi-archive" }]
+  }
+}
+```
+
+The root is walked recursively for `*.jsonl`, so native agent trees and flat
+archive directories both work; session keys are root-relative paths. The
+adapter satisfies the same interface as a hand-written source, including
+content-hash revisions and coverage reporting, so everything below applies
+to it unchanged. Key rules and validation errors are documented in
+[configuration](configuration.md#memory-sources); with no `memory.sources`
+entries the provider behaves exactly as before.
 
 Host records reuse the normal branch, normalization, ranking, structural trace,
 coverage, and lossless expansion paths. Revision/content hashes and lineage

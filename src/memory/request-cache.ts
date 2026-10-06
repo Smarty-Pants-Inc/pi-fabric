@@ -32,6 +32,8 @@ export interface ResolvedExpansionSelection {
 export interface ExpansionSnapshot {
   file: string;
   branches: MemoryBranches;
+  /** Host scope digest; a snapshot is never served under another scope. */
+  scopeDigest?: string;
   sourceHash: string;
   lineageFingerprint: string;
   observation: SourceObservation;
@@ -49,7 +51,8 @@ export interface RecallContinuationCache {
   touchedAt: number;
 }
 
-export const recallContinuationKey = (args: MemoryRecallCallArgs): string => JSON.stringify([
+export const recallContinuationKey = (args: MemoryRecallCallArgs, scopeDigest?: string): string => JSON.stringify([
+  scopeDigest ?? null,
   args.query ?? null,
   args.queryMode ?? "literal",
   args.queryMatch ?? null,
@@ -70,8 +73,8 @@ export const recallContinuationKey = (args: MemoryRecallCallArgs): string => JSO
   args.entryRange ? [args.entryRange.first, args.entryRange.last] : null,
 ]);
 
-const expansionSnapshotKey = (file: string, branches: MemoryBranches): string =>
-  `${path.resolve(file)}\0${branches}`;
+const expansionSnapshotKey = (file: string, branches: MemoryBranches, scopeDigest?: string): string =>
+  `${path.resolve(file)}\0${branches}\0${scopeDigest ?? ""}`;
 
 export const expansionSelectionKey = (selection: CanonicalExpansionSelection): string => JSON.stringify([
   selection.indices ?? null,
@@ -116,8 +119,9 @@ export class MemoryRequestCache {
     file: string,
     branches: MemoryBranches,
     observation: SourceObservation | null,
+    scopeDigest?: string,
   ): ExpansionSnapshot | undefined {
-    const key = expansionSnapshotKey(file, branches);
+    const key = expansionSnapshotKey(file, branches, scopeDigest);
     const cached = this.expansionSnapshots.get(key);
     if (!cached) return undefined;
     if (
@@ -135,7 +139,7 @@ export class MemoryRequestCache {
   }
 
   rememberExpansionSnapshot(snapshot: ExpansionSnapshot): void {
-    const key = expansionSnapshotKey(snapshot.file, snapshot.branches);
+    const key = expansionSnapshotKey(snapshot.file, snapshot.branches, snapshot.scopeDigest);
     this.expansionSnapshots.delete(key);
     this.expansionSnapshots.set(key, snapshot);
     while (this.expansionSnapshots.size > EXPANSION_SNAPSHOT_LIMIT) {
@@ -162,7 +166,7 @@ export class MemoryRequestCache {
   }
 
   forgetExpansionSnapshot(snapshot: ExpansionSnapshot): void {
-    const key = expansionSnapshotKey(snapshot.file, snapshot.branches);
+    const key = expansionSnapshotKey(snapshot.file, snapshot.branches, snapshot.scopeDigest);
     if (this.expansionSnapshots.get(key) === snapshot) this.expansionSnapshots.delete(key);
   }
 }

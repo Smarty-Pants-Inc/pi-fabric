@@ -1,14 +1,14 @@
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
-import type { AgentHandleInfo } from "../src/agents/types.js";
+import type { AgentHandleInfo, AgentTransportHandle } from "../src/agents/types.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -226,6 +226,37 @@ const args = new Map();`));
   });
 });
 
+const directory = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-transport-"));
+  roots.push(root);
+  return root;
+};
+
+describe("process transport startup diagnostics", () => {
+  it("rejects a failed spawn without an unhandled child error", async () => {
+    const root = directory();
+    await expect(spawnDetached(path.join(root, "missing.mjs"), [], path.join(root, "missing-cwd"))).rejects.toThrow(/ENOENT/);
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+  it("surfaces bounded stderr even when the worker cannot execute its bootstrap", async () => {
+    const root = directory();
+    const worker = path.join(root, "crash.mjs");
+    fs.writeFileSync(worker, 'process.stderr.write("x".repeat(60000) + "\\nworker-bootstrap-sentinel 界面\\n"); process.exitCode = 1;');
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 20000, sessionExport: false }, {
+      workerPath: worker, runRoot: path.join(root, "runs"), fullCodeMode: false,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "probe", transport: "process", extensions: false });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("worker stderr:");
+    expect(result.error).toContain("worker-bootstrap-sentinel 界面");
+    expect(result.error).not.toContain("�");
+    expect(result.error!.length).toBeLessThan(21000);
+
+  });
+});
+
 // Keep processSlice fixtures isolated from release-selection fixtures.
 {
 const roots: string[] = [];
@@ -271,12 +302,75 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     expect(await outcome).toBeInstanceOf(Error);
     expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
   });
-  it("unconfirmed scope teardown vetoes fallback and retains custody debt", async () => {
-    const f = fixture("trap '' TERM; while :; do :; done"); const debt = vi.fn();
-    await expect(new ProcessTransport("batch.slice").launch({ ...f.request, onUnconfirmedExit: debt }))
-      .rejects.toThrow("termination is unconfirmed");
-    expect(debt).toHaveBeenCalledOnce(); expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+  it("A24 unconfirmed scoped rejection transfers exact process custody before awaiting admission", async () => {
+    const f = fixture("trap '' TERM; while :; do :; done");
+    const debt = vi.fn();
+    let custody: AgentTransportHandle | undefined;
+    let settled = false;
+    const outcome = new ProcessTransport("batch.slice").launch({ ...f.request, onUnconfirmedExit: debt,
+      onCustody: handle => { custody = handle; } }).then(handle => { settled = true; return handle; }, error => { settled = true; return error; });
+    try {
+      await vi.waitFor(() => expect(custody).toBeDefined());
+      expect(settled).toBe(false); // exact controllable handle precedes effectful admission await
+      expect(await custody!.isAlive()).toBe(true);
+      const error = await outcome;
+      expect(error).toMatchObject({ launchOutcome: "unknown", message: expect.stringContaining("termination is unconfirmed") });
+      expect(debt).toHaveBeenCalledOnce();
+      expect(fs.existsSync(path.join(f.root, "started"))).toBe(false); // never replay unadmitted worker
+      await custody!.closed;
+      expect(await custody!.isAlive()).toBe(false);
+      expect(custody!.lostContact?.()).toContain("termination is unconfirmed"); // native close alone cannot erase tree debt
+    } finally {
+      if (custody) { await custody.stop(); await custody.closed; }
+      await outcome;
+    }
   }, 20_000);
+
+  it("A24 a real rejected replacement keeps actor result, files and permit fenced after predecessor exit", async () => {
+    const f = fixture('if [ ! -f first-scope ]; then : > first-scope; while [ "$1" != "--" ]; do shift; done; shift; exec "$@"; else trap \'\' TERM; while :; do :; done; fi');
+    const settled = vi.fn();
+    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, processSlice: "batch.slice", maxConcurrent: 2,
+      retainRuns: false, budgetUsd: 0, sessionExport: false, timeoutMs: 30_000 }, {
+      runRoot: path.join(f.root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), onSettled: settled,
+    });
+    const actual = ProcessTransport.prototype.launch;
+    const attempts: AgentTransportHandle[] = [];
+    const errors: Error[] = [];
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      try { return await actual.call(this, { ...request, onCustody: handle => { attempts.push(handle); request.onCustody?.(handle); } }); }
+      catch (error) { errors.push(error as Error); throw error; }
+    });
+    let id = "";
+    let resultSettled = false;
+    const run = manager.run({ task: "RESUME_AFTER_STOP", actorId: "actor:scope-replacement", transport: "process",
+      sessionFile: path.join(f.root, "native-session.jsonl") }, undefined, handle => { id = handle.id; })
+      .then(result => { resultSettled = true; return result; }, error => { resultSettled = true; return error; });
+    try {
+      await vi.waitFor(() => expect(errors).toHaveLength(1), { timeout: 20_000 });
+      expect(attempts).toHaveLength(2);
+      await attempts[0]!.closed;
+      expect(await attempts[0]!.isAlive()).toBe(false);
+      expect(attempts[0]!.lostContact?.()).toBeUndefined(); // confirmed predecessor receipt
+      expect(errors[0]).toMatchObject({ launchOutcome: "unknown" });
+      await attempts[1]!.closed; // even replacement native close cannot erase its unconfirmed tree receipt
+      expect(resultSettled).toBe(false);
+      expect(settled).not.toHaveBeenCalled();
+      const directory = manager.runDirectory(id)!;
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "unresolved-worker.json"), "utf8"))).toMatchObject({ sessionId: attempts[1]!.sessionId });
+      await expect(manager.stop(id)).rejects.toThrow(/execution exit unconfirmed/);
+      await expect(manager.cleanup(id)).rejects.toThrow("running agent");
+      await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+      expect(resultSettled).toBe(false);
+      expect(fs.existsSync(directory)).toBe(true);
+      expect(settled).not.toHaveBeenCalled();
+      expect(launch).toHaveBeenCalledTimes(2);
+    } finally {
+      for (const handle of attempts) { await handle.stop(); await handle.closed; }
+      await manager.close().catch(() => undefined); // immutable unresolved obligation intentionally retained
+      launch.mockRestore();
+      void run; // result remains fenced, but all owned native processes above have closed
+    }
+  }, 30_000);
 
   it("is off by default", async () => {
     const f = fixture(); const handle = await new ProcessTransport().launch(f.request);
@@ -310,7 +404,7 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
   });
   it("handles an executable disappearing after lookup with a close-fenced fallback", async () => {
     const f = fixture(); const warn = vi.fn();
-    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable: path.join(f.root, "missing"), slice: "batch.slice", warn });
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, {}, { executable: path.join(f.root, "missing"), slice: "batch.slice", warn });
     try { expect(await workerStarted(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); }
     finally { await handle.stop(); await handle.waitForClose(); }
   });

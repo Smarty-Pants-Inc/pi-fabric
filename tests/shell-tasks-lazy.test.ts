@@ -3,14 +3,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 const loads = vi.hoisted(() => vi.fn());
+const imageLoads = vi.hoisted(() => vi.fn());
+vi.mock("../src/ui/image-overlays.js", async original => { imageLoads(); return original<typeof import("../src/ui/image-overlays.js")>(); });
 vi.mock("../src/ui/shell-tasks.js", async original => { loads(); return original<typeof import("../src/ui/shell-tasks.js")>(); });
 afterEach(() => vi.useRealTimers());
 
 describe("shell inspector first use", () => {
   it("stays unloaded and timer-free at import/idle, then opens lazily and releases on stop", async () => {
-    vi.resetModules(); loads.mockClear(); vi.useFakeTimers();
+    vi.resetModules(); loads.mockClear(); imageLoads.mockClear(); vi.useFakeTimers();
     const { FabricUiController } = await import("../src/ui/controller.js");
-    expect(loads).not.toHaveBeenCalled();
+    expect(loads).not.toHaveBeenCalled(); expect(imageLoads).not.toHaveBeenCalled();
     const jobs = new FabricShellJobStore();
     const state = { shellJobs: jobs, config: { ui: { enabled: true, widget: "auto", refreshMs: 1000, maxRows: 5 }, mesh: { enabled: false } },
       activity: { subscribe: () => () => {}, runs: () => [] }, agents: { list: () => [], subscribeUi: () => () => {} }, actors: { list: () => [], subscribe: () => () => {} },
@@ -24,11 +26,12 @@ describe("shell inspector first use", () => {
     try {
       controller.start(context);
       await vi.advanceTimersByTimeAsync(5000);
-      expect(loads).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+      expect(loads).not.toHaveBeenCalled(); expect(imageLoads).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
       const pending = controller.openTasks(context);
       expect(controller.ownsInput).toBe(true);
       await vi.waitFor(() => expect(custom).toHaveBeenCalledOnce());
       expect(loads).toHaveBeenCalledOnce();
+      expect(imageLoads).toHaveBeenCalledOnce();
       expect(view.render(80).join("\n")).toContain("No background shell tasks");
       controller.stop(); await pending;
       expect(controller.ownsInput).toBe(false); expect(vi.getTimerCount()).toBe(0);

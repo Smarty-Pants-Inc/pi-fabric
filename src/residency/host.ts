@@ -21,8 +21,8 @@ import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeJsonAtomic, ownerHeartbeatFields, recordOwnerLiveness, startOwnerHeartbeat } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
@@ -36,6 +36,7 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
+import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -153,6 +154,41 @@ const readJson = <T>(filePath: string): T | undefined => {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+const processAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // On Windows, EPERM means the process exists but cannot be opened for
+    // signaling; only ESRCH (or other errors) mean it is gone.
+    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+// Identity-less (pre-heartbeat) owners keep the plain signal probe; an owner
+// in another PID namespace is judged by its heartbeat, and "unknown" is not death.
+const ownerAlive = (record: unknown): boolean =>
+  recordOwnerLiveness(record, { legacyAlive: (pid: number) => residentProcessAlive(pid,
+    (record as { processStartTime?: string } | null)?.processStartTime) }) !== "dead";
+
+// The resident host runs Pi with --no-extensions, so a custom runner is only
+// registered here when its residentModule is imported (once per process).
+const runnerModules = new Map<string, Promise<void>>();
+const loadRunnerModule = (specifier: string): Promise<void> => {
+  if (!/^(?:\/|[A-Za-z]:[\\/]|file:)/.test(specifier)) {
+    return Promise.reject(new Error(`Fabric runner module must be absolute: ${specifier}`));
+  }
+  const url = specifier.startsWith("file:") ? specifier : pathToFileURL(specifier).href;
+  let pending = runnerModules.get(url);
+  if (!pending) {
+    pending = import(url).then(() => undefined);
+    runnerModules.set(url, pending);
+    pending.catch(() => runnerModules.delete(url));
+  }
+  return pending;
+};
+
 export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
@@ -201,6 +237,30 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
+/**
+ * The resident host's idle rule. Live durable participants, queued work or a
+ * pending request keep it alive; pending mesh schedules do too while at least
+ * one durable participant could receive them, and `wakeAt` names the next due
+ * time so the host releases it on time. Without durable participants a
+ * schedule waits for the next Fabric process that touches the mesh.
+ */
+export const residentIdleDecision = (input: {
+  now: number;
+  idleSince: number;
+  activeActor: boolean;
+  activeAgent: boolean;
+  pendingRequest: boolean;
+  durableParticipants: boolean;
+  nextScheduleDueAt: number | undefined;
+  idleExitMs?: number;
+}): { busy: boolean; exit: boolean; wakeAt?: number } => {
+  const holdsSchedules = input.nextScheduleDueAt !== undefined && input.durableParticipants;
+  const wakeAt = holdsSchedules ? input.nextScheduleDueAt : undefined;
+  const busy = input.activeActor || input.activeAgent || input.pendingRequest || holdsSchedules;
+  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? IDLE_EXIT_MS);
+  return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
+};
+
 export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
@@ -226,6 +286,9 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #stopHeartbeat: (() => void) | undefined;
+  #scheduleTimer: NodeJS.Timeout | undefined;
+  #scheduleWakeAt: number | undefined;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
@@ -312,7 +375,8 @@ export class ResidentHost {
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
-      reapDeadHosts: false,                                    // its session's runtime sweeps
+      reapDeadHosts: false, // its session's runtime sweeps
+      ownerIncarnation: this.control.incarnation,
       presencePass: () => rootPresenceAlarms(this.mesh, this.identity, this.hostId,
         this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
     });
@@ -578,6 +642,7 @@ export class ResidentHost {
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
+      this.#stopHeartbeat = startOwnerHeartbeat((heartbeatAt: number) => this.#refreshHeartbeat(heartbeatAt));
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
@@ -635,6 +700,7 @@ export class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        ...ownerHeartbeatFields(now),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
@@ -674,6 +740,8 @@ export class ResidentHost {
       if (!this.#staged) {
         this.actors.resumeAfterRelease();
         void this.#backgroundDeliveries.enqueue(async () => {
+          // Re-attach existing adapter-owned work only after serving readiness.
+          await this.#recoverHostedRuns();
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
         });
@@ -689,6 +757,11 @@ export class ResidentHost {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
     const routeClosed = this.#routeOwner?.close();
+    this.#stopHeartbeat?.();
+    this.#stopHeartbeat = undefined;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#scheduleWakeAt = undefined;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
@@ -821,7 +894,7 @@ export class ResidentHost {
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
       assertMeshConsumption(() => this.participants.canConsumeMesh());
-      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
+      const result = this.actors.tell(command.targetId, message, command.data, { provenance, sender: command.sender ?? null, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (error instanceof MeshConsumptionPausedError) throw error;
@@ -874,7 +947,12 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn },
+      {
+        message,
+        data: event,
+        triggerTurn: subscription.triggerTurn,
+        ...(target.ownerIncarnation ? { ownerIncarnation: target.ownerIncarnation } : {}),
+      },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );
@@ -1038,15 +1116,50 @@ export class ResidentHost {
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
-    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
+    const pendingRequest = this.#admissions > 0 || [this.#requestsPath, this.#processingPath].some((directory) => {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
-      this.#idleSince = Date.now();
+    let nextScheduleDueAt: number | undefined;
+    try {
+      nextScheduleDueAt = this.mesh.nextScheduleDueAt();
+    } catch {
+      // Unreadable schedules neither keep the host alive nor stop it.
+    }
+    const now = Date.now();
+    const decision = residentIdleDecision({
+      now,
+      idleSince: this.#idleSince,
+      activeActor,
+      activeAgent,
+      pendingRequest,
+      durableParticipants: activeActor || activeAgent,
+      nextScheduleDueAt,
+    });
+    this.#armScheduleWake(decision.wakeAt);
+    if (decision.busy) {
+      this.#idleSince = now;
       return;
     }
-    if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
+    if (decision.exit) this.onIdle();
+  }
+
+  // Re-armed on every idle check: the due time of the earliest pending
+  // schedule, released here even if no actor monitor polls in time.
+  #armScheduleWake(wakeAt: number | undefined): void {
+    if (wakeAt === this.#scheduleWakeAt) return;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#scheduleWakeAt = wakeAt;
+    if (wakeAt === undefined || this.#closed) return;
+    this.#scheduleTimer = setTimeout(() => {
+      this.#scheduleTimer = undefined;
+      this.#scheduleWakeAt = undefined;
+      void this.mesh.releaseDueSchedules().catch(() => undefined).finally(() => {
+        if (!this.#closed) this.#checkIdle();
+      });
+    }, Math.min(Math.max(0, wakeAt - Date.now()), 2_147_000_000));
+    this.#scheduleTimer.unref();
   }
 
   #trackPublication(promise: Promise<unknown>): void {
@@ -1139,6 +1252,8 @@ export class ResidentHost {
         this.#staged = false;
         this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
         this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
+          // Re-attach existing adapter-owned work only after serving readiness.
+          await this.#recoverHostedRuns();
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
         }));
@@ -1318,6 +1433,7 @@ export class ResidentHost {
         if (
           command.request.residentStartupProbe ||
           command.request.sessionSeed ||
+          command.request.forkSeed ||
           command.request.sessionFile ||
           command.request.actorId ||
           command.request.actorName ||
@@ -1327,11 +1443,13 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
+        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
         // No executor fallback: revalidate the captured caller before the mutation fence.
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
+        const scope = launchScope(command.request.scope, command.request.inheritedScope);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never
@@ -1349,6 +1467,8 @@ export class ResidentHost {
           runDirectory,
           handle: { ...handle, residency: "durable" },
           ...(worktreeGitRoot ? { worktreeGitRoot } : {}),
+          ...(command.runnerModule ? { runnerModule: command.runnerModule } : {}),
+          ...(scope ? { scope } : {}),
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -1498,6 +1618,29 @@ export class ResidentHost {
     else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
   }
 
+  /**
+   * Re-import the runner modules recorded for this host's durable runs, then
+   * re-attach their hosted runs from the persisted locators. A run whose
+   * runner cannot be loaded settles indeterminate; nothing is re-submitted.
+   */
+  async #recoverHostedRuns(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.#agentsPath).filter((entry) => entry.endsWith(".json"));
+    } catch {
+      entries = [];
+    }
+    const modules = new Set<string>();
+    for (const entry of entries) {
+      const metadata = readJson<ResidentAgentMetadata>(path.join(this.#agentsPath, entry));
+      if (metadata?.rootId === this.config.rootId && typeof metadata.runnerModule === "string") {
+        modules.add(metadata.runnerModule);
+      }
+    }
+    for (const module of modules) await loadRunnerModule(module).catch(() => undefined);
+    await this.agents.recoverHostedRuns().catch(() => []);
+  }
+
   #recoverInterruptedRequests(): void {
     let entries: string[];
     try {
@@ -1517,6 +1660,7 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: "Fabric residency outcome is indeterminate after resident host restart",
+        outcome: "indeterminate",
         completedAt: Date.now(),
       };
       atomicWrite(path.join(this.#responsesPath, entry), response);
@@ -1549,7 +1693,7 @@ export class ResidentHost {
   /** Legacy Windows primitive: an atomic claim, not automatic crash recovery. */
   #acquireWindowsLock(): void {
     const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && residentProcessAlive(existing.pid, existing.processStartTime)) {
+    if (existing && ownerAlive(existing)) {
       throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
     }
     try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
@@ -1563,7 +1707,7 @@ export class ResidentHost {
     }
     this.#exclusiveCreateLock = true;
     try {
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), ...ownerHeartbeatFields() }));
     } catch (error) { this.#releaseLock(); throw error; }
   }
 
@@ -1590,7 +1734,7 @@ export class ResidentHost {
       if (!sameInode(current)) throw new Error("Fabric resident host startup inode was replaced; verify legacy drain");
       // Read before overwriting: an unknown birth identity is not permission to displace a live owner.
       const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
-      if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
+      if (records.some((owner) => owner && owner.pid !== process.pid && ownerAlive(owner))) {
         throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
       }
       const provenancePath = path.join(this.config.residencyRoot, "host-fence.json");
@@ -1605,8 +1749,23 @@ export class ResidentHost {
         atomicWrite(provenancePath, { format: 1, dev: String(locked.dev), ino: String(locked.ino) });
       }
       fs.ftruncateSync(this.#lockFd, 0);
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), ...ownerHeartbeatFields() }));
     } catch (error) { this.#releaseLock(); throw error; }
+  }
+
+  // Long-lived ownership: refresh both the start lock and owner.json while
+  // they are still ours, so readers in other PID namespaces can judge us.
+  #refreshHeartbeat(heartbeatAt: number): void {
+    const lock = readJson<Record<string, unknown>>(this.#lockPath);
+    if (lock?.token === this.#token && this.#lockFd !== undefined) {
+      // flock fences this inode for the whole host lifetime: atomic rename would
+      // replace it and let a second host acquire an unrelated lock. Refresh in place.
+      const text = JSON.stringify({ ...lock, heartbeatAt });
+      fs.writeSync(this.#lockFd, text, 0, "utf8");
+      fs.ftruncateSync(this.#lockFd, Buffer.byteLength(text));
+    }
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (owner?.token === this.#token) atomicWrite(this.#ownerPath, { ...owner, heartbeatAt });
   }
 
   #releaseLock(): void {

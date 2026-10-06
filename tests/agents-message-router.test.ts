@@ -64,7 +64,7 @@ const running = async () => {
   return { root, manager, id: handle.id, statusFile, record, entries };
 };
 const remote = (id: string, status = "running", kind = "agent") => ({ id, kind, status, local: false,
-  ownerHostId: "host:owner", ownerIdentityId: "host:owner", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
+  ownerHostId: "host:owner", ownerIdentityId: "host:owner", controlProtocol: "v1", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
 const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0];
 
 afterEach(async () => {

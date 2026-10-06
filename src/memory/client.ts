@@ -2,6 +2,7 @@ import type { FabricMemoryConfig } from "../config.js";
 import type { MemoryProviderContext } from "./request-context.js";
 import { MemoryRequestCache } from "./request-cache.js";
 import type { MemorySourceRegistry } from "./portable.js";
+import type { FabricScope } from "../protocol.js";
 import { processMemoryRecall } from "./recall-service.js";
 import { processMemoryExpand } from "./expand-service.js";
 import { processMemorySessions } from "./sessions-service.js";
@@ -16,6 +17,8 @@ export interface MemorySourceClientOptions {
 export interface MemorySourceCallOptions {
   /** Checked between adapter loads and index builds; aborted work fails with code "aborted". */
   signal?: AbortSignal;
+  /** Host-issued caller scope: passed to source authorize() and keyed into the request cache. */
+  scope?: FabricScope;
 }
 
 const CLIENT_CONFIG: FabricMemoryConfig = {
@@ -64,19 +67,21 @@ export const createMemorySourceClient = (options: MemorySourceClientOptions) => 
     sources: options.sources,
   };
   const cache = new MemoryRequestCache();
+  const scoped = (call: MemorySourceCallOptions | undefined): MemoryProviderContext =>
+    call?.scope ? { ...context, fabricScope: call.scope } : context;
   return {
     recall: (args: { source: string } & Record<string, unknown>, call?: MemorySourceCallOptions) =>
       processMemoryRecall(
         { ...args, source: requireSource(args) },
         { update: () => {}, signal: call?.signal },
-        context,
+        scoped(call),
         cache,
       ),
     expand: (
       args: { source: string; session: string } & Record<string, unknown>,
       call?: MemorySourceCallOptions,
-    ) => processMemoryExpand({ ...args, source: requireSource(args) }, context, cache, call?.signal),
+    ) => processMemoryExpand({ ...args, source: requireSource(args) }, scoped(call), cache, call?.signal),
     sessions: (args: { source: string } & Record<string, unknown>, call?: MemorySourceCallOptions) =>
-      processMemorySessions({ ...args, source: requireSource(args) }, context, call?.signal),
+      processMemorySessions({ ...args, source: requireSource(args) }, scoped(call), call?.signal),
   };
 };

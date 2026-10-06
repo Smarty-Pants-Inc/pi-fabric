@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { AtomicFileWriter, writeFileAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, writeFileAtomic, decodeOwnerIdentityLine, lockOwnerLiveness } from "../core/atomic-write.js";
 import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
@@ -158,8 +158,19 @@ export class ActorRegistryStore {
           const recordedStart = firstOwner.endsWith("\n") && startText && /^\d+$/.test(startText) ? startText : undefined;
           const alive = validPid && processAlive(pid);
           const actualStart = alive && recordedStart ? processStartTime(pid) : undefined;
-          const dead = alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
-            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS;
+          // New owners carry boot/namespace identity; numeric fourth lines retain the
+          // fork's legacy PID-reuse evidence. Torn/malformed structured identities stay
+          // unknown, never falling back to an unrelated PID in this namespace.
+          const structuredIdentity = startText?.startsWith("{") === true;
+          const identityLine = firstOwner.endsWith("\n") && structuredIdentity ? startText : undefined;
+          const dead = structuredIdentity
+            ? validOwner && decodeOwnerIdentityLine(identityLine) !== undefined &&
+              // This lock can span asynchronous adoption: creation age is NOT a
+              // heartbeat or an exit receipt. Only positive identity/death evidence
+              // authorizes reaping; an unobservable foreign holder remains in custody.
+              lockOwnerLiveness(pid, Number.NaN, identityLine, { legacyAlive: processAlive }) === "dead"
+            : alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
+              validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS;
           if (dead) {
             const current = fs.lstatSync(lockPath);
             if (current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&

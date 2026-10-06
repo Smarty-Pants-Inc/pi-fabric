@@ -193,6 +193,7 @@ export const parseFormattedNumericValue = (value: string): number => {
 };
 
 export const coerceValue = (id: string, value: string, config: FabricConfig): unknown => {
+  if (id === "mcp.nativeServers") return value.split(",").map(name => name.trim()).filter(Boolean);
   if (id === COMPACTION_THRESHOLD_SETTING_ID) {
     if (value === COMPACTION_DEFAULT_THRESHOLD_LABEL) return { mode: "default" };
     const tokens = /^(.+?) tokens$/.exec(value);

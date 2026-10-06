@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -300,6 +301,80 @@ describe("spawnDetached", () => {
       expect(child.kill).not.toHaveBeenCalled();
     } finally {
       killer.emit("close", 0); child.emit("close", null);
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  it.each(["tree-first", "worker-first"] as const)("Windows stop retires its diagnostic pipe after native exit without skipping either close (%s)", async order => {
+    vi.useFakeTimers();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn(), kill: vi.fn(), stderr });
+    const killer = Object.assign(new EventEmitter(), { pid: 5678, kill: vi.fn() });
+    // Native ChildProcess close includes its stdio-close obligations. Model a
+    // Windows diagnostic read handle that outlives the killed worker, not a
+    // missing native process-exit receipt or an unclosed tree helper.
+    stderr.once("close", () => child.emit("close", null));
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+    const debt = vi.fn();
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    let stopping: Promise<void> | undefined;
+    try {
+      const handle = await spawnDetached("worker.mjs", [], process.cwd(), { onUnconfirmedExit: debt }, undefined, { captureStderr: true });
+      stderr.write("worker diagnostic 界面\n");
+      let stopped = false;
+      stopping = handle.stop().then(() => { stopped = true; });
+      if (order === "tree-first") killer.emit("close", 0);
+      else child.emit("exit", null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stopped, "one receipt cannot skip the other owned join").toBe(false);
+      if (order === "tree-first") {
+        expect(stderr.destroyed, "helper close is not worker exit").toBe(false);
+        child.emit("exit", null);
+      } else killer.emit("close", 0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stopped, "diagnostics must not manufacture a seven-second native-close debt").toBe(true);
+      expect(stderr.destroyed).toBe(true);
+      await handle.waitForClose();
+      expect(debt).not.toHaveBeenCalled();
+      expect(handle.lostContact()).toBeUndefined();
+      expect(handle.readStderr?.()).toBe("worker diagnostic 界面\n");
+    } finally {
+      stderr.destroy(); killer.emit("close", 0); child.emit("exit", null); child.emit("close", null);
+      await stopping;
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  it("Windows diagnostic disposal requires native exit, and disposal alone cannot acknowledge native close", async () => {
+    vi.useFakeTimers();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn(), stderr });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    let joining: Promise<void> | undefined;
+    try {
+      const handle = await spawnDetached("worker.mjs", [], process.cwd(), undefined, undefined, { captureStderr: true });
+      vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+      expect(await handle.isAlive()).toBe(false);
+      let joined = false;
+      joining = handle.waitForClose().then(() => { joined = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stderr.destroyed, "a numeric absence probe is not a native exit receipt").toBe(false);
+      expect(joined).toBe(false);
+      child.emit("exit", 0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stderr.destroyed).toBe(true);
+      expect(joined, "retiring diagnostics cannot manufacture captured close").toBe(false);
+      child.emit("close", 0);
+      await joining;
+      expect(joined).toBe(true);
+      expect(handle.lostContact()).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      stderr.destroy(); child.emit("exit", 0); child.emit("close", 0);
+      await joining;
       Object.defineProperty(process, "platform", platform);
     }
   });

@@ -29,6 +29,7 @@ import {
 } from "./settings-sections.js";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { openRpcFabricSettings } from "./settings-rpc.js";
+import { imageSafeCustom } from "./image-overlays.js";
 
 const ROOT_ITEM_IDS = [
   "fullCodeMode",
@@ -161,7 +162,7 @@ export async function openFabricSettings(
     context.ui.notify("Fabric settings require an interactive UI", "warning");
     return;
   } else {
-    await context.ui.custom<void>(
+    await imageSafeCustom<void>(context.ui,
       (tui, theme, _keybindings, done) => {
         const component = new FabricSettingsComponent(
           theme,
@@ -180,6 +181,17 @@ export async function openFabricSettings(
         );
         rootComponent = component;
         return component;
+      },
+      {
+        // Use the same image-safe overlay lifecycle as dashboard and chat.
+        overlay: true,
+        overlayOptions: {
+          width: "94%",
+          minWidth: 40,
+          maxHeight: "90%",
+          anchor: "center",
+          margin: 1,
+        },
       },
     );
   }

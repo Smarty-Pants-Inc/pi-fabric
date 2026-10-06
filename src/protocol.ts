@@ -16,8 +16,144 @@ export type {
   FabricCacheSample, FabricCacheObservation, FabricCacheStatus,
 } from "./cache/types.js";
 
+/** Host-local background shell accounting, independent of model-facing notifications. */
+export const FABRIC_SHELL_TIMING_EVENT = "pi-fabric:shell:timing:v1";
+
+export interface FabricShellTimingV1 {
+  version: 1;
+  sessionId: string;
+  taskId: string;
+  tool: "bash" | "powershell";
+  /** started = handoff to background; finished includes runtime teardown. */
+  phase: "started" | "finished";
+  /** Synchronous observation time, not a backdated process timestamp. */
+  timestamp: number;
+}
+
+/** Host-emitted on each `workflow.item` status transition; observation only. */
+export const FABRIC_WORKFLOW_ITEM_EVENT = "pi-fabric:workflow-item:v1";
+
+export type FabricWorkflowItemStatusV1 =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "blocked"
+  | "stopped";
+
+export interface FabricWorkflowItemEventV1 {
+  version: 1;
+  /** The outer `fabric_exec` tool call id that owns the item. */
+  invocationId: string;
+  sessionId?: string;
+  /** Caller-supplied stable id, or the deterministic per-invocation `item-<n>`. */
+  itemId: string;
+  label?: string;
+  /** Absent on the item's first status. */
+  from?: FabricWorkflowItemStatusV1;
+  to: FabricWorkflowItemStatusV1;
+  /** Synchronous observation time (epoch ms). */
+  at: number;
+  /** Caller-supplied plain JSON object carried by the transitioning call. */
+  meta?: Record<string, unknown>;
+}
+
+/** Host-local request: run a saved program without the model, like `/fabric run`. */
+export const FABRIC_PROGRAM_RUN_EVENT = "pi-fabric:program:run:v1";
+
+export type FabricProgramRunReplyV1 =
+  | { ok: true; program: string; value: unknown; logs: string[] }
+  | { ok: false; error: string; program?: string };
+
+export interface FabricProgramRunRequestV1 {
+  /** name, name@<digest prefix >= 12>, or a full digest. */
+  ref: string;
+  input?: unknown;
+  requirePromoted?: boolean;
+  signal?: AbortSignal;
+  /** Called exactly once. */
+  reply: (result: FabricProgramRunReplyV1) => void;
+}
+
 export const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
 export const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";
+export const FABRIC_PROVIDER_WITHDRAW_EVENT = "pi-fabric:provider:withdraw:v1";
+
+/**
+ * Withdraws a directly registered provider. `generation` pins the withdrawal
+ * to one binding: a number matches the binding generation, a string matches
+ * the provider binding id. A mismatch or unknown name is ignored.
+ */
+export interface FabricProviderWithdrawalV1 {
+  name: string;
+  generation?: number | string;
+}
+
+export const readFabricProviderWithdrawalV1 = (
+  value: unknown,
+): FabricProviderWithdrawalV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const generation = record.generation;
+  if (
+    typeof record.name !== "string" ||
+    record.name.length === 0 ||
+    record.name.length > 128 ||
+    (generation !== undefined &&
+      !(typeof generation === "number" && Number.isSafeInteger(generation) && generation > 0) &&
+      !(typeof generation === "string" && generation.length > 0 && generation.length <= 128))
+  ) {
+    return undefined;
+  }
+  return {
+    name: record.name,
+    ...(generation !== undefined ? { generation: generation as number | string } : {}),
+  };
+};
+
+export const FABRIC_TOOL_PLACEMENT_EVENT = "pi-fabric:tool-placement:v1";
+export const MAX_FABRIC_TOOL_PLACEMENT_QUERY = 1_024;
+
+/**
+ * model = declared to the model this turn; program = callable from
+ * fabric_exec (pi.* / extensions.*); unavailable otherwise. model wins when
+ * both apply.
+ */
+export type FabricToolPlacement = "model" | "program" | "unavailable";
+export type FabricToolPlacementMode = "full-code" | "enforce" | "orchestration";
+
+export interface FabricToolPlacementResultV1 {
+  version: 1;
+  mode: FabricToolPlacementMode;
+  tools: Record<string, FabricToolPlacement>;
+  /** `model` tools a program can also call (foreground tools); omitted when empty. */
+  programCallable?: string[];
+}
+
+/** Host-local synchronous query; omitted `tools` reports every registered tool. */
+export interface FabricToolPlacementRequestV1 {
+  tools?: string[];
+  reply: (result: FabricToolPlacementResultV1) => void;
+}
+
+export const readFabricToolPlacementRequestV1 = (
+  value: unknown,
+): FabricToolPlacementRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const tools = record.tools;
+  if (
+    typeof record.reply !== "function" ||
+    (tools !== undefined && (
+      !Array.isArray(tools) ||
+      tools.length > MAX_FABRIC_TOOL_PLACEMENT_QUERY ||
+      tools.some((name) => typeof name !== "string" || name.length === 0 || name.length > 256)
+    ))
+  ) {
+    return undefined;
+  }
+  return value as FabricToolPlacementRequestV1;
+};
 export const FABRIC_COMPONENT_REGISTER_EVENT = "pi-fabric:component:register:v1";
 export const FABRIC_COMPONENT_DISCOVER_EVENT = "pi-fabric:component:discover:v1";
 export const FABRIC_PREWALK_REQUEST_EVENT = "pi-fabric:prewalk:request:v1";
@@ -335,11 +471,84 @@ export interface FabricDynamicGuestDeclarations {
   extensions?: string;
 }
 
+/**
+ * Provider-owned work (for example a delegated run) registered with Fabric's
+ * participant directory under `provider:<provider>:<id>`. Non-detached
+ * participants are stopped when their fabric_exec program is cancelled or
+ * times out; detached ones survive until stopped, withdrawn, or shut down.
+ */
+export interface FabricParticipantSpec {
+  /** Unique per provider while unsettled; `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`. */
+  id: string;
+  label: string;
+  kind?: string;
+  detached?: boolean;
+  stop(reason: string): Promise<{ confirmed: boolean }>;
+  steer?(message: string): Promise<void>;
+  followUp?(message: string): Promise<void>;
+}
+
+export interface FabricParticipantProgress {
+  phase?: string;
+  message?: string;
+  /** Cumulative totals; each update replaces the previous usage. */
+  usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number };
+}
+
+export interface FabricParticipantSettlement {
+  status: "completed" | "failed" | "stopped";
+  summary?: string;
+}
+
+export interface FabricParticipantHandle {
+  readonly ref: string;
+  update(progress: FabricParticipantProgress): void;
+  settle(result: FabricParticipantSettlement): void;
+  dispose(): void;
+}
+
+export interface FabricInvocationParticipants {
+  register(spec: FabricParticipantSpec): FabricParticipantHandle;
+}
+
+/** Host-issued principal and grants (`pi-fabric/scope`); trusted host code, not a verified kernel. */
+export type FabricScopeAction = "read" | "write" | "execute";
+export interface FabricScopeGrant {
+  /** `<ns>:<path>`, `<ns>:<path>/*` (one level), `<ns>:<path>/**` (any depth) or `<ns>:*`. */
+  resource: string;
+  actions: FabricScopeAction[];
+}
+export interface FabricScope {
+  version: 1;
+  principal: { id: string; issuer: "host" };
+  /** At most 64, merged per resource and sorted. */
+  grants: FabricScopeGrant[];
+  /** sha256 hex of canonical JSON { grants, parentDigest?, principal }. */
+  digest: string;
+  parentDigest?: string;
+}
+/**
+ * Host-stamped authority of a message's sender (actor mailbox items, mesh
+ * events). "host" is an unscoped session; "scope" carries the sender's scope,
+ * with grants when they fit. Absent on records written by older builds.
+ */
+export type FabricMessageSender =
+  | { authority: "host" }
+  | {
+      authority: "scope";
+      principalId: string;
+      digest: string;
+      grants?: FabricScopeGrant[];
+      parentDigest?: string;
+    };
+
 export interface FabricInvocationContext {
   cwd: string;
   signal: AbortSignal | undefined;
   parentToolCallId: string;
   nestedToolCallId: string;
+  /** Host-owned scoped runner; preserves nested budget ancestry across registry signal wrappers. */
+  nestedProgramRunner?: import("./execution-service.js").FabricNestedProgramRunner;
   extensionContext: ExtensionContext;
   update(message: string): void;
   activity?(update: FabricInvocationActivityUpdate): void;
@@ -349,6 +558,8 @@ export interface FabricInvocationContext {
   readonly checkExecutionBudget?: () => void;
   /** Host-only receipt: commit consumption after result publication, abandon on rejection. */
   deferResultConsumption?(consume: () => void, abandon?: () => void): void;
+  /** Host-supplied inside fabric_exec: register provider-owned work as a participant. */
+  participants?: FabricInvocationParticipants;
   /** Host-supplied inside fabric_exec so agents.handoff schedules the outer-call boundary. */
   deferHandoff?(args: Record<string, unknown>): Record<string, unknown>;
   // Out-of-band image content blocks a provider (currently only pi.read of an
@@ -367,6 +578,8 @@ export interface FabricInvocationContext {
   // never projected into the durable execution trace.
   attachPreview?(preview: unknown): void;
   capabilityView?: FabricCommittedCapabilityView;
+  /** Frozen host-issued scope; set by the registry only, absent when unscoped. */
+  scope?: Readonly<FabricScope>;
   /** Advisory for ordinary calls; strict components reject concurrent conflicting effects. */
   effectPolicy?: "advisory" | "strict";
 }

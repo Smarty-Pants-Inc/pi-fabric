@@ -279,9 +279,14 @@ describe("compaction config", () => {
     const configured = normalizeFabricConfig({
       compaction: { engine: "pi", targetContextRatio: 0.7 },
     }).compaction;
-    expect(configured).toEqual({ engine: "pi", targetContextRatio: 0.7, thresholds: {}, tokenThresholds: {} });
+    const defaults = {
+      pressureBands: { warn: 0.6, urgent: 0.8 },
+      outputReserveTokens: 0,
+      repairOrphans: true,
+    };
+    expect(configured).toEqual({ engine: "pi", targetContextRatio: 0.7, thresholds: {}, tokenThresholds: {}, ...defaults });
     expect(normalizeFabricConfig({ compaction: { engine: "bogus", targetContextRatio: 2 } }).compaction)
-      .toEqual({ engine: "fabric", targetContextRatio: 0.85, thresholds: {}, tokenThresholds: {} });
+      .toEqual({ engine: "fabric", targetContextRatio: 0.85, thresholds: {}, tokenThresholds: {}, ...defaults });
     expect(normalizeFabricConfig({ compaction: { targetContextRatio: 0.1 } }).compaction.targetContextRatio)
       .toBe(0.25);
     expect(normalizeFabricConfig({ compaction: { targetContextRatio: "large" } }).compaction.targetContextRatio)

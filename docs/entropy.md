@@ -67,6 +67,19 @@ changes still update the report. These caches are session-owned, retain at most
 16 windows, and are discarded on session start/shutdown. Cached snapshot inputs
 must not be mutated by callers.
 
+Persistence contention is advisory, not a compilation failure. Pool updates
+reload and merge the latest evidence under the shared lock so sibling Pi
+processes cannot overwrite each other's contributions. A busy pool does not
+stop normal-form compilation; a busy artifact store does not prevent activation
+of freshly proved plans. One coalesced background retry uses exponential backoff
+with jitter (capped at 30 seconds), re-reading current evidence on each attempt.
+Retry timers do not keep Pi alive and are canceled on session start/shutdown;
+turn hooks never wait for them. Old locks from dead owners, incomplete writes,
+or malformed metadata recover automatically after the 30-second grace period.
+Live owners (including permission-denied process probes) are never evicted just
+because a lock is old. Damaged pool/artifact data is still preserved and reported,
+not silently rebuilt or treated as ordinary contention.
+
 The background compile reads only the active session's file, from a
 complete-line cursor: a partial tail is left for the next read, so a live
 session is never re-read from byte 0. Reads and scoring stop at once when the

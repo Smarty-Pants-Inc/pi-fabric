@@ -9,14 +9,18 @@ import {
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
 
+// RUNNER_ID_PATTERN (src/agents/runner-registry.ts) as source text; kept in sync by a test.
+const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
+
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
   needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
   runner: {
     type: "string",
-    enum: ["pi", "claude", "veda"],
-    description: "Execution harness. Defaults to agents.runner.",
+    pattern: RUNNER_ID_SOURCE,
+    maxLength: 64,
+    description: "Execution harness: pi, claude, veda, or a runner registered through pi-fabric/runners. Defaults to agents.runner.",
   },
   kernel: {
     type: "string",
@@ -47,6 +51,15 @@ const runProperties = {
     type: "string",
     enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   },
+  thinkingBounds: {
+    type: "object",
+    properties: {
+      min: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+      max: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+    },
+    additionalProperties: false,
+    description: "Optional child thinking bounds; must lie inside this session's bounds (omitted ends inherit). Child Fabric sessions never widen them. thinking outside the effective bounds is clamped and reported as requestedThinking.",
+  },
   tools: { type: "array", items: { type: "string" } },
   nice: {
     type: "integer",
@@ -66,10 +79,58 @@ const runProperties = {
     description: "Filesystem execution directory for leaf or recursive Pi runs; relative paths resolve from the caller cwd. Does not change project/mesh ownership or grant target project trust.",
   },
   worktree: { type: "boolean" },
+  worktreeSetup: {
+    type: "string",
+    maxLength: 8192,
+    description: "Shell command run in a new worktree before the child starts; overrides agents.worktree.setup. Non-zero exit fails the run.",
+  },
+  seed: {
+    type: "string",
+    enum: ["task", "branch", "snippet"],
+    description: "Child context (Pi only). task (default): the task alone. branch: a non-blocking fork of this conversation up to its last completed turn, then the task. snippet: the last seedMessages user/assistant texts prefixed to the task.",
+  },
+  seedMessages: { type: "integer", minimum: 1, maximum: 50, description: "snippet only; default 12" },
+  readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
+  writableRoots: {
+    type: "array",
+    items: { type: "string", maxLength: 4096 },
+    maxItems: 32,
+    description: "Pi only: confine write/edit to these directories (relative to the child cwd; default the cwd). Shell is refused unless shell: \"unconfined\".",
+  },
+  scope: {
+    type: "object",
+    properties: {
+      grants: {
+        type: "array",
+        maxItems: 64,
+        items: {
+          type: "object",
+          properties: {
+            resource: { type: "string", minLength: 3, maxLength: 512 },
+            actions: { type: "array", minItems: 1, maxItems: 3, items: { type: "string", enum: ["read", "write", "execute"] } },
+          },
+          required: ["resource", "actions"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["grants"],
+    additionalProperties: false,
+    description: "Narrow this session's host-issued scope for the child (each grant must be covered by a parent grant; resource <ns>:<path>, <ns>:<path>/*, <ns>:<path>/**, <ns>:*). Omit to inherit it; refused in an unscoped session.",
+  },
+  shell: {
+    type: "string",
+    enum: ["deny", "unconfined"],
+    description: "With a write policy, bash is refused by default; unconfined allows it and is not a sandbox",
+  },
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
   systemPrompt: {
     type: "string",
     description: "Optional extra system prompt body for this child run. Pi runners merge it below component guidance and forward it via --system-prompt; Claude runners receive it via --append-system-prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+  },
+  persistSession: {
+    type: "boolean",
+    description: "Claude runner only: persist the Claude Code transcript for hook-based observability. Defaults to false.",
   },
 };
 
@@ -374,7 +435,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     inputSchema: {
       type: "object",
       properties: {
-        runner: { type: "string", enum: ["pi", "claude", "veda"] },
+        runner: { type: "string", pattern: RUNNER_ID_SOURCE, maxLength: 64 },
         refresh: { type: "boolean" },
       },
       additionalProperties: false,

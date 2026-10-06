@@ -24,6 +24,7 @@ export class PiModelControl {
   #pending: { id: string; command: string } | undefined;
   #sequence = 0;
   #failed = false;
+  #admission: "strict" | "permissive";
   ready = false;
 
   private readonly runId: string;
@@ -44,9 +45,10 @@ export class PiModelControl {
     requested: string | undefined,
     thinking: string | undefined,
     io: PiModelControl["io"],
-    activationWindow = false,
+    activationWindow: boolean | "strict" | "permissive" = false,
     startupFence = false,
     requiredPin = false,
+    admission: "strict" | "permissive" = "strict",
   ) {
     // Keep this module executable through Node's native type stripping too;
     // source workers must not rely on transform-only parameter properties.
@@ -54,9 +56,10 @@ export class PiModelControl {
     this.requested = requested;
     this.thinking = thinking;
     this.io = io;
-    this.activationWindow = activationWindow;
+    this.activationWindow = typeof activationWindow === "boolean" ? activationWindow : false;
     this.startupFence = startupFence;
     this.requiredPin = requiredPin;
+    this.#admission = typeof activationWindow === "string" ? activationWindow : admission;
   }
 
   start(): void {
@@ -147,7 +150,9 @@ export class PiModelControl {
       const state = object(event.data);
       const actual = identity(state?.model);
       if (actual) this.io.observed(key(actual));
-      if (!actual || key(actual) !== key(this.#expected!)) {
+      // Permissive virtual-provider attribution never overrides an explicit route pin.
+      const mismatch = !actual || key(actual) !== key(this.#expected!);
+      if (mismatch && !(this.#admission === "permissive" && !this.requiredPin && actual)) {
         this.fail(`${this.requiredPin ? "MODEL_ROUTE_PIN_MISMATCH: " : ""}requested ${key(this.#expected!)}, but child reports ${actual ? key(actual) : "no model"} after set_model; task was not sent`);
       } else if (this.requiredPin && (!this.thinking || state?.thinkingLevel !== this.thinking ||
         !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(this.thinking))) {
@@ -156,7 +161,7 @@ export class PiModelControl {
         this.fail("child started work before model admission; task was not sent");
       } else {
         this.ready = true;
-        this.io.admitted(key(actual), typeof state?.thinkingLevel === "string" ? state.thinkingLevel : undefined);
+        this.io.admitted(key(actual!), typeof state?.thinkingLevel === "string" ? state.thinkingLevel : undefined);
       }
     }
     return true;
@@ -171,7 +176,11 @@ export class PiModelControl {
     if (this.#failed) return;
     if (this.requested && !this.ready) {
       this.fail("child emitted an assistant message before model admission");
-    } else if (this.#expected && (!actual || key(actual) !== key(this.#expected))) {
+    } else if (
+      (this.requiredPin || this.#admission === "strict") &&
+      this.#expected &&
+      (!actual || key(actual) !== key(this.#expected))
+    ) {
       this.fail(`requested ${key(this.#expected)}, but assistant reports ${actual ? key(actual) : "missing model attribution"}; terminating child`);
     }
   }

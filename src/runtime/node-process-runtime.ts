@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { NODE_PROCESS_CHILD_SOURCE } from "./node-process-child-source.js";
@@ -116,7 +118,7 @@ export class NodeProcessRuntime {
     );
     const hostAbortController = new AbortController();
     shareCancellationEffects(hostAbortController.signal, options.signal);
-    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options, startedAt);
     let abortHandler: (() => void) | undefined;
     let settled = false;
     let finishing = false;
@@ -149,7 +151,10 @@ export class NodeProcessRuntime {
         hostAbortController.abort(executionDeadline.reason);
         finish(executionDeadline.timeoutResult([]));
       };
-      const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const scheduleDeadline = (): void => {
+        if (settled || finishing || humanWait.paused) return;
+        executionDeadline.scheduleDeadline(expireDeadline, true);
+      };
       const send = (message: any, delivered?: () => void): void => {
         if (settled || finishing || !child.connected) return;
         if (executionDeadline.reached) { expireDeadline(); return; }
@@ -174,8 +179,14 @@ export class NodeProcessRuntime {
       };
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
-        if (executionDeadline.extend(requested)) scheduleDeadline();
+        if (humanWait.paused && typeof requested === "number" && Number.isFinite(requested)) humanWait.raise(requested);
+        else if (executionDeadline.extend(requested)) scheduleDeadline();
       };
+
+      const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+        () => executionDeadline, options, scheduleDeadline, expireDeadline,
+      ));
+      options.registerHumanWaitPause?.(humanWait);
 
       abortHandler = () => {
         // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).
@@ -252,14 +263,19 @@ export class NodeProcessRuntime {
           });
           return;
         }
-        const task = runAbortable(hostAbortController.signal, () =>
-          hostCall(message.ref, message.args, hostAbortController.signal),
-        ).then(
+        const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
+        if (executionDeadline.reached) { expireDeadline(); return; }
+        if (waitsForHuman) humanWait.enter();
+        const task = runAbortable(hostAbortController.signal, () => {
+          if (executionDeadline.reached) { expireDeadline(); throw executionDeadline.reason; }
+          return hostCall(message.ref, message.args, hostAbortController.signal);
+        }).finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        }).then(
           (value) => {
             if (settled || finishing || !child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }
-            // Serialize before admission: getters/toJSON can spend the remaining
-            // budget, and must not acknowledge an undelivered observation.
+            // A native write is not admission; serialize within the budget, then await the correlated guest ack.
             const response = JSON.parse(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
             if (executionDeadline.reached) { expireDeadline(); return; }
             send(response, () => options.onHostResultDelivered?.(message.args));
@@ -306,6 +322,7 @@ export class NodeProcessRuntime {
         code: guestBundle.code,
         strings: options.strings ?? {},
         tokenBudget: options.tokenBudget,
+        workflowSpentTokens: options.workflowSpentTokens,
         maxLogChars: options.maxLogChars ?? 100_000,
       });
     });

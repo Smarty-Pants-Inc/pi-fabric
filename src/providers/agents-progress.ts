@@ -194,8 +194,9 @@ export const waitWithProgress = async (
       );
       if (revision === lastPreviewRevision) return;
       lastPreviewRevision = revision;
-      const currentTool =
-        "currentTool" in status && status.currentTool ? ` · ${status.currentTool}` : "";
+      const currentTool = "blockedOn" in status && status.blockedOn
+        ? " · waiting_for_answer"
+        : "currentTool" in status && status.currentTool ? ` · ${status.currentTool}` : "";
       const displayName = status.actorName ?? status.name;
       context.update(`Agent ${displayName}: ${status.status}${currentTool}`);
       if ("usage" in status) {

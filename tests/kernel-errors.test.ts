@@ -55,10 +55,9 @@ for (const backend of ["monty", "cpython"] as const) {
     it("retains host schema ref/property and gives Python repair advice", async () => {
       const code = 'return await tools.call(ref="demo.echo", args={"count": "bad"})';
       const result = await run(code, async () => { throw new Error("Invalid arguments for demo.echo: /count: expected number"); });
-      expect(result.error).toContain("Invalid arguments for demo.echo: /count: expected number");
+      expect(result.terminationReason).toBe("runtime_error");
+      expect(result.error).toContain("RuntimeError: Invalid arguments for demo.echo: /count: expected number");
       if (backend === "cpython") {
-        expect(result.terminationReason).toBe("runtime_error");
-        expect(result.error).toContain("RuntimeError: Invalid arguments for demo.echo: /count: expected number");
         expect(result.error).toContain('File "fabric-exec.py", line 1, in <fabric_exec>');
       }
       expect(result.error).not.toMatch(/<string>|_HostError|in _call|in __call__/);
@@ -93,6 +92,14 @@ for (const backend of ["monty", "cpython"] as const) {
       expect(pythonErrorRecoveryHint(code, result.error!, backend)).toContain("explicit trusted CPython");
     });
     if (backend === "cpython") {
+      it.each([" from cause", ""])("formats host errors in chained exceptions (%s)", async (suffix) => {
+        const result = await run('try:\n    await tools.call(ref="demo.echo", args={})\nexcept Exception as cause:\n    raise ValueError("outer failure")' + suffix, async () => { throw new Error("host failure"); });
+        expect(result.terminationReason).toBe("runtime_error");
+        expect(result.error).toContain("RuntimeError: host failure");
+        expect(result.error).toContain("ValueError: outer failure");
+        expect(result.error).toContain(suffix ? "direct cause" : "During handling");
+        expect(result.error).not.toMatch(/_HostError|AttributeError|DeprecationWarning|in _call/);
+      });
       it("preserves exception causes and implicit context", async () => {
         for (const suffix of [' from cause', '']) {
           const result = await run('try:\n    raise ValueError("first cause")\nexcept ValueError as cause:\n    raise RuntimeError("second failure")' + suffix);

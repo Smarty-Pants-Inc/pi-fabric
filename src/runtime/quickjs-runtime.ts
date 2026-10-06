@@ -7,6 +7,8 @@ import { cancellationError, preserveCancellationOutcome, runAbortable, settleWit
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
 
@@ -114,7 +116,7 @@ const __fabricBridge = globalThis.__fabricHostCall;
 delete globalThis.__fabricHostCall;
 const __successfulCalls = [];
 const __resolvedCallRef = (ref, args) =>
-  ref === "fabric.$call" && args && typeof args.ref === "string" ? args.ref : ref;
+  ref === "fabric.$workflowRun" ? "agents.run" : ref === "fabric.$call" && args && typeof args.ref === "string" ? args.ref : ref;
 const __recordSuccessfulCall = (ref, args) => {
   __successfulCalls.push(Object.freeze({ ref: __resolvedCallRef(ref, args) }));
 };
@@ -129,9 +131,18 @@ const __handoffFacts = () => {
 };
 const __call = async (ref, args) => {
   const normalizedArgs = args ?? {};
-  const value = await __fabricBridge(ref, normalizedArgs);
-  __recordSuccessfulCall(ref, normalizedArgs);
-  return value;
+  try {
+    const value = await __fabricBridge(ref, normalizedArgs);
+    __recordSuccessfulCall(ref, normalizedArgs);
+    return value;
+  } finally {
+    // Synchronous budget observations refresh at these await boundaries, including
+    // failed nested runs. Host admission owns the guard, not this guest snapshot.
+    if (__sharedWorkflowBudget && (ref === "fabric.$workflowRun" || __resolvedCallRef(ref, normalizedArgs) === "programs.run")) {
+      try { __workflowSpentTokens = Math.max(__workflowSpentTokens, await __fabricBridge("fabric.$workflowBudget", {})); }
+      catch { /* Cancellation must retain the original call outcome. */ }
+    }
+  }
 };
 const __piToolNames = ["read","bash","powershell","edit","write","grep","find","ls"];
 const __coreToolHint = (name) => __piToolsAvailable
@@ -475,6 +486,9 @@ globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 globalThis.cache = __providerProxy("cache");
+globalThis.thinking = __providerProxy("thinking");
+globalThis.decisions = __providerProxy("decisions");
+globalThis.programs = __providerProxy("programs");
 globalThis.prewalk = __providerProxy("prewalk");
 globalThis.records = __providerProxy("records");
 globalThis.jev = __providerProxy("jev");
@@ -584,6 +598,11 @@ globalThis.mesh = Object.freeze({
   list: (args = {}) => __call("mesh.list", args),
   put: (args) => __call("mesh.put", args),
   delete: (args) => __call("mesh.delete", args),
+  scheduled: (args = {}) => __call("mesh.scheduled", args),
+  unschedule: (args) => __call("mesh.unschedule", args),
+  grant: (args) => __call("mesh.grant", args),
+  revoke: (args) => __call("mesh.revoke", args),
+  grants: () => __call("mesh.grants", {}),
 });
 // The mcp proxy itself stays schema-less — the registry validates args at
 // dispatch — but guestTypeDeclarations renders per-server argument types from
@@ -604,22 +623,25 @@ globalThis.mcp = new Proxy({}, {
     });
   },
 });
-let __workflowSpentTokens = 0;
+const __sharedWorkflowBudget = typeof globalThis.__fabricWorkflowSpentTokens === "number";
+let __workflowSpentTokens = globalThis.__fabricWorkflowSpentTokens ?? 0;
+delete globalThis.__fabricWorkflowSpentTokens;
 const __workflowBudgetTotal = Number.isFinite(globalThis.__fabricTokenBudget)
   ? Math.max(0, globalThis.__fabricTokenBudget)
   : Number.POSITIVE_INFINITY;
 const __recordAgentUsage = (result) => {
   const usage = result && result.usage;
-  if (usage) __workflowSpentTokens += Number(usage.input || 0) + Number(usage.output || 0);
+  if (usage && !__sharedWorkflowBudget) __workflowSpentTokens += Number(usage.input || 0) + Number(usage.output || 0);
   return result;
 };
+const __workflowRun = (args) => __sharedWorkflowBudget ? __call("fabric.$workflowRun", args) : agents.run(args);
 const __workflowAgent = async (prompt, options = {}) => {
   if (__workflowSpentTokens >= __workflowBudgetTotal) {
     throw new Error("Fabric workflow token budget exhausted");
   }
   const { label, ...agentOptions } = options;
   const workerName = String(label || agentOptions.name || "Fabric workflow agent");
-  const result = __recordAgentUsage(await agents.run({
+  const result = __recordAgentUsage(await __workflowRun({
     ...agentOptions,
     ...(label && !agentOptions.name ? { name: label } : {}),
     task: prompt,
@@ -637,7 +659,7 @@ const __budgetedRun = async (args) => {
   if (__workflowSpentTokens >= __workflowBudgetTotal) {
     throw new Error("Fabric workflow token budget exhausted");
   }
-  return __recordAgentUsage(await agents.run(args));
+  return __recordAgentUsage(await __workflowRun(args));
 };
 let __nextWorkflowSpanId = 0;
 const __workflowSpanMetadata = (kind, items, options, stageCount) => {
@@ -1027,7 +1049,7 @@ export class QuickJsRuntime {
       rejectDeadline?.(new Error(outcome));
     };
     const scheduleDeadline = (): void => {
-      if (!rejectDeadline || closing || cancelled || timedOut) return;
+      if (!rejectDeadline || closing || cancelled || timedOut || humanWait.paused) return;
       executionDeadline.scheduleDeadline(expireDeadline);
     };
     const extendExecutionTimeout = (
@@ -1041,8 +1063,14 @@ export class QuickJsRuntime {
       ) {
         return;
       }
+      if (humanWait.paused) { humanWait.raise(requestedTimeoutMs); return; }
       if (executionDeadline.extend(requestedTimeoutMs)) scheduleDeadline();
     };
+
+    const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+      () => executionDeadline, options, scheduleDeadline, expireDeadline,
+    ));
+    options.registerHumanWaitPause?.(humanWait);
 
     try {
       const hostFunction = context.newFunction(
@@ -1083,12 +1111,17 @@ export class QuickJsRuntime {
             void promise.settled.then(() => pendingTimers.delete(timer));
             return promise.handle;
           }
+          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
+          // Policy evaluation also spends budget; an expired call cannot revive it by pausing.
+          if (deadlineReached()) { expireDeadline(); return { error: context.newError(timeoutMessage()) }; }
+          if (waitsForHuman) humanWait.enter();
           const task = runAbortable(hostAbortController.signal, () => {
-            // Argument decoding and deadline policy also consume wall time.
-            // Recheck immediately before admitting actual host work.
             if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
           })
+            .finally(() => {
+              if (waitsForHuman) humanWait.leave();
+            })
             .then((value) => {
               if (closing || promise.alive === false) return;
               if (deadlineReached()) { expireDeadline(); return; }
@@ -1187,6 +1220,11 @@ export class QuickJsRuntime {
       const tokenBudget = context.newNumber(options.tokenBudget ?? Number.POSITIVE_INFINITY);
       context.setProp(context.global, "__fabricTokenBudget", tokenBudget);
       tokenBudget.dispose();
+      if (options.workflowSpentTokens !== undefined) {
+        const spent = context.newNumber(options.workflowSpentTokens);
+        context.setProp(context.global, "__fabricWorkflowSpentTokens", spent);
+        spent.dispose();
+      }
 
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
       const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false), "pi-fabric-setup.js");

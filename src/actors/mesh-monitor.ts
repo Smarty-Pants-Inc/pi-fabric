@@ -20,6 +20,8 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #timer: NodeJS.Timeout | undefined;
+  #dueTimer: NodeJS.Timeout | undefined;
+  #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #watchTimer: NodeJS.Timeout | undefined;
   #lastWatchAt = Number.NEGATIVE_INFINITY;
@@ -44,7 +46,7 @@ export class ActorMeshMonitor {
   #lastCheckpointAt = Date.now();
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor" | "nextScheduleDueAt" | "releaseDueSchedules">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -166,6 +168,22 @@ export class ActorMeshMonitor {
     this.schedule();
   }
 
+  // A schedule falling due changes no file, so wake at its due time instead of
+  // waiting for the reconcile interval.
+  #armDue(dueAt: number | undefined): void {
+    if (dueAt === this.#dueAt) return;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
+    this.#dueAt = dueAt;
+    if (dueAt === undefined || this.#closed) return;
+    this.#dueTimer = setTimeout(() => {
+      this.#dueTimer = undefined;
+      this.#dueAt = undefined;
+      this.schedule();
+    }, Math.min(Math.max(0, dueAt - Date.now()), 2_147_000_000));
+    this.#dueTimer.unref();
+  }
+
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = setInterval(() => this.schedule(), delay);
@@ -177,6 +195,15 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
     this.#polling = true;
     try {
+      // Release due schedules before reading, without bypassing receipt/cursor fences.
+      let dueAt: number | undefined;
+      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      if (dueAt !== undefined && dueAt <= Date.now()) {
+        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
+        if (this.#closed || this.callbacks.canConsumeMesh?.() === false) return;
+        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      }
+      this.#armDue(dueAt);
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.

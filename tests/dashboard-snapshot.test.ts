@@ -249,7 +249,7 @@ describe("dashboard snapshot agent ownership", () => {
       format: 1,
       id: `remote-${index}`,
       kind: "agent",
-      rootId: "session:peer",
+      rootId: "session:test",
       ownerHostId: "session:peer",
       ownerIdentityId: "session:peer",
       parentId: "session:peer",
@@ -270,6 +270,38 @@ describe("dashboard snapshot agent ownership", () => {
     expect(snapshot.agents).toHaveLength(240);
     expect(snapshot.agents.some((agent) => agent.id === local.id)).toBe(true);
     expect(snapshot.agents.filter((agent) => agent.local === false)).toHaveLength(239);
+  });
+
+  it("excludes agents owned by another session's lineage", () => {
+    const local = {
+      ...record("local-agent"),
+      startedAt: 1,
+      updatedAt: 2,
+      status: "running" as const,
+    };
+    const foreign: FabricParticipantInfo[] = Array.from({ length: 3 }, (_, index) => ({
+      format: 1,
+      id: `foreign-${index}`,
+      kind: "agent",
+      rootId: "session:other",
+      ownerHostId: "session:other",
+      ownerIdentityId: "session:other",
+      parentId: "session:other",
+      name: `foreign-${index}`,
+      status: "running",
+      runner: "pi",
+      transport: "process",
+      capabilities: ["steer", "followUp", "stop"],
+      startedAt: 1_000 + index,
+      updatedAt: 2_000 + index,
+      controlProtocol: "v1",
+      local: false,
+      stale: false,
+    }));
+
+    const snapshot = createDashboardSnapshot(fakeState([], [local], [], [], foreign), []);
+
+    expect(snapshot.agents.map((agent) => agent.id)).toEqual([local.id]);
   });
 
   it("does not overlay private local actor state when another host owns it", () => {
@@ -355,5 +387,41 @@ describe("dashboard snapshot agent ownership", () => {
 
     const snapshot = createDashboardSnapshot(fakeState([], [failed, running], [actor]), []);
     expect(snapshot.actors[0]?.worker?.id).toBe("actor-running");
+  });
+
+  it("shows provider-registered participants as agent rows", () => {
+    const participant: FabricParticipantInfo = {
+      format: 1,
+      id: "provider:delegate:run-1",
+      kind: "provider",
+      provider: "delegate",
+      rootId: "session:test",
+      ownerHostId: "session:test",
+      ownerIdentityId: "session:test",
+      parentId: "session:test",
+      name: "Delegated run",
+      status: "running",
+      transport: "host",
+      capabilities: ["stop"],
+      startedAt: 10,
+      updatedAt: 20,
+      currentTool: "build: compiling",
+      controlProtocol: "v1",
+      local: true,
+      stale: false,
+    };
+    const snapshot = createDashboardSnapshot(fakeState([], [], [], [], [participant]), []);
+    expect(snapshot.agents).toEqual([
+      expect.objectContaining({
+        id: participant.id,
+        name: "Delegated run",
+        status: "running",
+        transport: "provider delegate",
+        currentTool: "build: compiling",
+        participantKind: "provider",
+        capabilities: ["stop"],
+      }),
+    ]);
+    expect(snapshot.agents[0]).not.toHaveProperty("runner");
   });
 });

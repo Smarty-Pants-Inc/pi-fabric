@@ -365,7 +365,10 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
       fs.mkdirSync(dir, { mode: 0o700 }); fs.writeFileSync(path.join(dir, "data"), "x");
       const stat = fs.statSync(dir, { bigint: true });
       // An ended owner: no live process has this start time.
-      fs.writeFileSync(`${dir}.custody`, JSON.stringify({ host: process.pid, hostStart: -1, since: 0,
+      // Admission began now, not at boot: pre-existing no_new_privs processes
+      // elsewhere on the shared host are not descendants of this retained temp.
+      const since = Math.floor(Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]) * 100) - 100;
+      fs.writeFileSync(`${dir}.custody`, JSON.stringify({ host: process.pid, hostStart: -1, since,
         dev: String(stat.dev), ino: String(stat.ino), groups: [], unconfirmed: false, ...record }));
       return dir;
     };

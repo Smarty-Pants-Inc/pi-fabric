@@ -23,6 +23,7 @@ const selectListThemeFor = (theme: unknown) => {
   };
 };
 import type { FabricApprovalConfig } from "../config.js";
+import { actionApprovalOverride } from "./approval-overrides.js";
 import type { FabricRisk } from "../protocol.js";
 import type { ResolvedFabricAction } from "./action-registry.js";
 import {
@@ -44,24 +45,8 @@ const onceLabel = "Allow once";
 const sessionLabel = (risk: FabricRisk): string =>
   `Allow ${risk} access for this session`;
 
-export class FabricSessionApprovals {
-  readonly approvedRisks = new Set<FabricRisk>();
-  #tail: Promise<void> = Promise.resolve();
-
-  async serialize<T>(request: () => Promise<T>): Promise<T> {
-    const previous = this.#tail;
-    let release: (() => void) | undefined;
-    this.#tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await request();
-    } finally {
-      release?.();
-    }
-  }
-}
+import { FabricSessionApprovals } from "./session-approvals.js";
+export { FabricSessionApprovals } from "./session-approvals.js";
 
 export interface FabricAutoApprovalAudit {
   action: string;
@@ -90,17 +75,38 @@ export class ApprovalController {
       decision?: FabricAutoApprovalDecision,
     ) => void,
     readonly brokeredNetwork?: (provider: string) => boolean,
-    /** Internal routing cannot own a classifier or approval dialog: refuse ungranted `auto`/`ask` before queuing. */
-    readonly internalRouting = false,
+    /** Upstream's headless callback slot also accepts the fork's legacy routing fence. */
+    readonly headlessOrInternalRouting: ((action: ResolvedFabricAction, reason?: string, signal?: AbortSignal) => Promise<boolean>) | boolean = false,
+    /** Internal routing cannot own classifier work or a queued approval dialog. */
+    readonly internalRouting = typeof headlessOrInternalRouting === "boolean" ? headlessOrInternalRouting : false,
   ) {}
+
+  /** Headless decisions resolve to true only on an explicit approve. */
+  get headless(): ((action: ResolvedFabricAction, reason?: string, signal?: AbortSignal) => Promise<boolean>) | undefined {
+    return typeof this.headlessOrInternalRouting === "function" ? this.headlessOrInternalRouting : undefined;
+  }
 
   async approve(
     action: ResolvedFabricAction,
     args: Record<string, unknown> = {},
+    signal?: AbortSignal,
   ): Promise<void> {
+    signal?.throwIfAborted();
+    // Alternate MCP routes (notably mcp.$call) must be judged by the same
+    // canonical tool ref as direct dispatch, never by their management ref.
+    const canonicalRef = action.ref === "mcp.$call" && typeof args.server === "string" && typeof args.tool === "string"
+      ? `mcp.${args.server}.${args.tool}`
+      : action.ref;
+    const override = actionApprovalOverride(this.config.actions, canonicalRef)
+      ?? (canonicalRef === action.ref ? undefined : actionApprovalOverride(this.config.actions, action.ref));
+    // An action-level deny is absolute: no inherited or session risk grant lifts it.
+    if (override === "deny") {
+      throw new FabricTraceSafeError(`${canonicalRef} is denied by the Fabric approvals.actions policy`);
+    }
     // This is an immutable host capability, not a model/configurable network grant.
     if (action.risk === "network" && this.brokeredNetwork?.(action.provider) === true) return;
-    const mode = this.config[action.risk];
+    // Exact ref beats provider wildcard beats the risk-class mode.
+    const mode = override ?? this.config[action.risk];
     if (
       mode === "allow" ||
       (!this.brokeredNetwork && (
@@ -123,9 +129,10 @@ export class ApprovalController {
     }
 
     await this.sessionApprovals.serialize(async () => {
+      signal?.throwIfAborted(); // A queued caller can expire before owning the slot.
       if (this.sessionApprovals.approvedRisks.has(action.risk)) return;
       if (mode !== "auto") {
-        await this.#requestApproval(action);
+        await this.#requestApproval(action, undefined, signal);
         return;
       }
       let decision: FabricAutoApprovalDecision;
@@ -149,9 +156,11 @@ export class ApprovalController {
         await this.#requestApproval(
           action,
           `Auto mode could not determine safety: ${message}`,
+          signal,
         );
         return;
       }
+      signal?.throwIfAborted();
       this.onAutoDecision?.({
         action: action.ref,
         risk: action.risk,
@@ -166,6 +175,7 @@ export class ApprovalController {
       await this.#requestApproval(
         action,
         `Auto mode escalated (${decision.model}): ${decision.reason}`,
+        signal,
       );
     });
   }
@@ -173,8 +183,14 @@ export class ApprovalController {
   async #requestApproval(
     action: ResolvedFabricAction,
     escalationReason?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
+    signal?.throwIfAborted();
     if (!this.context.hasUI) {
+      if (this.config.headless === "decision" && this.headless) {
+        if (await this.headless(action, escalationReason, signal)) { signal?.throwIfAborted(); return; }
+        throw new FabricTraceSafeError(`${action.ref} approval was denied, cancelled, or expired`);
+      }
       throw new FabricTraceSafeError(`${action.ref} requires approval, but no interactive UI is available`);
     }
 

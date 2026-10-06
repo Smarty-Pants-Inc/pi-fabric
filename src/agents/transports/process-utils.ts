@@ -5,6 +5,18 @@ import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
+import { StringDecoder } from "node:string_decoder";
+
+export interface DetachedProcessHandle {
+  pid: number;
+  closed: Promise<void>;
+  stop(): Promise<void>;
+  isAlive(): Promise<boolean>;
+  lostContact(): string | undefined;
+  stopDebt?(): string | undefined;
+  waitForClose(): Promise<void>;
+  readStderr?: () => string;
+}
 
 export interface ExecFileResult {
   stdout: string;
@@ -280,13 +292,23 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit"> & { captureStderr?: boolean; onCustody?: (handle: DetachedProcessHandle) => void },
   environment?: NodeJS.ProcessEnv,
-  scope?: { executable: string; slice: string; warn: (reason: string) => void },
+  options: { captureStderr?: boolean } = {},
+  scope?: { executable: string; slice: string; warn: (reason: string) => void } | number,
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
-  termGraceMs = STOP_TERM_MS,
+  termGraceMs: number | boolean = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<DetachedProcessHandle> => {
+
+  // Preserve the pre-scope positional contract used by older callers:
+  // (options, termGraceMs, executionCustodian).
+  if (typeof scope === "number") {
+    executionCustodian = termGraceMs === true;
+    termGraceMs = scope;
+    scope = undefined;
+  }
+  const graceMs = typeof termGraceMs === "number" ? termGraceMs : STOP_TERM_MS;
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -304,8 +326,12 @@ export const spawnDetached = async (
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
-    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: tracksExecution
+      ? ["ignore", "ignore", (options.captureStderr ?? authority?.captureStderr) ? "pipe" : "ignore", "ipc"]
+      : ["ignore", "ignore", (options.captureStderr ?? authority?.captureStderr) ? "pipe" : "ignore"],
+
   });
+  // Install native exit/close receipts before awaiting spawn acknowledgement.
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
   if (!child.pid) {
@@ -314,13 +340,23 @@ export const spawnDetached = async (
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
     assertTransportLaunchAllowed(authority);
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
-    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, options, undefined, termGraceMs, executionCustodian);
   }
-  const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
+
   let exited = false;
+  let nativeExited = false;
+  let closeRequested = false;
+  // Windows native close also waits for the newly captured diagnostic pipe.
+  // That pipe is not execution custody: after an OWNED native exit, retire our
+  // read end when joining close, just as main's ignored stderr had no pipe join.
+  // A liveness probe cannot retire it, and the captured close/helper joins and
+  // immutable tree debt below remain mandatory.
+  const retireDiagnostics = (): void => {
+    if (process.platform === "win32" && nativeExited && closeRequested) child.stderr?.destroy();
+  };
   let force: ReturnType<typeof setTimeout> | undefined;
-  child.once("exit", () => { exited = true; clearTimeout(force); });
+  child.once("exit", () => { nativeExited = true; exited = true; clearTimeout(force); retireDiagnostics(); });
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
@@ -329,10 +365,50 @@ export const spawnDetached = async (
     lost = reason;
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
+  // Drain throughout the run, retaining only a bounded UTF-8 tail in memory.
+  const decoder = new StringDecoder("utf8");
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr = (stderr + decoder.write(chunk)).slice(-20_000);
+  });
+  let stderrEnded = false;
+  const finishStderr = (): void => {
+    if (stderrEnded) return;
+    stderrEnded = true;
+    stderr = (stderr + decoder.end()).slice(-20_000);
+  };
+  child.stderr?.on("end", finishStderr);
+  child.stderr?.on("close", finishStderr);
+  child.stderr?.on("error", () => {});
+  try {
+    await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", (error) => {
+      if (child.pid) unconfirmed(`Owned process worker emitted a native error: ${error.message}`);
+      reject(error);
+    });
+    // Native spawn publishes pid synchronously only after OS creation succeeds.
+    // Retain the fork's immediate owned-handle contract; a pid-less failed spawn
+    // must still await its native error instead of leaving it unhandled.
+    if (child.pid) resolve();
+    });
+  } catch (error) {
+    // A failed scoped spawn owns no worker; join its native close before retry.
+    // A pid-bearing native error remains unconfirmed custody, never replayable.
+    if (!scope || child.pid) throw error;
+    await closed;
+    fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    scope.warn(spawnError?.message ?? "systemd-run did not launch");
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, options, undefined, termGraceMs, executionCustodian);
+  }
+  if (!child.pid) throw new Error("Failed to launch Fabric worker process");
+  const pid = child.pid;
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
   // native unref above is still valid; optional channel APIs are not custody.
   child.channel?.unref?.();
+  // A diagnostic pipe must not keep the owner process alive on its own.
+  (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
   let executionPending = false;
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
@@ -472,14 +548,14 @@ export const spawnDetached = async (
     // POSIX custodians drain cooperatively on TERM. Windows uses only its
     // legacy native worker stop; no tree receipt or custody IPC is supported.
     signal("SIGTERM");
-    if (await wait(termGraceMs)) return;
+    if (await wait(graceMs)) return;
     if (process.platform !== "linux" && (executionPending || portableUncertain || groups.size > 1)) {
       throw new Error(`Fabric worker ${pid} execution exit unconfirmed; retaining custodian without birth-safe escalation`);
     }
     // A forcibly killed custodian cannot attest that all separately grouped
     // native execution was drained. Birth-checked escalation still joins every
     // observed group, but must not erase this immutable receipt debt.
-    if (tracksExecution && !exited) unconfirmed(`POSIX worker tree termination is unconfirmed after ${termGraceMs}ms grace`);
+    if (tracksExecution && !exited) unconfirmed(`POSIX worker tree termination is unconfirmed after ${graceMs}ms grace`);
     signal("SIGKILL");
     if (!(await wait(STOP_KILL_MS))) {
       if (tracksExecution) {
@@ -489,12 +565,16 @@ export const spawnDetached = async (
       throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
     }
   };
+
   const handle = {
     pid,
+    readStderr: () => stderr,
     closed,
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
+      closeRequested = true;
+      retireDiagnostics();
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
@@ -506,6 +586,8 @@ export const spawnDetached = async (
       } finally { clearTimeout(deadline); }
     },
     stop() {
+      closeRequested = true;
+      retireDiagnostics();
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {
@@ -587,6 +669,8 @@ export const spawnDetached = async (
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
     },
   };
+  // Transfer the captured control handle before scoped admission can reject.
+  authority?.onCustody?.(handle);
   if (scope && marker) {
     let nativeClosed = false;
     void closed.then(() => { nativeClosed = true; });
@@ -602,7 +686,17 @@ export const spawnDetached = async (
       assertTransportLaunchAllowed(authority);
       if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
-      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, options, undefined, termGraceMs, executionCustodian);
+
+    } catch (error) {
+      // A rejected admission is not proof that its captured execution stopped.
+      // Keep both a machine-readable obligation and the already-transferred handle.
+      if (handle.lostContact() !== undefined || await handle.isAlive().catch(() => true)) {
+        const reason = error instanceof Error ? error.message : String(error);
+        unconfirmed(reason);
+        throw Object.assign(new Error(reason), { launchOutcome: "unknown" });
+      }
+      throw error;
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
   }
   return handle;

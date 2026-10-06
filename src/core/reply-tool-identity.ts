@@ -23,6 +23,6 @@ export const isRunReplyTool = (
 };
 
 export const ownsRunReplyTool = (
-  tools: ReadonlyArray<{ name: string; sourceInfo: { path: string } }>,
+  tools: ReadonlyArray<{ name: string; sourceInfo?: { path: string } }>,
   env: NodeJS.ProcessEnv = process.env,
-): boolean => tools.some((tool) => isRunReplyTool(tool.name, tool.sourceInfo.path, env));
+): boolean => tools.some((tool) => isRunReplyTool(tool.name, tool.sourceInfo?.path, env));

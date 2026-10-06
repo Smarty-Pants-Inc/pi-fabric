@@ -100,7 +100,7 @@ Both confidence and chosen probability must be >= 0.90. Low confidence, malforme
 answer, backend error or timeout records a fixed reason and uses the pin. Caller
 cancellation still cancels launch. The existing Jev provider/client supplies the
 backend; `jev.enabled: false`, Schema enforce's unavailable Jev programs, or owner
-retirement yields `jev-error` and pinned dispatch rather than relaxing that gate.
+retirement yields `jev-error` and pinned dispatch; the gate remains enforced.
 Optional shadow inference also requires the current host `approvals.network` to
 be explicitly `"allow"`. Agent approval, inherited/session grants, and network
 `"ask"`/`"auto"`/`"deny"` do not authorize this internal call: these cases record
@@ -260,8 +260,8 @@ Main/child native session IDs for new tasks (actor rows instead carry `actorId`,
 confidence, probability, fixed reason, latency and time. A seeded native child
 session binds the recorded child ID to Pi, not just to the process transport.
 For worktree tasks, its header is seeded only after the final worktree cwd is
-known and before launch; a failed bind settles preparation failure instead of
-launching against the parent checkout. Retries and resumes retain that session
+known and before launch; a failed bind settles preparation failure and cannot
+launch against the parent checkout. Retries and resumes retain that session
 and child ID.
 Once the terminal join is durable and workers have exited, `route-session.jsonl`
 and `route-dispatch-receipt.json` are owned run artifacts collected by normal
@@ -273,7 +273,7 @@ and effort, observed model, token/cache/cost counters when known and time.
 Pre-admission failures record null admission, not the requested model. Confirmed
 pre-worker failures (including task/schema/image writes and worktree creation)
 get a terminal outcome; an unconfirmed launch is retained by the existing
-manager's cleanup obligation rather than falsely reported as a completed child.
+manager's cleanup obligation and cannot be reported as a completed child.
 Outcome writes use the manager's terminal-save retry/retention fence. Queued
 outcomes retry at most three times per settlement/cleanup/close attempt; persistent
 failure surfaces a warning and retains the full terminal receipt and run files.

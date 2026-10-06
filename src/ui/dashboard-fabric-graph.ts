@@ -311,9 +311,8 @@ const buildLayout = (
     if (entity.kind === "actor") return topologyParticipantGroup("actor");
     if (entity.kind === "agent") return topologyParticipantGroup("agent");
     if (entity.kind === "peer") return topologyParticipantGroup("peer");
-    return topologyParticipantGroup(
-      entity.kind === "meshParticipant" ? entity.value.participant?.kind ?? "root" : "root",
-    );
+    const kind = entity.kind === "meshParticipant" ? entity.value.participant?.kind ?? "root" : "root";
+    return topologyParticipantGroup(kind === "provider" ? "agent" : kind);
   };
   const nodes: GraphNode[] = entities
     .filter((entity) => entity.kind !== "meshRoute")

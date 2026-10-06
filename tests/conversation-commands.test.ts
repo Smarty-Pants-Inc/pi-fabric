@@ -317,7 +317,8 @@ describe("preview-local commands", () => {
     const frame = h.render();
     const index = frame.findIndex((line) => line.includes("Error: Use /latest before /copy"));
     expect(index).toBeGreaterThan(1);
-    expect(frame.slice(index - 1, index)).toEqual([""]);
+    // Transcript spacing stays blank apart from Pi's right-edge scrollbar.
+    expect(frame[index - 1]!.replace(/[│┃█]$/, "").trimEnd()).toBe("");
     expect(h.latest).not.toHaveBeenCalled();
     expect(h.state.view("a").following).toBe(false);
     expect(h.copy).not.toHaveBeenCalled();

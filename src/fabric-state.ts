@@ -10,6 +10,7 @@ import {
   FABRIC_COMPONENT_PROVIDER_NAMES,
   FABRIC_PROVIDER_COMPONENT_PREFIX,
 } from "./components/provider-component.js";
+import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import type { FabricOwnedModelGuidance } from "./components/model-guidance.js";
 import type { FabricComponentGraph } from "./components/types.js";
 import {
@@ -21,9 +22,13 @@ import {
   type FabricResultFormat,
   type FabricSchemaMode,
 } from "./config.js";
-import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { FabricSessionApprovals } from "./core/session-approvals.js";
+import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
+import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";
 import { PrewalkDriftTracker } from "./prewalk/fs-drift.js";
+import type { FabricThinkingController } from "./thinking-control.js";
+import { FABRIC_THINKING_ENTRY_TYPE } from "./thinking.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
 import type { FabricExecutionResult } from "./execution-service.js";
@@ -95,6 +100,9 @@ export class FabricState {
   readonly prewalk = new PrewalkController();
   readonly prewalkDrift = new PrewalkDriftTracker();
   readonly sessionApprovals = new FabricSessionApprovals();
+  // agent_end must revert an override even before activation; the controller
+  // itself loads only when an override can exist.
+  readonly thinking: FabricThinkingHost;
   #widgetDismissedAt = 0;
 
   constructor(
@@ -105,6 +113,10 @@ export class FabricState {
     this.#options = options;
     this.#managedHost = options.managedHost ? new FabricManagedHost(options.managedHost) : undefined;
     this.#entryIdentity = options.entryIdentity;
+    this.thinking = new FabricThinkingHost(async () => {
+      const { FabricThinkingController } = await import("./thinking-control.js");
+      return new FabricThinkingController(pi, () => this.#config?.thinking?.bounds ?? {});
+    });
   }
 
   get kernelReloadRequired(): boolean {
@@ -153,6 +165,20 @@ export class FabricState {
 
   get cwd(): string | undefined {
     return this.#cwd;
+  }
+
+  /** Foreground tools declared beside fabric_exec. prepareLoadout passes its pending active set. */
+  foregroundTools(active?: readonly string[]): FabricForegroundResolution {
+    const config = this.#config;
+    if (!config || config.foreground.tools.length === 0) return NO_FOREGROUND;
+    return resolveForegroundTools({
+      policy: config.foreground,
+      mode: config.schema.mode === "enforce" ? "enforce" : config.fullCodeMode ? "full-code" : "orchestration",
+      managedHost: this.#managedHost !== undefined,
+      registered: this.pi.getAllTools(),
+      active: new Set(active ?? this.pi.getActiveTools()),
+      allowlist: readChildToolAllowlist(),
+    });
   }
 
   get widgetDismissedAt(): number {
@@ -309,7 +335,11 @@ export class FabricState {
   componentGraph(): FabricComponentGraph {
     return this.#current()?.componentGraph() ?? { components: [], edges: [], cycles: [] };
   }
-  modelGuidance(): FabricOwnedModelGuidance[] { return this.#current()?.modelGuidance() ?? []; }
+  modelGuidance(): FabricOwnedModelGuidance[] {
+    // Built-in provider guidance is a pure function of configuration, so it is
+    // already available before (and independent of) runtime activation.
+    return this.#current()?.modelGuidance() ?? (this.#config ? builtinModelGuidance(this.#config) : []);
+  }
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
     return this.#current()?.participantInfos(options) ?? [];
   }
@@ -361,6 +391,17 @@ export class FabricState {
     }
     this.#externalProviders.set(provider.name, provider);
     this.#current()?.registerExternal(provider, options);
+  }
+
+  /** False when the name is unknown, managed, or the generation pin does not match. */
+  withdrawExternal(name: string, generation?: number | string): boolean {
+    if (this.#managedHost || !this.#externalProviders.has(name)) return false;
+    // A generation pin needs a live binding to match; an unpinned withdrawal
+    // also forgets registrations no runtime has mounted yet.
+    const withdrawn = this.#current()?.withdrawExternal(name, generation) ?? false;
+    if (!withdrawn && generation !== undefined) return false;
+    this.#externalProviders.delete(name);
+    return true;
   }
 
   registerExternalComponent(
@@ -593,8 +634,10 @@ export class FabricState {
         prewalk: this.prewalk,
         prewalkDrift: this.prewalkDrift,
         sessionApprovals: this.sessionApprovals,
+        thinking: await this.thinking.load(),
         ...(this.#options.paths ? { paths: this.#options.paths } : {}),
         ...(this.#entryIdentity ? { entryIdentity: this.#entryIdentity } : {}),
+        foregroundTools: () => this.foregroundTools().tools,
       },
     );
   }
@@ -607,5 +650,52 @@ export class FabricState {
     const runtime = this.#current();
     if (!runtime?.initialized) throw new Error("Pi Fabric has not activated");
     return runtime;
+  }
+}
+
+type ThinkingHookContext = Pick<ExtensionContext, "sessionManager" | "model">;
+
+/** True when the active branch's latest Fabric thinking entry holds an override. */
+const branchHasThinkingOverride = (context: ThinkingHookContext): boolean => {
+  const branch = context.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (entry?.type !== "custom" || entry.customType !== FABRIC_THINKING_ENTRY_TYPE) continue;
+    const data = entry.data as { override?: unknown } | undefined;
+    return data?.override !== null && data?.override !== undefined;
+  }
+  return false;
+};
+
+/**
+ * Lazy front for the host thinking controller. Before first use an override
+ * can only come from a persisted session entry, so lifecycle hooks scan the
+ * branch instead of loading the controller module.
+ */
+export class FabricThinkingHost {
+  #controller: FabricThinkingController | undefined;
+  #loading: Promise<FabricThinkingController> | undefined;
+
+  constructor(private readonly create: () => Promise<FabricThinkingController>) {}
+
+  load(): Promise<FabricThinkingController> {
+    this.#loading ??= this.create().then((controller) => {
+      this.#controller = controller;
+      return controller;
+    });
+    return this.#loading;
+  }
+
+  invalidate(): void {
+    this.#controller?.invalidate();
+  }
+
+  async agentEnded(context: ThinkingHookContext): Promise<void> {
+    if (!this.#controller && !branchHasThinkingOverride(context)) return;
+    (await this.load()).agentEnded(context);
+  }
+
+  async enforceBounds(context: ThinkingHookContext): Promise<void> {
+    (await this.load()).enforceBounds(context);
   }
 }

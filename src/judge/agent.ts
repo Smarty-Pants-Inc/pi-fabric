@@ -33,8 +33,17 @@ export async function runJudgmentAgent(request: AgentRunRequest, limits: { timeo
   }
   // Stop/close can reject while retaining execution custody. That rejection is
   // not permission to skip the preservation veto or lose the child's identity.
-  try { await manager.close(); } catch (error) { failure ??= error; }
-  if (fs.existsSync(runs)) {
+  let closed = false;
+  try { await manager.close(); closed = true; } catch (error) { failure ??= error; }
+  let cleanupResolved = false;
+  if (closed) {
+    // The explicit run root belongs to this wrapper, not the manager. Remove
+    // only its empty allocation: rmdir is atomic and cannot delete receipts.
+    try { fs.rmdirSync(runs); cleanupResolved = true; }
+    catch (error) { cleanupResolved = (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  }
+  // Missing files do not prove release when close itself failed.
+  if (!cleanupResolved) {
     const error = `agent_cleanup_unresolved: retained receipt root ${root}`;
     if (!result && handle) {
       const receipt = manager.status(handle.id);
@@ -49,8 +58,8 @@ export async function runJudgmentAgent(request: AgentRunRequest, limits: { timeo
     if (!result) throw new Error(error);
     result = { ...result, status: "failed", error };
   } else {
-    // Close collects only durably saved, confirmed-exited runs. A remaining
-    // root (including an in-memory veto after marker failure) is never deleted.
+    // Checked close collected the execution custody and the caller-owned runs
+    // allocation was empty or absent. Only then release the private wrapper.
     fs.rmSync(root, { recursive: true, force: true });
     if (failure) throw failure;
   }

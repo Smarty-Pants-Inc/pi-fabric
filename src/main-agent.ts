@@ -907,27 +907,30 @@ export class MainAgentController implements FabricMainAgentTarget {
     catch (error) { console.warn("[pi-fabric] cannot append Main delivery outcome; retaining journal", error); return false; }
   }
 
-  #recordSuperseded(item: HeldAgentMessage): void {
+  #recordSuperseded(item: HeldAgentMessage): boolean {
     const pending = item.supersededSends ?? [];
+    const before = pending.length;
     while (pending.length && this.#recordOutcome(pending[0], "superseded", "replaced by a newer message for the same key before delivery")) pending.shift();
     if (!pending.length) delete item.supersededSends;
+    return pending.length !== before;
   }
 
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
-    for (const item of this.#held) this.#recordSuperseded(item);
-    if (!this.#sent.length) return;
+    let outcomesChanged = false;
+    for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+    if (!this.#sent.length) { if (outcomesChanged) this.#trySave(); return; }
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
-    for (const item of [...this.#held, ...this.#sent]) this.#recordSuperseded(item);
+    for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
     const kept = this.#sent.filter((item) => {
       if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) return true;
       this.#consume(item);
       return false;
     });
     this.#sent.splice(0, this.#sent.length, ...kept);
-    if (this.#sent.length !== before) this.#trySave();
+    if (this.#sent.length !== before || outcomesChanged) this.#trySave();
   }
 
   /** After a restart: every journalled followUp the session does not hold goes back in the queue. */
@@ -1007,11 +1010,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
-        if (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) {
+        this.#recordSuperseded(item);
+        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"))) {
           this.#sent.push(item);
           continue;
         }
-        this.#recordSuperseded(item);
         this.#consume(item);
         continue;
       }

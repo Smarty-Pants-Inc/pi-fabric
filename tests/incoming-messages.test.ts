@@ -125,7 +125,12 @@ describe("incoming Fabric display projection", () => {
     h.setBranch([entry(first), entry(second)]);
     expect(plain(h.render(first)![0]!)).toContain("first copy");
     expect(plain(h.render(second)![0]!)).toBe(" ↳ Build & Test: new work");
-    expect(plain(h.render(second)![0]!)).toBe(" ↳ Build & Test: new work");
+    expect(plain(h.render(second, true)!.join("\n"))).toContain("new work");
+    expect(plain(h.render(second, true)!.join("\n"))).not.toContain("repeat");
+    h.setMode("expanded");
+    expect(plain(h.render(second)!.join("\n"))).toContain("new work");
+    expect(plain(h.render(second)!.join("\n"))).not.toContain("repeat");
+    h.setMode("collapsed");
     h.setBranch([entry(second)]);
     expect(plain(h.render(second)![0]!)).toContain("repeat");
   });

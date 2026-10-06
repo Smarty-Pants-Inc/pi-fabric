@@ -1,4 +1,4 @@
-import { appendDeliveryOutcome, deliverySend, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -384,6 +384,7 @@ export class ActorManager {
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
   readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
+  readonly #pendingDeliveryOutcomes = new Map<string, DeliveryOutcomeRecord[]>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -627,6 +628,7 @@ export class ActorManager {
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
         }
+        this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
@@ -2509,7 +2511,7 @@ export class ActorManager {
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
-        this.#recordSuperseded(existing);
+        this.#recordSuperseded(actor.id, existing);
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -4390,7 +4392,7 @@ export class ActorManager {
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
     try {
-      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
+      if (items.length === 0 && !this.#pendingDeliveryOutcomes.get(actorId)?.length && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
         try {
@@ -4418,6 +4420,7 @@ export class ActorManager {
       // What validWhile reads, so it judges the items the same way after a restart.
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+          ...(this.#pendingDeliveryOutcomes.get(actorId)?.length ? { pendingDeliveryOutcomes: this.#pendingDeliveryOutcomes.get(actorId) } : {}),
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
           ...(cleanHandover ? { cleanHandover: true } : {}),
         }, { durable });
@@ -4431,20 +4434,55 @@ export class ActorManager {
     return true;
   }
 
-  #recordSuperseded(item: ActorQueueItem): void {
-    const pending = item.supersededSends ?? [];
+  #confirmDeliveryOutcomes(): void {
+    for (const actorId of this.#pendingDeliveryOutcomes.keys()) this.#flushDeliveryOutcomes(actorId);
+    for (const [actorId, item] of this.#inFlight) {
+      if (!item.outcomeSend) continue;
+      const runId = this.#actors.get(actorId)?.inFlightRun?.id;
+      if (!runId) continue;
+      try {
+        const run = this.agents.status(runId);
+        if (!("toolCalls" in run)) continue; // A queued handle is not inference evidence.
+        if (!(run.inferenceStarted ?? (run.status === "completed" || run.toolCalls > 0))) continue;
+        this.#recordDeliveryOutcome(actorId, item.outcomeSend, "delivered", "consumed by actor inference as itself");
+        delete item.outcomeSend;
+        this.#persistQueue(actorId, true);
+      } catch { /* Preserve the original send and retry on the next owner poll. */ }
+    }
+  }
+
+  #recordDeliveryOutcome(actorId: string, send: DeliverySend, outcome: DeliveryOutcome, reason: string): void {
+    const pending = this.#pendingDeliveryOutcomes.get(actorId) ?? [];
+    if (!pending.some(record => record.eventId === send.eventId && record.to === send.to && record.from === send.from && record.mode === send.mode && record.outcome === outcome)) {
+      pending.push({ ...send, outcome, reason, at: Date.now() });
+      this.#pendingDeliveryOutcomes.set(actorId, pending);
+      this.#persistQueue(actorId, true);
+    }
+    this.#flushDeliveryOutcomes(actorId);
+  }
+
+  #flushDeliveryOutcomes(actorId: string): void {
+    const pending = this.#pendingDeliveryOutcomes.get(actorId);
+    if (!pending) return;
     while (pending.length) {
-      try { appendDeliveryOutcome(this.mesh.root, pending[0]!, "superseded", "replaced by a newer message for the same key before delivery"); }
-      catch { return; }
+      const record = pending[0]!;
+      try { appendDeliveryOutcome(this.mesh.root, record, record.outcome, record.reason, record.at); }
+      catch { return; } // Retained in the queue envelope, independently of runnable work.
       pending.shift();
     }
+    this.#pendingDeliveryOutcomes.delete(actorId);
+    this.#persistQueue(actorId, true);
+  }
+
+  #recordSuperseded(actorId: string, item: ActorQueueItem): void {
+    for (const send of item.supersededSends ?? []) this.#recordDeliveryOutcome(actorId, send, "superseded", "replaced by a newer message for the same key before delivery");
     delete item.supersededSends;
   }
 
   #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
-    this.#recordSuperseded(item);
+    this.#recordSuperseded(actorId, item);
     if (consumed && item.outcomeSend) {
-      appendDeliveryOutcome(this.mesh.root, item.outcomeSend, "delivered", "consumed by actor inference as itself");
+      this.#recordDeliveryOutcome(actorId, item.outcomeSend, "delivered", "consumed by actor inference as itself");
       delete item.outcomeSend;
     }
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
@@ -4520,10 +4558,22 @@ export class ActorManager {
   #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
-      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
+      format?: unknown; items?: unknown; pendingDeliveryOutcomes?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (Array.isArray(saved.pendingDeliveryOutcomes)) {
+      const pending = this.#pendingDeliveryOutcomes.get(actor.id) ?? [];
+      for (const raw of saved.pendingDeliveryOutcomes) {
+        const send = deliverySend(raw); const record = raw as DeliveryOutcomeRecord;
+        if (!send || !["delivered", "superseded", "failed", "unknown"].includes(record.outcome) ||
+          typeof record.reason !== "string" || !Number.isFinite(record.at)) continue;
+        if (!pending.some(item => item.eventId === send.eventId && item.outcome === record.outcome && item.to === send.to && item.from === send.from && item.mode === send.mode)) {
+          pending.push({ ...send, outcome: record.outcome, reason: record.reason, at: record.at });
+        }
+      }
+      if (pending.length) this.#pendingDeliveryOutcomes.set(actor.id, pending);
+    }
     const counter = (value: unknown): number =>
       typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
     actor.latestActivationSequence = Math.max(actor.latestActivationSequence, counter(saved.latestActivationSequence));
@@ -5156,7 +5206,7 @@ export class ActorManager {
     }
     if (changed) {
       this.#persistQueue(actor.id);
-      for (const item of kept.values()) this.#recordSuperseded(item);
+      for (const item of kept.values()) this.#recordSuperseded(actor.id, item);
       this.#persistQueue(actor.id);
     }
   }

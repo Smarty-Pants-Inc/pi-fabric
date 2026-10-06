@@ -212,7 +212,9 @@ export class MeshProvider implements FabricProvider {
         ) {
           throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
         }
-        if (typeof args.to === "string" && !this.participants.get(args.to, undefined, { fresh: true })) {
+        if (typeof args.to === "string" && !this.participants.get(args.to, undefined, { fresh: true }) &&
+          !this.participants.list({ scope: "project", includeStale: true, fresh: true })
+            .some(member => member.id === args.to || member.name === args.to)) {
           const reason = `Unknown Fabric target: ${args.to}`;
           appendDeliveryOutcome(this.store.root, { eventId: randomUUID(), to: args.to, from: this.identity.id, mode: "publish" }, "failed", reason);
           throw new Error(reason);

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
@@ -12,7 +12,7 @@ export const INCOMING_MESSAGE_TYPES = [
 ] as const;
 
 type IncomingMessage = Parameters<MessageRenderer>[0];
-type Row = { sender: string; body: string; attributes: Record<string, string> };
+type Row = { sender: string; body: string; fullBody: string; attributes: Record<string, string> };
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const decodeXml = (text: string): string => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, name: string) =>
@@ -40,13 +40,13 @@ const rows = (message: IncomingMessage): Row[] => {
   const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
   if (matches.length) return matches.map(match => {
     const attrs = attributes(match[2]!);
-    return { sender: attrs.from_name ?? attrs.name ?? "Fabric", attributes: attrs,
+    return { sender: attrs.from_name ?? attrs.name ?? "Fabric", attributes: attrs, fullBody: decodeXml(match[3]!.trim()),
       body: decodeXml(match[3]!.replace(/\n<data>[\s\S]*?<\/data>\s*$/, "").trim()) };
   });
   const details = record(message.details);
   const from = record(details.from);
   const actor = record(details.actor);
-  return [{ sender: String(from.name ?? actor.name ?? "Fabric"), body: text, attributes: {} }];
+  return [{ sender: String(from.name ?? actor.name ?? "Fabric"), body: text, fullBody: text, attributes: {} }];
 };
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
@@ -137,10 +137,24 @@ export const registerIncomingMessageRenderers = (
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
       const history = type === "pi-fabric-inbox" ? entries() : [];
+      const prior = priorInboxReceipts(history, message);
+      if (options.expanded || !incomingMessagesCollapsed(mode())) {
+        if (type !== "pi-fabric-inbox") return undefined;
+        const all = rows(message); const seen = new Set<string>();
+        const unique = all.filter(row => {
+          const id = row.attributes.id;
+          if (id && (seen.has(id) || prior.has(receipt("", "event", id)))) return false;
+          if (id) seen.add(id);
+          return true;
+        });
+        if (unique.length === all.length) return undefined; // Unchanged native expanded rendering.
+        return { render: width => unique.flatMap(row =>
+          [`${row.sender}:`, ...row.fullBody.split("\n")].flatMap(line =>
+            wrapTextWithAnsi(safeText(line), Math.max(1, width)))), invalidate() {} };
+      }
       const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history) : []);
-      for (const id of priorInboxReceipts(history, message)) receipts.add(id);
+      for (const id of prior) receipts.add(id);
       const visible = unseenRows(message, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
       const first = visible[0]!;

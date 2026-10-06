@@ -689,7 +689,10 @@ export class FabricControlPlane {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (error instanceof FabricControlRejection) finalOutcome = { outcome: "failed", reason };
-      else if (reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError) finalOutcome = { outcome: "unknown", reason };
+      else if (reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
+        (options.signal?.aborted && isObject(options.signal.reason) && options.signal.reason.name === "TimeoutError")) {
+        finalOutcome = { outcome: "unknown", reason };
+      }
       recordFinal();
       const cancelled = this.#clearPending(commandId);
       if (cancelled) void this.#publishCancellation(commandId, cancelled);

@@ -348,17 +348,31 @@ const allocateRunTmpDirectoryLocked = (runDirectory: string): { directory: strin
   };
 };
 
-/** Retention owns arbitrary scratch names, not arbitrary paths/foreign objects. */
+/** Retention owns arbitrary scratch names, not arbitrary paths/foreign objects.
+ * Pin the run filesystem, including at tmp itself, before entering directories.
+ * A mount is not a symlink: owner/type checks alone do not authorize its deletion. */
 export const safeRunTmpTree = (directory: string, expired: () => boolean, depth = 0): boolean => {
-  if (expired() || depth > 32 || !ownedStat(directory)?.isDirectory()) return false;
+  if (expired() || depth > 32) return false;
+  const device = ownedStat(path.dirname(directory))?.dev;
+  return device !== undefined && safeRunTmpTreeOnDevice(directory, expired, depth, device);
+};
+const onScratchDevice = (file: string, stat: fs.Stats, device: number): boolean => {
+  if (stat.dev === device) return true;
+  console.warn(`[pi-fabric] Scratch retained: filesystem boundary at ${JSON.stringify(file)} (expected device ${device}, found ${stat.dev})`);
+  return false;
+};
+const safeRunTmpTreeOnDevice = (directory: string, expired: () => boolean, depth: number, device: number): boolean => {
+  if (expired() || depth > 32) return false;
+  const root = ownedStat(directory);
+  if (!root?.isDirectory() || !onScratchDevice(directory, root, device)) return false;
   try {
     for (const name of fs.readdirSync(directory)) {
       if (expired()) return false;
       const file = path.join(directory, name);
       const stat = ownedStat(file);
-      if (!stat) return false;
+      if (!stat || !onScratchDevice(file, stat, device)) return false;
       if (stat.isFile()) continue;
-      if (stat.isDirectory() && safeRunTmpTree(file, expired, depth + 1)) continue;
+      if (stat.isDirectory() && safeRunTmpTreeOnDevice(file, expired, depth + 1, device)) continue;
       return false;
     }
     return true;

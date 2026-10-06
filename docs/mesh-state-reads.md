@@ -44,8 +44,8 @@ parsed index while their physical identity is unchanged.
 An explicit successful `confirmWritable` requires canonical revalidation on the next read
 and starts a new fixed idle window, without throwing away an unchanged payload. Ordinary
 cache hits do not slide the deadline. Participant indexes preserve unchanged entry
-identities; on full-parse fallback they compare entry bytes, rather than allowing unchanged
-version/timestamp labels to conceal a legacy name/ownership edit.
+identities; on full-parse fallback they compare entry bytes. Unchanged
+version/timestamp labels cannot conceal a legacy name/ownership edit.
 
 A strict readability check only shares a snapshot known to come from a valid canonical
 envelope. A tolerant dashboard parse of `{}`/damaged bytes cannot certify routing absence.
@@ -79,13 +79,13 @@ chain head and cannot match a copied canonical marker. Unchanged entry objects s
 verified replay, keeping derived directory indexes inexpensive.
 Cursors advance only through the consumed UTF-8 prefix, not a later record appended after
 the reader captured its canonical endpoint. Changed entry encodings are reused by the
-canonical payload, namespace signal and journal, rather than traversing values again.
+canonical payload, namespace signal and journal, avoiding another value traversal.
 
 History rotates atomically at 2 MiB; an individual record is capped at 256 KiB. Missing,
 stale, truncated, corrupt, oversized, disconnected or mismatched journals fall back to a
 canonical read. A failed sidecar append cannot fail a committed write or hide a commit.
 If the optional chain head would exceed the canonical byte budget, omit the head and
-record rather than rejecting an otherwise fitting write.
+record so the otherwise fitting write remains accepted.
 Rotation or an older writer can break the chain; the next successful full read reestablishes
 the base. Records from older journal writers without a payload binding also fall back. Older
 writers copying an existing UUID still invalidate the physical endpoint; retargeting terminal

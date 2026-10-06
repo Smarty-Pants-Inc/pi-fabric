@@ -66,15 +66,23 @@ describe("bounded durable bridge event batches", () => {
     // Deterministic count bound independent of this machine's fsync latency.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
-    const sync = vi.spyOn(fs, "fsyncSync");
+    const originalSync = fs.fsyncSync;
+    const syncedFiles: boolean[] = [];
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      syncedFiles.push(fs.fstatSync(fd).isFile());
+      originalSync(fd);
+    });
     const events = Array.from({ length: 256 }, (_, index) => ({ event: event(String(index)) }));
     const first = await side.publishBatch(events);
     expect(first).toHaveLength(256);
     expect(count()).toBe(1);
     expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
-    // One event-file sync and namespace confirmation, not receipts per event.
-    expect(sync.mock.calls.length).toBeLessThan(8);
+    // One event-file sync, never per-event receipts. The fleet confirms the
+    // whole namespace ancestry, so directory count depends on TMPDIR depth.
+    expect(syncedFiles.filter(Boolean)).toHaveLength(1);
+    const ancestorCount = path.resolve(mesh.root).split(path.sep).filter(Boolean).length + 1;
+    expect(sync.mock.calls.length).toBeLessThanOrEqual(ancestorCount + 1);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");
   }, 30000);

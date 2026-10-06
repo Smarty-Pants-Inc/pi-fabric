@@ -18,9 +18,9 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 const cleanup: Array<() => unknown | Promise<unknown>> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
 function temp() { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-")); cleanup.push(() => fs.rmSync(root, { recursive: true, force: true })); return root; }
-function setup(persistent = false) {
+function setup(persistent = false, images = false) {
   const models = createModels();
-  const faux = fauxProvider({ provider: "offline", models: [{ id: "test", reasoning: true }], tokensPerSecond: 100000 });
+  const faux = fauxProvider({ provider: "offline", models: [{ id: "test", reasoning: true, input: images ? ["text", "image"] : ["text"] }], tokensPerSecond: 100000 });
   models.setProvider(faux.provider);
   const registry = createRegistry();
   const root = temp();
@@ -105,14 +105,16 @@ import { createPiDurableRunner } from ${JSON.stringify(path.join(project, "src/d
 const models = createModels(); const faux = fauxProvider({provider:"offline",models:[{id:"test",reasoning:true}],tokensPerSecond:100000}); models.setProvider(faux.provider);
 faux.setResponses([fauxAssistantMessage(fauxToolCall("effect",{}),{stopReason:"toolUse"})]);
 const registry = createRegistry(); const context = ${JSON.stringify(ctx)};
-let locator;
+let locator; let entered; const entering = new Promise(resolve => { entered = resolve; });
 registry.install(defineExtension({name:"tools",tools:[defineTool({name:"effect",description:"effect",parameters:Type.Object({}),execute:async()=>{
  fs.appendFileSync(${JSON.stringify(effects)},"effect\\n");
- fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({locator,pid:process.pid}));
+ entered();
  await new Promise(()=>{}); return {};
 }})]}));
 const runner=createPiDurableRunner({models,registry,env:()=>undefined,allowedModels:[{provider:"offline",modelId:"test"}],storage:${JSON.stringify(f.options.storage)}});
 locator=runner.prepare(context); await runner.start(locator,context,{progress(){},usage(){},transcript(){},question:async()=>({}),finish(){},fail(error){console.error(error)}});
+await entering; await runner.followUp(locator,"surviving follow-up",{requestId:"survivor"});
+fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({locator,pid:process.pid}));
 setInterval(()=>{},1000);
 `);
     const child = spawn("bun", [script], { stdio: ["ignore", "ignore", "pipe"] });
@@ -126,15 +128,19 @@ setInterval(()=>{},1000);
     const admitted = JSON.parse(fs.readFileSync(ready, "utf8"));
     child.kill("SIGKILL"); await exited; // Positive process-exit evidence, not a lease timeout.
     f.registry.install(defineExtension({ name: "tools", tools: [defineTool({ name: "effect", description: "effect", parameters: Type.Object({}), execute: async () => { fs.appendFileSync(effects, "REPLAY\n"); return {}; } })] }));
-    f.faux.setResponses([transcript => { expect(JSON.stringify(transcript)).toContain("interrupted"); return fauxAssistantMessage("after kill"); }]);
+    f.faux.setResponses([
+      transcript => { expect(JSON.stringify(transcript)).toContain("interrupted"); return fauxAssistantMessage("after kill"); },
+      transcript => { expect(JSON.stringify(transcript)).toContain("surviving follow-up"); return fauxAssistantMessage("after recovered follow-up"); },
+    ]);
     const runner = f.make(); await expect(runner.attach(admitted.locator, ctx, reporter().target)).rejects.toThrow(/single-writer lock/);
     const directory = (f.options.storage as { directory: string }).directory;
     const lock = fs.readdirSync(directory).find(name => name.endsWith(".writer"))!;
     fs.rmdirSync(path.join(directory, lock)); // Host restore after the child exit receipt.
     const result = reporter(); await runner.attach(admitted.locator, ctx, result.target);
-    expect(await result.done).toEqual({ status: "completed", output: "after kill" });
-    const duplicate = reporter(); await runner.start(admitted.locator, ctx, duplicate.target); expect((await duplicate.done).output).toBe("after kill");
-    expect(fs.readFileSync(effects, "utf8")).toBe("effect\n"); expect(f.faux.state.callCount).toBe(1);
+    expect(await result.done).toEqual({ status: "completed", output: "after recovered follow-up" });
+    const duplicate = reporter(); await runner.start(admitted.locator, ctx, duplicate.target); expect((await duplicate.done).output).toBe("after recovered follow-up");
+    await runner.followUp(admitted.locator, "surviving follow-up", { requestId: "survivor" });
+    expect(fs.readFileSync(effects, "utf8")).toBe("effect\n"); expect(f.faux.state.callCount).toBe(2);
   }, 20000);
 
   it("close joins opening/start, rejects new work and releases ownership exactly once", async () => {
@@ -234,7 +240,154 @@ setInterval(()=>{},1000);
     await runner.start(otherLoc, otherCtx, otherReporter.target); expect((await otherReporter.done).output).toBe("other run done");
     expect(await runner.liveness(loc)).toBe("running"); expect(await runner.stop(loc, "requested")).toEqual({ confirmed: true }); expect((await r.done).status).toBe("stopped"); expect(await runner.liveness(loc)).toBe("cancelled");
     expect(await runner.liveness(otherLoc)).toBe("settled");
-    expect(runner.steer).toBeUndefined(); expect(runner.followUp).toBeUndefined();
+    await expect(runner.steer(loc, "too late")).rejects.toThrow(/no longer accepts messages/);
+    await expect(runner.followUp(loc, "too late")).rejects.toThrow(/no longer accepts messages/);
+  });
+
+  it("can be a configured leaf-run default with allowlisted, credential-free model discovery", async () => {
+    const f = setup();
+    f.options.defaultModel = { provider: "offline", modelId: "test" };
+    Object.assign(f.faux.getModel(), { headers: { Authorization: "private-token" }, apiKey: "private-token" });
+    f.faux.setResponses([fauxAssistantMessage("default selected")]);
+    const runner = f.make(); cleanup.push(registerAgentRunner(runner));
+    const models = await runner.models!({ cwd: process.cwd(), refresh: false });
+    expect(models).toMatchObject([{ runner: runner.id, key: "offline/test", input: ["text"] }]);
+    expect(JSON.stringify(models)).not.toContain("private-token");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: runner.id }, { runRoot: path.join(f.root, "runs") });
+    cleanup.push(() => manager.close());
+    expect(await manager.run({ task: "use the configured runner", tools: [], thinking: "off" })).toMatchObject({ runner: runner.id, model: "offline/test", status: "completed", text: "default selected" });
+    expect(() => createPiDurableRunner({ ...f.options, defaultModel: { provider: "other", modelId: "no" } })).toThrow(/default model must be allowlisted/);
+  });
+
+  it("admits image input only for a compatible model and fingerprints its exact content", async () => {
+    const f = setup(true, true);
+    const image = { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" };
+    f.faux.setResponses([transcript => {
+      expect(JSON.stringify(transcript)).toContain(image.data);
+      expect(JSON.stringify(transcript)).toContain("image/png");
+      return fauxAssistantMessage("image received");
+    }]);
+    const ctx = context({ images: [image] }); const runner = f.make(); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); expect((await r.done).output).toBe("image received");
+    expect(JSON.stringify(loc)).not.toContain(image.data);
+    await runner.close();
+    const reopened = f.make();
+    await expect(reopened.attach(loc, { ...ctx, images: [{ ...image, data: "Ynll" }] }, reporter().target)).rejects.toThrow(/different work/);
+    const textOnly = setup();
+    expect(() => textOnly.make().prepare(ctx)).toThrow(/does not accept image input/);
+    expect(textOnly.faux.state.callCount).toBe(0);
+  });
+
+  it.each([
+    ['{"answer":42}', "completed"],
+    ['{"answer":"wrong"}', "failed"],
+    ["not json", "failed"],
+  ])("validates structured output %s (%s)", async (output, status) => {
+    const f = setup(); const schema = { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false };
+    f.faux.setResponses([transcript => {
+      expect(JSON.stringify(transcript)).toContain("Your final response must contain only JSON");
+      return fauxAssistantMessage(output!);
+    }]);
+    const runner = f.make(); const ctx = context({ schema }); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); expect((await r.done).status).toBe(status);
+    if (status === "completed") expect(r.target.finish).toHaveBeenCalledWith(expect.objectContaining({ structured: { answer: 42 } }));
+    else expect((await r.done).output).toContain("Structured agent output was invalid");
+    await expect(runner.start(loc, { ...ctx, schema: { type: "string" } }, reporter().target)).rejects.toThrow(/different work/);
+  });
+
+  it.each(["steer-first", "follow-up-first"])("waits for steering and follow-ups and deduplicates message identities across reopen (%s)", async order => {
+    const f = setup(true); let enter!: () => void; let release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; }); const gate = new Promise<void>(resolve => { release = resolve; });
+    f.registry.install(defineExtension({ name: "hold", tools: [defineTool({ name: "hold", description: "hold", parameters: Type.Object({}), execute: async (_args, _api, ctx) => { enter(); await awaitWithContext(gate, ctx); return {}; } })] }));
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+      transcript => { expect(JSON.stringify(transcript)).toContain("steering note"); return fauxAssistantMessage("initial answer"); },
+      transcript => { expect(JSON.stringify(transcript)).toContain("follow-up note"); return fauxAssistantMessage("follow-up answer"); },
+    ]);
+    const ctx = context({ tools: ["hold"] }); const runner = f.make(); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); await entered;
+    if (order === "follow-up-first") await runner.followUp(loc, "follow-up note", { requestId: "follow-1" });
+    await runner.steer(loc, "steering note", { requestId: "steer-1" });
+    await runner.steer(loc, "steering note", { requestId: "steer-1" });
+    await expect(runner.steer(loc, "different", { requestId: "steer-1" })).rejects.toThrow(/different work/);
+    if (order === "steer-first") await runner.followUp(loc, "follow-up note", { requestId: "follow-1" });
+    expect(r.target.finish).not.toHaveBeenCalled(); expect(await runner.liveness(loc)).toBe("running"); release();
+    expect(await r.done).toEqual({ status: "completed", output: "follow-up answer" });
+    expect(f.faux.state.callCount).toBe(3); expect(await runner.liveness(loc)).toBe("settled");
+    await expect(runner.followUp(loc, "late note")).rejects.toThrow(/no longer accepts messages/);
+    await runner.close(); const reopened = f.make(); const again = reporter(); await reopened.attach(loc, ctx, again.target);
+    expect(await again.done).toEqual({ status: "completed", output: "follow-up answer" });
+    await reopened.followUp(loc, "follow-up note", { requestId: "follow-1" });
+    await expect(reopened.steer(loc, "follow-up note", { requestId: "follow-1" })).rejects.toThrow(/different work/);
+    expect(f.faux.state.callCount).toBe(3);
+  });
+
+  it("recovers queued follow-ups without replaying an interrupted unsafe tool", async () => {
+    const f = setup(true); let effects = 0; let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    f.registry.install(defineExtension({ name: "tools", tools: [interruptedTool(() => effects++, () => enter())] }));
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("recovered first answer"),
+      transcript => { expect(JSON.stringify(transcript)).toContain("durable follow-up"); return fauxAssistantMessage("recovered follow-up"); },
+    ]);
+    const ctx = context({ tools: ["effect"] }); const runner = f.make(); const loc = runner.prepare(ctx); const first = reporter();
+    await runner.start(loc, ctx, first.target); await entered;
+    await runner.followUp(loc, "durable follow-up", { requestId: "durable-message" });
+    await runner.close(); expect(first.target.finish).not.toHaveBeenCalled(); expect(first.target.fail).not.toHaveBeenCalled();
+    const reopened = f.make(); const next = reporter(); await reopened.attach(loc, ctx, next.target);
+    expect(await next.done).toEqual({ status: "completed", output: "recovered follow-up" });
+    expect(effects).toBe(1); expect(f.faux.state.callCount).toBe(3);
+  });
+
+  it("withdraws queued follow-ups when the active generation fails", async () => {
+    const f = setup(); let enter!: () => void; let release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; }); const gate = new Promise<void>(resolve => { release = resolve; });
+    f.registry.install(defineExtension({ name: "hold", tools: [defineTool({ name: "hold", description: "hold", parameters: Type.Object({}), execute: async (_args, _api, ctx) => { enter(); await awaitWithContext(gate, ctx); return {}; } })] }));
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "offline failure" }),
+      fauxAssistantMessage("must not run"),
+    ]);
+    const ctx = context({ tools: ["hold"] }); const runner = f.make(); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); await entered;
+    await runner.followUp(loc, "queued work", { requestId: "queued" }); release();
+    expect((await r.done).status).toBe("failed"); expect(f.faux.state.callCount).toBe(2);
+    expect(await runner.liveness(loc)).toBe("interrupted");
+    await expect(runner.followUp(loc, "new work")).rejects.toThrow(/no longer accepts messages/);
+  });
+
+  it("keeps the run live while a follow-up is executing and stops it", async () => {
+    const f = setup(); let firstEnter!: () => void; let nextEnter!: () => void; let release!: () => void; let calls = 0;
+    const firstEntered = new Promise<void>(r => { firstEnter = r; }); const nextEntered = new Promise<void>(r => { nextEnter = r; }); const gate = new Promise<void>(r => { release = r; });
+    f.registry.install(defineExtension({ name: "hold", tools: [defineTool({ name: "hold", description: "hold", parameters: Type.Object({}), execute: async (_args, _api, ctx) => {
+      if (++calls === 1) { firstEnter(); await awaitWithContext(gate, ctx); }
+      else { nextEnter(); await awaitWithContext(new Promise<void>(() => {}), ctx); }
+      return {};
+    } })] }));
+    f.faux.setResponses([fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }), fauxAssistantMessage("first answer"), fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" })]);
+    const ctx = context({ tools: ["hold"] }); const runner = f.make(); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); await firstEntered;
+    await runner.followUp(loc, "more work"); release(); await nextEntered;
+    expect(r.target.finish).not.toHaveBeenCalled(); expect(await runner.liveness(loc)).toBe("running");
+    expect(await runner.stop(loc, "requested")).toEqual({ confirmed: true });
+    expect((await r.done).status).toBe("stopped"); expect(await runner.liveness(loc)).toBe("cancelled");
+  });
+
+  it("bounds and validates message controls before admission", async () => {
+    const f = setup(); let enter!: () => void; const entered = new Promise<void>(r => { enter = r; });
+    f.registry.install(defineExtension({ name: "tools", tools: [interruptedTool(() => {}, () => enter())] }));
+    f.faux.setResponses([fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" })]);
+    const ctx = context({ tools: ["effect"] }); const runner = f.make(); const loc = runner.prepare(ctx); const r = reporter();
+    await runner.start(loc, ctx, r.target); await entered;
+    await expect(runner.steer(loc, " ")).rejects.toThrow(/characters/);
+    await expect(runner.steer(loc, "x".repeat(16385))).rejects.toThrow(/characters/);
+    await expect(runner.steer(loc, "note", { requestId: "" })).rejects.toThrow(/requestId/);
+    await expect(runner.steer(loc, "note", { images: [] } as never)).rejects.toThrow(/only requestId/);
+    for (let i = 0; i < 128; i++) await runner.followUp(loc, `queued ${i}`, { requestId: `message-${i}` });
+    await expect(runner.followUp(loc, "overflow")).rejects.toThrow(/128 messages/);
+    await runner.stop(loc, "requested"); expect((await r.done).status).toBe("stopped");
+    expect(f.faux.state.callCount).toBe(1);
   });
 
   it("rejects missing models/tools and every unsupported launch capability before admission", () => {
@@ -242,7 +395,7 @@ setInterval(()=>{},1000);
     expect(() => runner.prepare(context({ model: "offline/unknown" }))).toThrow(/model/);
     expect(() => runner.prepare(context({ model: undefined } as unknown as Partial<FabricHostedRunContext>))).toThrow(/model/);
     expect(() => runner.prepare(context({ tools: ["fabric_exec"] }))).toThrow(/tool/);
-    for (const changes of [{ recursive: true }, { kernel: "typescript" }, { sessionFile: "/seed" }, { actorId: "actor" }, { writePolicy: {} }, { scope: {} }, { schema: {} }, { images: [{ type: "image" }] }, { residency: "durable" }]) {
+    for (const changes of [{ recursive: true }, { kernel: "typescript" }, { sessionFile: "/seed" }, { actorId: "actor" }, { writePolicy: {} }, { scope: {} }, { residency: "durable" }]) {
       expect(() => runner.prepare(context(changes as Partial<FabricHostedRunContext>))).toThrow(/does not support|requires/);
     }
     expect(f.faux.state.callCount).toBe(0);

@@ -966,7 +966,7 @@ export class AgentManager {
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
       : runner === "veda" ? this.config.veda.model
-      : runner === "pi" ? this.config.model : requireAgentRunner(runner).defaultModel?.();
+      : (runner === "pi" || runner === "pi-durable") ? this.config.model : requireAgentRunner(runner).defaultModel?.();
   }
 
   /** Call only on explicit public requests, before defaults/aliases are materialized. */
@@ -1010,7 +1010,7 @@ export class AgentManager {
     timeoutMs?: number,
   ): Promise<string | undefined> {
     this.assertModelAllowed(model, runner);
-    if (runner === "pi") {
+    if (runner === "pi" || runner === "pi-durable") {
       const prepared = await this.#prepareModel(model, requiredPin, signal, timeoutMs);
       this.assertModelAllowed(prepared, runner);
       return prepared;
@@ -1493,7 +1493,7 @@ export class AgentManager {
         const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
         const recursive = capabilities.recursiveFabric && request.recursive === true;
         const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
-        const inheritedSessionPins = runner === "pi" && extensions
+        const inheritedSessionPins = (runner === "pi" || runner === "pi-durable") && extensions
           ? this.#inheritedSessionPins(request)
           : undefined;
         // In a full-code parent every extension-enabled Pi child runs Fabric
@@ -1694,8 +1694,8 @@ export class AgentManager {
           id,
           name,
           cwd: agentCwd,
-          workerPath: this.#workerPath,
-          workerArguments,
+          workerPath: runnerLaunch.workerPath,
+          workerArguments: runnerLaunch.workerArguments,
           ...(request.needs ? { needs: [...request.needs] } : {}),
           placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
@@ -3714,7 +3714,7 @@ export class AgentManager {
       // miss or transport-death diagnostic. Never launch a second Pi for it.
       /Context exceeds window:/i.test(record.error ?? "") ||
       !(
-        (managed.runner === "pi" && retryablePiStartupError(record.error)) ||
+        ((managed.runner === "pi" || managed.runner === "pi-durable") && retryablePiStartupError(record.error)) ||
         transportExitedWithoutResult(record.error)
       ) ||
       record.turns !== 0 ||
@@ -3775,7 +3775,11 @@ export class AgentManager {
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
-      task: resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
+      // Durable recovery reopens the same journal, not a fresh conversation.
+      // Changing its prompt breaks recorded-result identity after completion.
+      task: managed.runner === "pi-durable"
+        ? managed.task
+        : resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
       carryOver: { turns, toolCalls, usage: { ...usage } },
     });
   }
@@ -3805,7 +3809,7 @@ export class AgentManager {
   ): Promise<boolean> {
     let replacement: { generation: number; custody: boolean; unknown: boolean; pending: boolean } | undefined;
     try {
-      if (managed.runner === "pi") {
+      if (managed.runner === "pi" || managed.runner === "pi-durable") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
@@ -3870,7 +3874,7 @@ export class AgentManager {
       // while the already-launched retry is still running. The previous worker has exited.
       if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
 
-      if (managed.runner === "pi") {
+      if (managed.runner === "pi" || managed.runner === "pi-durable") {
         // status.json must be removed to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
         // confirmed exit so the previous worker's final observations are included.

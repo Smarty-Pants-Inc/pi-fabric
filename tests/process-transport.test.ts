@@ -302,7 +302,7 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     expect(await outcome).toBeInstanceOf(Error);
     expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
   });
-  it("A24 unconfirmed scoped rejection transfers exact process custody before awaiting admission", async () => {
+  it("unconfirmed scope teardown vetoes fallback and retains custody debt", async () => {
     const f = fixture("trap '' TERM; while :; do :; done");
     const debt = vi.fn();
     let custody: AgentTransportHandle | undefined;

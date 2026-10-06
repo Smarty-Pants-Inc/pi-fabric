@@ -1,6 +1,7 @@
 import { beforeEach } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
+import { normalizeScope, senderStamp } from "../src/scope.js";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -1090,6 +1091,14 @@ describe("resident host ownership", () => {
           expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance, sender: null });
         }
       }
+      // Never borrow the resident process's broader scope for a remote ask.
+      const scopedSender = senderStamp(normalizeScope({ principal: { id: "restricted-child" },
+        grants: [{ resource: "fs:/fixture/**", actions: ["read"] }] }));
+      await expect(handler({ ...resolved, sender: scopedSender }, { ...from, id: "session:foreign" }, signal, "mesh"))
+        .resolves.toMatchObject({ accepted: true });
+      const scopedOptions = { binding: {}, provenance, sender: scopedSender };
+      if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, scopedOptions);
+      else expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, scopedOptions);
     } finally {
       control.mockRestore();
       await host.close();

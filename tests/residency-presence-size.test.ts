@@ -13,7 +13,9 @@ import { readParticipantFile } from "../src/topology/participant-files.js";
 it("isolates a real 1024-byte legacy presence failure across startup and recovery without rapid retries", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ps-"));
   const config: ResidentHostConfig = {
-    format: 1, rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
+    // Fixed 1 KiB tests size actor metadata, not the host's variable TMPDIR
+    // attribution string. Root/session custody identities are still real.
+    format: 1, project: "", rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "m"), actorRoot: path.join(root, "a"), residencyRoot: path.join(root, "r"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
@@ -71,7 +73,9 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
 it("rejects oversize create and configurable updates before committing actor state", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pa-"));
   const config: ResidentHostConfig = {
-    format: 1, rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
+    // Fixed 1 KiB tests size actor metadata, not the host's variable TMPDIR
+    // attribution string. Root/session custody identities are still real.
+    format: 1, project: "", rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "m"), actorRoot: path.join(root, "a"), residencyRoot: path.join(root, "r"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,

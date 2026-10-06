@@ -495,7 +495,7 @@ describe("fleet model policy (#2490)", () => {
         expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
         await published.refresh(); expect(published.get(id)).toBeUndefined();
         const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
-        expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
+        expect(control.success, control.error).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
         const controlId = (control.value as FabricActorInfo).id;
         expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
@@ -2807,7 +2807,7 @@ describe("AgentsProvider runner support", () => {
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
     expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
 
     const outerToolResult = {
@@ -3778,7 +3778,7 @@ return { first, second, tail: "continued" };`,
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
 
     const outerToolResult = {
       role: "toolResult" as const,

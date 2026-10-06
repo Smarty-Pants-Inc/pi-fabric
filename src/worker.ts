@@ -329,6 +329,7 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
+  const isPi = options.runner === "pi" || options.runner === "pi-durable";
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
         file: options.sessionExportFile,
@@ -445,7 +446,7 @@ const main = async (): Promise<void> => {
   // Opaque launchers have no supplied native discovery API. Fail closed on
   // auto-discovery rather than reintroducing an unvalidated Fabric generation.
   // Explicit task hooks still load; native launchers retain all other resources.
-  if (!options.extensions || (options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
+  if (!options.extensions || (options.runner === "pi" && options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -512,7 +513,8 @@ const main = async (): Promise<void> => {
     piArguments.push("-e", hookPath);
   }
   if (options.writePolicy) {
-    if (options.runner !== "pi") throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
+    // The guard loads even with --no-extensions; other runners cannot enforce it.
+    if (!isPi) throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
     const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
     piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
   }
@@ -528,6 +530,12 @@ const main = async (): Promise<void> => {
       replyTool
         ? `Reply by calling the fabric_reply tool exactly once, as your last step. Its arguments are your reply and must match this schema:\n${schema}\nText outside that call is not delivered.`
         : `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
+    );
+  }
+  if (options.runner === "pi-durable") {
+    piArguments.push(
+      "--durable-run-id", options.id,
+      "--durable-directory", path.join(path.dirname(options.statusFile), "durable"),
     );
   }
   const claudeCli = options.runner === "claude" ? await loadClaudeCli() : undefined;
@@ -563,7 +571,12 @@ const main = async (): Promise<void> => {
       ? options.claudeBinary
       : options.runner === "veda"
         ? options.vedaBinary
-        : options.piBinary;
+        : options.runner === "pi-durable"
+          ? fileURLToPath(new URL(
+              import.meta.url.endsWith(".ts") ? "./durable/worker.ts" : "./durable/worker.js",
+              import.meta.url,
+            ))
+          : options.piBinary;
 
   // smarty-dev#1579: agents.nice lowers CPU and IO priority. This dedicated worker lowers its own
   // spawning (main) thread before the fork, so the child, every thread it starts and its tools
@@ -744,7 +757,7 @@ const main = async (): Promise<void> => {
   // once the child closes instead of treating stdout as NDJSON lines.
   let vedaOutput = "";
   let vedaParsed: Record<string, unknown> | undefined;
-  let eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
+  let eventProjection = isPi ? new PiEventProjection() : undefined;
   let outputDecoder = new StringDecoder("utf8");
   let stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
@@ -761,10 +774,14 @@ const main = async (): Promise<void> => {
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
+  let answerProjected = false;
+  let recordedResultPending = false;
+  let recordedResultTimer: NodeJS.Timeout | undefined;
+  const recordedResultId = `fabric-recorded-result:${options.id}`;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   // agents.childQuestions "route": child dialogs wait for a parent ui_response.
-  const questionRelay = options.childQuestionTimeoutMs !== undefined && options.runner === "pi" && options.steerFile
+  const questionRelay = options.childQuestionTimeoutMs !== undefined && isPi && options.steerFile
     ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
         emit: (question) => emitLifecycle("question", { ...question }),
         send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
@@ -1426,6 +1443,63 @@ const main = async (): Promise<void> => {
       processClaudeEvent(event);
       return;
     }
+    if (event.type === "response" && recordedResultPending && event.id === recordedResultId) {
+      recordedResultPending = false;
+      clearTimeout(recordedResultTimer);
+      const fail = (reason: string): void => failStalledChild(`Durable recorded result retrieval failed: ${reason}`);
+      if (event.command !== "get_messages" || event.success !== true) {
+        fail(typeof event.error === "string" ? event.error : "invalid or rejected RPC response");
+        return;
+      }
+      const data = event.data as { messages?: unknown } | undefined;
+      const messages = Array.isArray(data?.messages) ? data.messages : [];
+      const isMessage = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      let start = messages.length - 1;
+      while (start >= 0 && !(isMessage(messages[start]) && messages[start].role === "user")) start--;
+      // Native history includes earlier actor turns. Never attribute those to
+      // this run, or accept a stale assistant as the completed prompt's answer.
+      if (start < 0 || extractText(messages[start]) !== task) {
+        fail("recorded history does not end with the submitted prompt");
+        return;
+      }
+      const assistants = messages.slice(start + 1).filter(
+        (message): message is Record<string, unknown> => isMessage(message) && message.role === "assistant",
+      );
+      const last = assistants.at(-1);
+      if (!last) {
+        fail("recorded prompt has no assistant result");
+        return;
+      }
+      // Read-only projection: do not manufacture message_end/SessionManager
+      // writes or export already charged usage as newly generated tokens.
+      const restored = { ...record, usage: emptyUsage() };
+      for (const message of assistants) {
+        applyUsage(restored, message);
+        modelControl.observeAssistant(message);
+      }
+      if (terminalStatus) return;
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+        record.usage[key] = Math.max(record.usage[key], restored.usage[key]);
+      }
+      answerProjected = true;
+      record.text = latestRunText(extractText(last));
+      record.turns = Math.max(record.turns, assistants.length);
+      record.toolCalls = Math.max(record.toolCalls, messages.slice(start + 1).filter(
+        message => isMessage(message) && message.role === "toolResult",
+      ).length);
+      if (last.stopReason === "error" || last.stopReason === "aborted") {
+        sawAgentError = true;
+        terminalError = assistantError(last);
+      }
+      enforceTokenLimit();
+      update();
+      if (!terminalStatus) {
+        pollSteer();
+        compactControl.childSettled();
+      }
+      return;
+    }
     if (event.type === "fabric_runner_session") {
       const sessionId = stringField(event.sessionId);
       if (event.runId === options.id && sessionId && record.runnerSessionId !== sessionId) {
@@ -1491,7 +1565,7 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_start") {
       nativeActivity = true;
       deferredFollowUpSettle = false;
-      if (options.runner === "pi" && replayAfterStart) {
+      if (isPi && replayAfterStart) {
         replayAfterStart = false;
         piControlLive = true;
         const retained = retainedPiQueues;
@@ -1604,6 +1678,9 @@ const main = async (): Promise<void> => {
       hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
         messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
       producedFinalAnswer ||= hasFinalText;
+      if (text || messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+        answerProjected = true;
+      }
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1642,6 +1719,16 @@ const main = async (): Promise<void> => {
       nativeActivity = false;
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
+        if (options.runner === "pi-durable" && !answerProjected && !terminalStatus) {
+          if (!recordedResultPending) {
+            recordedResultPending = true;
+            recordedResultTimer = setTimeout(() => failStalledChild(
+              "Durable recorded result retrieval timed out waiting for get_messages",
+            ), KILL_GRACE_MS);
+            child.stdin?.write(`${JSON.stringify({ type: "get_messages", id: recordedResultId })}\n`);
+          }
+          return;
+        }
         // Settlement ends automatic work, not necessarily successfully: native
         // compaction failures/aborts need not emit an assistant error message.
         // Older Pi frames omit outcome; retain their existing result checks.
@@ -1722,7 +1809,7 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
+    if (!options.steerFile || terminalStatus || (isPi &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
     let descriptor: number | undefined;
     try {
@@ -1945,7 +2032,7 @@ const main = async (): Promise<void> => {
     if (terminalStatus) return;
     terminalStatus = "timed_out";
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
-    if (options.runner === "pi" && !modelControl.ready) {
+    if (isPi && !modelControl.ready) {
       terminalError += "; Pi model admission did not complete; task was not sent";
     }
     killChild();
@@ -2087,6 +2174,11 @@ const main = async (): Promise<void> => {
 
   if (crashPending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
+  clearTimeout(recordedResultTimer);
+  if (recordedResultPending && !terminalStatus) {
+    terminalStatus = "failed";
+    terminalError = "Durable worker exited before recorded result retrieval completed";
+  }
   questionRelay?.close();
   delete record.blockedOn;
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
@@ -2095,7 +2187,7 @@ const main = async (): Promise<void> => {
   if (closeTimer) clearTimeout(closeTimer);
   recoveryWatchdog.dispose();
   toolCallStreamGuard.dispose();
-  if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
+  if (isPi && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
   }
@@ -2195,7 +2287,7 @@ const main = async (): Promise<void> => {
   const childCompleted =
     exitCode === 0 &&
     !sawAgentError &&
-    (options.runner === "pi" ||
+    (isPi ||
       (options.runner === "claude" &&
         claudeResultSeen &&
         claudeSentInputs.length === 0 &&

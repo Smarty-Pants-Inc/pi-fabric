@@ -5,7 +5,7 @@ import type { FabricThinking } from "../thinking.js";
 import type { FabricAgentLineage, FabricWritePolicy } from "./child-env.js";
 import type { AgentChildQuestionResponse, AgentUsage } from "./types.js";
 
-export type BuiltInFabricAgentRunner = "pi" | "claude" | "veda";
+export type BuiltInFabricAgentRunner = "pi" | "pi-durable" | "claude" | "veda";
 
 /**
  * What a runner honors. Fabric refuses a request that needs an undeclared
@@ -229,7 +229,7 @@ export interface FabricHostedRunner extends FabricRunnerBase {
 export type FabricRunnerAdapter = FabricWorkerRunner | FabricHostedRunner;
 
 /** Canonical built-in runner ids; src/config.ts inlines the same set. */
-export const BUILT_IN_RUNNER_IDS: ReadonlySet<string> = new Set(["pi", "claude", "veda"]);
+export const BUILT_IN_RUNNER_IDS: ReadonlySet<string> = new Set(["pi", "pi-durable", "claude", "veda"]);
 /** Canonical runner id syntax; eager modules inline an identical copy. */
 export const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const MAX_RUNNER_ID_CHARS = 64;
@@ -265,7 +265,7 @@ const builtIn = (
 // Built-ins keep their model and tool handling in the manager; this table
 // carries only the capability facts checked uniformly for every runner.
 for (const adapter of [
-  builtIn("pi", "Pi", {
+  ...(["pi", "pi-durable"] as const).map((id) => builtIn(id, id === "pi" ? "Pi" : "Pi Durable", {
     recursiveFabric: true,
     steer: true,
     followUp: true,
@@ -278,7 +278,7 @@ for (const adapter of [
     questions: true,
     sleep: false,
     writePolicy: true,
-  }),
+  })),
   builtIn("claude", "Claude", {
     recursiveFabric: false,
     steer: true,

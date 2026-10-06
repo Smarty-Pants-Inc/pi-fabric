@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { PythonLiteralCallScanner } from "../src/speculation/python-scanner.js";
+import { TIER_A_SPECULATION_REFS } from "../src/speculation/eligibility.js";
 
 const scan = (code: string) => new PythonLiteralCallScanner().push(code);
 describe("Python speculation scanner", () => {
+  it("recognizes every Tier-A namespace", () => {
+    for (const ref of TIER_A_SPECULATION_REFS) {
+      expect(scan(`await ${ref}({})`), ref).toEqual([{ ref, args: {} }]);
+    }
+  });
+  it("does not speculate on a shadowed mesh namespace", () => {
+    expect(scan('mesh = other\nawait mesh.scheduled({})')).toEqual([]);
+  });
   it.each([
     ['await pi.read("x", 2, 5)', { path: "x", offset: 2, limit: 5 }],
     ['await pi.read(path="x", limit=5)', { path: "x", limit: 5 }],

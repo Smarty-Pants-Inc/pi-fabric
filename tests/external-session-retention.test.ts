@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { socketFixtureDirectory, closeSocketFixtureDirectories } from "./helpers/socket-fixture-directory.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -140,8 +141,8 @@ for (const kind of ["tmux", "screen"] as const) {
   const installed = await processUtils.commandAvailable(kind);
   it.skipIf(!installed)(`real ${kind}: terminal-live retention and checked inventory (skip only when ${kind} is absent)`, async () => {
     const root = repository(); const screenDir = path.join(root, "s"); fs.mkdirSync(screenDir, { mode: 0o700 });
-    const socket = path.join(root, "t.sock");
-    vi.stubEnv("SCREENDIR", screenDir);
+    const socket = path.join(socketFixtureDirectory(root), "t.sock");
+    vi.stubEnv("SCREENDIR", socketFixtureDirectory(screenDir));
     const worker = path.join(root, "live-worker.mjs");
     fs.writeFileSync(worker, `import fs from 'node:fs';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i].slice(2),process.argv[i+1]);
@@ -208,6 +209,7 @@ process.on('SIGHUP',()=>process.exit(0));process.on('SIGTERM',()=>process.exit(0
         return false;
       });
       vi.restoreAllMocks(); vi.unstubAllEnvs();
+      closeSocketFixtureDirectories();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 30_000);

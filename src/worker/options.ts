@@ -180,7 +180,8 @@ export const parseWorkerOptions = (
   } : undefined;
   const fabricSessionId = optional(args, "fabric-session-id");
   const runner = required(args, "runner");
-  if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
+  const isPi = runner === "pi" || runner === "pi-durable";
+  if (!isPi && runner !== "claude" && runner !== "veda") {
     throw new Error(`Unsupported Fabric agent runner: ${runner}`);
   }
   if (persistSession && runner !== "claude") {
@@ -202,11 +203,11 @@ export const parseWorkerOptions = (
   if (selectedKernel !== undefined && selectedKernel !== "typescript" && selectedKernel !== "python") {
     throw new Error(`Invalid worker kernel: ${selectedKernel}`);
   }
-  if (selectedKernel !== undefined && (runner !== "pi" || !extensions)) {
+  if (selectedKernel !== undefined && (!isPi || !extensions)) {
     throw new Error("Explicit worker kernel requires the Pi runner with Fabric extensions enabled");
   }
   // Old launchers had no flag and always used TypeScript, regardless of ambient env.
-  const kernel = runner === "pi" && extensions ? selectedKernel ?? "typescript" : undefined;
+  const kernel = isPi && extensions ? selectedKernel ?? "typescript" : undefined;
   const residentStartupProbe = optional(args, "resident-startup-probe") === "true";
   if (residentStartupProbe && (runner !== "pi" || !extensions || actorId || sessionFile || schemaFile || replyTool)) {
     throw new Error("Resident startup probe must be an isolated Pi worker");

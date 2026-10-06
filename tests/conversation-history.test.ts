@@ -272,7 +272,7 @@ describe("preview native prompt history", () => {
     resolve();
     await tick();
     const frame = h.render().map(stripTerminalSequences);
-    const border = frame.findIndex((line) => /^─+$/.test(line));
+    const border = frame.findIndex((line) => /^─+ .+ ──$/.test(line));
     expect(frame.slice(border + 1).join("\n")).toContain("matching text");
     h.input("\x1b");
     expect(h.draft()).toBe("");
@@ -291,7 +291,7 @@ describe("preview native prompt history", () => {
     for (let i = 0; i < 4; i++) h.input(up);
     expect(h.render().join("\n")).toContain("queued first");
     const frame = h.render().map(stripTerminalSequences);
-    const border = frame.findIndex((line) => /^─+$/.test(line));
+    const border = frame.findIndex((line) => /^─+ .+ ──$/.test(line));
     expect(frame.slice(border + 1).join("\n")).not.toContain("old composer prompt");
     h.input("\x1b");
     expect(h.draft()).toBe("unfinished composer");

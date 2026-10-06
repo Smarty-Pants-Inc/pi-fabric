@@ -321,7 +321,7 @@ export class ActionRegistry {
 
   /**
    * Attach the speculative-PTC runtime. Eligibility is re-checked against the
-   * resolved descriptor inside speculate(), so a config/captured-tool change
+   * resolved descriptor at launch and replay, so a config/captured-tool change
    * cannot sneak a side-effecting ref into the store after the fact.
    */
   setSpeculation(
@@ -330,6 +330,16 @@ export class ActionRegistry {
   ): void {
     this.#speculation = runtime;
     this.#speculationEligibility = eligibility;
+  }
+
+  #allowsSpeculation(action: ResolvedFabricAction): boolean {
+    const localRead = action.risk === "read" && action.effect?.kind === "none";
+    // MCP keeps its conservative network/effect classification. Only the live
+    // eligibility callback can attest an allowlisted read; explicit unsafe
+    // annotations still refuse even if a custom callback opts it in.
+    const mcpRead = action.provider === "mcp" && action.risk === "network" &&
+      action.annotations?.destructiveHint !== true && action.annotations?.readOnlyHint !== false;
+    return (localRead || mcpRead) && this.#speculationEligibility?.(structuredClone(action)) === true;
   }
 
   register(provider: FabricProvider, options: { overwrite?: boolean } = {}): void {
@@ -1046,7 +1056,7 @@ export class ActionRegistry {
       let providerValue: unknown;
       let providerInvoked = false;
       try {
-      if (this.#speculation && action.risk === "read" && effect.kind === "none") {
+      if (this.#speculation && this.#allowsSpeculation(action)) {
         const served = await runAbortable(context.signal, () =>
           this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null, context.scope?.digest ?? null])));
         if (served.hit) {
@@ -1257,7 +1267,7 @@ export class ActionRegistry {
         return undefined;
       }
       const authority = { ref: action.ref, descriptor: actionDescriptorHash(action) };
-      if (action.risk !== "read" || action.effect?.kind !== "none" || !this.#speculationEligibility(structuredClone(action))) return undefined;
+      if (!this.#allowsSpeculation(action)) return undefined;
       const effectiveSchema = effectiveInputSchema(
         action.ref,
         action.inputSchema,

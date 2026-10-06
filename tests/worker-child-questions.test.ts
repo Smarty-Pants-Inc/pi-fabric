@@ -45,7 +45,7 @@ const setup = (
   fs.chmodSync(fakePi, 0o755);
   const log = path.join(root, "responses.jsonl");
   process.env.FAKE_PI_QUESTION_LOG = log;
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agents }, {
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, ...agents }, {
     workerPath: path.resolve("src/worker.ts"),
     piBinary: fakePi,
     runRoot: root,

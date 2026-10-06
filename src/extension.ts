@@ -24,7 +24,6 @@ import { isSelectedNativeMcpTool, nativeMcpIdentity } from "./core/native-mcp-id
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import { FileLockTimeoutError } from "./core/file-lock.js";
 import { setActiveCompiledSurface } from "./entropy/active-state.js";
 import {
   filterPrewalkContinuationMessages,
@@ -664,7 +663,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       }
     } catch (error) {
       if (signal.aborted) return false;
-      if (error instanceof FileLockTimeoutError) {
+      if (error instanceof (await import("./core/file-lock.js")).FileLockTimeoutError) {
         retry = true;
       } else {
         // Advisory evidence cannot gate the normal-form compiler.
@@ -696,7 +695,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           }
         }
       } catch (error) {
-        if (!(error instanceof FileLockTimeoutError)) throw error;
+        if (!(error instanceof (await import("./core/file-lock.js")).FileLockTimeoutError)) throw error;
         // Proof-checked plans are usable now; durable persistence can catch up
         // later without blocking this session on another process's writer.
         if (current()) setActiveCompiledSurface(outcome.artifact);
@@ -1278,6 +1277,35 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     },
   });
 
+  // No extractive module import, branch read or model call until explicit opt-in
+  // reaches a real agent boundary. Context replay only reads the prepared view.
+  let extractiveHistory: import("./memory/extractive-history.js").ExtractiveHistory | undefined;
+  let extractiveEpoch = 0;
+  const invalidateExtractive = (clear = false): void => {
+    extractiveEpoch++;
+    extractiveHistory?.invalidate(clear);
+  };
+  const extractiveConfig = () => state.bootstrapped && state.config.memory.enabled ? state.config.memory.extractive : undefined;
+  const unsubscribeExtractiveConfig = pi.events.on("pi-fabric:extractive-config-changed", () => invalidateExtractive(true));
+  pi.on("session_start", () => invalidateExtractive(true));
+  pi.on("session_tree", () => invalidateExtractive(true));
+  pi.on("agent_end", () => invalidateExtractive());
+  pi.on("session_shutdown", () => {
+    invalidateExtractive(true);
+    unsubscribeExtractiveConfig();
+  });
+  pi.on("before_agent_start", async (event, context) => {
+    if (!extractiveConfig()?.enabled) { invalidateExtractive(true); return; }
+    const epoch = ++extractiveEpoch;
+    const sessionId = context.sessionManager.getSessionId();
+    const leaf = context.sessionManager.getLeafId();
+    const { ExtractiveHistory } = await import("./memory/extractive-history.js");
+    if (epoch !== extractiveEpoch || !extractiveConfig()?.enabled || context.signal?.aborted ||
+      context.sessionManager.getSessionId() !== sessionId || context.sessionManager.getLeafId() !== leaf) return;
+    extractiveHistory ??= new ExtractiveHistory(extractiveConfig);
+    await extractiveHistory.prepare(context, event.prompt);
+  });
+
   pi.on("context", async (event, context) => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
@@ -1325,6 +1353,18 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     return changed ? { messages } : undefined;
   });
 
+  pi.on("context", (event, context) => {
+    const customType = "fabric-extractive-history";
+    const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === customType));
+    if (!extractiveConfig()?.enabled) invalidateExtractive(true);
+    const view = extractiveHistory?.view(context);
+    if (!view) return messages.length !== event.messages.length ? { messages } : undefined;
+    // Request-local custom data: never appendEntry/sendMessage, never system
+    // instructions, never replace current raw work. Replays contain one copy.
+    return { messages: [{ role: "custom" as const, customType, content: view.text,
+      display: false, timestamp: 0, details: { advisory: true, ...(view.usage ? { classifierUsage: view.usage } : {}) },
+    }, ...messages] };
+  });
   pi.on("before_agent_start", async (event, context) => {
     const config = state.provisionalConfig();
     const fullCodeMode = config.fullCodeMode;

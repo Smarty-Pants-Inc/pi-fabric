@@ -47,7 +47,7 @@ export type FabricAgentTransport =
   | "localterm"
   | "herdr";
 /** Built-in runner ids, or a runner registered through pi-fabric/runners. */
-export type FabricAgentRunner = "pi" | "claude" | "veda" | (string & {});
+export type FabricAgentRunner = "pi-durable" | "pi" | "claude" | "veda" | (string & {});
 
 /** How a child run's reported model is checked against the requested key.
  * Strict fails the run on a mismatch. Permissive records the reported
@@ -415,7 +415,26 @@ export interface FabricMemorySourceConfig {
   root: string;
 }
 
+export interface FabricExtractiveConfig {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  maxViewBytes: number;
+  maxCandidates: number;
+  maxSourceChars: number;
+  /** Zero selects deterministic-only operation. V1 issues at most one batch. */
+  maxEvaluationsPerTurn: number;
+  timeoutMs: number;
+}
+
+export const DEFAULT_EXTRACTIVE_CONFIG: FabricExtractiveConfig = {
+  enabled: false, provider: "typesafe", model: "jev-latest",
+  maxViewBytes: 8192, maxCandidates: 128, maxSourceChars: 24000,
+  maxEvaluationsPerTurn: 1, timeoutMs: 3000,
+};
+
 export interface FabricMemoryConfig {
+  extractive?: FabricExtractiveConfig;
   enabled: boolean;
   indexDir?: string;
   maxSessions: number;
@@ -684,6 +703,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     aliases: {},
   },
   memory: {
+    extractive: { ...DEFAULT_EXTRACTIVE_CONFIG },
     enabled: true,
     maxSessions: 500,
     maxEntryChars: 2_000,
@@ -1000,6 +1020,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const extractive = objectValue(memory.extractive);
   const memorySources = memorySourcesValue(memory.sources);
   const entropy = objectValue(input.entropy);
   const repairs = objectValue(input.repairs);
@@ -1604,6 +1625,16 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       aliases: normalizeModelAliases(modelsSection.aliases),
     },
     memory: {
+      extractive: {
+        enabled: booleanValue(extractive.enabled, false),
+        provider: stringValue(extractive.provider) || DEFAULT_EXTRACTIVE_CONFIG.provider,
+        model: stringValue(extractive.model) || DEFAULT_EXTRACTIVE_CONFIG.model,
+        maxViewBytes: boundedInteger(extractive.maxViewBytes, 8192, 1024, 32768),
+        maxCandidates: boundedInteger(extractive.maxCandidates, 128, 1, 256),
+        maxSourceChars: boundedInteger(extractive.maxSourceChars, 24000, 256, 100000),
+        maxEvaluationsPerTurn: boundedInteger(extractive.maxEvaluationsPerTurn, 1, 0, 1),
+        timeoutMs: boundedInteger(extractive.timeoutMs, 3000, 100, 10000),
+      },
       enabled: booleanValue(memory.enabled, DEFAULT_FABRIC_CONFIG.memory.enabled),
       ...(memoryIndexDir ? { indexDir: memoryIndexDir } : {}),
       ...(memorySources ? { sources: memorySources } : {}),

@@ -15,6 +15,7 @@ const identity = (value: unknown): ModelIdentity | undefined => {
 
 const key = (model: ModelIdentity): string => `${model.provider}/${model.id}`;
 
+// Shared by pi and pi-durable: both process workers speak native Pi RPC.
 // CLI selection happens before session_start extensions. Reapply it over RPC
 // after startup, then read actual state: set_model's response echoes its input
 // model even if a model_select extension switched away again.

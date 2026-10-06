@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { socketFixtureDirectory, closeSocketFixtureDirectories } from "./helpers/socket-fixture-directory.js";
 import net, { type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ afterEach(async () => {
         }),
     ),
   );
+  closeSocketFixtureDirectories();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -25,7 +27,7 @@ type Drop = "apply-after-create" | "apply-before-create" | "apply-error" | "pane
 const startServer = async (options: { drop?: Drop; tabs?: Array<{ tab_id: string; label: string }> } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-"));
   roots.push(root);
-  const socketPath = path.join(root, "herdr.sock");
+  const socketPath = path.join(socketFixtureDirectory(root), "herdr.sock");
   let paneAlive = true;
   const tabs = [{ tab_id: "w1:t1", label: "Main" }, ...(options.tabs ?? [])];
   const panes = tabs.map((tab) => ({ pane_id: tab.tab_id.replace(":t", ":p"), tab_id: tab.tab_id }));
@@ -110,7 +112,7 @@ const startServer = async (options: { drop?: Drop; tabs?: Array<{ tab_id: string
 
 const env = (socketPath: string) => ({ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: "w1" });
 // Each test keeps its spawn ledger beside its socket, inside the temporary root.
-const ledger = (socketPath: string) => path.join(path.dirname(socketPath), "spawns");
+const ledger = (socketPath: string) => path.join(fs.realpathSync(path.dirname(socketPath)), "spawns");
 const herdr = (socketPath: string, options: HerdrTransportOptions = {}) =>
   new HerdrTransport(env(socketPath), { spawnLedgerDir: ledger(socketPath), ...options });
 const launchRequest = { id: "run-1", name: "review worker", cwd: "/repo", workerPath: "/fabric/worker.js", workerArguments: [] };
@@ -364,7 +366,7 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
 
     it("launches without the budget, and warns once, when the ledger is unusable", async () => {
       const { socketPath, requests } = await startServer();
-      const blocked = path.join(path.dirname(socketPath), "not-a-directory");
+      const blocked = path.join(fs.realpathSync(path.dirname(socketPath)), "not-a-directory");
       fs.writeFileSync(blocked, "");
       const warnings: string[] = [];
       const onWarning = (warning: Error & { code?: string }) => { if (warning.code === "PI_FABRIC_HERDR_SPAWN_LEDGER") warnings.push(warning.message); };
@@ -385,10 +387,10 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       const { socketPath } = await startServer();
       const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-link-"));
       roots.push(linkDir);
-      const linked = path.join(linkDir, "herdr.sock");
-      fs.symlinkSync(socketPath, linked);
+      const linked = path.join(socketFixtureDirectory(linkDir), "herdr.sock");
+      fs.symlinkSync(fs.realpathSync(socketPath), linked);
       await new HerdrTransport(env(linked)).launch(launchRequest);
-      const ledgerDir = `${socketPath}.pi-fabric-spawns`;
+      const ledgerDir = `${fs.realpathSync(socketPath)}.pi-fabric-spawns`;
       expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
       expect(fs.readdirSync(ledgerDir)).toHaveLength(1);
       expect(fs.existsSync(`${linked}.pi-fabric-spawns`)).toBe(false);
@@ -460,8 +462,8 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       const { socketPath, requests } = await startServer();
       const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-link-"));
       roots.push(linkDir);
-      const linked = path.join(linkDir, "herdr.sock");
-      fs.symlinkSync(socketPath, linked);
+      const linked = path.join(socketFixtureDirectory(linkDir), "herdr.sock");
+      fs.symlinkSync(fs.realpathSync(socketPath), linked);
       const [first, second] = await Promise.all([
         new HerdrTransport(env(socketPath)).launch(launchRequest),
         new HerdrTransport(env(linked)).launch(launchRequest),

@@ -362,6 +362,17 @@ export class ResidentHost {
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
     const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
       ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
+    this.control = new FabricControlPlane(this.mesh, this.identity, {
+      enabled: true,
+      hostId: this.hostId,
+      pollMs: config.mesh.actorPollMs,
+      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
+    });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
@@ -379,17 +390,6 @@ export class ResidentHost {
       ownerIncarnation: this.control.incarnation,
       presencePass: () => rootPresenceAlarms(this.mesh, this.identity, this.hostId,
         this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
-    });
-    this.control = new FabricControlPlane(this.mesh, this.identity, {
-      enabled: true,
-      hostId: this.hostId,
-      pollMs: config.mesh.actorPollMs,
-      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
-      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
-      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
-        this.participants.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
-      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
-        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -864,7 +864,7 @@ export class ResidentHost {
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+          { provenance, sender: command.sender ?? null, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
             this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };

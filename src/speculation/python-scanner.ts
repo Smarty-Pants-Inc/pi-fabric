@@ -4,7 +4,7 @@ import { stableJsonHash } from "../core/stable-hash.js";
 import { pythonArgumentsFor } from "../runtime/python-arguments.js";
 import type { FabricSpeculationCandidate } from "./types.js";
 
-const ROOTS = new Set(["pi", "memory", "state", "schema", "compact", "thinking", "decisions", "programs", "components", "mcp"]);
+const ROOTS = new Set(["pi", "memory", "state", "schema", "compact", "thinking", "decisions", "programs", "components", "mesh", "mcp"]);
 const FAIL = Symbol("unsupported Python literal");
 const children = (node: SyntaxNode): SyntaxNode[] => {
   const result: SyntaxNode[] = [];

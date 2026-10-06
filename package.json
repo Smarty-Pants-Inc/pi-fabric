@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.105.0",
+  "version": "0.108.1",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -145,6 +145,8 @@
     "image": "https://raw.githubusercontent.com/fabric-runtime/pi-fabric/main/media/banner.svg"
   },
   "dependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
     "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
     "@lezer/common": "^1.5.2",
     "@lezer/python": "^1.1.19",
@@ -161,23 +163,15 @@
     "yaml": "^2.9.0"
   },
   "peerDependencies": {
-    "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "peerDependenciesMeta": {
-    "@earendil-works/chord": { "optional": true },
-    "@earendil-works/pi-durable": { "optional": true }
-  },
   "devDependencies": {
-    "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
-    "@earendil-works/pi-ai": "1.0.0",
     "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
     "@earendil-works/pi-coding-agent": "1.0.0",
     "@earendil-works/pi-tui": "1.0.0",
     "typebox": "1.3.27",

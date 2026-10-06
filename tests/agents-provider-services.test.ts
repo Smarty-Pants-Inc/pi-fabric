@@ -758,7 +758,7 @@ describe("agents provider message routing service boundaries", () => {
     control.request.mockResolvedValue(ack);
     await expect(router.routeMessage(remote.id, "hello", { topic: "work" }, "followUp", undefined, { triggerTurn: false })).resolves.toEqual(ack);
     expect(control.request).toHaveBeenCalledWith(
-      "host", remote.id, "followUp", { message: "hello", data: { topic: "work" }, triggerTurn: false }, "owner", { routedRemoteHost: null },
+      "host", remote.id, "followUp", { message: "hello", data: { topic: "work" }, principal: undefined, triggerTurn: false }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey },
     );
     expect(main.deliverAgent).not.toHaveBeenCalled();
     expect(actors.validateDirectMessage).not.toHaveBeenCalled();
@@ -778,7 +778,7 @@ describe("agents provider message routing service boundaries", () => {
     expect(call[3]).toMatchObject({ message: "survive reload", triggerTurn: true });
     expect(call[3]).not.toHaveProperty("ownerIncarnation");
     expect(call[4]).toBe(root.ownerIdentityId);
-    expect(call[5]).toEqual({ routedRemoteHost: "forge" });
+    expect(call[5]).toEqual({ routedRemoteHost: "forge", idempotencyKey: generatedIdempotencyKey });
   });
 
   it.each(["root", "agent", "actor"] as const)("keeps distinct runtime-owned %s controls generation-pinned", async kind => {
@@ -816,7 +816,7 @@ describe("agents provider message routing service boundaries", () => {
     participants.get.mockReturnValue(actor);
     await router.routeMessage(actor.id, "actor message", undefined, "steer");
     expect(actors.validateDirectMessage).toHaveBeenCalledWith("actor message", undefined);
-    expect(control.request).toHaveBeenCalledWith("host", actor.id, "steer", { message: "actor message", data: undefined }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", actor.id, "steer", { message: "actor message", data: undefined, principal: undefined }, "owner", { routedRemoteHost: null, idempotencyKey: generatedIdempotencyKey });
   });
 
   it("does not hide local agent failures by falling through to actors", async () => {

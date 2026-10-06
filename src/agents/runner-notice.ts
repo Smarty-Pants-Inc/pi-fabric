@@ -1,4 +1,4 @@
-const BUILT_IN_RUNNERS = ["pi", "claude", "veda"];
+const BUILT_IN_RUNNERS = ["pi", "pi-durable", "claude", "veda"];
 
 const editDistance = (left: string, right: string): number => {
   const row = Array.from({ length: right.length + 1 }, (_, index) => index);

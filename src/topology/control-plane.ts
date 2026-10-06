@@ -553,6 +553,9 @@ export class FabricControlPlane {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
     if (!ownerHostId.trim()) throw new Error("Remote participant has no execution owner");
+    if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
+      throw new Error("Invalid Fabric owner incarnation");
+    }
     if (options.signal?.aborted) throw new Error(`Remote Fabric request cancelled: ${targetId}`);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
     const commandId = createHash("sha256")

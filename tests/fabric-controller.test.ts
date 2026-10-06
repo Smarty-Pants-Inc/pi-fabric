@@ -235,6 +235,65 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it("wires global template events end to end from the dashboard to the registry", async () => {
+    const state = stubState();
+    vi.mocked(state.globalActors.list).mockReturnValue([
+      {
+        id: "g-actor-1",
+        name: "global-reviewer",
+        instructions: "Review when asked.",
+        runner: "pi",
+        events: ["turn_end"],
+        topics: [],
+        delivery: "mailbox",
+        responseMode: "directive",
+        triggerTurn: false,
+        coalesce: true,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ] as never);
+    const controller = new FabricUiController(state);
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    let dashboard: FabricDashboard | undefined;
+    const context = {
+      mode: "tui",
+      modelRegistry: { getAvailable: () => [] },
+      ui: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        custom: vi.fn(async (factory: any) => {
+          dashboard = factory(tui, theme, {}, () => {}) as FabricDashboard;
+        }),
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      await controller.openDashboard(context);
+      expect(dashboard).toBeDefined();
+      // Move from the first actor to the global template, then open its
+      // detail; the hint is gated on onGlobalEvents being wired.
+      dashboard!.handleInput("l");
+      dashboard!.handleInput("j");
+      dashboard!.handleInput("\r");
+      expect(dashboard!.render(120).join("\n")).toContain("v events");
+      dashboard!.handleInput("v");
+      dashboard!.handleInput(" ");
+      dashboard!.handleInput("\r");
+      expect(state.globalActors.update).toHaveBeenCalledWith("g-actor-1", {
+        events: ["input", "turn_end"],
+      });
+      expect(context.ui.notify).toHaveBeenCalledWith(
+        "Global actor event subscriptions updated",
+        "info",
+      );
+    } finally {
+      dashboard?.dispose();
+      controller.stop();
+    }
+  });
+
   it("routes Main dashboard messages through FabricState", async () => {
     const state = stubState();
     const controller = new FabricUiController(state);

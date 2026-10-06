@@ -36,7 +36,7 @@ registry rename and completion of checkpoint publication, an old release may
 obscure that **unacknowledged** head; the previously checkpointed, acknowledged
 history remains recoverable. Checkpoint completion is part of acknowledgment,
 not background work. A leading newline isolates a torn append; readers select
-exact committed ranges rather than parsing the whole growing log. Invalid or
+exact committed ranges without parsing the whole growing log. Invalid or
 truncated history/checkpoints are errors, not empty guessed histories to save
 back. Paths are derived from actor ids, never from a stored path.
 

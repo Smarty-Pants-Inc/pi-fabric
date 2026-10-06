@@ -1,4 +1,5 @@
 import type { FabricDynamicGuestDeclarations } from "../protocol.js";
+import { NATIVE_CODEMODE_TYPES } from "./native-codemode-types.js";
 import { JEV_GUEST_DECLARATIONS } from "../jev/guest-types.js";
 
 // These names and compatibility fields are the single source of truth for
@@ -30,10 +31,11 @@ export const PI_CORE_NUMERIC_FIELDS = {
 } as const;
 
 export const GUEST_TYPE_DECLARATIONS = `
+${NATIVE_CODEMODE_TYPES}
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type FabricTransport = "auto" | "process" | "tmux" | "screen" | "localterm" | "herdr";
-type FabricAgentRunner = "pi" | "claude" | "veda" | (string & {});
+type FabricAgentRunner = "pi-durable" | "pi" | "claude" | "veda" | (string & {});
 type FabricKernel = "typescript" | "python";
 type FabricThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 interface FabricActionEffect {
@@ -498,7 +500,7 @@ interface FabricToolsApi {
   describe(args: { ref: string }): Promise<FabricAction>;
   call(args: { ref: string; args?: Record<string, unknown> }): Promise<unknown>;
   progress(args: { message: string }): Promise<void>;
-  models(): Promise<FabricModelInfo[]>;
+  models: FabricNativeModels;
 }
 interface FabricCapturedToolResult {
   content: Array<{ type: string; text?: string; [key: string]: unknown }>;
@@ -1876,7 +1878,7 @@ declare function phase(name: string, options?: FabricWorkflowPhaseOptions): Prom
 declare function phase(input: FabricWorkflowPhaseInput): Promise<{ name: string; index: number; id?: string }>;
 declare function log(...values: unknown[]): void;
 declare const budget: FabricWorkflowApi["budget"];
-type FabricRlmRequest = Omit<FabricAgentRequest, "runner" | "recursive"> & { runner?: "pi" };
+type FabricRlmRequest = Omit<FabricAgentRequest, "runner" | "recursive"> & { runner?: "pi" | "pi-durable" };
 declare const rlm: { query(args: FabricRlmRequest): Promise<FabricAgentResult> };
 interface FabricConsole {
   log(...args: unknown[]): void;

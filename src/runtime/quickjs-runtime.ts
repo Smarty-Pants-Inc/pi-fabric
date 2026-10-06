@@ -107,8 +107,10 @@ const quickJsModule = (): Promise<QuickJsModule> => {
 
 // piTools is false in orchestration-only mode: `pi` fails the type check there, so hints
 // name the native tool instead (smarty-dev#459).
-export const guestSetupSource = (fields?: Record<string, string[]>, piTools = true): string =>
-  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\nconst __piToolsAvailable = ${piTools};\n${GUEST_SETUP}`;
+export const guestSetupSource = (fields?: Record<string, string[]>, piTools = true, nativeStoreEnabled = false): string =>
+  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\nconst __piToolsAvailable = ${piTools};\nconst __nativeStoreEnabled = ${nativeStoreEnabled};\n${GUEST_SETUP}`;
+
+import { NATIVE_CODEMODE_GUEST } from "./native-codemode-guest.js";
 
 export const GUEST_SETUP = `
 (() => {
@@ -161,6 +163,7 @@ const __toolsBase = {
   progress: (args) => __call("fabric.$progress", args),
   models: () => __call("fabric.$models", {}),
 };
+${NATIVE_CODEMODE_GUEST}
 // tools is discovery + generic calls only. The proxy keeps the seven discovery
 // methods and turns a core-tool name (read/bash/edit/...) into an actionable
 // error pointing at pi.<name>, so a model that writes tools.read(...) learns
@@ -771,10 +774,10 @@ globalThis.log = workflow.log;
 globalThis.budget = workflow.budget;
 globalThis.rlm = Object.freeze({
   query: (args) => {
-    if (args && args.runner && args.runner !== "pi") {
-      throw new Error("rlm.query requires the Pi runner because recursive Fabric is unavailable in Claude Code");
+    if (args && args.runner && args.runner !== "pi" && args.runner !== "pi-durable") {
+      throw new Error("rlm.query requires a Pi runner (pi-durable or pi) for recursive Fabric");
     }
-    return __budgetedRun({ ...args, runner: "pi", recursive: true });
+    return __budgetedRun({ ...args, runner: args?.runner ?? "pi", recursive: true });
   },
 });
 globalThis.council = Object.freeze({
@@ -793,7 +796,7 @@ globalThis.council = Object.freeze({
     });
   },
 });
-globalThis.console = Object.freeze({ log: print, info: print, warn: print, error: print });
+globalThis.console = Object.freeze({ log: print, info: print, warn: print, error: print, debug: print });
 const __timerCallbacks = new Map();
 let __nextTimerId = 1;
 globalThis.setTimeout = (callback, ms = 0) => {
@@ -998,6 +1001,13 @@ export class QuickJsRuntime {
       interruptedByDeadline = true;
       return true;
     });
+    const emittedSnapshot = (): unknown[] => {
+      try {
+        const handle = context.getProp(context.global, "__fabricEmitted");
+        try { const value = context.dump(handle); return Array.isArray(value) ? value : []; }
+        finally { handle.dispose(); }
+      } catch { return []; }
+    };
     const logs: string[] = [];
     const maxLogChars = options.maxLogChars ?? 100_000;
     let logChars = 0;
@@ -1016,7 +1026,8 @@ export class QuickJsRuntime {
     const hostAbortController = new AbortController();
     shareCancellationEffects(hostAbortController.signal, options.signal);
     let executionResult: FabricSandboxResult | undefined;
-    const recordResult = (result: FabricSandboxResult): FabricSandboxResult => executionResult = result;
+    const recordResult = (result: FabricSandboxResult): FabricSandboxResult =>
+      executionResult = { ...result, emitted: result.emitted ?? emittedSnapshot() };
     const cancellationMessage = (message: string): string =>
       cancellationError(hostAbortController.signal, new Error(message)).message;
     const abortHostCalls = (reason: string | Error): void => {
@@ -1129,6 +1140,9 @@ export class QuickJsRuntime {
               const handle = jsonHandle(context, jsonObject, jsonParse, value);
               if (deadlineReached()) { handle.dispose(); expireDeadline(); return; }
               promise.resolve(handle);
+              // VM jobs can finish the outer native wrapper before host promise
+              // microtasks run. This delivered call is not unawaited work.
+              pendingHostPromises.delete(promise);
               handle.dispose();
               options.onHostResultDelivered?.(args);
             })
@@ -1183,11 +1197,14 @@ export class QuickJsRuntime {
                   }
                 }
                 promise.reject(errorHandle);
+                pendingHostPromises.delete(promise);
               } finally {
                 errorHandle.dispose();
               }
             })
             .finally(() => {
+              // Remove completed host work before pumping VM completion jobs.
+              hostTasks.delete(task);
               if (!closing) pumpJobs();
             });
           hostTasks.add(task);
@@ -1227,7 +1244,7 @@ export class QuickJsRuntime {
       }
 
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false), "pi-fabric-setup.js");
+      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false, options.nativeStoreEnabled), "pi-fabric-setup.js");
       if (setupResult.error) {
         const deadlineExceeded = interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
@@ -1260,7 +1277,7 @@ export class QuickJsRuntime {
         : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
       const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
       const guestLineCount = guestBundle.code.split("\n").length;
-      const invokeCode = "Promise.race([__piFabricMain(), globalThis.__fabricExecutionGate])";
+      const invokeCode = "Promise.race([globalThis.__fabricRun(__piFabricMain), globalThis.__fabricExecutionGate])";
       const wrappedCode = `${guestBundle.code}\n${invokeCode}`;
       if (options.setupTimeoutMs !== undefined) {
         // evalCode compiles AND evaluates: serialized source can escape the main
@@ -1335,10 +1352,14 @@ export class QuickJsRuntime {
             ? cancellationMessage(timeoutMessage())
             : remapGuestErrorText(formatValue(context.dump(resolution.error)), guestStackMap, guestLineCount);
         resolution.error.dispose();
+        const emittedHandle = context.getProp(context.global, "__fabricEmitted");
+        const emitted = context.dump(emittedHandle) as unknown[];
+        emittedHandle.dispose();
         abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
         return recordResult({
           value: undefined,
           logs,
+          emitted,
           terminationReason: options.signal?.aborted
             ? "aborted"
             : deadlineExceeded
@@ -1357,12 +1378,15 @@ export class QuickJsRuntime {
       }
       const value = context.dump(resolution.value);
       resolution.value.dispose();
+      const emittedHandle = context.getProp(context.global, "__fabricEmitted");
+      const emitted = context.dump(emittedHandle) as unknown[];
+      emittedHandle.dispose();
       if (deadlineReached()) {
         timedOut = true;
         abortHostCalls(executionDeadline.reason);
         return recordResult(executionDeadline.timeoutResult(logs));
       }
-      return recordResult({ value, logs, terminationReason: "completed" });
+      return recordResult({ value, logs, emitted, terminationReason: "completed" });
     } catch (error) {
       const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
       if (deadlineExceeded) timedOut = true;
@@ -1371,6 +1395,7 @@ export class QuickJsRuntime {
         ...(deadlineExceeded && !interruptedByCpu && !cancelled ? executionDeadline.timeoutResult(logs) : {}),
         value: undefined,
         logs,
+        emitted: emittedSnapshot(),
         terminationReason: cancelled ? "aborted" : deadlineExceeded ? "timed_out" : "runtime_error",
         error: cancelled
           ? cancellationMessage("Execution cancelled")
@@ -1384,6 +1409,7 @@ export class QuickJsRuntime {
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
       const unawaitedHostCalls = pendingHostPromises.size > 0;
       if (hostTasks.size > 0) {
+        abortHostCalls("Fabric guest execution ended before its host calls settled");
         const settled = await settleWithin(hostTasks, HOST_TASK_SETTLE_GRACE_MS);
         if (!settled) {
           abortHostCalls("Fabric guest execution ended before its host calls settled");

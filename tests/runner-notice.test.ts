@@ -11,6 +11,7 @@ const NONE: FabricRunnerCapabilities = {
 describe("unregistered runner notice", () => {
   it("stays quiet for built-in and registered runners", () => {
     expect(unregisteredRunnerNotice("pi", [])).toBeUndefined();
+    expect(unregisteredRunnerNotice("pi-durable", [])).toBeUndefined();
     expect(unregisteredRunnerNotice("veda", [])).toBeUndefined();
     expect(unregisteredRunnerNotice("acme-daemon", ["acme-daemon"])).toBeUndefined();
   });
@@ -19,7 +20,7 @@ describe("unregistered runner notice", () => {
     const notice = unregisteredRunnerNotice("claud", ["acme-daemon"]);
     expect(notice).toContain('agents.runner "claud" is not registered');
     expect(notice).toContain('Did you mean "claude"?');
-    expect(notice).toContain("Registered runners: pi, claude, veda, acme-daemon.");
+    expect(notice).toContain("Registered runners: pi, pi-durable, claude, veda, acme-daemon.");
     expect(unregisteredRunnerNotice("acme-deamon", ["acme-daemon"])).toContain('Did you mean "acme-daemon"?');
     expect(unregisteredRunnerNotice("something-else", [])).not.toContain("Did you mean");
   });

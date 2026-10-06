@@ -49,7 +49,7 @@ describe.skipIf(!hasWorker)("agent worker launch under a bundled pi binary", () 
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-bundled-"));
     roots.push(root);
-    const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 20_000, maxConcurrent: 1 };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 20_000, maxConcurrent: 1 };
     const manager = new AgentManager(process.cwd(), config, { workerPath, piBinary, runRoot: root });
     managers.push(manager);
 

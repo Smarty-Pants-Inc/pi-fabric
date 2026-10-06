@@ -192,13 +192,14 @@ describe("FabricSettingsComponent", () => {
       "Capture",
       "UI",
       "Compaction",
+      "Classifier-assisted extractive history (Jev supported)",
       "Retention",
       "Mesh",
       "Code previews",
     ]) {
       expect(labels).toContain(label);
     }
-    expect(items.length).toBe(13);
+    expect(items.length).toBe(14);
   });
 
   it("marks submenu rows with a drill-in marker and leaves inline toggles plain", () => {

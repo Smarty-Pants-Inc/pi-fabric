@@ -113,7 +113,7 @@ describe("standalone worker without Pi host peers", () => {
     const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
     fs.writeFileSync(path.join(bin, "tmux"), `#!/bin/sh\nexec ${quote(binary)} -L ${quote(socket)} -f /dev/null "$@"\n`, { mode: 0o755 });
     vi.stubEnv("PATH", bin + path.delimiter + process.env.PATH);
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 12000, sessionExport: false }, {
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 12000, sessionExport: false }, {
       workerPath: worker, piBinary, runRoot: path.join(root, "runs"), fullCodeMode: false,
     });
     managers.push(manager);
@@ -130,7 +130,7 @@ describe("standalone worker without Pi host peers", () => {
   it("propagates bootstrap failure through the real process transport", async () => {
     const { root, worker, piBinary } = installation();
     fs.rmSync(path.join(root, "dist/worker/options.js"));
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 12000, sessionExport: false }, {
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 12000, sessionExport: false }, {
       workerPath: worker, piBinary, runRoot: path.join(root, "runs"), fullCodeMode: false,
     });
     managers.push(manager);

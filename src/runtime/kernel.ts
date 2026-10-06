@@ -115,6 +115,8 @@ export interface FabricResidentOutcomeReceipt {
 export interface FabricSandboxResult {
   value: unknown;
   logs: string[];
+  /** Explicit image() output, including partial output on errors. */
+  emitted?: unknown[];
   terminationReason: FabricSandboxTerminationReason;
   error?: string;
   /** Host-side reconciliation data, independent of verbose guest error prose. */
@@ -131,6 +133,7 @@ export interface FabricSandboxOptions {
   maximumDeadlineAt?: number;
   /** Opaque host-issued cause, used only when this runtime is clamped to that ceiling. */
   maximumDeadlineReason?: Error;
+  nativeStoreEnabled?: boolean;
   memoryLimitBytes: number;
   /** Optional uninterrupted guest CPU limit. Await host work/timers to yield. */
   maxCpuSliceMs?: number;

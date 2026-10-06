@@ -336,7 +336,7 @@ const actorRequest = (
   const kernel = inheritModel ? manager.resolveKernel(kernelRequest) : requestedKernel;
   if (!inheritModel && kernel !== undefined && kernel !== "inherit") manager.resolveKernel(kernelRequest);
   const inheritedModel =
-    inheritModel && args.routeClass === undefined && runner === "pi" && !(typeof args.model === "string" && args.model.trim()) && context.extensionContext.model
+    inheritModel && args.routeClass === undefined && (runner === "pi" || runner === "pi-durable") && !(typeof args.model === "string" && args.model.trim()) && context.extensionContext.model
       ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}`
       : undefined;
   return {
@@ -550,7 +550,7 @@ export class AgentsProvider implements FabricProvider {
     const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     this.manager.assertModelAllowed(model || undefined, runner);
-    if (runner !== "pi") {
+    if (runner !== "pi" && runner !== "pi-durable") {
       if (this.manager.config.deniedModels.length === 0) return args;
       const prepared = await this.manager.prepareModelForAdmission(model || undefined, runner, selector => this.#resolvePiModel(selector, context));
       return { ...args, model: prepared };
@@ -620,7 +620,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     requiredPin = false,
   ): Promise<FabricActorRunBinding> {
-    if (runner !== "pi" || !binding.model) return binding;
+    if ((runner !== "pi" && runner !== "pi-durable") || !binding.model) return binding;
     if (requiredPin) {
       const exact = await resolvePiRoutePin({ selector: binding.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
       this.manager.assertModelAllowed(`${exact.provider}/${exact.id}`, "pi");
@@ -676,14 +676,15 @@ export class AgentsProvider implements FabricProvider {
         "agents.handoff must be scheduled from inside fabric_exec and completed at its outer result boundary",
       );
     }
+    const runner = this.manager.config.runner === "pi" ? "pi" : "pi-durable";
     const handoffArgs = await this.#resolvePiModelArgs(
-      { ...args, model },
+      { ...args, model, runner },
       context,
-      "pi",
+      runner,
       false,
     );
     delete handoffArgs.cwd;
-    const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager, this.modelsConfig());
+    const request = runRequest({ ...handoffArgs, runner }, context, this.manager, this.modelsConfig());
     const kernel = this.manager.resolveKernel(request);
     delete handoffArgs.kernel;
     if (kernel) handoffArgs.kernel = kernel;
@@ -700,6 +701,8 @@ export class AgentsProvider implements FabricProvider {
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
+    const runner = args.runner === "pi" || args.runner === "pi-durable"
+      ? args.runner : this.manager.config.runner === "pi" ? "pi" : "pi-durable";
     const request = runRequest(
       await this.#resolvePiModelArgs(
         {
@@ -709,7 +712,7 @@ export class AgentsProvider implements FabricProvider {
             typeof args.name === "string" && args.name.trim()
               ? args.name
               : "Trajectory handoff",
-          runner: "pi",
+          runner,
           model,
         },
         context,
@@ -721,7 +724,7 @@ export class AgentsProvider implements FabricProvider {
       this.modelsConfig(),
       { allowCwd: false },
     );
-    request.runner = "pi";
+    request.runner = runner;
     if (args.pythonRuntime !== undefined) {
       // Only host-created deferred handoffs carry this internal policy snapshot.
       request.pythonRuntime = this.manager.resolvePythonRuntime(args.pythonRuntime as AgentRunRequest["pythonRuntime"]);
@@ -1094,7 +1097,7 @@ export class AgentsProvider implements FabricProvider {
         try {
           const available = context.extensionContext.modelRegistry.getAvailable();
           return available.map((model) => ({
-            runner: "pi",
+            runner,
             provider: String(model.provider),
             id: String(model.id),
             name: String(model.name ?? model.id),
@@ -1939,7 +1942,8 @@ export class AgentsProvider implements FabricProvider {
   ): AgentRunRequest {
     const { seed, seedMessages } = checkedSeed(args.seed, args.seedMessages);
     if (seed === "task") return request;
-    if ((request.runner ?? this.manager.config.runner) !== "pi") {
+    const runner = request.runner ?? this.manager.config.runner;
+    if (runner !== "pi" && runner !== "pi-durable") {
       throw new Error(`seed: "${seed}" requires the Pi runner`);
     }
     const session = context.extensionContext.sessionManager;

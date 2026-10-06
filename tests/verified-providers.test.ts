@@ -260,6 +260,19 @@ describe("universal registry migration", () => {
     expect(provider.invoke).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { provider: "demo", risk: "write" },
+    { provider: "demo", risk: "read", effect: { kind: "emission" } },
+    { provider: "demo", risk: "network" },
+    { provider: "mcp", risk: "write" },
+    { provider: "mcp", risk: "network", annotations: { destructiveHint: true } },
+    { provider: "mcp", risk: "network", annotations: { readOnlyHint: false } },
+  ] as const)("rejects unsafe speculation even if an eligibility callback opts it in: %j", async ({ provider: name, ...overrides }) => {
+    const registry = create(); const { provider, descriptor } = fixture(name); Object.assign(descriptor, overrides); registry.register(provider); speculative(registry);
+    expect(await registry.speculate(`${name}.run`, {}, context, {})).toBeUndefined();
+    expect(provider.invoke).not.toHaveBeenCalled();
+  });
+
   it("does not wait for a hanging provider close before rejecting a canceled approval", async () => {
     const registry = create(); const { provider } = fixture(); const close = deferred(); const entered = deferred(); const approval = deferred();
     provider.close = () => close.promise; registry.register(provider);

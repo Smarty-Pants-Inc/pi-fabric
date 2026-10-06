@@ -47,8 +47,8 @@ if (rangeMode) {
       .split("\n")
       .filter(Boolean);
   } catch {
-    console.error(`cannot resolve base ${base}; nothing to select`);
-    process.exit(0);
+    console.error(`cannot resolve base ${base}; refusing an unverifiable test selection`);
+    process.exit(1);
   }
 } else {
   // No flag at all: the local dirty-tree mode.

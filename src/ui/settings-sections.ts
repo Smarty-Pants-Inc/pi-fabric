@@ -19,6 +19,7 @@ import {
 } from "./settings-sections-presentation.js";
 import {
   buildCompactionSection,
+  buildExtractiveSection,
   buildRetentionSection,
   buildMeshSection,
 } from "./settings-sections-lifecycle.js";
@@ -40,6 +41,8 @@ export const buildFabricSettingsItems = (
     keepVisibleCandidates: readonly string[];
     modelSource: ModelSource;
     claudeModelSource?: ModelSource;
+    classifierModels?: readonly string[];
+    availableClassifierModels?: readonly string[];
     activeModelKey?: string;
     cachedMcpServers?: readonly string[];
   },
@@ -58,6 +61,7 @@ export const buildFabricSettingsItems = (
     buildCaptureSection(context),
     buildUiSection(context),
     buildCompactionSection(context),
+    buildExtractiveSection(context),
     buildRetentionSection(context),
     buildMeshSection(context),
     buildCodePreviewSection(context),

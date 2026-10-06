@@ -32,9 +32,9 @@ export const normalizeAgentRunRequest = (
   const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
   // The caller's admitted Pi binding wins over package/workspace defaults, also in
   // actor/task processes whose Main target is remote. Never infer from that target.
-  const inheritedModel = runner === "pi" && !explicitModel && defaults.inheritedModel
+  const inheritedModel = (runner === "pi" || runner === "pi-durable") && !explicitModel && defaults.inheritedModel
     ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}` : undefined;
-  const requestedModel = explicitModel ?? inheritedModel ?? (runner === "pi" ? defaults.model : undefined);
+  const requestedModel = explicitModel ?? inheritedModel ?? ((runner === "pi" || runner === "pi-durable") ? defaults.model : undefined);
   const thinking = isFabricThinking(args.thinking) ? args.thinking
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");

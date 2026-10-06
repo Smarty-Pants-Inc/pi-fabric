@@ -1,13 +1,16 @@
 import type { SettingItem } from "@earendil-works/pi-tui";
+import { DEFAULT_EXTRACTIVE_CONFIG } from "../config.js";
 import type { SettingsSectionContext } from "./settings-section-context.js";
 import {
   setting,
   sectionSubmenu,
   compactionThresholdSubmenu,
   numericSubmenu,
+  stringOptionsSubmenu,
 } from "./settings-submenus.js";
 import {
   summaryFor,
+  EXTRACTIVE_OFF, EXTRACTIVE_LOCAL, EXTRACTIVE_CONSENT,
   COMPACTION_THRESHOLD_SETTING_ID,
   formatCompactionThreshold,
   COMPACTION_ENGINES,
@@ -58,6 +61,35 @@ export const buildCompactionSection = (
       ],
       persist,
     ),
+  });
+};
+
+export const buildExtractiveSection = (
+  { config, theme, persist, options }: Pick<SettingsSectionContext<"classifierModels" | "availableClassifierModels">, "config" | "theme" | "persist" | "options">,
+): SettingItem => {
+  const extractive = config.memory.extractive ?? DEFAULT_EXTRACTIVE_CONFIG;
+  const mode = !extractive.enabled ? EXTRACTIVE_OFF : extractive.maxEvaluationsPerTurn === 0 ? EXTRACTIVE_LOCAL : EXTRACTIVE_CONSENT;
+  const disclosure = "Opt-in: sends bounded current-session active-branch user/assistant text to the selected native classifier (API charges). No thinking/tool output. No secret scanning. Scores are salience, not truth. Raw history and compaction are unchanged.";
+  return setting("memory", "Classifier-assisted extractive history (Jev supported)", summaryFor("memory", config), {
+    description: disclosure,
+    submenu: sectionSubmenu(theme, "Extractive history", disclosure, [
+      setting("memory.extractive.mode", "Consent / mode", mode, {
+        description: disclosure,
+        submenu: stringOptionsSubmenu(theme, [EXTRACTIVE_OFF, EXTRACTIVE_LOCAL, EXTRACTIVE_CONSENT], "Explicit classifier opt-in", disclosure),
+      }),
+      setting("memory.extractive.classifier", "Native classifier", `${extractive.provider}/${extractive.model}`, {
+        description: `Native registry classifiers only. Available now: ${options.availableClassifierModels?.join(", ") || "none (deterministic fallback; configure credentials)"}.`,
+        submenu: stringOptionsSubmenu(theme, options.classifierModels ?? [], "Select native classifier", "Any registered classifier; unavailable credentials produce deterministic fallback. Selection does not enable inference."),
+      }),
+      ...([
+        ["maxViewBytes", "View bytes", [1024, 4096, 8192, 16384, 32768]],
+        ["maxCandidates", "Candidate bundles", [16, 32, 64, 128, 256]],
+        ["maxSourceChars", "Source character budget", [4000, 12000, 24000, 48000]],
+        ["timeoutMs", "Classifier timeout ms", [1000, 2000, 3000, 5000, 10000]],
+      ] as const).map(([key, label, values]) => setting(`memory.extractive.${key}`, label, String(extractive[key]), {
+        submenu: numericSubmenu(theme, values, String, label, "Whole bundles or omission with source addresses; never clipped evidence."),
+      })),
+    ], persist),
   });
 };
 

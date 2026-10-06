@@ -132,7 +132,7 @@ describe("participant scrollbar integration", () => {
       f.frame();
       expect(f.state.view("child").scroll).toBe(position);
       const barRows = scrolled.map((line, row) => ({ line, row })).filter(({ line }) => /[┃│]$/.test(line));
-      expect(barRows[0]!.row).toBe(1);
+      expect(barRows[0]!.row).toBe(0);
       expect(scrolled.slice(barRows.at(-1)!.row + 1).every((line) => !/[┃│]$/.test(line))).toBe(true);
       f.view.handleMouse({ ...mouse("wheel", 0, 2), wheelDelta: -3 });
       f.frame();

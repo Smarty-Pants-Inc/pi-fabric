@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
@@ -187,7 +188,7 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       expect(recovered.actor).toMatchObject({ id: before.actors[0].id, name: "untouched-rollback" });
       await stop(legacy, () => output);
       const after = JSON.parse(fs.readFileSync(registryPath, "utf8"));
-      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages, messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
       expect(after.actors.map(settings)).toEqual(before.actors.map(settings));
     } finally {
       if (current.exitCode === null && current.signalCode === null) { current.kill("SIGKILL"); await once(current, "exit"); }
@@ -216,6 +217,7 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       const registryPath = path.join(config.actorRoot, "actors.json");
       const beforeRegistry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
       const actor = beforeRegistry.actors[0];
+      const archivedMessages = new ActorRegistryStore(config.actorRoot).messages(actor);
       const actorDir = path.join(config.actorRoot, actor.id);
       const queues = () => !fs.existsSync(actorDir) ? [] : fs.readdirSync(actorDir).filter(file => file.startsWith("queue-")).flatMap(file =>
         JSON.parse(fs.readFileSync(path.join(actorDir, file), "utf8")).items);
@@ -242,8 +244,12 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       // Recovery legitimately updates running status, timestamps and run history,
       // but must not rewrite identity or any of the actor's persistent settings.
       const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId,
-        messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+        messages: _messages, messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
       expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
+      // The old owner materializes history instead of retaining the new journal
+      // pointer. Assert actual history survives, not its optional wire representation.
+      const restoredMessages = new ActorRegistryStore(config.actorRoot).messages(registry.actors[0]);
+      expect.soft(restoredMessages.slice(0, archivedMessages.length)).toEqual(archivedMessages);
       expect.soft(registry.actors[0]?.removal).toBeUndefined();
       const afterItems = queues();
       // B70 retries recovered deliveries and predates bindingVersion. Preserve

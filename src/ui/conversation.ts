@@ -338,6 +338,7 @@ export class FabricConversationView implements Component, Focusable {
     // including one rebuilt for a new epoch or a queue-row swap — inherits the
     // indicator that is live right now.
     editor.setWorkingStatusIndicator(this.working);
+    editor.topBorderBadge = (width) => this.targetBadge(width);
     editor.focused = this.focusState && this.mode === "conversation";
     if (!withHistory) return editor;
     editor.setAutocompleteProvider(conversationCommandCompletion(() =>
@@ -560,7 +561,7 @@ export class FabricConversationView implements Component, Focusable {
       : [];
     remaining -= footer.length;
     const head: string[] = [];
-    if (remaining > 0) {
+    if (remaining > 0 && this.mode === "picker") {
       head.push(this.breadcrumbLine(width));
       remaining--;
     }
@@ -1392,6 +1393,22 @@ export class FabricConversationView implements Component, Focusable {
     // peek() only: listing targets must never create or evict drafts.
     const seen = this.state.peek(target.id)?.lastSeenUpdatedAt ?? 0;
     return target.updatedAt > seen;
+  }
+
+  private targetBadge(width: number): string {
+    const target = this.currentTarget();
+    const labelWidth = Math.max(0, width - 2);
+    const access = target?.readOnlyReason ? " · read-only" : "";
+    const name = target ? (isMainTarget(target) ? "Main" : safeText(target.name) || safeText(target.id)) : "Fabric";
+    // Drop ancestors before truncating the active target. Keep the access label
+    // when it fits alongside at least one cell of the target name.
+    const suffix = visibleWidth(access) + 1 <= labelWidth ? access : "";
+    const chain = this.breadcrumbLine(Number.MAX_SAFE_INTEGER);
+    const label = visibleWidth(chain) + visibleWidth(access) <= labelWidth
+      ? chain + this.theme.fg("warning", access)
+      : this.theme.fg("accent", truncateToWidth(name, Math.max(0, labelWidth - visibleWidth(suffix)), "…")) +
+        this.theme.fg("warning", suffix);
+    return this.theme.bg("selectedBg", ` ${label} `);
   }
 
   private breadcrumbLine(width: number): string {

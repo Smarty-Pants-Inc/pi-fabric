@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { socketFixtureDirectory, closeSocketFixtureDirectories } from "./helpers/socket-fixture-directory.js";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -166,7 +167,7 @@ setTimeout(() => process.exit(0), 700);`);
     // is the worker contract used by session transports (tmux/screen/etc.).
     let session: AgentTransportHandle | undefined;
     let sentinel: AgentTransportHandle | undefined;
-    const socket = path.join(root, "t.sock");
+    const socket = path.join(socketFixtureDirectory(root), "t.sock");
     const execute = processUtils.executeFile;
     const isolatedExecute = (command: string, args: string[], options?: Parameters<typeof execute>[2]) =>
       execute(command, command === "tmux" ? ["-f", "/dev/null", "-S", socket, ...args] : args, options);
@@ -233,7 +234,7 @@ setTimeout(() => process.exit(0), 700);`);
             }
           }
         });
-      } finally { query?.mockRestore(); }
+      } finally { query?.mockRestore(); closeSocketFixtureDirectories(); }
     }
   }, 30000);
 });

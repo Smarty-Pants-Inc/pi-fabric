@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { hostGlobalsGuidance } from "../src/core/system-guidance.js";
+import ts from "typescript";
 import { normalizeFabricConfig } from "../src/config.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import type { FabricState } from "../src/fabric-state.js";
@@ -17,13 +18,20 @@ describe("prewalk prompt isolation", () => {
       path.join(process.cwd(), "src", "fabric-exec-tool.ts"),
       "utf8",
     );
-    const start = extensionSource.indexOf('pi.on("before_agent_start"');
-    const end = extensionSource.indexOf("registerFabricCommand", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-
-    const handler = extensionSource.slice(start, end);
-    expect(handler.toLowerCase()).not.toContain("prewalk");
+    const source = ts.createSourceFile("extension.ts", extensionSource, ts.ScriptTarget.Latest, true);
+    const handlers: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === "pi.on" &&
+          node.arguments[0] && ts.isStringLiteral(node.arguments[0]) &&
+          node.arguments[0].text === "before_agent_start") {
+        expect(node.arguments[1]).toBeDefined();
+        handlers.push(node.arguments[1]!.getText(source));
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(handlers.length).toBeGreaterThan(0);
+    for (const handler of handlers) expect(handler.toLowerCase()).not.toContain("prewalk");
 
     const guidelinesStart = toolSource.indexOf("promptGuidelines: [");
     const guidelinesEnd = toolSource.indexOf("parameters:", guidelinesStart);

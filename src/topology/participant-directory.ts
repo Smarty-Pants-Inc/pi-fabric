@@ -376,7 +376,7 @@ const legacyActorFromEntry = (
     transport: "host",
     capabilities: [
       ...(active ? (["steer", "followUp"] as const) : []),
-      ...(value.runner === "pi" ? (["fabric"] as const) : []),
+      ...(value.runner === "pi" || value.runner === "pi-durable" ? (["fabric"] as const) : []),
     ],
     startedAt: typeof value.createdAt === "number" ? value.createdAt : entry.updatedAt,
     updatedAt: entry.updatedAt,

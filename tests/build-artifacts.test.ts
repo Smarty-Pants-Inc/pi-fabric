@@ -88,6 +88,16 @@ describe("published build artifact guards", () => {
     fs.rmSync(path.join(dir, "dist/ui/image-overlays.js"));
     rejected(dir, "ui/image-overlays.js");
   });
+  it.each(["native-discovery.js", "memory/extractive-history.js"])("requires stable optional entry %s", (entry) => {
+    const dir = fixture();
+    fs.rmSync(path.join(dir, "dist", entry));
+    rejected(dir, entry);
+  });
+  it("rejects an eager extractive engine implementation", () => {
+    const dir = fixture();
+    fs.appendFileSync(path.join(dir, "dist/extension-bootstrap.js"), "\n// src/memory/extractive-index.ts\n");
+    rejected(dir, "Startup static graph contains lazy module marker: src/memory/extractive-index.ts");
+  });
   it("rejects a missing generated ABI declaration", () => {
     const dir = fixture();
     fs.rmSync(path.join(dir, "dist/verified/generated/storage-kernel.d.ts"));

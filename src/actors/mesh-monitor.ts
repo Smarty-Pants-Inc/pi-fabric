@@ -92,7 +92,7 @@ export class ActorMeshMonitor {
     }
     try {
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
-        if (filename !== null && path.basename(filename.toString()) !== "events.jsonl") return;
+        if (filename !== null && !["events.jsonl", "schedules.json"].includes(path.basename(filename.toString()))) return;
         this.#scheduleBackground();
       });
       this.#watcher = watcher;

@@ -273,6 +273,9 @@ export const createFabricExecTool = (
             "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs and, in a Main, executor.mainMaxTimeoutMs",
         }),
       ),
+      timeout_ms: Type.Optional(Type.Integer({ minimum: 1, description: "Hard whole-script deadline in milliseconds; cannot be extended or paused, capped by executor.maxTimeoutMs." })),
+      maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Per-call output token budget (estimated at four characters per token), capped by executor.maxOutputChars." })),
+      max_output_tokens: Type.Optional(Type.Integer({ minimum: 1, description: "Alias of maxOutputTokens." })),
       display: Type.Optional(
         Type.Union([
           Type.Object(
@@ -295,7 +298,7 @@ export const createFabricExecTool = (
           }),
         ]),
       ),
-    }),
+    }, { additionalProperties: false }),
     // Pi validates custom-tool arguments before `tool_call` and `execute`, so
     // compatibility coercions for the model-facing boundary must live in the
     // official prepareArguments hook rather than execute-time fallbacks.
@@ -906,6 +909,7 @@ export const createFabricExecTool = (
         ...(tokenBudget !== undefined ? { tokenBudget } : {}),
         ...(params.agentBudget !== undefined ? { maxAgentCalls: params.agentBudget } : {}),
         ...(params.timeoutMs !== undefined ? { requestedTimeoutMs: params.timeoutMs } : {}),
+        ...(params.timeout_ms !== undefined ? { hardTimeoutMs: params.timeout_ms } : {}),
         ...(runDisplay
           ? {
               display: {
@@ -979,7 +983,7 @@ export const createFabricExecTool = (
       if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const fullRawOutput = fullSections.join("\n\n");
       const outputBudget = modelOutputBudget(
-        state.config.executor.maxOutputChars,
+        Math.min(state.config.executor.maxOutputChars, (params.maxOutputTokens ?? params.max_output_tokens ?? Infinity) * 4),
         result.success,
       );
       const outputWillTruncate = fullRawOutput.length > outputBudget;

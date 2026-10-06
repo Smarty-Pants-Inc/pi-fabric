@@ -485,7 +485,7 @@ describe("worker child environment contract", () => {
       fabricSessionId: "root-session",
     });
     managers.push(manager);
-    const result = await manager.run({ task: "report", transport: "process", extensions: false, writableRoots: ["."] });
+    const result = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, writableRoots: ["."] });
     expect(result.status).toBe("completed");
     const report = JSON.parse(result.text) as { lineage: string; writePolicy: string; args: string[] };
     expect(readAgentLineage(report.lineage)).toMatchObject({ rootSessionId: "root-session", runId: result.id, depth: 1 });
@@ -553,12 +553,12 @@ describe("agents provider seeds and confinement", () => {
     update() {},
   });
 
-  it("prefixes snippets and forks branches without blocking the caller", async () => {
+  it.each(["pi", "pi-durable"])("prefixes snippets and forks branches with %s without blocking the caller", async (runner) => {
     const { provider, requests } = createProvider();
-    await provider.invoke("spawn", { task: "Do X", seed: "snippet", seedMessages: 1 }, context(callerBranch()));
+    await provider.invoke("spawn", { task: "Do X", runner, seed: "snippet", seedMessages: 1 }, context(callerBranch()));
     expect(requests[0]!.task).toBe('<inherited-conversation messages="1">\n[user]\nfork this work\n</inherited-conversation>\n\nTask:\nDo X');
     expect(requests[0]!.forkSeed).toBeUndefined();
-    const handle = await provider.invoke("spawn", { task: "Do Y", seed: "branch" }, context(callerBranch()));
+    const handle = await provider.invoke("spawn", { task: "Do Y", runner, seed: "branch" }, context(callerBranch()));
     expect(handle).toMatchObject({ id: "child" });
     expect(requests[1]!.task).toBe("Do Y");
     expect(requests[1]!.forkSeed).toMatchObject({ sourceSessionId: "caller-session" });

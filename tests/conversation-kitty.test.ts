@@ -67,7 +67,7 @@ describe("native tool images inside ctrl+shift+a", () => {
         tui.renderNow();
         const clipped = view.render(terminal.columns);
         const imageRow = clipped.findIndex((line) => line.includes("\x1b_G"));
-        expect(imageRow).toBe(1); // immediately below the breadcrumb
+        expect(imageRow).toBe(0); // no standalone breadcrumb above the transcript
         expect(header(clipped[imageRow]!)).toMatchObject({ i: String(id), r: String(rows - 2), y: "0", h: "1" });
         expect(clipped.slice(imageRow + 1, imageRow + rows - 2)).toEqual(Array(rows - 3).fill(""));
         expect(terminal.placements).toEqual(new Set([id]));
@@ -127,7 +127,7 @@ describe("native tool images inside ctrl+shift+a", () => {
         const resized = view.render(terminal.columns);
         expect(resized).toHaveLength(12);
         const resizedAnchor = resized.findIndex((line) => line.includes("\x1b_G"));
-        expect(resizedAnchor).toBeGreaterThanOrEqual(1);
+        expect(resizedAnchor).toBeGreaterThanOrEqual(0);
         expect(resizedAnchor + Number(header(resized[resizedAnchor]!).r)).toBeLessThan(terminal.rows);
         view.selectTarget("other");
         tui.renderNow();

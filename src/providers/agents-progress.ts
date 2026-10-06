@@ -53,7 +53,7 @@ export const collectAgentToolPreviewNodes = (
       id: record.id,
       name: record.actorName ?? record.name,
       status: record.status,
-      ...(record.runner === "pi" || record.runner === "claude" || record.runner === "veda"
+      ...(record.runner === "pi" || record.runner === "pi-durable" || record.runner === "claude" || record.runner === "veda"
         ? { runner: record.runner }
         : {}),
       owner: record.actorId ? "actor" : "agent",

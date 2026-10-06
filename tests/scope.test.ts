@@ -456,7 +456,7 @@ describe("agent scope narrowing", () => {
       const parent = root();
       scoped(parent);
       const result = await manager.run({
-        task: "report", transport: "process", extensions: false,
+        task: "report", runner: "pi", transport: "process", extensions: false,
         scope: { grants: [{ resource: "mesh:jobs/build", actions: ["read"] }] },
       });
       expect(result.status).toBe("completed");

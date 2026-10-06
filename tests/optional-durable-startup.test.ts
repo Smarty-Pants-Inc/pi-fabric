@@ -5,7 +5,7 @@ import path from "node:path";
 import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
 
-describe("optional durable Pi startup", () => {
+describe("lazy durable Pi startup", () => {
   it("imports ordinary Fabric and the adapter entry without resolving optional engines", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "fabric-durable-import-"));
     try {
@@ -44,11 +44,21 @@ describe("optional durable Pi startup", () => {
         const before = runners.listAgentRunners().map(runner => runner.id);
         const adapter = await load("durable");
         assert.equal(typeof adapter.createPiDurableRunner, "function");
+        const runner = adapter.createPiDurableRunner({
+          models: {}, registry: {}, env: () => undefined,
+          allowedModels: [{provider: "test", modelId: "offline"}],
+          defaultModel: {provider: "test", modelId: "offline"},
+          storage: {kind: "jsonl", directory: path.join(directory, "unused")},
+        });
+        assert.equal(runner.defaultModel(), "test/offline");
+        assert.equal(runner.capabilities.steer, true);
+        assert.equal(runner.capabilities.imageInput, true);
+        await runner.close();
         assert.deepEqual(runners.listAgentRunners().map(runner => runner.id), before);
-        assert.deepEqual(before, ["pi", "claude", "veda"]);
-        console.log("durable backend remains opt-in without optional dependencies");
+        assert.deepEqual(before, ["pi", "pi-durable", "claude", "veda"]);
+        console.log("durable engines stay lazy even with the built-in runner registered");
       `], { encoding: "utf8", timeout: 30_000 });
-      expect(output).toContain("durable backend remains opt-in without optional dependencies");
+      expect(output).toContain("durable engines stay lazy even with the built-in runner registered");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

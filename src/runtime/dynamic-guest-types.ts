@@ -296,6 +296,10 @@ const renderExtensionsDeclaration = (
 // Renders replacement `declare const mcp` / `declare const extensions` blocks
 // for guestTypeDeclarations(). Missing or empty sections return undefined so
 // the loose static lines survive, matching cold-cache behavior.
+/** Bounded advisory declaration for native describeTool compatibility. */
+export const describeFabricActionDeclaration = (name: string, inputSchema: Record<string, unknown>): string =>
+  `${JSON.stringify(name)}: (args: ${schemaType(inputSchema, 0)}) => Promise<unknown>`;
+
 export const buildDynamicGuestDeclarations = (
   sources: FabricGuestTypeSources,
 ): FabricDynamicGuestDeclarations => {

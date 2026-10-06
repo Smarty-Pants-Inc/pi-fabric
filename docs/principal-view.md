@@ -42,7 +42,7 @@ The newest installed runtime on the lane is `623f57905b902feafdaeb6b5aeed9812faf
 
 ## Smallest proposed change to Smarty-Pants-Inc/pi (not applied here)
 
-Add a **per-UI display-only setter**, analogous to `setEditorComponent`, rather than teaching Fabric to patch transcript internals:
+Add a **per-UI display-only setter**, analogous to `setEditorComponent`. Fabric should not patch transcript internals:
 
 ```ts host
 ctx.ui.setUserMessageRenderer(

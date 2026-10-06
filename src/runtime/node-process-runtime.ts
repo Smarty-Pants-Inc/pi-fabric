@@ -33,7 +33,7 @@ interface ChildResponseAckMessage {
   responseId: number;
 }
 
-type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage;
+type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage | { type: "output"; text?: string; image?: unknown };
 
 const HOST_TASK_SETTLE_GRACE_MS = 250;
 
@@ -100,7 +100,7 @@ export class NodeProcessRuntime {
       : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
     const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
     const guestLineCount = guestBundle.code.split("\n").length;
-    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false);
+    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false, options.nativeStoreEnabled);
     const child = spawn(
       interpreterPath,
       this.#interpreter === "bun"
@@ -125,6 +125,9 @@ export class NodeProcessRuntime {
     const hostTasks = new Set<Promise<void>>();
     let nextResponseId = 0;
     const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
+    const partialLogs: string[] = [];
+    const partialImages: unknown[] = [];
+    let partialChars = 0;
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const finish = (result: FabricSandboxResult, unawaitedHostCalls = false): void => {
@@ -144,7 +147,7 @@ export class NodeProcessRuntime {
         child.removeAllListeners();
         if (child.connected) child.disconnect();
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        resolve(result);
+        resolve(result.terminationReason === "completed" ? result : { ...result, logs: result.logs.length ? result.logs : partialLogs, emitted: result.emitted?.length ? result.emitted : partialImages });
       };
       const expireDeadline = (): void => {
         if (settled) return;
@@ -211,6 +214,15 @@ export class NodeProcessRuntime {
           if (!receipt || receipt.id !== message.id) return;
           pendingReceipts.delete(message.responseId);
           receipt.commit();
+          return;
+        }
+        if (message.type === "output") {
+          const chars = typeof message.text === "string" ? message.text.length : JSON.stringify(message.image ?? null).length;
+          partialChars += chars;
+          if (partialChars <= 16_777_216) {
+            if (typeof message.text === "string") partialLogs.push(message.text);
+            else if (message.image !== undefined) partialImages.push(message.image);
+          }
           return;
         }
         if (message.type === "result") {

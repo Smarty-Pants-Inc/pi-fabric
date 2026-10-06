@@ -1035,6 +1035,9 @@ export class MeshStore {
         this.#recoverArchive(archive, false, prepared);
         if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
       }
+      // Schedules due before this admission must precede the ordinary event.
+      // Recovery remains the fleet prepared off-lock/validated-under-lock path.
+      try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
@@ -1054,6 +1057,7 @@ export class MeshStore {
         ...(input.to ? { to: input.to } : {}),
         ...(input.text !== undefined ? { text: input.text } : {}),
         ...(eventData !== undefined ? { data: eventData } : {}),
+        ...(input.sender ? { sender: jsonClone(input.sender) } : {}),
         createdAt,
       };
       const line = JSON.stringify(event);

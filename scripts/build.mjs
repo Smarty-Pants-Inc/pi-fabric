@@ -25,6 +25,9 @@ const primaryEntryPoints = [
   // Public `pi-fabric/scope`; also the extension's first-use scope parser.
   "src/scope.ts",
   "src/protocol.ts",
+  "src/worker.ts",
+  // Full Pi-compatible durable process host; never in extension registration.
+  "src/durable/worker.ts",
   "src/residency/host.ts",
   "src/residency/launcher.ts",
   "src/residency/pi-entry.ts",
@@ -62,6 +65,9 @@ const lazyEntryPoints = [
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
+  "src/durable/worker-host.ts",
+  "src/native-discovery.ts",
+  "src/memory/extractive-history.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/thinking-control.ts",
@@ -122,6 +128,8 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/agents/write-guard.ts",
+  "src/worker/stall-session.ts",
   "src/worker/options.ts",
   "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",

@@ -2,6 +2,8 @@ import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecu
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
 import type { HumanWaitDeadlinePause } from "./runtime/deadline-pause.js";
+import { NativeCodemodeProvider } from "./native-codemode.js";
+import { nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -201,6 +203,8 @@ export interface FabricExecutionOptions {
    * Raises (never lowers) the configured executor.timeoutMs, subject to
    * executor.maxTimeoutMs and, in interactive Main, executor.mainMaxTimeoutMs. */
   requestedTimeoutMs?: number;
+  /** Hard whole-script deadline; unlike timeoutMs this cannot be raised or paused. */
+  hardTimeoutMs?: number;
   signal: AbortSignal | undefined;
   parentToolCallId: string;
   context: ExtensionContext;
@@ -212,6 +216,8 @@ export interface FabricExecutionOptions {
   onPartial(snapshot: FabricExecutionPartial): void;
 }
 
+const nativeProviders = new WeakMap<ActionRegistry, NativeCodemodeProvider>();
+
 export class FabricExecutionService {
   #runtime: FabricKernelRuntime | undefined;
   #runtimeKind: string | undefined;
@@ -219,6 +225,7 @@ export class FabricExecutionService {
   #emitEvent: ((channel: string, data: unknown) => void) | undefined;
   #headlessApproval: FabricHeadlessApproval | undefined;
   #participants: ProviderParticipantRegistry | undefined;
+  readonly nativeCodemode: NativeCodemodeProvider;
   readonly #nestedRunners = new Map<string, FabricNestedProgramRunner>();
   constructor(
     readonly registry: ActionRegistry,
@@ -229,7 +236,16 @@ export class FabricExecutionService {
     readonly sessionApprovals = new FabricSessionApprovals(),
     readonly capturedTools?: CapturedToolCatalog,
     readonly brokeredNetwork?: (provider: string) => boolean,
-  ) {}
+  ) {
+    const mounted = nativeProviders.get(registry);
+    if (mounted) this.nativeCodemode = mounted;
+    else {
+      if (this.registry.has("native")) throw new Error("Fabric provider name native is reserved for Pi codemode compatibility");
+      this.nativeCodemode = new NativeCodemodeProvider();
+      this.registry.register(this.nativeCodemode);
+      nativeProviders.set(registry, this.nativeCodemode);
+    }
+  }
 
   setCapabilityView(view: FabricCommittedCapabilityView | undefined): void {
     this.#capabilityView = view;
@@ -573,12 +589,12 @@ export class FabricExecutionService {
       ? this.config.executor.mainMaxTimeoutMs
       : undefined;
     const capForMain = (ms: number): number => Math.min(ms, mainMaxTimeoutMs ?? Infinity);
-    const effectiveTimeoutMs = capForMain(Math.max(
+    const effectiveTimeoutMs = Math.min(options.hardTimeoutMs ?? Infinity, capForMain(Math.max(
       codeUsesOrchestration(code)
         ? orchestrationTimeoutMs
         : this.config.executor.timeoutMs,
       Math.min(requestedTimeoutMs, this.config.executor.maxTimeoutMs),
-    ));
+    )));
     const timeoutFloorForHostCall = (
       ref: string,
       args: Record<string, unknown>,
@@ -720,12 +736,15 @@ export class FabricExecutionService {
           await approval.approve(action, preparedArgs, effectiveSignal);
         },
         audits,
-        maxResultChars: this.config.executor.maxNestedResultChars,
+        // Native images/state must stay intact; final output has its own bounds.
+        maxResultChars: ref.startsWith("native.") ? 16_777_216 : this.config.executor.maxNestedResultChars,
         traceOperation,
         observeInvocation,
         ...(observeResult ? { observeResult } : {}),
       });
     };
+    const nativeTransaction = this.nativeCodemode.begin(options.parentToolCallId, options.context);
+    let nativeFinished = false;
     let sandboxResult: FabricSandboxResult;
     let invocationOutcome: FabricInvocationOutcome = "failed";
     // Host-call floors are measured from each call and can slide a runtime's deadline.
@@ -734,13 +753,17 @@ export class FabricExecutionService {
     const mainCeiling = mainMaxTimeoutMs === undefined ? undefined : new AbortController();
     const mainBudget = mainMaxTimeoutMs === undefined ? undefined : new ExecutionDeadline({ timeoutMs: mainMaxTimeoutMs });
     const mainDeadlineAt = mainBudget?.at;
+    const hardDeadlineAt = options.hardTimeoutMs === undefined ? undefined : Date.now() + effectiveTimeoutMs;
+    const runtimeMaximumAt = mainDeadlineAt === undefined ? hardDeadlineAt
+      : hardDeadlineAt === undefined ? mainDeadlineAt : Math.min(mainDeadlineAt, hardDeadlineAt);
     const mainCeilingReason = mainMaxTimeoutMs === undefined ? undefined : createMainExecutionCeilingError(mainMaxTimeoutMs);
     const mainCeilingError = mainCeilingReason?.message ?? "";
     // Share the actual clamp record with the runtime: a lossy runtime-first
     // abort must not erase the host cause, including after a host-call floor.
     const runtimeDeadline = new ExecutionDeadline({
       timeoutMs: effectiveTimeoutMs,
-      ...(mainBudget ? { maximumDeadlineAt: mainBudget.at, maximumDeadlineReason: mainCeilingReason! } : {}),
+      ...(runtimeMaximumAt !== undefined ? { maximumDeadlineAt: runtimeMaximumAt,
+        ...(runtimeMaximumAt === mainDeadlineAt ? { maximumDeadlineReason: mainCeilingReason! } : {}) } : {}),
     }, mainBudget?.startedAt);
     mainBudget?.scheduleDeadline(() => mainCeiling!.abort(mainCeilingReason), true);
     // Pi may reuse its outer signal for multiple fabric_exec calls. Forward
@@ -820,13 +843,14 @@ export class FabricExecutionService {
     let hostCall: FabricHostCall | undefined;
     const sandboxBase = {
       cwd: options.context.cwd,
+      nativeStoreEnabled: this.nativeCodemode.persistenceAvailable,
       memoryLimitBytes: this.config.executor.memoryLimitBytes,
       maxLogChars: this.config.executor.maxOutputChars,
-      minimumTimeoutMsForHostCall,
+      ...(options.hardTimeoutMs === undefined ? { minimumTimeoutMsForHostCall } : {}),
       registerHumanWaitPause(pause: HumanWaitDeadlinePause) { rootHumanWaitPause = pause; },
       workflowSpentTokens: 0,
-      ...(humanWaitRefs.size > 0 ? { isHumanWaitHostCall } : {}),
-      ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
+      ...(options.hardTimeoutMs === undefined && humanWaitRefs.size > 0 ? { isHumanWaitHostCall } : {}),
+      ...(runtimeMaximumAt !== undefined ? { maximumDeadlineAt: runtimeMaximumAt, ...(runtimeMaximumAt === mainDeadlineAt ? { maximumDeadlineReason: mainCeilingReason! } : {}) } : {}),
       onHostResultDelivered(args: Record<string, unknown>) {
         const consumption = pendingConsumption.get(args);
         pendingConsumption.delete(args);
@@ -897,7 +921,7 @@ export class FabricExecutionService {
         let nestedPause: HumanWaitDeadlinePause | undefined;
         const nestedBridge: FabricHostCall = async (ref, args, callSignal) => {
           humanWaitPauses.set(callSignal, [...enclosingPauses, ...(nestedPause ? [nestedPause] : [])]);
-          const humanWait = isHumanWaitHostCall(ref, args);
+          const humanWait = options.hardTimeoutMs === undefined && isHumanWaitHostCall(ref, args);
           if (humanWait) for (const pause of enclosingPauses) pause.enter();
           try {
             return await ((ref === "fabric.$spanStart" || ref === "fabric.$spanEnd") && typeof args.id === "string"
@@ -910,7 +934,7 @@ export class FabricExecutionService {
         const nestedTimeoutMs = capForMain(codeUsesOrchestration(source) ? orchestrationTimeoutMs : this.config.executor.timeoutMs);
         const nestedDeadline = new ExecutionDeadline({
           timeoutMs: nestedTimeoutMs,
-          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
+          ...(runtimeMaximumAt !== undefined ? { maximumDeadlineAt: runtimeMaximumAt, ...(runtimeMaximumAt === mainDeadlineAt ? { maximumDeadlineReason: mainCeilingReason! } : {}) } : {}),
         });
         let result: FabricSandboxResult;
         try {
@@ -993,6 +1017,30 @@ export class FabricExecutionService {
                 }
               });
             }
+            case "fabric.$allTools":
+            case "fabric.$nativeSearch":
+            case "fabric.$nativeDescribe":
+            case "fabric.$describeNamespace":
+              return traceAttempt("fabric.discovery.compatibility", args, runtimeSignal, async () => {
+                const actions = (await this.registry.list({ limit: 1_000 }, callContext)).filter(action => effectiveFullCodeMode || !fullCodeProvider(action.provider));
+                if (ref === "fabric.$describeNamespace") {
+                  const { describeNativeNamespace } = await import("./native-discovery.js");
+                  return describeNativeNamespace(String(args.name ?? ""), actions, this.capturedTools, nativeMcpIdentity);
+                }
+                if (ref === "fabric.$nativeDescribe") {
+                  const matches = actions.filter(action => action.ref === args.name || action.name === args.name);
+                  if (matches.length !== 1) return undefined;
+                  const action = matches[0]!;
+                  const { describeFabricActionDeclaration } = await import("./runtime/dynamic-guest-types.js");
+                  return { name: action.ref, description: action.description, declaration: describeFabricActionDeclaration(action.ref, action.inputSchema) };
+                }
+                if (ref === "fabric.$nativeSearch") {
+                  const candidates = await this.registry.search(String(args.query ?? ""), callContext, 1_000);
+                  const visible = new Set(actions.filter(action => args.namespace === undefined || action.namespace === args.namespace || action.provider === args.namespace).map(action => action.ref));
+                  return candidates.filter(action => visible.has(action.ref)).slice(0, Math.max(1, Math.min(typeof args.limit === "number" ? args.limit : 8, 1_000))).map(action => ({ name: action.ref, description: action.description }));
+                }
+                return actions.map(action => ({ name: action.ref, description: action.description }));
+              });
             case "fabric.$providers":
               return traceAttempt(
                 "fabric.discovery.providers",
@@ -1330,7 +1378,7 @@ export class FabricExecutionService {
           ...sandboxBase,
           timeoutMs: effectiveTimeoutMs,
           executionDeadline: runtimeDeadline,
-          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
+          ...(runtimeMaximumAt !== undefined ? { maximumDeadlineAt: runtimeMaximumAt, ...(runtimeMaximumAt === mainDeadlineAt ? { maximumDeadlineReason: mainCeilingReason! } : {}) } : {}),
 
           ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
           ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
@@ -1351,6 +1399,13 @@ export class FabricExecutionService {
         sandboxResult.error = sandboxResult.residentOutcomes?.length ? `${mainCeilingError}\n${sandboxResult.error ?? ""}` : mainCeilingError;
       }
       if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
+      try {
+        classifierUsages.push(...nativeTransaction.finish(sandboxResult.terminationReason === "completed" && !options.signal?.aborted));
+        nativeFinished = true;
+      } catch (error) {
+        sandboxResult.terminationReason = "runtime_error";
+        sandboxResult.error = error instanceof Error ? error.message : String(error);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.activity?.finish(options.parentToolCallId, false, message);
@@ -1360,6 +1415,7 @@ export class FabricExecutionService {
       }
       throw error;
     } finally {
+      if (!nativeFinished) classifierUsages.push(...nativeTransaction.finish(false));
       this.#nestedRunners.delete(options.parentToolCallId);
       consumptionClosed = true;
       for (const consumption of pendingConsumption.values()) consumption.abandon();
@@ -1378,14 +1434,14 @@ export class FabricExecutionService {
     // Logs, results, and error text reach the model, the event stream, and
     // persisted traces. Raw media must not: images are hoisted out of band and
     // base64 payloads collapse to a descriptor (see core/media-sanitize.ts).
-    let sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
+    let sanitizedValue = sanitizeFabricMediaValue({ value: sandboxResult.value, emitted: sandboxResult.emitted ?? [] });
     const sanitizedLogs = [...sandboxResult.logs, ...nestedLogs].map(sanitizeFabricMediaText);
     // Cleanup and final media/log serialization also consume the absolute budget.
     // Reject before announcing success or attaching model-visible media.
     const finalizedResult = preserveLateDeadline(sandboxResult);
     if (finalizedResult !== sandboxResult) {
       sandboxResult = finalizedResult;
-      sanitizedValue = sanitizeFabricMediaValue(undefined);
+      sanitizedValue = sanitizeFabricMediaValue({ value: undefined, emitted: [] });
     }
     const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
     const succeeded = runOutcome === "succeeded";
@@ -1403,7 +1459,7 @@ export class FabricExecutionService {
     return {
       success: succeeded,
       kernel: python ? "python" : "typescript",
-      value: sanitizedValue.value,
+      value: (sanitizedValue.value as { value: unknown }).value,
       logs: sanitizedLogs,
       ...(sanitizedValue.images.length > 0 ? { media: sanitizedValue.images } : {}),
       audits,

@@ -5,6 +5,9 @@ import { createRequire } from "node:module";
 import type { Harness, HarnessOptions, ModelRef, Registry, Storage, Conversation, Submission, ConversationWatch, ConversationView, ToolRegistration } from "@earendil-works/pi-durable";
 import type { FabricHostedRunner, FabricHostedRunContext, FabricHostedReporter, FabricHostedLiveness } from "./agents/runner-registry.js";
 import type { AgentUsage } from "./agents/types.js";
+import { durableInput } from "./durable-input.js";
+import { openDurableControls, type PiDurableControls, type PiDurableMessageOptions } from "./durable-controls.js";
+export type { PiDurableMessageOptions } from "./durable-controls.js";
 
 /** The host must hold exclusive ownership until release, including across processes. */
 export interface PiDurableStorageLease {
@@ -22,9 +25,13 @@ export interface PiDurableRunnerOptions {
   registry: Registry;
   env: NonNullable<HarnessOptions["env"]>;
   allowedModels: readonly ModelRef[];
+  /** Optional host-selected model, which must also appear in allowedModels. */
+  defaultModel?: ModelRef;
   storage: PiDurableStorageOptions;
 }
 export interface PiDurableRunner extends FabricHostedRunner {
+  steer(locator: unknown, message: string, options?: PiDurableMessageOptions): Promise<void>;
+  followUp(locator: unknown, message: string, options?: PiDurableMessageOptions): Promise<void>;
   /** Seal this instance, join invocations and release storage; never abort work. Create a new runner to reopen. */
   close(): Promise<void>;
 }
@@ -49,7 +56,7 @@ async function runtime(): Promise<Runtime> {
     .then(([durable, context]) => ({ durable, context }))
     .catch((cause: unknown) => {
       runtimePromise = undefined;
-      throw new Error(`Pi durable runner requires optional peers @earendil-works/pi-durable@1.0.0 and @earendil-works/chord@1.0.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      throw new Error(`Pi durable runner requires pinned dependencies @earendil-works/pi-durable@1.0.0 and @earendil-works/chord@1.0.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     });
 }
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -60,6 +67,7 @@ interface OpenRun {
   harness: Harness;
   conversation?: Conversation;
   submission?: Submission;
+  controls?: PiDurableControls;
   lease: PiDurableStorageLease;
   ownerKey: string;
   watch?: ConversationWatch;
@@ -77,6 +85,9 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
   const identity = hash(storage.kind === "jsonl" ? `jsonl:${directory}` : `factory:${storage.identity}`);
   const allowed = new Map(options.allowedModels.map(model => [`${model.provider}/${model.modelId}`, { ...model }]));
   if (!allowed.size) throw new Error("Pi durable requires an explicit model allowlist");
+  const id = options.id ?? "pi-durable-leaf";
+  const defaultModel = options.defaultModel ? `${options.defaultModel.provider}/${options.defaultModel.modelId}` : undefined;
+  if (defaultModel && !allowed.has(defaultModel)) throw new Error("Pi durable default model must be allowlisted");
   const runs = new Map<string, OpenRun>();
   const transcriptSeen = new WeakMap<FabricHostedReporter, Set<import("@earendil-works/pi-durable").EntryId>>();
   let sealed = false;
@@ -96,13 +107,15 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
   function validate(context: FabricHostedRunContext) {
     if (context.id !== context.idempotencyKey) throw new Error("Pi durable requires Fabric run ID as idempotencyKey");
     if (context.residency === "durable" && !options.residentModule) throw new Error("Durable residency requires an explicit residentModule");
-    for (const key of ["kernel", "sessionFile", "actorId", "actorName", "writePolicy", "scope", "schema"] as const) {
+    for (const key of ["kernel", "sessionFile", "actorId", "actorName", "writePolicy", "scope"] as const) {
       if (context[key] !== undefined) throw new Error(`Pi durable does not support ${key}`);
     }
-    if (context.recursive || context.images?.length) throw new Error("Pi durable does not support recursiveFabric or image input");
-    const model = context.model ? allowed.get(context.model) : undefined;
-    if (!model || !options.models.getModel(model.provider, model.modelId)) throw new Error(`Unknown or disallowed Pi durable model: ${context.model ?? "(missing explicit provider/model)"}`);
+    if (context.recursive) throw new Error("Pi durable does not support recursiveFabric");
+    const modelKey = context.model ?? defaultModel;
+    const model = modelKey ? allowed.get(modelKey) : undefined;
+    if (!model || !options.models.getModel(model.provider, model.modelId)) throw new Error(`Unknown or disallowed Pi durable model: ${modelKey ?? "(missing explicit provider/model)"}`);
     const catalogModel = options.models.getModel(model.provider, model.modelId)!;
+    const input = durableInput(context, catalogModel.input.includes("image"));
     if (context.thinking && ((!catalogModel.reasoning && context.thinking !== "off") || catalogModel.thinkingLevelMap?.[context.thinking] === null)) throw new Error(`Unsupported thinking level: ${context.thinking}`);
     const snapshot = options.registry.snapshot();
     const available = new Map(snapshot.tools().map(({ tool }) => [tool.name, tool]));
@@ -120,8 +133,8 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
         return result;
       } } satisfies ToolRegistration;
     });
-    const fingerprint = hash(JSON.stringify({ task: context.task, cwd: context.cwd, model, tools: [...context.tools], thinking: context.thinking ?? "off", systemPrompt: context.systemPrompt ?? "" }));
-    return { model, tools, fingerprint };
+    const fingerprint = hash(JSON.stringify({ task: context.task, cwd: context.cwd, model, tools: [...context.tools], thinking: context.thinking ?? "off", systemPrompt: context.systemPrompt ?? "", ...(input.images?.length ? { images: input.images } : {}), ...(input.schema ? { schema: input.schema } : {}) }));
+    return { model, tools, fingerprint, input };
   }
   async function acquire(runId: string, rt: Runtime): Promise<PiDurableStorageLease> {
     if (storage.kind === "factory") return storage.acquire(runId);
@@ -181,7 +194,7 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     const run = await open(loc.runId, selected);
     const Manifest = rt.durable.defineDoc<{ fingerprint: string }>({ kind: "fabric.durable.request", version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => ({ fingerprint: selected.fingerprint }) });
     let conversation = await run.harness.conversation(rt.durable.ROOT_CONVERSATION_ID, ctx);
-    if (!conversation && admit) conversation = await run.harness.root(ctx, { agent: { model: selected.model, tools: selected.tools, thinkingLevel: context.thinking ?? "off", cwd: context.cwd, instructions: context.systemPrompt ?? "" }, init: async (tx, id) => { await tx.doc(Manifest, id); } });
+    if (!conversation && admit) conversation = await run.harness.root(ctx, { agent: { model: selected.model, tools: selected.tools, thinkingLevel: context.thinking ?? "off", cwd: context.cwd, instructions: selected.input.instructions }, init: async (tx, id) => { await tx.doc(Manifest, id); } });
     if (!conversation) throw new Error("Pi durable attach found no existing conversation; outcome indeterminate (not resubmitted)");
     const manifest = await run.harness.snapshot(Manifest, conversation.id, ctx);
     if (manifest?.fingerprint !== selected.fingerprint) throw new Error("Fabric run ID already bound to different work or missing committed manifest");
@@ -189,9 +202,12 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     run.conversation = conversation;
     const found = await conversation.commit(tx => tx.submissionByRequest(conversation!.id, context.id), ctx);
     let submission = found ? await run.harness.submission(found.id, ctx) : undefined;
-    if (!submission && admit) submission = await conversation.submit({ type: "input", content: context.task, requestId: context.id }, ctx);
+    if (!submission && admit) submission = await conversation.submit({ type: "input", content: selected.input.content, requestId: context.id }, ctx);
     if (!submission) throw new Error("Pi durable attach found no existing submission; outcome indeterminate (not resubmitted)");
     run.submission = submission;
+    if (!run.controls) {
+      run.controls = await openDurableControls({ durable: rt.durable, context: ctx, harness: run.harness, storage: run.lease.storage, conversation, initial: submission, runId: context.id, serialize: serial, closed: () => sealed });
+    }
     run.reporters.add(reporter);
     if (!run.watch) {
       run.watch = await conversation.watch(ctx);
@@ -199,15 +215,23 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     }
     report(run.watch.value, reporter);
     if (!run.observing) {
-      run.observing = submission.wait(ctx).then(async result => {
-        if (sealed) return;
+      run.observing = run.controls.wait().then(async result => {
+        if (sealed || !result) return;
         const view = await conversation!.context(ctx);
         const answer = result.type === "input" && result.status === "done" ? view.entries.find(entry => entry.id === result.answer) : undefined;
         const output = answer?.model?.flatMap(message => message.role === "assistant" ? message.content.filter(block => block.type === "text").map(block => block.text) : []).join("") ?? "";
+        const completion: { status: "completed" | "stopped" | "failed"; text: string; value?: unknown; error?: string } = {
+          status: result.status === "done" ? "completed" : result.reason === "aborted" ? "stopped" : "failed",
+          text: result.status === "done" ? output : `Pi durable unanswered: ${result.reason}`,
+        };
+        if (selected.input.schema) {
+          const { validateAgentResult } = await import("./agents/result.js");
+          validateAgentResult(completion, selected.input.schema);
+        }
         const usage = await run.harness.usage(ctx);
         for (const target of run.reporters) {
           target.usage(totalUsage(usage));
-          target.finish({ status: result.status === "done" ? "completed" : result.reason === "aborted" ? "stopped" : "failed", output: result.status === "done" ? output : `Pi durable unanswered: ${result.reason}` });
+          target.finish({ status: completion.status, output: completion.error ?? completion.text, ...(completion.value !== undefined ? { structured: completion.value } : {}) });
         }
         delete run.observing;
       }).catch(error => { if (!sealed) for (const target of run.reporters) target.fail({ error: `Pi durable observation failed: ${String(error)}` }); });
@@ -243,23 +267,36 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     if (usage) reporter.usage(totalUsage(usage as unknown as import("@earendil-works/pi-durable").UsageState));
   }
   return {
-    id: options.id ?? "pi-durable", label: options.label ?? "Pi durable (opt-in)", kind: "hosted", ...(options.residentModule ? { residentModule: options.residentModule } : {}),
-    capabilities: Object.freeze({ recursiveFabric: false, steer: false, followUp: false, persistentSessions: false, kernels: false, handoff: false, modelDiscovery: false, imageInput: false, compaction: false, questions: false, sleep: false, writePolicy: false }),
+    id, label: options.label ?? "Pi durable (opt-in)", kind: "hosted", ...(options.residentModule ? { residentModule: options.residentModule } : {}),
+    capabilities: Object.freeze({ recursiveFabric: false, steer: true, followUp: true, persistentSessions: false, kernels: false, handoff: false, modelDiscovery: true, imageInput: true, compaction: false, questions: false, sleep: false, writePolicy: false }),
+    defaultModel: () => defaultModel,
+    models: () => [...allowed.values()].flatMap(ref => {
+      const model = options.models.getModel(ref.provider, ref.modelId);
+      return model ? [{ runner: id, provider: ref.provider, id: ref.modelId, key: `${ref.provider}/${ref.modelId}`, name: model.name, input: [...model.input], reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens }] : [];
+    }),
     prepare(context) { if (sealed) throw new Error("Pi durable runner is closed"); validate(context); return { version: 1, backend: "pi-durable", storage: identity, runId: context.id } satisfies PiDurableLocator; },
     normalizeModel(model) { if (!allowed.has(model)) throw new Error(`Unknown or disallowed Pi durable model: ${model}`); return model; },
     mapTools(tools) { const names = new Set(options.registry.snapshot().tools().map(item => item.tool.name)); for (const tool of tools) if (!names.has(tool)) throw new Error(`Unknown Pi durable tool: ${tool}`); return [...tools]; },
     start: (loc, context, reporter) => serial(() => bind(loc, context, reporter, true)),
     attach: (loc, context, reporter) => serial(() => bind(loc, context, reporter, false)),
+    steer: (value, message, data) => serial(async () => {
+      const run = runs.get(locator(value).runId);
+      if (!run?.controls) throw new Error("Pi durable run is not attached");
+      await run.controls.send("steer", message, data);
+    }),
+    followUp: (value, message, data) => serial(async () => {
+      const run = runs.get(locator(value).runId);
+      if (!run?.controls) throw new Error("Pi durable run is not attached");
+      await run.controls.send("followUp", message, data);
+    }),
     liveness: value => serial(async (): Promise<FabricHostedLiveness> => {
       const run = runs.get(locator(value).runId);
-      if (!run?.submission) return "unknown";
-      const result = await run.submission.status((await runtime()).context.BACKGROUND_CONTEXT);
-      return result.status === "done" ? "settled" : result.status === "unanswered" ? result.reason === "aborted" ? "cancelled" : "interrupted" : "running";
+      return run?.controls ? run.controls.liveness() : "unknown";
     }),
     stop: value => serial(async () => {
       const run = runs.get(locator(value).runId);
-      if (!run?.conversation || !run.submission) return { confirmed: false };
-      await run.conversation.abort((await runtime()).context.BACKGROUND_CONTEXT, { background: true });
+      if (!run?.controls) return { confirmed: false };
+      await run.controls.stop();
       return { confirmed: true };
     }),
     close() {

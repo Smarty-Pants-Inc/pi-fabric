@@ -745,7 +745,7 @@ export class ActorManager {
     }
     await validateActorValidWhile(request.validWhile);
     const runner = request.runner ?? this.agents.config.runner;
-    if (runner !== "pi" && runner !== "claude") {
+    if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
     validateActorInferenceContext(request.inferenceContext, runner);
@@ -3207,7 +3207,7 @@ export class ActorManager {
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
-      recursive: (actor.extensions ?? true) && actor.runner === "pi",
+      recursive: (actor.extensions ?? true) && (actor.runner === "pi" || actor.runner === "pi-durable"),
       extensions: actor.extensions ?? true,
       sessionFile: actor.sessionFile,
       ...(inferenceContext !== undefined ? { inferenceContext } : {}),
@@ -3260,9 +3260,9 @@ export class ActorManager {
         : "Respond with the useful result for this message. Keep durable state in your session context.";
     const fabricEnabled = actor.extensions ?? true;
     const coordinationInstruction =
-      actor.runner === "pi" && !fabricEnabled
+      (actor.runner === "pi" || actor.runner === "pi-durable") && !fabricEnabled
         ? "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. You do not have fabric_exec or direct agents/mesh APIs; reply with your analysis and the host delivers it. Do not attempt to call fabric_exec, agents, or mesh tools."
-        : actor.runner === "pi"
+        : actor.runner === "pi" || actor.runner === "pi-durable"
           ? "You may use Fabric for tools and durable coordination. In fabric_exec, agents.main() discovers the user-facing Main target; agents.steer() and agents.followUp() message Main or other known agents, while mesh.self(), mesh.members(), mesh.publish(), mesh.read(), mesh.get(), and mesh.put() support durable coordination. Use addressed messages or shared versioned state when useful."
           : "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. This Claude runner has Claude Code tools but not fabric_exec or direct mesh APIs; coordinate through the messages the host delivers.";
     const capabilityInstruction = actor.requirements.length > 0
@@ -4248,7 +4248,7 @@ export class ActorManager {
         triggerTurn,
         coalesce: record.coalesce !== false,
         residency: record.residency === "durable" ? "durable" : "session",
-        runner: record.runner === "claude" ? "claude" : "pi",
+        runner: record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi",
         // Legacy Pi sessions were TypeScript-only. Do not change their language
         // when the current host happens to select Python after a restart.
         ...(record.runner !== "claude" && record.extensions !== false
@@ -4640,7 +4640,7 @@ export class ActorManager {
 
   #resolvedModel(runner: FabricAgentRunner, model: string, requiredPin = false): string | Promise<string> {
     this.agents.assertModelAllowed(model, runner);
-    const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
+    const resolved = (runner === "pi" || runner === "pi-durable") && this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
     const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
     return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }

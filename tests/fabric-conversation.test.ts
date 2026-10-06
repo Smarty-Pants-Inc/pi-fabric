@@ -28,7 +28,7 @@ const theme = {
 
 /** Row of the editor's top border while the streaming indicator is embedded. */
 const editorStatusRow = (lines: string[]): number =>
-  lines.findIndex((line) => /^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+$/.test(line));
+  lines.findIndex((line) => /^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+ Main > .+ ──$/.test(line));
 
 const historyText = (line: string): string => stripTerminalSequences(line).replace(/[│┃█]$/, "").trimEnd();
 
@@ -225,10 +225,10 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     h.view.render(100);
     h.view.handleInput("\x1b[<64;4;4M");
     const lines = h.view.render(100);
-    const border = lines.findIndex((line) => /^─+$/.test(line));
+    const border = lines.findIndex((line) => /^─+ Main > .+ ──$/.test(line));
     const scroll = h.state.view("b").scroll;
     expect(h.state.view("b").following).toBe(false);
-    expect(lines.slice(1, border - 1).map(historyText)).toEqual(history.slice(scroll, scroll + border - 2));
+    expect(lines.slice(0, border - 1).map(historyText)).toEqual(history.slice(scroll, scroll + border - 1));
     expect(lines[border - 1]).toContain("Jump to latest message");
     h.view.handleInput("\x1b[F");
     const latest = h.view.render(100);
@@ -290,7 +290,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
       return true;
     });
     h.view.handleInput("\x1b[<64;4;4M");
-    expect(historyText(h.view.render(100)[1]!)).toBe("older 7");
+    expect(historyText(h.view.render(100)[0]!)).toBe("older 7");
     expect(h.state.view("a").scroll).toBe(7);
   });
 
@@ -320,7 +320,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     ]);
     const h = makeHarness({ mode, initialTargetId: "b" });
     const lines = h.view.render(100);
-    const border = lines.findIndex((line) => /^─+$/.test(line));
+    const border = lines.findIndex((line) => /^─+ Main > .+ ──$/.test(line));
     expect(border).toBeGreaterThan(3);
     expect(lines.slice(border - 3, border)).toEqual(["history-last", tail, ""]);
   });
@@ -339,7 +339,8 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     const native = new WorkingStatusIndicator(h.tui, "Working");
     const nativeStatus = stripTerminalSequences(native.renderInBorder(95));
     native.dispose();
-    expect(lines[statusRow]).toBe(`── ${nativeStatus} ${"─".repeat(100 - visibleWidth(nativeStatus) - 4)}`);
+    const badge = " Main > Agent A ──";
+    expect(lines[statusRow]).toBe(`── ${nativeStatus} ${"─".repeat(100 - visibleWidth(nativeStatus) - 4 - visibleWidth(badge))}${badge}`);
     expect(lines.slice(0, statusRow).join("\n")).not.toContain("Working");
     // Pi paints the embedded spinner and label with the thinking-level border color.
     expect(colors).toHaveBeenCalledWith("borderMuted", "⠋");
@@ -963,7 +964,7 @@ describe("FabricConversationView", () => {
     }
   });
 
-  it("prioritizes editor content and breadcrumb at tiny heights", () => {
+  it("prioritizes editor content at tiny heights", () => {
     const h = makeHarness({ initialTargetId: "a", rows: 4 });
     type(h.view, "tiny");
     const lines = h.view.render(80);

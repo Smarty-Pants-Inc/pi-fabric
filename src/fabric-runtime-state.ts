@@ -707,6 +707,8 @@ export class FabricRuntimeState {
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
+      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
+        this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -765,16 +767,6 @@ export class FabricRuntimeState {
       if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
     }
     this.#rootInbox?.start();
-    this.#control = new FabricControlPlane(this.#mesh, identity, {
-      enabled: this.#config.mesh.enabled,
-      hostId,
-      pollMs: this.#config.mesh.actorPollMs,
-      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
-      captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
-        this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
-      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
-        this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
-    });
     await builtins.mesh(this.#config, this.#mesh, identity, this.#participants);
     this.#decisions = this.#config.mesh.enabled ? new DecisionStore(this.#mesh, identity) : undefined;
     this.#schema = new SchemaController(
@@ -890,7 +882,7 @@ export class FabricRuntimeState {
       sessionId: () => context.sessionManager?.getSessionId?.(),
       executorRuntime: () => this.#config?.schema.mode === "enforce" ? "quickjs" : this.#config?.executor.runtime,
       resolveParticipantGuidance: ({ model, runner }) => {
-        const targetModel = model ?? (runner === "pi" && context.model
+        const targetModel = model ?? ((runner === "pi" || runner === "pi-durable") && context.model
           ? `${context.model.provider}/${context.model.id}`
           : undefined);
         if (!targetModel) return undefined;
@@ -1401,6 +1393,7 @@ export class FabricRuntimeState {
       this.capturedTools,
       this.#managedHost ? (name) => this.#managedHost!.ownsProvider(name) : undefined,
     );
+    this.#execution.nativeCodemode.setPersistence((type, data) => this.pi.appendEntry(type, data));
     this.#execution.setParticipantRegistry(this.#providerParticipants);
     const events = this.pi.events;
     if (events) this.#execution.setEventEmitter((channel, data) => events.emit(channel, data));
@@ -1859,6 +1852,7 @@ export class FabricRuntimeState {
     }
     this.#registry = undefined;
     this.#config = undefined;
+    this.#execution?.nativeCodemode.invalidate();
     this.#execution = undefined;
     this.#agents = undefined;
     this.#actors = undefined;
@@ -1993,6 +1987,7 @@ export class FabricRuntimeState {
       await this.#participants?.close();
     }
     this.#registry = undefined;
+    this.#execution?.nativeCodemode.invalidate();
     this.#execution = undefined;
     this.#agents = undefined;
     this.#actors = undefined;

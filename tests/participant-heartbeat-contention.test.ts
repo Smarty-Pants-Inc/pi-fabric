@@ -8,6 +8,7 @@ import { StoreBridgeSide } from "../src/mesh/bridge.js";
 import { deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readParticipantFile } from "../src/topology/participant-files.js";
 import { isLiveLegacyRootEntry, sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -89,6 +90,43 @@ describe("#3752 participant heartbeat contention", () => {
     expect(directory.confirmedAt()).toBe(Date.now());
     expect(writes).not.toHaveBeenCalled();
   });
+  it("publishes deferred owned actor files after a lock-free probe under a bounded publication fence", async () => {
+    const { root, directory, mesh, record, identity, advance, writes } = await setup(true);
+    const actor: FabricParticipantRecord = { ...record, id: "actor:deferred", kind: "actor", name: "deferred" };
+    directory.options.renewActorParticipants = true;
+    directory.options.withPublicationFence = publish => mesh.withTryLock(publish, 50);
+    directory.registerSource(() => [{ ...actor, updatedAt: Date.now() }]);
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files", participants: "files" }, identity });
+    await directory.refresh(); // first publication/migration remains files-first
+    const actorKey = key("topology/participants/", actor.id);
+    const priorFile = readParticipantFile(root, actorKey)!;
+    const state = fs.readFileSync(path.join(root, "state.json"), "utf8");
+    const absenceBarrier = directory.confirmedAt();
+    const lock = path.join(root, ".lock");
+    fs.mkdirSync(lock);
+    const receipt = `held\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(path.join(lock, "owner"), receipt);
+    const confirm = mesh.confirmWritable.bind(mesh);
+    const probe = vi.spyOn(mesh, "confirmWritable").mockImplementation(async callback => {
+      expect(readParticipantFile(root, actorKey)).toEqual(priorFile); // owned copies are deferred
+      await confirm(callback);
+    });
+    writes.mockClear();
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    advance(5_000);
+    try {
+      await directory.refresh();
+      expect(probe).toHaveBeenCalledOnce();
+      expect(readParticipantFile(root, actorKey)!.updatedAt).toBe(Date.now());
+      expect(writes).not.toHaveBeenCalled();
+      expect(mkdir.mock.calls.some(([file]) => String(file) === lock)).toBe(false);
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(receipt);
+      expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(state);
+      expect(directory.confirmedAt()).toBe(absenceBarrier);
+      expect(directory.canConsumeMesh()).toBe(true);
+    } finally { fs.rmSync(lock, { recursive: true, force: true }); }
+  });
+
   it.each([false, true])("all-new fleet renews both TTLs only in the small file (policy: %s)", async files => {
     const { root, directory, mesh, writes, advance, hostKey, participantKey, identity } = await setup(files, 120_000);
     const before = fs.readFileSync(path.join(root, "state.json"), "utf8");

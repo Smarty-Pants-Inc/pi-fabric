@@ -23,15 +23,16 @@ describe("mesh try-lock async scope", () => {
     try {
       const start = performance.now();
       await mesh.withTryLock(async () => {
+        // Idle filesystem confirmation is deliberately outside the mutation lock.
+        await expect(mesh.confirmWritable()).resolves.toBeUndefined();
         for (const write of [
           () => mesh.exclusive(() => { throw new Error("must not enter"); }),
-          () => mesh.confirmWritable(),
           () => mesh.put({ key: "try-put", value: 1, identity }),
           () => mesh.delete({ key: "try-delete" }),
           () => mesh.writeBatch({ identity, ops: [{ kind: "put", key: "try-batch", value: 1 }] }),
           () => mesh.publish({ topic: "try-publish", from: identity, text: "must not land" }),
         ]) await expect(write()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-        await expect(mesh.withTryLock(() => mesh.confirmWritable())).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        await expect(mesh.withTryLock(() => mesh.exclusive(() => undefined))).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       });
       expect(performance.now() - start).toBeLessThan(500);
       release(); await ordinary;
@@ -46,27 +47,27 @@ describe("mesh try-lock async scope", () => {
       const start = performance.now();
       await mesh.withTryLock(async () => {
         // A nested helper must not turn a 50 ms try into an ordinary 2 s wait.
-        await expect(mesh.withTryLock(() => mesh.confirmWritable(), 2000)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        await expect(mesh.withTryLock(() => mesh.exclusive(() => undefined), 2000)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       }, 50);
       expect(performance.now() - start).toBeLessThan(500);
       const unlock = pause(20).then(release);
-      await mesh.withTryLock(() => mesh.confirmWritable(), 100);
+      await mesh.withTryLock(() => mesh.exclusive(() => undefined), 100);
       await unlock; // a transient collision may still succeed inside the bounded budget
     } finally { release(); }
   });
 
   it("restores the ordinary budget after rejection, success and escaped async work", async () => {
     const { mesh, release } = fixture(1);
-    await expect(mesh.withTryLock(() => mesh.confirmWritable())).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await expect(mesh.withTryLock(() => mesh.exclusive(() => undefined))).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     let resume!: () => void;
     const gate = new Promise<void>(resolve => { resume = resolve; });
     let escaped!: Promise<void>;
-    await mesh.withTryLock(async () => { escaped = gate.then(() => mesh.confirmWritable()); });
+    await mesh.withTryLock(async () => { escaped = gate.then(() => mesh.exclusive(() => undefined)); });
     resume();
     const unlock = pause(100).then(release);
     try { await escaped; await unlock; }
     finally { release(); await escaped; await unlock; }
-    await expect(mesh.withTryLock(() => mesh.withTryLock(() => mesh.confirmWritable()))).resolves.toBeUndefined();
+    await expect(mesh.withTryLock(() => mesh.withTryLock(() => mesh.exclusive(() => undefined)))).resolves.toBeUndefined();
     expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(false);
   });
 });

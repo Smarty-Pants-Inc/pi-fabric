@@ -57,7 +57,7 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       const attempt = registry.withLock(() => {
         selected();
         return budget === 0 ? mesh.exclusive(() => { throw new Error("must not enter"); }, 0)
-          : mesh.withTryLock(() => mesh.confirmWritable(), 50);
+          : mesh.withTryLock(() => mesh.exclusive(() => undefined), 50);
       }).catch(error => error);
       await selectedPromise;
       const begin = performance.now();
@@ -138,7 +138,9 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const mesh = new MeshStore(path.join(base, "mesh"), 65536, 100, { lockProtocol: 2 });
     const begin = performance.now();
     await registry.withLock(async () => {
-      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      // A lock-free idle probe does not need a native acquisition receipt.
+      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).resolves.toBeUndefined();
+      await expect(mesh.withTryLock(() => mesh.exclusive(() => undefined), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       await expect(mesh.exclusive(() => undefined, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     });
     const registryHeldMs = performance.now() - begin;

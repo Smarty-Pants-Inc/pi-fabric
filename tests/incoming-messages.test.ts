@@ -81,6 +81,41 @@ describe("incoming Fabric display projection", () => {
       .toBe(" ↳ Build & Test: plain body");
   });
 
+  it("identifies a mixed-sender burst and its delivery kinds without changing the carrier", () => {
+    const first = message("Build is ready");
+    const second = { ...message("Tests are green"),
+      content: '<fabric-agent-message from_name="Reviewer" delivery="followUp">Tests are green</fabric-agent-message>' };
+    const value = { ...first,
+      content: `${String(first.content).replace('from_id="session:peer"', 'from_id="session:peer" delivery="steer"')}\n${second.content}` };
+    const bytes = JSON.stringify(value);
+    expect(plain(harness().render(value)![0]!)).toBe(" ↳ Build & Test +1 sender: [2 steer/followUp] Build is ready");
+    expect(JSON.stringify(value)).toBe(bytes);
+  });
+
+  it.each(["org", "org-agent", "org-agent@revision"])("keeps %s replies full even when collapsed", name => {
+    initTheme("dark", false);
+    const h = harness();
+    const value = { ...message(), content: `<fabric-agent-message from_name="${name}" delivery="followUp">Reply to Paul\nFULL_ORG_REPLY</fabric-agent-message>` };
+    expect(h.render(value)).toBeUndefined();
+    expect(new CustomMessageComponent(value, h.renderers.get(value.customType)).render(120))
+      .toEqual(new CustomMessageComponent(value).render(120));
+  });
+
+  it("keeps explicitly principal-addressed messages full, including a mixed burst", () => {
+    const h = harness();
+    const value = { ...message("Principal reply\nFULL_PRINCIPAL_REPLY"),
+      details: { from: sender, delivery: "followUp", data: { to: "principal" } } };
+    expect(h.render(value)).toBeUndefined();
+    const mixed = { ...value, content: `${message("Peer chatter").content}\n${value.content}`,
+      details: { items: [message().details, value.details] } };
+    expect(h.render(mixed)).toBeUndefined(); // Never clip the principal's reply in a shared carrier.
+    expect(h.render({ ...message(), content: '<fabric-agent-message from_name="Builder" to="principal">Full reply</fabric-agent-message>' }))
+      .toBeUndefined();
+    // Originating authority and a mention in the body are NOT a recipient or org reply.
+    expect(h.render({ ...message("org: status for the principal"), details: { principal: { binding: "org-agent" } } }))
+      .toHaveLength(1);
+  });
+
   it("uses the exact native current rendering when expanded and can collapse again", () => {
     initTheme("dark", false);
     const h = harness(); const value = message("first line\nsecond line\nfinal detail");

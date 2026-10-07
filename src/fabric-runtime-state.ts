@@ -769,6 +769,7 @@ export class FabricRuntimeState {
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
+      ...(!this.#managedHost ? { placementConfigPath: path.join(resolveAgentDir(), "fabric.json") } : {}),
       fullCodeMode: this.#config.fullCodeMode,
       kernel: () => this.#config?.executor.kernel ?? "typescript",
       pythonRuntime: () => this.#config?.executor.pythonRuntime ?? "monty",

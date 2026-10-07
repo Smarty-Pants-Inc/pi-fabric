@@ -838,9 +838,16 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
-not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
-Each activation allows three preparation requeues; a further retryable preparation failure
-reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
+not the execution/restart `attempts` counter. Callerless work (mesh, host, and tells) retries
+with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
+its pending activation. After three preparation requeues, further failures report
+`failing-preparation` and raise one owner alarm until a successful activation clears it.
+A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
+does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
+the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a
+restart restores the pending item without replaying already processed events.
+Caller-owned asks retain three preparation requeues and terminal exhaustion so a waiting
+caller receives a finite failure. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.
@@ -857,7 +864,7 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
-Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
+Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, a routed mesh event on a persistent host goes to the actor's own dead-letter file (`dead-letter.jsonl` in its registry directory, bounded at 10,000 entries or 50 MB with the oldest dropped and counted), the host cursor advances, and the owner gets at most one `actor.alarm` per actor per hour. Dead letters re-queue in order once the actor's queue drains below half, never ahead of work restored after a restart or an ownership change; restored work past the overflow goes back to the head of the dead-letter file instead of being dropped, and an entry leaves the file only once the actor's queue file holds it. A recovered actor catches up and one sick actor never holds the other actors on its host. A failed preparation moves its item behind newer work rather than keeping it first. Elsewhere, past the overflow an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
 
 ```ts
 const reviewers = await agents.actors();
@@ -914,6 +921,88 @@ await agents.setActivationFilter({
 At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. `clearWhen` verdict-based clearing is not implemented: use expiry or explicitly clear after observing the PR's complete verdict.
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
+
+### Dead-root activation filter
+
+A durable actor keeps running on its resident host after the Main that owns it (its root) is gone, and every event it reacts to then spends a model run that nobody reads (smarty-dev#6062). With `agents.deadRootFilter.mode: "on"`, the resident host checks the actor's owning root just before a callerless mesh or host event would run a durable actor, and skips the run only on a **positive** dead verdict:
+
+- the root's own host lease file (`<meshRoot>/host-leases/`, the Main's lease) is present, readable, names that root and expired **more than 10 minutes** ago; **and**
+- the root has no live participant record (`<meshRoot>/participants/`): none, or one whose owner host lease has expired.
+
+Everything else runs (fail-open): a live lease or participant, a lease that expired within 10 minutes, a missing lease file, an unreadable or invalid lease or participant file, a lease stamped in the future (clock doubt), an unreadable config or any read error. The check reads only those files (no lock is taken); each root's verdict is cached for 60 seconds, and a cached dead verdict is dropped as soon as the root's lease file changes. Session actors and a caller's own `ask`/`tell` are never skipped.
+
+A skipped event is acknowledged like an activation-filter skip: no model call, an actor message with reason `filtered: dead-root`, the `filterSkipped` counters, and one JSONL line in `<meshRoot>/metrics/dead-root-skips.jsonl`:
+
+```json
+{"at":"2026-10-07T12:00:00.000Z","actorId":"…","actorName":"…","rootId":"session:…","eventId":"…","topic":"github.demo","reason":"root lease expired 42 min ago; no live participant"}
+```
+
+`agents.deadRootFilter.exempt` lists actor ids, id prefixes or exact actor names that always run. There are no implicit exemptions: a `*-supervisor` actor is exempt only if it is listed. The setting is host-only (a project config cannot change it) and is read on every activation, so setting `mode: "off"` reverts it at once. The fleet configuration, whose exemptions are the only reviewers for some repositories and live under dead roots on purpose:
+
+```json
+{
+  "agents": {
+    "deadRootFilter": {
+      "mode": "on",
+      "exempt": [
+        "0536f1ea",
+        "138dd545",
+        "217018c8",
+        "2cec34f4",
+        "383647f6",
+        "456dad01",
+        "5942be83",
+        "71930014",
+        "858ac32a",
+        "bf8a8562",
+        "dd0b33fb",
+        "e3a27c5b",
+        "0b824536",
+        "0e3ac75e",
+        "38299985",
+        "494f6a92",
+        "4a5465de",
+        "59f84b67",
+        "62af2ccd",
+        "6b0e76ad",
+        "d8b9e555",
+        "e1dab9b7",
+        "ecc95aa7",
+        "f2636e75",
+        "07d2fd0a",
+        "0ad8d77f",
+        "0dfe1b06",
+        "169bc23e",
+        "16a07279",
+        "34756a40",
+        "6299ef69",
+        "68ef4a63",
+        "7d4da881",
+        "c1542385",
+        "cedf8dc2",
+        "e8385d7d",
+        "edf67040",
+        "efb3e192",
+        "f1522fcb",
+        "0d966f8e",
+        "e0920925",
+        "4c3cfdc7",
+        "9d82f91a",
+        "81bde9b4",
+        "9d401c1a",
+        "2824d795",
+        "30883604",
+        "97a31058",
+        "ead7988f",
+        "f9640b3b",
+        "25ceadc1"
+      ]
+    }
+  }
+}
+```
+
+`tools/meters/dead_root_skips_24h.py [meshRoot-or-jsonl ...]` prints the number of skip lines in the last 24 hours (the last line is the number); it only reads.
 
 ### Native asynchronous vision handoff
 

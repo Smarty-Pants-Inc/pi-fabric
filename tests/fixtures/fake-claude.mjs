@@ -57,6 +57,19 @@ const textOf = (message) => {
 };
 
 const answer = (input) => {
+  // Idle-worker tests: log each user input with its arrival time, and hold
+  // turns (no output) until an input carries the release marker.
+  if (process.env.FAKE_CLAUDE_INPUT_LOG) {
+    fs.appendFileSync(process.env.FAKE_CLAUDE_INPUT_LOG, JSON.stringify({ at: Date.now(), text: textOf(input) }) + "\n");
+  }
+  const release = process.env.FAKE_CLAUDE_HOLD_UNTIL;
+  if (release && !textOf(input).includes(release)) { held.push(input); return; }
+  for (const earlier of held.splice(0)) respond(earlier);
+  respond(input);
+};
+
+const held = [];
+const respond = (input) => {
   turn++;
   if (!initialized) {
     initialized = true;

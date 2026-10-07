@@ -49,7 +49,10 @@ export const executionGroup = (child: ChildProcess) => {
     return current;
   };
   return {
-    observe(): void { if (process.platform === "linux") members(); },
+    /** Refresh birth anchors; returns the observed membership so callers can back off while it is stable. */
+    observe(): string {
+      return process.platform === "linux" ? members().map(value => `${value.pid}:${value.started}`).join(",") : "";
+    },
     exited(): boolean {
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;
@@ -76,5 +79,54 @@ export const executionGroup = (child: ChildProcess) => {
       try { process.kill(-pid, signal); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     },
+  };
+};
+
+/** A full /proc scan costs ~15-20 ms of CPU on a busy host (~1,000 processes),
+ * so a fixed 100 ms observer kept every idle worker at ~17% of a core
+ * (smarty-dev#4250). Observe at the original 100 ms while the group may be
+ * changing: at start, after any observed membership change, and whenever the
+ * caller pokes on child activity (Pi announces a tool before spawning it).
+ * While the membership is unchanged, double the interval up to the cap. Cleanup,
+ * exit checks and signals still scan immediately, so they never rely on this
+ * cadence. */
+export const GROUP_OBSERVE_MIN_MS = 100;
+export const GROUP_OBSERVE_MAX_MS = 5_000;
+export const observeGroupAdaptively = (
+  observe: () => string,
+  { minMs = GROUP_OBSERVE_MIN_MS, maxMs = GROUP_OBSERVE_MAX_MS }: { minMs?: number; maxMs?: number } = {},
+) => {
+  let delay = minMs;
+  let last: string | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const schedule = (): void => {
+    if (stopped) return;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = (): void => {
+    timer = undefined;
+    let snapshot: string;
+    // An unconfirmed group fails closed at cleanup; repeating the same error is not a change.
+    try { snapshot = observe(); } catch (error) { snapshot = `error:${String(error)}`; }
+    delay = snapshot === last ? Math.min(delay * 2, maxMs) : minMs;
+    last = snapshot;
+    schedule();
+  };
+  schedule();
+  return {
+    /** Child activity: return to the fast cadence (a no-op while already fast). */
+    poke(): void {
+      if (stopped || delay === minMs) return;
+      delay = minMs;
+      if (timer) clearTimeout(timer);
+      schedule();
+    },
+    stop(): void {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+    get delayMs(): number { return delay; },
   };
 };

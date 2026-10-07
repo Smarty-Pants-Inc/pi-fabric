@@ -18,7 +18,7 @@ import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
-import { executionGroup } from "./worker/execution-group.js";
+import { executionGroup, observeGroupAdaptively } from "./worker/execution-group.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
@@ -167,6 +167,10 @@ const MAX_STDERR_CHARS = 20_000;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
 const MAX_STEER_COMMANDS_PER_POLL = 256;
+// Steer cadence while a delivery is pending or no directory watch exists, and
+// the safety poll behind a working watch (smarty-dev#4250).
+const STEER_POLL_MS = 200;
+const STEER_IDLE_POLL_MS = 2_000;
 const MAX_CLAUDE_PENDING_INPUTS = 256;
 const MAX_CLAUDE_PENDING_TOOLS = 1_000;
 const KILL_GRACE_MS = 5_000;
@@ -660,12 +664,14 @@ const main = async (): Promise<void> => {
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
+  // Child activity can precede a spawn; return the current group observer to its fast cadence.
+  let pokeExecutionObserver = (): void => {};
   const retainExecutionCustody = (execution: ChildProcess): void => {
     const executionBirth = execution.pid === undefined ? undefined : processStartTime(execution.pid);
     let nativeClosed = false;
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
-      observe(): void {},
+      observe: (): string => "",
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
         if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
@@ -673,7 +679,9 @@ const main = async (): Promise<void> => {
     } : executionGroup(execution);
     executionGroups.set(execution, group);
     execution.once("close", () => { nativeClosed = true; });
-    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    // Adaptive, not a fixed 100 ms /proc scan: see observeGroupAdaptively (smarty-dev#4250).
+    const groupObserver = observeGroupAdaptively(() => group.observe());
+    pokeExecutionObserver = () => groupObserver.poke();
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
       const exited = () => nativeClosed && group.exited();
@@ -690,7 +698,7 @@ const main = async (): Promise<void> => {
           if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
         }
       }
-      clearInterval(groupObserver);
+      groupObserver.stop();
     })();
     if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
   };
@@ -1359,6 +1367,9 @@ const main = async (): Promise<void> => {
       return;
     }
     runLog.event(line, event);
+    // Tool and lifecycle events can precede a spawn into the execution group;
+    // streamed model deltas cannot, so they leave an idle observer backed off.
+    if (event.type !== "message_update") pokeExecutionObserver();
     if (pendingWhitespaceStall) {
       compactControl.observe(event); // Preserve the compaction fence during abort/drain.
       if (event.type === "response" && event.id === `whitespace-abort-${options.id}` && event.success === true) {
@@ -1625,6 +1636,7 @@ const main = async (): Promise<void> => {
         // consumed. Keep stdin alive for their deferred native turn/cancellation.
         deferredFollowUpSettle = piSettledSuccessfully && hasUnsettledFollowUps();
         if (!deferredFollowUpSettle) compactControl.childSettled();
+        else steerTick(); // Return the steer timer to its 200 ms settle cadence.
       }
       return;
     }
@@ -1677,13 +1689,17 @@ const main = async (): Promise<void> => {
   let steerOffset = 0;
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
+  // Unread steer bytes may remain (a watch event, a gated poll, or a chunked read).
+  let steerWaiting = false;
+  const steerGated = (): boolean => !options.steerFile || Boolean(terminalStatus) || (options.runner === "pi" &&
+    (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed));
   const pollSteer = (): void => {
-    if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
-        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
+    if (!options.steerFile || steerGated()) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
     } catch {
+      steerWaiting = false;
       return;
     }
     try {
@@ -1787,17 +1803,58 @@ const main = async (): Promise<void> => {
         }
       }
     } finally {
+      try { steerWaiting = fs.fstatSync(descriptor).size > steerOffset; } catch { steerWaiting = true; }
       fs.closeSync(descriptor);
     }
   };
-  const steerTimer = options.steerFile ? setInterval(() => {
+  // Steer delivery is event-driven (smarty-dev#4250). A watch on the run
+  // directory polls as soon as steer.jsonl changes. The 200 ms poll remains
+  // only while a delivery is pending (unread steer bytes on an open cursor, a
+  // deferred follow-up settle) or no watch is available; otherwise a 2 s
+  // safety poll covers a missed event. A fixed 200 ms interval woke every idle
+  // worker 5 times/s.
+  let steerTimer: NodeJS.Timeout | undefined;
+  let steerStopped = !options.steerFile;
+  let steerWatcher: fs.FSWatcher | undefined;
+  const steerTick = (): void => {
+    if (steerTimer) clearTimeout(steerTimer);
+    steerTimer = undefined;
+    if (steerStopped) return;
     pollSteer();
     if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
     }
-  }, 200) : undefined;
-  steerTimer?.unref?.();
+    if (steerStopped) return;
+    // A gated cursor needs no fast poll: the transition that opens it (a
+    // resumed child's agent_start) polls immediately.
+    const pending = !steerWatcher || deferredFollowUpSettle || (steerWaiting && !steerGated());
+    steerTimer = setTimeout(steerTick, pending ? STEER_POLL_MS : STEER_IDLE_POLL_MS);
+    steerTimer.unref?.();
+  };
+  const stopSteer = (): void => {
+    steerStopped = true;
+    if (steerTimer) clearTimeout(steerTimer);
+    steerTimer = undefined;
+    steerWatcher?.close();
+    steerWatcher = undefined;
+  };
+  if (options.steerFile) {
+    const steerName = path.basename(options.steerFile);
+    try {
+      steerWatcher = fs.watch(path.dirname(options.steerFile), { persistent: false }, (_event, name) => {
+        if (name && String(name) !== steerName) return;
+        steerWaiting = true;
+        steerTick();
+      });
+      steerWatcher.on("error", () => { steerWatcher?.close(); steerWatcher = undefined; });
+    } catch {
+      steerWatcher = undefined; // No watch here: keep the 200 ms poll.
+    }
+    try { steerWaiting = fs.statSync(options.steerFile).size > 0; } catch { /* no steer yet */ }
+    steerTimer = setTimeout(steerTick, STEER_POLL_MS);
+    steerTimer.unref?.();
+  }
 
   // smarty-dev#1907: an event line above the cap is dropped, not fatal. The run
   // keeps its child; the warning names the event and its size, and a bounded
@@ -1847,12 +1904,14 @@ const main = async (): Promise<void> => {
 
   const recordStderr = (text: string): void => {
     if (!text) return;
+    pokeExecutionObserver();
     appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
     process.stderr.write(text);
     stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
   };
   const consumeOutput = (decoded: string, projected = false): void => {
     if (options.runner === "veda") {
+      pokeExecutionObserver();
       vedaOutput += decoded;
       return;
     }
@@ -2040,7 +2099,7 @@ const main = async (): Promise<void> => {
   await executionSettled();
 
   if (crashPending) return; // finishCrash owns result publication after the drain.
-  if (steerTimer) clearInterval(steerTimer);
+  stopSteer();
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);

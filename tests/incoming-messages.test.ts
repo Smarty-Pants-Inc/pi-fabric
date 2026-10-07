@@ -116,6 +116,28 @@ describe("incoming Fabric display projection", () => {
       .toHaveLength(1);
   });
 
+  it.each([
+    ["details.to", { to: "principal" }],
+    ["details.data.to", { data: { to: "principal" } }],
+  ])("applies a carrier-level principal marker (%s) to unmarked burst items; an item's own marker wins", (_name, carrier) => {
+    initTheme("dark", false);
+    const h = harness();
+    const peer = { id: "peer-1", from: sender, to: "session:other" };
+    const unmarked = { id: "reply-1", from: sender, delivery: "followUp" };
+    const mixed = { ...message(), content: `${message("Peer chatter").content}\n${message("Reply for Paul\nFULL_PRINCIPAL_REPLY").content}`,
+      details: { ...carrier, items: [peer, unmarked] } };
+    expect(h.render(mixed)).toBeUndefined(); // The unmarked item inherits the carrier's principal destination.
+    expect(new CustomMessageComponent(mixed, h.renderers.get(mixed.customType)).render(120))
+      .toEqual(new CustomMessageComponent(mixed).render(120));
+    // Only unmarked items inherit: an item's own non-principal marker (details, data, or XML attribute) wins.
+    for (const own of [peer, { id: "peer-2", from: sender, data: { to: "session:other" } }]) {
+      expect(h.render({ ...message("Peer chatter"), details: { ...carrier, items: [own] } })).toHaveLength(1);
+    }
+    expect(h.render({ ...message(), details: { ...carrier, items: [unmarked] },
+      content: '<fabric-agent-message from_name="Builder" to="session:other">Peer chatter</fabric-agent-message>' })).toHaveLength(1);
+    expect(h.render({ ...message("Reply for Paul"), details: { ...carrier, items: [unmarked] } })).toBeUndefined();
+  });
+
   it("uses the exact native current rendering when expanded and can collapse again", () => {
     initTheme("dark", false);
     const h = harness(); const value = message("first line\nsecond line\nfinal detail");

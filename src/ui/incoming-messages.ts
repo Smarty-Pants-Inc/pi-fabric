@@ -42,6 +42,8 @@ const rows = (message: IncomingMessage): Row[] => {
   const text = contentText(message);
   const details = record(message.details);
   const items = Array.isArray(details.items) ? details.items : [details];
+  // A carrier-level recipient applies to each item that has no marker of its own.
+  const carrierTo = Array.isArray(details.items) ? details.to ?? record(details.data).to : undefined;
   const row = (body: string, attrs: Record<string, string>, index: number): Row => {
     const item = record(items[index]);
     const from = record(item.from);
@@ -52,7 +54,7 @@ const rows = (message: IncomingMessage): Row[] => {
     const kind = /^mail\.inbound\b/.test(body) ? "mail.inbound" : String(attrs.kind ?? delivery ??
       (message.customType === "pi-fabric-actor" ? "actor" : message.customType === "pi-fabric-inbox-summary" ? "inbox" : "agent"));
     return { sender, body, kind, attributes: attrs,
-      full: orgSender(sender) || (attrs.to ?? item.to ?? data.to) === "principal" };
+      full: orgSender(sender) || (attrs.to ?? item.to ?? data.to ?? carrierTo) === "principal" };
   };
   const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
   return matches.length ? matches.map((match, index) => row(

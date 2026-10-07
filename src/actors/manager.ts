@@ -35,7 +35,7 @@ import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
-import { hydrateWakeText, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
+import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
 import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
@@ -418,7 +418,9 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
-  readonly #wakeTextConfig: FabricWakeTextConfig | undefined;
+  // smarty-dev#6144 review round 3: read at every drain, never captured, so a live config reload that
+  // enables or removes agents.wakeText applies to the next activation (removal revokes at once).
+  readonly #wakeTextPolicy: () => FabricWakeTextConfig | undefined;
   // Actors whose queue file this manager has loaded as their owner. Only these may write it: a
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
@@ -611,8 +613,13 @@ export class ActorManager {
       retention?: FabricRetentionConfig;
       /** Reset an actor's session at a run boundary past this size; 0 disables (smarty-dev#1439). */
       maxSessionBytes?: number;
-      /** Host-only agents.wakeText: hydrate projected GitHub webhook text from the local receipt (smarty-dev#6144). */
-      wakeText?: FabricWakeTextConfig;
+      /**
+       * Host-only agents.wakeText: hydrate projected GitHub webhook text from the local receipt (smarty-dev#6144).
+       * A resolver is read at every activation drain, so a live config reload enables or revokes it at once;
+       * a resolver that throws or returns an invalid policy gives no text (fail closed). Main and the resident
+       * host pass resolvers over their live config; a plain object is a fixed policy.
+       */
+      wakeText?: FabricWakeTextConfig | (() => FabricWakeTextConfig | undefined);
       /** How long close() waits for running actor turns before it stops them (smarty-dev#1113). */
       closeGraceMs?: number;
       acquireCapabilityView?(
@@ -628,7 +635,8 @@ export class ActorManager {
     this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
-    this.#wakeTextConfig = options.wakeText;
+    const wakeText = options.wakeText;
+    this.#wakeTextPolicy = typeof wakeText === "function" ? wakeText : () => wakeText;
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
     this.#snapshotActorOwnership = options.snapshotActorOwnership;
@@ -2821,7 +2829,8 @@ export class ActorManager {
         // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
         // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
         // another scope can share); otherwise the activation runs as it was.
-        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload,
+        // The policy is read live here (review round 3): a reload that removed it hydrates nothing.
+        const wakeText = hydrateWakeText(item.source.startsWith("mesh:") ? this.wakeTextPolicy() : undefined, item.source, item.payload,
           { id: actor.id, topics: actor.topics });
         if (wakeText) item.wakeText = wakeText;
         else delete item.wakeText;
@@ -3518,6 +3527,18 @@ export class ActorManager {
       this.#deadRoots ??= new DeadRootCache(this.mesh.root);
       const verdict = this.#deadRoots.judge(actor.rootId);
       return verdict.dead ? verdict.reason : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The agents.wakeText policy the next activation drain applies, read live from the configured
+   * resolver and revalidated (smarty-dev#6144). Unset, invalid or unreadable: undefined, so no text.
+   */
+  wakeTextPolicy(): FabricWakeTextConfig | undefined {
+    try {
+      return normalizeWakeTextConfig(this.#wakeTextPolicy());
     } catch {
       return undefined;
     }

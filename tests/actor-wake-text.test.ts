@@ -22,6 +22,14 @@ import {
 } from "../src/actors/wake-text.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentHost } from "../src/residency/host.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import type { FabricParticipantSource } from "../src/topology/types.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
 
 // smarty-dev#6144: bounded wake text from the factory ingress receipt on the same host.
 
@@ -390,7 +398,7 @@ describe("renderWakeTextBlock", () => {
   });
 });
 
-const setup = (wakeText?: FabricWakeTextConfig, session = "test") => {
+const setup = (wakeText?: FabricWakeTextConfig | (() => FabricWakeTextConfig | undefined), session = "test") => {
   const identity: MeshIdentity = { id: `session:${session}`, name: "main", kind: "main", sessionId: session };
   const root = tempRoot();
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -552,5 +560,122 @@ describe("wake text in actor activations", () => {
       expect(task).not.toContain("Please rebase");
       expect(task).not.toContain("private comment in other/demo");
     }
+  }, 30_000);
+});
+
+// smarty-dev#6144 review round 3: the policy follows a live config reload; removal revokes at once.
+describe("wake text policy follows live config reload", () => {
+  it("ActorManager reads the policy at each drain: enable -> text, remove -> no text, unreadable -> no text", async () => {
+    const db = receiptDb(tempRoot());
+    let policy: FabricWakeTextConfig | undefined;
+    let unreadable = false;
+    const { root, mesh, actors } = setup(() => {
+      if (unreadable) throw new Error("config unreadable");
+      return policy;
+    });
+    const actor = await actors.create({ name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], responseMode: "directive", coalesce: false });
+    const activate = async (count: number) => {
+      await publish(mesh, projected("issue_comment", 7));
+      await waitFor(() => runTasks(root, actor.id).length === count && actors.status(actor.id).status === "idle");
+      return runTasks(root, actor.id)[count - 1]!;
+    };
+    expect(actors.wakeTextPolicy()).toBeUndefined();
+    expect(await activate(1)).not.toContain(WAKE_TEXT_FENCE_OPEN);
+    // Enable (a reload adds agents.wakeText): the next activation hydrates.
+    policy = granting(db);
+    grant(policy, actor.id, "acme/demo");
+    expect(actors.wakeTextPolicy()?.repositories[actor.id]).toEqual(["acme/demo"]);
+    expect(fenced(await activate(2))).toMatchObject({ author: "alice", body: "Please rebase onto main." });
+    // Remove (a reload drops agents.wakeText): revoked at once, no restart.
+    policy = undefined;
+    expect(actors.wakeTextPolicy()).toBeUndefined();
+    const revoked = await activate(3);
+    expect(revoked).not.toContain(WAKE_TEXT_FENCE_OPEN);
+    expect(revoked).not.toContain("Please rebase");
+    // Re-enable, then the policy becomes unreadable: fail closed.
+    policy = granting(db);
+    grant(policy, actor.id, "acme/demo");
+    expect(fenced(await activate(4))).toMatchObject({ author: "alice" });
+    unreadable = true;
+    expect(actors.wakeTextPolicy()).toBeUndefined();
+    expect(await activate(5)).not.toContain("Please rebase");
+    // An invalid policy (no absolute receiptDb) is no policy.
+    unreadable = false;
+    policy = { ...granting(db), receiptDb: "relative.sqlite" };
+    expect(actors.wakeTextPolicy()).toBeUndefined();
+  }, 60_000);
+
+  it("Main runtime: reloadConfig enabling or removing agents.wakeText updates the live actor policy", async () => {
+    const cwd = tempRoot();
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    try {
+      const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn(), on: vi.fn() } as unknown as ExtensionAPI;
+      const context = {
+        cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+        modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn(), getAvailable: () => [], getAll: () => [] },
+        sessionManager: { getSessionId: () => "wake-text-reload", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+        ui: { setStatus: vi.fn(), notify: vi.fn() },
+      } as unknown as ExtensionContext;
+      const base = { mcp: { enabled: false, cache: { enabled: false } }, residency: { enabled: false }, memory: { enabled: false },
+        records: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } };
+      const unused = path.join(cwd, "unused.mjs");
+      fs.writeFileSync(unused, "export default {};");
+      const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: unused, worker: unused, residentHost: unused, skills: cwd } });
+      closers.push(() => runtime.shutdown());
+      await runtime.initialize(context, normalizeFabricConfig(base));
+      const actorId = idOf("main-actor");
+      const enabled = { receiptDb: "/srv/ingress.sqlite", trustedPublishers: [FORWARDER.id], repositories: { [actorId]: ["acme/demo"], [idOf("other")]: ["acme/demo"] } };
+      expect(runtime.actors.wakeTextPolicy()).toBeUndefined();
+      runtime.reloadConfig(context, normalizeFabricConfig({ ...base, agents: { wakeText: enabled } }));
+      expect(runtime.actors.wakeTextPolicy()).toMatchObject({ receiptDb: "/srv/ingress.sqlite", trustedPublishers: [FORWARDER.id] });
+      expect(runtime.actors.wakeTextPolicy()?.repositories[actorId]).toEqual(["acme/demo"]);
+      // Narrowing a grant takes effect live too.
+      runtime.reloadConfig(context, normalizeFabricConfig({ ...base, agents: { wakeText: { ...enabled, repositories: { [actorId]: ["acme/demo"] } } } }));
+      expect(Object.keys(runtime.actors.wakeTextPolicy()!.repositories)).toEqual([actorId]);
+      runtime.reloadConfig(context, normalizeFabricConfig(base));
+      expect(runtime.config.agents.wakeText).toBeUndefined();
+      expect(runtime.actors.wakeTextPolicy()).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
+
+  it("resident host: Main's reload rewrites config.json and the host's actors follow it; unreadable fails closed", async () => {
+    const root = tempRoot();
+    const identity = { id: "session:wake-text-resident", sessionId: "wake-text-resident", kind: "main" as const, name: "Main" };
+    const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
+    const mesh = new MeshStore(path.join(root, "mesh"), meshConfig.maxEventBytes, meshConfig.maxReadEvents);
+    const actorId = idOf("resident-actor");
+    const wakeText = normalizeWakeTextConfig({ receiptDb: "/srv/ingress.sqlite", trustedPublishers: [FORWARDER.id], repositories: { [actorId]: ["acme/demo"] } })!;
+    const config: ResidentHostConfig = { format: RESIDENT_HOST_FORMAT, rootId: identity.id, sessionId: identity.sessionId,
+      cwd: root, projectRoot: root, meshRoot: mesh.root, actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"),
+      residencyRoot: residentRoot(mesh.root, identity.id), fullCodeMode: true,
+      agents: { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0, wakeText }, mesh: meshConfig, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+      piModels: { available: [], aliases: {} },
+      shadowRouting: { jev: { ...DEFAULT_FABRIC_CONFIG.jev, credentialCommand: [] }, networkAllowed: false, schemaEnforced: false } };
+    fs.mkdirSync(config.residencyRoot, { recursive: true, mode: 0o700 });
+    const configFile = path.join(config.residencyRoot, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify(config));
+    const host = new ResidentHost(structuredClone(config), () => {}, { getAvailable: () => [] });
+    await host.start();
+    closers.push(() => host.close());
+    const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource, mainAgent: { local: true } as FabricMainAgentTarget });
+    closers.push(() => client.close());
+    expect(host.actors.wakeTextPolicy()?.repositories[actorId]).toEqual(["acme/demo"]);
+    // Removal on Main's reload: config.json drops it and the running host revokes at once.
+    client.updateWakeText(undefined);
+    expect(JSON.parse(fs.readFileSync(configFile, "utf8")).agents.wakeText).toBeUndefined();
+    expect(host.actors.wakeTextPolicy()).toBeUndefined();
+    // Enabling on reload applies without a host restart.
+    client.updateWakeText(wakeText);
+    expect(host.actors.wakeTextPolicy()?.repositories[actorId]).toEqual(["acme/demo"]);
+    // An unreadable snapshot never falls back to the startup policy (which had wake text): no text.
+    fs.writeFileSync(configFile, "{ not json");
+    expect(host.actors.wakeTextPolicy()).toBeUndefined();
+    // Another generation's snapshot is not this host's policy either.
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, fabricExtensionPath: "/other/index.js" }));
+    expect(host.actors.wakeTextPolicy()).toBeUndefined();
   }, 30_000);
 });

@@ -952,7 +952,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            ...(this.#config.agents.wakeText ? { wakeText: this.#config.agents.wakeText } : {}),
+            // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
+            wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
@@ -975,7 +976,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            ...(this.#config.agents.wakeText ? { wakeText: this.#config.agents.wakeText } : {}),
+            // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
+            wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
@@ -1356,6 +1358,9 @@ export class FabricRuntimeState {
     this.#speculation?.reset();
     const previousComponents = structuredClone(this.#config.components);
     deepAssign(this.#config as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>);
+    // Host-only agents.wakeText: this Main's actors read this.#config at each drain; publish it to the
+    // resident host's config.json, which its actors read at each drain too, so removal revokes there at once.
+    this.#residency?.updateWakeText(this.#config.agents.wakeText);
     this.#configureSpeculation();
     // The persisted master switch wins over any live arm: disabling prewalk
     // via /fabric settings (or an external config edit followed by a reload)

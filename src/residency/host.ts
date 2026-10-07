@@ -33,7 +33,6 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
-import { normalizeWakeTextConfig } from "../actors/wake-text.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -508,8 +507,14 @@ export class ResidentHost {
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
-    // Host-only agents.wakeText, revalidated from the resident config file (smarty-dev#6144).
-    const residentWakeText = normalizeWakeTextConfig(config.agents.wakeText);
+    // Host-only agents.wakeText (smarty-dev#6144), read at every activation from the accepted config.json
+    // snapshot that Main rewrites on a live reload, so enabling applies and removal revokes at once. Fail
+    // closed: an unreadable, invalid or other-generation snapshot (currentConfig() fell back to the startup
+    // config) gives no text, never the startup policy. ActorManager revalidates whatever this returns.
+    const currentWakeText = (): ResidentHostConfig["agents"]["wakeText"] => {
+      const overlay = currentConfig();
+      return overlay === config ? undefined : overlay.agents?.wakeText;
+    };
     this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
       config.sessionId,
@@ -555,7 +560,7 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        ...(residentWakeText ? { wakeText: residentWakeText } : {}),
+        wakeText: currentWakeText,
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");

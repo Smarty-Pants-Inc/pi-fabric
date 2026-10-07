@@ -35,6 +35,8 @@ import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
+import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -421,6 +423,8 @@ export class ActorManager {
   readonly #resolvePiModel: ((model: string, requiredPin?: boolean) => string | Promise<string>) | undefined;
   readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
+  readonly #deadRootFilter: (() => FabricDeadRootFilterConfig | undefined) | undefined;
+  #deadRoots: DeadRootCache | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #project: string | undefined;
@@ -534,6 +538,11 @@ export class ActorManager {
       /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
       prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
+      /**
+       * agents.deadRootFilter, read per activation (smarty-dev#6062). The resident host supplies it;
+       * absent or mode "off" never skips. Only durable actors' callerless mesh/host events are checked.
+       */
+      deadRootFilter?: () => FabricDeadRootFilterConfig | undefined;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
@@ -585,6 +594,7 @@ export class ActorManager {
     this.#resolvePiModel = options.resolvePiModel;
     this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
+    this.#deadRootFilter = options.deadRootFilter;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
@@ -2720,6 +2730,15 @@ export class ActorManager {
           await this.#publishDrainPresence(actor);
           continue;
         }
+        const deadRoot = this.#deadRootSkip(actor, item);
+        if (deadRoot) {
+          // smarty-dev#6062: the owning root is positively dead. Skipped like a filter match.
+          this.#recordDeadRootSkip(actor, item, deadRoot);
+          this.#persistQueue(actor.id);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
@@ -3355,6 +3374,38 @@ export class ActorManager {
     if (!actor.activationFilter || item.resolve || item.reject) return undefined;
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
     return activationFilterSkip(actor.activationFilter, item.source, item.payload);
+  }
+
+  /**
+   * The dead-root verdict's reason when this activation must be skipped (smarty-dev#6062), else
+   * undefined. Fail-open: off, exempt, caller-awaited, non-durable, no root, or any doubt runs.
+   */
+  #deadRootSkip(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    if (!this.#deadRootFilter || item.resolve || item.reject || actor.residency !== "durable" || !actor.rootId) return undefined;
+    if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
+    try {
+      const config = normalizeDeadRootFilterConfig(this.#deadRootFilter());
+      if (config.mode !== "on" || deadRootExempt(config, actor)) return undefined;
+      this.#deadRoots ??= new DeadRootCache(this.mesh.root);
+      const verdict = this.#deadRoots.judge(actor.rootId);
+      return verdict.dead ? verdict.reason : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #recordDeadRootSkip(actor: ManagedActor, item: ActorQueueItem, reason: string): void {
+    this.#recordFiltered(actor, item, "dead-root");
+    const event = item.source.startsWith("mesh:") ? item.payload as { id?: unknown; topic?: unknown } | null | undefined : undefined;
+    appendDeadRootSkip(this.mesh.root, {
+      at: new Date().toISOString(),
+      actorId: actor.id,
+      actorName: actor.name,
+      rootId: actor.rootId,
+      eventId: typeof event?.id === "string" ? event.id : item.id,
+      topic: typeof event?.topic === "string" ? event.topic : item.source.slice(item.source.indexOf(":") + 1),
+      reason,
+    });
   }
 
   /**

@@ -10,7 +10,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
-import { probeAgentPlacement } from "../src/agents/placement-config.js";
+import { liveAgentPlacement, probeAgentPlacement } from "../src/agents/placement-config.js";
 import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
@@ -42,7 +42,7 @@ if (mode === 'launch') {
  console.log(JSON.stringify(fs.existsSync(rc) ? {rc:fs.readFileSync(rc,'utf8').trim(),text:fs.readFileSync(path.join(dir,'result.md'),'utf8')} : {rc:null}));
 } else if (mode === 'bad-poll') { console.log('not JSON'); }
 `;
-const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined) => {
+const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined, live = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-")); roots.push(root);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile); vi.stubEnv("PI_CODING_AGENT_DIR", profile);
   const launcher = path.join(root, "launcher.mjs"); fs.writeFileSync(launcher, fake);
@@ -55,7 +55,9 @@ const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSession
   const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, placement: normalizeFabricConfig({agents:{placement:raw}}).agents.placement! };
   const worker = path.join(root, "local.mjs");
   fs.writeFileSync(worker, `import fs from 'node:fs'; const args = new Map(); for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]); const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify({id:args.get('--id'),name:args.get('--name'),task:'local',status:'completed',runner:'pi',transport:'process',cwd:args.get('--cwd'),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:0,text:'LOCAL',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
-  const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs"), ...(resolveInheritedSessionPins ? { resolveInheritedSessionPins } : {}) }); managers.push(manager);
+  const placementConfigPath = path.join(profile, "fabric.json");
+  if (live) fs.writeFileSync(placementConfigPath, JSON.stringify({ agents: { placement: raw } }));
+  const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs"), ...(resolveInheritedSessionPins ? { resolveInheritedSessionPins } : {}), ...(live ? { placementConfigPath } : {}) }); managers.push(manager);
   return { root, profile, results, raw, config, manager, launcher };
 };
 const launch = (f: ReturnType<typeof fixture>, task: string, timeoutMs = 80): AgentTransportLaunch => {
@@ -79,6 +81,70 @@ describe("host process task placement", () => {
     fs.writeFileSync(path.join(f.profile,"fabric.json"), JSON.stringify({agents:{placement:f.raw}}));
     fs.writeFileSync(path.join(f.root,".pi/fabric.json"), JSON.stringify({agents:{placement:{...f.raw,default:"local",capabilities:["github-write"]}}}));
     expect(loadFabricConfig({cwd:f.root,agentDir:f.profile,projectTrusted:true}).agents.placement).toEqual(f.config.placement);
+  });
+  it("uses changed host placement on the next spawn without stopping a running task", async () => {
+    const f = fixture(false, 10_000, undefined, true);
+    const first = await f.manager.spawn({ task: "pending", transport: "process" });
+    const nextResults = path.join(f.root, "new-results");
+    const next = {
+      ...f.raw,
+      command: f.raw.command.map(entry => entry === f.results ? nextResults : entry),
+      resultDirectory: path.join(nextResults, "{id}"),
+      cancelCommand: f.raw.cancelCommand.map(entry => entry === f.results ? nextResults : entry),
+      capabilities: ["compute"],
+    };
+    // A conflicting workspace edit is still never placement authority.
+    fs.mkdirSync(path.join(f.root, ".pi"));
+    fs.writeFileSync(path.join(f.root, ".pi/fabric.json"), JSON.stringify({ agents: { placement: { ...next, default: "local" } } }));
+    fs.writeFileSync(path.join(f.profile, "fabric.json"), JSON.stringify({ agents: { placement: next } }));
+    const second = await f.manager.spawn({ task: "new policy", transport: "process", needs: ["compute"] });
+    expect(await f.manager.wait(second.id)).toMatchObject({ status: "completed", text: "REMOTE: new policy" });
+    expect(fs.existsSync(path.join(nextResults, second.id, "argv.json"))).toBe(true);
+    expect(fs.existsSync(path.join(f.results, second.id))).toBe(false);
+    await expect(f.manager.wait(first.id, { timeoutMs: 30 })).rejects.toThrow("still running");
+    expect(fs.existsSync(path.join(f.results, first.id, "cancelled"))).toBe(false);
+    // Original receipt path remains authoritative for the already-admitted task.
+    fs.writeFileSync(path.join(f.results, first.id, "result.md"), "ORIGINAL TASK COMPLETED");
+    fs.writeFileSync(path.join(f.results, first.id, "rc"), "0");
+    expect(await f.manager.wait(first.id)).toMatchObject({ status: "completed", text: "ORIGINAL TASK COMPLETED" });
+    fs.writeFileSync(path.join(f.profile, "fabric.json"), JSON.stringify({ agents: { placement: { ...next, default: "local" } } }));
+    expect((await f.manager.run({ task: "local policy", transport: "process" })).text).toBe("LOCAL");
+  });
+  it("caches unchanged host placement and handles atomic replacement, invalid edits, removal and recreation", () => {
+    const f = fixture();
+    const file = path.join(f.profile, "fabric.json");
+    const read = liveAgentPlacement(file, f.config.placement);
+    expect(read()).toBeUndefined();
+    fs.writeFileSync(file, JSON.stringify({ agents: { placement: f.raw } }));
+    const accepted = read()!;
+    expect(accepted.default).toBe("remote");
+    const readFile = vi.spyOn(fs, "readFileSync");
+    expect(read()).toBe(accepted);
+    expect(readFile).not.toHaveBeenCalled();
+    // Replacing the inode must invalidate even with a preserved mtime and size.
+    const replacement = `${file}.tmp`;
+    const stat = fs.statSync(file);
+    fs.writeFileSync(replacement, JSON.stringify({ agents: { placement: { ...f.raw, default: "local" } } }) + " ");
+    fs.utimesSync(replacement, stat.atime, stat.mtime);
+    fs.renameSync(replacement, file);
+    expect(read()?.default).toBe("local");
+    const local = read();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const invalid of ['{"agents":', JSON.stringify({ agents: { placement: { ...f.raw, command: [] } } })]) {
+      fs.writeFileSync(file, invalid);
+      expect(read()).toBe(local);
+      expect(read()).toBe(local);
+      expect(fs.readFileSync(file, "utf8")).toBe(invalid);
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
+    fs.writeFileSync(file, JSON.stringify({ agents: { placement: f.raw } }));
+    expect(read()?.default).toBe("remote");
+    fs.writeFileSync(file, "{}");
+    expect(read()).toBeUndefined();
+    fs.unlinkSync(file);
+    expect(read()).toBeUndefined();
+    fs.writeFileSync(file, JSON.stringify({ agents: { placement: f.raw } }));
+    expect(read()?.default).toBe("remote");
   });
   it("registers needs on run/spawn and rejects malformed declarations", () => {
     const defaults={runner:"pi" as const,timeoutMs:1000};

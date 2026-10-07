@@ -28,6 +28,23 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Opt-in process task placement
+
+A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.
+
+Declare locality requirements explicitly, for example:
+
+```ts
+const handle = await agents.spawn({ task: "Inspect the private corpus", transport: "process", needs: ["corpus"] });
+const result = await agents.wait({ id: handle.id });
+```
+
+Any need absent from the configured target's guaranteed capabilities keeps the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
+
+Remote handles still use `agents.status`, `wait`, `run`, and `stop`. `wait` bounds still detach observations without cancelling the task. A terminal native `rc` receipt—not a partial `result.md`—settles the run. A failed filesystem-only startup executable probe keeps tasks local with an audited `placement-probe-failed` reason. Once a launcher is invoked, its failures never cause local fallback or automatic relaunch. Ambiguous launch/exit outcomes retain execution custody and local run files. The configured cancellation command requests stop; only the terminal receipt confirms exit.
+
+One-shot placement does **not** stream text/tools, report token usage/cost, mirror native transcripts, implement local worker recovery, or provide steering/follow-up/compaction. Those controls reject explicitly. Model/effort are requested through argv, not independently attested on the remote host. The remote host's own Pi profile and launcher govern permissions, instructions, extension/tool availability, and temporary-directory policy. Keep needs accurate; Fabric itself does not ship a workspace or grant target access; the Ryzen 1 example delegates Git workspace shipment to the launcher with `--src {cwd}` and uses an explicit work-host SSH alias map.
+
 ### Background completion inbox
 
 `agents.spawn` validates the request and returns a handle. With a free concurrency slot, Fabric launches the worker and returns a `running` handle. When every slot is occupied, it returns a `queued` handle without waiting for admission. `agents.list` and `agents.status` show queued runs with a one-based `queuePosition`. Fabric admits them in FIFO order as running children finish. Queued spawns count against `maxPerExecution` and the calling program's `agentBudget`; cancelling one does not refund that count.
@@ -104,7 +121,8 @@ governor derives their lane from the child's cwd, not from a role or a lane envi
 and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
 ordinary task spawned by an actor clears `PI_FABRIC_ACTOR_NAME`, so its governed
 writes count as the task-agent writer, not as the spawning actor. This is write attribution, not an authorization boundary.
-Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override and `SMARTY_READ_CLASS`,
+Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override, `PI_FABRIC_ROLE_SESSION`,
+`PI_FABRIC_ROLE_PROJECT`, and `SMARTY_READ_CLASS`,
 so participant discovery cannot still report the parent's role or critical-read class.
 Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
 
@@ -251,7 +269,7 @@ Selectors with no available match, rejected/malformed RPC responses, or a remain
 
 Existing workers are not retroactively changed by rebuilding or reloading the parent. Stop and respawn affected workers to apply model admission.
 
-Pi workers with extensions enabled also inherit the parent session's `pi-multiprovider` `/switch-account` pin, when that extension is installed. Fabric forwards the pin as `PI_MULTIPROVIDER_SESSION_PINS`; the child rebinds it to its own session id. This is host state, not a model argument. Claude and Veda runners, and `extensions: false` children, do not receive it.
+Pi workers with extensions enabled also inherit the parent session's `pi-multiprovider` `/switch-account` pin, when that extension is installed. Fabric forwards the pin as `PI_MULTIPROVIDER_SESSION_PINS`; the child rebinds it to its own session id. This is host state, not a model argument. Claude and Veda runners, and `extensions: false` children, do not receive it. A resolved request or parent-session account pin keeps one-shot placed tasks local with audit reason `inherited account pins require the local worker`, so the existing pin forwarding/rebinding contract is not silently dropped.
 
 ### Choose the child's language
 
@@ -628,6 +646,28 @@ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-
 
 [Model-guidance components](components.md#model-facing-guidance-components) can target participants by canonical provider/model. Direct agents and actors retain their role prompt and receive matching append guidance after it. Recursive Pi children load the project components and resolve their own replaceable Fabric execution slot, so the parent does not duplicate guidance. Durable owners use the latest atomically committed guidance snapshot for each launch. Guidance changes prompts only; it cannot widen tools, approvals, or committed capabilities. Task text, message envelopes, run IDs, and timestamps stay out of the guidance system prompt, so repeated runs with the same role, model, and component projection retain a byte-stable prefix.
 
+### Session-bound launch roles
+
+A launch role is not transferable to every history opened by a Pi process. At the first
+`session_start`, Fabric binds the env role (`PI_FABRIC_ROLE`, else stamped `SMARTY_ROLE`)
+to the **native session id and `projectOf(session cwd)`** before any lazy runtime use.
+On `/new`, fork/clone, or resume/switch to a different history, an env-granted root
+publishes `area-lead`, not `project-agent`. Actor adoption, resident-host configuration,
+and completion-recipient metadata use the same checked role. Returning to the exact
+original session/project retains its grant; changing only the cwd to another project
+demotes it too. `PI_FABRIC_PROJECT` and Fabric session/id aliases cannot satisfy this check.
+
+A launcher targeting an existing session can supply both `PI_FABRIC_ROLE_SESSION`
+(the bare native id, without `session:`) and `PI_FABRIC_ROLE_PROJECT` (the exact canonical
+project path). Both compare case-sensitively, without trimming or origin normalization;
+partial/empty metadata fails closed. Older launchers without either field bind their
+first native session, and Fabric records both fields in that process's environment so
+`/reload` cannot rebind an old grant to a new history. The in-memory grant is immutable:
+changing role env during a process does not promote another session. An explicit launcher
+re-grant in a fresh process can authorize the new tuple, and an explicit same-tuple restart
+keeps its role. These non-secret bindings are launch metadata, not proof against arbitrary
+code already running with the host process's privileges.
+
 ## Unified participants and steering
 
 Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, or `actor`. It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
@@ -798,9 +838,16 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
-not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
-Each activation allows three preparation requeues; a further retryable preparation failure
-reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
+not the execution/restart `attempts` counter. Callerless work (mesh, host, and tells) retries
+with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
+its pending activation. After three preparation requeues, further failures report
+`failing-preparation` and raise one owner alarm until a successful activation clears it.
+A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
+does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
+the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a
+restart restores the pending item without replaying already processed events.
+Caller-owned asks retain three preparation requeues and terminal exhaustion so a waiting
+caller receives a finite failure. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.
@@ -817,7 +864,7 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
-Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
+Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, a routed mesh event on a persistent host goes to the actor's own dead-letter file (`dead-letter.jsonl` in its registry directory, bounded at 10,000 entries or 50 MB with the oldest dropped and counted), the host cursor advances, and the owner gets at most one `actor.alarm` per actor per hour. Dead letters re-queue in order once the actor's queue drains below half, never ahead of work restored after a restart or an ownership change; restored work past the overflow goes back to the head of the dead-letter file instead of being dropped, and an entry leaves the file only once the actor's queue file holds it. A recovered actor catches up and one sick actor never holds the other actors on its host. A failed preparation moves its item behind newer work rather than keeping it first. Elsewhere, past the overflow an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
 
 ```ts
 const reviewers = await agents.actors();
@@ -874,6 +921,88 @@ await agents.setActivationFilter({
 At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. `clearWhen` verdict-based clearing is not implemented: use expiry or explicitly clear after observing the PR's complete verdict.
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
+
+### Dead-root activation filter
+
+A durable actor keeps running on its resident host after the Main that owns it (its root) is gone, and every event it reacts to then spends a model run that nobody reads (smarty-dev#6062). With `agents.deadRootFilter.mode: "on"`, the resident host checks the actor's owning root just before a callerless mesh or host event would run a durable actor, and skips the run only on a **positive** dead verdict:
+
+- the root's own host lease file (`<meshRoot>/host-leases/`, the Main's lease) is present, readable, names that root and expired **more than 10 minutes** ago; **and**
+- the root has no live participant record (`<meshRoot>/participants/`): none, or one whose owner host lease has expired.
+
+Everything else runs (fail-open): a live lease or participant, a lease that expired within 10 minutes, a missing lease file, an unreadable or invalid lease or participant file, a lease stamped in the future (clock doubt), an unreadable config or any read error. The check reads only those files (no lock is taken); each root's verdict is cached for 60 seconds, and a cached dead verdict is dropped as soon as the root's lease file changes. Session actors and a caller's own `ask`/`tell` are never skipped.
+
+A skipped event is acknowledged like an activation-filter skip: no model call, an actor message with reason `filtered: dead-root`, the `filterSkipped` counters, and one JSONL line in `<meshRoot>/metrics/dead-root-skips.jsonl`:
+
+```json
+{"at":"2026-10-07T12:00:00.000Z","actorId":"…","actorName":"…","rootId":"session:…","eventId":"…","topic":"github.demo","reason":"root lease expired 42 min ago; no live participant"}
+```
+
+`agents.deadRootFilter.exempt` lists actor ids, id prefixes or exact actor names that always run. There are no implicit exemptions: a `*-supervisor` actor is exempt only if it is listed. The setting is host-only (a project config cannot change it) and is read on every activation, so setting `mode: "off"` reverts it at once. The fleet configuration, whose exemptions are the only reviewers for some repositories and live under dead roots on purpose:
+
+```json
+{
+  "agents": {
+    "deadRootFilter": {
+      "mode": "on",
+      "exempt": [
+        "0536f1ea",
+        "138dd545",
+        "217018c8",
+        "2cec34f4",
+        "383647f6",
+        "456dad01",
+        "5942be83",
+        "71930014",
+        "858ac32a",
+        "bf8a8562",
+        "dd0b33fb",
+        "e3a27c5b",
+        "0b824536",
+        "0e3ac75e",
+        "38299985",
+        "494f6a92",
+        "4a5465de",
+        "59f84b67",
+        "62af2ccd",
+        "6b0e76ad",
+        "d8b9e555",
+        "e1dab9b7",
+        "ecc95aa7",
+        "f2636e75",
+        "07d2fd0a",
+        "0ad8d77f",
+        "0dfe1b06",
+        "169bc23e",
+        "16a07279",
+        "34756a40",
+        "6299ef69",
+        "68ef4a63",
+        "7d4da881",
+        "c1542385",
+        "cedf8dc2",
+        "e8385d7d",
+        "edf67040",
+        "efb3e192",
+        "f1522fcb",
+        "0d966f8e",
+        "e0920925",
+        "4c3cfdc7",
+        "9d82f91a",
+        "81bde9b4",
+        "9d401c1a",
+        "2824d795",
+        "30883604",
+        "97a31058",
+        "ead7988f",
+        "f9640b3b",
+        "25ceadc1"
+      ]
+    }
+  }
+}
+```
+
+`tools/meters/dead_root_skips_24h.py [meshRoot-or-jsonl ...]` prints the number of skip lines in the last 24 hours (the last line is the number); it only reads.
 
 ### Native asynchronous vision handoff
 
@@ -949,6 +1078,8 @@ const selected = await agents.actorStatus({ id: actor.id });
 // Restore the default policy explicitly:
 await agents.setInferenceContext({ id: actor.id, inferenceContext: "full-history" });
 ```
+
+Before dispatching a **full-history** actor activation through a native Pi launcher, Fabric measures the current session messages plus the incoming activation and actor instructions using that launcher's token estimator. The effective model's registry `contextWindow` (not previous usage telemetry) sets an 85% admission ceiling. Small sessions are left unchanged. Above that ceiling, Fabric requests native compaction once and remeasures. If compaction is unavailable, cancelled, fails, or leaves too much context (including an oversized history RPC response), Fabric drains the old child and reseeds the **same registered session path** with a fresh native header, the actor's unchanged instructions, and bounded excerpts of recent visible state. The original journal is preserved beside it as `session.jsonl.<UUID>.context-reseed.bak`; the seed identifies that full-history archive. Reseeding is a context recovery, not a replay of the current activation or a change to actor permissions. It publishes the header, seed, and `fabric-context-reseed` audit note together by atomic rename before launching the replacement child, so native Bash's `PI_SESSION_ID`, the registered header, and review attribution stay aligned. The run log records `fabric_context_compaction` attempts and `fabric_context_reseed` recovery; lifecycle telemetry also records `actor.context_reseed`. The replacement is re-admitted before the original activation is sent. This fallback bounds accumulated history; it does not truncate an intrinsically oversized new activation, system prompt, or late extension/provider expansion. Opaque/custom launchers retain their own native admission policy.
 
 Only the owner can change a live actor. The setting persists on the same ID and applies when the next activation starts; running work keeps its snapshot. `scope: "global"` changes a template. Export/import retains the policy but never imports history. The setting does not change instructions, model, effort, tools, subscriptions, checkpoints, delivery, quiet/hold rules, or retained task references.
 

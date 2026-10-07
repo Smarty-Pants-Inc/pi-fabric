@@ -5,6 +5,7 @@ import {
   MeshStore,
   type MeshEvent,
   type MeshIdentity,
+  type MeshReadOptions,
   type MeshStateEntry,
 } from "../mesh/store.js";
 import { countFileComplexity } from "./complexity.js";
@@ -567,8 +568,8 @@ export class StateStore {
     };
   }
 
-  getHead(): StateHead | null {
-    const entry = this.store.get(CURRENT_KEY);
+  getHead(options: Pick<MeshReadOptions, "fresh"> = {}): StateHead | null {
+    const entry = this.store.get(CURRENT_KEY, options);
     if (!entry) return null;
     const head = this.toHead(entry);
     if (head.protocolVersion === DURABLE_HEAD_PROTOCOL_VERSION) {

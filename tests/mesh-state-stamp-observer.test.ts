@@ -18,7 +18,7 @@ const setup = async (readCacheMs = RUNTIME_MESH_READ_CACHE_MS) => {
   const root = fs.mkdtempSync(path.join(scratch, "stamp-observer-"));
   roots.push(root);
   const file = path.join(root, "state.json");
-  const writer = new MeshStore(root, 64 * 1024, 100);
+  const writer = new MeshStore(root, 64 * 1024, 100, { writeReadJournal: false });
   const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs });
   await writer.put({ key, value: { owner: "old" }, identity });
   const disk = (): State => JSON.parse(String(real.readFileSync(file, "utf8")));
@@ -122,7 +122,7 @@ for (const method of ["get", "listAll", "listAllShared", "stateToken", "confirmW
   });
 }
 
-it("markerless warm observer shares TTL without even a header read, then parses at expiry", async () => {
+it("markerless warm observer uses physical metadata at expiry without re-reading unchanged bytes", async () => {
   const { reader, replace, count } = await setup();
   await replace((state) => { delete state.readGeneration; });
   let now = Date.now();
@@ -136,9 +136,9 @@ it("markerless warm observer shares TTL without even a header read, then parses 
   expect(headers).not.toHaveBeenCalled();
   now += RUNTIME_MESH_READ_CACHE_MS;
   expect(reader.cachedStateStamp(true)).toBe(stamp);
-  expect(count()).toBe(before + 1); // Unknown generation cannot waive ordinary expiry.
+  expect(count()).toBe(before); // High-resolution physical identity, not an absent UUID, gates reuse.
   expect(reader.cachedStateStamp(true)).toBe(stamp);
-  expect(count()).toBe(before + 1);
+  expect(count()).toBe(before);
 });
 
 for (const barrier of ["fresh", "confirmWritable"] as const) it(`markerless metadata ABA observer reuse preserves ${barrier} authority`, async () => {
@@ -233,7 +233,7 @@ for (const poll of ["ordinary", "observer"] as const) it(`legacy changed-stat ob
   expect(count()).toBe(before + 1); // Next observer and UI read reuse that ONE expiry parse.
 });
 
-it("readCacheMs 0 checks the canonical header on every observer and parses changed stat immediately", async () => {
+it("readCacheMs 0 gates unchanged headers by physical metadata and parses changed stat immediately", async () => {
   const { reader, replace, count } = await setup(0);
   reader.get(key);
   const stamp = reader.cachedStateStamp();
@@ -241,8 +241,7 @@ it("readCacheMs 0 checks the canonical header on every observer and parses chang
   const headers = vi.spyOn(fs, "readSync");
   expect(reader.cachedStateStamp(true)).toBe(stamp);
   expect(reader.cachedStateStamp(true)).toBe(stamp);
-  expect(headers.mock.calls).toHaveLength(2);
-  for (const call of headers.mock.calls) expect(call.slice(2)).toEqual([0, 64, 0]);
+  expect(headers).not.toHaveBeenCalled(); // Same physical file: no repeated 64-byte opens.
   expect(count()).toBe(before);
   await replace((state) => { state.entries[key]!.value = { owner: "larger-new-owner" }; });
   const afterWrite = count();
@@ -252,7 +251,7 @@ it("readCacheMs 0 checks the canonical header on every observer and parses chang
   expect(count()).toBe(afterWrite + 1);
 });
 
-it("confirmWritable clears a warm cache so the next observer parses canonical state", async () => {
+it("confirmWritable preserves a snapshot but requires canonical revalidation on its next read", async () => {
   const { reader, freeze, replace, count } = await setup();
   freeze();
   reader.get(key);
@@ -260,7 +259,7 @@ it("confirmWritable clears a warm cache so the next observer parses canonical st
   await replace((state) => { state.entries[key]!.value = { owner: "new" }; });
   const before = count();
   await reader.confirmWritable();
-  expect(reader.cachedStateStamp()).toBeUndefined();
+  expect(reader.cachedStateStamp()).toBe(stamp);
   expect(count()).toBe(before);
   expect(reader.cachedStateStamp(true)).toBe(stamp); // Same stat, copied marker: still a full read.
   expect(reader.get(key)?.value).toEqual({ owner: "new" });
@@ -387,7 +386,7 @@ for (const marker of ["copied", "unknown", "EIO"] as const) it(`explicit ${marke
   expect(count()).toBe(before + 1);
 });
 
-it("unchanged public fresh payload calls still perform canonical full reads", async () => {
+it("unchanged public fresh payload calls share the canonical physical generation", async () => {
   const { reader, count } = await setup();
   reader.get(key);
   const before = count();
@@ -395,7 +394,7 @@ it("unchanged public fresh payload calls still perform canonical full reads", as
   reader.listAll("", { fresh: true });
   reader.listAllShared("", { fresh: true });
   reader.stateToken({ fresh: true });
-  expect(count()).toBe(before + 4);
+  expect(count()).toBe(before);
   reader.cachedStateStamp(true);
-  expect(count()).toBe(before + 4);
+  expect(count()).toBe(before);
 });

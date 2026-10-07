@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
@@ -50,10 +51,11 @@ const assertOutputs = async (h: ReturnType<typeof fixture>, id: string, expected
   const call = h.pi.sendMessage.mock.calls.find(call => String(call[0].content).includes(text))!;
   expect.soft(call[1].provenance.principal).toEqual(expected);
   await waitFor(() => {
-    const records = JSON.parse(fs.readFileSync(path.join(h.dir, "actors", "actors.json"), "utf8"));
-    const journal = (Array.isArray(records) ? records : records.actors).find((a: any) => a.id === id).messages;
+    const store = new ActorRegistryStore(path.join(h.dir, "actors"));
+    const record = store.records().find(a => a.id === id)!;
+    const journal = store.messages(record) as Array<{ id: string; principal?: typeof A | typeof B }>;
     expect(journal.find((m: any) => m.id === result.id)).toBeTruthy();
-    expect.soft(journal.find((m: any) => m.id === result.id).principal).toEqual(expected);
+    expect.soft(journal.find(m => m.id === result.id)!.principal).toEqual(expected);
   });
   const mainJournal = JSON.parse(fs.readFileSync(path.join(h.dir, "main-followups.json"), "utf8"));
   const delivered = mainJournal.items.find((m: any) => m.id === result.id || m.deliveryId === result.id);

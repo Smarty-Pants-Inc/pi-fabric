@@ -90,6 +90,60 @@ const stubState = () =>
   }) as unknown as FabricState;
 
 describe("FabricUiController dashboard wiring", () => {
+  it.each(["poll", "coalesced-refresh"] as const)("contains %s during an activation gap and clears old timers", async (kind) => {
+    vi.useFakeTimers();
+    const state = stubState();
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }] });
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      if (kind === "coalesced-refresh") changed();
+      expect(vi.getTimerCount()).toBe(kind === "poll" ? 1 : 2);
+      Object.assign(state, { initialized: false });
+      // The RC2 mesh getter throws synchronously, before a Promise can catch it.
+      Object.defineProperty(state, "mesh", { configurable: true, get() { throw new Error("Pi Fabric has not activated"); } });
+      state.config.mesh.enabled = true;
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      controller.stop();
+      Object.assign(state, { initialized: true });
+      state.config.mesh.enabled = false;
+      controller.start(context);
+      expect(vi.getTimerCount()).toBe(1);
+      controller.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+
+  it("contains a poll scheduling failure even when its host warning throws", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let meshReads = 0;
+    const mesh = state.mesh;
+    Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }] });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn(() => { throw new Error("stale UI"); }) } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      Object.defineProperty(state, "mesh", { configurable: true, get() {
+        meshReads++; throw new Error("poll mesh read failed");
+      } });
+      state.config.mesh.enabled = true;
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(meshReads).toBeGreaterThan(0);
+      expect(context.ui.notify).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      Object.defineProperty(state, "mesh", { value: mesh, configurable: true });
+      controller.stop(); vi.useRealTimers();
+    }
+  });
   it("uses incremental views, skips duplicate progress refreshes, and releases readers on stop", async () => {
     vi.useFakeTimers();
     const state = stubState();
@@ -561,9 +615,11 @@ describe("FabricUiController dashboard wiring", () => {
           expect(shown()).toBe("A");
           expect(readCount()).toBe(afterWrite); // Local events retain ordinary warm-cache semantics.
         }
-        await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 1_000);
+        await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 2_000);
         expect(shown()).toBe("B");
-        expect(readCount()).toBe(afterWrite + 1); // New generation needs exactly ONE canonical parse.
+        // The journal replays B into a new snapshot; showing the remote value no longer
+        // requires another full canonical parse after the writer's locked read.
+        expect(readCount()).toBe(afterWrite);
       } finally {
         controller.stop();
         vi.restoreAllMocks();
@@ -572,6 +628,81 @@ describe("FabricUiController dashboard wiring", () => {
       }
     },
   );
+
+  it("idle UI never bypasses the window and sees a change within 5 s of a warmed cache", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-idle-coalesce-"));
+    const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5_000 });
+    const writer = new MeshStore(root, 64 * 1024, 100);
+    const identity = { id: "writer", name: "writer", kind: "main" as const };
+    await writer.put({ key: "status", value: "before", identity });
+    const state = stubState();
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    Object.assign(state, { config: { ...state.config, mesh: { enabled: true } }, mesh,
+      peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }],
+    });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const reads = vi.spyOn(fs, "readFileSync");
+    const count = () => reads.mock.calls.filter(([file]) => String(file) === path.join(root, "state.json")).length;
+    const shown = () => controller.snapshot().state.find(entry => entry.key === "status")?.value;
+    const observe = vi.spyOn(mesh, "cachedStateStamp");
+    try {
+      state.config.ui.refreshMs = 500;
+      controller.start(context);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await writer.put({ key: "status", value: "warm", identity });
+      // Another correctness consumer warms canonical state just before a remote change.
+      expect(mesh.get("status", { fresh: true })?.value).toBe("warm");
+      await writer.put({ key: "status", value: "after", identity });
+      const before = count();
+      await vi.advanceTimersByTimeAsync(3_000); // First UI poll consumes the warm, older snapshot.
+      expect(shown()).toBe("warm");
+      expect(count()).toBe(before); // Generation change must NOT force an idle parse.
+      await vi.advanceTimersByTimeAsync(2_000); // Fixed deadline, not another full 5 s poll.
+      expect(shown()).toBe("after");
+      // Expiry observes the new generation via the journal, not a redundant full parse.
+      expect(count()).toBe(before);
+      // Idle metadata observation must not independently parse at expiry before snapshot
+      // consumers use the shared reader (#4383); active demand has separate coverage below.
+      expect(observe).toHaveBeenCalledWith(false, false);
+      expect(observe.mock.calls.some(([fresh]) => fresh === true)).toBe(false);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      controller.stop(); vi.restoreAllMocks(); vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["running", "pending"] as const)("revalidates a warm remote view immediately for %s Main demand", async demand => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-active-coalesce-"));
+    const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5_000 });
+    const writer = new MeshStore(root, 64 * 1024, 100);
+    const identity = { id: "writer", name: "writer", kind: "main" as const };
+    await writer.put({ key: "status", value: "before", identity });
+    const state = stubState();
+    state.config.ui.refreshMs = 100;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    Object.assign(state, { activity, config: { ...state.config, mesh: { enabled: true } }, mesh });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      activity.start("work");
+      await vi.advanceTimersByTimeAsync(200);
+      await writer.put({ key: "status", value: "after", identity });
+      vi.mocked(state.mainAgentInfo).mockReturnValue({ ...vi.mocked(state.mainAgentInfo)(),
+        status: demand === "running" ? "running" : "idle", pendingMessages: demand === "pending",
+      } as ReturnType<FabricState["mainAgentInfo"]>);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(controller.snapshot().state.find(entry => entry.key === "status")?.value).toBe("after");
+    } finally {
+      controller.stop(); vi.restoreAllMocks(); vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it("keeps stationary mesh state at zero extra canonical reads across idle UI polls", async () => {
     vi.useFakeTimers();
@@ -642,9 +773,11 @@ describe("FabricUiController dashboard wiring", () => {
         expect(shown()).toBe("A0");
         await writer.put({ key: "status", value: "A", identity });
         const afterWrite = readCount();
-        const consumedToken = mesh.stateToken(); // Ordinary topology/poll reader already paid for A.
+        const consumedToken = mesh.stateToken(); // Ordinary reader already consumed A via replay.
         expect(mesh.get("status")?.value).toBe("A");
-        expect(readCount()).toBe(afterWrite + 1);
+        // The committed journal supplies A without a full canonical read; the later rebuild
+        // must still reuse exactly this consumed snapshot, including the legacy-marker case.
+        expect(readCount()).toBe(afterWrite);
         const consumedStamp = mesh.cachedStateStamp();
         if (order === "legacy unrelated writer copied marker") {
           // A pre-generation writer replaces real canonical bytes under the real lock, retaining UUID.
@@ -714,7 +847,7 @@ describe("FabricUiController dashboard wiring", () => {
       expect(readParticipantFiles(root, { maxAgeMs: 0 })).toHaveLength(1);   // another reader: a warm cache holds A
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);      // B lands in a later timestamp tick
       writeExternally("B");
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(2_500);
       expect(shown()).toBe("B");
     } finally {
       controller.stop();

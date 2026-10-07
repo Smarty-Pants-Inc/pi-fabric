@@ -133,11 +133,42 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(await control.request(client.hostId, writer.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
     await waitFor(() => host.actors.inFlightCount() === 0);
     expect(host.agents.status(writer.id).status).toBe("stopped");
+    // Actor drain/logical stop may precede the native-close release on Windows.
+    // Finish the full checked-exit snapshot, not just absence of this actor in
+    // a still-incomplete (wildcard-vetoed) ownership preparation.
+    let refs = host.agents.retentionReferences({ refresh: true, budgetMs: 100 });
+    await waitFor(() => {
+      refs = host.agents.retentionReferences({ budgetMs: 100 });
+      return !processAlive(Number(writer.sessionId)) && !refs.has("*") && !refs.has(actor.id);
+    });
+    expect(refs.has(actor.id)).toBe(false);
+    // Exercise a single conservative first-sample veto deterministically, rather
+    // than depending on Windows filesystem/native-close timing to hit it.
+    const custodyVeto = host.agents.retentionCustodyVeto.bind(host.agents);
+    let deferred = false;
+    if (process.platform !== "win32") vi.spyOn(host.agents, "retentionCustodyVeto").mockImplementation(id => {
+      if (id === actor.id && !deferred) { deferred = true; return true; }
+      return custodyVeto(id);
+    });
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
-    await waitFor(() => scans > before && !fs.existsSync(decisionPath));
+    let attempted = before;
+    await waitFor(() => {
+      if (scans <= before) return false;
+      if (!fs.existsSync(decisionPath)) return true;
+      // A conservative first-sample exit/deadline veto is allowed. Forcing due
+      // does not bypass the collector's internal 60-second sample fence: advance
+      // only the retention clock before retrying, never the worker/lease clocks.
+      if (scans > attempted) { attempted = scans; scanTime = (scanTime ?? 0) + 60_001; }
+      return false;
+    });
     due.mockReturnValue(false);
+    // Main has no targeted veto callback on Windows (smarty-dev#5132).
+    expect(deferred).toBe(process.platform !== "win32");
+    // Native retirement must not remove the tree while the manager still owns
+    // it: a missing tree would turn the next checked-exit snapshot into a veto.
+    if (process.platform !== "win32") expect(fs.existsSync(host.agents.runDirectory(writer.id)!)).toBe(true);
     expect(fs.existsSync(ackPath)).toBe(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
     const collected = scans;
@@ -315,7 +346,9 @@ it.skipIf(process.platform === "win32").each([
     expect(await settlement).toMatchObject({ status: "failed" });
     expect((restart ? host.actors.status(actor.id) : await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
-    expect(host.agents.retentionReferences().has(actor.id)).toBe(false);
+    // Explicitly finish a fresh offline proof; idle snapshots may conservatively
+    // retain an exited descendant until the next 60-second refresh.
+    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
@@ -451,7 +484,7 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     expect(refs.has("live")).toBe(true);
     expect(refs.has("live_actor")).toBe(true); // A terminal file never overrides a live PID.
     record("live", "live_actor", "2147483647");
-    expect(manager.retentionReferences().has("live_actor")).toBe(false);
+    expect(manager.retentionReferences({ refresh: true }).has("live_actor")).toBe(false);
     const unresolved = record("unresolved", "unresolved_actor", "2147483647");
     markUnresolvedWorker(unresolved, "worker exit unconfirmed");
     const nested = path.join(record("parent", "parent_actor", "2147483647"), "nested", "child");
@@ -468,7 +501,7 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     expect(manager.retentionReferences().has("*")).toBe(true);
     fs.rmSync(path.join(runs, "unknown"), { recursive: true });
     clock.mockReturnValueOnce(0).mockReturnValue(10);
-    expect(manager.retentionReferences().has("*")).toBe(true);
+    expect(manager.retentionReferences({ refresh: true }).has("*")).toBe(true);
   } finally {
     clock.mockRestore();
     await manager.close();

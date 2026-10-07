@@ -37,6 +37,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/residency/launcher-owner.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
@@ -51,6 +52,7 @@ const lazyEntryPoints = [
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
+  "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
@@ -88,6 +90,7 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/worker/context-reseed.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",

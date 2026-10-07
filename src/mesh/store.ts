@@ -1,13 +1,17 @@
+import { createCommitStats } from "./commit-stats.js";
+import { MeshLockTicket } from "./lock-queue.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { appendStateJournal, prepareStateJournal, journalBase, replayStateJournal, stateReadIdentity, type JournalBase, type JournalCursor } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, renameAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
-import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
+import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -26,6 +30,8 @@ export interface MeshEvent {
   verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
+  /** Host-only once-publication identity; never accepted from the public mesh provider. */
+  dedupeKey?: string;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -33,6 +39,24 @@ export interface MeshEvent {
   text?: string;
   data?: unknown;
   createdAt: number;
+}
+
+export interface MeshPublishInput {
+  topic: string;
+  /** Host-only durable publication receipt; never accepted by the public provider. */
+  dedupeKey?: string;
+  /** Host-only durability fence; batches share this barrier across their prefix. */
+  durable?: boolean;
+  kind?: string;
+  from: MeshIdentity;
+  to?: string;
+  text?: string;
+  /** Checked under the lock before admission. */
+  signal?: AbortSignal | undefined;
+  /** Host-only relay metadata. */
+  principal?: FabricPrincipal | undefined;
+  /** A function receives commit time under the lock. */
+  data?: unknown;
 }
 
 export interface MeshTailResult {
@@ -63,11 +87,15 @@ interface MeshStateFile {
    * committed payload's identity from a bounded header. Older readers ignore unknown fields.
    */
   readGeneration?: string;
+  /** Hash-chain head for optional incremental readers, committed with the canonical payload. */
+  readJournalHash?: string;
 }
 
 export interface MeshReadOptions {
-  /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
+  /** Revalidate canonical commit/physical identity now, bypassing the idle age window. */
   fresh?: boolean;
+  /** Opt in only for background display observations; never authority, routing or admission. */
+  background?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
 }
@@ -80,16 +108,29 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** Host-owned lifetime of advisory writes. Abort stops acquisition without
+   * bypassing ownership checks or rolling back an admitted synchronous commit. */
+  writeSignal?: AbortSignal;
   /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
    * another process has rewritten the file since. Every write still reads the file fresh
-   * under the lock and checks versions, and a store sees its own writes at once. 0 (the
+   * against an identity revalidated under the lock and checks versions, and a store sees its own writes at once. 0 (the
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
+  /** Background-only idle window. Ordinary reads stay exact unless readCacheMs is explicitly set. */
+  backgroundReadCacheMs?: number;
+  /** A live turn/pending operation bypasses explicit ordinary TTL and bounds background TTL to 1 s. */
+  readActive?: () => boolean;
+  /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
+  writeReadJournal?: boolean;
 }
+
+// Capture the opt-in once at process startup/module load: no timer, key classification,
+// counters, extra serialization, filesystem work or per-commit environment lookup when off.
+const commitStats = createCommitStats();
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
 // Capture before entering the async lock so the actual writer survives the await boundary.
@@ -111,12 +152,15 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 // commands are rejected once past their deadline.
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 /**
- * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
- * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
- * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
+ * Background-only read-cache age in a Fabric runtime and its resident host. Ordinary reads
+ * are exact on change; only explicitly opted-in display observations reuse a recent parse.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs), active observers for
+ * 1 s. Fresh protocol decisions always bypass both age windows (smarty-dev#2355/#4383).
+ * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
-export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
+export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
+/** Floor for runtime background observations, including active turns (smarty-dev#4383). */
+export const MIN_BACKGROUND_MESH_READ_CACHE_MS = 1_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -127,8 +171,23 @@ export const meshCursorGeneration = (cursor: number): number => Math.floor(curso
 /** The cursor at the start of a generation's log. */
 export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
 
-const delay = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds));
+// Keep the normal global timer seam (including diagnostic/test clocks). An
+// aborted lifetime clears its referenced retry timer instead of awaiting the lock.
+const delay = (milliseconds: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 
 const errorCode = (error: unknown): string | undefined =>
   error instanceof Error && "code" in error && typeof error.code === "string"
@@ -287,10 +346,11 @@ const readState = (
 // observe the committed generation (the stat stamp alone can repeat, ABA). The signal is only a
 // hint: its `generation` (first field) must equal the canonical header, so a failed, crashed or
 // capped signal publication can never hide a commit; it only forces the canonical parse.
-// Fresh authoritative payload reads always parse the canonical file: legacy writers can copy an existing marker
-// unchanged, and repeated metadata plus that marker cannot prove the payload unchanged.
-// Nonfresh expired reads re-parse markerless files; copied-marker, same-stat rewrites remain
-// outside the nonfresh cache's change detection (smarty-dev#2355).
+// Fresh observations bypass the idle window, but not the physical-generation gate. High-resolution
+// inode/mtime/ctime metadata detects cooperating atomic and in-place replacements, including old
+// writers copying a UUID. If an adapter cannot supply that identity, fresh reads retain the canonical
+// payload fallback (#2355). Journal replay additionally binds both physical endpoints and every
+// delta through the chain head committed IN state.json; a self-checksummed sidecar is not authority.
 const MAX_SIGNAL_BYTES = 128 * 1024;
 const HEADER_BYTES = 64;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -329,11 +389,42 @@ const digestEntries = (entries: Iterable<MeshStateEntry>): string => {
 // Reuse is authorized only by exact fresh canonical text, then the entry's own version after
 // the locked transition. UUID/stat/version alone cannot defeat a copied-marker ABA (#2355, #2395).
 // Namespace hashes are always recomputed from this commit's bytes, never cached.
+interface PreparedLiveCatchUp {
+  dir: string;
+  after: number;
+  identity: string;
+  entries: MeshArchiveEntry[];
+}
+
+interface WriteStateSnapshot {
+  state: MeshStateFile;
+  reuse: Map<string, EncodedStateEntry> | undefined;
+  base: JournalBase;
+}
+interface PreparedStateCommit {
+  stamped: MeshStateFile;
+  generation: string;
+  encoded: ReturnType<typeof encodeState>;
+  journal: ReturnType<typeof prepareStateJournal>;
+  namespaces: Record<string, string> | undefined;
+  serializedText: string;
+  temporary?: string;
+}
+const WRITE_SNAPSHOT_CHANGED = Symbol("mesh write snapshot changed");
+
 interface EncodedStateEntry {
   version: number | undefined;
   member: Buffer;
   entry: Buffer;
 }
+const encodeEntry = (key: string, value: MeshStateEntry | undefined): EncodedStateEntry | undefined => {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) return undefined;
+  const encodedKey = JSON.stringify(key);
+  const member = Buffer.from(`${encodedKey}:${serialized}`, "utf8");
+  // Canonical member and hash input share the same UTF-8 bytes.
+  return { version: value?.version, member, entry: member.subarray(Buffer.byteLength(encodedKey, "utf8") + 1) };
+};
 const encodeState = (state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>): {
   serialized: Buffer; entries: Map<string, EncodedStateEntry>;
 } => {
@@ -354,16 +445,12 @@ const encodeState = (state: MeshStateFile, reuse?: Map<string, EncodedStateEntry
           fields.push(cached.member);
           continue;
         }
-        const serialized = JSON.stringify(state.entries[key]);
-        if (serialized === undefined) continue;
-        const encodedKey = JSON.stringify(key);
-        const bytes = Buffer.from(`${encodedKey}:${serialized}`, "utf8");
-        // The canonical member and the hash's entry-only view share the same UTF-8 bytes.
-        const entry = bytes.subarray(Buffer.byteLength(encodedKey, "utf8") + 1);
-        entries.set(key, { version: state.entries[key]?.version, member: bytes, entry });
+        const encoded = encodeEntry(key, state.entries[key]);
+        if (!encoded) continue;
+        entries.set(key, encoded);
         if (!first) fields.push(comma);
         first = false;
-        fields.push(bytes);
+        fields.push(encoded.member);
       }
       fields.push(Buffer.from("}"));
     } else {
@@ -394,7 +481,18 @@ const statStamp = (filePath: string): string | undefined => {
  * runtime MeshStore stays tolerant; readers that must not report false absence call this first.
  */
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
-  readState(path.join(root, "state.json"), maxBytes, false);
+  const file = path.resolve(root, "state.json");
+  const identity = stateReadIdentity(file, maxBytes);
+  const shared = processReadSnapshots.get(file)?.deref();
+  if (identity !== undefined && shared?.identity === identity && shared.canonicalReadable && shared.size <= maxBytes) return;
+  let readable = false;
+  const state = readState(file, maxBytes, false, () => { readable = true; });
+  if (identity !== undefined && stateReadIdentity(file, maxBytes) === identity) {
+    const stat = fs.statSync(file);
+    rememberReadSnapshot(file, { device: stat.dev, inode: stat.ino, size: stat.size, modifiedAt: stat.mtimeMs,
+      stamp: stampOf(stat), parsedAt: Date.now(), state, generation: generationOf(state), identity,
+      canonicalReadable: readable });
+  }
 };
 
 const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
@@ -517,6 +615,41 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
+interface MeshDedupeIntent {
+  dedupeKey: string;
+  reservedSequence: number;
+  eventId: string;
+  /** Byte offset captured before the live append; it makes recovery a direct read. */
+  liveOffset: number;
+  /** Captured before append: removing/changing archive configuration cannot authorize retry. */
+  archiveDir?: string;
+}
+
+export class MeshDedupeRecoveryError extends Error {
+  readonly retryable = true;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MeshDedupeRecoveryError";
+  }
+}
+
+interface ParsedStateSnapshot {
+  device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
+  generation: string | undefined;
+  identity: string | undefined;
+  canonicalReadable: boolean;
+  journalCursor?: JournalCursor;
+}
+// Reader snapshots only: mutable write transactions never share their state. Weak references
+// avoid retaining abandoned roots; a small key cap bounds stale root names too.
+const processReadSnapshots = new Map<string, WeakRef<ParsedStateSnapshot>>();
+const rememberReadSnapshot = (file: string, snapshot: ParsedStateSnapshot): void => {
+  if (processReadSnapshots.size >= 64 && !processReadSnapshots.has(file)) {
+    processReadSnapshots.delete(processReadSnapshots.keys().next().value!);
+  }
+  processReadSnapshots.set(file, new WeakRef(snapshot));
+};
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -524,6 +657,10 @@ export class MeshStore {
   readonly #generationPath: string;
   readonly #lockPath: string;
   readonly #lockProtocol: MeshLockProtocol;
+  readonly #ownIncarnation: Promise<string | undefined> | undefined;
+  #ownIncarnationReady = false;
+  #ownStartTime: string | undefined;
+  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
@@ -531,28 +668,36 @@ export class MeshStore {
   #writeEncodings: { serialized: string; entries: Map<string, EncodedStateEntry> } | undefined;
   /** The last full signal index parsed, keyed by its unique generation: one object, bounded. */
   #signalIndex: { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined;
+  #signalIdentity: string | undefined;
   readonly #maxEventLogBytes: number;
   readonly #retainedEventLogBytes: number;
   readonly #maxStateBytes: number;
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
+  readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #backgroundReadCacheMs: number | undefined;
+  readonly #readActive: (() => boolean) | undefined;
+  readonly #writeReadJournal: boolean;
+  #requireCanonicalRead = false;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
    * several readers at one cursor (a host's lifecycle subscriptions after a new event) moved it
    * past each other, and all but the first scanned the whole log again (smarty-dev#557).
    */
-  #readHints: { generation: number; inode: number; lines: Array<{ sequence: number; offset: number }> } | undefined;
-  #stateCache:
-    | {
-      device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
-      /** The payload's own canonical readGeneration; undefined for a legacy (no-marker) payload. */
-      generation: string | undefined;
-    }
-    | undefined;
+  #readHints: {
+    generation: number; inode: number;
+    lines: Array<{ sequence: number; offset: number }>;
+    /** LRU boundaries of readers paused behind the recent-line window (e.g. steer grace). */
+    anchors: Map<number, { sequence: number; offset: number }>;
+  } | undefined;
+  #stateCache: ParsedStateSnapshot | undefined;
+  #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
+  #journalBase: JournalBase | undefined;
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
+  #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
   constructor(
     readonly root: string,
@@ -564,6 +709,18 @@ export class MeshStore {
     const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
     if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
     this.#lockProtocol = lockProtocol;
+    // Prepare this immutable process identity once, at store construction rather
+    // than inside a registry-fenced acquisition. A cold bounded try fails closed
+    // until preparation finishes; the ordinary outside-custody recovery lane can
+    // wait for it. UNKNOWN still publishes the conservative three-line receipt.
+    if (lockProtocol === 2) {
+      this.#ownIncarnation = ownProcessIncarnation().then(start => {
+        this.#ownStartTime = start;
+        this.#ownIncarnationReady = true;
+        return start;
+      }, () => { this.#ownIncarnationReady = true; return undefined; });
+    }
+    this.#writeAbortSignal = options.writeSignal;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
     this.#counterPath = path.join(root, "sequence");
@@ -592,6 +749,10 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#backgroundReadCacheMs = options.backgroundReadCacheMs === undefined ? undefined
+      : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, Math.floor(options.backgroundReadCacheMs));
+    this.#readActive = options.readActive;
+    this.#writeReadJournal = options.writeReadJournal !== false;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -601,37 +762,237 @@ export class MeshStore {
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
   get readCacheMs(): number {
-    return this.#readCacheMs;
+    return this.#readActive?.() ? 0 : this.#readCacheMs;
   }
 
-  async publish(input: {
-    topic: string;
-    kind?: string;
-    from: MeshIdentity;
-    to?: string;
-    text?: string;
-    /** Host-only cancellation fence, checked under the lock before admission. */
-    signal?: AbortSignal | undefined;
-    /** Host-only relay metadata. The public provider never forwards args.principal. */
-    principal?: FabricPrincipal | undefined;
-    /** A function receives the commit time, under the lock (smarty-dev#816). */
-    data?: unknown;
-  }): Promise<MeshEvent> {
+  /** Opt-in background observations only; absence preserves legacy explicit TTL behavior. */
+  get backgroundReadCacheMs(): number {
+    if (this.#backgroundReadCacheMs === undefined) return this.readCacheMs;
+    return this.#readActive?.() ? MIN_BACKGROUND_MESH_READ_CACHE_MS : this.#backgroundReadCacheMs;
+  }
+
+  /** Time until an idle observer may revalidate; hits do not slide this deadline. */
+  get readCacheRemainingMs(): number {
+    return this.#stateCache ? Math.max(0, this.backgroundReadCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
+  }
+
+  #dedupePath(dedupeKey: string, suffix: string): string {
+    return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
+  }
+
+  #confirmEventFile(file: string): void {
+    const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+  }
+
+  #readDedupeReceipt(dedupeKey: string): MeshEvent | undefined {
+    const file = this.#dedupePath(dedupeKey, ".json");
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const event = JSON.parse(text) as MeshEvent;
+    if (event.dedupeKey !== dedupeKey || typeof event.id !== "string" || !Number.isSafeInteger(event.sequence)) {
+      throw new Error("Invalid event publication receipt");
+    }
+    // A visible rename whose final barrier failed is not yet a durable receipt.
+    this.#confirmEventFile(file);
+    return event;
+  }
+
+  #removeDedupeIntent(file: string): void {
+    fs.rmSync(file, { force: true });
+    syncPathNamespace(path.dirname(file));
+  }
+
+  /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
+  #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const stat = fs.fstatSync(descriptor);
+      if (intent.liveOffset >= stat.size) return undefined;
+      const bytes = Buffer.allocUnsafe(Math.min(this.maxEventBytes + 1, stat.size - intent.liveOffset));
+      const count = fs.readSync(descriptor, bytes, 0, bytes.length, intent.liveOffset);
+      const newline = bytes.subarray(0, count).indexOf(0x0a);
+      if (newline < 0) return undefined; // A partial append never committed.
+      const event = JSON.parse(bytes.subarray(0, newline).toString("utf8")) as MeshEvent;
+      return event.sequence === intent.reservedSequence && event.id === intent.eventId &&
+        event.dedupeKey === intent.dedupeKey ? event : undefined;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT" || error instanceof SyntaxError) return undefined;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive): MeshEvent | undefined {
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const intent = JSON.parse(text) as MeshDedupeIntent;
+    if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
+        (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
+        !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
+        typeof intent.eventId !== "string" || !intent.eventId ||
+        !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 ||
+        (intent.archiveDir !== undefined && (typeof intent.archiveDir !== "string" || !path.isAbsolute(intent.archiveDir))) ||
+        file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
+      throw new Error("Invalid event publication intent");
+    }
+    // A crash may also leave both the receipt and its intent. Never replace a receipt.
+    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const live = prior ? undefined : this.#readEventAtIntent(intent);
+    let event = prior ?? live;
+    if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
+    }
+    if (!event && !prior && archive) {
+      let entry: (MeshArchiveEntry & { committed: boolean }) | undefined;
+      try { entry = archive.lookupEntry(intent.reservedSequence); }
+      catch (error) {
+        if (error instanceof MeshArchiveLookupUnavailableError) {
+          throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive lookup is unavailable`, { cause: error });
+        }
+        throw error;
+      }
+      const archived = entry?.event;
+      if (archived?.id === intent.eventId && archived.dedupeKey !== intent.dedupeKey) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive key does not match`);
+      }
+      // A different archived identity positively proves this reservation is absent. Never
+      // abort that other event; leave its archive visibility and index intact.
+      if (entry && archived?.id === intent.eventId) {
+        this.#repairEventLog();
+        const lastLive = this.#readLastEventSequence();
+        if (lastLive < archived.sequence) {
+          // An archive append is not a publication. Restore its exact bytes before issuing
+          // a receipt, and update the anchor first so another death cannot append it twice.
+          let liveOffset = 0;
+          try { liveOffset = fs.statSync(this.#eventsPath).size; }
+          catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
+          fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
+          this.#confirmEventFile(this.#eventsPath);
+        }
+        // A false sidecar is not non-publication evidence: an old writer can recover a
+        // completed live append without updating it, then compact away the live anchor.
+        // An overtaken archive-only append is indistinguishable. Prefer its one archive
+        // delivery over loss; never append behind the live sequence or publish a new id.
+        archive.confirmLive(archived.sequence, archived.id);
+        const pending = archive.pending();
+        // Receipt recovery is direct metadata work. Leave closed-day sealing to the next
+        // ordinary archive append, never scan history just to resolve this intent.
+        if (pending?.id === archived.id && pending.sequence === archived.sequence) archive.commit(pending, false);
+        event = archived;
+      }
+    }
+    if (event && !prior) {
+      if (live) {
+        this.#confirmEventFile(this.#eventsPath);
+        archive?.confirmLive(live.sequence, live.id);
+        const pending = archive?.pending();
+        if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
+      }
+      writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
+    }
+    this.#removeDedupeIntent(file);
+    return event;
+  }
+
+  /** Under the mesh lock, settle all intents before a rewrite can invalidate byte offsets. */
+  #settleDedupeIntents(archive?: MeshArchive): void {
+    const directory = path.join(this.root, "event-receipts");
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
+      this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
+    }
+  }
+
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
-    const principal = copyFabricPrincipal(input.principal);
+    const principal = input.principal;
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
-    const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
-    return this.#withLock(() => {
+    const fixedData = stamp ? undefined : input.data;
+    input.signal?.throwIfAborted();
+    // Historical reads are prepared off-lock and validated before any mutation.
+    // An authoritative receipt needs no archive recovery, even if its mount is gone.
+    let preflight: MeshArchive | undefined;
+    if (!input.dedupeKey || !fs.existsSync(this.#dedupePath(input.dedupeKey, ".json"))) {
+      try { preflight = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (input.dedupeKey && fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
+          throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        }
+        throw error;
+      }
+    }
+    let prepared: MeshArchiveRecoveryPlan | undefined;
+    let digestRepair: ReturnType<MeshArchive["prepareDigestRepair"]>;
+    let liveCatchUp: PreparedLiveCatchUp | undefined;
+    try {
+      prepared = preflight?.prepareRecovery(this.#readLastEventSequence());
+      digestRepair = preflight?.prepareDigestRepair();
+      if (preflight) liveCatchUp = this.#prepareLiveCatchUp(preflight);
+    } catch (error) {
+      if (!(error instanceof MeshArchiveRecoveryChanged) && input.dedupeKey &&
+          fs.existsSync(this.#dedupePath(input.dedupeKey, ".pending.json"))) {
+        throw new MeshDedupeRecoveryError("Event archive preflight is unavailable during dedupe recovery", { cause: error });
+      }
+      throw error;
+    }
+    return () => {
       input.signal?.throwIfAborted();
+      const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
+      const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
+      if (input.dedupeKey) {
+        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        if (prior) {
+          // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
+          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          return prior;
+        }
+      }
+      let archive: MeshArchive | undefined;
+      try { archive = MeshArchive.fromRoot(this.root); }
+      catch (error) {
+        if (intentPath && fs.existsSync(intentPath)) throw new MeshDedupeRecoveryError("Event archive configuration is unavailable during dedupe recovery", { cause: error });
+        throw error;
+      }
+      // Fence a historical live-log read BEFORE repair/recovery/intent mutations.
+      if (archive && (archive.head()?.sequence ?? 0) < this.#readLastEventSequence()) {
+        if (!liveCatchUp || liveCatchUp.dir !== archive.dir ||
+          liveCatchUp.after > (archive.head()?.sequence ?? 0) ||
+          liveCatchUp.identity !== this.#liveLogIdentity()) throw new MeshArchiveRecoveryChanged();
+      }
       this.#repairEventLog();
-      const archive = MeshArchive.fromRoot(this.root);
-      if (archive) this.#recoverArchive(archive);
+      // Recover the whole reboot suffix before any one intent can advance the live horizon.
+      // In the same boot, defer ordinary pending cutback until the exact retry has settled.
+      // New keys still take only the normal recovery path, with no event-history lookup.
+      if (input.dedupeKey) {
+        if (archive && fs.existsSync(intentPath!)) {
+          try { this.#recoverArchive(archive, true, prepared, liveCatchUp); }
+          catch (error) {
+            if (error instanceof MeshArchiveRecoveryChanged) throw error;
+            throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
+          }
+        }
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
+        if (prior) return prior;
+      }
+      if (archive) {
+        this.#recoverArchive(archive, false, prepared, liveCatchUp);
+        if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
+      }
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
       const event: MeshEvent = {
         id: randomUUID(),
+        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
         sequence,
         topic: input.topic,
         kind: input.kind?.trim() || "message",
@@ -658,17 +1019,109 @@ export class MeshStore {
       // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
       // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
       atomicWrite(this.#counterPath, sequence);
+      let liveOffset = 0;
+      try { liveOffset = fs.statSync(this.#eventsPath).size; }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      if (intentPath) {
+        // A durable negative lookup exists before the intent. Only begin() can replace it
+        // with the synced archive line address, before any live append.
+        archive?.reserveLookup(sequence);
+        // This is the crash fence: the intent is durable before the live append begins.
+        writeFileAtomic(intentPath, JSON.stringify({
+          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+          ...(archive ? { archiveDir: archive.dir } : {}),
+        } satisfies MeshDedupeIntent), { durable: true });
+      }
       const pending = archive?.begin({ event, line });
+      // Test-only process-death fence: unlike an append exception, no rollback can run.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
       try {
+        if (batch) batch.appendStarted = true;
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
       } catch (error) {
         if (pending) archive!.rollback(pending);
         throw error;
       }
+      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
       if (pending) archive!.commit(pending);
-      this.#compactEventLog();
+      // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
+      if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+      if (receiptPath) {
+        this.#confirmEventFile(this.#eventsPath);
+        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+        if (intentPath) this.#removeDedupeIntent(intentPath);
+      }
+      if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
+      else {
+        this.#compactEventLog();
+        if (input.durable && !receiptPath) this.#confirmEventFile(this.#eventsPath);
+      }
       return event;
-    });
+    };
+  }
+
+  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+    // Freeze ordinary payload/principal bytes once, even if archive validation retries.
+    input = this.#capturePublication(input);
+    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
+    for (;;) {
+      try { return await this.#withLock(this.#preparePublish(input)); }
+      catch (error) {
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        await delay(0);
+      }
+    }
+  }
+
+  /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
+   * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
+   * Events retain publish's append/archive protocol, with one final durability barrier. A failed suffix
+   * is retried by the caller after checkpointing the returned committed prefix.
+   */
+  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
+    inputs = inputs.map(input => this.#capturePublication(input));
+    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
+    for (;;) {
+      try {
+        const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number } }> = [];
+        for (const input of inputs) {
+          const outcome = { appendStarted: false, bytes: 0 };
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome), outcome }); }
+          catch (error) { if (!prepared.length) throw error; break; }
+        }
+        return await this.#withLock(() => {
+          const started = performance.now();
+          const events: MeshEvent[] = [];
+          let bytes = 0;
+          for (const { commit, outcome } of prepared) {
+            // Keep the entire uncheckpointed prefix inside the retained tail, including
+            // a line-boundary slack event, rather than compacting away its recovery IDs.
+            if (events.length && (performance.now() - started >= 50 || bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
+            try { events.push(commit()); bytes += outcome.bytes; }
+            catch (error) {
+              // After append begins, success may be unknown. Stop rather than replay a
+              // possibly complete event; a restarted bridge reconciles its committed IDs.
+              if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });
+              if (!events.length) throw error;
+              break;
+            }
+          }
+          this.#compactEventLog();
+          this.#confirmEventFile(this.#eventsPath);
+          return events;
+        });
+      } catch (error) {
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        await delay(0);
+      }
+    }
+  }
+
+  #capturePublication(input: MeshPublishInput): MeshPublishInput {
+    return { ...input, principal: copyFabricPrincipal(input.principal),
+      data: typeof input.data === "function" || input.data === undefined ? input.data : jsonClone(input.data) };
   }
 
   read(
@@ -736,8 +1189,10 @@ export class MeshStore {
   // stopped between its archive append and its commit is cut back out; if its event did go
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
-  #recoverArchive(archive: MeshArchive): void {
-    const recovery = archive.recover(this.#readLastEventSequence());
+  #recoverArchive(archive: MeshArchive, rebootOnly = false, prepared?: MeshArchiveRecoveryPlan,
+    liveCatchUp?: PreparedLiveCatchUp): void {
+    const recovery = archive.recover(this.#readLastEventSequence(), prepared, rebootOnly);
+    if (rebootOnly && !recovery.rebooted) return;
     if (recovery.rebooted) {
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.
@@ -752,19 +1207,46 @@ export class MeshStore {
         }
         atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
       }
-      archive.recovered(last);
+      archive.recovered(last, recovery.promote);
     }
     const archived = archive.head()?.sequence ?? 0;
-    if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
+    if (archived < this.#readLastEventSequence()) {
+      if (!liveCatchUp || liveCatchUp.dir !== archive.dir || liveCatchUp.after > archived) throw new MeshArchiveRecoveryChanged();
+      archive.catchUp(liveCatchUp.entries.filter(entry => entry.event.sequence > archived));
+    }
+  }
+
+  #liveLogIdentity(): string {
+    try {
+      const stat = fs.statSync(this.#eventsPath, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs ?? stat.mtimeMs}:${stat.ctimeNs ?? stat.ctimeMs}`;
+    } catch (error) { if (errorCode(error) === "ENOENT") return "absent"; throw error; }
+  }
+
+  #prepareLiveCatchUp(archive: MeshArchive): PreparedLiveCatchUp | undefined {
+    const after = archive.head()?.sequence ?? 0;
+    if (after >= this.#readLastEventSequence()) {
+      this.#preparedLiveCatchUp = undefined;
+      return undefined;
+    }
+    const identity = this.#liveLogIdentity();
+    const cached = this.#preparedLiveCatchUp;
+    if (cached?.dir === archive.dir && cached.after === after && cached.identity === identity) return cached;
+    // Only complete lines are committed. A torn suffix is repaired under custody;
+    // capture its complete byte boundary here so it is never archived by this scan.
+    const offset = this.#decodeCursor(this.latestOffset()).offset;
+    const entries = this.#liveEntriesAfter(after, offset);
+    if (this.#liveLogIdentity() !== identity) throw new MeshArchiveRecoveryChanged();
+    return this.#preparedLiveCatchUp = { dir: archive.dir, after, identity, entries };
   }
 
   // Live lines after a sequence, oldest first. It reads back from the end, so the usual one or
   // two unarchived events cost one chunk.
-  #liveEntriesAfter(after: number): MeshArchiveEntry[] {
+  #liveEntriesAfter(after: number, endOffset?: number): MeshArchiveEntry[] {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
-      let position = fs.fstatSync(descriptor).size;
+      let position = Math.min(fs.fstatSync(descriptor).size, endOffset ?? Number.MAX_SAFE_INTEGER);
       let carry = Buffer.alloc(0);
       const entries: MeshArchiveEntry[] = [];
       while (position > 0) {
@@ -992,16 +1474,17 @@ export class MeshStore {
       // each read scanned the whole log (tens of MB on the fleet) from the start
       // (smarty-dev#557). A rotated log is a new file and generation, and the hint must end a line.
       const generation = this.#readGeneration();
-      const hints = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
-        ? this.#readHints.lines
-        : [];
-      let position = 0;
-      for (let index = hints.length - 1; index >= 0; index--) {
-        const hint = hints[index]!;
-        if (hint.sequence > after) continue;
-        if (hint.offset <= size && this.#endsLine(descriptor, hint.offset)) position = hint.offset;
-        break;
+      const cached = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
+        ? this.#readHints : undefined;
+      const hints = cached?.lines ?? [];
+      const anchors = cached?.anchors ?? new Map<number, { sequence: number; offset: number }>();
+      let boundary: { sequence: number; offset: number } | undefined;
+      for (const hint of [...hints, ...anchors.values()]) {
+        if (hint.sequence <= after && (!boundary || hint.sequence > boundary.sequence)) boundary = hint;
       }
+      let position = 0;
+      if (boundary && boundary.offset <= size && this.#endsLine(descriptor, boundary.offset)) position = boundary.offset;
+      else boundary = undefined;
       const scanned: Array<{ sequence: number; offset: number }> = [];
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
@@ -1015,7 +1498,9 @@ export class MeshStore {
           try {
             const event = JSON.parse(line) as MeshEvent;
             if (typeof event.sequence === "number" && lineEnd !== undefined) {
-              scanned.push({ sequence: event.sequence, offset: lineEnd });
+              const hint = { sequence: event.sequence, offset: lineEnd };
+              scanned.push(hint);
+              if (event.sequence <= after) boundary = hint;
               if (scanned.length > 2 * READ_HINT_LINES) scanned.splice(0, scanned.length - READ_HINT_LINES);
             }
             if (
@@ -1062,12 +1547,22 @@ export class MeshStore {
         }
       }
       if (!reachedLimit && (lineBytes > 0 || skippingOversizedLine)) emitLine();
-      if (scanned.length > 0) {
+      // A page can read hundreds of events beyond `after` while its caller waits at a grace
+      // boundary. Keeping only the last 128 lines evicted that boundary on every poll, making
+      // idle wakes scan the entire fleet log twice. Retain bounded reader anchors separately;
+      // they use the same generation/inode/line-end checks, never delivery authority (#2039).
+      if (boundary) {
+        anchors.delete(after);
+        anchors.set(after, boundary);
+        if (anchors.size > READ_HINT_LINES) anchors.delete(anchors.keys().next().value!);
+      }
+      if (scanned.length > 0 || boundary) {
         const lines = new Map(hints.map((hint) => [hint.sequence, hint.offset]));
         for (const line of scanned) lines.set(line.sequence, line.offset);
         this.#readHints = {
           generation,
           inode: stat.ino,
+          anchors,
           lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
             .map(([sequence, offset]) => ({ sequence, offset })),
         };
@@ -1093,19 +1588,22 @@ export class MeshStore {
     return true;
   }
 
-  // fresh: read and parse the canonical file, bypassing all snapshot reuse, for a read that
-  // decides a protocol step rather than a listing.
+  // Fresh protocol observations bypass idle coalescing, not the physical commit gate.
+  // Actual writes still read authoritative bytes under the lock and apply verified CAS.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState(options.fresh === true).entries;
+    const state = options.fresh === true || options.snapshot === undefined
+      ? this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true)
+      : options.snapshot as MeshStateFile;
+    const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
-  list(prefix = "", limit = 100): MeshStateEntry[] {
+  list(prefix = "", limit = 100, options: MeshReadOptions = {}): MeshStateEntry[] {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
     // Clone only the page: the dashboard lists the first 200 of the whole fleet state, and
     // cloning every entry to keep 200 was a large share of an idle Pi's CPU (smarty-dev#557).
-    return this.#select(prefix, {}).slice(0, boundedLimit).map((entry) => jsonClone(entry));
+    return this.#select(prefix, options).slice(0, boundedLimit).map((entry) => jsonClone(entry));
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
@@ -1119,7 +1617,7 @@ export class MeshStore {
    * while the token is unchanged (smarty-dev#557).
    */
   stateToken(options: MeshReadOptions = {}): object {
-    return this.#readCachedState(options.fresh === true);
+    return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true);
   }
 
   /**
@@ -1134,9 +1632,10 @@ export class MeshStore {
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     const fresh = options.fresh === true;
-    const state = options.snapshot !== undefined
+    const state = options.snapshot !== undefined && !fresh
       ? options.snapshot as MeshStateFile
-      : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
+      : (!fresh && this.#signalledState(prefix, options.background === true)) ||
+        this.#readCachedState(fresh, fresh, options.background === true);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {
@@ -1158,10 +1657,11 @@ export class MeshStore {
   // The cached parse, when the reuse window expired, the canonical generation changed, and the read signal bound
   // to the file's exact current stat shows this prefix's namespace unchanged. Otherwise undefined:
   // the caller re-reads as before. Never used by fresh reads or with readCacheMs 0.
-  #signalledState(prefix: string): MeshStateFile | undefined {
+  #signalledState(prefix: string, background: boolean): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    if (!cached || !namespace || this.#readCacheMs <= 0 || Date.now() - cached.parsedAt < this.#readCacheMs) return undefined;
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
+    if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
     // The canonical header decides, not the stat (which can repeat): an unchanged generation is
@@ -1183,6 +1683,8 @@ export class MeshStore {
   // The current signal's index: its bounded header every call, the full body only when the
   // generation differs from the memoized one (once per commit, across all namespaces).
   #readSignalIndex(): { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined {
+    const identity = stateReadIdentity(this.#signalPath, MAX_SIGNAL_BYTES);
+    if (identity !== undefined && this.#signalIdentity === identity && this.#signalIndex) return this.#signalIndex;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#signalPath, "r");
@@ -1199,6 +1701,7 @@ export class MeshStore {
         signal?.generation !== generation || typeof signal.stamp !== "string" ||
         typeof namespaces !== "object" || namespaces === null || Array.isArray(namespaces)
       ) return undefined;
+      if (identity !== undefined && stateReadIdentity(this.#signalPath, MAX_SIGNAL_BYTES) === identity) this.#signalIdentity = identity;
       return this.#signalIndex = { generation, stamp: signal.stamp, namespaces: namespaces as Record<string, unknown> };
     } catch {
       return undefined;
@@ -1207,13 +1710,21 @@ export class MeshStore {
     }
   }
 
-  // The canonical state.json's commit generation from its 64-byte header: open, read, close.
+  // Canonical commit UUID and optional journal hash: one bounded header per physical generation.
   // undefined: a legacy file without a marker; false: unreadable, which never matches a label.
   #canonicalGeneration(): string | undefined | false {
+    const identity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+    if (identity !== undefined && this.#canonicalHeader?.identity === identity) return this.#canonicalHeader.generation;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#statePath, "r");
-      return readHeader(descriptor, STATE_HEADER);
+      const buffer = Buffer.alloc(192);
+      const read = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+      const header = buffer.toString("latin1", 0, read);
+      const generation = STATE_HEADER.exec(header)?.[1];
+      const journalHash = /^\{"readGeneration":"[0-9a-f-]{36}","readJournalHash":"([0-9a-f]{64})"/.exec(header)?.[1];
+      if (identity !== undefined && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity) this.#canonicalHeader = { identity, generation, journalHash };
+      return generation;
     } catch {
       return false;
     } finally {
@@ -1233,15 +1744,97 @@ export class MeshStore {
     return digest;
   }
 
-  // A writer still reads and parses the canonical file under the lock on every operation.
-  #readStateForWrite(): { state: MeshStateFile; reuse: Map<string, EncodedStateEntry> | undefined } {
+  // Capture canonical bytes OUTSIDE custody. The physical identity is rechecked around
+  // preparation and again under the lock; copied UUID/version labels are never authority.
+  #readStateForWrite(): WriteStateSnapshot {
     let reuse: Map<string, EncodedStateEntry> | undefined;
     const state = readState(this.#statePath, this.#maxStateBytes, false, (serialized) => {
       // Full content equality, not UUID/stat/version equality: a legacy copied-marker writer
       // can change an entry without advancing any of those labels. Always read and parse fresh.
       if (serialized === this.#writeEncodings?.serialized) reuse = this.#writeEncodings.entries;
     });
-    return { state, reuse };
+    return { state, reuse, base: journalBase(state, this.#statePath) };
+  }
+
+  #stateWriteIdentity(): string | undefined {
+    const identity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+    if (identity !== undefined) return identity;
+    try { fs.statSync(this.#statePath); }
+    catch (error) { if (errorCode(error) === "ENOENT") return "absent"; }
+    // Adapters without usable physical metadata retain the conservative locked read.
+    return undefined;
+  }
+
+  async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
+    commit: (prepared: P) => T, cleanup?: (prepared: P) => void): Promise<T> {
+    const scope = this.#tryLockScope.getStore();
+    const deadline = Date.now() + this.#lockTimeoutMs;
+    // The reduced remaining budget below must not turn an ordinary cold protocol-2
+    // write into a bounded custody try. Await constructor preparation outside custody;
+    // an actual registry-fenced try still fails closed promptly in #withLock.
+    if (this.#lockProtocol === 2 && !this.#ownIncarnationReady && !scope?.active) {
+      await this.#ownIncarnation;
+    }
+    for (;;) {
+      this.#writeAbortSignal?.throwIfAborted();
+      const identity = this.#stateWriteIdentity();
+      if (identity === undefined) {
+        return this.#withLock(() => {
+          const prepared = prepare(this.#readStateForWrite());
+          try { return commit(prepared); } finally { cleanup?.(prepared); }
+        });
+      }
+      let admitted = false;
+      let prepared: P | undefined;
+      try {
+        prepared = prepare(this.#readStateForWrite());
+        if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
+        return await this.#withLock(() => {
+          if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
+          admitted = true;
+          return commit(prepared!);
+        }, Math.max(0, deadline - Date.now()));
+      } catch (error) {
+        // A stale CAS/parse/size error belongs to the snapshot, not the current file.
+        if (error !== WRITE_SNAPSHOT_CHANGED && (admitted || this.#stateWriteIdentity() === identity)) {
+          this.#stateCache = undefined;
+          throw error;
+        }
+        // Never retry inside an actor registry fence: its caller releases custody and
+        // retries the whole admission step, just as for a busy mesh.
+        if (scope?.active || Date.now() >= deadline) {
+          throw new MeshLockTimeoutError(describeLockHolder(path.join(this.#lockPath, "owner")), 0, 0);
+        }
+        await delay(0, this.#writeAbortSignal);
+      } finally {
+        if (prepared !== undefined) cleanup?.(prepared);
+      }
+    }
+  }
+
+  // Only pure single-key transitions may be prepared optimistically. Callback batches
+  // still select and invoke their callbacks exactly once under validated custody.
+  async #writeState<T>(change: (state: MeshStateFile) => { result: T; keys?: string[] }, caller?: string[]): Promise<T> {
+    return this.#withWriteSnapshot(({ state, reuse, base }) => {
+      const outcome = change(state);
+      const prepared = outcome.keys ? this.#prepareStateCommit(state, reuse, outcome.keys, base) : undefined;
+      if (prepared) {
+        // State remains a soft-state atomic replacement (no durability policy change).
+        // Stage the large write off-lock too; custody only compares identity and renames.
+        const temporary = `${this.#statePath}.${process.pid}.${randomUUID()}.prepared.tmp`;
+        writeFileAtomic(temporary, prepared.encoded.serialized);
+        prepared.temporary = temporary;
+      }
+      return { state, ...outcome, prepared };
+    }, ({ state, result, keys, prepared }) => {
+      if (prepared) this.#commitPreparedState(prepared, keys!, caller);
+      else this.#cacheState(state, undefined);
+      return result;
+    }, ({ prepared }) => {
+      if (prepared?.temporary) {
+        try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+      }
+    });
   }
 
   // A commit's write, signal and cache, under the lock. The stamp is taken right after the rename,
@@ -1252,20 +1845,54 @@ export class MeshStore {
   // The commit's new readGeneration is serialized FIRST and atomically with the payload (the
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
-  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
+  #commitState(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined, keys: string[], caller: string[] | undefined,
+    namespaces?: Record<string, string>): void {
+    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller);
+  }
+
+  #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
+    keys: string[], base: JournalBase | undefined, namespaces?: Record<string, string>): PreparedStateCommit {
     const payload: MeshStateFile = { ...state };
     delete payload.readGeneration;
+    delete payload.readJournalHash;
     const generation = randomUUID();
-    const stamped: MeshStateFile = { readGeneration: generation, ...payload };
-    const encoded = encodeState(stamped, reuse);
+    const unstamped: MeshStateFile = { readGeneration: generation, ...payload };
+    const canonical = encodeState(unstamped, reuse);
+    let journal = this.#writeReadJournal ? prepareStateJournal(unstamped, base, keys, canonical.entries, canonical.serialized) : undefined;
+    let stamped: MeshStateFile = journal
+      ? { readGeneration: generation, readJournalHash: journal.hash, ...payload } : unstamped;
+    let encoded = journal ? encodeState(stamped, canonical.entries) : canonical;
+    // An optional accelerator must not reject a write whose canonical payload fits.
+    // Omit the chain head/record at the cap; readers safely fall back to canonical bytes.
+    if (journal && encoded.serialized.byteLength > this.#maxStateBytes) {
+      journal = undefined; stamped = unstamped; encoded = canonical;
+    }
     if (encoded.serialized.byteLength > this.#maxStateBytes) {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
     }
-    writeFileAtomic(this.#statePath, encoded.serialized);
+    // Batch preparation hashes unchanged namespaces outside custody from this exact
+    // snapshot. Never reuse a digest for a namespace changed by a locked callback.
+    const unchanged = { ...namespaces };
+    for (const key of keys) {
+      const namespace = keyNamespace(key);
+      if (namespace) delete unchanged[namespace];
+    }
+    return { stamped, generation, encoded, journal, namespaces: this.#signalNamespaces(encoded.entries, unchanged),
+      serializedText: encoded.serialized.toString("utf8") };
+  }
+
+  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
+    const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
+    if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
+    else writeFileAtomic(this.#statePath, encoded.serialized);
+    commitStats?.record(encoded.serialized.byteLength, keys);
     const stamp = statStamp(this.#statePath);
-    if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
+    if (stamp !== undefined) {
+      if (this.#writeReadJournal) appendStateJournal(this.root, journal, stamp);
+      this.#writeSignal(encoded.entries, stamp, generation, namespaces);
+    }
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
-    this.#writeEncodings = { serialized: encoded.serialized.toString("utf8"), entries: encoded.entries };
+    this.#writeEncodings = { serialized: serializedText, entries: encoded.entries };
     const trace = process.env.PI_FABRIC_COMMIT_TRACE;
     if (trace) {
       try {
@@ -1277,21 +1904,29 @@ export class MeshStore {
 
   // Best effort, after a commit: a failure leaves an older signal whose generation no longer
   // matches the canonical header, which only forces re-reads. It never fails the committed write.
-  #writeSignal(entries: Map<string, EncodedStateEntry>, stamp: string, generation: string): boolean {
+  #signalNamespaces(entries: Map<string, EncodedStateEntry>, reuse: Record<string, string> = {},
+    omit: Set<string | undefined> = new Set()): Record<string, string> | undefined {
     try {
       const hashes = new Map<string, ReturnType<typeof createHash>>();
       const delimiter = Buffer.from("\n");
       // Same ordered entry bytes and newline framing as digestEntries, without re-encoding.
       for (const key of sortedKeys([...entries.keys()])) {
         const namespace = keyNamespace(key);
-        if (!namespace) continue;
+        if (!namespace || Object.hasOwn(reuse, namespace) || omit.has(namespace)) continue;
         let hash = hashes.get(namespace);
         if (!hash) hashes.set(namespace, hash = createHash("sha256"));
         hash.update(entries.get(key)!.entry).update(delimiter);
       }
-      const namespaces: Record<string, string> = {};
+      const namespaces: Record<string, string> = { ...reuse };
       for (const [namespace, hash] of hashes) namespaces[namespace] = hash.digest("base64");
-      if (statStamp(this.#statePath) !== stamp) return false;   // replaced while hashing: publish nothing
+      return namespaces;
+    } catch { return undefined; } // Optional acceleration must never reject a canonical commit.
+  }
+
+  #writeSignal(entries: Map<string, EncodedStateEntry>, stamp: string, generation: string,
+    namespaces = this.#signalNamespaces(entries)): boolean {
+    try {
+      if (!namespaces || statStamp(this.#statePath) !== stamp) return false;   // replaced while preparing: publish nothing
       // `generation` first: readers take it from the file's first HEADER_BYTES; it must equal the canonical readGeneration.
       const serialized = JSON.stringify({ generation, stamp, namespaces });
       if (Buffer.byteLength(serialized, "utf8") > MAX_SIGNAL_BYTES) return false;
@@ -1313,8 +1948,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
-    return this.#withLock(() => {
-      const { state, reuse } = this.#readStateForWrite();
+    return this.#writeState((state) => {
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -1335,27 +1969,42 @@ export class MeshStore {
       state.highWater = plan.highWater;
       state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((key) => key !== plan.key);
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse, [plan.key], caller);
-      return jsonClone(entry);
+      return { result: jsonClone(entry), keys: [plan.key] };
+    }, caller);
+  }
+
+  /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
+   * Registry -> mesh publication retains custody through source selection and copies,
+   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * release registry fences and retry the whole step. This acquires NO lock itself.
+   * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
+  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
+    // Nested helpers retain the surrounding try budget and its lifetime.
+    const inherited = this.#tryLockScope.getStore();
+    if (inherited?.active) return operation();
+    const scope = { active: true, timeoutMs: Math.max(0, timeoutMs) };
+    return this.#tryLockScope.run(scope, async () => {
+      try { return await operation(); }
+      finally { scope.active = false; }
     });
   }
 
-  /**
-   * Runs an operation under the mesh lock without touching the state: for a rare step that must
-   * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
-   */
-  async exclusive<T>(operation: () => T): Promise<T> {
-    return this.#withLock(operation);
+  /** Runs a synchronous operation under mesh custody without writing shared state. */
+  async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs);
   }
 
   /**
    * Takes and releases the mesh lock without writing the state: evidence that the shared state is
-   * writable now, for a heartbeat that renewed only its file lease. Discards this store's cached
-   * snapshot so the next state read must read the canonical file, even if metadata is unchanged.
+   * writable now, for a heartbeat that renewed only its file lease. Revalidates on the next
+   * read without discarding an unchanged parsed snapshot. Explicit confirmation starts one
+   * new fixed idle window; ordinary cache hits never slide that deadline.
    */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
     await this.#withLock(() => {
-      this.#stateCache = undefined;
+      // Invalidate observation age, not the payload. Metadata + generation still guard reuse.
+      this.#requireCanonicalRead = true;
+      if (this.#stateCache) this.#stateCache = { ...this.#stateCache, parsedAt: 0 };
       onAcquired?.(Date.now());
     });
   }
@@ -1368,13 +2017,11 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
-    return this.#withLock(() => {
-      const { state, reuse } = this.#readStateForWrite();
+    return this.#writeState<{ deleted: boolean; version?: number }>((state) => {
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind === "unchanged") {
-        this.#cacheState(state, undefined);
-        return { deleted: false };
+        return { result: { deleted: false } };
       }
       if (plan.kind !== "delete") throw new Error("Invalid verified storage delete plan");
       delete state.entries[plan.key];
@@ -1392,9 +2039,8 @@ export class MeshStore {
         plan.key,
       ];
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse, [plan.key], caller);
-      return { deleted: true, version: plan.version };
-    });
+      return { result: { deleted: true, version: plan.version }, keys: [plan.key] };
+    }, caller);
   }
 
   // Applies several puts and deletes in ONE locked read-modify-write, so a caller that
@@ -1416,11 +2062,23 @@ export class MeshStore {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
-    return this.#withLock(() => {
+    return this.#withWriteSnapshot(snapshot => {
+      const omitted = new Set(input.ops.map(op => op.key));
+      const reuse = new Map(snapshot.reuse);
+      // Cold multi-process writers pre-encode retained entries before custody too.
+      // Explicitly changed/deleted keys are encoded only after their locked transition.
+      for (const key of Object.keys(snapshot.state.entries)) {
+        if (omitted.has(key) || reuse.has(key)) continue;
+        const encoded = encodeEntry(key, snapshot.state.entries[key]);
+        if (encoded) reuse.set(key, encoded);
+      }
+      const namespaces = this.#signalNamespaces(reuse, {}, new Set(input.ops.map(op => keyNamespace(op.key))));
+      return { ...snapshot, reuse, namespaces };
+    }, ({ state, reuse, base, namespaces }) => {
+      this.#journalBase = base;
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
       // state is the same write barrier.
-      const { state, reuse } = this.#readStateForWrite();
       state.versions ??= {};
       const tombstones = new Set(state.tombstoneOrder ?? []);
       const results: MeshBatchResult[] = [];
@@ -1488,7 +2146,7 @@ export class MeshStore {
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller);
+        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller, namespaces);
       }
       input.afterCommit?.(view);
       return results;
@@ -1510,8 +2168,8 @@ export class MeshStore {
 
   /**
    * The stamp of the state payload that reads now return, from this store's cache. With fresh,
-   * revalidate through the ordinary read-cache window, not authoritative payload freshness.
-   * This UI observer may lag remote changes by readCacheMs; observing a cached payload does
+   * revalidate through the background read-cache window, not authoritative payload freshness.
+   * This UI observer may lag remote changes by backgroundReadCacheMs; observing a cached payload does
    * not extend its age window. Expired reads use ordinary metadata/header validation and fallback.
    * An explicit remote rebuild may opt into revalidateGeneration: a new canonical UUID bypasses
    * even a warm window. Matching/copied, missing or unreadable markers keep ordinary TTL behavior;
@@ -1523,11 +2181,11 @@ export class MeshStore {
       try {
         const cached = this.#stateCache;
         let changed = false;
-        if (revalidateGeneration && cached && this.#readCacheMs > 0 && Date.now() - cached.parsedAt < this.#readCacheMs) {
+        if (revalidateGeneration && cached && this.backgroundReadCacheMs > 0 && Date.now() - cached.parsedAt < this.backgroundReadCacheMs) {
           const generation = this.#canonicalGeneration();
           changed = typeof generation === "string" && generation !== cached.generation;
         }
-        this.#readCachedState(changed, false); // observer only; public fresh payload reads stay canonical
+        this.#readCachedState(changed, false, true); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }
@@ -1536,49 +2194,101 @@ export class MeshStore {
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
-  #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
+  #readCachedState(fresh = false, canonical = fresh, background = false): MeshStateFile {
+    const confirmed = this.#requireCanonicalRead;
+    if (confirmed) { fresh = true; canonical = true; this.#requireCanonicalRead = false; }
     const recent = this.#stateCache;
-    if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+    const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
+    if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
     let before: string;
+    let beforeIdentity: string | undefined;
+    let replayFailed = false;
     try {
-      before = stampOf(fs.statSync(this.#statePath));
-      // Metadata alone can repeat (ABA): a same-stamp cache is reused only while the canonical
-      // header still names the payload's own generation (a 64-byte peek, not a parse). A payload
-      // without a marker (legacy) is UNKNOWN: expired nonfresh reads always re-parse it.
-      // Only the UI observer (fresh, !canonical) may reuse matching metadata + missing header.
+      const observed = fs.statSync(this.#statePath);
+      if (observed.size > this.#maxStateBytes) throw new Error(`Failed to read Fabric mesh state: state exceeds ${this.#maxStateBytes} bytes`);
+      before = stampOf(observed);
+      const identity = beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+      const generation = this.#canonicalGeneration();
       const cached = this.#stateCache;
-      if (
-        !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) && cached.generation === this.#canonicalGeneration()
-      ) return cached.state;
+      // Nanosecond ctime/inode also detect an older writer that copies the UUID or writes
+      // in place. Without that identity retain the historical conservative fresh fallback.
+      const matches = (snapshot: ParsedStateSnapshot | undefined): boolean =>
+        !!snapshot && snapshot.size <= this.#maxStateBytes && snapshot.stamp === before &&
+        identity !== undefined && snapshot.identity === identity &&
+        (generation === undefined || snapshot.generation === generation); // Legacy markers need not occupy the header.
+      if (cached && matches(cached)) {
+        if (confirmed) this.#stateCache = { ...cached, parsedAt: Date.now() };
+        return cached.state;
+      }
+      // A copied marker/rounded stat cannot override a changed high-resolution identity.
+      // Only adapters without that identity retain the historical nonfresh fallback.
+      if (identity === undefined && !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) &&
+        cached.generation === generation) return cached.state;
+      const shared = processReadSnapshots.get(path.resolve(this.#statePath))?.deref();
+      if (shared && matches(shared)) {
+        this.#stateCache = confirmed ? { ...shared, parsedAt: Date.now() } : shared;
+        return shared.state;
+      }
+      // A newly constructed store can replay from this process's prior snapshot too;
+      // it need not parse the whole file merely because another store observed it first.
+      const base = cached ?? shared;
+      if (base && identity !== undefined && typeof generation === "string" &&
+        this.#canonicalHeader?.journalHash !== undefined) {
+        const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
+          this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor);
+        if (replay && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity && this.#canonicalGeneration() === generation &&
+          this.#cacheState(replay.state, before, true, identity)) {
+          this.#stateCache!.journalCursor = replay.cursor;
+          rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
+          return replay.state;
+        }
+        replayFailed = true;
+      }
     } catch (error) {
       this.#stateCache = undefined;
       if (errorCode(error) === "ENOENT") return emptyState();
       throw error;
+    }
+    if (replayFailed) {
+      // Failed verification may have consumed a replaced Windows file. Discard its
+      // header/endpoints only on recovery, not on an ordinary canonical parse.
+      this.#canonicalHeader = undefined;
+      before = statStamp(this.#statePath) ?? before;
+      beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
     }
     // A payload is cached only under the stamp seen both before and after its read: a commit
     // landing during the parse must not label the older payload with the newer file's stamp.
     // The label is the parsed payload's own canonical readGeneration, never a separately observed
     // marker, so an older payload can never carry a newer commit's generation.
     for (let attempt = 0; ; attempt++) {
-      const state = readState(this.#statePath, this.#maxStateBytes);
-      if (this.#cacheState(state, before)) return state;
+      let readable = false;
+      const state = readState(this.#statePath, this.#maxStateBytes, true, () => { readable = true; });
+      if (this.#cacheState(state, before, readable, beforeIdentity)) {
+        rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
+        return state;
+      }
       const next = statStamp(this.#statePath);
       if (attempt >= 2 || next === undefined) {
         this.#stateCache = undefined;                   // served once, never cached or stamped
         return state;
       }
       before = next;
+      beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
     }
   }
 
   // Under the lock (writes) no expected stamp is needed; lock-free reads pass the pre-read stamp.
   // The entry is labelled with the payload's own canonical generation.
-  #cacheState(state: MeshStateFile, expectedStamp: string | undefined): boolean {
+  #cacheState(state: MeshStateFile, expectedStamp: string | undefined, canonicalReadable = true, expectedIdentity?: string): boolean {
     try {
       const stat = fs.statSync(this.#statePath);
       if (expectedStamp !== undefined && stampOf(stat) !== expectedStamp) return false;
+      const identity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+      // Pin both physical endpoints: a same-marker replacement during a full parse must
+      // never label older bytes with the replacement's identity, even when the stat repeats.
+      if (expectedIdentity !== undefined && identity !== expectedIdentity) return false;
       this.#stateCache = {
         device: stat.dev,
         inode: stat.ino,
@@ -1588,6 +2298,8 @@ export class MeshStore {
         parsedAt: Date.now(),
         state,
         generation: generationOf(state),
+        identity,
+        canonicalReadable,
       };
       return true;
     } catch {
@@ -1596,12 +2308,26 @@ export class MeshStore {
     }
   }
 
-  async #withLock<T>(operation: () => T): Promise<T> {
+  // Global actor-custody order: actor registries (sorted path), then mesh.
+  // Mesh critical sections are synchronous: never await a registry mutation
+  // here or wrap resident async controls in this second/innermost lock.
+  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
+    this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + this.#lockTimeoutMs;
-    const token = randomUUID();
+    // A registry-fenced publisher gets only a short try, never the ordinary wait.
+    // Async-local scope leaves concurrent ordinary callers on their own budget.
+    const scope = this.#tryLockScope.getStore();
+    const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
+    if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
+      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+    }
+    const startTime = this.#lockProtocol === 2
+      ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
+      : undefined;
+    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
@@ -1616,98 +2342,109 @@ export class MeshStore {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    // Attempts and the largest gap between two of them: a large gap means this waiter stalled
-    // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
-    let attempts = 0;
-    let maxGapMs = 0;
-    let lastAttemptAt = Date.now();
-    let retryAttempt = 0;
-    while (true) {
-      const attemptAt = Date.now();
-      if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
-      attempts += 1;
-      lastAttemptAt = attemptAt;
-      try {
-        if (this.#lockProtocol === 1) {
-          // Keep the B68 three-line wire, but never overwrite an owner published by a
-          // successor while this initializer was stopped after canonical mkdir.
-          fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-          const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
-            code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
-          });
-          try {
-            const directory = fs.lstatSync(this.#lockPath);
-            fs.writeFileSync(ownerPath, ownerRecord, {
-              encoding: "utf8", flag: "wx", mode: 0o600,
-            });
-            // The exclusive create may itself have paused with an open descriptor to a
-            // recovered directory. Prove publication still belongs to the canonical lock
-            // before entering the critical section; never clean a successor on failure.
-            const current = fs.lstatSync(this.#lockPath);
-            if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
-              fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
-          } catch (error) {
-            // A resumed initializer may have published into an empty replacement before
-            // rejecting its directory identity. Remove only that attempt's exact receipt.
-            releaseOwned();
-            if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
-            throw error;
-          }
-        } else {
-          // Never expose an ownerless canonical directory: a stalled initializer must not
-          // resume its owner write through a name that legacy recovery gave to a successor.
-          const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
-          try {
-            fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
-              encoding: "utf8", flag: "wx", mode: 0o600,
-            });
-            // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
-            // lock may be an in-flight creator. Route every observed canonical path through
-            // the original owner/stale checks instead of publishing over it.
-            try {
-              fs.lstatSync(this.#lockPath);
-              throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
-            } catch (error) {
-              if (errorCode(error) !== "ENOENT") throw error;
-            }
-            // New-format competitors publish nonempty owners atomically. This does not fence
-            // old-format writers that create an empty canonical after the absence check.
-            fs.renameSync(staging, this.#lockPath);
-          } finally {
-            fs.rmSync(staging, { recursive: true, force: true });
-          }
-        }
-        break;
-      } catch (error) {
-        const code = errorCode(error);
-        if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
-          (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-        if (await this.#clearStaleLock(ownerPath)) continue;
-        if (Date.now() >= deadline) {
-          throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-        }
-        // Full jitter spreads a fleet after a stalled holder resumes. The original
-        // absolute deadline still bounds every sleep (including a zero draw).
-        await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
-      }
-    }
+    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
     try {
-      return operation();
-    } catch (error) {
-      // A failed write (a version conflict above all) means this store's view is behind: the
-      // next read parses the file again instead of reusing a recent parse.
-      this.#stateCache = undefined;
-      throw error;
-    } finally {
-      releaseOwned();
-    }
+      // Attempts and the largest gap between two of them: a large gap means this waiter stalled
+      // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
+      let attempts = 0;
+      let maxGapMs = 0;
+      let lastAttemptAt = Date.now();
+      let retryAttempt = 0;
+      while (true) {
+        this.#writeAbortSignal?.throwIfAborted();
+        if (!ticket.mayContend()) {
+          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          await delay(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          continue;
+        }
+        const attemptAt = Date.now();
+        if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
+        attempts += 1;
+        lastAttemptAt = attemptAt;
+        try {
+          if (this.#lockProtocol === 1) {
+            // Keep the B68 three-line wire, but never overwrite an owner published by a
+            // successor while this initializer was stopped after canonical mkdir.
+            fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+            const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+              code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
+            });
+            try {
+              const directory = fs.lstatSync(this.#lockPath);
+              fs.writeFileSync(ownerPath, ownerRecord, {
+                encoding: "utf8", flag: "wx", mode: 0o600,
+              });
+              // The exclusive create may itself have paused with an open descriptor to a
+              // recovered directory. Prove publication still belongs to the canonical lock
+              // before entering the critical section; never clean a successor on failure.
+              const current = fs.lstatSync(this.#lockPath);
+              if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
+                fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
+            } catch (error) {
+              // A resumed initializer may have published into an empty replacement before
+              // rejecting its directory identity. Remove only that attempt's exact receipt.
+              releaseOwned();
+              if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
+              throw error;
+            }
+          } else {
+            // Never expose an ownerless canonical directory: a stalled initializer must not
+            // resume its owner write through a name that legacy recovery gave to a successor.
+            const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
+            try {
+              fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
+                encoding: "utf8", flag: "wx", mode: 0o600,
+              });
+              // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
+              // lock may be an in-flight creator. Route every observed canonical path through
+              // the original owner/stale checks instead of publishing over it.
+              try {
+                fs.lstatSync(this.#lockPath);
+                throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
+              } catch (error) {
+                if (errorCode(error) !== "ENOENT") throw error;
+              }
+              // New-format competitors publish nonempty owners atomically. This does not fence
+              // old-format writers that create an empty canonical after the absence check.
+              fs.renameSync(staging, this.#lockPath);
+            } finally {
+              fs.rmSync(staging, { recursive: true, force: true });
+            }
+          }
+          break;
+        } catch (error) {
+          const code = errorCode(error);
+          if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
+            (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
+          if (await this.#clearStaleLock(ownerPath, deadline)) continue;
+          if (Date.now() >= deadline) {
+            throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          }
+          // Only the FIFO head probes promptly. After the bounded admission fallback,
+          // full jitter spreads plain contenders; the original deadline bounds every sleep.
+          await delay(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+        }
+      }
+      try {
+        this.#writeAbortSignal?.throwIfAborted();
+        return operation();
+      } catch (error) {
+        // A failed write (a version conflict above all) means this store's view is behind: the
+        // next read parses the file again instead of reusing a recent parse.
+        this.#stateCache = undefined;
+        throw error;
+      } finally {
+        releaseOwned();
+      }
+    } finally { ticket.close(); }
   }
 
   // Complete dead/different-incarnation receipts recover immediately. Empty ownerless
   // directories recover only after the grace, using atomic rmdir (never recursive removal
   // or rename): an owner published after our last comparison makes rmdir fail closed.
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
-  async #clearStaleLock(ownerPath: string): Promise<boolean> {
+  async #clearStaleLock(ownerPath: string, deadline: number): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -1744,8 +2481,24 @@ export class MeshStore {
       if (!validOwner) return false;
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
-        const actualStart = await processIncarnation(pid);
-        if (!actualStart || actualStart === recordedStart) return false;
+        // Registry-fenced publication cannot start even a bounded native read.
+        // Fail closed; the ordinary outside-custody admission lane obtains fresh
+        // holder evidence/recovery, then publication selects under fresh fences.
+        if (this.#tryLockScope.getStore()?.active) return false;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let actualStart: string | undefined;
+        try {
+          // Race only the evidence read, NEVER the recovery operation. A reader
+          // ignoring its native timeout cannot leave an escaped rename behind.
+          // The native reader also receives this budget so its child is aborted.
+          actualStart = await Promise.race([
+            processIncarnation(pid, remaining),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
+          ]);
+        } finally { clearTimeout(timer); }
+        if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
@@ -1789,11 +2542,14 @@ export class MeshStore {
   }
 
   #compactEventLog(): void {
+    // Never rewrite away an event named by a durable intent. Resolve every intent while
+    // the publish lock is held, before taking the retained tail snapshot.
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
+      this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,
@@ -1807,17 +2563,10 @@ export class MeshStore {
       const retained = captured.subarray(retainedStart);
       fs.closeSync(descriptor);
       descriptor = undefined;
-      const temporaryPath =
-        this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
-      try {
-        fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
-        fs.renameSync(temporaryPath, this.#eventsPath);
-      } finally {
-        try { fs.rmSync(temporaryPath, { force: true }); } catch {}
-      }
+      // Persist both the retained bytes and the rename. Later intents may name offsets in
+      // this generation; a reboot must not resurrect its unsynced predecessor or lose bytes.
+      writeFileAtomic(this.#eventsPath, retained, { durable: true });
       atomicWrite(this.#generationPath, this.#readGeneration() + 1);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }

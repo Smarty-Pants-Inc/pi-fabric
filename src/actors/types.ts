@@ -119,7 +119,8 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
 
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
-export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
+/** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
+export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -273,6 +274,8 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** Exact registry lineage token; changes on adoption, including a return to the same root. */
+  ownershipToken?: string;
   /** The session that owns and runs the actor (from its `session:<id>` root), whoever reads it. */
   ownerSessionId?: string;
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */

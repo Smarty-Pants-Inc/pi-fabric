@@ -247,6 +247,42 @@ describe("SqliteStateStore", () => {
     await expect(store.importState(state)).rejects.toThrow(/empty database/);
   });
 
+  it("imports a tombstone-only or metadata-only snapshot and finishes its metadata (review round 2 P1)", async () => {
+    const store = await open(tempRoot("import-tombstones"));
+    expect(await store.importState({ entries: {}, versions: { "g/1": 3, "g/2": 5 }, tombstoneOrder: ["g/1", "g/2"], highWater: 5 }))
+      .toEqual({ entries: 0, tombstones: 2, highWater: 5 });
+    expect(store.exportState()).toMatchObject({ highWater: 5, tombstoneOrder: ["g/1", "g/2"] });
+    // New keys take the imported clock's successors (a present key its own successor, as the file
+    // store), and two deletions take fresh tombstone ordinals instead of reusing imported ones.
+    expect((await store.put({ key: "x/1", value: 1, identity })).version).toBe(6);
+    expect((await store.put({ key: "x/2", value: 2, identity })).version).toBe(7);
+    expect(await store.delete({ key: "x/1" })).toEqual({ deleted: true, version: 7 });
+    expect(await store.delete({ key: "x/2" })).toEqual({ deleted: true, version: 8 });
+    const after = store.exportState();
+    expect(after.tombstoneOrder).toEqual(["g/1", "g/2", "x/1", "x/2"]);
+    expect(after.highWater).toBeGreaterThanOrEqual(8);
+    // Recreating an imported tombstone never reissues a revision.
+    expect((await store.put({ key: "g/2", value: 1, identity, ifVersion: 5 })).version).toBeGreaterThan(after.highWater);
+
+    // A metadata-only snapshot (no entries, no tombstones) still persists its clock and counts as an import.
+    const empty = await open(tempRoot("import-meta"));
+    expect(await empty.importState({ entries: {}, highWater: 9 })).toEqual({ entries: 0, tombstones: 0, highWater: 9 });
+    expect(empty.exportState().highWater).toBe(9);
+    expect((await empty.put({ key: "m/1", value: 1, identity })).version).toBe(10);
+    await expect(empty.importState({ entries: {} })).rejects.toThrow(/empty database/);
+  });
+
+  it("fails closed on its own retirement after a read cached data_version (review round 2 P2)", async () => {
+    const store = await open(tempRoot("retire-self"));
+    await store.put({ key: "s/1", value: 1, identity });
+    expect(store.get("s/1")?.value).toBe(1);
+    expect(store.listAll("s/")).toHaveLength(1);
+    expect(await store.retire()).toBe(2);
+    expect(() => store.get("s/1")).toThrow(MeshStateRetiredError);
+    expect(() => store.listAll("")).toThrow(MeshStateRetiredError);
+    await expect(store.put({ key: "s/2", value: 2, identity })).rejects.toBeInstanceOf(MeshStateRetiredError);
+  });
+
   it("retires in place: a writer that waited through the retirement and every reader fail closed", async () => {
     const root = tempRoot("retire");
     const store = await open(root);

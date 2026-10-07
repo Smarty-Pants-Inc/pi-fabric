@@ -341,6 +341,8 @@ interface Tx {
   tombstoneOrd: number;
   grew: boolean;
   deleted: boolean;
+  /** Finish metadata (clock, commit, ordinal) even without a change row: set by importState. */
+  finish: boolean;
   changes: Array<{ key: string; version: number; deleted: boolean }>;
 }
 
@@ -663,12 +665,15 @@ export class SqliteStateStore {
   }
 
   /**
-   * Retires the database in place (review-opus P0-1): every later write, and every read through
-   * another store, fails with MeshStateRetiredError. Never rename or delete the files while open.
+   * Retires the database in place (review-opus P0-1): every later write and every read, through this
+   * or another store, fails with MeshStateRetiredError. Never rename or delete the files while open.
    */
   async retire(): Promise<number> {
     return this.#write((tx) => {
       const epoch = this.#epoch + 1;
+      // data_version does not move for this connection's own commits: drop the cached value so the
+      // next read on this store re-checks the retirement flag (review round 2 P2).
+      this.#dataVersion = -1;
       this.#sql.metaSet.run("retired", "backend");
       this.#sql.metaSet.run(epoch, "epoch");
       tx.changes.length = 0;
@@ -715,6 +720,9 @@ export class SqliteStateStore {
       tx.highWater = highWater;
       tx.deleted = tombstones > 0;
       tx.grew = true;
+      // Tombstone-only and metadata-only snapshots push no change row but must still persist the
+      // clock, the tombstone ordinal and the commit number (review round 2 P1).
+      tx.finish = true;
       return { entries, tombstones, highWater };
     });
   }
@@ -980,12 +988,12 @@ export class SqliteStateStore {
       // rollback can never commit into a retired database (review-opus P0-1).
       if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
       const tx: Tx = { highWater: meta.highWater, commit: meta.commit, stateBytes: meta.stateBytes,
-        tombstoneOrd: meta.tombstoneOrd, grew: false, deleted: false, changes: [] };
+        tombstoneOrd: meta.tombstoneOrd, grew: false, deleted: false, finish: false, changes: [] };
       const result = body(tx);
       if (result !== null && typeof result === "object" && typeof (result as { then?: unknown }).then === "function") {
         throw new Error("Fabric mesh state transactions must be synchronous");
       }
-      if (tx.changes.length > 0) { this.#finish(tx); changed = true; }
+      if (tx.changes.length > 0 || tx.finish) { this.#finish(tx); changed = true; }
       this.#db.exec("COMMIT");
       committed = true;
       if (changed) this.#stats.commits += 1;

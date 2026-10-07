@@ -1340,6 +1340,7 @@ describe("FabricControlPlane", () => {
       expect(own.get(seenKey("host:receiver", commandId))).toBeDefined();
       for (let index = 0; index < 100; index++) {                          // rotate it out of the log
         await store.publish({ topic: "compact", from: identity("host:publisher"), text: "x".repeat(900) });
+        await store.settleCompaction(); // compaction runs after publish returns
       }
       expect(store.oldestSequence()).toBeGreaterThan(1);
       await vi.waitFor(() => expect(own.get(seenKey("host:receiver", commandId))).toBeUndefined(), { timeout: 5_000, interval: 20 });

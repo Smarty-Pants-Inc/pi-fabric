@@ -209,6 +209,7 @@ describe("mesh event archive", () => {
     await store.publish({ topic: longTopic("bc"), from, text: "long" });
     for (let index = 0; index < 6; index++) await store.publish({ topic: "ops.owner", from, text: "x".repeat(900) });
     expect(lines(file(today(), longTopic("bc")))).toHaveLength(1);
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(1);
     expect(store.read({ after: 0, topic: longTopic("bc") }).map((event) => event.text)).toEqual(["long"]);
     expect(live().length).toBeGreaterThan(0);
@@ -354,6 +355,7 @@ describe("mesh event archive", () => {
       .flatMap((name) => fs.readFileSync(path.join(dir, day, name), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line).id)));
     expect(ids).toHaveLength(8);
     expect(new Set(ids).size).toBe(8);
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(1);
     expect(store.read({ after: 0, limit: 10 }).map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
@@ -607,6 +609,7 @@ describe("mesh event archive", () => {
     expect(sequences(file("2026/09/27", "ops.owner"))).toEqual([1]);
     expect(sequences(file("2026/09/28", "ops.owner"))).toEqual([2, 3, 4, 5, 6, 7]);
     expect(fs.readFileSync(path.join(dir, "2026/09/27/SEAL.json"), "utf8")).toBe(sealed);
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(2);
     expect(store.read({ after: 1, limit: 10 }).map((event) => event.sequence)).toEqual([2, 3, 4, 5, 6, 7]);
     expect(store.read({ after: 0, limit: 10 }).map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7]);
@@ -617,6 +620,7 @@ describe("mesh event archive", () => {
     for (let index = 1; index <= 60; index++) {
       await store.publish({ topic: index % 2 ? "team.odd" : "team.even", from, text: `event ${index}`, ...(index % 3 ? {} : { to: "reviewer" }) });
     }
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(10);
     expect(store.read({ after: 0, limit: 5 }).map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5]);
     expect(store.read({ after: 2, topic: "team.even", limit: 3 }).map((event) => event.sequence)).toEqual([4, 6, 8]);

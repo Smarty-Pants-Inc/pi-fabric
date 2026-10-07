@@ -761,6 +761,7 @@ describe("ActorMeshMonitor work-topic reconciliation", () => {
     // The host is away while the live log is rewritten several times.
     for (let index = 1; index <= 40; index++) {
       await mesh.publish({ topic: index % 5 === 0 ? "fleet.work.pi-fabric.1" : "team.noise", to: "actor:a", from, text: `${index % 5 === 0 ? "work" : "noise"} ${index}` });
+      await mesh.settleCompaction(); // compaction runs after publish returns
     }
     expect(mesh.oldestSequence()).toBeGreaterThan(10);
     const seen: MeshEvent[] = [];
@@ -823,7 +824,10 @@ describe("ActorMeshMonitor work-topic reconciliation, round 2", () => {
     await mesh.publish({ topic: "fleet.work.a", from, text: "w0" });
     for (let index = 0; index < 5; index++) { first.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
     first.close();
-    for (let index = 1; index <= 400; index++) await mesh.publish({ topic: index % 50 === 0 ? "fleet.work.a" : "team.noise", from, text: `e${index}` });
+    for (let index = 1; index <= 400; index++) {
+      await mesh.publish({ topic: index % 50 === 0 ? "fleet.work.a" : "team.noise", from, text: `e${index}` });
+      await mesh.settleCompaction(); // compaction runs after publish returns
+    }
     expect(mesh.oldestSequence()).toBeGreaterThan(100);
     let ticks = 0;
     const heartbeat = setInterval(() => { ticks++; }, 1);

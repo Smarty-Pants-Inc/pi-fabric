@@ -596,7 +596,18 @@ interface MeshDedupeIntent {
   liveOffset: number;
   /** Captured before append: removing/changing archive configuration cannot authorize retry. */
   archiveDir?: string;
+  /** Off-lock (two-step) publish attempts only: recovery never removes a live owner's intent. */
+  owner?: MeshIntentOwner;
 }
+
+interface MeshIntentOwner { pid: number; token: string; at: number }
+
+// Publish attempts of THIS process whose canonical intent may still be unappended.
+const liveIntentOwners = new Set<string>();
+// A foreign owner is presumed live while its pid exists, up to this generous age.
+const INTENT_OWNER_STALE_MS = 5 * 60_000;
+// At most one best-effort compaction per live log per process (smarty-dev#4383).
+const compactions = new Map<string, Promise<void>>();
 
 interface MeshPublicationDraft {
   event: MeshEvent;
@@ -845,6 +856,8 @@ export class MeshStore {
     const prior = this.#readDedupeReceipt(intent.dedupeKey);
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
+    // A live owner may be between its off-lock intent barrier and its append.
+    if (!event && this.#intentOwnerLive(intent)) throw new MeshArchiveRecoveryChanged();
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
     }
@@ -1139,6 +1152,8 @@ export class MeshStore {
       fs.existsSync(path.join(this.root, "event-archive.json"))) return undefined;
     const identity = this.#publicationIdentity();
     const event = this.#readEventAtIntent(intent);
+    // Never treat a live owner's unappended reservation as abandoned: wait for it.
+    if (!event && this.#intentOwnerLive(intent)) throw new MeshArchiveRecoveryChanged();
     const receiptPath = this.#dedupePath(key, ".json");
     const temporary = `${receiptPath}.${process.pid}.${randomUUID()}.prepared`;
     try {
@@ -1185,8 +1200,22 @@ export class MeshStore {
         await this.#withLock(() => this.#settleDedupeIntent(file, undefined, MeshArchive.fromRoot(this.root)));
         continue;
       }
-      await this.#recoverLiveReceipt({ dedupeKey: intent.dedupeKey });
+      // A live or racing intent stays pending; compaction then refuses its rename.
+      try { await this.#recoverLiveReceipt({ dedupeKey: intent.dedupeKey }); }
+      catch (error) { if (!(error instanceof MeshArchiveRecoveryChanged)) throw error; }
     }
+  }
+
+  /** Provably abandoned means: no owner (written and appended under one lock), this
+   * process without that attempt, a gone pid, or an age far above any publish timeout. */
+  #intentOwnerLive(intent: MeshDedupeIntent): boolean {
+    const owner = intent.owner;
+    if (!owner || typeof owner !== "object" || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 ||
+      typeof owner.token !== "string" || typeof owner.at !== "number") return false;
+    if (owner.pid === process.pid) return liveIntentOwners.has(owner.token);
+    if (Date.now() - owner.at > Math.max(INTENT_OWNER_STALE_MS, 30 * this.#lockTimeoutMs)) return false;
+    try { process.kill(owner.pid, 0); return true; }
+    catch (error) { return errorCode(error) === "EPERM"; }
   }
 
   async #publishKeyed(input: MeshPublishInput): Promise<MeshEvent> {
@@ -1209,7 +1238,11 @@ export class MeshStore {
       // Confirm independently, OUTSIDE mesh custody, before acknowledging it.
       return this.#confirmReceiptAfterRelease(input, event);
     }
-    const intentText = JSON.stringify(draft.intent);
+    // The attempt token marks this intent live until the attempt ends (P2-2).
+    const owner: MeshIntentOwner = { pid: process.pid, token: randomUUID(), at: Date.now() };
+    const intentText = JSON.stringify({ ...draft.intent, owner } satisfies MeshDedupeIntent);
+    const outcome = { appendStarted: false, bytes: 0 };
+    liveIntentOwners.add(owner.token);
     const intentStage = `${intentPath}.${process.pid}.${randomUUID()}.prepared`;
     const receiptStage = `${receiptPath}.${process.pid}.${randomUUID()}.prepared`;
     const ownsIntent = (): boolean => {
@@ -1244,7 +1277,7 @@ export class MeshStore {
           if (ownsIntent()) fs.rmSync(intentPath, { force: true });
           return false;
         }
-        this.#commitPublication(input, draft.event, draft.line, draft.archive, undefined, true);
+        this.#commitPublication(input, draft.event, draft.line, draft.archive, outcome, true);
         return true;
       });
       if (!committed) {
@@ -1259,6 +1292,10 @@ export class MeshStore {
       if (ownsIntent()) this.#removeDedupeIntent(intentPath);
       return draft.event;
     } finally {
+      liveIntentOwners.delete(owner.token);
+      // A failed attempt that never began its append withdraws its own reservation,
+      // so peers need not wait for its age bound. Best effort: recovery covers the rest.
+      if (!outcome.appendStarted) { try { if (ownsIntent()) fs.rmSync(intentPath, { force: true }); } catch { /* recovery */ } }
       fs.rmSync(intentStage, { force: true });
       fs.rmSync(receiptStage, { force: true });
     }
@@ -1282,7 +1319,8 @@ export class MeshStore {
     // Once append has committed, a compaction/barrier failure must NEVER retry
     // an unkeyed publication and accidentally append it a second time.
     if (input.durable && !input.dedupeKey) await this.#confirmEventsAfterRelease();
-    await this.#compactEventLog();
+    // Committed: compaction is best effort and runs after this publish returns.
+    this.#scheduleCompaction();
     return event;
   }
 
@@ -1330,7 +1368,8 @@ export class MeshStore {
       }
     }
     await this.#confirmEventsAfterRelease();
-    await this.#compactEventLog();
+    // Committed: never fail or delay the batch; unkeyed retries would duplicate it.
+    this.#scheduleCompaction();
     return events;
   }
 
@@ -2612,65 +2651,178 @@ export class MeshStore {
     };
   }
 
+  /** Best effort and AFTER the publish has returned: compaction never fails or delays a
+   * committed publication (smarty-dev#4383). At most one runs per live log per process. */
+  #scheduleCompaction(): void {
+    try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
+    catch { return; }
+    void this.#startCompaction();
+  }
+
+  #startCompaction(): Promise<void> {
+    const file = this.#eventsPath;
+    const running = compactions.get(file);
+    if (running) return running;
+    // Never inherit a caller's try-lock budget; errors are only reported.
+    const run: Promise<void> = this.#tryLockScope.exit(async () => {
+      await delay(0);
+      await this.#compactEventLog();
+    }).catch((error: unknown) => {
+      process.emitWarning(`[pi-fabric] Mesh event log compaction deferred: ${error instanceof Error ? error.message : String(error)}`,
+        { code: "PI_FABRIC_MESH_COMPACTION" });
+    }).finally(() => { if (compactions.get(file) === run) compactions.delete(file); });
+    compactions.set(file, run);
+    return run;
+  }
+
+  /** Await this process's in-flight compaction, then (if still oversized) one more
+   * best-effort attempt. Never rejects. For tests and maintenance tooling. */
+  async settleCompaction(): Promise<void> {
+    await compactions.get(this.#eventsPath);
+    try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
+    catch { return; }
+    await this.#startCompaction();
+  }
+
   async #compactEventLog(): Promise<void> {
-    // Idle/small-log publishes still take exactly their publication lock(s).
     try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
     catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-    const deadline = Date.now() + this.#lockTimeoutMs;
-    for (;;) {
-      // Recovery of legacy durable intents remains conservative. In particular,
-      // never discard the sole live anchor before its authoritative receipt exists.
-      try { await this.#settleDedupeIntentsAfterRelease(); }
-      catch (error) {
-        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= deadline) throw error;
-        await delay(0);
-        continue;
-      }
-      const identity = this.#publicationIdentity();
-      const descriptor = fs.openSync(this.#eventsPath, "r");
-      let retained: Buffer;
-      try {
-        const size = fs.fstatSync(descriptor).size;
-        if (size <= this.#maxEventLogBytes) return;
-        const readBytes = Math.min(size, this.#retainedEventLogBytes + this.maxEventBytes + 1);
-        const buffer = Buffer.allocUnsafe(readBytes);
-        const count = fs.readSync(descriptor, buffer, 0, readBytes, size - readBytes);
-        const captured = buffer.subarray(0, count);
-        const boundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
-        const newline = boundary === 0 ? -1 : captured.indexOf(0x0a, boundary);
-        retained = captured.subarray(boundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length);
-      } finally { fs.closeSync(descriptor); }
-      if (this.#publicationIdentity() !== identity) {
-        if (Date.now() >= deadline) throw new MeshArchiveRecoveryChanged();
-        await delay(0);
-        continue;
-      }
-      const temporary = `${this.#eventsPath}.${process.pid}.${randomUUID()}.retained`;
-      try {
-        // Prepared-file barriers are off-lock. A concurrent
-        // append, truncate, rewrite or generation change invalidates this snapshot.
-        writePreparedFile(temporary, retained);
-        const committed = await this.#withLock(() => {
-          if (this.#publicationIdentity() !== identity) return false;
-          let intents: string[] = [];
-          try { intents = fs.readdirSync(path.join(this.root, "event-receipts")); }
-          catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-          if (intents.some(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))) return false;
+    // Recovery of legacy durable intents remains conservative. In particular, never
+    // discard the sole live anchor before its authoritative receipt exists. A live
+    // owner's intent stays pending, and the rename below then refuses.
+    try { await this.#settleDedupeIntentsAfterRelease(); }
+    catch (error) { if (!(error instanceof MeshArchiveRecoveryChanged)) throw error; }
+    // Appends cannot void a prepared snapshot; only a rewrite (dev/ino/generation) can.
+    // Then take ONE locked attempt and otherwise wait for the next trigger.
+    if (await this.#compactPrepared() === "overtaken") await this.#compactLocked();
+  }
+
+  #readTextFile(file: string): string | undefined {
+    try { return fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+  }
+
+  #hasPendingIntents(): boolean {
+    let names: string[] = [];
+    try { names = fs.readdirSync(path.join(this.root, "event-receipts")); }
+    catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    return names.some(name => /^[a-f0-9]{64}\.pending\.json$/.test(name));
+  }
+
+  /** The retained tail of complete lines, and the live offset just past it. */
+  #retainedTail(descriptor: number, size: number): { bytes: Buffer; end: number } {
+    const readBytes = Math.min(size, this.#retainedEventLogBytes + this.maxEventBytes + 1);
+    const buffer = Buffer.allocUnsafe(readBytes);
+    const count = fs.readSync(descriptor, buffer, 0, readBytes, size - readBytes);
+    const captured = buffer.subarray(0, count);
+    const boundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
+    const newline = boundary === 0 ? -1 : captured.indexOf(0x0a, boundary);
+    const start = boundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
+    const last = captured.lastIndexOf(0x0a);
+    const stop = last >= start ? last + 1 : start;
+    return { bytes: captured.subarray(start, stop), end: size - readBytes + stop };
+  }
+
+  /** Append live bytes [from, to) of the snapshot inode to a stage; complete lines only
+   * while publishers may still be appending. Returns the bytes copied. */
+  #foldAppended(stage: string, ino: number, from: number, to: number, completeOnly: boolean): number {
+    if (to <= from) return 0;
+    const source = fs.openSync(this.#eventsPath, "r");
+    let bytes: Buffer;
+    try {
+      if (fs.fstatSync(source).ino !== ino) return 0;
+      const buffer = Buffer.allocUnsafe(to - from);
+      const count = fs.readSync(source, buffer, 0, buffer.length, from);
+      bytes = buffer.subarray(0, count);
+    } finally { fs.closeSync(source); }
+    if (completeOnly) bytes = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1);
+    if (!bytes.length) return 0;
+    const fd = fs.openSync(stage, "a");
+    try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    return bytes.length;
+  }
+
+  /** Prepare off-lock; fold appends that overtake the snapshot instead of discarding it.
+   * Barriers stay off-lock unless appends keep arriving for every catch-up round. */
+  async #compactPrepared(): Promise<"done" | "refused" | "overtaken"> {
+    const generation = this.#readTextFile(this.#generationPath);
+    let snapshot: { dev: number; ino: number; end: number };
+    let retained: Buffer;
+    let descriptor: number;
+    try { descriptor = fs.openSync(this.#eventsPath, "r"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return "done"; throw error; }
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (stat.size <= this.#maxEventLogBytes) return "done";
+      const tail = this.#retainedTail(descriptor, stat.size);
+      retained = tail.bytes;
+      snapshot = { dev: stat.dev, ino: stat.ino, end: tail.end };
+    } finally { fs.closeSync(descriptor); }
+    const temporary = `${this.#eventsPath}.${process.pid}.${randomUUID()}.retained`;
+    try {
+      // No mkdir: a removed store root must not be recreated by background work.
+      const stage = fs.openSync(temporary, "wx", 0o600);
+      try { fs.writeSync(stage, retained); fs.fsyncSync(stage); }
+      finally { fs.closeSync(stage); }
+      let staged = snapshot.end;
+      const sameInode = (stat: fs.Stats | undefined): stat is fs.Stats =>
+        stat !== undefined && stat.dev === snapshot.dev && stat.ino === snapshot.ino && stat.size >= staged;
+      const liveStat = (): fs.Stats | undefined => {
+        try { return fs.statSync(this.#eventsPath); }
+        catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+      };
+      for (let round = 0; ; round++) {
+        // Off-lock catch-up of complete appended lines.
+        const before = liveStat();
+        if (!sameInode(before)) return "overtaken";
+        staged += this.#foldAppended(temporary, snapshot.ino, staged, before.size, true);
+        const last = round >= 3;
+        const outcome = await this.#withLock((): "done" | "refused" | "overtaken" | "behind" => {
+          const stat = liveStat();
+          if (!sameInode(stat) || this.#readTextFile(this.#generationPath) !== generation) return "overtaken";
+          if (this.#hasPendingIntents()) return "refused";
+          if (stat.size > staged) {
+            if (!last) return "behind";
+            // Appends kept arriving every round: fold the small remainder under custody.
+            staged += this.#foldAppended(temporary, snapshot.ino, staged, stat.size, false);
+          }
           renameAtomic(temporary, this.#eventsPath);
           // Generation is a non-durable cursor hint, guarded by the live inode.
           atomicWrite(this.#generationPath, this.#readGeneration() + 1);
-          return true;
+          return "done";
         });
-        if (committed) {
-          // Confirm the rename before returning, not while excluding publishers.
-          // Root confirmation remains valid across a successor's file rename.
-          syncPathNamespace(this.root);
-          return;
-        }
-      } finally { fs.rmSync(temporary, { force: true }); }
-      if (Date.now() >= deadline) throw new MeshArchiveRecoveryChanged();
-      await delay(0);
-    }
+        if (outcome === "behind") continue;
+        // Confirm the rename before returning, not while excluding publishers.
+        if (outcome === "done") syncPathNamespace(this.root);
+        return outcome;
+      }
+    } finally { fs.rmSync(temporary, { force: true }); }
+  }
+
+  /** The single fallback after a rewrite overtook the snapshot: prepare under the lock. */
+  async #compactLocked(): Promise<void> {
+    const temporary = `${this.#eventsPath}.${process.pid}.${randomUUID()}.retained`;
+    try {
+      const committed = await this.#withLock(() => {
+        let descriptor: number;
+        try { descriptor = fs.openSync(this.#eventsPath, "r"); }
+        catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
+        let retained: Buffer;
+        try {
+          const size = fs.fstatSync(descriptor).size;
+          if (size <= this.#maxEventLogBytes || this.#hasPendingIntents()) return false;
+          retained = this.#retainedTail(descriptor, size).bytes;
+        } finally { fs.closeSync(descriptor); }
+        const stage = fs.openSync(temporary, "wx", 0o600);
+        try { fs.writeSync(stage, retained); fs.fsyncSync(stage); }
+        finally { fs.closeSync(stage); }
+        renameAtomic(temporary, this.#eventsPath);
+        atomicWrite(this.#generationPath, this.#readGeneration() + 1);
+        return true;
+      });
+      if (committed) syncPathNamespace(this.root);
+    } finally { fs.rmSync(temporary, { force: true }); }
   }
 
   #repairEventLog(): void {

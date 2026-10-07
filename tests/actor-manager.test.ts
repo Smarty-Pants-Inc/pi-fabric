@@ -821,6 +821,7 @@ describe("ActorManager across a session reload", () => {
     for (let index = 1; index <= 40; index++) {
       await mesh.publish({ topic: "fleet.work.x", from, text: `w${index}` });
       await mesh.publish({ topic: "team.noise", from, text: "x".repeat(1_500) });
+      await mesh.settleCompaction(); // compaction runs after publish returns
     }
     expect(mesh.oldestSequence()).toBeGreaterThan(10);                   // the first work events left the live log
     const after = reloadable(root, mesh, agents, 10 * 60_000, 2);

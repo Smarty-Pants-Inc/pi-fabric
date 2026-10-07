@@ -364,6 +364,7 @@ describe("MeshStore", () => {
       // After compaction, the archive cursor delivers the retained ambiguous identity once.
       const compacting = new MeshStore(store.root, store.maxEventBytes, 100, { maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
       for (let index = 0; index < 5; index++) await compacting.publish({ topic: packet.topic, from: identity, text: "x".repeat(20_000) });
+      await compacting.settleCompaction();
       expect(compacting.oldestSequence()).toBeGreaterThan(recovered.sequence);
       expect(compacting.read({ after: 1 }).filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
     }
@@ -542,6 +543,7 @@ describe("MeshStore", () => {
     crash.mockRestore();
     const event = JSON.parse(fs.readFileSync(path.join(root, "events.jsonl"), "utf8"));
     for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(event.sequence);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
@@ -565,7 +567,8 @@ describe("MeshStore", () => {
     await expect(store.publish(packet)).rejects.toThrow("intent namespace barrier");
     barrier.mockRestore(); renameSpy.mockRestore();
     expect(store.read()).toEqual([]);
-    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    // The failed attempt never began its append, so it withdrew its own reservation.
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
     const event = await store.publish(packet);
     expect(await store.publish(packet)).toEqual(event);
     expect(store.read()).toEqual([event]);
@@ -629,6 +632,7 @@ describe("MeshStore", () => {
     crash.mockRestore();
     const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
     for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    await store.settleCompaction();
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(fs.existsSync(base + ".json")).toBe(false);
     const event = await store.publish(packet);
@@ -636,7 +640,7 @@ describe("MeshStore", () => {
     expect(store.read().filter(e => e.dedupeKey === packet.dedupeKey)).toEqual([event]);
   });
 
-  it("does not compact if settlement cannot durably write its receipt", async () => {
+  it("does not compact if settlement cannot durably write its receipt, and never fails the publish", async () => {
     const store = createStore({ maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
     const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "blocked-settlement", text: "first" };
     const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
@@ -648,7 +652,12 @@ describe("MeshStore", () => {
     try {
       await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
       await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
-      await expect(store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) })).rejects.toThrow("receipt unavailable");
+      const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+      // Compaction is best effort after commit: the publish resolves; the failure is only reported.
+      const committed = await store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) });
+      await store.settleCompaction();
+      expect(String(warn.mock.calls.at(-1)?.[0])).toContain("receipt unavailable");
+      expect(store.read().at(-1)).toEqual(committed);
       expect(store.oldestSequence()).toBe(1);
       expect(fs.existsSync(base + ".pending.json")).toBe(true);
     } finally { crash.mockRestore(); }
@@ -980,6 +989,7 @@ describe("MeshStore", () => {
       for (let sequence = 1; sequence <= 3; sequence++) await publish(sequence);
       expect(sequences(store.read({ after: 0 }))).toEqual([1, 2, 3]);
       for (let sequence = 4; sequence <= 40; sequence++) await publish(sequence);
+      await store.settleCompaction();
       expect(fs.readFileSync(path.join(meshRoot, "generation"), "utf8").trim()).not.toBe("0");
       const expected = sequences(new MeshStore(meshRoot, 512, 100).read({ after: 3 }));
       expect(expected.at(-1)).toBe(40);
@@ -1009,6 +1019,7 @@ describe("MeshStore", () => {
     await store.publish({ topic: "t", from: identity, text: "first" });
     expect(store.oldestSequence()).toBe(1);
     for (let index = 0; index < 30; index++) await store.publish({ topic: "t", from: identity, text: `event-${index}` });
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBe(store.read({ after: 0, limit: 100 })[0]!.sequence);
     expect(store.oldestSequence()).toBeGreaterThan(1);                     // rotated
   });
@@ -1112,6 +1123,7 @@ describe("MeshStore", () => {
     for (let index = 2; index < 30; index += 1) {
       await store.publish({ topic: "team.auth", from: identity, text: `event-${index}` });
     }
+    await store.settleCompaction();
 
     const tail = store.tail(staleCursor, 100);
     const recent = store.read({ limit: 3 });

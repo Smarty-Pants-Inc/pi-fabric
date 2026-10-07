@@ -180,6 +180,7 @@ describe("durable bridge byte cursors (smarty-dev#2854)", () => {
     const side = new StoreBridgeSide(store, "forge");
     const head = await side.latestCursor();
     for (let i = 0; i < 10; i++) await store.publish({ topic: "fleet.work.test", from, to: "remote", text: String(i).repeat(500) });
+    await store.settleCompaction();
     expect(store.oldestSequence()).toBeGreaterThan(1);
     let after = head.through, offset: number | undefined = head.offset;
     const texts: string[] = [];

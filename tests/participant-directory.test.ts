@@ -2124,6 +2124,37 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     expect(f.mesh.get("bench/other")?.value).toEqual({ at: 1 });
   });
 
+  // Review round 2 on #592: the fresh read after the witness is synchronous file I/O and can be
+  // slow during a mesh stall. Evidence that ages past one heartbeat during that read must not
+  // confirm: the heartbeat falls back to the lock path.
+  it("falls back to the lock when the fresh read outlasts one heartbeat of witness age", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    await f.writer.put({ key: "bench/other", value: { at: 4 }, identity: f.other });
+    const committedAt = Date.now();
+    const realNow = Date.now.bind(Date);
+    const realToken = f.mesh.stateToken.bind(f.mesh);
+    let stalled = false;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + (stalled ? 60_001 : 0));
+    // Only the confirmation's own read is fresh on this idle path; it completes one heartbeat late.
+    const token = vi.spyOn(f.mesh, "stateToken").mockImplementation(options => {
+      const result = realToken(options);
+      if (options?.fresh === true) stalled = true;
+      return result;
+    });
+    try {
+      const baseline = f.acquisitions();
+      await f.directory.refresh();
+      expect(token.mock.calls.some(([options]) => options?.fresh === true)).toBe(true);
+      expect(f.confirmations).toHaveBeenCalledOnce();
+      expect(f.acquisitions() - baseline).toBe(1);
+      expect(f.writes).not.toHaveBeenCalled();
+      // The receipt is the lock's, taken after the stall, not the aged commit's time.
+      expect(f.directory.confirmedAt()).toBeGreaterThan(committedAt + 60_000);
+    } finally { clock.mockRestore(); token.mockRestore(); }
+  });
+
   it("takes the lock exactly once when no unseen commit is evidence, and never confirms behind a stuck holder", async () => {
     const f = await idleFixture();
     const baseline = f.acquisitions();

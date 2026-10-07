@@ -2015,7 +2015,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * canConsumeMesh/writeStalled count it): lock-free evidence only extends a fresh chain of
    * receipts. The evidence must be newer than the last confirmation and at most one heartbeat old, so a stalled mesh stops confirmation within one interval and falls back to
    * the lock wait (and its timeout/outage path). Like confirmWritable, the next view is
-   * canonical: read it fresh now, after the evidence. */
+   * canonical: read it fresh now, after the evidence. That read is synchronous file I/O and can
+   * itself be slow while the mesh stalls, so every condition is checked again against a clock
+   * taken after it: evidence that aged past one heartbeat during the read (or a chain that went
+   * overdue) no longer confirms, and the caller takes the lock (review round 2 on #592). */
   #confirmWithoutLock(): number | undefined {
     if (!this.#leaseConfirmed || this.#refreshError !== undefined || this.#closed) return undefined;
     const now = Date.now();
@@ -2025,7 +2028,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const evidence = Math.min(latest, now);
     if (evidence <= this.#refreshedAt || now - evidence > this.#heartbeatMs) return undefined;
     try { this.mesh.stateToken({ fresh: true }); } catch { return undefined; }
-    return evidence;
+    return this.#witnessHolds(latest, evidence, Date.now()) ? evidence : undefined;
+  }
+
+  /** The lock-free confirmation conditions at `at`, a clock reading taken after the fresh read. */
+  #witnessHolds(latest: number, evidence: number, at: number): boolean {
+    return this.#leaseConfirmed && this.#refreshError === undefined && !this.#closed &&
+      at - this.#refreshedAt < this.#heartbeatMs * 2 &&
+      latest > this.#commitWitnessSeen && evidence > this.#refreshedAt && at - evidence <= this.#heartbeatMs;
   }
 
   #renewFileLease(): number {

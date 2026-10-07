@@ -2402,6 +2402,8 @@ export class MeshStore {
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
       (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      // A bounded try that fails closed before the common accounting below: count it once here.
+      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, true);
       throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
     }
     const startTime = this.#lockProtocol === 2

@@ -136,6 +136,38 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(root)).toBe(false);
   });
 
+  it("prunes a quiet root hourly without new acquisitions and drops a removed root", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const parent = temp();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(root);
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    vi.advanceTimersByTime(63_000); // written and pruned once; the root is quiet from now on
+    const written = fs.statSync(ownFile(root)).mtimeMs;
+    const stale = path.join(root, "lock-stats", "gone-1.json");
+    const fresh = path.join(root, "lock-stats", "alive-2.json");
+    fs.writeFileSync(stale, "{}");
+    fs.writeFileSync(fresh, "{}");
+    fs.utimesSync(stale, (T0 - 25 * 60 * 60_000) / 1000, (T0 - 25 * 60 * 60_000) / 1000);
+    fs.utimesSync(fresh, T0 / 1000, T0 / 1000);
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(fs.existsSync(stale)).toBe(true); // hourly, not every minute
+    vi.advanceTimersByTime(31 * 60_000);
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.statSync(ownFile(root)).mtimeMs).toBe(written); // pruning did not rewrite
+    fs.rmSync(root, { recursive: true, force: true });
+    expect(() => vi.advanceTimersByTime(61 * 60_000)).not.toThrow();
+    expect(fs.existsSync(root)).toBe(false);
+    // Dropped from tracking: later hourly flushes no longer touch it.
+    const readdir = vi.spyOn(fs, "readdirSync");
+    vi.advanceTimersByTime(61 * 60_000);
+    expect(readdir.mock.calls.filter(([target]) => String(target).startsWith(root))).toHaveLength(0);
+    expect(fs.existsSync(root)).toBe(false);
+  });
+
   it("captures a disabled setting once across a release reload", async () => {
     vi.useFakeTimers();
     expect(createLockStats("0")).toBeUndefined();

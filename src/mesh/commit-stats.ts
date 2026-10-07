@@ -196,18 +196,20 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
     // Atomic for readers; deliberately not durable (diagnostics, no fsync).
     fs.writeFileSync(`${file}.tmp`, JSON.stringify(body, roundMs), { mode: 0o600 });
     fs.renameSync(`${file}.tmp`, file);
-    if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
-      entry.prunedAt = now;
-      prune(directory, name, now);
-    }
   };
   const flush = (): void => {
     const now = Date.now();
     for (const [key, entry] of roots) {
-      if (!entry.dirty) continue;
       try {
-        write(entry, now);
-        entry.dirty = false;
+        if (entry.dirty) {
+          write(entry, now);
+          entry.dirty = false;
+        }
+        // Hourly and read-only, also for a quiet root: never creates the directory.
+        if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
+          entry.prunedAt = now;
+          prune(path.join(entry.root, LOCK_STATS_DIR), `${host}-${process.pid}.json`, now);
+        }
       } catch (error) {
         // A removed root is forgotten; any other failure retries at the next flush.
         if (errorCodeOf(error) === "ENOENT" || errorCodeOf(error) === "ENOTDIR") roots.delete(key);

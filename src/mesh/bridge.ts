@@ -438,8 +438,10 @@ export class StoreBridgeSide implements BridgeSide {
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
     // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
-    // root of such a spoke on every pass (smarty-dev#6477). Never later than now.
-    const liveAt = Math.min(now, observedAt ?? now);
+    // root of such a spoke on every pass (smarty-dev#6477). Never later than now. A non-finite
+    // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
+    // one for a full lease (independent review, P2).
+    const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
     const leases: Array<{ id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number }> = [];
     const removed: Array<{ key: string; id: string }> = [];
     await this.store.writeBatch({
@@ -466,9 +468,13 @@ export class StoreBridgeSide implements BridgeSide {
           // A mirror never renews: its lease carries the origin's last renewal, not this sync.
           // Liveness is judged when the snapshot was requested (liveAt); the origin's remaining
           // life is then counted from this commit, so a slow pass does not lapse a live mirror.
-          // That shift is at most this pass's latency (zero when no observedAt is given).
+          // That shift is at most this pass's latency (zero when no observedAt is given) and never
+          // more than one BRIDGE_LEASE_MS, so a stalled pass cannot keep a dead origin's mirror
+          // alive longer than one lease past the origin (independent review, P2). A mirror that
+          // the capped shift leaves already lapsed is not written: it is dropped like any other.
           if (!Number.isFinite(expiresAt) || expiresAt <= liveAt) continue;
-          const until = Math.min(expiresAt + (now - liveAt), now + BRIDGE_LEASE_MS);
+          const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          if (until <= now) continue;
           const renewedAt = Math.min(record.updatedAt, now);
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {

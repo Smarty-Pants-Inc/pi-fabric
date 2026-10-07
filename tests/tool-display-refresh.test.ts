@@ -10,6 +10,33 @@ const flushDrainTurns = async (turns: number): Promise<void> => {
 };
 
 describe("FabricToolDisplayController.refresh", () => {
+  it("keeps callbacks on the host-owned state, using the newest call/result pair", async () => {
+    const controller = new FabricToolDisplayController();
+    const owner = {};
+    const oldCall = vi.fn(), oldResult = vi.fn(), currentResult = vi.fn();
+    controller.observe("card", "call", oldCall, owner);
+    controller.observe("card", "result", oldResult, owner);
+    controller.refresh();
+    controller.observe("card", "result", currentResult, owner);
+    await flushDrainTurns(2);
+    expect(currentResult).toHaveBeenCalledOnce();
+    expect(oldCall).not.toHaveBeenCalled();
+    expect(oldResult).not.toHaveBeenCalled();
+  });
+
+  it("does not combine callbacks from rebuilt cards sharing a call id", async () => {
+    const controller = new FabricToolDisplayController();
+    const oldOwner = {}, newOwner = {};
+    const oldResult = vi.fn(), newCall = vi.fn();
+    controller.observe("reused", "result", oldResult, oldOwner);
+    controller.refresh(); // queued old work must also be discarded on replacement
+    controller.observe("reused", "call", newCall, newOwner);
+    controller.refresh();
+    await flushDrainTurns(2);
+    expect(newCall).toHaveBeenCalledOnce();
+    expect(oldResult).not.toHaveBeenCalled();
+  });
+
   it("invalidates each card once even when call and result kinds are registered", async () => {
     const controller = new FabricToolDisplayController();
     const call = vi.fn();

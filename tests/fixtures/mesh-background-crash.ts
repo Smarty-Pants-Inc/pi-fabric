@@ -77,8 +77,12 @@ if (mode === "foreground") {
   await provider.invoke("put", { key: "probe", value: 2 }, {} as FabricInvocationContext);
   assert.equal(mesh.get("probe")?.value, 2);
 } else if (mode.startsWith("directory-")) {
+  // A change refresh that hit a lock timeout is deliberately NOT retried by later
+  // change requests: pending changes ride the next heartbeat (#4383, e442f292).
+  // Keep that heartbeat well after the 350 ms hold but inside wait()'s 5 s, so
+  // recovery is proven through the designed path rather than a 60 s timer.
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
-    heartbeatMs: mode === "directory-change" ? 60_000 : 100, leaseMs: 180_000 });
+    heartbeatMs: mode === "directory-change" ? 1_000 : 100, leaseMs: 180_000 });
   let name = "before";
   directory.registerSource(() => [{ ...member(identity.id, true), name, label: "probe" }]);
   await directory.start();
@@ -89,6 +93,7 @@ if (mode === "foreground") {
   await sleep(350);
   assert.equal(mesh.listAll("topology/hosts/")[0]!.version, initial);
   release();
+  // During the outage this must be a no-op (no extra retry); the heartbeat recovers.
   if (mode === "directory-change") directory.scheduleRefresh();
   await wait(() => directory.list().some(value => value.name === "after"));
   await directory.close();

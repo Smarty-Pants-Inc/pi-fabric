@@ -37,17 +37,23 @@ const world = (actorQueueLimit: number) => {
   closers.push(() => agents.close());
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
+  let unhold!: () => void;                                        // a second gate, for tasks containing HOLD
+  const holdGate = new Promise<void>((resolve) => { unhold = resolve; });
+  let held = 0;
   const tasks: Array<{ actor: string; task: string }> = [];
   const run = agents.run.bind(agents);
   vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
-    tasks.push({ actor: request.actorName ?? "", task: request.task });
-    if (request.task.includes("BLOCK")) {                         // until release(), or the run is aborted
+    const wait = request.task.includes("BLOCK") ? gate : request.task.includes("HOLD") ? holdGate : undefined;
+    if (wait) {                                                   // until release()/unhold(), or the run is aborted
+      if (wait === holdGate) held++;
       await new Promise<void>((resolve) => {
-        void gate.then(resolve);
+        void wait.then(resolve);
         if (signal?.aborted) resolve();
         signal?.addEventListener("abort", () => resolve(), { once: true });
       });
     }
+    // A run aborted while it waited to launch never ran.
+    if (!signal?.aborted) tasks.push({ actor: request.actorName ?? "", task: request.task });
     return run(request, signal, ...callbacks);
   });
   const manager = (queueLimit = actorQueueLimit) => {
@@ -68,7 +74,7 @@ const world = (actorQueueLimit: number) => {
       ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => (JSON.parse(line) as { event: { text?: string } }).event.text ?? "")
       : [];
   };
-  return { root, mesh, agents, manager, release: () => release(), events, deadLetters };
+  return { root, mesh, agents, manager, release: () => release(), unhold: () => unhold(), held: () => held, events, deadLetters };
 };
 const evs = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => `ev-${from + index}`);
 
@@ -190,6 +196,28 @@ describe("actor queue overflow", () => {
     const second = w.manager();
     w.release();
     await waitFor(() => w.events("slow").length >= 12 && w.deadLetters(slow.id).length === 0, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(w.events("slow")).toEqual(evs(1, 12));
+    void second;
+  }, 60_000);
+
+  // Round 4 P2: replay rewrote the queue file before the drained item was in flight, so a close()
+  // while that item waited to launch lost it. After a restart it must run, exactly once, in order.
+  it("keeps the drained item that triggered a replay when the manager closes before it launches", async () => {
+    const w = world(1);                                           // overflow cap: 8
+    const first = w.manager();
+    const slow = await first.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => first.status(slow.id).status === "preparing");
+    for (let n = 1; n <= 12; n++) await w.mesh.publish({ topic: "team.events", from, text: n === 9 ? "HOLD ev-9" : `ev-${n}` });
+    await waitFor(() => w.deadLetters(slow.id).length === 3, 10_000);
+    w.release();                                                  // ev-1..ev-8 run; draining ev-9 replays ev-10
+    await waitFor(() => w.held() === 1 && w.deadLetters(slow.id).length === 2, 30_000);
+    expect(w.events("slow")).toEqual(evs(1, 8));
+    await first.close();                                          // ev-9 still waits to launch
+    w.unhold();
+    const second = w.manager();
+    await waitFor(() => w.events("slow").length >= 11 && w.deadLetters(slow.id).length === 0, 30_000);
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(w.events("slow")).toEqual(evs(1, 12));
     void second;

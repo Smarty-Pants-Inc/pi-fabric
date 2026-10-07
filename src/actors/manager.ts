@@ -2757,7 +2757,6 @@ export class ActorManager {
         }
         const item = actor.queue.shift();
         this.#refill(actor);
-        this.#replayDeadLetters(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
@@ -2766,11 +2765,14 @@ export class ActorManager {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
           this.#recordFiltered(actor, item, filteredBy);
           this.#persistQueue(actor.id);
+          this.#replayDeadLetters(actor);
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           await this.#publishDrainPresence(actor);
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        // Only now: the replay rewrites the queue file, which must still hold this item (round 4 P2).
+        this.#replayDeadLetters(actor);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
         actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
@@ -3682,7 +3684,12 @@ export class ActorManager {
     if (entries.length === 0) fs.rmSync(file, { force: true });
     else {
       const temporary = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(temporary, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), { mode: 0o600 });
+      // Synced before the rename: a spill must be durable before the queue file forgets it.
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
       fs.renameSync(temporary, file);
     }
     this.#deadLetters.set(actorId, entries.length);
@@ -3748,7 +3755,7 @@ export class ActorManager {
   // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
   // leave the file only after the queue file durably holds what they replayed.
   #replayDeadLetters(actor: ManagedActor): void {
-    if (!this.#persistent || this.#closing || actor.status === "stopped" || actor.removal ||
+    if (!this.#persistent || this.#closing || this.#halted || actor.status === "stopped" || actor.removal ||
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;

@@ -13,7 +13,11 @@ A bare directory prefix searches `$PI_FABRIC_MESH_ROOT/residency`; alternatively
 pass `--mesh-root`. Without either, the default is
 `$PI_FABRIC_PROJECT_ROOT/.pi/fabric/mesh` (or the current directory).
 Explicit paths must be direct children of that residency directory; selector and
-channel symlinks are refused. Ambiguous resident prefixes and actor names are
+channel symlinks are refused. The resident directory and its channel files must
+be owned by the invoking OS user: on POSIX by uid; on Windows by owner SID
+(queried with PowerShell `Get-Acl`). If the Windows owner SID cannot be read,
+or any owner differs from the current user's SID, the command refuses before it
+sends a request. Ambiguous resident prefixes and actor names are
 refused. Actor IDs and names are exact and scoped to the selected host's root,
 not the caller's root.
 

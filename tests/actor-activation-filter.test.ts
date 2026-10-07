@@ -805,7 +805,8 @@ describe("native P0 activation reservations", () => {
     const { actors, root } = setup();
     const actor = await actors.create({ name: "retry", instructions: "x" });
     const held = await reserveP0(actors, actor.id, p0Request({ requiredSecurity: [] }));
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    // The required commit stages via prepare() (smarty-dev#4383); fail that stage once.
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
     try {
       await expect(observeP0(actors, actor.id, held, { reviewTerminal: true })).rejects.toThrow("disk unavailable");
       const receipt = actors.status(actor.id).activationFilterRelease;
@@ -823,7 +824,8 @@ describe("native P0 activation reservations", () => {
   it("rolls back an issued reservation whose commit failed, so no unreleasable claim is left behind", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "issue-rollback", instructions: "x" });
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    // The required commit stages via prepare() (smarty-dev#4383); fail that stage once.
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
     try {
       await expect(actors.setActivationFilter(actor.id, BOTH, undefined, undefined, p0Request())).rejects.toThrow("disk unavailable");
       expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();

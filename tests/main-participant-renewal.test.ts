@@ -107,3 +107,23 @@ it("the fixed Main session lease lapses even with a longer host lease", async ()
   expect(readParticipantFile(s.root, s.participantKey)!.version).toBeGreaterThan(before.version);
   expect(s.warning).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/Main participant re-published.*lapsed/));
 });
+it.each([false, true])("a reaped host lease while Main is live re-publishes presence and the root re-registers (files-only=%s)", async filesOnly => {
+  const s = await setup(filesOnly);
+  const before = readParticipantFile(s.root, s.participantKey)!;
+  expect(s.observer.sessions().map(root => root.id)).toContain(s.identity.id);
+  removeHostLease(s.root, s.identity.id); // lease lost (reaped) while the Main process stays live
+  expect(readHostLease(s.root, s.identity.id)).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(5_000); // next real renewal tick, not a manual publish
+  expect(readHostLease(s.root, s.identity.id)?.expiresAt).toBeGreaterThan(Date.now());
+  expect(readParticipantFile(s.root, s.participantKey)!.version).toBeGreaterThan(before.version);
+  expect(s.observer.get(s.identity.id, Date.now(), { fresh: true })).toMatchObject({ kind: "root", stale: false });
+  const fresh = new ParticipantDirectory(new MeshStore(s.root, 65_536, 100), {
+    enabled: true, identity: s.observerIdentity, rootId: s.observerIdentity.id, hostId: s.observerIdentity.id, reapDeadHosts: false,
+  }); directories.push(fresh);
+  expect(fresh.sessions().map(root => root.id)).toContain(s.identity.id); // re-registered as a live root
+  expect(fresh.peers().map(peer => peer.id)).toContain(s.identity.id);
+  expect(s.warning).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/Main participant re-published.*session:live.*lapsed/));
+  const count = s.writes.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(5_000); // recovered: back to ordinary quiet renewal
+  expect(s.writes).toHaveBeenCalledTimes(count); expect(s.warning).toHaveBeenCalledTimes(1);
+});

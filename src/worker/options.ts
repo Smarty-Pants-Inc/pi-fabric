@@ -146,6 +146,7 @@ export const parseWorkerOptions = (
   const spawnerId = optional(args, "spawner-id");
   const spawnerKind = optional(args, "spawner-kind");
   const spawnerRun = optional(args, "spawner-run");
+  const spawnerName = optional(args, "spawner-name");
   if (spawnerId && spawnerKind !== "main" && spawnerKind !== "agent" && spawnerKind !== "actor") {
     throw new Error("Invalid worker spawner kind");
   }
@@ -209,6 +210,7 @@ export const parseWorkerOptions = (
     fullCodeMode: required(args, "full-code-mode") === "true",
     ...(mainAgentId ? { mainAgentId } : {}),
     ...(spawner ? { spawner } : {}),
+    ...(spawnerName ? { spawnerName } : {}),
     ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions,
     tools: JSON.parse(required(args, "tools")) as string[],

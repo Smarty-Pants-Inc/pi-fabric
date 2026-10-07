@@ -50,6 +50,7 @@ import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import { resolveAgentSpawner } from "./spawner.js";
+import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import type {
   AgentSpawner,
   FabricBudgetSummary,
@@ -694,6 +695,7 @@ export class AgentManager {
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
   readonly #spawner: AgentSpawner | undefined;
+  readonly #spawnerName: () => string | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
@@ -778,6 +780,8 @@ export class AgentManager {
       identityId?: string;
       /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
       spawnerSessionId?: string;
+      /** This caller's sender name for its children's X-Smarty-Spawner (smarty-dev#6207). */
+      spawnerName?: () => string | undefined;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
@@ -843,6 +847,7 @@ export class AgentManager {
       this.#mainAgentId,
     );
     this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
+    this.#spawnerName = options.spawnerName ?? (() => senderAgent());
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1364,6 +1369,7 @@ export class AgentManager {
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
           ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
             ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
+          ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(this.#spawnerName())),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           ...(adapter.kind === "process" && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments

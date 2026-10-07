@@ -169,6 +169,7 @@ const escapeXmlText = (value: string): string =>
 
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
+import { senderAgent } from "./guards/sender-headers.js";
 
 // Loaded-code identity of this lazy runtime module. Stable-path lazy imports
 // keep their first evaluation for the life of the host process, so a hash
@@ -783,6 +784,7 @@ export class FabricRuntimeState {
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
+      spawnerName: () => senderAgent(process.env, this.pi.getSessionName?.()),
       retention: this.#config.retention,
       ...(this.#paths
         ? {

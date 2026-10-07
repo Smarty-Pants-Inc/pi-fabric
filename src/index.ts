@@ -242,6 +242,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
   registerFabricPrincipalCapture(pi);
+  // smarty-dev#6207: the Main names its sender; a Fabric worker child loads the same hook with -e.
+  // First-use import of the standalone hook file (a stable package-local path, as the worker's -e),
+  // so the resolver shared with lazy agent code stays out of the startup graph and its chunks.
+  if (!process.env.PI_FABRIC_PARENT_RUN?.trim() && !process.env.PI_FABRIC_ACTOR_ID?.trim()) {
+    const senderHeadersUrl = new URL(import.meta.url.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js", import.meta.url).href;
+    pi.on("before_provider_headers", async event => {
+      const { resolveSenderHeaders } = await import(senderHeadersUrl) as typeof import("./guards/sender-headers.js");
+      Object.assign(event.headers, resolveSenderHeaders(process.env, pi.getSessionName?.()));
+    });
+  }
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;

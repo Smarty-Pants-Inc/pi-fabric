@@ -717,6 +717,9 @@ export class ResidentHost {
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
+    // Observed below by closeWithActors, but only after further awaits: a rejection
+    // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
+    void actorsClosed?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
@@ -1301,7 +1304,8 @@ export class ResidentHost {
       entry = { result: Promise.resolve().then(() => this.#executeRequest(command)) };
       this.#creations.set(key, entry);
       const tracked = entry;
-      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); });
+      // The caller awaits the result; this bookkeeping branch must not leak its rejection.
+      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); }, () => undefined);
     }
     const response = await entry.result;
     if (response.requestId !== command.requestId) {

@@ -213,6 +213,18 @@ type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
 /** An accepted removal whose cleanup fails is retried this often, from REMOVAL_RETRY_MS doubling. */
 const REMOVAL_RETRIES = 5;
 const REMOVAL_RETRY_MS = 1_000;
+// A failed background registry save stays dirty and retries until it commits
+// (smarty-dev#816, pi-fabric#577). Jittered exponential backoff, capped.
+const REGISTRY_SAVE_RETRY_MIN_MS = 250;
+const REGISTRY_SAVE_RETRY_MAX_MS = 30_000;
+const registrySaveRetryMs = (failures: number): number => {
+  const ceiling = Math.min(REGISTRY_SAVE_RETRY_MAX_MS, REGISTRY_SAVE_RETRY_MIN_MS * 2 ** Math.min(Math.max(0, failures - 1), 7));
+  return Math.max(1, Math.round(ceiling * (0.5 + Math.random() * 0.5)));
+};
+/** A veto (or any error typed retryable) committed nothing; the same save may be retried. */
+const isRetryableRegistrySave = (error: unknown): boolean => error instanceof ActorRegistryUpdateVetoedError ||
+  (typeof error === "object" && error !== null && (error as { retryable?: unknown }).retryable === true);
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const HOST_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set(FABRIC_ACTOR_HOST_EVENTS);
@@ -527,6 +539,8 @@ export class ActorManager {
   #registrySaveTimer: NodeJS.Timeout | undefined;
   #registrySavePending: Promise<void> | undefined;
   #registrySaveDurable = false;
+  /** Consecutive failed background registry saves; 0 once one commits. */
+  #registrySaveFailures = 0;
   #registrySaveRevision = 0;
   #registrySaveChain: Promise<void> = Promise.resolve();
   readonly #registrySaveControllers = new Set<AbortController>();
@@ -2391,7 +2405,7 @@ export class ActorManager {
         if (actor.status !== "stopped") actor.status = "idle";
         actor.updatedAt = Date.now();
       }
-      if (owned.length > 0) await this.#saveActors();
+      if (owned.length > 0) await this.#saveActorsAtClose();
       return;
     }
     await Promise.allSettled([...this.#actors.keys()].map((id) => this.stop(id)));
@@ -2399,6 +2413,32 @@ export class ActorManager {
       [...this.#actors.values()].map((actor) => actor.drain ?? Promise.resolve()),
     );
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
+  }
+
+  /**
+   * The final status save at close retries a retryable veto with backoff inside the
+   * close grace; it never turns a transient veto into a failed shutdown (pi-fabric#577).
+   * Exhausted, the registry keeps its last committed state (queues are checkpointed
+   * separately) and the next owner reloads from it.
+   */
+  async #saveActorsAtClose(): Promise<void> {
+    const deadline = Date.now() + Math.max(this.#closeGraceMs, 5_000);
+    for (let failures = 1; ; failures++) {
+      try {
+        await this.#saveActors();
+        if (failures > 1) console.warn(`[pi-fabric] actor registry save at close committed after ${failures - 1} failed attempt(s)`);
+        return;
+      } catch (error) {
+        if (!isRetryableRegistrySave(error)) throw error;
+        const wait = registrySaveRetryMs(failures);
+        if (Date.now() + wait >= deadline) {
+          console.warn(`[pi-fabric] actor registry save at close not committed; keeping the last committed registry: ${errorText(error)}`);
+          return;
+        }
+        if (failures === 1) console.warn(`[pi-fabric] actor registry save at close failed; retrying: ${errorText(error)}`);
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+    }
   }
 
   #childCompletionStore(actor: ManagedActor): ActorChildCompletionStore {
@@ -4267,21 +4307,32 @@ export class ActorManager {
     return this.#registryState(rows, true);
   }
 
-  #scheduleRegistrySave(durable = false): void {
+  #scheduleRegistrySave(durable = false, delayMs?: number): void {
     this.#registrySaveDurable ||= durable;
     if (this.#registrySaveTimer || this.#closing) return;
     this.#registrySaveTimer = setTimeout(() => {
       this.#registrySaveTimer = undefined;
       const durable = this.#registrySaveDurable;
       this.#registrySaveDurable = false;
-      this.#registrySavePending = this.#saveActors(new Set(), { flush: true, durable }).catch((error) => {
-        console.warn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
-        // Preserve dirty state and retry after the same bounded window.
-        this.#lastRegistrySaveAt = Date.now();
-        this.#scheduleRegistrySave(durable);
-      }).finally(() => { this.#registrySavePending = undefined; });
-    }, Math.max(1, 5_000 - (Date.now() - this.#lastRegistrySaveAt)));
+      // The background save owns its rejection: it never escapes the timer
+      // (an unhandled veto killed the resident host, pi-fabric#577).
+      const pending: Promise<void> = this.#saveActors(new Set(), { flush: true, durable })
+        .catch((error: unknown) => this.#retryRegistrySave(error, durable))
+        .finally(() => { if (this.#registrySavePending === pending) this.#registrySavePending = undefined; });
+      this.#registrySavePending = pending;
+    }, delayMs ?? Math.max(1, 5_000 - (Date.now() - this.#lastRegistrySaveAt)));
     this.#registrySaveTimer.unref?.();
+  }
+
+  /** Keep a failed save dirty and retry it with backoff until it commits. Logs once per outage. */
+  #retryRegistrySave(error: unknown, durable: boolean): void {
+    this.#registrySaveDurable ||= durable;
+    if (this.#registrySaveTimer || this.#closing) return;
+    if (this.#registrySaveFailures++ === 0) {
+      console.warn(`[pi-fabric] actor registry save failed; retrying until it commits: ${errorText(error)}`);
+    }
+    this.#lastRegistrySaveAt = Date.now();
+    this.#scheduleRegistrySave(durable, registrySaveRetryMs(this.#registrySaveFailures));
   }
 
   #deferSoftRegistrySave(rows: Record<string, unknown>[], forced: boolean): boolean {
@@ -4389,13 +4440,18 @@ export class ActorManager {
       });
       });
     } catch (error) {
-      // A persistent veto committed nothing: keep the state dirty and fail the awaited save.
-      if (error instanceof ActorRegistryUpdateVetoedError) {
-        this.#scheduleRegistrySave(options?.durable === true || removedIds.size > 0);
+      // A persistent veto committed nothing: keep the state dirty, retry it in the
+      // background with backoff, and still fail the awaited save.
+      if (isRetryableRegistrySave(error)) {
+        this.#retryRegistrySave(error, options?.durable === true || removedIds.size > 0);
       }
       throw error;
     }
     if (!committed) return;
+    if (this.#registrySaveFailures > 0) {
+      console.warn(`[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
+      this.#registrySaveFailures = 0;
+    }
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;
     this.#registrySaveDurable = false;

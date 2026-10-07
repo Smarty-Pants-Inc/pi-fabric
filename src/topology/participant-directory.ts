@@ -153,6 +153,8 @@ interface ParsedDirectory {
   shadowed: FabricParticipantRecord[];
   legacySessions: MeshStateEntry[];
   legacyActors: MeshStateEntry[];
+  /** Entries that failed validation. Refusals for them are published only from a bound read. */
+  malformed: MeshStateEntry[];
 }
 
 const deepFreeze = <T>(value: T): T => {
@@ -745,9 +747,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
       return [...byId.values()];
     }
-    const read = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}) };
-    const parsed = this.#parsed(read, this.options.listReadCacheMs);
-    const hosts = this.#liveHosts(parsed.hosts);
+    // smarty-dev#4250: `background` is display-only by contract (FabricParticipantListOptions):
+    // its only callers are the dashboard snapshot's participantInfos/peerInfos, which feed the
+    // widget and never route, admit or write. So it may read a journal-followed state whose
+    // terminal endpoint is not bound to the payload hash yet (displayOnly) and stay incremental.
+    // Ownership, routing and delivery callers never pass background and keep the bound read.
+    const display = options.background === true && options.fresh !== true;
+    let read: MeshReadOptions = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}),
+      ...(display ? { displayOnly: true } : {}) };
+    let parsed = this.#parsed(read, this.options.listReadCacheMs);
+    let hosts = this.#liveHosts(parsed.hosts);
+    // The one write below is the advisory collision refusal (#reportRefusal publishes). A display
+    // view is only a change check for it: on any collision, re-read authoritatively (bound) and
+    // report from that view alone, so an unbound endpoint can never publish a refusal.
+    // A malformed mirror is the same: its refusal is published only from the bound re-read.
+    if (display && (parsed.malformed.length > 0 ||
+      [...parsed.shadowed, ...parsed.participants].some((participant) => this.#collides(participant, hosts, false)))) {
+      read = { fresh: false, background: true };
+      parsed = this.#parsed(read, this.options.listReadCacheMs);
+      hosts = this.#liveHosts(parsed.hosts);
+    }
     const byId = new Map<string, FabricParticipantInfo>();
     const refused: string[] = [];
     for (const mirror of parsed.shadowed) this.#collides(mirror, hosts);
@@ -800,7 +819,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     }
-    const self = this.self(now, options);
+    // Same read as the listing: a display listing's self fallback scan stays displayOnly too.
+    const self = this.self(now, read);
     if (
       (!options.kinds || options.kinds.includes(self.kind)) &&
       options.scope !== "project" &&
@@ -820,11 +840,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // copies only the entries whose version moved; the fleet state is rewritten several times a
   // second, but by a few writers. The copies are frozen, since every caller now shares them.
   #parsed(read: MeshReadOptions, listReadCacheMs?: number): ParsedDirectory {
+    const value = this.#parse(read, listReadCacheMs);
+    // smarty-dev#4250: a displayOnly view is not bound to the payload hash, so it never
+    // publishes a malformed-mirror refusal; a bound read (cached or not) reports, deduplicated.
+    if (read.displayOnly !== true) for (const entry of value.malformed) this.#reportMalformedMirror(entry);
+    return value;
+  }
+
+  #parse(read: MeshReadOptions, listReadCacheMs?: number): ParsedDirectory {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
       const merged = mergeParticipantEntries(this.#participantFiles(read, listReadCacheMs), this.mesh.listAll(PARTICIPANT_PREFIX, read));
       return {
         hosts: this.mesh.listAll(HOST_PREFIX, read),
-        participants: this.#participantsOf(merged.entries),
+        ...this.#participantsOf(merged.entries),
         shadowed: merged.shadowed.flatMap((entry) => participantFromEntry(entry) ?? []),
         legacySessions: this.mesh.listAll(LEGACY_SESSION_PREFIX, read),
         legacyActors: this.mesh.listAll(LEGACY_ACTOR_PREFIX, read),
@@ -853,10 +881,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
     const value: ParsedDirectory = {
       hosts: copies(HOST_PREFIX),
-      ...((): Pick<ParsedDirectory, "participants" | "shadowed"> => {
+      ...((): Pick<ParsedDirectory, "participants" | "malformed" | "shadowed"> => {
         const merged = mergeParticipantEntries(files, copies(PARTICIPANT_PREFIX));
         return {
-          participants: this.#participantsOf(merged.entries),
+          ...this.#participantsOf(merged.entries),
           shadowed: merged.shadowed.flatMap((entry) => participantFromEntry(entry) ?? []),
         };
       })(),
@@ -2080,12 +2108,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return readParticipantFiles(this.mesh.root, { maxAgeMs });
   }
 
-  #participantsOf(entries: readonly MeshStateEntry[]): FabricParticipantRecord[] {
-    return entries.flatMap((entry) => {
+  #participantsOf(entries: readonly MeshStateEntry[]): Pick<ParsedDirectory, "participants" | "malformed"> {
+    const participants: FabricParticipantRecord[] = [];
+    const malformed: MeshStateEntry[] = [];
+    for (const entry of entries) {
       const participant = participantFromEntry(entry);
-      if (!participant) this.#reportMalformedMirror(entry);
-      return participant ?? [];
-    });
+      if (participant) participants.push(participant);
+      else if (isObject(entry.value) && entry.value.remoteHost !== undefined) malformed.push(entry);
+    }
+    return { participants, malformed };
   }
 
   #participantEntry(key: string, read: MeshReadOptions = {}): MeshStateEntry | undefined {

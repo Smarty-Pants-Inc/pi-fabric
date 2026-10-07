@@ -111,6 +111,9 @@ export const createDashboardSnapshot = (
       : state.agents.list();
   // Observe externally owned domains on every poll, including remote lease
   // expiry and model/usage updates that need not emit a local manager event.
+  // smarty-dev#4250: these three mesh reads only FEED the dashboard (nothing here routes,
+  // admits or writes), so they are displayOnly: `background` makes the participant directory
+  // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.
   const participants = typeof state.participantInfos === "function"
     ? state.participantInfos({ scope: "project", background: true }) : [];
   const actorRecords = state.actors.list();
@@ -119,7 +122,7 @@ export const createDashboardSnapshot = (
   const globalActors = state.globalActors.list();
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
-  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true }) : [];
+  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true, displayOnly: true }) : [];
   const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };

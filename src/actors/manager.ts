@@ -58,7 +58,7 @@ import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
-import { ActorRegistryCheckpointBarrierError, ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { publicationGeneration } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
@@ -224,11 +224,6 @@ const registrySaveRetryMs = (failures: number): number => {
 /** A veto (or any error typed retryable) committed nothing; the same save may be retried. */
 const isRetryableRegistrySave = (error: unknown): boolean => error instanceof ActorRegistryUpdateVetoedError ||
   (typeof error === "object" && error !== null && (error as { retryable?: unknown }).retryable === true);
-/** What a committed registry save acknowledges (the update() value of #saveActorsNow). */
-type RegistrySaveAcknowledgment = {
-  owned: ManagedActor[]; revoked: string[]; actors: readonly Record<string, unknown>[];
-  saved: { owned: string; critical: string }; revision: number; appends: Map<ManagedActor, FabricActorMessage[]>;
-};
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
@@ -4445,12 +4440,6 @@ export class ActorManager {
       });
       });
     } catch (error) {
-      // A checkpoint barrier failure after the registry rename is not a success, but
-      // the registry already references these appends: acknowledge exactly that
-      // prefix so the retry never re-appends it, then fail the awaited save.
-      if (error instanceof ActorRegistryCheckpointBarrierError && error.committed) {
-        this.#acknowledgeRegistrySave(error.committed.value as RegistrySaveAcknowledgment);
-      }
       // A persistent veto committed nothing: keep the state dirty, retry it in the
       // background with backoff, and still fail the awaited save.
       if (isRetryableRegistrySave(error)) {
@@ -4459,10 +4448,6 @@ export class ActorManager {
       throw error;
     }
     if (!committed) return;
-    this.#acknowledgeRegistrySave(committed);
-  }
-
-  #acknowledgeRegistrySave(committed: RegistrySaveAcknowledgment): void {
     if (this.#registrySaveFailures > 0) {
       console.warn(`[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
       this.#registrySaveFailures = 0;

@@ -141,43 +141,68 @@ describe("actor registry lazy/status writes (#3752, #4383)", () => {
     expect(f.store.messages(record)).toHaveLength(100);
   });
 
-  it("a checkpoint barrier failure after the commit fails the save but never re-appends its messages (pi-fabric#590)", async () => {
+  // pi-fabric#590 scope cut: the checkpoint directory barrier runs under the registry lock;
+  // a barrier that fails twice rolls the commit back under that lock, so nothing is
+  // committed and the manager re-appends on its (background) retry.
+  it.skipIf(process.platform === "win32")("a checkpoint barrier that fails twice under the lock rolls back; the manager retries and the message is selected exactly once (pi-fabric#590)", async () => {
     const f = setup();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(f.agent, "run").mockImplementation((_request, signal, onSpawned) => {
       onSpawned?.({ id: "mock-run" } as Parameters<NonNullable<typeof onSpawned>>[0]);
       return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("fixture abort")), { once: true }));
     });
     const actor = await f.manager.create({ name: "barrier", instructions: "Review." });
     await settle();
-    // The store committed the registry rename, then both deferred checkpoint barriers
-    // failed: update() rejects with the committed value attached (fail closed).
-    const real = ActorRegistryStore.prototype.update;
-    let calls = 0, failed = 0;
-    vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(async function (this: ActorRegistryStore, ...args) {
-      calls++;
-      const value = await real.apply(this, args as Parameters<typeof real>);
-      if (value !== undefined && failed === 0) {
-        failed++;
-        throw new ActorRegistryCheckpointBarrierError(["checkpoint"], { value }, new Error("EIO"));
+    const checkpoints = path.join(f.actorRoot, actor.id, "registry");
+    const lockPath = path.join(f.actorRoot, "actors.json.lock");
+    const original = { open: fs.openSync, fsync: fs.fsyncSync, exists: fs.existsSync };
+    const paths = new Map<number, string>();
+    let failures = 0;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
+      const fd = (original.open as (...args: unknown[]) => number)(file, ...rest);
+      paths.set(fd, String(file));
+      return fd;
+    }) as typeof fs.openSync);
+    // Only the commit's checkpoint barrier (under the lock) fails, twice: the first try
+    // and its one retry. The rollback and every later barrier succeed.
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      if (failures < 2 && paths.get(fd) === checkpoints && original.exists(lockPath) && fs.fstatSync(fd).isDirectory()) {
+        failures++;
+        throw Object.assign(new Error("EIO: checkpoint barrier"), { code: "EIO" });
       }
-      return value;
+      original.fsync(fd);
+    });
+    const real = ActorRegistryStore.prototype.update;
+    const outcomes: string[] = [];
+    vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(async function (this: ActorRegistryStore, ...args) {
+      try {
+        const value = await real.apply(this, args as Parameters<typeof real>);
+        outcomes.push(value === undefined ? "none" : "committed");
+        return value;
+      } catch (error) {
+        outcomes.push(error instanceof ActorRegistryCheckpointBarrierError && error.rolledBack && error.retryable ? "rolled-back" : `error ${String(error)}`);
+        throw error;
+      }
     });
     f.manager.tell(actor.id, "exactly-once");
     const deadline = Date.now() + 10_000;
-    while (!(failed === 1 && calls >= 2)) {
-      if (Date.now() > deadline) throw new Error(`no retry after the barrier failure (calls ${calls}, failed ${failed})`);
+    const selected = () => {
+      const record = f.store.records().find(row => row.id === actor.id);
+      return record ? f.store.messages(record).filter(message => (message as { data?: { message?: string } }).data?.message === "exactly-once").length : 0;
+    };
+    while (!(outcomes.includes("rolled-back") && outcomes.lastIndexOf("committed") > outcomes.indexOf("rolled-back") && selected() === 1)) {
+      if (Date.now() > deadline) throw new Error(`no committed retry after the rollback (${outcomes.join(", ")})`);
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     await f.manager.close();
-    const log = fs.readFileSync(path.join(f.actorRoot, actor.id, "registry", "messages.jsonl"), "utf8");
+    expect(failures).toBe(2);
+    expect(outcomes.filter(outcome => outcome.startsWith("error"))).toEqual([]);
+    // The rolled-back append stays behind as an unreferenced archive; the accepted head
+    // selects the message exactly once.
+    const log = fs.readFileSync(path.join(checkpoints, "messages.jsonl"), "utf8");
     const archived = log.split("\n").filter(Boolean).flatMap(line => JSON.parse(line).messages as Array<{ data?: { message?: string } }>);
-    // The failed save already put the message in the registry; the retry and the
-    // close flush acknowledge it instead of appending it again.
-    expect(archived.filter(message => message.data?.message === "exactly-once")).toHaveLength(1);
-    const record = f.store.records()[0]!;
-    expect(f.store.messages(record).filter(message => (message as { data?: { message?: string } }).data?.message === "exactly-once")).toHaveLength(1);
-    expect(warn.mock.calls.some(call => String(call[0]).includes("checkpoint barrier failed after the registry commit"))).toBe(true);
+    expect(archived.filter(message => message.data?.message === "exactly-once").length).toBeGreaterThanOrEqual(1);
+    expect(selected()).toBe(1);
   });
 
   it("coalesces native worker status pulses before acquiring locks and flushes the latest state on close", async () => {

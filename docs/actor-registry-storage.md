@@ -29,51 +29,54 @@ stay behind as an unreferenced archive and the save re-selects under the lock.
 Each changed checkpoint and the new registry are also written to fsynced
 `*.prepared` temp files before custody. Under the registry lock a save then only
 checks the registry generation and the log identities (a `stat`), renames the
-registry, runs the registry's one directory barrier (durable saves), and renames
-the changed checkpoints. The checkpoint directory barriers run right after the
-lock is released and before the save is acknowledged. Only a save that already
-lost a race prepares, and therefore appends, under the lock.
+registry and runs its directory barrier (durable saves), then renames the changed
+checkpoints and runs their directory barriers, all before the lock is released
+(pi-fabric#590: the checkpoint barrier never leaves the lock). Only a save that
+already lost a race prepares, and therefore appends, under the lock.
 
 A crash at any point leaves the registry selecting only complete, durable
 payloads: before the registry rename the new bytes and temp files are
 unreferenced; after it they were already fsynced. Checkpoints are renamed after
 the durable registry rename, so after a crash a checkpoint can lag the registry
 but never lead it. `tests/actor-registry-crash-points.test.ts` crashes at every
-file-system step and checks this, plus the barrier order under the lock.
+file-system step and checks this, plus the barrier order under the lock; it
+repeats every crash point with failing checkpoint barriers, so crashes inside the
+rollback are covered too.
 
 New payload heads, custody and removal decisions are committed with the
 existing durable atomic registry rename and rollback protocol. Before
 acknowledging a save, the writer also checkpoints each changed accepted head to
 `<actor-id>/registry/messages-head.json`. This small checkpoint is independent of unknown registry fields:
 it survives a legacy owned-row save that removes `messageHistory`. Unchanged
-checkpoints are not rewritten. A checkpoint rename failure under the lock rolls
-back changed checkpoints and the registry; later commits never select an
-abandoned append. A checkpoint directory barrier that fails after the lock was
-released is retried once. If it still fails, the save takes the **slow path**
-(pi-fabric#590 security round): it reacquires the registry lock and retries the
-barrier under it. Older releases know nothing about owed barriers; the registry
-lock is the only thing every supported writer honours, so no writer of any
-release can commit on top of the unsynced checkpoint while the slow path runs.
-The lock is released only after the barrier succeeded (the save is then
-acknowledged normally) or after the commit was rolled back. If the barrier still
-fails under the lock and the registry is still this commit, the registry is
-durably restored to its prior bytes and the checkpoints are restored (best
-effort; their directories stay owed). `update()` then rejects with a retryable
-`ActorRegistryCheckpointBarrierError` whose `rolledBack` is set and whose
-`committed` is undefined: nothing is acknowledged, the store's cached snapshot is
-invalidated, and the manager re-appends the messages on retry. The fast path is
-unchanged: a barrier that succeeds runs outside the lock.
-Only if another writer committed in the short interval between the release and
-the reacquisition (the generation moved) can the commit no longer be rolled back:
-the error then carries the committed value, so the manager acknowledges exactly
-the appended prefix instead of appending it again, and the barrier stays owed.
-The next update from that store retries every owed barrier before it selects or
-writes anything and, while one still fails, rejects without committing. A
-removed actor directory owes no barrier. `tests/actor-registry-crash-points.test.ts`
-proves the slow path with an older-release-shaped writer (drops
-`messageHistory`) and an OS-crash model in which unsynced checkpoint renames are
-lost: the older writer never commits over an unsynced checkpoint and recovery
-keeps every acknowledged message.
+checkpoints are not rewritten.
+
+Every directory barrier of a commit (the registry rename's and each renamed
+checkpoint's) runs under the registry lock, before it is released, exactly as
+before smarty-dev#6477 L7; only the payload and temp-file fsyncs moved before
+custody. A failed barrier is retried once under the lock. If it still fails, the
+commit is rolled back under that same lock: the replaced checkpoints are restored
+first (best effort: their directory may be the failing one), then the previous
+registry is restored durably, and `update()` rejects with a retryable
+`ActorRegistryCheckpointBarrierError` (`rolledBack`). Nothing is acknowledged and
+the manager re-appends on retry; the rolled-back appends stay behind as
+unreferenced archives, so later commits never select them. A checkpoint rename
+failure rolls back the same way. If a checkpoint restore's own barrier fails and
+the OS then crashes, that checkpoint may still name the rolled-back head; it is
+only consulted for a row whose `messageHistory` a legacy writer dropped, and can
+then only surface durable but unacknowledged messages, never lose acknowledged
+ones. No writer of any
+release can observe or build on a commit whose checkpoint barrier did not succeed:
+the registry lock is the one thing every supported writer honours, and it is held
+from the registry rename to the barrier's success or the completed rollback.
+If even the registry restore fails, `rolledBack` is false and the save is still
+not acknowledged (unchanged from before this change). Errors are classified by
+code: only `ENOENT` for a checkpoint directory (its actor was removed, so no rename
+is left to persist) is ignored; every other error, including `ENOENT` for the
+registry directory, fails the save. `tests/actor-registry-crash-points.test.ts`
+proves this with an older-release-shaped writer (drops `messageHistory`) that tries
+to commit while the barrier fails, and an OS-crash model in which unsynced
+checkpoint renames are lost: the older writer only runs after the rollback, and
+recovery keeps every acknowledged message.
 A crash may leave stray `messages-head.json.*.prepared` temp files; they are
 never read.
 

@@ -25,9 +25,10 @@ type LandedTail = { identity: string; end: number };
 
 /** Staged checkpoint replacements; temp files are written and fsynced before custody. */
 export interface StagedHeads {
-  /** Under custody: rename the staged checkpoints. Returns the directories that owe a barrier. */
+  /** Under custody: rename the staged checkpoints. Returns the directories of the renamed
+   * checkpoints; the caller runs their directory barriers before it releases custody. */
   publish(): string[];
-  /** Under custody: restore the checkpoints a failed commit replaced. */
+  /** Under custody: restore the checkpoints a failed commit replaced (durably). */
   rollback(): void;
   /** Remove staged temp files that were not published (no-op after publication). */
   dispose(): void;
@@ -62,7 +63,8 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
  * commit. Instructions stay inline for mixed-release readers. A durable per-actor
  * checkpoint preserves accepted heads when an old owned-row serializer drops
  * unknown fields. Payload data and namespace barriers complete BEFORE registry
- * custody; under the lock only the registry rename (and checkpoint renames) remain
+ * custody; under the lock only the registry and checkpoint renames and their
+ * directory barriers remain
  * (smarty-dev#6477 L7). A crash anywhere leaves at most unreferenced bytes/files. */
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
@@ -126,7 +128,7 @@ export class ActorRegistryPayloads {
   }
 
   /** Before custody: write and fsync a temp file for every changed accepted head.
-   * Under custody only a rename remains; its directory barrier may follow the lock. */
+   * Under custody only a rename and its directory barrier remain. */
   stageHeads(rows: readonly Row[]): StagedHeads {
     const staged: Array<{ file: string; next: string; temporary?: string; previous?: string | undefined; replaced?: boolean }> = [];
     const read = (file: string): string | undefined => {

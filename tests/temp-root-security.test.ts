@@ -96,6 +96,76 @@ describe("review F2: file-data namespace safety", () => {
     expect(fs.existsSync(directory)).toBe(false);
   });
 
+  // #369 r9: umask-002 hosts create 0775 user-owned ancestors under a private home.
+  // Make every real user-owned ancestor above `top` group-traversable, so only
+  // the chain built by the test can provide (or withhold) a private boundary.
+  const withoutOuterBoundary = (top: string, overrides: Record<string, { uid?: number }> = {}) => {
+    const lstat = fs.lstatSync.bind(fs);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike) => {
+      const stat = lstat(file);
+      const name = path.resolve(String(file));
+      if (name.length < top.length && top.startsWith(name === path.sep ? name : name + path.sep) && stat.uid === process.getuid!()) {
+        Object.defineProperty(stat, "mode", { value: stat.mode | 0o055 });
+      }
+      if (overrides[name]?.uid !== undefined) Object.defineProperty(stat, "uid", { value: overrides[name]!.uid });
+      return stat;
+    }) as typeof fs.lstatSync);
+  };
+  const groupChain = (base: string): { shared: string; directory: string } => {
+    const shared = path.join(base, "local");
+    const share = path.join(shared, "share");
+    fs.mkdirSync(share, { recursive: true });
+    fs.chmodSync(shared, 0o775);
+    fs.chmodSync(share, 0o775);
+    return { shared, directory: path.join(share, "residency", "runs") };
+  };
+
+  it.skipIf(process.platform === "win32")("accepts 0775 user-owned ancestors below a 0700 user-owned boundary (umask 002)", () => {
+    const home = sandbox();
+    fs.chmodSync(home, 0o700);
+    const { shared, directory } = groupChain(home);
+    withoutOuterBoundary(home);
+    vi.stubEnv("PI_FABRIC_TMPDIR", directory);
+    expect(fabricDataRoot()).toBe(directory);
+    expect(fs.statSync(directory).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(shared).mode & 0o777).toBe(0o775);
+  });
+
+  it.skipIf(process.platform === "win32").each([0o755, 0o750, 0o775])("refuses the same 0775 chain without a private boundary (top %s)", mode => {
+    const home = sandbox();
+    fs.chmodSync(home, mode);
+    const { directory } = groupChain(home);
+    withoutOuterBoundary(home);
+    vi.stubEnv("PI_FABRIC_TMPDIR", directory);
+    expect(() => fabricDataRoot()).toThrow(/PI_FABRIC_TMPDIR.*(local|home|data-root).* is writable by other users/);
+    expect(fs.existsSync(path.dirname(directory))).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32").each([{ uid: "other" }, { uid: "root" }])("refuses a writable $uid-owned directory in the chain even below a private boundary", ({ uid }) => {
+    const home = sandbox();
+    fs.chmodSync(home, 0o700);
+    const { shared, directory } = groupChain(home);
+    withoutOuterBoundary(home, { [shared]: { uid: uid === "root" ? 0 : process.getuid!() + 1 } });
+    vi.stubEnv("PI_FABRIC_TMPDIR", directory);
+    expect(() => fabricDataRoot()).toThrow(uid === "root" ? /PI_FABRIC_TMPDIR.*local is writable by other users/ : /PI_FABRIC_TMPDIR.*local is owned by another user/);
+    expect(fs.existsSync(path.dirname(directory))).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps refusing other-writable and final group-writable roots below a private boundary", () => {
+    const home = sandbox();
+    fs.chmodSync(home, 0o700);
+    const { shared, directory } = groupChain(home);
+    withoutOuterBoundary(home);
+    fs.chmodSync(shared, 0o777);
+    vi.stubEnv("PI_FABRIC_TMPDIR", directory);
+    expect(() => fabricDataRoot()).toThrow(/PI_FABRIC_TMPDIR.*local is writable by other users/);
+    fs.chmodSync(shared, 0o775);
+    fs.mkdirSync(directory, { recursive: true });
+    fs.chmodSync(directory, 0o770);
+    expect(() => fabricDataRoot()).toThrow(/PI_FABRIC_TMPDIR.*runs is writable by other users/);
+    expect(fs.statSync(directory).mode & 0o777).toBe(0o770);
+  });
+
   it.skipIf(process.platform === "win32")("accepts private recursive roots below an owned sticky ancestor", () => {
     const ancestor = path.join(sandbox(), "sticky");
     fs.mkdirSync(ancestor);

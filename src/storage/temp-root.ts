@@ -4,7 +4,14 @@ import path from "node:path";
 import { windowsDataRoot } from "./windows-temp-root.js";
 
 /** Shared POSIX namespace custody policy. Validate top-down before any mkdir;
- * never repair existing permissions. Sticky is allowed only on ancestors. */
+ * never repair existing permissions. Sticky is allowed only on ancestors.
+ *
+ * umask-002 hosts (#369 r9): a user-owned, group-writable (not other-writable)
+ * ancestor is accepted only below a private boundary: an earlier user-owned
+ * ancestor that nobody else can write or traverse as group (no g+w, o+w, g+x,
+ * e.g. a 0700 or 0701/0705 home). Group members then cannot reach the shared
+ * group bit. Without such a boundary, or for another user's directory, an
+ * other-writable bit, or the final root itself, refusal is unchanged. */
 export const posixDataRoot = (root: string, options: { create?: boolean; asAncestor?: boolean } = {}): string => {
   if (!path.isAbsolute(root)) throw new Error("Fabric data root must be an absolute path");
   const fail = (directory: string, reason: string): never => {
@@ -17,6 +24,7 @@ export const posixDataRoot = (root: string, options: { create?: boolean; asAnces
     if (path.dirname(current) === current) break;
   }
   const uid = process.getuid!();
+  let groupSealed = false;
   for (const current of chain) {
     let stat: fs.Stats;
     try { stat = fs.lstatSync(current); }
@@ -31,7 +39,9 @@ export const posixDataRoot = (root: string, options: { create?: boolean; asAnces
     if (stat.isSymbolicLink() || !stat.isDirectory()) fail(current, "is not a real directory");
     const final = current === directory && !options.asAncestor;
     if (stat.uid !== uid && (final || stat.uid !== 0)) fail(current, "is owned by another user");
-    if ((stat.mode & 0o022) !== 0 && (final || (stat.mode & 0o1000) === 0)) fail(current, "is writable by other users");
+    const groupOnlyBelowBoundary = !final && groupSealed && stat.uid === uid && (stat.mode & 0o002) === 0;
+    if ((stat.mode & 0o022) !== 0 && (final || (stat.mode & 0o1000) === 0) && !groupOnlyBelowBoundary) fail(current, "is writable by other users");
+    if (stat.uid === uid && (stat.mode & 0o032) === 0) groupSealed = true;
   }
   return directory;
 };

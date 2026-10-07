@@ -45,6 +45,19 @@ describe("#369 F3 / D6 POSIX run-root custody", () => {
     expect(fs.readdirSync(foreign)).toEqual([]);
     if (unsafe !== "symlink") expect(fs.readdirSync(selected)).toEqual([]);
   });
+  it.skipIf(process.platform === "win32")("#369 r9: launches below umask-002 0775 owned ancestors under a 0700 boundary", async () => {
+    const root = sandbox();
+    fs.chmodSync(root, 0o700);
+    const shared = path.join(root, "local", "share");
+    fs.mkdirSync(shared, { recursive: true });
+    fs.chmodSync(path.dirname(shared), 0o775);
+    fs.chmodSync(shared, 0o775);
+    const runRoot = path.join(shared, "residency", "runs");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    managers.push(manager);
+    expect((await manager.run({ task: "umask 002 resident root", transport: "process" })).status).toBe("completed");
+    expect(fs.statSync(shared).mode & 0o777).toBe(0o775);
+  });
   it.skipIf(process.platform === "win32")("accepts a private explicit root beneath the safe sticky OS temp ancestor", async () => {
     const root = sandbox();
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false }, { runRoot: path.join(root, "new", "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });

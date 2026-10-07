@@ -2611,7 +2611,10 @@ export class ActorManager {
         if (options.outcomeSend?.mode !== "publish" && options.outcomeSend) {
           throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
         }
-        this.#recordDropped(actor, item, `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`);
+        const full = `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`;
+        // An addressed mesh event dropped here never reached the actor: its sender gets a failed outcome.
+        if (options.outcomeSend) this.#recordDeliveryOutcome(actor.id, options.outcomeSend, "failed", `dropped: queue full; ${full}`);
+        this.#recordDropped(actor, item, full);
         return item;
       }
       overflow.push(item);
@@ -3721,9 +3724,10 @@ export class ActorManager {
       ...(addressed ? { outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: "publish" as const } } : {}),
       // A durable host never holds the shared cursor for one actor's full queue: past it, work
       // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
-      // which has no such file, keeps addressed and fleet.* work in the mesh until there is room (#754).
-      ...(this.#persistent ? { deadLetter: true }
-        : (addressed || event.topic.startsWith("fleet.")) ? { holdWhenFull: true } : {}),
+      // which has no such file, keeps fleet.* work in the mesh until there is room (#754). Only fleet.*:
+      // #554 round 2 P2, a sick actor's full queue must not pin the shared cursor for everyone. An
+      // addressed event past the queue and overflow is dropped with a failed delivery outcome instead.
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
       // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
       // so a joined key could merge two topics' subjects. Keeps the value's type.
       ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),

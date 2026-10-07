@@ -56,12 +56,12 @@ const world = (actorQueueLimit: number) => {
     if (!signal?.aborted) tasks.push({ actor: request.actorName ?? "", task: request.task });
     return run(request, signal, ...callbacks);
   });
-  const manager = (queueLimit = actorQueueLimit) => {
+  const manager = (queueLimit = actorQueueLimit, persistent = true) => {
     const value = new ActorManager("test", identity, mesh,
-      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {}, {
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {}, persistent ? {
         actorRoot: path.join(root, "actors"), persistent: true,
         meshCursorPath: path.join(root, "mesh-cursor.json"), meshReplayAgeMs: 10 * 60_000,
-      });
+      } : { actorRoot: path.join(root, "actors"), persistent: false });
     closers.unshift(() => value.close());
     return value;
   };
@@ -150,6 +150,38 @@ describe("actor queue overflow", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(w.events("slow")).toEqual(evs(1, 12));
     expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toEqual([]);
+  }, 60_000);
+
+  // #554 round 2 P2: on a non-persistent host only fleet.* work holds the shared cursor. An addressed
+  // event past the queue and overflow is dropped at once, with one failed delivery outcome.
+  it("drops an addressed event past a full non-persistent queue with a failed outcome, never holding the cursor", async () => {
+    const w = world(1);                                           // overflow cap: 8
+    const actors = w.manager(1, false);
+    const slow = await actors.create({ name: "slow", instructions: "Supervise.", topics: [], responseMode: "text", coalesce: false });
+    const fast = await actors.create({ name: "fast", instructions: "Review.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => actors.status(slow.id).status === "preparing");
+    for (let n = 1; n <= 9; n++) await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: `ev-${n}` });
+    await waitFor(() => actors.status(slow.id).queued === 9, 10_000);          // 1 queued and 8 in its overflow
+    const dropped = await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "ev-10" });
+    await w.mesh.publish({ topic: "team.events", from, text: "ev-11" });
+    // The event behind the dropped one reaches another actor: the cursor did not wait for room.
+    await waitFor(() => w.events("fast").includes("ev-11"), 10_000);
+    const outcomes = () => {
+      const directory = path.join(w.root, "mesh", "delivery-outcomes");
+      return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap((file) => fs.readFileSync(path.join(directory, file), "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line) as { eventId: string; outcome: string; reason: string; to: string; mode: string })) : [];
+    };
+    await waitFor(() => outcomes().some((record) => record.eventId === dropped.id), 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));     // a held event would be offered again
+    const failed = outcomes().filter((record) => record.outcome === "failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ eventId: dropped.id, to: slow.id, from: from.id, mode: "publish" });
+    expect(failed[0]!.reason).toMatch(/^dropped: queue full/);
+    expect(outcomes().filter((record) => record.eventId === dropped.id)).toHaveLength(1);
+    expect(actors.status(slow.id).queued).toBe(9);
+    expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toHaveLength(1);
+    void fast;
   }, 60_000);
 
   // PR #554 round 3 P1: restored work waits in #parked after a restart. Dead letters must not replay

@@ -264,7 +264,8 @@ export const filesystemRefusal = (root: string,
     return undefined;
   }
   if (platform !== "linux") return undefined;
-  const target = input.mountinfo === undefined ? nearestExisting(root) : path.resolve(root);
+  // A supplied mountinfo describes a Linux system: resolve with POSIX rules whatever the host is.
+  const target = input.mountinfo === undefined ? nearestExisting(root) : path.posix.resolve(root);
   let mountinfo = input.mountinfo;
   if (mountinfo === undefined) {
     try { mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8"); } catch { mountinfo = undefined; }
@@ -369,7 +370,8 @@ const prepareStatements = (db: SqliteConnection) => ({
   tombEvict: db.prepare("DELETE FROM tombstones WHERE ord <= ? RETURNING key"),
   tombAll: db.prepare("SELECT key, version FROM tombstones ORDER BY ord"),
   changeInsert: db.prepare("INSERT INTO changes(commit_no, key, version, deleted) VALUES (?, ?, ?, ?)"),
-  changeTrim: db.prepare("DELETE FROM changes WHERE seq <= ?"),
+  // Trims whole commits only: the commit holding row `seq` goes entirely, so a reader never sees half of one.
+  changeTrim: db.prepare("DELETE FROM changes WHERE commit_no <= (SELECT commit_no FROM changes WHERE seq <= ? ORDER BY seq DESC LIMIT 1)"),
   changesSince: db.prepare("SELECT commit_no, key, version, deleted FROM changes WHERE commit_no > ? ORDER BY seq"),
   changesOldest: db.prepare("SELECT min(commit_no) AS oldest FROM changes"),
   dataVersion: db.prepare("PRAGMA data_version"),

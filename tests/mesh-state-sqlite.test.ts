@@ -229,6 +229,26 @@ describe("SqliteStateStore", () => {
     expect(changes.changes.at(-1)).toEqual({ commit: changes.commit, key: "t/1", version: 9, deleted: false });
   });
 
+  it("trims the change feed by whole commits: a range never reads half of one", async () => {
+    const store = await open(tempRoot("trim"));
+    // One commit of 4,097 changes crosses the 4,096-row retention boundary.
+    await store.writeBatch({ identity, ops: Array.from({ length: 4_097 }, (_, index) => ({ kind: "put" as const, key: `big/${index}`, value: index })) });
+    const big = store.changesSince(0);
+    expect(big.commit).toBe(1);
+    if (big.complete) expect(big.changes).toHaveLength(4_097);
+    else expect(big.changes).toEqual([]);
+    expect(big.complete).toBe(false); // the whole commit went: retention stays bounded
+    await store.put({ key: "after/1", value: 1, identity });
+    expect(store.changesSince(0).complete).toBe(false);
+    const after = store.changesSince(1);
+    expect(after.complete).toBe(true);
+    expect(after.changes).toEqual([{ commit: 2, key: "after/1", version: 4_098, deleted: false }]);
+    const observer = raw(store.root);
+    try {
+      expect({ ...observer.prepare("SELECT count(*) AS n, min(commit_no) AS oldest FROM changes").get() }).toEqual({ n: 1, oldest: 2 });
+    } finally { observer.close(); }
+  });
+
   it("imports a file-store snapshot and exports it back in the same envelope", async () => {
     const file = new MeshStore(tempRoot("import-file"), 64 * 1024, 1_000);
     for (let index = 0; index < 20; index += 1) await file.put({ key: `p/${index}`, value: { index }, identity });
@@ -331,8 +351,9 @@ describe("SqliteStateStore", () => {
       const until = Date.now() + 800; spin(() => Date.now() >= until);
       db.exec("COMMIT");`, [root, ready]);
     await waitFor(() => fs.existsSync(ready), 30_000, "holder");
-    let ticks = 0;
-    const timer = setInterval(() => { ticks += 1; }, 5);
+    let lastTick = Date.now();
+    let maxGap = 0;
+    const timer = setInterval(() => { const now = Date.now(); maxGap = Math.max(maxGap, now - lastTick); lastTick = now; }, 5);
     try {
       const tried = Date.now();
       await expect(store.withTryLock(() => store.put({ key: "w/try", value: 1, identity }), 20)).rejects.toBeInstanceOf(MeshLockTimeoutError);
@@ -341,12 +362,16 @@ describe("SqliteStateStore", () => {
       setTimeout(() => controller.abort(new Error("quiesce")), 30);
       await expect(aborted).rejects.toThrow("quiesce");
       const waited = Date.now();
-      ticks = 0;
+      lastTick = waited;
+      maxGap = 0;
       expect((await store.put({ key: "w/1", value: 1, identity })).version).toBe(1);
-      const elapsed = Date.now() - waited;
+      const done = Date.now();
+      const elapsed = done - waited;
+      maxGap = Math.max(maxGap, done - lastTick);
       expect(elapsed).toBeGreaterThan(100);
-      // The event loop kept turning while the write waited (SQLite's own handler would block it).
-      expect(ticks).toBeGreaterThan(Math.floor(elapsed / 5 / 4));
+      // The event loop kept turning while the write waited (SQLite's own handler would block it for
+      // the whole wait). A gap bound, not a tick count: Windows timers tick at ~15.6 ms, not 5 ms.
+      expect(maxGap).toBeLessThan(elapsed / 2);
     } finally { clearInterval(timer); }
     expect((await holder.done).code).toBe(0);
     expect(store.stats().busyRetries).toBeGreaterThan(0);

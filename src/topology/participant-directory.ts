@@ -745,9 +745,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
       return [...byId.values()];
     }
-    const read = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}) };
-    const parsed = this.#parsed(read, this.options.listReadCacheMs);
-    const hosts = this.#liveHosts(parsed.hosts);
+    // smarty-dev#4250: `background` is display-only by contract (FabricParticipantListOptions):
+    // its only callers are the dashboard snapshot's participantInfos/peerInfos, which feed the
+    // widget and never route, admit or write. So it may read a journal-followed state whose
+    // terminal endpoint is not bound to the payload hash yet (displayOnly) and stay incremental.
+    // Ownership, routing and delivery callers never pass background and keep the bound read.
+    const display = options.background === true && options.fresh !== true;
+    let read: MeshReadOptions = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}),
+      ...(display ? { displayOnly: true } : {}) };
+    let parsed = this.#parsed(read, this.options.listReadCacheMs);
+    let hosts = this.#liveHosts(parsed.hosts);
+    // The one write below is the advisory collision refusal (#reportRefusal publishes). A display
+    // view is only a change check for it: on any collision, re-read authoritatively (bound) and
+    // report from that view alone, so an unbound endpoint can never publish a refusal.
+    if (display && [...parsed.shadowed, ...parsed.participants].some((participant) => this.#collides(participant, hosts, false))) {
+      read = { fresh: false, background: true };
+      parsed = this.#parsed(read, this.options.listReadCacheMs);
+      hosts = this.#liveHosts(parsed.hosts);
+    }
     const byId = new Map<string, FabricParticipantInfo>();
     const refused: string[] = [];
     for (const mirror of parsed.shadowed) this.#collides(mirror, hosts);
@@ -800,7 +815,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     }
-    const self = this.self(now, options);
+    // Same read as the listing: a display listing's self fallback scan stays displayOnly too.
+    const self = this.self(now, read);
     if (
       (!options.kinds || options.kinds.includes(self.kind)) &&
       options.scope !== "project" &&

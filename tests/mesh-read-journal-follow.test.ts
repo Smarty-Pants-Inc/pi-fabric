@@ -4,6 +4,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
+import { writeFileAtomic } from "../src/core/atomic-write.js";
+import { stateReadIdentity } from "../src/mesh/read-journal.js";
 
 // smarty-dev#4250: idle readers follow the read journal by offset, never re-hash the whole
 // canonical payload per change, and still fall back on rotation, legacy writers and corruption.
@@ -27,19 +29,25 @@ const fixture = async (options: ConstructorParameters<typeof MeshStore>[3] = {})
   return { root, writer, reader, file, journal, bytes, parses, rows };
 };
 const disk = (file: string) => JSON.parse(fs.readFileSync(file, "utf8"));
+const display = { displayOnly: true } as const;
+const stampOf = (file: string) => { const stat = fs.statSync(file); return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`; };
+const reseal = (row: { checksum: string; delta: unknown }) => {
+  row.checksum = createHash("sha256").update(JSON.stringify(row.delta)).digest("hex");
+};
 
 describe("read journal offset follow (smarty-dev#4250)", () => {
-  it("sees every change exactly once, reading only appended bytes, without re-hashing the payload", async () => {
+  it("a display-only poll sees every change exactly once, reading only appended bytes, without re-hashing the payload", async () => {
     const f = await fixture();
-    let tokens = new Set<object>([f.reader.stateToken()]);
+    let tokens = new Set<object>([f.reader.stateToken(display)]);
     for (let n = 1; n <= 20; n++) {
       await f.writer.put({ key: "field/heartbeat", value: n, identity });
       const before = f.bytes(), parses = f.parses();
-      expect(f.reader.get("field/heartbeat")?.value).toBe(n);
-      tokens.add(f.reader.stateToken());
+      expect(f.reader.get("field/heartbeat", display)?.value).toBe(n);
+      tokens.add(f.reader.stateToken(display));
       // Polling again without a change reads nothing and yields the same snapshot.
-      for (let poll = 0; poll < 5; poll++) expect(f.reader.get("field/heartbeat")?.value).toBe(n);
-      tokens.add(f.reader.stateToken());
+      for (let poll = 0; poll < 5; poll++) expect(f.reader.get("field/heartbeat", display)?.value).toBe(n);
+      expect(f.reader.cachedStateStamp(true, true)).toBeDefined(); // the UI observer is display-only too
+      tokens.add(f.reader.stateToken(display));
       expect(f.parses()).toBe(parses);
       expect(f.bytes() - before).toBeLessThan(8 * 1024); // the appended record + a bounded header, not ~1 MB
     }
@@ -48,16 +56,67 @@ describe("read journal offset follow (smarty-dev#4250)", () => {
     expect(f.reader.listAll("bulk/")).toEqual(new MeshStore(f.root, 256 * 1024, 1000).listAll("bulk/"));
   });
 
-  it("an authoritative (fresh) read binds the followed endpoint to the canonical payload once", async () => {
+  it.each([{}, { fresh: true }])("an authoritative read (%o) binds the display-followed endpoint to the canonical payload once", async options => {
     const f = await fixture();
     await f.writer.put({ key: "field/heartbeat", value: 1, identity });
-    expect(f.reader.get("field/heartbeat")?.value).toBe(1);
+    expect(f.reader.get("field/heartbeat", display)?.value).toBe(1);
     const before = f.bytes();
-    expect(f.reader.get("field/heartbeat", { fresh: true })?.value).toBe(1);
+    expect(f.reader.get("field/heartbeat", options)?.value).toBe(1);
     expect(f.bytes() - before).toBeGreaterThan(fs.statSync(f.file).size - 1024); // one payload hash
     const again = f.bytes();
-    expect(f.reader.get("field/heartbeat", { fresh: true })?.value).toBe(1);
+    expect(f.reader.get("field/heartbeat", options)?.value).toBe(1);
+    expect(f.reader.get("field/heartbeat", display)?.value).toBe(1);
     expect(f.bytes() - again).toBeLessThan(1024); // bound once, not per read
+  });
+
+  it("an ordinary read binds every followed endpoint before serving it", async () => {
+    const f = await fixture();
+    for (let n = 1; n <= 3; n++) {
+      await f.writer.put({ key: "field/heartbeat", value: n, identity });
+      const before = f.bytes(), parses = f.parses();
+      expect(f.reader.get("field/heartbeat")?.value).toBe(n);
+      expect(f.parses()).toBe(parses); // still a journal follow, not a full parse
+      expect(f.bytes() - before).toBeGreaterThan(fs.statSync(f.file).size - 1024); // with one payload hash
+    }
+  });
+
+  // P2 (security review of #560): a copied-marker replacement of state.json plus a rewritten
+  // terminal identity/stamp must never let an ordinary read serve the stale chain state.
+  it.each(["verified", "display-followed"])("an ordinary read rejects a forged copied marker with rewritten terminal metadata (%s base)", async base => {
+    const f = await fixture();
+    await f.writer.put({ key: "field/owner", value: "old-host", identity });
+    expect(f.reader.get("field/owner")?.value).toBe("old-host"); // a verified anchor
+    await f.writer.put({ key: "field/heartbeat", value: 1, identity });
+    if (base === "display-followed") expect(f.reader.get("field/heartbeat", display)?.value).toBe(1); // pending endpoint
+    // A legacy edit keeps both canonical markers (copied) but changes the payload.
+    const state = disk(f.file);
+    state.entries["field/owner"].value = "new-host";
+    writeFileAtomic(f.file, JSON.stringify(state));
+    const rows = f.rows(), terminal = rows.at(-1)!;
+    terminal.delta.identity = stateReadIdentity(f.file);
+    terminal.delta.stamp = stampOf(f.file);
+    reseal(terminal);
+    fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const parses = f.parses();
+    expect(f.reader.get("field/owner")?.value).toBe("new-host"); // the canonical payload, not the chain
+    expect(f.parses()).toBe(parses + 1);
+    expect(new MeshStore(f.root, 256 * 1024, 1000).get("field/owner")?.value).toBe("new-host");
+    expect(f.reader.listAll("field/").find(entry => entry.key === "field/owner")?.value).toBe("new-host");
+  });
+
+  it("chains each predecessor's endpoint stamp into format-2 records", async () => {
+    const f = await fixture();
+    await f.writer.put({ key: "field/heartbeat", value: 1, identity });
+    await f.writer.put({ key: "field/heartbeat", value: 2, identity });
+    const rows = f.rows(), [previous, terminal] = rows.slice(-2);
+    expect(terminal!.delta).toMatchObject({ format: 2, previousStamp: previous!.delta.stamp, previousIdentity: previous!.delta.identity });
+    // Rewriting the earlier endpoint's stamp (outer checksum resealed) breaks the chain.
+    previous!.delta.stamp = previous!.delta.stamp.replace(/:[^:]*$/, ":1");
+    reseal(previous!);
+    fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const parses = f.parses();
+    expect(f.reader.get("field/heartbeat", display)?.value).toBe(2);
+    expect(f.parses()).toBe(parses + 1); // replay rejected: canonical read
   });
 
   it("publishes tombstone changes as a small patch and replays deletes, recreates and compaction", async () => {
@@ -94,7 +153,7 @@ describe("read journal offset follow (smarty-dev#4250)", () => {
     expect(f.bytes() - before).toBeGreaterThan(fs.statSync(f.file).size - 1024); // full verify on rotation
     await f.writer.put({ key: "field/heartbeat", value: 3, identity });
     const next = f.bytes();
-    expect(f.reader.get("field/heartbeat")?.value).toBe(3);
+    expect(f.reader.get("field/heartbeat", display)?.value).toBe(3);
     expect(f.bytes() - next).toBeLessThan(8 * 1024); // back to offset follow
   });
 

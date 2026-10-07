@@ -215,6 +215,7 @@ describe("incremental state read journal", () => {
     const f = await fixture(), base = f.disk(), baseIdentity = stateReadIdentity(f.file);
     const stamp = () => { const stat = fs.statSync(f.file);
       return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`; };
+    const baseStamp = stamp();
     await f.writer.put({ key: "field/heartbeat/writer", value: "雪😀", identity });
     const first = f.disk(), firstIdentity = stateReadIdentity(f.file)!;
     const firstStamp = stamp();
@@ -223,14 +224,15 @@ describe("incremental state read journal", () => {
     // outer checksum. Keep the canonical endpoint present so its payload binding can be
     // verified; a canonical file already advanced to G2 now correctly requires fallback.
     fs.appendFileSync(f.journal, fs.readFileSync(f.journal, "utf8"));
-    const replay = replayStateJournal(f.root, base, first.readGeneration, firstIdentity, firstStamp, baseIdentity, first.readJournalHash)!;
+    const replay = replayStateJournal(f.root, base, first.readGeneration, firstIdentity, firstStamp, baseIdentity, first.readJournalHash,
+      undefined, true, baseStamp)!;
     expect(replay.state).toEqual(first);
     expect(replay.cursor.offset).toBe(firstOffset);
     fs.truncateSync(f.journal, firstOffset); // Drop the simulated uncommitted tail.
     await f.writer.put({ key: "field/heartbeat/writer", value: "latest雪😀", identity });
     const last = f.disk(), lastIdentity = stateReadIdentity(f.file)!;
     const next = replayStateJournal(f.root, replay.state, last.readGeneration, lastIdentity, stamp(),
-      firstIdentity, last.readJournalHash, replay.cursor);
+      firstIdentity, last.readJournalHash, replay.cursor, true, firstStamp);
     expect(next?.state).toEqual(last);
     expect(next?.cursor.offset).toBe(fs.statSync(f.journal).size);
   });

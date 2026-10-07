@@ -97,6 +97,12 @@ export interface MeshReadOptions {
   fresh?: boolean;
   /** Opt in only for background display observations; never authority, routing or admission. */
   background?: boolean;
+  /**
+   * Display-only observation (smarty-dev#4250): may serve a journal-followed state whose terminal
+   * endpoint is not yet bound to the canonical payload hash, so idle polls stay incremental.
+   * Never for a caller that decides, routes, admits or writes; every other read binds it first.
+   */
+  displayOnly?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
 }
@@ -615,6 +621,8 @@ interface ParsedStateSnapshot {
   journalCursor?: JournalCursor;
   /** A followed journal endpoint not yet bound to the canonical payload (false: that check failed). */
   pending?: JournalEndpoint | false;
+  /** With pending: the last verified snapshot, from which an authoritative read replays instead. */
+  anchor?: ParsedStateSnapshot;
 }
 // Reader snapshots only: mutable write transactions never share their state. Weak references
 // avoid retaining abandoned roots; a small key cap bounds stale root names too.
@@ -1532,7 +1540,7 @@ export class MeshStore {
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
     const state = options.fresh === true || options.snapshot === undefined
-      ? this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true)
+      ? this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true, options.displayOnly === true)
       : options.snapshot as MeshStateFile;
     const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
@@ -1556,7 +1564,7 @@ export class MeshStore {
    * while the token is unchanged (smarty-dev#557).
    */
   stateToken(options: MeshReadOptions = {}): object {
-    return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true);
+    return this.#readCachedState(options.fresh === true, options.fresh === true, options.background === true, options.displayOnly === true);
   }
 
   /**
@@ -1573,8 +1581,8 @@ export class MeshStore {
     const fresh = options.fresh === true;
     const state = options.snapshot !== undefined && !fresh
       ? options.snapshot as MeshStateFile
-      : (!fresh && this.#signalledState(prefix, options.background === true)) ||
-        this.#readCachedState(fresh, fresh, options.background === true);
+      : (!fresh && this.#signalledState(prefix, options.background === true, options.displayOnly === true)) ||
+        this.#readCachedState(fresh, fresh, options.background === true, options.displayOnly === true);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {
@@ -1596,11 +1604,12 @@ export class MeshStore {
   // The cached parse, when the reuse window expired, the canonical generation changed, and the read signal bound
   // to the file's exact current stat shows this prefix's namespace unchanged. Otherwise undefined:
   // the caller re-reads as before. Never used by fresh reads or with readCacheMs 0.
-  #signalledState(prefix: string, background: boolean): MeshStateFile | undefined {
+  #signalledState(prefix: string, background: boolean, displayOnly: boolean): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
     const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
-    if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
+    // An unbound journal endpoint is never a base for an authoritative read.
+    if (!cached || (cached.pending !== undefined && !displayOnly) || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
     // The canonical header decides, not the stat (which can repeat): an unchanged generation is
@@ -1691,7 +1700,7 @@ export class MeshStore {
       // can change an entry without advancing any of those labels. Always read and parse fresh.
       if (serialized === this.#writeEncodings?.serialized) reuse = this.#writeEncodings.entries;
     });
-    this.#journalBase = journalBase(state, this.#statePath);
+    this.#journalBase = journalBase(state, this.#statePath, statStamp(this.#statePath));
     return { state, reuse };
   }
 
@@ -2011,7 +2020,7 @@ export class MeshStore {
           const generation = this.#canonicalGeneration();
           changed = typeof generation === "string" && generation !== cached.generation;
         }
-        this.#readCachedState(changed, false, true); // observer only; public fresh payload reads stay canonical
+        this.#readCachedState(changed, false, true, true); // display-only observer; public payload reads stay bound
       } catch {
         return undefined;
       }
@@ -2020,12 +2029,15 @@ export class MeshStore {
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
-  #readCachedState(fresh = false, canonical = fresh, background = false): MeshStateFile {
+  #readCachedState(fresh = false, canonical = fresh, background = false, displayOnly = false): MeshStateFile {
     const confirmed = this.#requireCanonicalRead;
     if (confirmed) { fresh = true; canonical = true; this.#requireCanonicalRead = false; }
+    // Only an explicitly display-only, non-canonical read may serve a journal endpoint whose
+    // payload hash is not bound yet. Every other read (decisions, routing, writes) binds it.
+    const deferrable = displayOnly && !canonical;
     const recent = this.#stateCache;
     const readCacheMs = background ? this.backgroundReadCacheMs : this.readCacheMs;
-    if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
+    if (!fresh && recent && (deferrable || recent.pending === undefined) && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
     let before: string;
@@ -2044,13 +2056,14 @@ export class MeshStore {
         !!snapshot && snapshot.size <= this.#maxStateBytes && snapshot.stamp === before &&
         identity !== undefined && snapshot.identity === identity &&
         (generation === undefined || snapshot.generation === generation); // Legacy markers need not occupy the header.
-      // An idle follow may defer the canonical payload hash of its journal endpoint. An
-      // authoritative read binds that endpoint once (shared by every store in the process);
-      // a failed binding is never served again and falls back to the canonical read.
+      // A display-only follow may defer the canonical payload hash of its journal endpoint. Any
+      // other read binds that endpoint once (shared by every store in the process) before
+      // serving it; a failed binding is never served again and falls back to the canonical read.
       const settled = (snapshot: ParsedStateSnapshot): boolean => {
-        if (snapshot.pending === undefined || (snapshot.pending !== false && !canonical)) return true;
+        if (snapshot.pending === undefined || (snapshot.pending !== false && deferrable)) return true;
         if (snapshot.pending !== false && verifyStateJournalEndpoint(this.root, snapshot.pending)) {
           delete snapshot.pending;
+          delete snapshot.anchor;
           return true;
         }
         snapshot.pending = false;
@@ -2063,7 +2076,7 @@ export class MeshStore {
       }
       // A copied marker/rounded stat cannot override a changed high-resolution identity.
       // Only adapters without that identity retain the historical nonfresh fallback.
-      if (identity === undefined && !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) &&
+      if (identity === undefined && !canonical && cached?.stamp === before && cached.pending === undefined && (cached.generation !== undefined || fresh) &&
         cached.generation === generation) return cached.state;
       const shared = processReadSnapshots.get(path.resolve(this.#statePath))?.deref();
       if (shared && matches(shared) && settled(shared)) {
@@ -2072,15 +2085,25 @@ export class MeshStore {
       }
       // A newly constructed store can replay from this process's prior snapshot too;
       // it need not parse the whole file merely because another store observed it first.
-      const base = cached ?? shared;
-      if (base && base.pending !== false && !replayFailed && identity !== undefined && typeof generation === "string" &&
+      // An authoritative read never replays from an unbound endpoint: a forged terminal there
+      // would poison every later state. It replays from that snapshot's last verified anchor.
+      const replayBase = (snapshot: ParsedStateSnapshot | undefined): ParsedStateSnapshot | undefined =>
+        !snapshot || snapshot.pending === false ? undefined
+          : snapshot.pending === undefined || deferrable ? snapshot : snapshot.anchor;
+      const base = replayBase(cached) ?? replayBase(shared);
+      if (base && !replayFailed && identity !== undefined && typeof generation === "string" &&
         this.#canonicalHeader?.journalHash !== undefined) {
         const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
-          this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor, canonical);
+          this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor,
+          !deferrable, base.stamp);
         if (replay && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity && this.#canonicalGeneration() === generation &&
           this.#cacheState(replay.state, before, true, identity)) {
           this.#stateCache!.journalCursor = replay.cursor;
-          if (replay.pending) this.#stateCache!.pending = replay.pending;
+          if (replay.pending) {
+            this.#stateCache!.pending = replay.pending;
+            const anchor = base.pending === undefined ? base : base.anchor;
+            if (anchor) this.#stateCache!.anchor = anchor;
+          }
           rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
           return replay.state;
         }

@@ -18,6 +18,8 @@ export interface JournalState {
 export interface JournalBase {
   generation: string | undefined;
   identity: string | undefined;
+  /** The base file's stat stamp, chained into the next (format-2) record as previousStamp. */
+  stamp: string | undefined;
   hash: string | undefined;
   versionKeys: string[];
   tombstoneOrder: string;
@@ -59,9 +61,10 @@ export const stateReadIdentity = (file: string, maxBytes = Number.POSITIVE_INFIN
   } catch { return undefined; }
 };
 
-export const journalBase = (state: JournalState, file: string): JournalBase => ({
+export const journalBase = (state: JournalState, file: string, stamp: string | undefined): JournalBase => ({
   generation: uuid(state.readGeneration) ? state.readGeneration : undefined,
   identity: stateReadIdentity(file),
+  stamp,
   hash: state.readJournalHash,
   versionKeys: Object.keys(state.versions ?? {}),
   tombstoneOrder: JSON.stringify(state.tombstoneOrder),
@@ -164,7 +167,7 @@ interface PreparedStateJournal { hash: string; text: string }
 export const prepareStateJournal = (state: JournalState, base: JournalBase | undefined,
   changedKeys: readonly string[], encodedEntries: ReadonlyMap<string, { entry: Buffer }>, canonicalPayload: Buffer): PreparedStateJournal | undefined => {
   try {
-    if (!base?.generation || !base.identity || !uuid(state.readGeneration)) return undefined;
+    if (!base?.generation || !base.identity || !base.stamp || !uuid(state.readGeneration)) return undefined;
     // Reuse the exact canonical entry bytes: neither chain hashing nor publication should
     // traverse changed payloads again (including large batches and UTF-8/escaped keys).
     const entries: Record<string, string> = Object.create(null);
@@ -175,18 +178,21 @@ export const prepareStateJournal = (state: JournalState, base: JournalBase | und
     }
     for (const key of base.versionKeys) if (!own(state.versions ?? {}, key)) versions[key] = null;
     const { entries: _entries, versions: _versions, readGeneration: _generation, readJournalHash: _hash, tombstoneOrder, ...envelope } = state;
-    const head = JSON.stringify({ format: 1, previous: base.generation, previousIdentity: base.identity, previousHash: base.hash ?? null,
-      generation: state.readGeneration, canonicalPayloadHash: digest(canonicalPayload), envelope });
+    // Format 2 chains the predecessor's whole endpoint: its physical identity AND its stat stamp
+    // are inside this record's hash, which the canonical header commits. A record's own endpoint
+    // is only known after the rename, so the terminal endpoint is bound by its payload hash.
+    const head = JSON.stringify({ format: 2, previous: base.generation, previousIdentity: base.identity, previousStamp: base.stamp,
+      previousHash: base.hash ?? null, generation: state.readGeneration, canonicalPayloadHash: digest(canonicalPayload), envelope });
     const members = Object.keys(entries).map(key => `${JSON.stringify(key)}:${entries[key]}`).join(",");
     const tombstones = JSON.stringify(tombstoneOrder);
-    // A changed order is published as a patch (format 2) when that is smaller: a delete or a
-    // recreate must not repeat every retained tombstone key. Format-1 readers reject format 2
-    // and fall back to the canonical read; the full order (format 1) stays readable.
+    // A changed order is published as a patch when that is smaller: a delete or a recreate
+    // must not repeat every retained tombstone key. Format-1 readers reject format 2 and fall
+    // back to the canonical read; format-1 records of older writers stay readable.
     const patch = tombstones === base.tombstoneOrder || !base.tombstoneKeys ? undefined
       : tombstonePatch(base.tombstoneKeys, tombstoneOrder ?? []);
     const patchText = patch && JSON.stringify(patch);
     const usePatch = patchText !== undefined && patchText.length < (tombstones ?? "[]").length;
-    const text = `${(usePatch ? head.replace('{"format":1,', '{"format":2,') : head).slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
+    const text = `${head.slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
       (tombstones === base.tombstoneOrder ? "" : usePatch ? `,"tombstonePatch":${patchText}` : `,"tombstoneOrder":${tombstones ?? "[]"}`) + "}";
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES - 1024) return undefined;
     return { hash: digest(text), text };
@@ -218,7 +224,7 @@ export const appendStateJournal = (root: string, prepared: PreparedStateJournal 
  * descriptor. Missing/failed bindings fall back. Existing opaque snapshots stay immutable. */
 export const replayStateJournal = (root: string, base: JournalState, generation: string, identity: string,
   stamp: string, baseIdentity: string | undefined, canonicalHash: string | undefined, cursor?: JournalCursor,
-  verify = true): { state: JournalState; cursor: JournalCursor; pending?: JournalEndpoint } | undefined => {
+  verify = true, baseStamp?: string): { state: JournalState; cursor: JournalCursor; pending?: JournalEndpoint } | undefined => {
   let fd: number | undefined;
   try {
     if (!uuid(base.readGeneration) || base.readGeneration === generation || !canonicalHash) return undefined;
@@ -237,7 +243,7 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
     const text = buffer.toString("utf8");
     if (!text.endsWith("\n")) return undefined;
     let state = base, last: Record<string, unknown> | undefined;
-    let previousIdentity = baseIdentity;
+    let previousIdentity = baseIdentity, previousStamp = baseStamp;
     let consumed = 0;
     for (const line of text.slice(0, -1).split("\n")) {
       const bytes = Buffer.byteLength(line);
@@ -254,7 +260,8 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
       const { identity: _identity, stamp: _stamp, ...body } = delta;
       const hash = digest(JSON.stringify(body));
       if (delta.previousHash !== (state.readJournalHash ?? null) || delta.previousIdentity !== previousIdentity ||
-        (delta.format !== 1 && delta.format !== 2) || (delta.format === 1 && own(delta, "tombstonePatch")) || !uuid(delta.generation) || !record(delta.envelope) ||
+        (delta.format !== 1 && delta.format !== 2) || (delta.format === 1 && (own(delta, "tombstonePatch") || own(delta, "previousStamp"))) ||
+        (delta.format === 2 && (previousStamp === undefined || delta.previousStamp !== previousStamp)) || !uuid(delta.generation) || !record(delta.envelope) ||
         ![1, 2].includes(delta.envelope.format as number) || !record(delta.entries) || !record(delta.versions) ||
         ["entries", "versions", "readGeneration", "readJournalHash", "tombstoneOrder", "tombstonePatch"].some(key => own(delta.envelope as object, key))) return undefined;
       const entries = { ...state.entries }, versions = { ...state.versions };
@@ -281,14 +288,16 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
         entries, versions, ...(tombstones === undefined ? {} : { tombstoneOrder: tombstones as string[] }) };
       last = delta;
       previousIdentity = typeof delta.identity === "string" ? delta.identity : undefined;
+      previousStamp = typeof delta.stamp === "string" ? delta.stamp : undefined;
       if (state.readGeneration === generation) break;
     }
     if (!last || state.readGeneration !== generation || state.readJournalHash !== canonicalHash || last.identity !== identity || last.stamp !== stamp) return undefined;
     // The terminal hash is bound to the canonical header and every record links to its
-    // predecessor. The endpoint identity/stamp are outside that chain, so only the payload hash
-    // binds a copied-marker replacement: an authoritative caller (verify) or a replay without
-    // an anchor (rotation, first follow) checks it now; an anchored idle follow returns the
-    // endpoint as pending, checked once by the first authoritative read that needs it.
+    // predecessor's hash, identity and (format 2) stamp. The terminal record's OWN endpoint is
+    // only known after the rename, so only the payload hash binds a copied-marker replacement
+    // there. Every authoritative caller (verify) and every replay without an anchor (rotation,
+    // first follow) checks it now; only an explicitly display-only, anchored follow may return
+    // the endpoint as pending, which is never served to an authoritative read unbound.
     const endpoint: JournalEndpoint = { generation, chainHash: canonicalHash, identity, payloadHash: last.canonicalPayloadHash };
     const checked = verify || !followed;
     if (checked && !verifyStateJournalEndpoint(root, endpoint)) return undefined;

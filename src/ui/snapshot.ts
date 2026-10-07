@@ -119,7 +119,7 @@ export const createDashboardSnapshot = (
   const globalActors = state.globalActors.list();
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
-  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true }) : [];
+  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true, displayOnly: true }) : [];
   const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };

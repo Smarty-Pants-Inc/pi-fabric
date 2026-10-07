@@ -2718,8 +2718,9 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
-        // smarty-dev#6144: read-only, bounded and fail-open; no text leaves the activation as it was.
-        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload);
+        // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
+        // topic this actor subscribes to, bound to the receipt's delivery; otherwise the activation runs as it was.
+        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload, actor.topics);
         if (wakeText) item.wakeText = wakeText;
         else delete item.wakeText;
         const filteredBy = this.#filteredBy(actor, item);

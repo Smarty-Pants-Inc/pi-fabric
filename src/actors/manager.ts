@@ -2778,8 +2778,10 @@ export class ActorManager {
         this.#meshMonitor.schedule();
         if (!item) break;
         // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
-        // topic this actor subscribes to, bound to the receipt's delivery; otherwise the activation runs as it was.
-        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload, actor.topics);
+        // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
+        // actor's host-only allowlist; otherwise the activation runs as it was.
+        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload,
+          { id: actor.id, name: actor.name, topics: actor.topics });
         if (wakeText) item.wakeText = wakeText;
         else delete item.wakeText;
         const filteredBy = this.#filteredBy(actor, item);

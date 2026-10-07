@@ -18,8 +18,12 @@ import path from "node:path";
  * stamped from the publisher's own runtime identity, never from the payload; verification "mesh") is
  * in the host-only trustedPublishers list; (2) IMMUTABLE IDENTITY: the receipt row at that sequence
  * has the envelope's GitHub delivery id (X-GitHub-Delivery, the projection's data.id), digest and
- * receipt store id; (3) AUTHORIZED REPOSITORY: the receipt's repository is the one the topic names
- * (github.<repository name>[.<suffix>]) and the actor subscribes to that topic.
+ * receipt store id; (3) AUTHORIZED REPOSITORY: the receipt's full owner/repository equals the
+ * envelope's, the GitHub payload's repository.full_name agrees, the topic names it
+ * (github.<repository name>[.<suffix>]), the actor subscribes to that topic AND the full owner/repository
+ * is on the actor's host-only allowlist (agents.wakeText.repositories, keyed by actor name or id). The
+ * topic carries no owner, so acme/demo and other/demo share github.demo: the topic alone never
+ * authorizes. An actor without an allowlist entry gets no text (fail closed).
  */
 
 export const WAKE_TEXT_MAX_CHARS = 2_000;
@@ -37,6 +41,18 @@ export const WAKE_TEXT_MAX_TRUSTED_PUBLISHERS = 16;
  */
 export const DEFAULT_WAKE_TEXT_TRUSTED_PUBLISHERS: readonly string[] = Object.freeze([]);
 
+/** Upper bounds on the per-actor repository allowlist. */
+export const WAKE_TEXT_MAX_ACTORS = 64;
+export const WAKE_TEXT_MAX_REPOSITORIES_PER_ACTOR = 32;
+
+/** A full GitHub owner/repository name, never a bare repository name, wildcard or path. */
+const FULL_REPOSITORY = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/;
+
+/** True for an exact full owner/repository identity (`acme/demo`). */
+export function isFullRepository(value: unknown): value is string {
+  return typeof value === "string" && FULL_REPOSITORY.test(value);
+}
+
 export interface FabricWakeTextConfig {
   /** Absolute path (or ~/...) of the factory ingress receipt SQLite file, opened read-only. */
   receiptDb: string;
@@ -47,6 +63,19 @@ export interface FabricWakeTextConfig {
    * github.webhook receipts. An event from any other sender is never hydrated. Empty: no hydration.
    */
   trustedPublishers: readonly string[];
+  /**
+   * Per-actor allowlist of full owner/repository names (lowercased), keyed by actor name or id.
+   * An actor hydrates only receipts of a repository listed under its name or id. Empty: no hydration.
+   */
+  repositories: Readonly<Record<string, readonly string[]>>;
+}
+
+/** The actor an activation belongs to, as hydration authorizes it. */
+export interface WakeTextActor {
+  id: string;
+  name: string;
+  /** The actor's subscribed mesh topics. */
+  topics: readonly string[];
 }
 
 export interface ActorWakeText {
@@ -80,7 +109,43 @@ export function normalizeWakeTextConfig(value: unknown): FabricWakeTextConfig | 
       .map((id) => id.trim())
       .filter((id) => id.length > 0 && id.length <= 256 && !id.includes("*")))].slice(0, WAKE_TEXT_MAX_TRUSTED_PUBLISHERS)
     : [...DEFAULT_WAKE_TEXT_TRUSTED_PUBLISHERS];
-  return { receiptDb, maxChars: Math.min(WAKE_TEXT_MAX_CHARS, Math.max(1, chars)), trustedPublishers };
+  return {
+    receiptDb, maxChars: Math.min(WAKE_TEXT_MAX_CHARS, Math.max(1, chars)), trustedPublishers,
+    repositories: normalizeWakeTextRepositories(value.repositories),
+  };
+}
+
+/**
+ * `{ "<actor name or id>": ["owner/repo", ...] }`: exact keys and full owner/repository names only.
+ * A bare repository name, a wildcard or any other malformed entry is dropped, never widened.
+ */
+function normalizeWakeTextRepositories(value: unknown): Record<string, readonly string[]> {
+  const result: Record<string, readonly string[]> = Object.create(null) as Record<string, readonly string[]>;
+  if (!isRecord(value)) return result;
+  let actors = 0;
+  for (const [rawKey, list] of Object.entries(value)) {
+    if (actors >= WAKE_TEXT_MAX_ACTORS) break;
+    const key = rawKey.trim();
+    if (!key || key.length > 256 || key.includes("*") || !Array.isArray(list)) continue;
+    const repositories = [...new Set(list
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter(isFullRepository)
+      .map((entry) => entry.toLowerCase()))].slice(0, WAKE_TEXT_MAX_REPOSITORIES_PER_ACTOR);
+    if (repositories.length === 0) continue;
+    result[key] = [...new Set([...(result[key] ?? []), ...repositories])].slice(0, WAKE_TEXT_MAX_REPOSITORIES_PER_ACTOR);
+    actors += 1;
+  }
+  return result;
+}
+
+/** The full owner/repository names (lowercased) this actor may hydrate: its id's and its name's entries. */
+export function wakeTextActorRepositories(config: Pick<FabricWakeTextConfig, "repositories"> | undefined, actor: Pick<WakeTextActor, "id" | "name">): string[] {
+  const table = config && isRecord(config.repositories) ? config.repositories : undefined;
+  if (!table) return [];
+  const own = (key: string): readonly string[] =>
+    key && Object.prototype.hasOwnProperty.call(table, key) && Array.isArray(table[key]) ? table[key]! : [];
+  return [...new Set([...own(actor.id), ...own(actor.name)].filter(isFullRepository).map((entry) => entry.toLowerCase()))];
 }
 
 interface ReceiptKey {
@@ -109,16 +174,19 @@ export function wakeTextTopicMatchesRepository(topic: string, repository: string
   return topic === base || topic.startsWith(`${base}.`);
 }
 
-/** Who may receive hydration: the host's trusted publishers and the actor's subscribed topics. */
+/** Who may receive hydration: the host's trusted publishers, the actor's topics and its repositories. */
 export interface WakeTextAuthority {
   trustedPublishers: readonly string[];
   subscribedTopics: readonly string[];
+  /** The actor's allowlisted full owner/repository names, lowercased. Empty: nothing is authorized. */
+  repositories: readonly string[];
 }
 
 /**
  * The receipt address of a projected github.webhook mesh event that may carry wake text, or
- * undefined unless the event's recorded sender is trusted, the actor subscribes to its topic and
- * the topic names its repository. The envelope's other fields only address the receipt.
+ * undefined unless the event's recorded sender is trusted, the actor subscribes to its topic, the
+ * topic names its repository and the full owner/repository is on the actor's allowlist. The
+ * envelope's other fields only address the receipt.
  */
 export function wakeTextReceiptKey(source: string, payload: unknown, authority: WakeTextAuthority): ReceiptKey | undefined {
   if (!source.startsWith("mesh:") || !isRecord(payload) || payload.kind !== "github.webhook") return undefined;
@@ -136,7 +204,10 @@ export function wakeTextReceiptKey(source: string, payload: unknown, authority: 
   if (typeof event !== "string" || !(WAKE_TEXT_EVENTS as readonly string[]).includes(event)) return undefined;
   const { sequence, repository, id: delivery, digest, storeId } = data;
   if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) return undefined;
-  if (!boundedId(repository, 200) || !wakeTextTopicMatchesRepository(topic, repository)) return undefined;
+  if (!isFullRepository(repository) || !wakeTextTopicMatchesRepository(topic, repository)) return undefined;
+  // The topic has no owner (acme/demo and other/demo are both github.demo): only the exact full
+  // owner/repository on the actor's own allowlist authorizes the receipt.
+  if (!Array.isArray(authority.repositories) || !authority.repositories.includes(repository.toLowerCase())) return undefined;
   // (2) Immutable identity: all three must be present to bind the row.
   if (!boundedId(delivery) || !boundedId(digest) || !boundedId(storeId)) return undefined;
   return { event: event as ActorWakeTextEvent, repository, sequence, delivery, digest, storeId };
@@ -186,18 +257,23 @@ export function hydrateWakeText(
   config: FabricWakeTextConfig | undefined,
   source: string,
   payload: unknown,
-  subscribedTopics: readonly string[],
+  actor: WakeTextActor,
 ): ActorWakeText | undefined {
   try {
     if (!config) return undefined;
     const trustedPublishers = Array.isArray(config.trustedPublishers) ? config.trustedPublishers : [];
-    const key = wakeTextReceiptKey(source, payload, { trustedPublishers, subscribedTopics });
+    const repositories = wakeTextActorRepositories(config, actor);
+    if (repositories.length === 0) return undefined;
+    const key = wakeTextReceiptKey(source, payload, { trustedPublishers, subscribedTopics: actor.topics, repositories });
     if (!key) return undefined;
     const row = readReceipt(config.receiptDb, key);
     if (!row || row.id !== key.delivery || row.digest !== key.digest || row.storeId !== key.storeId ||
       row.repository !== key.repository || row.event !== key.event || typeof row.payload !== "string") return undefined;
     const webhook = JSON.parse(row.payload) as unknown;
     if (!isRecord(webhook)) return undefined;
+    // The GitHub payload itself must name the same full owner/repository as the row and envelope.
+    const named = isRecord(webhook.repository) ? webhook.repository.full_name : undefined;
+    if (typeof named !== "string" || named.toLowerCase() !== key.repository.toLowerCase()) return undefined;
     const object = key.event === "pull_request_review" ? webhook.review : webhook.comment;
     if (!isRecord(object)) return undefined;
     const user = isRecord(object.user) ? object.user : {};

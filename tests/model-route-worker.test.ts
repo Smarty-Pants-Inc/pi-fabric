@@ -17,15 +17,15 @@ afterEach(async () => {
 });
 describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker", () => {
   const run = async (scenario: string, route = true,
-    facts: { routeClass?: string; protected?: boolean; actorId?: string; actorName?: string } = {}) => {
+    facts: { routeClass?: string; protected?: boolean; actorId?: string; actorName?: string } = {}, live = false) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-worker-")); roots.push(root);
     const scenarioFile = path.join(root, "scenario"); fs.writeFileSync(scenarioFile, scenario);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
     vi.stubEnv("FAKE_MODEL_SCENARIO", scenarioFile);
     vi.stubEnv("PI_FABRIC_ROUTE_HEADER", "parent-attribution-must-not-leak");
     const pin = { model: "openai-codex/gpt-5.6-sol", effort: "high" as const };
-    const decision = await decideModelRoute({ routeClass: "bounded-lookup", protected: false, pin,
-      candidates: [{ model: "test/luna", effort: "medium" }], parentSessionId: "parent" }, async () => ({ model: "jev", answers: {
+    const decision = await decideModelRoute({ routeClass: facts.routeClass ?? "bounded-lookup", protected: false, pin, live,
+      candidates: [live ? { model: "runinfra/glm-5-3-flash", effort: "max" } : { model: "test/luna", effort: "medium" }], parentSessionId: "parent" }, async () => ({ model: "jev", answers: {
       route: { type: "choice", choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } },
     }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 5000, retainRuns: true }, {
@@ -39,7 +39,13 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));
     return { result, rows, launch, events, pin, saved };
   };
-  it("R3 cleanup joins a process that publishes its terminal result before exiting", async () => {
+  it("launches the live task candidate through the compiled worker with joined attribution and verified max effort", async () => {
+    const { result, rows, launch } = await run("success", true, { routeClass: "task:exact-checks", protected: false }, true);
+    expect(result).toMatchObject({ status: "completed", model: "runinfra/glm-5-3-flash", thinking: "max", admittedModel: "runinfra/glm-5-3-flash", admittedThinking: "max" });
+    expect(launch.header).toBe(`task:exact-checks/runinfra%2Fglm-5-3-flash-max/live-choice:${rows[0].decisionId}`);
+    expect(rows[1]).toMatchObject({ decisionId: rows[0].decisionId, admittedModel: "runinfra/glm-5-3-flash", admittedEffort: "max" });
+  });
+  it("R3 POSIX terminal publication and all-platform cleanup join owned process exit", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
       workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
@@ -48,7 +54,12 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.status).toBe("completed");
     const pid = Number(result.sessionId);
     expect(Number.isSafeInteger(pid)).toBe(true);
-    expect(() => process.kill(pid, 0)).not.toThrow();
+    // POSIX custody joins the launcher before exposing a terminal result.
+    // Windows deliberately preserves main's logical-result-before-native-close
+    // contract; admission stays held and cleanup still joins that exact close.
+    if (process.platform !== "win32") {
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    }
     const directory = manager.runDirectory(result.id)!;
     expect(fs.existsSync(directory)).toBe(true);
     await manager.cleanup(result.id);

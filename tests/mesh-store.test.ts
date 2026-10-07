@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
+import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import {
   MeshBatchConflictError,
   MeshStore,
@@ -40,6 +42,41 @@ const createStore = (options?: MeshStoreOptions, Store: typeof MeshStore = MeshS
   roots.push(root);
   return new Store(root, 64 * 1024, 100, options);
 };
+const createArchivedStore = (): { store: MeshStore; archiveDir: string } => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-archive-"));
+  roots.push(root);
+  const archiveDir = path.join(root, "event-archive");
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archiveDir }));
+  return { store: new MeshStore(root, 64 * 1024, 100), archiveDir };
+};
+
+// A real child death bypasses rollback catches at either side of the live append.
+const crashPublisher = async (store: MeshStore, packet: Parameters<MeshStore["publish"]>[0], fence = "PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN"): Promise<void> => {
+  const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-archive-before-live-crash.mjs"), store.root, JSON.stringify(packet)], {
+    cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, [fence]: "1" },
+  });
+  let stderr = "", timedOut = false;
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  child.stdout.resume();
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 10_000);
+  try {
+    const result = await closed;
+    expect(timedOut, stderr).toBe(false);
+    expect(stderr).toBe("");
+    expect(result.code).not.toBe(0);
+    if (process.platform !== "win32") expect(result.signal).toBe("SIGKILL");
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed.catch(() => undefined);
+  }
+};
 
 // A simulated native platform must not inherit the process-wide own-PID promise
 // from earlier real publication tests (notably on native Windows CI). Reload both
@@ -58,6 +95,45 @@ afterEach(() => {
 });
 
 describe("MeshStore", () => {
+  it("#4383 traces only successful commits with changed keys and the originating caller", async () => {
+    const store = createStore();
+    const trace = path.join(store.root, "trace.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    await store.put({ key: "authority/owner", value: { epoch: 1 }, identity });
+    await store.writeBatch({ identity, ops: [
+      { kind: "put", key: "authority/owner", value: { epoch: 2 } },
+      { kind: "put", key: "authority/receipt", value: { accepted: true } },
+      { kind: "delete", key: "missing" },
+    ] });
+    await store.delete({ key: "authority/receipt" });
+    await store.delete({ key: "missing" });
+    await expect(store.put({ key: "authority/owner", value: {}, identity, ifVersion: 0 })).rejects.toThrow();
+    const commits = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(commits.map(commit => commit.keys)).toEqual([
+      ["authority/owner"], ["authority/owner", "authority/receipt"], ["authority/receipt"],
+    ]);
+    for (const commit of commits) {
+      expect(commit.pid).toBe(process.pid);
+      expect(commit.statePath).toBe(path.join(store.root, "state.json"));
+      expect(commit.bytes).toBeGreaterThan(0);
+      expect(commit.caller.join("\n")).toContain("mesh-store.test.ts");
+      expect(JSON.stringify(commit)).not.toContain("accepted"); // no stored values
+    }
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", path.join(store.root, "missing", "trace"));
+    await expect(store.put({ key: "authority/owner", value: { epoch: 3 }, identity })).resolves.toMatchObject({ value: { epoch: 3 } });
+  });
+
+  it("#4383 identical explicit authority writes still commit and advance their CAS fence immediately", async () => {
+    const store = createStore();
+    const trace = path.join(store.root, "trace.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    const first = await store.put({ key: "authority/owner", value: { epoch: 1 }, identity });
+    const second = await store.put({ key: first.key, value: first.value, identity, ifVersion: first.version });
+    expect(second.version).toBeGreaterThan(first.version);
+    await expect(store.put({ key: first.key, value: { epoch: 2 }, identity, ifVersion: first.version })).rejects.toThrow();
+    expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
   it("publishes durable ordered events and reads from a cursor", async () => {
     const store = createStore();
     const initialOffset = store.latestOffset();
@@ -81,6 +157,502 @@ describe("MeshStore", () => {
     const secondTail = store.tail(firstTail.nextOffset, 10);
     expect(secondTail.events).toMatchObject([{ sequence: 2, text: "two" }]);
     expect(secondTail.nextOffset).toBe(store.latestOffset());
+  });
+
+  it("does not read an event archive while recovering a new dedupe key", async () => {
+    const { store } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const archive = MeshArchive.fromRoot(store.root)!;
+    // Bulk catch-up avoids thousands of durable publishes. Only the last event
+    // stays live: even a short retained log must not fall back to the archive.
+    const archived = Array.from({ length: 4_200 }, (_, index) => ({
+      ...seed,
+      id: `archived-${index + 2}`,
+      sequence: index + 2,
+      text: `archived-${index + 2}`,
+    }));
+    archive.catchUp(archived.map(event => ({ event, line: JSON.stringify(event) })));
+    const last = archived.at(-1)!;
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), `${JSON.stringify(last)}\n`);
+    fs.writeFileSync(path.join(store.root, "sequence"), `${last.sequence}\n`);
+    expect(archive.readAfter(0, last.sequence, () => true, 1)[0]?.id).toBe(seed.id);
+    const dedupeKey = "new-dedupe-key";
+    const receipt = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".json");
+    expect(fs.existsSync(receipt)).toBe(false);
+
+    const readAfter = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const read = vi.spyOn(store, "read");
+    const liveRead = vi.spyOn(fs, "readFileSync");
+    const directoryRead = vi.spyOn(fs, "readdirSync");
+    const published = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "new" });
+
+    expect(published.sequence).toBe(last.sequence + 1);
+    expect(readAfter).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled(); // A new key has no intent and performs no history read.
+    expect(liveRead.mock.calls.some(([file]) => file === path.join(store.root, "events.jsonl"))).toBe(false);
+    expect(directoryRead.mock.calls.some(([directory]) => directory === path.join(store.root, "event-receipts"))).toBe(false);
+  });
+
+  it("recovers an invalidated intent by one direct archive lookup, never a history scan", async () => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "old-compactor", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("before receipt");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("before receipt");
+    crash.mockRestore();
+    const event = store.read()[0]!;
+    // A pre-intent compactor drops this committed line and changes the offset's identity.
+    const later = { ...event, id: "later", sequence: event.sequence + 1 };
+    delete later.dedupeKey;
+    MeshArchive.fromRoot(store.root)!.catchUp([{ event: later, line: JSON.stringify(later) }]);
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), JSON.stringify(later) + "\n");
+    fs.writeFileSync(path.join(store.root, "sequence"), String(later.sequence));
+    const scan = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const lookup = vi.spyOn(MeshArchive.prototype, "lookupEntry");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const dirs = vi.spyOn(fs, "readdirSync");
+    expect(await store.publish(packet)).toEqual(event);
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
+    expect(scan).not.toHaveBeenCalled();
+    expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
+    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.latestSequence()).toBe(later.sequence);
+  });
+
+  it.each(["missing", "corrupt", "unreadable", "missing-segment", "short-segment", "missing-root", "missing-config", "null-index", "oversized-index"])("fails closed for an invalidated intent when its archive is %s", async damage => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "unavailable-" + damage, text: "once" };
+    const event = await store.publish(packet);
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    fs.rmSync(base + ".json");
+    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: event.sequence, eventId: event.id, liveOffset: 0, archiveDir }));
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const index = path.join(archiveDir, "sequence-index", "0", event.sequence + ".json");
+    const entry = JSON.parse(fs.readFileSync(index, "utf8"));
+    if (damage === "missing") fs.rmSync(index);
+    if (damage === "corrupt") fs.writeFileSync(index, "invalid");
+    if (damage === "null-index") fs.writeFileSync(index, "null");
+    if (damage === "oversized-index") fs.writeFileSync(index, " ".repeat(4097));
+    if (damage === "unreadable") { fs.rmSync(index); fs.mkdirSync(index); }
+    if (damage === "missing-segment") fs.rmSync(path.join(archiveDir, entry.file));
+    if (damage === "short-segment") fs.truncateSync(path.join(archiveDir, entry.file), 10);
+    if (damage === "missing-root") fs.rmSync(archiveDir, { recursive: true, force: true });
+    if (damage === "missing-config") fs.rmSync(path.join(store.root, MESH_ARCHIVE_CONFIG));
+    await expect(store.publish(packet)).rejects.toMatchObject({ name: "MeshDedupeRecoveryError", retryable: true });
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    expect(fs.statSync(path.join(store.root, "events.jsonl")).size).toBe(0);
+    expect(store.latestSequence()).toBe(event.sequence);
+  });
+
+  it("settles indexed archive evidence before ordinary recovery can roll it back, without sealing scans", async () => {
+    const { store } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "archive-commit-crash", text: "once" };
+    const crash = vi.spyOn(MeshArchive.prototype, "commit").mockImplementationOnce(() => { throw new Error("before archive commit"); });
+    await expect(store.publish(packet)).rejects.toThrow("before archive commit");
+    crash.mockRestore();
+    const event = store.read()[0]!;
+    // An older rewrite can remove the live anchor; the synced indexed archive is still proof.
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const directories = vi.spyOn(fs, "readdirSync");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    expect(await store.publish(packet)).toEqual(event);
+    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(scans).not.toHaveBeenCalled();
+    const archive = MeshArchive.fromRoot(store.root)!;
+    expect(archive.pending()).toBeUndefined();
+    expect(archive.head()?.id).toBe(event.id);
+    expect(archive.lookup(event.sequence)).toEqual(event);
+  });
+
+  it.each(["retry-first", "unrelated-first", "overtaken-archive"] as const)("completes a real archive-before-live process death with normal cursor delivery (%s)", async ordering => {
+    const { store, archiveDir } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    expect(seed.sequence).toBe(1);
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "process-death-before-live", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const seedBytes = fs.readFileSync(live, "utf8");
+    let cursor = store.latestOffset();
+    await crashPublisher(store, packet);
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const orphan = archive.lookupEntry(2)!;
+    expect(orphan).toMatchObject({ committed: false, event: { sequence: 2, dedupeKey: packet.dedupeKey } });
+    expect(archive.pending()?.id).toBe(orphan.event.id);
+    expect(fs.readFileSync(live, "utf8")).toBe(seedBytes); // No rollback catch ran, and nothing went live.
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    let unrelated;
+    const delivered = [];
+    if (ordering === "unrelated-first") {
+      unrelated = await restarted.publish({ topic: packet.topic, from: identity, text: "unrelated" });
+      expect(archive.lookup(2)).toBeUndefined(); // Ordinary recovery aborted the reservation: the gap stays a gap.
+    } else if (ordering === "overtaken-archive") {
+      // A mixed-version writer can leave the positive reservation but overwrite PENDING
+      // and advance both heads. Its live line and archive append never filled sequence 2.
+      unrelated = { ...seed, id: "later-mixed-writer", sequence: 3, text: "unrelated" };
+      const pending = archive.begin({ event: unrelated, line: JSON.stringify(unrelated) });
+      fs.appendFileSync(live, JSON.stringify(unrelated) + "\n");
+      fs.writeFileSync(path.join(store.root, "sequence"), "3");
+      archive.commit(pending);
+      expect(archive.pending()).toBeUndefined();
+      expect(archive.lookupEntry(2)?.committed).toBe(false);
+    }
+    if (unrelated) {
+      expect(restarted.read({ after: 1 })).toEqual([unrelated]);
+      // Exact archived bytes remain visible even if an old writer left a false marker.
+      expect(restarted.nextEventAfter(1)).toEqual(ordering === "overtaken-archive" ? orphan.event : unrelated);
+      const beforeRetry = restarted.tail(cursor, 100);
+      delivered.push(...beforeRetry.events);
+      cursor = beforeRetry.nextOffset; // A normal consumer has already passed the reserved sequence.
+    }
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const history = vi.spyOn(restarted, "read");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const recovered = await restarted.publish(packet);
+    expect(scans).not.toHaveBeenCalled();
+    expect(history).not.toHaveBeenCalled();
+    expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
+    scans.mockRestore(); history.mockRestore(); reads.mockRestore();
+    if (ordering === "retry-first") {
+      expect(recovered).toEqual(orphan.event);
+      expect(fs.readFileSync(live, "utf8")).toBe(seedBytes + orphan.line + "\n"); // Exact bytes and sequence restored.
+      unrelated = await restarted.publish({ topic: packet.topic, from: identity, text: "unrelated" });
+    } else if (ordering === "unrelated-first") {
+      expect(recovered.sequence).toBe(4);
+      expect(recovered.id).not.toBe(orphan.event.id);
+      expect(archive.lookup(2)).toBeUndefined();
+    } else {
+      // This never-live case is indistinguishable from old recovery + compaction.
+      // Receipt the original event; no live-tail replay behind sequence 3.
+      expect(recovered).toEqual(orphan.event);
+      expect(archive.lookupEntry(2)?.committed).toBe(true);
+      expect(fs.readFileSync(live, "utf8")).toBe(seedBytes + JSON.stringify(unrelated) + "\n");
+      expect(restarted.latestSequence()).toBe(3);
+    }
+    expect(await restarted.publish({ ...packet, text: "retry again" })).toEqual(recovered);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(recovered);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    for (const after of [0, 1]) {
+      const events = restarted.read({ after });
+      const overtaken = ordering === "overtaken-archive";
+      expect(events.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual(overtaken ? [] : [recovered]);
+      expect(events.map(event => event.sequence)).toEqual(ordering === "retry-first" ? (after === 0 ? [1, 2, 3] : [2, 3]) : overtaken ? (after === 0 ? [1, 3] : [3]) : (after === 0 ? [1, 3, 4] : [3, 4]));
+    }
+    const tail = restarted.tail(cursor, 100);
+    delivered.push(...tail.events);
+    expect(delivered.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual(ordering === "overtaken-archive" ? [] : [recovered]);
+    expect(restarted.tail(tail.nextOffset, 100).events).toEqual([]);
+    const archived = archive.readAfter(1, restarted.latestSequence(), () => true, 100);
+    expect(archived.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    const normal = [];
+    for (let after = 1; ;) {
+      const next = restarted.nextEventAfter(after);
+      if (!next) break;
+      normal.push(next);
+      after = next.sequence;
+    }
+    expect(normal.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    if (ordering === "overtaken-archive") {
+      // After compaction, the archive cursor delivers the retained ambiguous identity once.
+      const compacting = new MeshStore(store.root, store.maxEventBytes, 100, { maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
+      for (let index = 0; index < 5; index++) await compacting.publish({ topic: packet.topic, from: identity, text: "x".repeat(20_000) });
+      expect(compacting.oldestSequence()).toBeGreaterThan(recovered.sequence);
+      expect(compacting.read({ after: 1 }).filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    }
+  }, 30_000);
+
+  it("delivers a real live-append-before-commit death despite false and pending markers", async () => {
+    const { store } = createArchivedStore();
+    await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const cursor = store.latestOffset();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "process-death-before-commit", text: "once" };
+    await crashPublisher(store, packet, "PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT");
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const original = archive.lookupEntry(2)!;
+    expect(original.committed).toBe(false);
+    expect(archive.pending()?.id).toBe(original.event.id);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    expect(restarted.nextEventAfter(1)).toEqual(original.event);
+    expect(archive.readAfter(1, 2, () => true, 100)).toEqual([original.event]);
+    const delivered = restarted.tail(cursor, 100);
+    expect(delivered.events).toEqual([original.event]);
+    const abort = vi.spyOn(MeshArchive.prototype, "abort");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    expect(await restarted.publish(packet)).toEqual(original.event);
+    expect(await restarted.publish(packet)).toEqual(original.event);
+    expect(abort).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+    expect(archive.lookupEntry(2)?.committed).toBe(true);
+    expect(restarted.latestSequence()).toBe(2);
+    expect(restarted.tail(delivered.nextOffset, 100).events).toEqual([]);
+  }, 30_000);
+
+  it("abandons a positively different archived identity without aborting that event", async () => {
+    const { store, archiveDir } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "different-archive-identity", text: "once" };
+    const existing = await store.publish(packet);
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    fs.rmSync(base + ".json");
+    fs.writeFileSync(base + ".pending.json", JSON.stringify({ dedupeKey: packet.dedupeKey, reservedSequence: existing.sequence, eventId: "absent-reservation", liveOffset: 0, archiveDir }));
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const abort = vi.spyOn(MeshArchive.prototype, "abort");
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const recovered = await store.publish(packet);
+    expect(recovered.sequence).toBe(2);
+    expect(recovered.id).not.toBe(existing.id);
+    expect(archive.lookup(1)).toEqual(existing);
+    expect(abort).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+    expect(await store.publish(packet)).toEqual(recovered);
+  });
+
+  it("publishes when a direct archive reservation proves that the intent never appended", async () => {
+    const { store } = createArchivedStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "provably-absent", text: "once" };
+    const before = vi.spyOn(MeshArchive.prototype, "begin").mockImplementationOnce(() => { throw new Error("before archive append"); });
+    await expect(store.publish(packet)).rejects.toThrow("before archive append");
+    before.mockRestore();
+    expect(MeshArchive.fromRoot(store.root)!.lookup(1)).toBeUndefined();
+    const event = await store.publish(packet);
+    expect(event.sequence).toBe(2);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
+  it("does not recover a legacy append that has no intent (the documented migration residual)", async () => {
+    const { store } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const older = Array.from({ length: 4_200 }, (_, index) => ({ ...seed, id: `older-${index}`, sequence: index + 2 }));
+    const dedupeKey = "crashed-dedupe-key";
+    const crashed = { ...seed, id: "crashed-event", sequence: older.at(-1)!.sequence + 1, dedupeKey, text: "crashed" };
+    const newer = Array.from({ length: 4_095 }, (_, index) => ({
+      ...seed,
+      id: `newer-${index}`,
+      sequence: crashed.sequence + index + 1,
+    }));
+    const live = path.join(store.root, "events.jsonl");
+    fs.appendFileSync(live, [...older, crashed, ...newer].map(event => `${JSON.stringify(event)}\n`).join(""));
+    fs.writeFileSync(path.join(store.root, "sequence"), `${newer.at(-1)!.sequence}\n`);
+    const receipt = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".json");
+    expect(fs.existsSync(receipt)).toBe(false); // Append completed, but its receipt write crashed.
+    const before = fs.readFileSync(live, "utf8");
+    const read = vi.spyOn(store, "read");
+
+    const recovered = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry" });
+
+    expect(read).not.toHaveBeenCalled();
+    expect(recovered.id).not.toBe(crashed.id); // No intent exists for this legacy event.
+    expect(recovered.sequence).toBe(newer.at(-1)!.sequence + 1);
+    expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toEqual(recovered);
+    expect(await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry again" })).toEqual(recovered);
+    expect(fs.readFileSync(live, "utf8")).not.toBe(before); // The migration residual permits one duplicate.
+  });
+
+  it.each([false, true])("recovers a durable intent before append (archive=%s) without publishing twice", async archived => {
+    const store = archived ? createArchivedStore().store : createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-before-append", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) throw new Error("crash before append");
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("crash before append");
+    crash.mockRestore();
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const intent = JSON.parse(fs.readFileSync(base + ".pending.json", "utf8"));
+    expect(intent).toMatchObject({ dedupeKey: packet.dedupeKey, reservedSequence: 1, liveOffset: 0 });
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    const event = await restarted.publish(packet);
+    expect(event.id).not.toBe(intent.eventId);
+    expect(event.sequence).toBe(2); // An abandoned reservation remains a gap.
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(restarted.read({ topic: packet.topic })).toEqual([event]);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+  });
+
+  it.each([false, true])("recovers the exact event after append before receipt (archive=%s)", async archived => {
+    const store = archived ? createArchivedStore().store : createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-after-append", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("crash before receipt");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("crash before receipt");
+    crash.mockRestore();
+    const live = path.join(store.root, "events.jsonl");
+    const event = JSON.parse(fs.readFileSync(live, "utf8"));
+    const before = fs.readFileSync(live, "utf8");
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const readAfter = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    const history = vi.spyOn(restarted, "read");
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(history).not.toHaveBeenCalled();
+    expect(readAfter).not.toHaveBeenCalled();
+    expect(fs.readFileSync(live, "utf8")).toBe(before);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+  });
+
+  it("directly recovers an intent with more than 4096 newer events without reading their history", async () => {
+    const store = createStore({ maxEventLogBytes: 32 * 1024 * 1024 });
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity });
+    const live = path.join(store.root, "events.jsonl");
+    const offset = fs.statSync(live).size;
+    const dedupeKey = "far-back-intent";
+    const event = { ...seed, id: "pending-event", sequence: 2, dedupeKey };
+    const newer = Array.from({ length: 10_000 }, (_, index) => ({ ...seed, id: `newer-${index}`, sequence: index + 3 }));
+    fs.appendFileSync(live, [event, ...newer].map(e => `${JSON.stringify(e)}\n`).join(""));
+    fs.writeFileSync(path.join(store.root, "sequence"), "10002");
+    const pending = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".pending.json");
+    fs.mkdirSync(path.dirname(pending));
+    fs.writeFileSync(pending, JSON.stringify({ dedupeKey, reservedSequence: 2, eventId: event.id, liveOffset: offset }));
+    const history = vi.spyOn(store, "read");
+    const readSync = vi.spyOn(fs, "readSync");
+    expect(await store.publish({ topic: event.topic, from: identity, dedupeKey })).toEqual(event);
+    expect(history).not.toHaveBeenCalled();
+    expect(readSync.mock.calls.some(call => (call as readonly unknown[])[4] === offset)).toBe(true); // A direct seek.
+    expect(fs.statSync(live).size).toBeGreaterThan(offset);
+  });
+
+  it.each([false, true])("compaction settles a crashed intent before dropping its event (archive=%s)", async archived => {
+    const root = archived ? createArchivedStore().store.root : createStore().root;
+    const store = new MeshStore(root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "compact-crash", text: "first" };
+    const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("receipt unavailable");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
+    crash.mockRestore();
+    const event = JSON.parse(fs.readFileSync(path.join(root, "events.jsonl"), "utf8"));
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    expect(store.oldestSequence()).toBeGreaterThan(event.sequence);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
+    expect(await new MeshStore(root, 1024, 100).publish(packet)).toEqual(event);
+  });
+
+  it.skipIf(process.platform === "win32")("does not append until the intent's final durability barrier succeeds", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-barrier", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let renamed = false;
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (target === base + ".pending.json") renamed = true;
+    });
+    const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (renamed) { renamed = false; throw new Error("intent namespace barrier"); }
+      sync(fd);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("intent namespace barrier");
+    barrier.mockRestore(); renameSpy.mockRestore();
+    expect(store.read()).toEqual([]);
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const event = await store.publish(packet);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
+  it.skipIf(process.platform === "win32")("re-confirms a visible receipt after its final barrier failed and clears its intent", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "receipt-barrier", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let renamed = false;
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (target === base + ".json") renamed = true;
+    });
+    const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (renamed) { renamed = false; throw new Error("receipt namespace barrier"); }
+      sync(fd);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("receipt namespace barrier");
+    barrier.mockRestore(); renameSpy.mockRestore();
+    const event = JSON.parse(fs.readFileSync(base + ".json", "utf8"));
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(restarted.read()).toEqual([event]);
+  });
+
+  it("drops a torn append's intent and publishes one complete event on retry", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "partial-append", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) {
+        append(file, String(rest[0]).slice(0, 40));
+        throw new Error("partial append");
+      }
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("partial append");
+    crash.mockRestore();
+    const event = await store.publish(packet);
+    expect(event.sequence).toBe(2);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
+  it("compaction drops an intent whose append never happened before rewriting offsets", async () => {
+    const root = createStore().root;
+    const store = new MeshStore(root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "unappended-compaction", text: "once" };
+    const live = path.join(root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) throw new Error("before append");
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("before append");
+    crash.mockRestore();
+    const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    const event = await store.publish(packet);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read().filter(e => e.dedupeKey === packet.dedupeKey)).toEqual([event]);
+  });
+
+  it("does not compact if settlement cannot durably write its receipt", async () => {
+    const store = createStore({ maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "blocked-settlement", text: "first" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("receipt unavailable");
+      rename(source, target);
+    });
+    try {
+      await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
+      await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
+      await expect(store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) })).rejects.toThrow("receipt unavailable");
+      expect(store.oldestSequence()).toBe(1);
+      expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    } finally { crash.mockRestore(); }
+    expect((await store.publish(packet)).sequence).toBe(1);
   });
 
   it("captures a coherent tail cursor without using reserved or partial sequences", async () => {
@@ -700,6 +1272,9 @@ describe("MeshStore lock recovery", () => {
     const initializer = start("initializer");
     try {
       await ready("initializer.ready");
+      // Force the original recovery syscall seam despite advisory FIFO admission. A
+      // removed/expired receipt (or an old-release initializer) must not weaken exclusion.
+      for (const name of fs.readdirSync(meshLockQueueDirectory(store.root))) fs.unlinkSync(path.join(meshLockQueueDirectory(store.root), name));
       expect(fs.existsSync(ownerPath)).toBe(phase === "opened");
       if (phase === "opened") expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
       const past = new Date(Date.now() - 60_000);
@@ -984,7 +1559,7 @@ describe("MeshStore lock recovery", () => {
     await expect(result).resolves.toBe("done");
   });
 
-  it("bounded lock backoff grows exponentially with jitter and caps contention waits", async () => {
+  it("the FIFO head uses a prompt capped polling cadence", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 2_000 });
     const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
@@ -995,9 +1570,9 @@ describe("MeshStore lock recovery", () => {
     expect(operation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
     const waits = timers.mock.calls.map(([, wait]) => Number(wait));
-    expect(waits.slice(0, 6)).toEqual([15, 25, 45, 85, 130, 130]);
-    expect(waits.length).toBeLessThan(15); // fixed 10 ms retries took 100 probes here
-    expect(waits.every((wait) => wait >= 10 && wait <= 250)).toBe(true);
+    expect(waits.slice(0, 6)).toEqual([10, 10, 10, 10, 10, 10]);
+    expect(waits.length).toBeLessThanOrEqual(101); // only the head probes at this cadence
+    expect(waits.every((wait) => wait >= 0 && wait <= 250)).toBe(true);
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
     fs.rmSync(lockPath, { recursive: true });
     await vi.advanceTimersByTimeAsync(250);
@@ -1006,7 +1581,7 @@ describe("MeshStore lock recovery", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounded lock backoff applies the jitter floor and clamps the deadline, preserving diagnostics", async () => {
+  it("FIFO admission falls back to bounded full jitter, preserving diagnostics", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100 });
     const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
@@ -1017,19 +1592,22 @@ describe("MeshStore lock recovery", () => {
     await vi.advanceTimersByTimeAsync(100);
     const error = await result;
     expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect((error as Error).message).toMatch(/after 4 attempts, largest gap between attempts 42 ms$/);
-    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([19, 39, 42]);
+    expect((error as Error).message).toMatch(/after 11 attempts, largest gap between attempts 19 ms$/);
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([...Array(8).fill(10), 19, 1]);
     expect(operation).not.toHaveBeenCalled();
     expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
     expect(vi.getTimerCount()).toBe(0);
 
-    // Minimum randomness still sleeps at least 10 ms rather than spinning on contention.
+    // A zero draw yields through a timer (native timers have a 1ms floor),
+    // and still cannot extend the absolute deadline.
     vi.mocked(Math.random).mockReturnValue(0);
     timers.mockClear();
     const second = store.exclusive(operation).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(100);
     await second;
-    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual(Array(10).fill(10));
+    expect(timers.mock.calls.slice(0, 8).every(([, wait]) => wait === 10)).toBe(true);
+    expect(timers.mock.calls.slice(8).every(([, wait]) => wait === 0)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("reclaims a recent dead holder immediately without spending the stale window", async () => {

@@ -119,12 +119,14 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
 
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
-export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
+/** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
+export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
 }
 
@@ -231,7 +233,7 @@ export interface FabricActorRequest {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
-  /** Creation-time model justification retained on actor activation runs. */
+  /** Named model exception (non-blank, ≤200 chars), retained on activation runs. */
   modelReason?: string;
   thinking?: FabricThinking;
   /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
@@ -272,6 +274,8 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** Exact registry lineage token; changes on adoption, including a return to the same root. */
+  ownershipToken?: string;
   /** The session that owns and runs the actor (from its `session:<id>` root), whoever reads it. */
   ownerSessionId?: string;
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
@@ -288,7 +292,10 @@ export interface FabricActorInfo {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
-  /** Events the activation filter skipped without a model run. */
+  /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
+  filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
+  activationFilterExpiresAt?: number;
+  /** Lifetime events the activation filter skipped without a model run (legacy). */
   filteredCount?: number;
   lastFilteredAt?: number;
   /**
@@ -301,6 +308,8 @@ export interface FabricActorInfo {
   via?: string;
   /** Canonical selection when via is present; may differ from the session's effective model. */
   selectedModel?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
@@ -317,6 +326,8 @@ export interface FabricActorInfo {
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   validWhile?: FabricActorValidWhileSource;
   queued: number;
   messages: number;

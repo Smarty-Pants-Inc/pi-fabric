@@ -753,7 +753,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(events.some((event) => event.type === "abort")).toBe(false);
   });
 
-  it("aborts a hanging run as stopped, not exited-without-a-result", async () => {
+  it.each(["abort", "stop"] as const)("%s ends a hanging run as stopped, not exited-without-a-result", async (method) => {
     process.env.FAKE_PI_BEHAVIOR = "hang";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
@@ -767,34 +767,43 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const ac = new AbortController();
     const handle = await manager.spawn({ task: "hang", transport: "process" }, ac.signal);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    ac.abort();
+    if (method === "abort") ac.abort();
+    else expect((await manager.stop(handle.id)).status).toBe("stopped");
     const result = await manager.wait(handle.id);
-    expect(result.status).toBe("stopped");
+    expect(result.status, JSON.stringify(result)).toBe("stopped");
+    expect(manager.status(handle.id).status).toBe("stopped");
   });
+
+  // These fixtures test crash reporting, not the run deadline. The shared 2s
+  // budget can kill a slow-starting child before its first stream event injects
+  // the crash. Allow cold startup and the worker's 5s execution-cleanup grace;
+  // keep the outer test bound above the run budget and transport teardown.
+  const crashRunTimeoutMs = 30_000;
+  const crashTestTimeoutMs = 45_000;
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "stream";
     try {
-      const result = await run();
+      const result = await run("do it", crashRunTimeoutMs);
       expect(result.status).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated stream crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
     }
-  });
+  }, crashTestTimeoutMs);
 
   it("reports a terminal failure when the worker crashes while finalizing", async () => {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "close";
     try {
-      const result = await run();
+      const result = await run("do it", crashRunTimeoutMs);
       expect(result.status).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated close crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
     }
-  });
+  }, crashTestTimeoutMs);
 
   it("emits attributed tokens.usage events live and lands them in the budget ledger", async () => {
     process.env.FAKE_PI_BEHAVIOR = "usage-flow";

@@ -62,11 +62,13 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
+  /** Required placement capabilities; any unmet need keeps process tasks local. */
+  needs?: string[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   persona?: string;
   thinking?: FabricThinking;
@@ -227,6 +229,7 @@ type FabricLifecycleEventType =
   | "pi.agent_settled"
   | "pi.tool_error"
   | "pi.session_compact"
+  | "run.spawned"
   | "run.completed"
   | "run.failed"
   | "run.stopped"
@@ -683,7 +686,7 @@ interface FabricActorValidityFacts {
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
-interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
+interface FabricActorRunBinding { model?: string; modelReason?: string; thinking?: FabricThinking }
 type FabricActorActivationFilterScalar = string | number | boolean | null;
 /** One test on a payload field; exactly one of equals, in, exists. A missing field never matches. */
 interface FabricActorActivationFilterPredicate {
@@ -730,7 +733,7 @@ interface FabricActorRequestBase {
   protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
@@ -768,7 +771,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   validWhile?: { version: 1; source: string };
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
-type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 interface FabricActorInfo {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -795,11 +798,15 @@ interface FabricActorInfo {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
-  /** Events the activation filter skipped without a model run. */
+  /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
+  filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
+  activationFilterExpiresAt?: number;
   filteredCount?: number;
   lastFilteredAt?: number;
   /** The stored filter cannot be read: it is kept but not applied (every event is delivered). */
   activationFilterError?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   model?: string;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
@@ -813,6 +820,8 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
   residency: FabricParticipantResidency;
@@ -893,7 +902,13 @@ type FabricMessageTarget =
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
 /** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
-type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
+type FabricMessageArgs = FabricMessageTarget & {
+  message: string;
+  /** See FabricMessageData. */ data?: unknown;
+  /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
+  idempotencyKey?: string;
+};
+type FabricMessageSteerArgs = FabricMessageArgs;
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -943,7 +958,7 @@ interface FabricMessageDelivery {
   replacedMessageId?: string;
 }
 interface FabricAgentsApi {
-  run(args: FabricAgentRequest): Promise<FabricAgentResult>;
+  run(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
@@ -981,7 +996,7 @@ interface FabricAgentsApi {
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
   setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
-  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
+  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
@@ -990,7 +1005,7 @@ interface FabricAgentsApi {
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;
@@ -1008,7 +1023,7 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
-  steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
   cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;

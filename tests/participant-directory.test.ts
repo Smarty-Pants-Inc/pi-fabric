@@ -15,6 +15,7 @@ import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
 
 const roots: string[] = [];
@@ -93,7 +94,150 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ParticipantDirectory routing freshness (#2386)", () => {
+  const fixture = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-routing-view-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:observer", name: "Observer", kind: "main" };
+    return createDirectory(path.join(root, "mesh"), identity, identity.id, () => [], { heartbeatMs: 60_000, leaseMs: 120_000 });
+  };
+
+  it("distinguishes missing, fresh and overdue views, and does not upgrade read evidence to lease admission", async () => {
+    const directory = fixture();
+    expect(directory.routingUnavailable()).toContain("no confirmed view");
+    expect(directory.canConsumeMesh()).toBe(false);
+    const read = vi.spyOn(directory.mesh, "exclusive");
+    await directory.refreshRoutingView();
+    expect(read).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.canConsumeMesh()).toBe(false);
+    await directory.refresh();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.routingUnavailable(directory.confirmedAt() + 120_000)).toContain("overdue");
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.confirmedAt()).toBe(confirmed);
+  });
+
+  it("invalidates prior routing confirmation after any failed refresh and recovers with one canonical read", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.refreshRoutingView();
+    const failure = new Error("directory refresh read failed");
+    const heartbeat = vi.spyOn(directory.mesh, "confirmWritable").mockRejectedValueOnce(failure);
+    await expect(directory.refresh()).rejects.toBe(failure);
+    heartbeat.mockRestore();
+    expect(directory.routingUnavailable()).toBe(failure.message);
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.confirmedAt()).toBe(confirmed);
+    expect(directory.canConsumeMesh()).toBe(false);
+    // A canonical read failure cannot leave behind successful routing evidence.
+    const read = vi.spyOn(directory.mesh, "stateToken").mockImplementation(() => { throw new Error("unreadable canonical view"); });
+    await expect(directory.refreshRoutingView()).rejects.toThrow("unreadable canonical view");
+    expect(directory.routingUnavailable()).toBeDefined();
+    read.mockRestore();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+  });
+
+  it("does not refresh a closed directory", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.close();
+    expect(directory.routingUnavailable()).toContain("closed");
+    await expect(directory.refreshRoutingView()).rejects.toThrow("closed");
+  });
+});
+
 describe("#3662 ParticipantDirectory lineage liveness", () => {
+  it("shares preparation reads across cache expiry but freshens after the confirmation fence (#4383)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-refresh-snapshot-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:snapshot", name: "main", kind: "main" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { readCacheMs: 5_000 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false,
+    });
+    directories.push(directory);
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "snapshot")]);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const originalGet = mesh.get.bind(mesh);
+    let crossed = false;
+    try {
+      await directory.refresh();
+      now += 4_999;
+      const reads = vi.spyOn(fs, "readFileSync");
+      const get = vi.spyOn(mesh, "get").mockImplementation((key, options) => {
+        const result = originalGet(key, options);
+        if (key === LIVENESS_POLICY_KEY && !crossed) { crossed = true; now += 2; }
+        return result;
+      });
+      try {
+        await directory.refresh();
+        expect(crossed).toBe(true);
+        const stateReads = reads.mock.calls.filter(([file]) => String(file) === path.join(mesh.root, "state.json"));
+        expect(stateReads).toHaveLength(0); // The post-lock recheck gates unchanged metadata, not another payload parse.
+        const hostKey = "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex");
+        const hostReads = get.mock.calls.filter(([key]) => key === hostKey);
+        expect(hostReads).toHaveLength(2);
+        expect(hostReads[0]![1]?.snapshot).toBeDefined();
+        expect(hostReads[1]![1]?.snapshot).toBeUndefined();
+      } finally { get.mockRestore(); reads.mockRestore(); }
+    } finally { clock.mockRestore(); }
+  });
+  it("freshens lineage only on root activation or explicit demand, never on idle heartbeats (#4383)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-demand-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:resumed", name: "main", kind: "main" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { readCacheMs: 5_000 });
+    const writer = new MeshStore(mesh.root, 64 * 1024, 1_000);
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false,
+    });
+    directories.push(directory);
+    let active = true;
+    directory.registerSource(() => active ? [rootRecord(identity.id, identity.id, "resumed")] : []);
+    const key = "topology/lineage-closures/" + createHash("sha256").update(identity.id).digest("hex");
+    const closure = () => writer.put({ key, identity, value: { format: 1, rootId: identity.id, closedAt: Date.now() } });
+    mesh.stateToken(); // Warm before a closure is added by the earlier generation.
+    await closure();
+    const resume = vi.spyOn(directory, "resumeLineage");
+    const get = vi.spyOn(mesh, "get");
+    try {
+      await directory.refresh();
+      expect(resume).toHaveBeenCalledOnce();
+      expect(get).toHaveBeenCalledWith(key, { fresh: true });
+      expect(writer.get(key, { fresh: true })).toBeUndefined();
+      get.mockClear();
+      for (let heartbeat = 0; heartbeat < 3; heartbeat++) await directory.refresh();
+      expect(resume).toHaveBeenCalledOnce();
+      expect(get.mock.calls.some(([target, read]) => target === key && read?.fresh)).toBe(false);
+      // Explicit runtime resumption must remain canonical against a warm negative cache.
+      await closure();
+      expect(mesh.get(key)).toBeUndefined();
+      await directory.resumeLineage();
+      expect(writer.get(key, { fresh: true })).toBeUndefined();
+      expect(resume).toHaveBeenCalledTimes(2);
+      // Removing and re-adding a source is a new activation, not an idle heartbeat.
+      active = false;
+      await directory.refresh();
+      await closure();
+      active = true;
+      await directory.refresh();
+      expect(resume).toHaveBeenCalledTimes(3);
+      expect(writer.get(key, { fresh: true })).toBeUndefined();
+      await directory.close();
+      await closure();
+      await directory.start();
+      expect(resume).toHaveBeenCalledTimes(4);
+      expect(writer.get(key, { fresh: true })).toBeUndefined();
+    } finally { get.mockRestore(); resume.mockRestore(); }
+  });
   it.each([null, {}, { format: 1, id: "session:lineage", kind: "invalid" }])(
     "S1 retains invalid raw shared-state lineage %j until withdrawal", async (value) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-raw-"));
@@ -361,8 +505,11 @@ describe("ParticipantDirectory host leases", () => {
   const alphaBatches = (spy: { mock: { calls: unknown[][] } }) =>
     spy.mock.calls.filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
 
-  it("renew a file lease on every heartbeat, and still the shared record without the fleet owner's policy", async () => {
-    const { meshRoot, hostEntry } = await setup(false);
+  it("keeps half-TTL state renewals for an advertising state-only peer", async () => {
+    const { meshRoot, store, hostEntry } = await setup(false);
+    const identity = identityOf("legacy-reader");
+    await store.put({ key: "sessions/legacy-reader", identity, value: { id: identity.id, sessionId: "legacy-reader",
+      cwd: "/tmp/project", startedAt: Date.now(), status: "idle" } });
     const before = hostEntry()!.updatedAt;
     await new Promise((resolve) => setTimeout(resolve, 450));      // several 100 ms heartbeats
     expect(readHostLeases(meshRoot).get("session:alpha")?.expiresAt).toBeGreaterThan(Date.now());
@@ -470,12 +617,14 @@ describe("ParticipantDirectory host leases", () => {
 
   // #411 R1: a lock acquisition can outlast the pre-confirmation renewal decision.
   it.each([
-    { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false },
-    { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false },
-    { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false },
-    { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false },
-    { crossing: "policy threshold", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true },
-  ])("renews after delayed confirmation crosses $crossing", async ({ leaseMs, delayMs, policy }) => {
+    { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false, legacy: true },
+    { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false, legacy: true },
+    { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false, legacy: true },
+    { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false, legacy: true },
+    { crossing: "all-new minute delay", leaseMs: 60_000, delayMs: 60_001, policy: false, legacy: false },
+    { crossing: "all-new policy delay", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true, legacy: false },
+    { crossing: "mixed policy delay", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true, legacy: true },
+  ])("renews after delayed confirmation crosses $crossing", async ({ leaseMs, delayMs, policy, legacy }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-delayed-confirm-"));
     roots.push(root);
     const identity = identityOf("delayed");
@@ -491,16 +640,24 @@ describe("ParticipantDirectory host leases", () => {
     const lockPath = path.join(mesh.root, ".lock");
     try {
       if (policy) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
+      if (legacy) {
+        const peer = identityOf("state-only");
+        await mesh.put({ key: "sessions/state-only", identity: peer, value: { id: peer.id, sessionId: "state-only",
+          cwd: "/tmp/project", startedAt: now, status: "idle" } });
+        // Keep this compatibility reader alive across the deterministic lock delay.
+        await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+          value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 1_000_000 } });
+      }
       await directory.refresh(); // no heartbeat timer: only this awaited refresh can renew
-      const hostBefore = mesh.listAll("topology/hosts/")[0]!;
+      const hostBefore = mesh.listAll("topology/hosts/").find(entry => (entry.value as { id: string }).id === identity.id)!;
       const legacyBefore = mesh.get("sessions/delayed")!;
       const participantBefore = mesh.listAll("topology/participants/")[0]!;
       const writes = vi.spyOn(mesh, "writeBatch");
       const confirm = mesh.confirmWritable.bind(mesh);
       let entered!: () => void;
       const confirming = new Promise<void>((resolve) => { entered = resolve; });
-      const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async () => {
-        const pending = confirm(); // the real acquisition waits behind a live lock
+      const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async onAcquired => {
+        const pending = confirm(onAcquired); // the real acquisition waits behind a live lock
         entered();
         await pending;
       });
@@ -515,14 +672,29 @@ describe("ParticipantDirectory host leases", () => {
       fs.rmSync(lockPath, { recursive: true, force: true });
       await refresh;
       expect(confirmations).toHaveBeenCalledOnce();
-      expect.soft(writes).toHaveBeenCalledOnce(); // host + legacy in one locked commit
-      const hostAfter = mesh.listAll("topology/hosts/", { fresh: true })[0]!;
-      expect.soft(hostAfter.version).toBeGreaterThan(hostBefore.version);
-      expect.soft(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+      const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
-      expect.soft(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
-      expect.soft(legacyAfter.updatedAt).toBe(now);
-      expect.soft(legacyAfter.value).toMatchObject({ updatedAt: now });
+      if (legacy) {
+        const hostDue = policy ? delayMs >= STATE_LEASE_RENEW_MS : delayMs >= leaseMs / 2;
+        const sessionDue = !policy && delayMs >= 7_500;
+        expect(writes).toHaveBeenCalledTimes(hostDue || sessionDue ? 1 : 0);
+        if (hostDue) {
+          expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
+          expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+        } else expect(hostAfter).toEqual(hostBefore);
+        if (sessionDue) {
+          expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
+          expect(legacyAfter.updatedAt).toBe(now);
+        } else expect(legacyAfter).toEqual(legacyBefore);
+      } else {
+        // Thresholds no longer require state commits when every live reader uses lease files.
+        expect(writes).not.toHaveBeenCalled();
+        expect(hostAfter).toEqual(hostBefore);
+        expect(legacyAfter).toEqual(legacyBefore);
+      }
+      expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+      if (policy) expect(legacyAfter).toBeUndefined();
+      else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
     } finally {
@@ -532,13 +704,95 @@ describe("ParticipantDirectory host leases", () => {
     }
   });
 
-  it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
-    const { hostEntry } = await setup(true);
+  it("renews idle state leases at half-life without rewriting timestamp-only participants, and commits real changes immediately", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const identity = identityOf("idle");
+    let status = "idle";
+    const record = () => ({ ...rootRecord(identity.id, identity.id, "idle"), status, updatedAt: Date.now() });
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+      identity, heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false });
+    directory.registerSource(() => [record()]);
+    directories.push(directory);
+    const observer = createDirectory(mesh.root, identityOf("observer"), "session:observer", () => []);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const trace = path.join(root, "commits.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    try {
+      // Keep an actual old reader live: this test retains the legacy half-life contract.
+      const peer = identityOf("state-only");
+      await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+        value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 600_000 } });
+      await directory.refresh();
+      fs.writeFileSync(trace, "");
+      const participant = mesh.listAll("topology/participants/")[0]!;
+      const start = now;
+      for (let tick = 1; tick <= 24; tick++) {
+        now = start + tick * 5_000;
+        await directory.refresh();
+        // A legacy reader has no host-file fallback: its fixed 15 s TTL must never lapse.
+        expect(now - mesh.get("sessions/idle", { fresh: true })!.updatedAt).toBeLessThan(15_000);
+        // Read the canonical file here; fake wall-clock jumps do not change filesystem clocks.
+        const leaseFile = fs.readdirSync(path.join(mesh.root, "host-leases"))[0]!;
+        const lease = JSON.parse(fs.readFileSync(path.join(mesh.root, "host-leases", leaseFile), "utf8"));
+        expect(lease.expiresAt).toBe(now + 15_000);
+        expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
+      }
+      const commits = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(commits).toHaveLength(12);
+      expect(commits.map(commit => commit.at - start)).toEqual(
+        Array.from({ length: 12 }, (_, index) => (index + 1) * 10_000),
+      );
+      expect(commits.every(commit => commit.keys.length === 2 && commit.keys.includes("sessions/idle"))).toBe(true);
+      expect(mesh.get(participant.key)).toEqual(participant); // timestamp-only participant unchanged
+      now += 15_001;
+      expect(observer.get(identity.id, now, { fresh: true })).toBeUndefined(); // original TTL lapses
+      await directory.refresh();
+      expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false); // re-acquire via file
+      expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(13);
+      status = "running";
+      await directory.refresh();
+      expect(mesh.get(participant.key)?.value).toMatchObject({ status: "running" });
+      const changed = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(changed).toHaveLength(14);
+      expect(changed[13].at).toBe(now); // no lease delay for durable state/authority changes
+      expect(changed[13].keys).toContain(participant.key);
+    } finally { clock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("renews at the stored host half-life even with a matching file lease", async () => {
+    const { store, alpha, hostEntry, meshRoot } = await setup(false);
+    const peer = identityOf("state-only-host");
+    const now = Date.now();
+    await store.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+      value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 120_000 } });
+    writeHostLease(meshRoot, { id: peer.id, rootId: "wrong-root", identityId: peer.id, updatedAt: now, expiresAt: now + 120_000 });
+    const before = hostEntry()!;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 200);
+    try {
+      await alpha.refresh();
+      expect(hostEntry()!.version).toBeGreaterThan(before.version);
+      writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id, updatedAt: now, expiresAt: now + 120_000 });
+      const shared = hostEntry()!;
+      clock.mockReturnValue(now + 400);
+      await alpha.refresh();
+      expect(hostEntry()!.version).toBeGreaterThan(shared.version);
+    } finally { clock.mockRestore(); }
+  });
+
+  it("all-new peers need no periodic shared record renewal, even under the old policy", async () => {
+    const { hostEntry, alpha, meshRoot } = await setup(true);
     const shared = hostEntry()!;
     const now = Date.now;
-    vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
-    await vi.waitFor(() => expect(hostEntry()!.version).toBeGreaterThan(shared.version), { timeout: 2_000, interval: 20 });
-    vi.restoreAllMocks();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
+    try {
+      await alpha.refresh();
+      expect(hostEntry()).toEqual(shared);
+      expect(readHostLeases(meshRoot).get("session:alpha")?.updatedAt).toBeGreaterThan(shared.updatedAt);
+      expect(alpha.get("session:alpha")?.stale).toBe(false);
+    } finally { clock.mockRestore(); }
   });
 });
 
@@ -643,6 +897,7 @@ describe("ParticipantDirectory actor operational counters", () => {
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       await store.put({ key: LIVENESS_POLICY_KEY, value: policy, identity });
       const actor: FabricActorInfo = {
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         id: "actor:running", scope: "project", name: "running", rootId: identity.id,
         status: "running", residency: "durable", runner: "pi", events: [], topics: [],
         delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
@@ -1199,8 +1454,11 @@ describe("ParticipantDirectory", () => {
       expect(writes).not.toHaveBeenCalled();
     });
 
-    it("preserves backoff and one warning across unchanged refreshes until real lock recovery", async () => {
+    it("defers change refreshes during a lock outage and preserves backoff until real heartbeat recovery", async () => {
       vi.useFakeTimers();
+      // Exercise near-ceiling full-jitter draws: the fixed 200 ms tick below
+      // must not consume the second outage's doubled backoff before checking it.
+      vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
@@ -1240,12 +1498,14 @@ describe("ParticipantDirectory", () => {
         const recovered = vi.spyOn(retry, "success");
         await vi.advanceTimersByTimeAsync(retry.waitMs);
 
-        const readsBefore = source.mock.calls.length;
+        const readsBefore = source.mock.calls.length, attemptsBefore = runs.mock.calls.length;
         directory.scheduleRefresh();
-        await Promise.resolve(); // run the queued change-only refresh
-        expect(await runs.mock.results.at(-1)!.value).toBe("done");
-        expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
-        expect(confirmations).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        await Promise.resolve();
+        // #4383: even an unchanged change refresh must not re-read the fleet or
+        // become an extra retry. Pending changes ride the next heartbeat.
+        expect(runs.mock.calls.length).toBe(attemptsBefore);
+        expect(source.mock.calls.length).toBe(readsBefore);
+        expect(confirmations).toHaveBeenCalledOnce();
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
@@ -1636,6 +1896,35 @@ describe("ParticipantDirectory reads", () => {
   const identity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
   const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
 
+  it("prepares idle heartbeats from shared pinned entries without cloning retained actor payloads (#2039)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-heartbeat-shared-"));
+    roots.push(root);
+    const reader = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    const actorKey = "actors/foreign/actor";
+    await reader.mesh.put({ key: actorKey, value: { id: "actor", instructions: "x".repeat(30_000) }, identity: writer });
+    const cloned = vi.spyOn(reader.mesh, "listAll");
+    const original = reader.mesh.listAllShared.bind(reader.mesh);
+    const shared = vi.spyOn(reader.mesh, "listAllShared").mockImplementation((prefix, options) => {
+      const entries = original(prefix, options);
+      for (const entry of entries) {
+        if (typeof entry.value === "object" && entry.value !== null) Object.freeze(entry.value);
+        Object.freeze(entry);
+      }
+      return entries;
+    });
+    await reader.start();
+    const prefixes = ["topology/participants/", "sessions/", "actors/"];
+    const preparation = shared.mock.calls.filter(([prefix, options]) => prefixes.includes(prefix!) && options?.snapshot);
+    expect(preparation.map(([prefix]) => prefix)).toEqual(prefixes);
+    expect(new Set(preparation.map(([, options]) => options!.snapshot)).size).toBe(1);
+    // Compatibility liveness probes still scan sessions/participants separately; the large
+    // retained actor payloads must never be copied by this heartbeat preparation.
+    expect(cloned.mock.calls.filter(([prefix]) => prefix === "actors/")).toEqual([]);
+    expect(reader.mesh.get(actorKey, { fresh: true })?.value).toEqual({ id: "actor", instructions: "x".repeat(30_000) });
+    cloned.mockRestore(); shared.mockRestore();
+  });
+
   it("reuse one parse while the state is unchanged, and see a write at once", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
@@ -1702,16 +1991,41 @@ describe("ParticipantDirectory lease reads", () => {
   };
   afterEach(() => vi.restoreAllMocks());
 
-  it("keep a peer whose file lease was renewed after the read and before its old expiry", async () => {
-    const { lease, renew, seesPeer } = await setup();
-    const clock = vi.spyOn(Date, "now");
-    clock.mockReturnValue(lease.expiresAt - 5_000);
-    expect(seesPeer()).toBe(true);                                   // fills the lease read
-    renew(lease.expiresAt - 2_000);                                  // file-only renewal
-    clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
-    expect(seesPeer()).toBe(true);
-    clock.mockReturnValue(lease.expiresAt + 5_000);
-    expect(seesPeer()).toBe(true);
+  it.each(["native", "win32"])("keep a peer whose file lease was renewed after the read and before its old expiry (%s)", async (target) => {
+    const { readerDirectory, lease, renew, seesPeer } = await setup();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let renewed = false;
+    try {
+      if (target === "win32") {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        // NTFS file IDs can exceed Number's exact integer range. Model two distinct
+        // IDs that round to the same number, with equal size and timestamps.
+        const file = path.join(readerDirectory.mesh.root, "host-leases",
+          createHash("sha256").update(peer.id).digest("hex").slice(0, 32) + ".json");
+        const stat = fs.statSync.bind(fs);
+        const before = stat(file);
+        const beforeBig = stat(file, { bigint: true });
+        vi.spyOn(fs, "statSync").mockImplementation(((name: fs.PathLike, options?: fs.StatOptions) => {
+          const current = stat(name, options);
+          if (String(name) !== file) return current;
+          const ino = 2n ** 54n + (renewed ? 1n : 0n);
+          return Object.assign(current!, options?.bigint
+            ? { ...beforeBig, ino }
+            : { ...before, ino: Number(ino) });
+        }) as typeof fs.statSync);
+      }
+      const clock = vi.spyOn(Date, "now");
+      clock.mockReturnValue(lease.expiresAt - 5_000);
+      expect(seesPeer()).toBe(true);                                   // fills the lease read
+      renew(lease.expiresAt - 2_000);                                  // file-only renewal
+      renewed = true;
+      clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
+      expect(seesPeer()).toBe(true);
+      clock.mockReturnValue(lease.expiresAt + 5_000);
+      expect(seesPeer()).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 
   it("drop a peer whose lease lapsed and was not renewed", async () => {

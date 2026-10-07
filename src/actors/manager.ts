@@ -3,9 +3,11 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
+import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
@@ -19,7 +21,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -28,11 +30,13 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
-import { ActorChildCompletionStore } from "./child-completions.js";
+import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
+import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -54,14 +58,15 @@ import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
-import { ActorRegistryStore } from "./registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
+import { publicationGeneration } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 
 export interface ActorModelRouteInput {
-  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
+  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
   parentSessionId: string; actorId: string; activationId: string;
 }
 
@@ -132,6 +137,8 @@ interface ManagedActor {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
+  activationFilterExpiresAt?: number;
+  filterSkipped?: FabricActorInfo["filterSkipped"];
   /** A stored filter that cannot be read: kept as stored and written back, never applied. */
   invalidActivationFilter?: { value: unknown; error: string };
   filteredCount?: number;
@@ -156,6 +163,9 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Durable alarm deduplication for the uninterrupted activation failure streak. */
+  failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
   latestActivationSequence: number;
   sessionFile: string;
@@ -170,6 +180,8 @@ interface ManagedActor {
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
+  /** Persistent, deduplicated publication diagnostic; does not stop actor execution. */
+  presenceError?: string;
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
   ownershipAbort?: AbortController;
@@ -240,6 +252,19 @@ function loadedActivationFilter(
     }
     return { invalidActivationFilter: { value: structuredClone(value), error: reason } };
   }
+}
+// Old registries have no per-filter telemetry; never infer it from lifetime counters.
+function loadedFilterSkipped(value: unknown): FabricActorInfo["filterSkipped"] {
+  const empty = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return empty;
+  const row = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(row.count) || (row.count as number) < 0) return empty;
+  return {
+    count: row.count as number,
+    lastKey: typeof row.lastKey === "string" ? row.lastKey : null,
+    lastTopic: typeof row.lastTopic === "string" ? row.lastTopic : null,
+    lastAt: typeof row.lastAt === "number" && Number.isFinite(row.lastAt) ? row.lastAt : null,
+  };
 }
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
 
@@ -327,10 +352,29 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+/** A routed event did not reach the receiver's persisted queue; the cursor must keep it (#816). */
+export class ActorQueueCheckpointError extends Error {
+  constructor(actor: { id: string; name: string }) {
+    super(`Fabric actor queue checkpoint failed for ${actor.name} (${actor.id}); retry`);
+    this.name = "ActorQueueCheckpointError";
+  }
+}
+
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
-/** Three preparation requeues, independent of the owner-restoration/drop budget. */
+/** Windows metadata work yields after each actor; other platforms retain bounded batches. */
+export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
+/** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+/** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
+export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
+export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
+export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
+export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+/** At most one owner alarm per actor per hour while its events dead-letter. */
+const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -350,12 +394,12 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
 
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
-  readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
+  readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -366,6 +410,11 @@ export class ActorManager {
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
+  // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the oldest dropped
+  // by the bound, and when each actor last raised its dead-letter owner alarm.
+  readonly #deadLetters = new Map<string, number>();
+  readonly #deadLettersDropped = new Map<string, number>();
+  readonly #deadLetterAlarms = new Map<string, number>();
   // Predecessor queue files taken over, deleted after this lineage's own file is next written.
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
@@ -381,15 +430,22 @@ export class ActorManager {
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
   readonly #persistent: boolean;
+  #filterStateDirty = false;
+  #filterStateSave: Promise<void> | undefined;
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
-  readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
+  readonly #snapshotActorOwnership: ((fresh?: boolean) => ReadonlyMap<string, boolean>) | undefined;
+  #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
+  #directoryLineages: Map<string, boolean> | undefined;
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
   readonly #resolvePiModel: ((model: string, requiredPin?: boolean) => string | Promise<string>) | undefined;
   readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
+  readonly #deadRootFilter: (() => FabricDeadRootFilterConfig | undefined) | undefined;
+  #deadRoots: DeadRootCache | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #project: string | undefined;
@@ -398,6 +454,9 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  // Failed archives outlive lastRunId changes. Retry every retained join, not just
+  // the immediately previous activation; cleanup follows confirmed archival.
+  readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
@@ -412,12 +471,20 @@ export class ActorManager {
   // Adoption compares against this snapshot so two racing adopters cannot
   // both move the same dead lineage: only the first fenced write succeeds.
   readonly #persistedRoots = new Map<string, string>();
+  readonly #persistedLineages = new Map<string, string>();
+  readonly #displacedLineages = new Set<string>();
   // In-flight fenced adoption attempts, one per actor.
   readonly #adoptionPending = new Map<string, Promise<void>>();
+  readonly #adoptionRetryAt = new Map<string, number>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  #retentionSweep: Promise<void> | undefined;
+  #initialRetentionPending = true;
   readonly #pendingPresence = new Set<string>();
+  /** Residents publish both scopes through their one registry-fenced host heartbeat. */
+  readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
+  readonly #presenceRevisions = new Map<string, object>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -435,6 +502,7 @@ export class ActorManager {
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
+  #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
@@ -452,6 +520,18 @@ export class ActorManager {
   #mainIdle = true;
   #reloadingOwnership = false;
   #registryFingerprint: string | undefined;
+  #savedActors: { owned: string; critical: string; fingerprint: string | undefined } | undefined;
+  readonly #lazyMessages = new WeakMap<ManagedActor, Record<string, unknown>>();
+  readonly #unarchivedMessages = new WeakMap<ManagedActor, FabricActorMessage[]>();
+  readonly #resetMessages = new WeakSet<ManagedActor>();
+  #registrySaveTimer: NodeJS.Timeout | undefined;
+  #registrySavePending: Promise<void> | undefined;
+  #registrySaveDurable = false;
+  #registrySaveRevision = 0;
+  #registrySaveChain: Promise<void> = Promise.resolve();
+  readonly #registrySaveControllers = new Set<AbortController>();
+  readonly #registryRowEncodings = new Map<string, { instructions: unknown; metadata: string; encoded: string }>();
+  #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
 
   constructor(
@@ -468,7 +548,10 @@ export class ActorManager {
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
-      canManageActor?: (id: string) => boolean | undefined;
+      /** Fresh by default for authority; false is only an observational ownership view. */
+      canManageActor?: (id: string, fresh?: boolean) => boolean | undefined;
+      /** Directory decisions for one synchronous batch; fresh by default, never a custody-lock cache. */
+      snapshotActorOwnership?: (fresh?: boolean) => ReadonlyMap<string, boolean>;
       /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
       isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
@@ -476,6 +559,11 @@ export class ActorManager {
       /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
       prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
+      /**
+       * agents.deadRootFilter, read per activation (smarty-dev#6062). The resident host supplies it;
+       * absent or mode "off" never skips. Only durable actors' callerless mesh/host events are checked.
+       */
+      deadRootFilter?: () => FabricDeadRootFilterConfig | undefined;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
@@ -483,8 +571,10 @@ export class ActorManager {
       project?: string | undefined;
       role?: string | undefined;
       meshCursorPath?: string;
-      /** Resident lease fence, also defers archive retention until initial publication. */
+      /** Host publication/lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
+      /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
+      presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -520,10 +610,12 @@ export class ActorManager {
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#snapshotActorOwnership = options.snapshotActorOwnership;
     this.#isOwnResidentActor = options.isOwnResidentActor;
     this.#resolvePiModel = options.resolvePiModel;
     this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
+    this.#deadRootFilter = options.deadRootFilter;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
@@ -532,6 +624,7 @@ export class ActorManager {
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
+    this.#presencePublisher = options.presencePublisher;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -542,14 +635,16 @@ export class ActorManager {
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
     );
-    if (this.#persistent && meshConfig.enabled) this.#loadActors();
-    this.#registryFingerprint = this.#registry.fingerprint();
-    for (const actor of this.#actors.values()) {
-      this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
-    }
+    this.#withOwnershipRead(() => {
+      if (this.#persistent && meshConfig.enabled) this.#loadActors();
+      this.#registryFingerprint = this.#registry.fingerprint();
+      for (const actor of this.#actors.values()) {
+        this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
+      }
+    });
     this.#acquireCapabilityView = options.acquireCapabilityView;
-    this.#sweepRetainedRuns();
-    this.#retentionTimer = setInterval(() => this.#sweepRetainedRuns(), RETENTION_SWEEP_INTERVAL_MS);
+    this.#startRetentionSweep();
+    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
@@ -557,8 +652,15 @@ export class ActorManager {
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
         if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
+        // Initial publication may have outlived the first deferred slice (or
+        // failed and later recovered). Retry once ready, never on the constructor.
+        if (this.#initialRetentionPending) this.#startRetentionSweep();
         this.#syncActorsFromRegistry();
-        this.#refreshOwnership();
+        this.#refreshOwnership(undefined, false);
+        for (const actor of this.#actors.values()) {
+          if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
+        }
+        this.#flushFilterState();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
@@ -572,11 +674,15 @@ export class ActorManager {
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
-    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 1_000);
+    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
-    setTimeout(() => this.#reapOrphanPresence(), 0).unref();
+    this.#orphanPresenceTimer = setTimeout(() => {
+      this.#orphanPresenceTimer = undefined;
+      this.#reapOrphanPresence();
+    }, 0);
+    this.#orphanPresenceTimer.unref();
   }
 
   subscribe(listener: () => void): () => void {
@@ -598,6 +704,7 @@ export class ActorManager {
     if (this.#closing || this.#halted) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
+    if (this.#initialRetentionPending) this.#startRetentionSweep();
     this.#scheduleRestoreParked();
     for (const actor of this.#actors.values()) {
       if (actor.queue.length > 0 || this.#inFlight.has(actor.id)) this.#requestDrain(actor);
@@ -697,20 +804,7 @@ export class ActorManager {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
-    // Fence after async validation/model preparation, before even predecessor removal.
-    await beforeCommit?.(id);
-    // The async directory/predecessor hook may outlive cancellation. The local
-    // invocation fence must run synchronously next to each persistent effect.
-    checkActive?.();
-    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
-    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
-    checkActive?.();
-    // Local creation commits here: directory creation and runnable/subscribed insertion
-    // cannot yield before the caller has registered the actual ID's cancellation outcome.
-    // Preserve the pre-commit fences above, including an awaited predecessor removal.
-    onCommit?.(id);
     const actorDirectory = path.join(this.#actorRoot, id);
-    fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {
       id,
       name,
@@ -752,6 +846,15 @@ export class ActorManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    // Validate the complete public value before any directory, predecessor or registry effect.
+    this.#assertPresenceValue(this.#publicInfo(actor, false));
+    await beforeCommit?.(id);
+    checkActive?.();
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
+    checkActive?.();
+    // Receipt registration and insertion cannot yield after the cancellation fence.
+    onCommit?.(id);
+    fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     this.#actors.set(id, actor);
     this.#locallyCreated.add(id);
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
@@ -785,10 +888,52 @@ export class ActorManager {
 
   listOwned(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
-    this.#refreshOwnership();
+    this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor));
+  }
+
+  /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
+  hasActiveDurableActor(): boolean {
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    return [...this.#actors.values()].some(actor =>
+      this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped");
+  }
+
+  /** Prepared synchronously before the host publication fence; its registry
+   * generation is validated under custody before these operations can commit. */
+  presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void } {
+    this.#syncActorsFromRegistry();
+    return this.#withOwnershipRead(() => {
+      const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
+      const ids = new Set(pending.keys());
+      if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
+      const ops: MeshBatchOperation[] = [];
+      for (const id of ids) {
+        const actor = this.#actors.get(id);
+        if (actor) {
+          if (this.#ownershipDecision(id)) {
+            const value = this.#presenceValue(actor);
+            if (value) ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+          }
+        } else {
+          const fence = this.#orphanPresence.get(id);
+          ops.push({ kind: "delete", key: this.#presenceKey(id),
+            ...(fence !== undefined ? { ifVersion: fence, onConflict: "skip" as const } : {}) });
+        }
+      }
+      return { ops, committed: () => {
+        for (const [id, revision] of pending) {
+          // A mutation while the shared write waited belongs to the next refresh.
+          if (this.#presenceRevisions.get(id) !== revision) continue;
+          this.#pendingPresence.delete(id);
+          this.#presenceRevisions.delete(id);
+          this.#orphanPresence.delete(id);
+        }
+      } };
+    });
   }
 
   async cede(id: string): Promise<FabricActorInfo> {
@@ -864,6 +1009,7 @@ export class ActorManager {
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
     beforeCommit?: (id: string) => void,
+    modelReason?: string,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -883,17 +1029,35 @@ export class ActorManager {
       if (fallback) await this.#resolvedModel(actor.runner, fallback, actor.routeClass !== undefined);
       else await this.agents.prepareModelForAdmission(undefined, actor.runner);
     }
+    // Validate both the effective view and duplicated binding/default metadata before commit.
+    const preview = scope === "project"
+      ? this.#presencePreview(actor, { model: resolved, modelReason: resolved ? modelReason : undefined })
+      : this.#publicInfo(actor, false);
+    if (scope === "session") {
+      const effectiveModel = resolved ?? actor.model;
+      if (effectiveModel) preview.model = effectiveModel; else delete preview.model;
+      const reason = resolved ? modelReason : actor.modelReason;
+      if (reason !== undefined) preview.modelReason = reason; else delete preview.modelReason;
+      const binding: NonNullable<FabricActorInfo["binding"]> = { ...preview.binding!, updatedAt: Date.now() };
+      if (resolved) binding.model = resolved; else delete binding.model;
+      if (resolved && modelReason !== undefined) binding.modelReason = modelReason; else delete binding.modelReason;
+      if (!binding.model && !binding.thinking) delete binding.updatedAt;
+      preview.binding = binding;
+    }
+    this.#assertPresenceValue(preview);
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit, modelReason);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
+    if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
+    else delete actor.modelReason;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -918,16 +1082,25 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
+      const preview = this.#publicInfo(actor, false);
+      const thinking = next ?? actor.thinking;
+      if (thinking) preview.thinking = thinking; else delete preview.thinking;
+      const binding: NonNullable<FabricActorInfo["binding"]> = { ...preview.binding!, updatedAt: Date.now() };
+      if (next) binding.thinking = next; else delete binding.thinking;
+      if (!binding.model && !binding.thinking) delete binding.updatedAt;
+      preview.binding = binding;
+      this.#assertPresenceValue(preview);
       await this.#bindings.setThinking(actor.id, next, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    this.#assertPresenceValue(this.#presencePreview(actor, { thinking: next }));
     beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -941,10 +1114,11 @@ export class ActorManager {
   async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    this.#assertPresenceValue(this.#presencePreview(actor, { tools: next }));
     beforeCommit?.(actor.id);
     actor.tools = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -953,9 +1127,10 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
+    this.#assertPresenceValue(this.#presencePreview(actor, { inferenceContext }));
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set future runs' niceness (smarty-dev#1579); it only raises agents.nice, never lowers it. */
@@ -963,14 +1138,16 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     const parsed = parseAgentNice(nice);
     if (parsed === undefined) throw new Error("nice is required");
+    this.#assertPresenceValue(this.#presencePreview(actor, { nice: parsed }));
     actor.nice = parsed;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
   async setCoalesceKey(id: string, coalesceKey: string | null): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertPresenceValue(this.#presencePreview(actor, { coalesceKey: coalesceKey ?? undefined }));
     if (coalesceKey === null) delete actor.coalesceKey;
     else {
       validateActorCoalesceKey(coalesceKey);
@@ -978,23 +1155,31 @@ export class ActorManager {
       this.#mergeCoalesced(actor);                              // work queued before the key (smarty-dev#1065)
     }
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
   /**
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
-   * queued work from the next item on; the filtered count is kept.
+   * queued work from the next item on. Per-filter telemetry resets; legacy lifetime count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
+    this.#assertPresenceValue(this.#presencePreview(actor, { activationFilter: filter.length ? filter : undefined,
+      invalidActivationFilter: undefined, activationFilterExpiresAt: filter.length ? expiresAt : undefined,
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } }));
     beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
+    delete actor.activationFilterExpiresAt;
+    if (filter.length && expiresAt !== undefined) actor.activationFilterExpiresAt = expiresAt;
+    actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+    if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1010,9 +1195,10 @@ export class ActorManager {
     for (const event of next) {
       if (!HOST_EVENTS.has(event)) throw new Error(`Unsupported Fabric actor event: ${event}`);
     }
+    this.#assertPresenceValue(this.#presencePreview(actor, { events: next }));
     actor.events = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1027,10 +1213,11 @@ export class ActorManager {
   ): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const policy = resolveActorDeliveryPolicy(delivery, triggerTurn);
+    this.#assertPresenceValue(this.#presencePreview(actor, policy));
     actor.delivery = policy.delivery;
     actor.triggerTurn = policy.triggerTurn;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1042,8 +1229,9 @@ export class ActorManager {
   async clearMessages(id: string): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     actor.messages = [];
+    this.#resetMessages.add(actor);
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1067,7 +1255,7 @@ export class ActorManager {
     }
     options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1100,7 +1288,7 @@ export class ActorManager {
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
-    return this.#publishDrainPresence(live).then(
+    return this.#publishDrainPresence(live, waiters !== undefined).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
       (error: unknown) => {
         this.#recordPreparationFailure(live, error);
@@ -1163,19 +1351,7 @@ export class ActorManager {
 
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
   #hasSessionHeader(file: string): boolean {
-    const fd = fs.openSync(file, "r");
-    try {
-      const buffer = Buffer.alloc(64 * 1024);
-      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
-      const first = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0]!;
-      try {
-        const header = JSON.parse(first);
-        return header?.type === "session" && typeof header.id === "string" && header.id.length > 0 &&
-          typeof header.cwd === "string" && typeof header.timestamp === "string" &&
-          Number.isFinite(Date.parse(header.timestamp)) &&
-          (header.version === undefined || [1, 2, 3].includes(header.version));
-      } catch { return false; }
-    } finally { fs.closeSync(fd); }
+    return readPiSessionHeader(file) !== undefined;
   }
 
   #ensurePiSession(actor: ManagedActor): void {
@@ -1228,10 +1404,11 @@ export class ActorManager {
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    this.#assertPresenceValue(this.#presencePreview(actor, { instructions }));
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1718,7 +1895,7 @@ export class ActorManager {
     }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",
@@ -1873,7 +2050,7 @@ export class ActorManager {
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
       // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
       try {
-        await this.#saveActors(new Set(), { durable: true });
+        await this.#saveActors(new Set(), { durable: true, requiredActor: actor });
       } catch (error) {
         delete actor.removal;
         throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
@@ -1975,6 +2152,7 @@ export class ActorManager {
     return { id, scope: this.#actorScope, name: owner?.name ?? id,
       ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
       delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
       queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
       removal: { requestedAt, state: cleanup.pending ?? "registry revoked; removal cleanup pending" } };
   }
@@ -2100,7 +2278,7 @@ export class ActorManager {
     if (this.#actors.has(actor.id)) {
       this.#actors.delete(actor.id);
       try {
-        await this.#saveActors(new Set([actor.id]));
+        await this.#saveActors(new Set([actor.id]), { removedLineages: new Map([[actor.id, this.#lineage(actor)]]) });
         if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
       } catch (error) {
         // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
@@ -2117,6 +2295,7 @@ export class ActorManager {
   pauseForRelease(): void { this.#releasePaused = true; }
   resumeAfterRelease(): void {
     this.#releasePaused = false;
+    if (this.#initialRetentionPending) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
   }
@@ -2127,6 +2306,8 @@ export class ActorManager {
       throw new Error("Actor release boundary is not quiescent");
     }
     await Promise.all([...this.#presenceChains.values()]);
+    await this.#registrySavePending;
+    await this.#registrySaveChain;
     let checkpointedActor = false;
     for (const actor of this.#actors.values()) {
       if (!this.#ownershipDecision(actor.id)) continue;
@@ -2143,29 +2324,42 @@ export class ActorManager {
     if (!this.#closePromise) {
       this.#closing = true;
       this.#closePromise = this.#close();
+      // Retention/presence joins may yield before #close reaches its owned rows.
+      // Cancel current preparations now; a released model resolver must not launch
+      // a worker while shutdown waits for a deferred maintenance slice. Cache the
+      // close promise first so an abort listener can safely join close reentrantly.
+      for (const actor of this.#draining.values()) actor.abortController?.abort();
     }
     return this.#closePromise;
   }
 
   async #close(): Promise<void> {
     this.#meshMonitor.close();
+    if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
+    this.#registrySaveTimer = undefined;
+    await this.#registrySavePending;
+    await this.#registrySaveChain;
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    if (this.#orphanPresenceTimer) clearTimeout(this.#orphanPresenceTimer);
+    this.#orphanPresenceTimer = undefined;
+    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
+    this.#retentionTimer = undefined;
     // Cancellation is monotonic: pending claims must settle before the enclosing
     // runtime releases host custody or certifies terminal lineage closure.
     await Promise.allSettled([...this.#adoptionPending.values()]);
     // Let presence writes already in flight finish before the runtime goes.
     await Promise.allSettled([...this.#presenceChains.values()]);
+    await this.#filterStateSave;
     await this.#notifications.close();
-    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
-    this.#retentionTimer = undefined;
+    await this.#retentionSweep;
     this.#listeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
-      const owned = [...this.#actors.values()].filter((actor) => this.#canManage(actor.id));
+      const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
       for (const actor of owned) {
         actor.abortController?.abort();
         for (const item of actor.queue.splice(0)) {
@@ -2180,10 +2374,18 @@ export class ActorManager {
       // turn, keeping the session from exiting. Past the grace, stop it: while closing, no queue
       // file is written, so its item stays there and the next session runs it again (#79).
       const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
-      const timer = (ms: number) => new Promise<"late">((resolve) => setTimeout(resolve, ms, "late").unref?.());
-      if (await Promise.race([drains.then(() => "done" as const), timer(this.#closeGraceMs)]) === "late") {
+      // A losing race deadline is still a live old-generation timer. The shared
+      // bounded-settlement helper clears it when drains finish first (#4383).
+      if (!await settleWithin([drains], this.#closeGraceMs)) {
         await this.agents.close();
-        await Promise.race([drains, timer(this.#closeGraceMs)]);
+        await settleWithin([drains], this.#closeGraceMs);
+      }
+      // Retry every durable join before AgentManager.close. Failed sinks keep
+      // their source veto on disk for the next execution owner.
+      for (const actor of owned) {
+        const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+          ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+        for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
       }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";
@@ -2208,12 +2410,37 @@ export class ActorManager {
     return store;
   }
 
+  /** Bound the actual pretty-printed UTF-8 context, independently of the runnable FIFO. */
+  #handoffSnapshot(actor: ManagedActor): ActorQueueItem[] {
+    const snapshot: ActorQueueItem[] = [];
+    const encode = (items: ActorQueueItem[]): string => JSON.stringify(items.map(({ id, source, payload, activation }) =>
+      ({ id, source, payload, activation })), null, 2);
+    for (const original of this.#deferredHandoffs.get(actor.id) ?? []) {
+      if (snapshot.length === 16) break;
+      if (this.#pendingHandoffConsumption.get(actor.id)?.has(original.id) ||
+          this.#childCompletionStore(actor).handoffConsumed(original.id)) continue;
+      let item = original;
+      // One oversized summary must not starve itself or later outcomes. The full
+      // archive remains accessible, while this context carries only its reference.
+      if (Buffer.byteLength(encode([item]), "utf8") > 32 * 1024) {
+        item = { ...original, payload: {
+          message: "Unread child outcome; read the full archived result.",
+          data: { resultFile: this.#childCompletionStore(actor).resultFile(original.id) },
+        } };
+      }
+      if (Buffer.byteLength(encode([...snapshot, item]), "utf8") > 32 * 1024) break;
+      snapshot.push(item);
+    }
+    return snapshot;
+  }
+
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
-  #reconcileChildCompletions(): void {
+  #reconcileChildCompletions(completed?: ManagedActor): void {
     if (!this.#persistent || this.#closing) return;
-    for (const actor of this.#actors.values()) {
+    for (const actor of completed ? [completed] : this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
       for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
@@ -2234,9 +2461,27 @@ export class ActorManager {
             store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
           }
-        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+        } catch (error) {
+          if (error instanceof ChildCompletionClaimLostError) {
+            this.#forgetClaimedChild(actor, result.id);
+            this.#ensureDrain(actor);
+          } // Other I/O failures leave the actor-addressed envelope pending for retry.
+        }
       }
     }
+  }
+
+  #forgetClaimedChild(actor: ManagedActor, id: string): void {
+    const keep = (item: ActorQueueItem): boolean => item.source !== "child-completion" || item.id !== id;
+    actor.queue = actor.queue.filter(keep);
+    for (const held of [this.#overflow, this.#parked, this.#deferredHandoffs]) {
+      const items = held.get(actor.id)?.filter(keep);
+      if (items?.length) held.set(actor.id, items);
+      else held.delete(actor.id);
+    }
+    this.#refill(actor);
+    if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+    this.#persistQueue(actor.id, true);
   }
 
   #enqueue(
@@ -2254,6 +2499,12 @@ export class ActorManager {
       /** Host-owned deterministic child completion id and write-ahead handoff. */
       id?: string;
       deferDrain?: boolean;
+      /** Routed mesh work: acceptance requires the persisted queue to hold it (#816). */
+      requirePersisted?: boolean;
+      /** Durable routed work: past the queue and overflow it waits in the actor's dead-letter file. */
+      deadLetter?: boolean;
+      /** A dead-lettered event returning to the queue; it never goes back to the file. */
+      replaying?: boolean;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2279,7 +2530,8 @@ export class ActorManager {
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
-    if (options.coalesceKey) {
+    // A replayed dead letter is older than anything queued: it never overwrites a queued payload (#816).
+    if (options.coalesceKey && !options.replaying) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
@@ -2296,8 +2548,10 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
-        this.#persistQueue(actor.id);
+        const persisted = this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
+        // Memory already runs the merged item; an unacknowledged replay coalesces again.
+        if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
         return existing;
       }
     }
@@ -2325,6 +2579,14 @@ export class ActorManager {
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
     };
+    if (options.deadLetter && !options.replaying && this.#persistent && (this.#deadLetterCount(actor.id) > 0 ||
+      (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
+      // smarty-dev#816: a sick actor's full queue never holds the shared host cursor. Its further
+      // routed events wait in its own dead-letter file, behind any already there, so order holds.
+      this.#appendDeadLetter(actor, source, payload as MeshEvent);
+      this.#replayDeadLetters(actor);
+      return item;
+    }
     if (actor.queue.length >= this.meshConfig.actorQueueLimit) {
       // A full queue must not hold other actors' delivery (smarty-dev#1065): the item waits in this
       // actor's overflow, and past its cap it is recorded as dropped, never lost silently.
@@ -2341,7 +2603,16 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    this.#persistQueue(actor.id);
+    if (!this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
+      // Not durable in the receiver's queue: do not accept it, so the host cursor
+      // keeps the event and offers it again rather than losing it on a restart.
+      for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
+        const at = held.indexOf(item);
+        if (at >= 0) held.splice(at, 1);
+      }
+      if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
+      throw new ActorQueueCheckpointError(actor);
+    }
     if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -2420,10 +2691,24 @@ export class ActorManager {
     }
   }
 
-  async #publishDrainPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishDrainPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
-    await this.#prepare(actor, "registry", () => this.#saveActors());
+    // Preparation is an admission boundary, not a coalescible worker status pulse.
+    try {
+      await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
+        ...(requireCommit ? { requiredActor: actor } : {}) }));
+    } catch (error) {
+      if (error instanceof ActorPreparationTimeoutError) {
+        // Release only process-local serialization. An abandoned acquisition
+        // may settle later, but its preparation must never become commit authority.
+        for (const controller of this.#registrySaveControllers) controller.abort(error);
+      }
+      throw error;
+    }
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
@@ -2449,11 +2734,17 @@ export class ActorManager {
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
         ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
-    this.#noteFailedActivation(actor, message, undefined, false);
+    // A requeued item has not consumed an activation. #drain reports prolonged
+    // preparation failure after the initial retries, once per durable streak.
+    // Cleanup of that pending retry must not double-count a failed activation.
+    // Failures outside an item retry still need fail-loud host reporting.
+    if (!item && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
+      (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false);
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
     let retryDrain = false;
+    let retryDelay = this.#preparationRetryMs;
     try {
       while (
         actor.queue.length > 0 &&
@@ -2469,8 +2760,11 @@ export class ActorManager {
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
         const head = actor.queue[0];
-        if (head?.source === "child-completion" &&
-          !this.#childCompletionStore(actor).received(head.id)) break;
+        if (head?.source === "child-completion") {
+          const store = this.#childCompletionStore(actor);
+          if (!store.received(head.id)) break;
+          if (!store.mailboxClaimed(head.id)) { this.#forgetClaimedChild(actor, head.id); continue; }
+        }
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2481,11 +2775,23 @@ export class ActorManager {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
           this.#recordFiltered(actor, item, filteredBy);
           this.#persistQueue(actor.id);
+          this.#replayDeadLetters(actor);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
+        const deadRoot = this.#deadRootSkip(actor, item);
+        if (deadRoot) {
+          // smarty-dev#6062: the owning root is positively dead. Skipped like a filter match.
+          this.#recordDeadRootSkip(actor, item, deadRoot);
+          this.#persistQueue(actor.id);
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           await this.#publishDrainPresence(actor);
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        // Only now: the replay rewrites the queue file, which must still hold this item (round 4 P2).
+        this.#replayDeadLetters(actor);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
         actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
@@ -2513,7 +2819,15 @@ export class ActorManager {
           }
           // The current activation is fresh; retained outcomes are labelled context,
           // not retried activations with rewritten freshness facts.
-          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
+          const deferred = this.#deferredHandoffs.get(actor.id) ?? [];
+          const store = this.#childCompletionStore(actor);
+          item.handoffContext = deferred.filter((handoff) => store.retained(handoff.id, this.#logs.retention.actorRunArchiveMs));
+          if (item.handoffContext.length !== deferred.length) {
+            if (item.handoffContext.length) this.#deferredHandoffs.set(actor.id, item.handoffContext.slice());
+            else this.#deferredHandoffs.delete(actor.id);
+            this.#persistQueue(actor.id);
+          }
+          item.handoffContext = this.#handoffSnapshot(actor);
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -2550,11 +2864,14 @@ export class ActorManager {
             ? await this.#prepare(actor, "binding", () => {
               if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
               return this.#prepareModelRoute({ routeClass: actor.routeClass!, protected: actor.protected,
-                pinModel: binding.model, pinThinking: binding.thinking, parentSessionId: this.sessionId,
+                pinModel: binding.model, pinThinking: binding.thinking,
+                ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}), parentSessionId: this.sessionId,
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? { ...binding,
+            model: routeDecision.mode === "live" ? routeDecision.model : routeDecision.pin.model,
+            thinking: routeDecision.mode === "live" ? routeDecision.effort : routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
@@ -2660,7 +2977,9 @@ export class ActorManager {
           if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
-          this.#failureStreaks.delete(actor.id);
+          delete actor.failureStreak;
+          delete actor.activationBlocked;
+          actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);
@@ -2730,16 +3049,31 @@ export class ActorManager {
             error.launchOutcome === "unlaunched";
           const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
             (error instanceof ActorPreparationError && error.phase !== "binding")));
-          if (retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES &&
+          const callerless = !item.resolve && !item.reject;
+          if (retryPreparation && (callerless || (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
             // Transfer ownership before cleanup can yield: persistence must never see
             // this activation both in flight and queued (review/astra round 2, #3167).
             this.#inFlight.delete(actor.id);
-            actor.queue.unshift(item);
+            // Rotate, never unshift: a failing item retries behind newer work, so one bad item
+            // cannot block the rest of this actor's queue (smarty-dev#816 round 3).
+            const overflow = this.#overflow.get(actor.id);
+            if (overflow?.length) overflow.push(item);
+            else actor.queue.push(item);
             this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
+            // Retain routed work in the actor's durable queue beyond the ask budget, with
+            // bounded retry pressure. Tests may shorten the base; production uses 5s, 15s,
+            // 60s, then every 5 minutes. The host mesh cursor never waits for this item.
+            if (callerless) {
+              retryDelay = this.#preparationRetryMs * ACTOR_PREPARATION_BACKOFF[
+                Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
+              if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
+                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER, true);
+              }
+            }
             retryDrain = true;
             break;
           }
@@ -2768,15 +3102,21 @@ export class ActorManager {
           // actor sent to and received from its model, even after a successful
           // run cleans up the in-memory handle and tmp run directory. Failed
           // runs stay in the agent registry for agents.status(lastRunId).
+          let archived = false;
           if (runId) {
-            await this.#retainRunLog(actor, runId).catch(() => undefined);
+            archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
-          if (previousRunId && previousRunId !== runId) {
-            await this.agents.cleanup(previousRunId).catch(() => ({ cleaned: false }));
+          const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+            ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+          if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
+          for (const priorRunId of priorArchives) {
+            if (priorRunId === runId) continue;
+            const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+            if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
           }
-          if (runId && runCompleted) {
+          if (runId && runCompleted && archived) {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
@@ -2786,6 +3126,10 @@ export class ActorManager {
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
           this.#finishInFlight(actor.id, item, handoffConsumed);
+          // Status coalescing can make the idle boundary visible before the next
+          // monitor poll. Reconcile native live receipts before exposing that
+          // boundary or admitting a mailbox activation, not via incidental save I/O.
+          if (!this.#halted) this.#reconcileChildCompletions(this.#actors.get(actor.id) ?? actor);
           if (this.#canManage(actor.id)) {
             await this.#publishDrainPresence(actor).catch((error: unknown) => {
               this.#recordPreparationFailure(actor, error);
@@ -2820,7 +3164,7 @@ export class ActorManager {
             this.#drainRetries.delete(live.id);
             const current = this.#actors.get(live.id);
             if (current) this.#ensureDrain(current);
-          }, this.#preparationRetryMs);
+          }, retryDelay);
           timer.unref();
           this.#drainRetries.set(live.id, timer);
         } else if (live !== actor || resetAtExit || rearm) queueMicrotask(() => this.#ensureDrain(live));
@@ -2830,24 +3174,46 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
-    const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
-    // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
+    const streak = actor.failureStreak ?? { count: 0, notified: false };
+    // Retry exhaustion must still alarm immediately when its finite budget is spent.
     streak.count = Math.max(streak.count + 1, countFloor);
-    this.#failureStreaks.set(actor.id, streak);
+    actor.failureStreak = streak;
+    // Worker stderr can prefix the terminal failure with compatibility warnings.
+    // Report the last actual error line, never the legacy-provenance warning.
+    // A V8 stack frame can contain "Error" in a Windows or POSIX path; it is
+    // context for the error above it, not a later terminal activation failure.
+    const lines = error.split("\n").map(line => line.trim()).filter(line => line &&
+      !/^at\s/.test(line) &&
+      !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
+    const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
+      ?? lines.at(-1) ?? "Unknown activation failure";
+    const code = preparation ? "failing-preparation"
+      : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
+      : /Context exceeds window/i.test(lastError) ? "context-overflow"
+      : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
+      : "unknown";
+    const reason = lastError.slice(0, 300);
+    const previous = actor.activationBlocked;
+    actor.activationBlocked = {
+      reason, code, since: previous?.code === code ? previous.since : Date.now(),
+      count: previous?.code === code ? previous.count + 1 : 1,
+    };
+    actor.updatedAt = Date.now();
+    void this.#publishPresence(actor).catch(() => undefined);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
-    const contextOverflow = /Context exceeds window:/i.test(error);
+    const contextOverflow = code === "context-overflow";
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
-    const reason = error.split("\n")[0]!.slice(0, 300);
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
-      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
+      `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
       (contextOverflow ? ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
@@ -2859,6 +3225,12 @@ export class ActorManager {
       void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
         text, data: { actorId: actor.id, reason: "context_window", error, runId } }).catch(() => undefined);
     }
+    void this.#publishNotification({
+      topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
+        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
+        routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
+    }).catch(() => undefined);
     try {
       this.onDeliver({
         actor: this.#publicInfo(actor),
@@ -2925,7 +3297,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
-      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+      ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3066,9 +3438,42 @@ export class ActorManager {
 
   // Only callerless mesh and host events are filtered: a caller always hears its own run.
   #filteredBy(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    this.#expireActivationFilter(actor);
     if (!actor.activationFilter || item.resolve || item.reject) return undefined;
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
     return activationFilterSkip(actor.activationFilter, item.source, item.payload);
+  }
+
+  /**
+   * The dead-root verdict's reason when this activation must be skipped (smarty-dev#6062), else
+   * undefined. Fail-open: off, exempt, caller-awaited, non-durable, no root, or any doubt runs.
+   */
+  #deadRootSkip(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    if (!this.#deadRootFilter || item.resolve || item.reject || actor.residency !== "durable" || !actor.rootId) return undefined;
+    if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
+    try {
+      const config = normalizeDeadRootFilterConfig(this.#deadRootFilter());
+      if (config.mode !== "on" || deadRootExempt(config, actor)) return undefined;
+      this.#deadRoots ??= new DeadRootCache(this.mesh.root);
+      const verdict = this.#deadRoots.judge(actor.rootId);
+      return verdict.dead ? verdict.reason : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #recordDeadRootSkip(actor: ManagedActor, item: ActorQueueItem, reason: string): void {
+    this.#recordFiltered(actor, item, "dead-root");
+    const event = item.source.startsWith("mesh:") ? item.payload as { id?: unknown; topic?: unknown } | null | undefined : undefined;
+    appendDeadRootSkip(this.mesh.root, {
+      at: new Date().toISOString(),
+      actorId: actor.id,
+      actorName: actor.name,
+      rootId: actor.rootId,
+      eventId: typeof event?.id === "string" ? event.id : item.id,
+      topic: typeof event?.topic === "string" ? event.topic : item.source.slice(item.source.indexOf(":") + 1),
+      reason,
+    });
   }
 
   /**
@@ -3078,18 +3483,58 @@ export class ActorManager {
    * The drain checks again, for items queued before the filter was set.
    */
   #skipOnArrival(actor: ManagedActor, source: string, payload: unknown): boolean {
+    this.#expireActivationFilter(actor);
     if (!actor.activationFilter || actor.status === "stopped") return false;
     const ruleId = activationFilterSkip(actor.activationFilter, source, payload);
     if (!ruleId) return false;
-    this.#recordFiltered(actor, { id: randomUUID(), source }, ruleId);
-    // ponytail: save the count and log locally; no presence write, the skip changes no mesh state.
+    this.#recordFiltered(actor, { id: randomUUID(), source, payload }, ruleId);
+    // Persist soft telemetry once per poll, not once per event; no extra durable write.
     this.#emitChange();
-    void this.#saveActors().catch(() => undefined);
     return true;
   }
 
-  #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source">, ruleId: string): void {
+  #recordFilterClear(actor: ManagedActor, reason: "explicit" | "expired"): void {
+    this.#recordMessage(actor, {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
+      source: "actor:activation-filter", createdAt: Date.now(), reason: `activationFilter cleared: ${reason}`,
+    });
+  }
+
+  #expireActivationFilter(actor: ManagedActor): void {
+    if (actor.activationFilterExpiresAt === undefined || Date.now() < actor.activationFilterExpiresAt) return;
+    delete actor.activationFilter;
+    delete actor.invalidActivationFilter;
+    delete actor.activationFilterExpiresAt;
+    actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+    actor.updatedAt = Date.now();
+    this.#recordFilterClear(actor, "expired");
+    this.#filterStateDirty = true;
+    this.#emitChange();
+  }
+
+  #flushFilterState(): void {
+    if (!this.#filterStateDirty || this.#filterStateSave || this.#closing) return;
+    this.#filterStateDirty = false;
+    this.#filterStateSave = this.#saveActors().catch(() => {
+      this.#filterStateDirty = true;
+    }).finally(() => { this.#filterStateSave = undefined; });
+  }
+
+  #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source" | "payload"> & { coalesceKey?: string }, ruleId: string): void {
     const now = Date.now();
+    const event = item.payload as { id?: unknown; topic?: unknown; data?: unknown } | null | undefined;
+    const mesh = item.source.startsWith("mesh:");
+    const value = mesh && actor.coalesceKey ? meshCoalesceValue(event?.data, actor.coalesceKey) : undefined;
+    const key = item.coalesceKey ?? (mesh
+      ? value === undefined ? undefined : JSON.stringify(["mesh", event?.topic, value])
+      : actor.coalesce ? item.source : undefined);
+    actor.filterSkipped = {
+      count: (actor.filterSkipped?.count ?? 0) + 1,
+      lastKey: key ?? (mesh && typeof event?.id === "string" ? event.id : item.id),
+      lastTopic: item.source.slice(item.source.indexOf(":") + 1),
+      lastAt: now,
+    };
+    this.#filterStateDirty = true;
     actor.filteredCount = (actor.filteredCount ?? 0) + 1;
     actor.lastFilteredAt = now;
     actor.updatedAt = now;
@@ -3177,17 +3622,18 @@ export class ActorManager {
     }
   }
 
-  // Returns false when an owned receiver's queue was full; the monitor then offers the event
-  // again while it catches up, and actors that already took it are skipped.
+  // Returns false only when a receiver could not checkpoint the event (or, on a non-persistent
+  // host, a fleet.* receiver's queue was full); the monitor then offers it again and actors that
+  // already took it are skipped. A durable receiver's full queue dead-letters instead (#816).
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
-    // One ownership refresh per event. Each decision reads the participant directory, and
-    // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
-    // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
-    // The snapshot holds for this synchronous delivery (enqueue, drain start, message record);
-    // work that resumes later decides again.
-    this.#refreshOwnership();
+    // Empty polls only observe owners through the idle cache. The matched targets below
+    // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
+    // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
     this.#ownershipSnapshot = true;
     try {
+      // Acceptance is a checkpoint in the receiver's own queue file, never an
+      // activation outcome: failed preparation retries from that queue and must not
+      // pin this host's single mesh cursor (smarty-dev#816, smarty-dev#1065).
       return this.#deliverMeshEvent(event);
     } finally {
       this.#ownershipSnapshot = false;
@@ -3195,14 +3641,33 @@ export class ActorManager {
   }
 
   #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
+    // Keep stable IDs across ownership refreshes: persistent reacquisition can replace
+    // every ManagedActor object before the synchronous delivery loop enqueues work.
+    const targets = [...this.#actors.values()].filter((actor) => {
+      if (actor.status === "stopped") return false;
+      const addressed = event.to === actor.id || event.to === actor.name;
+      return (addressed || actor.topics.includes(event.topic)) &&
+        (event.from.id !== actor.id || addressed) &&
+        !this.#delivered.has(`${actor.id}\0${event.id}`);
+    }).map((actor) => actor.id);
+    if (targets.length === 0) return "ignored";
+    // One canonical directory snapshot per matching event, shared only by its
+    // synchronous deliveries. Activation/presence continuations still read fresh.
+    return this.#withOwnershipRead(() => this.#deliverMeshTargets(event, targets));
+  }
+
+  #deliverMeshTargets(event: MeshEvent, targets: readonly string[]): boolean | "ignored" {
     let full = false;
     let handedOn = false;
-    for (const actor of this.#actors.values()) {
-      if (actor.status === "stopped") continue;
+    for (const actorId of targets) {
+      this.#refreshOwnership(actorId);
+      // Ownership reacquisition may have reloaded the registry. Never enqueue on
+      // the captured object; resolve the current actor and recheck its filters.
+      const actor = this.#actors.get(actorId);
+      if (!actor || actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
-      const subscribed = actor.topics.includes(event.topic);
-      if (!addressed && !subscribed) continue;
-      if (event.from.id === actor.id && !addressed) continue;
+      if (!(addressed || actor.topics.includes(event.topic)) ||
+        (event.from.id === actor.id && !addressed)) continue;
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
       if (this.#delivered.has(delivery)) continue;
@@ -3210,17 +3675,7 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
-          const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
-          // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
-          // so a joined key could merge two topics' subjects. Keeps the value's type.
-          this.#enqueue(actor, `mesh:${event.topic}`, event, {
-            ...(event.verification === "mesh" || event.verification === "bridge"
-              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
-            ownershipChecked: true,
-            // Work waits for room; the monitor offers it again (smarty-dev#754).
-            ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
-            ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
-          });
+          this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -3229,59 +3684,281 @@ export class ActorManager {
         }
       } catch (error) {
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
-        if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
+        if (error instanceof ActorQueueCheckpointError ||
+          (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached"))) full = true;
       }
     }
     return full ? false : handedOn ? true : "ignored";
   }
 
-  async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
-    await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
+  #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
+    const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+    return {
+      ...(event.verification === "mesh" || event.verification === "bridge"
+        ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
+      ownershipChecked: true,
+      requirePersisted: true,
+      // A durable host never holds the shared cursor for one actor's full queue: past it, work
+      // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
+      // which has no such file, keeps fleet.* work in the mesh until there is room (#754).
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+      // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
+      // so a joined key could merge two topics' subjects. Keeps the value's type.
+      ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
+    };
   }
 
-  #sweepRetainedRuns(now = Date.now()): void {
-    if (this.#closing || this.#canConsumeMesh?.() === false) return;
-    this.#refreshOwnership();
-    for (const actor of this.#actors.values()) {
-      if (this.#canManage(actor.id)) {
-        this.#logs.pruneRuns(actor, now);
-        const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
-          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
-          .filter((item) => item?.source === "child-completion").map((item) => item!.id));
-        for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
-        const store = this.#childCompletionStore(actor);
-        store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
-        // Deferred work shares the archive TTL, rather than exempting stale results
-        // forever. An active inference snapshot is protected until its run ends.
-        const deferred = this.#deferredHandoffs.get(actor.id);
-        if (deferred) {
-          const kept = deferred.filter((item) => fs.existsSync(store.resultFile(item.id)));
-          if (kept.length !== deferred.length) {
-            if (kept.length) this.#deferredHandoffs.set(actor.id, kept);
-            else this.#deferredHandoffs.delete(actor.id);
-            this.#persistQueue(actor.id);
+  #deadLetterFile(actorId: string): string {
+    return path.join(this.#actorRoot, actorId, "dead-letter.jsonl");
+  }
+
+  #readDeadLetters(actorId: string): ActorDeadLetter[] {
+    let text: string;
+    try { text = fs.readFileSync(this.#deadLetterFile(actorId), "utf8"); } catch { return []; }
+    return text.split("\n").flatMap((line) => {
+      if (!line) return [];
+      try {
+        const value = JSON.parse(line) as Partial<ActorDeadLetter>;
+        return typeof value.source === "string" && typeof value.event?.id === "string" ? [value as ActorDeadLetter] : [];
+      } catch { return []; }                                  // a torn final line from a crash
+    });
+  }
+
+  #deadLetterCount(actorId: string): number {
+    let count = this.#deadLetters.get(actorId);
+    if (count === undefined) this.#deadLetters.set(actorId, count = this.#readDeadLetters(actorId).length);
+    return count;
+  }
+
+  #writeDeadLetters(actorId: string, entries: readonly ActorDeadLetter[]): void {
+    const file = this.#deadLetterFile(actorId);
+    if (entries.length === 0) fs.rmSync(file, { force: true });
+    else {
+      const temporary = `${file}.${process.pid}.tmp`;
+      // Synced before the rename: a spill must be durable before the queue file forgets it.
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      fs.renameSync(temporary, file);
+    }
+    this.#deadLetters.set(actorId, entries.length);
+  }
+
+  // Append-only and bounded: past the bound the oldest entries drop (to 90%, so a flood rewrites
+  // the file once per tenth), each drop counted on the actor. A write failure is a checkpoint
+  // failure, as for the queue file: the event stays in the mesh.
+  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
+    const file = this.#deadLetterFile(actor.id);
+    let count = this.#deadLetterCount(actor.id);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, `${JSON.stringify({ at: Date.now(), source, event })}\n`, { mode: 0o600 });
+      this.#deadLetters.set(actor.id, ++count);
+      if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
+        const entries = this.#readDeadLetters(actor.id);
+        const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
+        let bytes = entries.reduce((total, entry) => total + size(entry), 0);
+        let dropped = 0;
+        while (entries.length > 0 && (entries.length > ACTOR_DEAD_LETTER_MAX_ENTRIES * 0.9 || bytes > ACTOR_DEAD_LETTER_MAX_BYTES * 0.9)) {
+          bytes -= size(entries.shift()!);
+          dropped++;
+        }
+        this.#writeDeadLetters(actor.id, entries);
+        count = entries.length;
+        const total = (this.#deadLettersDropped.get(actor.id) ?? 0) + dropped;
+        this.#deadLettersDropped.set(actor.id, total);
+        this.#recordMessage(actor, {
+          id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+          createdAt: Date.now(),
+          error: `Dropped the ${dropped} oldest dead-lettered events: the dead-letter file is bounded at ${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries and ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes (${total} dropped since start)`,
+          data: { deadLetterDropped: dropped, deadLetterDroppedTotal: total },
+        });
+      }
+    } catch {
+      throw new ActorQueueCheckpointError(actor);
+    }
+    if (this.#closing) return;
+    const now = Date.now();
+    const last = this.#deadLetterAlarms.get(actor.id);
+    if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
+    this.#deadLetterAlarms.set(actor.id, now);
+    const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
+      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter file ${file}. ` +
+      `They re-queue automatically once its queue drains below half; other actors are not held. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count, file },
+    };
+    this.#recordMessage(actor, notice);
+    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count, file } }).catch(() => undefined);
+    try {
+      this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+    } catch { /* best effort: the notice stays in the actor's messages */ }
+  }
+
+  // Re-queues dead letters, oldest first, once the actor's queue has drained below half and its
+  // overflow is empty. Never while restored or regained work still waits in #parked: that work is
+  // older and returns first, and it may refill the queue and overflow (round 3 P1). An event still
+  // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
+  // leave the file only after the queue file durably holds what they replayed.
+  #replayDeadLetters(actor: ManagedActor): void {
+    if (!this.#persistent || this.#closing || this.#halted || actor.status === "stopped" || actor.removal ||
+      this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
+    const limit = this.meshConfig.actorQueueLimit;
+    if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
+    const entries = this.#readDeadLetters(actor.id);
+    const inFlight = this.#inFlight.get(actor.id);
+    const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue]
+      .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
+    let taken = 0;
+    let added = 0;
+    try {
+      while (taken < entries.length && actor.queue.length < limit) {
+        const entry = entries[taken]!;
+        if (!held.has(entry.event.id)) {
+          held.add(entry.event.id);
+          this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+          added++;
+        }
+        taken++;
+      }
+    } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
+    if (taken === 0) return;
+    // A single rewrite per batch (the O(N^2) worst case over a 50 MB file is a noted follow-up).
+    if (added === 0 || this.#persistQueue(actor.id, true)) {
+      try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+    }
+    this.#ensureDrain(actor);
+  }
+
+  // Restored work past the queue and its overflow returns to the HEAD of the dead-letter file, ahead
+  // of the later events already there, instead of being dropped (round 3 P1). The file is written
+  // before the queue file forgets them. Returns what could not spill (a resumed run, a non-mesh
+  // item, a write failure): it stays in the overflow past the cap, never dropped.
+  #spillDeadLetters(actor: ManagedActor, items: ActorQueueItem[]): ActorQueueItem[] {
+    const spillable = (item: ActorQueueItem) => this.#persistent && !item.resumed && item.source.startsWith("mesh:") &&
+      typeof (item.payload as { id?: unknown } | undefined)?.id === "string";
+    // Only a run-order tail can go: an item that must stay keeps everything after it in memory too.
+    let from = items.length;
+    while (from > 0 && spillable(items[from - 1]!)) from--;
+    const spilled = items.slice(from);
+    if (spilled.length === 0) return items;
+    try {
+      fs.mkdirSync(path.dirname(this.#deadLetterFile(actor.id)), { recursive: true, mode: 0o700 });
+      this.#writeDeadLetters(actor.id, [
+        ...spilled.map((item) => ({ at: Date.now(), source: item.source, event: item.payload as MeshEvent })),
+        ...this.#readDeadLetters(actor.id),
+      ]);
+    } catch {
+      this.#deadLetters.delete(actor.id);
+      return items;
+    }
+    return items.slice(0, from);
+  }
+
+  // A dead letter is accepted work: a cursor replay of its event (a crash before the cursor passed
+  // it) must neither queue nor dead-letter it a second time (round 3 P3).
+  #seedDeadLetterDeliveries(actor: ManagedActor): void {
+    if (!this.#persistent) return;
+    const entries = this.#readDeadLetters(actor.id);
+    this.#deadLetters.set(actor.id, entries.length);
+    for (const entry of entries.slice(-DELIVERED_EVENT_MEMORY / 2)) this.#delivered.add(`${actor.id}\0${entry.event.id}`);
+  }
+
+  async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
+    let pending = this.#pendingRunArchives.get(actor.id);
+    if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
+    pending.add(runId);
+    const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+    await this.#logs.retainRun(actor, runId, source);
+    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+    pending.delete(runId);
+    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
+  }
+
+  #startRetentionSweep(): void {
+    if (this.#retentionSweep || this.#closing) return;
+    const sweep = this.#sweepRetainedRuns().catch(() => undefined);
+    this.#retentionSweep = sweep;
+    void sweep.finally(() => { if (this.#retentionSweep === sweep) this.#retentionSweep = undefined; });
+  }
+
+  async #sweepRetainedRuns(now = Date.now()): Promise<void> {
+    // A microtask is not a yield: let RPC/input run before touching archives,
+    // and again after every bounded actor batch. Intervals cannot overlap a sweep.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const actors = [...this.#actors.values()];
+    // NTFS metadata/deletion can make eight actors (72 expired runs in the
+    // startup fixture) monopolize a turn. Keep each run's work unchanged,
+    // but re-enter the publication/ownership fences between Windows actors.
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    for (let offset = 0; offset < actors.length; offset += batchSize) {
+      if (this.#closing || this.#canConsumeMesh?.() === false) return;
+      this.#withOwnershipRead(() => {
+        for (const actor of actors.slice(offset, offset + batchSize)) {
+          if (this.#closing || this.#canConsumeMesh?.() === false) return;
+          // Reload/removal, cede and a newly published owner all veto maintenance.
+          if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          this.#logs.pruneRuns(actor, now);
+          const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
+            ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
+            .filter((item) => item?.source === "child-completion").map((item) => item!.id));
+          for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+          for (const id of this.#pendingHandoffConsumption.get(actor.id) ?? []) keepIds.add(id);
+          const store = this.#childCompletionStore(actor);
+          store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
+          // Deferred work shares the archive TTL, rather than exempting stale results
+          // forever. An active inference snapshot is protected until its run ends.
+          const deferred = this.#deferredHandoffs.get(actor.id);
+          if (deferred) {
+            const kept = deferred.filter((item) => fs.existsSync(store.resultFile(item.id)));
+            if (kept.length !== deferred.length) {
+              if (kept.length) this.#deferredHandoffs.set(actor.id, kept);
+              else this.#deferredHandoffs.delete(actor.id);
+              this.#persistQueue(actor.id);
+            }
           }
         }
-      }
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    if (this.#closing || this.#canConsumeMesh?.() === false) return;
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,
         ...(typeof this.#deadSessionReap === "object" ? { deadAfterMs: this.#deadSessionReap.deadAfterMs } : {}),
       }));
     }
+    this.#initialRetentionPending = false;
   }
 
   #recordMessage(actor: ManagedActor, message: FabricActorMessage): void {
     if (message.source === "child-completion" && message.direction === "in" &&
       actor.messages.some((known) => known.id === message.id && known.direction === "in")) return;
     this.#logs.recordMessage(actor.messages, message);
+    if (this.#persistent && this.meshConfig.enabled) {
+      const pending = this.#unarchivedMessages.get(actor) ?? [];
+      pending.push(structuredClone(message));
+      this.#unarchivedMessages.set(actor, pending);
+    }
   }
 
-  async #publishPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
-    await this.#saveActors();
+    // Global order: actor registries (sorted path), then mesh. The registry
+    // mutation finishes/releases before presence takes the mesh lock; callers
+    // must not wrap this async setter/create/remove path in mesh.exclusive.
+    // Maintenance may skip a displaced actor, but an acknowledged mutation must
+    // prove its selected object/generation survived inside the commit fence.
+    await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor } : undefined);
     await this.#writePresence(actor.id);
   }
 
@@ -3325,7 +4002,67 @@ export class ActorManager {
     return this.#notifications.enqueue(() => this.mesh.publish(request));
   }
 
+  #presencePreview(actor: ManagedActor, changes: { [K in keyof ManagedActor]?: ManagedActor[K] | undefined }): FabricActorInfo {
+    // Preserve accessor descriptors: spreading an actor would eagerly load its journal.
+    const preview = Object.create(Object.getPrototypeOf(actor), Object.getOwnPropertyDescriptors(actor)) as ManagedActor;
+    Object.assign(preview, { updatedAt: Date.now() }, changes);
+    const history = this.#lazyMessages.get(actor);
+    if (history) this.#lazyMessages.set(preview, history);
+    for (const key of Object.keys(changes) as Array<keyof ManagedActor>) {
+      if (changes[key] === undefined) delete preview[key];
+    }
+    return this.#publicInfo(preview, false);
+  }
+
+  #assertPresenceValue(value: FabricActorInfo): void {
+    // The lineage token belongs to native participant renewal, not the legacy
+    // actors/ wire value. Keep the historical byte limit on the actual payload.
+    const { ownershipToken: _token, ...legacy } = value;
+    const serialized = JSON.stringify(legacy);
+    if (serialized === undefined) throw new Error("Actor presence must be JSON-serializable");
+    if (Buffer.byteLength(serialized, "utf8") > this.mesh.maxEventBytes) {
+      throw new Error(`Actor presence exceeds ${this.mesh.maxEventBytes} bytes; reduce actor metadata`);
+    }
+  }
+
+  /** Permanent actor-local publication failures must never poison the shared heartbeat. */
+  #presenceValue(actor: ManagedActor): FabricActorInfo | undefined {
+    let value: FabricActorInfo;
+    try {
+      // Exclude our own diagnostic so a repaired value can fit again.
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false);
+      value = legacy;
+      this.#assertPresenceValue(value);
+    } catch (error) {
+      const diagnostic = `Actor presence omitted: ${error instanceof Error ? error.message : String(error)}`;
+      if (actor.presenceError !== diagnostic) {
+        actor.presenceError = diagnostic;
+        this.#scheduleRegistrySave(true);
+        this.#emitChange();
+        console.warn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+      }
+      return undefined;
+    }
+    if (actor.presenceError) {
+      delete actor.presenceError;
+      this.#scheduleRegistrySave(true);
+      this.#emitChange();
+    }
+    return value;
+  }
+
   async #writePresenceNow(id: string): Promise<void> {
+    if (this.#presencePublisher) {
+      this.#pendingPresence.add(id);
+      this.#presenceRevisions.set(id, {});
+      try { await this.#presencePublisher.refresh(); }
+      catch (error) {
+        // The failed acquisition wrote nothing. The host's next heartbeat carries
+        // every pending id, with no per-actor timer, extra retry, or warning storm.
+        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
       retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
@@ -3337,14 +4074,16 @@ export class ActorManager {
       return;
     }
     const actor = this.#actors.get(id);
-    if (actor && !this.#canManageCached(id)) {
+    if (actor && !this.#ownershipDecision(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
       return;
     }
     const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
-        await this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+        const value = this.#presenceValue(actor);
+        if (value) await this.mesh.put({ key: this.#presenceKey(id), value, identity: this.identity });
+        // An omitted permanent failure is settled, not a per-actor retry obligation.
       } else {
         await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
       }
@@ -3365,6 +4104,10 @@ export class ActorManager {
   }
 
   #schedulePresenceRetry(): void {
+    if (this.#presencePublisher) {
+      if (!this.#closing && this.#pendingPresence.size > 0) this.#presencePublisher.schedule();
+      return;
+    }
     if (this.#presenceTimer || this.#closing || this.#pendingPresence.size === 0) return;
     this.#presenceTimer = setTimeout(() => {
       this.#presenceTimer = undefined;
@@ -3447,51 +4190,261 @@ export class ActorManager {
         : actor.invalidActivationFilter
           ? { activationFilter: actor.invalidActivationFilter.value }
           : {}),
+      // Untouched actors need no new registry field; older rollback hosts omit it too.
+      ...(actor.filterSkipped ? { filterSkipped: { ...actor.filterSkipped } } : {}),
+      ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
+      ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       sessionFile: actor.sessionFile,
-      messages: actor.messages,
+      ...(this.#lazyMessages.has(actor)
+        ? this.#lazyMessages.get(actor)!.messageHistory !== undefined
+          ? { messageHistory: this.#lazyMessages.get(actor)!.messageHistory }
+          : { messages: this.#lazyMessages.get(actor)!.messages ?? [] }
+        : { messages: actor.messages }),
+      ...(this.#resetMessages.has(actor) ? { registryMessageReset: true } : {}),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
       ...(actor.removal ? { removal: actor.removal } : {}),
+      ...(actor.presenceError ? { presenceError: actor.presenceError } : {}),
     };
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
-    if (!this.#persistent || !this.meshConfig.enabled) return;
-    await this.#registry.withLock(() => {
-      // Finalization fences reloads and serialization, but only this save's explicit ids
-      // are authorized to revoke: their own durable write-ahead markers already exist.
-      // Preserve every other finalizer's current registry row, prepared or not.
-      const owned = [...this.#actors.values()].filter((actor) =>
-        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
-      );
-      const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
-      const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
-      const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
-      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
-      this.#registryFingerprint = this.#registry.fingerprint();
-      for (const id of removedIds) this.#persistedRoots.delete(id);
-      for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
-      for (const record of preserved) {
-        if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
-      }
+  #installLazyMessages(actor: ManagedActor, source: Record<string, unknown>): void {
+    this.#lazyMessages.set(actor, source);
+    const install = (messages: FabricActorMessage[]) => {
+      this.#lazyMessages.delete(actor);
+      Object.defineProperty(actor, "messages", { value: messages, writable: true, enumerable: true, configurable: true });
+    };
+    Object.defineProperty(actor, "messages", {
+      enumerable: true, configurable: true,
+      get: () => {
+        const messages: FabricActorMessage[] = [];
+        for (const candidate of this.#registry.messages(source, MESSAGE_HISTORY_LIMIT)) {
+          if (typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) &&
+              typeof (candidate as Partial<FabricActorMessage>).id === "string" &&
+              typeof (candidate as Partial<FabricActorMessage>).source === "string" &&
+              typeof (candidate as Partial<FabricActorMessage>).createdAt === "number") {
+            // Bounding must not mutate an inline legacy record before it is archived.
+            this.#logs.recordMessage(messages, structuredClone(candidate) as FabricActorMessage);
+          }
+        }
+        install(messages);
+        return messages;
+      },
+      set: install,
     });
-    // The locked merge can preserve a remote owner write that raced this host.
-    // Force one reload so passive views reflect the exact records just written.
+  }
+
+  #messageCount(actor: ManagedActor): number {
+    const source = this.#lazyMessages.get(actor);
+    if (!source) return actor.messages.length;
+    return this.#registry.messageCount(source);
+  }
+
+  #registryState(rows: Record<string, unknown>[], critical = false): string {
+    const encoded = rows.map(row => {
+      const { status, updatedAt: _updatedAt, lastRunId: _lastRunId, ...record } = row;
+      const selected = critical ? { ...record, stopped: status === "stopped" } : row;
+      const { instructions, ...metadata } = selected;
+      const signature = JSON.stringify(metadata);
+      const key = `${String(row.id)}:${critical}`;
+      const cached = this.#registryRowEncodings.get(key);
+      if (cached && cached.instructions === instructions && cached.metadata === signature) return cached.encoded;
+      const value = JSON.stringify(selected);
+      this.#registryRowEncodings.set(key, { instructions, metadata: signature, encoded: value });
+      return value;
+    });
+    return `[${encoded.join(",")}]`;
+  }
+
+  #criticalRegistryState(rows: Record<string, unknown>[]): string {
+    return this.#registryState(rows, true);
+  }
+
+  #scheduleRegistrySave(durable = false): void {
+    this.#registrySaveDurable ||= durable;
+    if (this.#registrySaveTimer || this.#closing) return;
+    this.#registrySaveTimer = setTimeout(() => {
+      this.#registrySaveTimer = undefined;
+      const durable = this.#registrySaveDurable;
+      this.#registrySaveDurable = false;
+      this.#registrySavePending = this.#saveActors(new Set(), { flush: true, durable }).catch((error) => {
+        console.warn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
+        // Preserve dirty state and retry after the same bounded window.
+        this.#lastRegistrySaveAt = Date.now();
+        this.#scheduleRegistrySave(durable);
+      }).finally(() => { this.#registrySavePending = undefined; });
+    }, Math.max(1, 5_000 - (Date.now() - this.#lastRegistrySaveAt)));
+    this.#registrySaveTimer.unref?.();
+  }
+
+  #deferSoftRegistrySave(rows: Record<string, unknown>[], forced: boolean): boolean {
+    if (forced || this.#closing || !this.#savedActors ||
+        this.#registry.fingerprint() !== this.#savedActors.fingerprint) return false;
+    if (this.#registryState(rows) === this.#savedActors.owned) return true;
+    // Only status/timestamps are soft. Creation, stop/start, instructions, messages,
+    // configuration, custody and removal bypass the window and retain their barriers.
+    if (this.#criticalRegistryState(rows) === this.#savedActors.critical &&
+        Date.now() - this.#lastRegistrySaveAt < 5_000) {
+      this.#scheduleRegistrySave();
+      return true;
+    }
+    return false;
+  }
+
+  #lineage(record: object): string {
+    const { rootId, adoptedAt, adoptedFrom } = record as { rootId?: unknown; adoptedAt?: unknown; adoptedFrom?: unknown };
+    return JSON.stringify([rootId, adoptedAt ?? null, adoptedFrom ?? []]);
+  }
+
+  #rememberLineages(records: readonly unknown[]): void {
+    for (const value of records) {
+      if (typeof value !== "object" || value === null) continue;
+      const record = value as { id?: unknown; rootId?: unknown; adoptedAt?: unknown; adoptedFrom?: unknown };
+      if (typeof record.id !== "string" || typeof record.rootId !== "string") continue;
+      const lineage = this.#lineage(record);
+      const actor = this.#actors.get(record.id);
+      if (actor && this.#lineage(actor) !== lineage) {
+        this.#displacedLineages.add(record.id);
+        this.#ownership.set(record.id, false);
+      }
+      this.#persistedRoots.set(record.id, record.rootId);
+      this.#persistedLineages.set(record.id, lineage);
+    }
+  }
+
+  #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
+    durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+  }): Promise<void> {
+    ++this.#registrySaveRevision;
+    // Serialization is process-local and OUTSIDE custody. A later preparation
+    // must not select unacknowledged additions from an earlier accepted commit.
+    // Other processes still race via the optimistic generation protocol.
+    const controller = new AbortController();
+    this.#registrySaveControllers.add(controller);
+    let cancel!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", cancel, { once: true });
+    });
+    const operation = this.#registrySaveChain.then(() => {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      return this.#saveActorsNow(removedIds, options, controller.signal);
+    });
+    const saved = Promise.race([operation, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", cancel);
+      this.#registrySaveControllers.delete(controller);
+    });
+    this.#registrySaveChain = saved.catch(() => undefined);
+    return saved;
+  }
+
+  async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
+    durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+  }, signal?: AbortSignal): Promise<void> {
+    if (!this.#persistent || !this.meshConfig.enabled) return;
+    if (this.#registrySaveDurable) options = { ...options, durable: true };
+    let committed;
+    try {
+      committed = await this.#registry.update(current => {
+      if (signal?.aborted) return undefined;
+      const revision = this.#registrySaveRevision;
+      const ownershipGeneration = publicationGeneration(this.mesh.root);
+      return this.#withOwnershipRead(() => {
+        // Source selection is speculative. update validates the atomic registry
+        // generation AND the ownership observation after acquisition, or retries.
+        this.#rememberLineages(current);
+        const owned = [...this.#actors.values()].filter(actor =>
+          !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
+        if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
+        const rows = owned.map(actor => this.#serializedActor(actor));
+        if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
+          options?.flush === true || options?.requiredActor !== undefined)) return undefined;
+        const revoked = [...removedIds].filter(id => {
+          const record = current.find(row => row.id === id);
+          const owner = this.#removalCleanup.get(id)?.owner;
+          return !record || (owner && record.rootId === owner.rootId &&
+            (record.residency ?? "session") === owner.residency && this.#lineage(record) === options?.removedLineages?.get(id));
+        });
+        const replaced = new Set([...revoked, ...owned.map(actor => actor.id)]);
+        const actors = [...current.filter(record => !replaced.has(record.id)), ...rows.map((row, index) => ({ ...row,
+          registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
+        }))];
+        const saved = { owned: this.#registryState(rows), critical: this.#criticalRegistryState(rows) };
+        const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
+          append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
+        return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+            states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
+              actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
+              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
+          value: { owned, revoked, actors, saved, revision,
+            appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
+      });
+      });
+    } catch (error) {
+      // A persistent veto committed nothing: keep the state dirty and fail the awaited save.
+      if (error instanceof ActorRegistryUpdateVetoedError) {
+        this.#scheduleRegistrySave(options?.durable === true || removedIds.size > 0);
+      }
+      throw error;
+    }
+    if (!committed) return;
+    if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
+    this.#registrySaveTimer = undefined;
+    this.#registrySaveDurable = false;
+    this.#registryFingerprint = this.#registry.fingerprint();
+    // A continuation may run after another mutation has started. Acknowledge
+    // exactly the selected prefix, not later additions; keeping the whole prefix
+    // would append already-committed messages again after an ownership reload.
+    for (const actor of committed.owned) {
+      const accepted = new Set(committed.appends.get(actor)?.map(message => `${message.id}:${message.direction}`));
+      // Ownership reload may have replaced the object and carried its pending
+      // prefix while the commit continuation was waiting. Both objects owe the
+      // same acknowledgement; otherwise the carried prefix is archived twice.
+      const live = this.#actors.get(actor.id);
+      for (const instance of new Set([actor, ...(live ? [live] : [])])) {
+        const pending = (this.#unarchivedMessages.get(instance) ?? []).filter(message => !accepted.has(`${message.id}:${message.direction}`));
+        if (pending.length) this.#unarchivedMessages.set(instance, pending);
+        else this.#unarchivedMessages.delete(instance);
+        if (committed.revision === this.#registrySaveRevision) this.#resetMessages.delete(instance);
+      }
+    }
+    this.#lastRegistrySaveAt = Date.now();
+    this.#savedActors = { ...committed.saved, fingerprint: this.#registryFingerprint };
+    for (const id of committed.revoked) {
+      this.#registryRowEncodings.delete(`${id}:false`);
+      this.#registryRowEncodings.delete(`${id}:true`);
+      this.#persistedRoots.delete(id);
+      this.#persistedLineages.delete(id);
+    }
+    this.#rememberLineages(committed.actors);
     this.#registryFingerprint = undefined;
     this.#syncActorsFromRegistry();
   }
 
   #syncActorsFromRegistry(): void {
+    // An unchanged registry needs no ownership read; idle polls share the
+    // coalesced directory view in #refreshOwnership instead.
+    if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
+    const fingerprint = this.#registry.fingerprint();
+    if (!fingerprint || fingerprint === this.#registryFingerprint) return;
+    this.#withOwnershipRead(() => this.#syncActorsFromRegistryNow());
+  }
+
+  #syncActorsFromRegistryNow(): void {
     if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
     const fingerprint = this.#registry.fingerprint();
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
     this.#registryFingerprint = fingerprint;
+    // A still-live predecessor participant cannot outrank a durable custody move.
+    this.#rememberLineages(this.#registry.records());
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
       const previous = [...this.#actors.values()];
@@ -3539,6 +4492,11 @@ export class ActorManager {
   }
 
   #loadActors(onlyMissing = false): void {
+    this.#withOwnershipRead(() => this.#loadActorsNow(onlyMissing));
+  }
+
+  #loadActorsNow(onlyMissing: boolean): void {
+    const loaded: ManagedActor[] = [];
     let added = 0;
     const firstLoads: ManagedActor[] = [];
     let parsed: unknown;
@@ -3555,16 +4513,15 @@ export class ActorManager {
     this.#registryIds = new Set(records.flatMap((value) =>
       typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
         ? [(value as { id: string }).id] : []));
+    this.#rememberLineages(records);
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const record = value as Partial<ManagedActor>;
-      if (typeof record.id === "string" && typeof record.rootId === "string") {
-        this.#persistedRoots.set(record.id, record.rootId);
-      }
-    }
-    for (const value of records) {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const record = value as Partial<ManagedActor>;
+      const source = value as Record<string, unknown>;
+      if (onlyMissing && typeof source.id === "string" && this.#actors.has(source.id)) continue;
+      let instructions: unknown;
+      try { instructions = this.#registry.instructions(source); }
+      catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
+      const record = { ...source, instructions } as Partial<ManagedActor>;
       if (
         typeof record.id !== "string" ||
         !/^[a-f0-9]{32}$/.test(record.id) ||
@@ -3663,9 +4620,22 @@ export class ActorManager {
           ? { filteredCount: record.filteredCount }
           : {}),
         ...(typeof record.lastFilteredAt === "number" ? { lastFilteredAt: record.lastFilteredAt } : {}),
+        ...(typeof record.activationFilterExpiresAt === "number" && Number.isFinite(record.activationFilterExpiresAt)
+          ? { activationFilterExpiresAt: record.activationFilterExpiresAt } : {}),
+        ...(Object.hasOwn(record, "filterSkipped")
+          ? { filterSkipped: loadedFilterSkipped(record.filterSkipped) }
+          : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
+          : {}),
+        ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
+          typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
+          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
+          : {}),
+        ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
+          typeof record.failureStreak?.notified === "boolean"
+          ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }
@@ -3676,7 +4646,8 @@ export class ActorManager {
         draining: false,
         messages: [],
         createdAt: record.createdAt,
-        updatedAt: Date.now(),
+        updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
+        ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
@@ -3688,34 +4659,36 @@ export class ActorManager {
             }
           : {}),
       };
-      if (Array.isArray(record.messages)) {
-        for (const candidate of record.messages.slice(-MESSAGE_HISTORY_LIMIT)) {
-          if (
-            typeof candidate === "object" &&
-            candidate !== null &&
-            !Array.isArray(candidate) &&
-            typeof (candidate as Partial<FabricActorMessage>).id === "string" &&
-            typeof (candidate as Partial<FabricActorMessage>).source === "string" &&
-            typeof (candidate as Partial<FabricActorMessage>).createdAt === "number"
-          ) {
-            this.#recordMessage(actor, candidate as FabricActorMessage);
-          }
-        }
-      }
+      this.#installLazyMessages(actor, source);
       this.#actors.set(actor.id, actor);
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        this.#seedDeadLetterDeliveries(actor);
         firstLoads.push(actor);
       }
       added++;
-      void this.#publishPresence(actor).catch(() => undefined);
+      // A watcher reload is observation, not a registry mutation. Publishing via
+      // #publishPresence saved every reloaded row and fed the next watcher poll.
+      loaded.push(actor);
     }
+    // Reading a registry must not save it once per row (or refresh every
+    // previously loaded actor). Publish owned presence through the existing
+    // retry queue after loading the complete registry, without rewriting it.
+    for (const actor of loaded) {
+      if (this.#ownershipDecision(actor.id)) this.#pendingPresence.add(actor.id);
+    }
+    this.#schedulePresenceRetry();
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();
+    // Dead letters from before a restart re-queue once this host manages an idle actor (#816),
+    // after restored work: #replayDeadLetters waits while any of it is still parked.
+    if (firstLoads.length && this.#persistent) queueMicrotask(() => {
+      for (const actor of firstLoads) { const live = this.#actors.get(actor.id); if (live) this.#replayDeadLetters(live); }
+    });
   }
 
   // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
@@ -3835,12 +4808,26 @@ export class ActorManager {
     const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);
-    // Commit removal before deleting archives; failed persistence leaves them recoverable.
-    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
-      for (const id of consumedIds) {
-        try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
-      }
-    }
+    if (actor && consumedIds.size) {
+      const pending = this.#pendingHandoffConsumption.get(actorId) ?? new Set<string>();
+      for (const id of consumedIds) pending.add(id);
+      this.#pendingHandoffConsumption.set(actorId, pending);
+      this.#flushHandoffConsumption(actor);
+    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+  }
+
+  #flushHandoffConsumption(actor: ManagedActor): void {
+    const pending = this.#pendingHandoffConsumption.get(actor.id);
+    if (!pending?.size) return;
+    const store = this.#childCompletionStore(actor);
+    try {
+      // Separate durable evidence survives a failed queue rewrite. Retain both
+      // fence and queue retries, and never offer an already inferred snapshot again.
+      for (const id of pending) store.markHandoffConsumed(id);
+      if (!this.#persistQueue(actor.id, true)) return;
+      for (const id of pending) store.releaseResult(id);
+      this.#pendingHandoffConsumption.delete(actor.id);
+    } catch { /* Keep original archives and retry each owner poll. */ }
   }
 
   #readQueue(file: string): unknown {
@@ -3912,6 +4899,16 @@ export class ActorManager {
       ) continue;
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
+      if (value.source === "child-completion" && this.#childCompletionStore(actor).handoffConsumed(value.id)) {
+        const pending = this.#pendingHandoffConsumption.get(actor.id) ?? new Set<string>();
+        pending.add(value.id);
+        this.#pendingHandoffConsumption.set(actor.id, pending);
+        continue;
+      }
+      if (value.source === "child-completion") {
+        const store = this.#childCompletionStore(actor);
+        if (store.received(value.id) && !store.mailboxClaimed(value.id)) continue;
+      }
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
       // New snapshots prove whether a worker actually launched since the last
       // restoration. Failed starts/preparation never consume accepted backlog.
@@ -3948,6 +4945,7 @@ export class ActorManager {
         preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {
+        if (!this.#childCompletionStore(actor).retained(value.id, this.#logs.retention.actorRunArchiveMs)) continue;
         const deferred = this.#deferredHandoffs.get(actor.id) ?? [];
         deferred.push({ ...item, deferredHandoff: true });
         this.#deferredHandoffs.set(actor.id, deferred);
@@ -3997,6 +4995,7 @@ export class ActorManager {
     }
     return {
       ...(model ? { model } : {}),
+      ...(model && binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
     };
   }
@@ -4008,14 +5007,16 @@ export class ActorManager {
     const session = this.#bindings.get(actor.id);
     const call = this.#validatedRunBinding(overrides);
     const model = call.model ?? session?.model ?? actor.model;
+    const modelReason = call.model ? call.modelReason : session?.model ? session.modelReason : actor.modelReason;
     const thinking = call.thinking ?? session?.thinking ?? actor.thinking;
     return {
       ...(model ? { model } : {}),
+      ...(modelReason !== undefined ? { modelReason } : {}),
       ...(thinking ? { thinking } : {}),
     };
   }
 
-  #publicInfo(actor: ManagedActor): FabricActorInfo {
+  #publicInfo(actor: ManagedActor, includePresenceError = true): FabricActorInfo {
     const session = this.#bindings.get(actor.id);
     const effective = this.#runBinding(actor);
     return {
@@ -4023,6 +5024,7 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
       ...(actor.project ? { project: actor.project } : {}),
@@ -4030,7 +5032,11 @@ export class ActorManager {
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
       instructionsLength: actor.instructions.length,
-      status: actor.status === "stopped" ? "stopped" : actor.preparing
+      // Failed is a routing view, not a destructive stop: retained events and
+      // explicit repair/probe asks can still run. Success clears the durable streak.
+      status: actor.status === "stopped" ? "stopped"
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER
+        ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
@@ -4049,17 +5055,20 @@ export class ActorManager {
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(effective.model ? { model: effective.model } : {}),
+      ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
       binding: {
         scope: "session",
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
+        ...(session?.modelReason !== undefined ? { modelReason: session.modelReason } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
       },
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
         ...(actor.thinking ? { thinking: actor.thinking } : {}),
       },
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
@@ -4069,6 +5078,8 @@ export class ActorManager {
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
+      ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       ...(actor.invalidActivationFilter ? { activationFilterError: actor.invalidActivationFilter.error } : {}),
@@ -4077,9 +5088,10 @@ export class ActorManager {
       ...(actor.missingCapabilities
         ? { missingCapabilities: [...actor.missingCapabilities] }
         : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
       queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
-      messages: actor.messages.length,
+      messages: this.#messageCount(actor),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
@@ -4094,7 +5106,8 @@ export class ActorManager {
       ...(actor.removal
         ? { removal: { ...actor.removal, state: this.#removalState(actor) } }
         : {}),
-      ...(actor.lastError ? { lastError: actor.lastError } : {}),
+      ...(includePresenceError && actor.presenceError
+        ? { lastError: actor.presenceError } : actor.lastError ? { lastError: actor.lastError } : {}),
       sessionFile: actor.sessionFile,
       logDir: path.join(path.dirname(actor.sessionFile), "runs"),
     };
@@ -4111,10 +5124,25 @@ export class ActorManager {
     }
   }
 
-  #ownershipDecision(id: string): boolean {
+  /** Reuse one directory read only within this synchronous slice; never across an await. */
+  #withOwnershipRead<T>(operation: () => T, fresh = true): T {
+    if (this.#directoryOwnership || !this.#snapshotActorOwnership) return operation();
+    this.#directoryOwnership = this.#snapshotActorOwnership(fresh);
+    this.#directoryLineages = new Map();
+    try { return operation(); }
+    finally { this.#directoryOwnership = undefined; this.#directoryLineages = undefined; }
+  }
+
+  #ownershipDecision(id: string, fresh = true): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
-    const decision = this.#canManageActor?.(id);
+    const lineage = this.#persistedLineages.get(id);
+    // A directory opinion may precede successor publication by an entire heartbeat.
+    // It can never authorize the cached predecessor after registry custody moved.
+    if (this.#displacedLineages.has(id) ||
+      (actor && lineage !== undefined && lineage !== this.#lineage(actor))) return false;
+    const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
+      : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
 
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
@@ -4168,12 +5196,23 @@ export class ActorManager {
     // A record from before projects were recorded keeps the old rule.
     if (actor.project !== undefined && (this.#project !== actor.project || this.#role !== "project-agent")) return;
     // Only when the directory has no live opinion about the actor itself.
-    if (this.#canManageActor(actor.id) !== undefined) return;
+    if ((this.#directoryOwnership ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses
     // lineages a racing winner already claimed and advertised, even when the
     // winner persisted before we loaded and its actor presence has not
     // reached our tail yet.
-    if (this.#lineageMayBeAlive(actor.rootId)) return;
+    // Many retained actors share one root. Reuse its conservative provisional
+    // veto only for this synchronous slice; #confirmAdoption rechecks under both locks.
+    let alive = this.#directoryLineages?.get(actor.rootId);
+    if (alive === undefined) {
+      alive = this.#lineageMayBeAlive(actor.rootId);
+      this.#directoryLineages?.set(actor.rootId, alive);
+    }
+    if (alive) return;
+    // Live foreign lineages take the unchanged shared-read fast path above. Only
+    // a confirmed-dead orphan with a failed attempt needs per-actor clock work.
+    const retryAt = this.#adoptionRetryAt.get(actor.id);
+    if (retryAt !== undefined && Date.now() < retryAt) return;
     // Only against a disk view we are in sync with.
     if (this.#persistedRoots.get(actor.id) !== actor.rootId) return;
     // A lineage adopted this recently has a live adopter that may simply be
@@ -4191,67 +5230,67 @@ export class ActorManager {
     try {
       if (this.#closing) return;
       const expectedRootId = actor.rootId;
-      // Lock order: registry, then mesh. Resume invalidates death proof under
-      // the mesh lock; retain both fences from the fresh recheck through commit.
-      const adopted = await this.#registry.withLock(() => this.mesh.exclusive(() => {
-        // Both custody waits may outlive this owner. No mutation is authorized
-        // once close begins, even when the previous lineage is provably dead.
-        if (this.#closing) return false;
-        const records = this.#registry.records();
-        const current = records.find((record) => record.id === actor.id);
-        // A racing adopter rewrote the lineage since we loaded it; they win.
-        if (!current || current.rootId !== expectedRootId) return false;
-        // A live owner opinion appeared while we waited for the lock.
-        if (this.#canManageActor?.(actor.id) !== undefined) return false;
-        // The lineage root turned out to be alive or unknown after all.
-        if (this.#lineageMayBeAlive(expectedRootId)) return false;
-        // Another adoption just landed; its adopter deserves the grace window.
-        if (
-          typeof current.adoptedAt === "number" &&
-          Date.now() - current.adoptedAt < this.#adoptionGraceMs
-        ) {
-          return false;
-        }
-        // Directory hooks above are synchronous but may re-enter shutdown.
-        if (this.#closing) return false;
-        for (const record of records) {
-          if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
-        }
-        // The claim and the queue copy cannot commit together, so the claim names the roots whose
-        // files still hold work; the copy completes on adoption, or on this lineage's next load.
-        const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
-        // Never this lineage itself: a returning predecessor keeps its own file (F7).
-        actor.adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
-          typeof root === "string" && root !== this.#rootId &&
-          fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
-        actor.rootId = this.#rootId;
-        actor.adoptedAt = Date.now();
-        actor.updatedAt = Date.now();
-        const preserved = records.filter((record) => record.id !== actor.id);
-        this.#registry.write([...preserved, this.#serializedActor(actor)]);
-        this.#registryFingerprint = this.#registry.fingerprint();
-        return true;
-      }));
+      const participantKey = `topology/participants/${createHash("sha256").update(actor.id).digest("hex")}`;
+      const incarnation = await ownProcessIncarnation();
+      await prepareParticipantFileLock(this.mesh, participantKey);
+      if (this.#closing || this.#actors.get(actor.id) !== actor) return;
+      // Prepare the claim without custody; no actor object changes until commit.
+      const snapshot = this.#registry.snapshot();
+      const current = snapshot.actors.find(record => record.id === actor.id);
+      if (!current || current.rootId !== expectedRootId) return;
+      const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
+      const adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
+        typeof root === "string" && root !== this.#rootId && fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
+      const adoptedAt = Date.now();
+      const previousUpdatedAt = actor.updatedAt;
+      const row = { ...this.#serializedActor(actor), rootId: this.#rootId, adoptedAt, adoptedFrom, updatedAt: adoptedAt };
+      const prepared = this.#registry.prepare([...snapshot.actors.filter(record => record.id !== actor.id), row], { durable: true }, snapshot);
+      let adopted: boolean;
+      try {
+        // #535's order and zero-wait mesh acquisition are unchanged. Generation
+        // validation fences the prepared merge; fresh death/owner checks remain
+        // under mesh custody and no selected snapshot crosses a retry wait.
+        adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
+          withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
+            if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
+            if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;
+            if (typeof current.adoptedAt === "number" && Date.now() - current.adoptedAt < this.#adoptionGraceMs) return false;
+            if (this.#closing) return false;
+            prepared.commit();
+            actor.adoptedFrom = adoptedFrom;
+            actor.rootId = this.#rootId;
+            actor.adoptedAt = adoptedAt;
+            actor.updatedAt = adoptedAt;
+            this.#registryFingerprint = this.#registry.fingerprint();
+            return true;
+          }), 0));
+      } finally { prepared.dispose(); }
+      this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release
       // resumes us. Do not take over queues or resync/notify a disposed owner.
       if (this.#closing) return;
       if (adopted) {
-        this.#persistedRoots.set(actor.id, this.#rootId);
+        // Only our own fresh registry+mesh claim can regain a displaced lineage.
+        this.#displacedLineages.delete(actor.id);
+        this.#rememberLineages([actor]);
         this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
         if (!current) {
           this.#persistedRoots.delete(actor.id);
+          this.#persistedLineages.delete(actor.id);
         } else if (typeof current.rootId === "string" && current.rootId !== this.#rootId) {
           // Resync to the lineage the racing winner persisted; its fresh
           // adoptedAt then fences our retry for the grace window.
-          this.#persistedRoots.set(actor.id, current.rootId);
+          this.#rememberLineages([current]);
           actor.rootId = current.rootId;
           if (typeof current.adoptedAt === "number") actor.adoptedAt = current.adoptedAt;
         }
       }
     } catch {
-      // Lock timeout or IO failure: state untouched; a later refresh retries.
+      // Lock timeout or IO failure: state untouched. Back off outside custody;
+      // the ownership refresh below must not immediately launch the same claim.
+      this.#adoptionRetryAt.set(actor.id, Date.now() + 1_000);
     } finally {
       this.#adoptionPending.delete(actor.id);
     }
@@ -4260,12 +5299,23 @@ export class ActorManager {
     this.#emitChange();
   }
 
-  #refreshOwnership(): void {
+  #refreshOwnership(id?: string, fresh = true): void {
+    // Registry synchronization runs first on polls. With no local actors there is nothing
+    // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
+    if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
+    this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
+  }
+
+  #refreshOwnershipNow(id?: string, fresh = true): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
-    for (const actor of this.#actors.values()) {
+    // Async activation boundaries recheck their target, not every actor for
+    // every target. Polls and mesh delivery still refresh the complete snapshot.
+    const target = id === undefined ? undefined : this.#actors.get(id);
+    const actors = id === undefined ? this.#actors.values() : target ? [target] : [];
+    for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
-      const next = this.#ownershipDecision(actor.id);
+      const next = this.#ownershipDecision(actor.id, fresh);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
         this.#markOwnershipAbort(actor);
@@ -4344,9 +5394,23 @@ export class ActorManager {
       const live = this.#actors.get(old.id);
       if (!live || live === old) continue;
       live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
-      const known = new Set(live.messages.map((message) => message.id));
-      for (const message of old.messages) {
-        if (!known.has(message.id)) this.#recordMessage(live, message);
+      // An unread history has no local additions to carry and must stay lazy.
+      if (this.#lazyMessages.has(old)) continue;
+      if (this.#resetMessages.has(old)) {
+        live.messages = structuredClone(old.messages);
+        this.#resetMessages.add(live);
+      } else {
+        const known = new Set(live.messages.map((message) => message.id));
+        for (const message of old.messages) {
+          if (!known.has(message.id)) this.#recordMessage(live, message);
+        }
+      }
+      // Additions that already fell out of the ring still need archival after a
+      // reload. Do not put them back in the active ring or reorder newer messages.
+      const pending = [...(this.#unarchivedMessages.get(old) ?? []), ...(this.#unarchivedMessages.get(live) ?? [])];
+      if (pending.length) {
+        const unique = new Map(pending.map(message => [`${message.id}:${message.direction}`, message]));
+        this.#unarchivedMessages.set(live, [...unique.values()]);
       }
     }
   }
@@ -4490,24 +5554,28 @@ export class ActorManager {
         if (actor.queue.length > room) {
           const excess = actor.queue.splice(room);
           const overflow = [...excess, ...(this.#overflow.get(actor.id) ?? [])];
-          while (overflow.length > this.#overflowCap()) {
-            this.#recordDropped(actor, overflow.pop()!, "the queue and its overflow were full when parked events returned");
+          // Past the cap, the newest go back to the head of the dead-letter file, never dropped (#816).
+          if (overflow.length > this.#overflowCap()) {
+            overflow.push(...this.#spillDeadLetters(actor, overflow.splice(this.#overflowCap())));
+            this.#overflow.set(actor.id, overflow);
+            this.#persistQueue(actor.id, true);
           }
           this.#overflow.set(actor.id, overflow);
         }
         actor.status = "queued";
         actor.updatedAt = Date.now();
+        this.#replayDeadLetters(actor);                         // restored work is back: dead letters may follow
         this.#ensureDrain(actor);
       }
     });
   }
 
   #canManageCached(id: string): boolean {
-    return this.#ownership.get(id) ?? this.#ownershipDecision(id);
+    return this.#ownership.get(id) ?? this.#ownershipDecision(id, false);
   }
 
   #canManage(id: string): boolean {
-    if (!this.#ownershipSnapshot) this.#refreshOwnership();
+    if (!this.#ownershipSnapshot) this.#refreshOwnership(id);
     return this.#canManageCached(id);
   }
 

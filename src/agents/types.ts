@@ -72,6 +72,8 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
+  /** Required target capabilities. Unknown needs force configured placement local. */
+  needs?: string[];
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -223,7 +225,7 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
-  /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
+  /** Unconsumed outcome retained for its exact bound Main root/session. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
@@ -367,6 +369,9 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
+  needs?: string[];
+  /** Host-derived incompatibility, never accepted from guest arguments. */
+  placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
@@ -399,6 +404,8 @@ export interface AgentTransportHandle {
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
    */
   relaunchable?: boolean;
+  /** One-shot placement adapters have no steering/compaction channel. */
+  controls?: boolean;
   /**
    * Why worker/tree exit could not be confirmed (lost contact or uncertain teardown).
    * Primary-worker exit alone does not clear process-tree debt. Fabric neither
@@ -407,8 +414,14 @@ export interface AgentTransportHandle {
   lostContact?(): string | undefined;
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  /** Immutable debt from this captured native stop/close deadline, not a generic
+   * liveness failure. Logical stop may finish while this exact debt retains files
+   * and admission; cancelled launches still require confirmed execution exit. */
+  stopDebt?(): string | undefined;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
+  /** Passive native close notification; wakes monitoring, never itself grants collection. */
+  closed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

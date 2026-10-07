@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -24,6 +26,7 @@ interface RunRecordSummary {
   transport?: string;
   sessionId?: string;
   processStartTime?: string;
+  queuedArchiveCommitted?: boolean;
   cleanupPending?: boolean;
 }
 export interface RetentionSweepResult {
@@ -100,6 +103,16 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
  * them even when a surviving host once observed a terminal result. */
 export const runTreeExitVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit);
+/** Native resource safety is independent of full-result archival. This only
+ * authorizes pre-launch worktree rollback or isolation of shutdown obligations;
+ * its tracked root has native transport custody, but descendants need saved exit
+ * proof. Run-file collection must use runTreeExitVeto with its archive/root fence. */
+export const runTreeResourceVeto = (
+  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false, requireRootExit = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit);
+const runTreeVeto = (
+  directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -111,6 +124,11 @@ export const runTreeExitVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
@@ -126,7 +144,12 @@ export const runTreeExitVeto = (
     // or absent unresolved marker does not prove the root writer has exited.
     // Recordless pre-launch rollback uses the non-retention mode explicitly;
     // missing persisted status is never evidence for an admitted worker.
-    if (requirePersistedExit) {
+    // A committed queued archive is explicit never-launched admission evidence,
+    // not an unknown legacy tree. Its durable marker permits later collection
+    // after best-effort deletion failed, but never exempts any descendant.
+    const committedPrelaunch = depth === 0 && record?.queuedArchiveCommitted === true &&
+      record.transport === undefined && !!record.status && TERMINAL_STATUSES.has(record.status);
+    if (((requirePersistedExit && depth > 0) || (requireRootExit && depth === 0)) && !committedPrelaunch) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
@@ -165,7 +188,7 @@ export const runTreeExitVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit);
+      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -176,7 +199,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
-  "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl",
+  "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
 ]);
@@ -232,7 +255,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && runFile(name)) continue;
+      if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -312,6 +335,7 @@ const pruneClosedRunRoot = (
       compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
       continue;
     }
+    if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
@@ -394,6 +418,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (expired()) break;
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
+      recoverActorRunArchives(directory, expired);
       if (!safeRunTree(directory, false, 0, expired)) continue;
       // Reported as the root's removal once it is empty, as before.
       try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
@@ -462,8 +487,8 @@ export const compactTerminalRunEvents = (
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
-      !canRemoveTerminalRun(directory, expired)) return false;
+  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
+      (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -503,6 +528,11 @@ export const compactTerminalRunEvents = (
     if (stat.size <= maxBytes && (retained.length === stat.size ||
         (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
          tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
+    // four redundant status reads for that no-op (native directory order can
+    // put the historical prefix inside the resident run phase).
+    // A real replacement still requires both independent fresh safety walks.
+    if (retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired))) return false;
     // Truncation is now known to be necessary. Reserve the marker's space and
     // drop only complete prefix lines; look behind by one byte so an exactly
     // aligned final event is kept. An oversized final event leaves only a marker.

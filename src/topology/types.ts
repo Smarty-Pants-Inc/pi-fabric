@@ -42,6 +42,8 @@ export interface FabricParticipantRecord {
   /** Reserved remote Main setter advertisement; false until a native Pi commit guard exists.
    * Kept outside capabilities: existing format-1 readers reject unknown capability strings. */
   mainBindings?: boolean;
+  /** Outside capabilities so old format-1 parsers can read the advertisement. */
+  livenessLeaseFiles?: 1;
   status: string;
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
@@ -61,6 +63,8 @@ export interface FabricParticipantRecord {
   turns?: number;
   toolCalls?: number;
   usage?: AgentUsage;
+  /** Registry lineage selected by an actor publisher; not an authority grant. */
+  actorOwnershipToken?: string;
   actorQueued?: number;
   actorMessages?: number;
   /** Accepted activation preparation or AgentManager admission receipt, before worker launch. */
@@ -84,6 +88,7 @@ export interface FabricParticipantInfo extends FabricParticipantRecord {
 
 export interface FabricHostRecord {
   format: 1;
+  livenessLeaseFiles?: 1;
   id: string;
   rootId: string;
   identity: MeshIdentity;
@@ -100,6 +105,8 @@ export interface FabricParticipantListOptions {
   includeStale?: boolean;
   /** Read the current mesh state, not a recent cached parse (for protocol decisions). */
   fresh?: boolean;
+  /** Display/background observation only; never use for routing or ownership decisions. */
+  background?: boolean;
 }
 
 export interface FabricPeerInfo {
@@ -145,6 +152,14 @@ export interface FabricParticipantSource {
   peers(now?: number): FabricPeerInfo[];
   /** The reason peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled?(now?: number): Error | undefined;
+  /** Why a negative routing lookup is not authoritative (unjoined, overdue or failed view). */
+  routingUnavailable?(now?: number): string | undefined;
+  /** Wait for a briefly late native lease using only its file; false means too old/ended. */
+  resolveRoutingLease?(id: string): Promise<boolean>;
+  /** Bound retained-root delivery by routing grace, never by lineage absence alone. */
+  retainedRouteAllowed?(id: string): boolean;
+  /** One short, lock-bounded canonical read; does not renew or confirm a host lease. */
+  refreshRoutingView?(): Promise<void>;
   /** When this host last committed its heartbeat through the mesh. */
   confirmedAt?(): number;
   /**

@@ -313,10 +313,10 @@ describe("project identity", () => {
       expect(deliveryRoot(rootId, [next], project, { lineageAlive: () => false })).toBe(rootId);
     });
 
-    it("delivers a dead root only to the bound integrator's exact session id", () => {
+    it("keeps a dead root at its exact owner even when an integrator is recorded", () => {
       expect(deliveryRoot(rootId, [integrator, next], project, {
         lineageAlive: () => false, boundIntegrator: () => ({ leadId: integrator.id }),
-      })).toBe(integrator.id);
+      })).toBe(rootId);
     });
 
     it("keeps the root when lineage death is unknown or the bound integrator is unavailable", () => {

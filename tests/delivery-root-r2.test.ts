@@ -87,6 +87,13 @@ const deferred = () => {
   const promise = new Promise<void>(r => { resolve = r; });
   return { promise, resolve };
 };
+const onPlatform = async (platform: "native" | "win32", operation: () => Promise<void>): Promise<void> => {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  try {
+    if (platform !== "native") Object.defineProperty(process, "platform", { ...original, value: platform });
+    await operation();
+  } finally { Object.defineProperty(process, "platform", original); }
+};
 const publishDuringAbsence = (mesh: MeshStore, root: string) => {
   const file = path.join(mesh.root, "participants", key("", original) + ".json");
   const stat = fs.statSync;
@@ -143,6 +150,13 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     await state.bootstrap(context); await state.ensure(context);
     const actor = await state.actors.create({ name: "session-orphan", instructions: "Keep original lineage.", residency: "session" });
     const pid = process.pid, session = context.sessionManager.getSessionId();
+    // Seed after the old runtime's startup sweep; only the replacement may prune.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const expiredRun = path.join(config.actorRoot, actor.id, "runs", "expired-before-reload");
+    fs.mkdirSync(expiredRun, { recursive: true });
+    fs.writeFileSync(path.join(expiredRun, "status.json"), JSON.stringify({ status: "completed",
+      transport: "process", sessionId: "2147483646", finishedAt: 1 }));
     registerFabricCommand(pi, { state, capturedTools, fabricUi: { stop: vi.fn() } as unknown as FabricUiController, applyFabricMode: vi.fn(), suspendToolCapture: vi.fn() });
     const registry = path.join(config.actorRoot, "actors.json");
     const entered = deferred(), release = deferred();
@@ -172,6 +186,7 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
       next.listOwned(); await new Promise(r => setTimeout(r, 100));
       expect(next.owns(actor.id)).toBe(false); expect(next.status(actor.id).rootId).toBe(original);
       expect(fs.readFileSync(registry, "utf8")).toBe(before);
+      expect(fs.existsSync(expiredRun)).toBe(true);
       expect(mesh.get(key("topology/lineage-closures/"), { fresh: true })).toBeUndefined();
     } finally { release.resolve(); await pending; }
     if (fail) expect(await pending).toBeInstanceOf(Error);
@@ -179,11 +194,29 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     // Replacement may already have admitted the first envelope to the SAME
     // Main's durable journal. That is not mailbox loss or cross-root delivery.
     const followups = path.join(mesh.root, "main-followups");
-    const journal = fs.existsSync(followups) ? fs.readdirSync(followups).map(file => fs.readFileSync(path.join(followups, file), "utf8")).join("\n") : "";
+    const journalFile = path.join(followups, `${encodeURIComponent(session)}.json`);
+    const readJournal = () => fs.existsSync(journalFile) ? fs.readFileSync(journalFile, "utf8") : "";
     const retained = mesh.listAll(residentDeliveryPrefix(original), { fresh: true }).some(e => (e.value as { id: string }).id === firstId);
-    expect(retained || journal.includes(firstId)).toBe(true);
+    expect(retained || readJournal().includes(firstId)).toBe(true);
     send(host, "after-replacement");
-    await vi.waitFor(() => expect(mesh.listAll(residentDeliveryPrefix(original), { fresh: true }).some(e => (e.value as { message: string }).message === "after-replacement")).toBe(true));
+    // Windows can admit/delete an envelope between observer polls. Yield past
+    // the drainer's cache window and check same-root durable custody, not a
+    // transient mailbox snapshot (successful publication must permit delivery).
+    if (!fail) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise(resolve => setTimeout(resolve, 2_200));
+    }
+    await vi.waitFor(() => {
+      const retained = mesh.listAll(residentDeliveryPrefix(original), { fresh: true })
+        .some(e => (e.value as { message: string }).message === "after-replacement");
+      const journal = readJournal();
+      const admitted = journal ? (JSON.parse(journal) as { items: { message: string; deliveryId?: string }[] }).items
+        .some(item => item.message === "after-replacement" && item.deliveryId?.startsWith(`resident:${original}:`)) : false;
+      expect(retained || admitted).toBe(true);
+      if (!fail) expect(admitted).toBe(true); // Exercise the previously missed destination.
+    });
+    if (!fail) await vi.waitFor(() => expect(fs.existsSync(expiredRun)).toBe(false));
+    else expect(fs.existsSync(expiredRun)).toBe(true);
     expect(mesh.listAll(residentDeliveryPrefix(successor), { fresh: true })).toHaveLength(0);
     expect(host.participants.lineageAlive(original)).toBe(true);
     expect(mesh.get(key("topology/lineage-closures/"), { fresh: true })).toBeUndefined();
@@ -192,48 +225,54 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
 });
 
 describe("Security R2 S3 file-only resume interleavings", () => {
-  it("rechecks delivery under custody after a resumed root wins the mesh fence", async () => {
-    const { mesh, directory, host } = await fixture();
+  it.each(["native", "win32"] as const)("keeps exact-owner custody when the root resumes before mesh handoff (%s)", async platform => onPlatform(platform, async () => {
+    const { mesh, directory, host, config } = await fixture();
     await seedClosure(mesh);
-    const exclusive = host.mesh.exclusive.bind(host.mesh);
-    let resumed = false, locked = false;
-    const fence = vi.spyOn(host.mesh, "exclusive").mockImplementation(async operation => {
-      await directory.refresh(); resumed = true;
-      return exclusive(() => { locked = fs.existsSync(path.join(mesh.root, ".lock", "owner")); return operation(); });
+    const put = host.mesh.put.bind(host.mesh);
+    let resumed = false, retainedBeforeHandoff = false;
+    const handoff = vi.spyOn(host.mesh, "put").mockImplementation(async request => {
+      if (request.key.startsWith("residency/deliveries/")) {
+        const outbox = path.join(config.residencyRoot, "delivery-outbox");
+        retainedBeforeHandoff = fs.readdirSync(outbox).some(file => {
+          const record = JSON.parse(fs.readFileSync(path.join(outbox, file), "utf8"));
+          return record.rootId === original && record.message === "waited-resume";
+        });
+        await directory.refresh(); resumed = true;
+      }
+      return put(request);
     });
     try {
       send(host, "waited-resume"); await assertMailbox(mesh);
-      expect(resumed).toBe(true); expect(locked).toBe(true);
-    } finally { fence.mockRestore(); }
-  });
+      expect(retainedBeforeHandoff).toBe(true); expect(resumed).toBe(true);
+      expect(directory.lineageAlive(original)).toBe(true);
+    } finally { handoff.mockRestore(); }
+  }));
 
-  it("host close joins fenced delivery custody and retains its durable outbox", async () => {
+  it.each(["native", "win32"] as const)("host close joins exact-owner handoff and retains its outbox on failure (%s)", async platform => onPlatform(platform, async () => {
     const { config, host } = await fixture();
     const entered = deferred(), release = deferred();
-    const exclusive = host.mesh.exclusive.bind(host.mesh);
-    const fence = vi.spyOn(host.mesh, "exclusive").mockImplementation(async operation => {
-      entered.resolve(); await release.promise; return exclusive(operation);
+    vi.spyOn(host.mesh, "put").mockImplementation(async () => {
+      entered.resolve(); await release.promise; throw new Error("custody unavailable");
     });
     send(host, "closing-custody");
-    await vi.waitFor(() => expect(fence).toHaveBeenCalled());
     await entered.promise;
     let closed = false;
     const closing = host.close().then(() => { closed = true; });
     try {
       await new Promise(r => setTimeout(r, 50)); expect(closed).toBe(false);
-    } finally { release.resolve(); await closing; fence.mockRestore(); }
+    } finally { release.resolve(); await closing; }
     const outbox = path.join(config.residencyRoot, "delivery-outbox");
     const items = fs.readdirSync(outbox).map(file => JSON.parse(fs.readFileSync(path.join(outbox, file), "utf8")));
-    expect(items).toEqual([expect.objectContaining({ rootId: original, message: "closing-custody" })]);
-  });
+    expect(items).toEqual([expect.objectContaining({ rootId: original, message: "closing-custody", from: expect.objectContaining({ kind: "actor" }) })]);
+  }));
 
-  it("unknown delivery custody preserves the original durable outbox/mailbox", async () => {
+  it.each(["native", "win32"] as const)("actor delivery ignores obsolete successor-custody selection faults (%s)", async platform => onPlatform(platform, async () => {
     const { mesh, host } = await fixture();
     await seedClosure(mesh);
     const fence = vi.spyOn(host.mesh, "exclusive").mockRejectedValueOnce(new Error("custody unavailable"));
-    try { send(host, "unknown-custody"); await assertMailbox(mesh); expect(fence).toHaveBeenCalled(); }
+    try { send(host, "unknown-custody"); await assertMailbox(mesh); expect(fence).not.toHaveBeenCalled(); }
     finally { fence.mockRestore(); }
-  });
+  }));
 
   it.each(["session", "durable"] as const)("retains registry custody while %s adoption waits for the resumed root's mesh fence", async residency => {
     const { mesh, directory, host, config } = await fixture();
@@ -286,20 +325,26 @@ describe("Security R2 S3 file-only resume interleavings", () => {
     expect(fs.existsSync(path.join(mesh.root, "participants", key("") + ".json"))).toBe(false);
   });
 
-  it("keeps delivery at the root when its resumed file appears between absence and receipt reads", async () => {
+  it.each(["native", "win32"] as const)("keeps exact-owner delivery when a resumed file appears before publication, without inference (%s)", async platform => onPlatform(platform, async () => {
     const { root, mesh, host } = await fixture();
     await seedClosure(mesh);
-    let race: ReturnType<typeof publishDuringAbsence> | undefined;
-    let observed: boolean | undefined;
-    const lineage = host.participants.lineageAlive.bind(host.participants);
-    const guard = vi.spyOn(host.participants, "lineageAlive").mockImplementation(id => {
-      race ??= publishDuringAbsence(mesh, root);
-      observed = lineage(id);
-      return observed;
+    const lineage = vi.spyOn(host.participants, "lineageAlive");
+    const put = host.mesh.put.bind(host.mesh);
+    let published = false;
+    const handoff = vi.spyOn(host.mesh, "put").mockImplementation(async request => {
+      if (request.key.startsWith("residency/deliveries/")) {
+        writeParticipantFile(mesh.root, { key: key("topology/participants/"), value: record(original, root),
+          version: 2, updatedAt: Date.now(), updatedBy: identity(original) });
+        published = true;
+      }
+      return put(request);
     });
-    try { send(host, "resume-directive"); await assertMailbox(mesh); expect(race?.fired()).toBe(true); expect(observed).toBe(true); }
-    finally { race?.spy.mockRestore(); guard.mockRestore(); }
-  });
+    try {
+      send(host, "resume-directive"); await assertMailbox(mesh);
+      expect(published).toBe(true); expect(lineage).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(mesh.root, "participants", key("") + ".json"))).toBe(true);
+    } finally { handoff.mockRestore(); }
+  }));
 
   it.each(["session", "durable"] as const)("keeps %s registry lineage when the resumed file appears during the locked adoption recheck", async residency => {
     const { root, mesh, host, config } = await fixture();

@@ -1,7 +1,7 @@
 import type { AgentRunRecord, AgentRunRequest, AgentUsage } from "./types.js";
 
 export type AgentServiceRequest = Pick<AgentRunRequest,
-  "task" | "name" | "model" | "thinking" | "tools" | "timeoutMs" | "schema" | "images" | "systemPrompt" | "recursive" | "cwd" | "routeClass" | "protected"
+  "task" | "needs" | "name" | "model" | "thinking" | "tools" | "timeoutMs" | "schema" | "images" | "systemPrompt" | "recursive" | "cwd" | "routeClass" | "protected"
 > & { runner?: "pi"; kernel?: "typescript" | "inherit"; extensions?: true; worktree?: false; residency?: "session" | "durable" };
 export type AgentServiceStatus = AgentRunRecord["status"] | "paused";
 export type AgentServiceRecord = Omit<AgentRunRecord, "status" | "transport" | "cwd"> & {

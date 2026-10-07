@@ -1,10 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
+import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
+
+/** A caller validate() veto that persisted under custody: nothing was committed; retry. */
+export class ActorRegistryUpdateVetoedError extends Error {
+  readonly code = "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED";
+  readonly retryable = true;
+  constructor() {
+    super("Actor registry update was vetoed by its validation and not committed; retry");
+    this.name = "ActorRegistryUpdateVetoedError";
+  }
+}
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,18 +40,184 @@ const processStartTime = (pid: number): string | undefined => {
   } catch { return undefined; }
 };
 
+const freezeRegistryValue = <T>(value: T): T => {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) freezeRegistryValue(child);
+  }
+  return value;
+};
+
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
 );
+
+export interface ActorRegistrySnapshot {
+  readonly generation: string | undefined;
+  readonly bytes: string | undefined;
+  readonly actors: Array<Record<string, unknown> & { id: string }>;
+}
+
+export interface ActorRegistryMutation<T> {
+  actors: readonly Record<string, unknown>[];
+  durable?: boolean;
+  /** Cheap synchronous validation of caller-local state after acquisition. */
+  validate?: () => boolean;
+  value: T;
+}
 
 /** Disk protocol shared by registry merges and fenced lineage adoption. */
 export class ActorRegistryStore {
   readonly #registryPath: string;
   readonly #actorRoot: string;
+  readonly #writer: AtomicFileWriter;
+  readonly #payloads: ActorRegistryPayloads;
+  readonly #ownProcessStart: string | undefined;
+  #snapshot: ActorRegistrySnapshot | undefined;
+  readonly #encoded = new WeakMap<Record<string, unknown>, string>();
 
   constructor(actorRoot: string) {
+    // Capture immutable self identity before multi-registry acquisition, never
+    // reread it while holding the earlier fence. No work at module import.
+    this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
     this.#registryPath = path.join(actorRoot, "actors.json");
+    this.#writer = new AtomicFileWriter(this.#registryPath);
+    this.#payloads = new ActorRegistryPayloads(actorRoot);
+  }
+
+  /** A generation is the atomic file identity, not a process-local counter. Old
+   * format-1 writers participate without a migration or an auxiliary head file. */
+  snapshot(): ActorRegistrySnapshot {
+    for (;;) {
+      const generation = this.fingerprint();
+      if (this.#snapshot && this.#snapshot.generation === generation) return this.#snapshot;
+      let bytes: string | undefined;
+      try { bytes = fs.readFileSync(this.#registryPath, "utf8"); }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      let actors: ActorRegistrySnapshot["actors"] = [];
+      try {
+        const parsed = JSON.parse(bytes ?? "null") as { actors?: unknown } | null;
+        if (Array.isArray(parsed?.actors)) actors = parsed.actors.filter((row): row is Record<string, unknown> & { id: string } =>
+          typeof row === "object" && row !== null && !Array.isArray(row) && typeof row.id === "string");
+      } catch { /* Preserve the historical malformed-registry recovery contract. */ }
+      if (this.fingerprint() !== generation) continue;
+      return this.#snapshot = { generation, bytes, actors: freezeRegistryValue(actors) };
+    }
+  }
+
+  /** Read/merge/compact/encode and stage outside the optimistic fence. After a
+   * conflict, update also uses this under custody to guarantee forward progress.
+   * Stale preparations never publish heads, and fallback re-runs source selection. */
+  prepare(actors: readonly Record<string, unknown>[], options: { durable?: boolean } = {}, snapshot = this.snapshot()) {
+    const prior = new Map(snapshot.actors.map(row => [row.id, row]));
+    const smallState = (row: Record<string, unknown>): string =>
+      JSON.stringify(Object.keys(row).sort().map(key => [key, row[key]]));
+    const reusable = actors.map(row => {
+      const before = prior.get(String(row.id));
+      if (!before || row === before || row.registryMessageReset === true ||
+        (Array.isArray(row.registryMessageAppend) && row.registryMessageAppend.length > 0)) return row;
+      const { instructions, messages, registryMessageAppend: _append, registryMessageReset: _reset, ...small } = row;
+      const { instructions: oldInstructions, messages: oldMessages, ...oldSmall } = before;
+      // Persona strings dominate registry size. Compare them directly; serialize
+      // only small metadata and (when needed) the bounded message ring.
+      const selectedStub = messages === undefined && row.messageHistory !== undefined &&
+        Array.isArray(oldMessages) && oldMessages.length === 0;
+      return instructions === oldInstructions && smallState(small) === smallState(oldSmall) &&
+        (selectedStub || messages === oldMessages || JSON.stringify(messages) === JSON.stringify(oldMessages)) ? before : row;
+    });
+    const payload = this.#payloads.prepare(reusable, prior);
+    const metadata = payload.metadata;
+    const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map(row =>
+      [row.id, row.rootId, row.residency, row.adoptedAt, row.adoptedFrom]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+    const changed = metadata.filter(row => row !== prior.get(String(row.id)));
+    const durable = options.durable === true || hasRemovalDecision(actors) ||
+      actors.some(row => row.adoptedAt !== undefined || row.adoptedFrom !== undefined) ||
+      custody(snapshot.actors) !== custody(actors) || changed.some(row =>
+        row.instructionsFile !== prior.get(String(row.id))?.instructionsFile ||
+        JSON.stringify(row.messageHistory) !== JSON.stringify(prior.get(String(row.id))?.messageHistory));
+    const encode = (row: Record<string, unknown>): string => {
+      let bytes = this.#encoded.get(row);
+      if (bytes === undefined) { bytes = JSON.stringify(row); this.#encoded.set(row, bytes); }
+      return bytes;
+    };
+    const encoded = metadata.map(encode);
+    const serialized = `{"format":1,"actors":[${encoded.join(",")}]}`;
+    // Detach only changed rows before caching; unchanged actors require neither
+    // another parse nor another serialization. All decoding stays outside custody.
+    const changedHeads: Record<string, unknown>[] = [];
+    const accepted = freezeRegistryValue(metadata.map((source, index) => {
+      if (source === prior.get(String(source.id))) return source as Record<string, unknown> & { id: string };
+      const row = JSON.parse(encoded[index]!) as Record<string, unknown> & { id: string };
+      this.#encoded.set(row, encoded[index]!);
+      changedHeads.push(row);
+      return row;
+    }));
+    const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
+    // File data and pre-rename namespace barriers happen outside custody.
+    try { writeFileAtomic(temporary, serialized, { durable }); }
+    catch (error) {
+      try { fs.rmSync(temporary, { force: true }); } catch { /* Preserve the failed preparation barrier. */ }
+      throw error;
+    }
+    let renamed = false;
+    return {
+      valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
+      commit: (): void => {
+        try {
+          payload.commit();
+          renameAtomic(temporary, this.#registryPath);
+          renamed = true;
+          if (durable) syncDirectoryChain(this.#actorRoot);
+          this.#payloads.publishHeads(changedHeads);
+          this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
+        } catch (error) {
+          if (renamed) {
+            if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
+            else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
+          }
+          this.#snapshot = undefined;
+          throw error;
+        }
+      },
+      dispose: () => fs.rmSync(temporary, { force: true }),
+    };
+  }
+
+  async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
+    const snapshot = this.snapshot();
+    const mutation = select(snapshot.actors);
+    if (!mutation) return undefined;
+    const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
+    try {
+      const committed = await this.withLock(() => {
+        if (!prepared.valid() || mutation.validate?.() === false) return false;
+        prepared.commit();
+        return true;
+      });
+      if (committed) return mutation.value;
+    } finally { prepared.dispose(); }
+    // One optimistic attempt keeps the uncontended fence cheap. After any race,
+    // select and prepare under custody: a slow codec must not starve behind even
+    // infrequent writers on a CPU-starved host (smarty-dev#816).
+    return this.withLock(() => {
+      // Caller-local cancellation/ownership validation still vetoes publication. A veto
+      // re-selects once from a fresh snapshot; one that persists is never reported as
+      // success: undefined means only that select() declined to write.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const current = this.snapshot();
+        const selected = select(current.actors);
+        if (!selected) return undefined;
+        const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
+        try {
+          if (locked.valid() && selected.validate?.() !== false) {
+            locked.commit();
+            return selected.value;
+          }
+        } finally { locked.dispose(); }
+      }
+      throw new ActorRegistryUpdateVetoedError();
+    });
   }
 
   records(): Array<Record<string, unknown> & { id: string }> {
@@ -62,13 +239,68 @@ export class ActorRegistryStore {
     }
   }
 
-  /** Retains registry custody while an adoption also acquires the mesh resume fence. */
+  /** Instructions remain inline; prior PR sidecars are accepted for migration. */
+  instructions(record: Record<string, unknown>): unknown {
+    return this.#payloads.instructions(record);
+  }
+
+  messages(record: Record<string, unknown>, limit?: number): unknown[] {
+    return this.#payloads.messages(record, limit);
+  }
+
+  messageCount(record: Record<string, unknown>): number {
+    return this.#payloads.count(record);
+  }
+
+  /** Restore the full inline downgrade view. Checkpoint-only rows must be hydrated too;
+   * old releases otherwise see an empty inline ring. Stop writers first. */
+  async restoreInlineForDowngrade(): Promise<number> {
+    return this.withLock(() => {
+      const previous = fs.readFileSync(this.#registryPath, "utf8");
+      const parsed = JSON.parse(previous) as { format?: number; actors?: unknown };
+      if (!parsed || !Array.isArray(parsed.actors)) throw new Error("Invalid actor registry for downgrade");
+      const actors = parsed.actors.map((value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value) ||
+            typeof (value as { id?: unknown }).id !== "string") return value;
+        const record = value as Record<string, unknown>;
+        // Always pass rows through the common readers: an old owner may have
+        // removed both selecting fields while the accepted head survives only
+        // in messages-head.json. Those readers also fail closed on bad payloads.
+        const restored = { ...record, instructions: this.instructions(record), messages: this.messages(record) };
+        delete (restored as Record<string, unknown>).instructionsFile;
+        delete (restored as Record<string, unknown>).messageHistory;
+        return restored;
+      });
+      try { writeFileAtomic(this.#registryPath, JSON.stringify({ ...parsed, format: 1, actors }, null, 2), { durable: true }); }
+      catch (error) {
+        writeFileAtomic(this.#registryPath, previous, { durable: true });
+        throw error;
+      }
+      return actors.length;
+    });
+  }
+
+  /** Acquire all registry fences in one global order before any mesh lock.
+   * Deduplicate normalized paths: project/session roots may name the same store.
+   * The callback retains every fence through source selection and publication;
+   * it must never be invoked while the caller already holds mesh custody. */
+  static withLocks<T>(registries: readonly ActorRegistryStore[], operation: () => T | Promise<T>): Promise<T> {
+    const stores = new Map(registries.map((store) => [path.resolve(store.#registryPath), store]));
+    const ordered = [...stores.keys()].sort().map((key) => stores.get(key)!);
+    const acquire = (index: number): Promise<T> => index === ordered.length
+      ? Promise.resolve().then(operation)
+      : ordered[index]!.withLock(() => acquire(index + 1));
+    return acquire(0);
+  }
+
+  /** Global order: actor registries (sorted path), then mesh; never the reverse.
+   * Retains registry custody while adoption/publication acquires the mesh fence. */
   async withLock<T>(operation: () => T | Promise<T>): Promise<T> {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
     const token = randomUUID();
-    const started = processStartTime(process.pid);
+    const started = this.#ownProcessStart;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
     fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
     while (true) {
@@ -133,8 +365,8 @@ export class ActorRegistryStore {
 
   fingerprint(): string | undefined {
     try {
-      const stat = fs.statSync(this.#registryPath);
-      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      const stat = fs.statSync(this.#registryPath, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
     } catch {
       return undefined;
     }
@@ -144,30 +376,40 @@ export class ActorRegistryStore {
     return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
   }
 
-  /** Call within withLock for read-modify-write operations. Pending decisions are always durable. */
+  /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
   write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
-    // A barrier belongs to an inode, not its contents. Every replacement carrying an
-    // accepted removal must establish its own barriers, including foreign/preserved rows.
-    if (!options?.durable && !hasRemovalDecision(actors)) {
-      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
-      return;
-    }
-    const previous = fs.readFileSync(this.#registryPath, "utf8");
-    let rollbackDurable = false;
+    let previous: string | undefined;
+    try { previous = fs.readFileSync(this.#registryPath, "utf8"); }
+    catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    let previousActors: readonly Record<string, unknown>[] = [];
     try {
-      const parsed = JSON.parse(previous) as { actors?: unknown } | null;
-      rollbackDurable = Array.isArray(parsed?.actors) && hasRemovalDecision(parsed.actors);
-    } catch {
-      // A malformed previous registry cannot contain an accepted, recoverable decision.
-    }
+      const parsed = JSON.parse(previous ?? "null") as { actors?: unknown } | null;
+      if (Array.isArray(parsed?.actors)) previousActors = parsed.actors;
+    } catch { /* Malformed bytes carry no accepted, recoverable decision. */ }
+    const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map((row) =>
+      [row?.id, row?.rootId, row?.residency, row?.adoptedAt, row?.adoptedFrom]).sort((a, b) =>
+      String(a[0]).localeCompare(String(b[0]))));
+    let durable = options?.durable === true || hasRemovalDecision(actors) ||
+      actors.some((actor) => actor.adoptedAt !== undefined || actor.adoptedFrom !== undefined) ||
+      custody(previousActors) !== custody(actors);
+    const prior = new Map(previousActors.map((actor) => [actor?.id, actor]));
+    const metadata = actors.map((actor) => this.#payloads.compact(actor, prior.get(actor.id)));
+    // Publishing a new sidecar reference is a commit, not soft status: the payload
+    // and its selecting registry head must both survive a crash/migration.
+    durable ||= metadata.some((actor) => {
+      const before = prior.get(actor.id);
+      return actor.instructionsFile !== before?.instructionsFile ||
+        JSON.stringify(actor.messageHistory) !== JSON.stringify(before?.messageHistory);
+    });
+    const serialized = JSON.stringify({ format: 1, actors: metadata }, null, 2);
     try {
-      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
+      this.#writer.write(serialized, { durable });
+      this.#payloads.publishHeads(metadata);
     } catch (error) {
-      // A directory barrier can fail after rename installed the new registry. Restore the
-      // live decision under the lock. If it carries an earlier accepted pending decision,
-      // this replacement needs barriers too; otherwise the cleanup marker covers rollback.
-      // Never report the failed commit as accepted.
-      writeFileAtomic(this.#registryPath, previous, { durable: rollbackDurable });
+      // The post-rename barrier may fail after replacement. Restore an accepted
+      // earlier decision with its barriers; never acknowledge the failed commit.
+      if (previous === undefined) fs.rmSync(this.#registryPath, { force: true });
+      else writeFileAtomic(this.#registryPath, previous, { durable: true });
       throw error;
     }
   }

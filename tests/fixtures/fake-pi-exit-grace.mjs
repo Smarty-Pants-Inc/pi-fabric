@@ -19,17 +19,21 @@ process.stdin.on("data", async (chunk) => {
   // control while all slow-exit text/reply controls report explicit success.
   const outcome = behavior.endsWith("-error") ? "error"
     : behavior.endsWith("-aborted") ? "aborted"
-    : behavior === "never-exit" ? undefined : "completed";
+    : ["never-exit", "settled-no-result"].includes(behavior) ? undefined : "completed";
   const unsuccessfulSettlement = outcome === "error" || outcome === "aborted";
   emit({ type: "fake_child_pid", pid: process.pid });
   process.on("SIGTERM", () => {
     // This snapshot proves persistence happened BEFORE cleanup signalled Pi.
     const status = JSON.parse(fs.readFileSync(path.join(process.cwd(), process.env.PI_FABRIC_PARENT_RUN, "status.json"), "utf8"));
-    emit({ type: "fake_term_snapshot", text: status.text, status: status.status, warnings: status.warnings });
+    const receipt = path.join(process.cwd(), process.env.PI_FABRIC_PARENT_RUN, "settlement.json");
+    emit({ type: "fake_term_snapshot", text: status.text, status: status.status, warnings: status.warnings,
+      ...(fs.existsSync(receipt) && fs.statSync(receipt).isFile() ? { receipt: JSON.parse(fs.readFileSync(receipt, "utf8")) } : {}) });
   });
   process.stdin.on("end", () => {
-    emit({ type: "fake_stdin_eof" });
-    if (behavior === "slow-exit" || toolReply || unsuccessfulSettlement) setTimeout(() => process.exit(0), 10_000);
+    const receipt = path.join(process.cwd(), process.env.PI_FABRIC_PARENT_RUN, "settlement.json");
+    emit({ type: "fake_stdin_eof", ...(fs.existsSync(receipt) && fs.statSync(receipt).isFile()
+      ? { receipt: JSON.parse(fs.readFileSync(receipt, "utf8")) } : {}) });
+    if (["slow-exit", "empty-slow-exit"].includes(behavior) || toolReply || unsuccessfulSettlement) setTimeout(() => process.exit(0), 10_000);
   });
   setInterval(() => {}, 1000);
   if (toolReply) {
@@ -57,12 +61,18 @@ process.stdin.on("data", async (chunk) => {
       emit({ type: "message_end", message: { role: "toolResult", toolCallId: "reply-1", toolName: "fabric_reply", content: [{ type: "text", text: "Reply delivered." }] } });
     }
   } else if (behavior !== "settled-no-result") {
-    emit({ type: "message_end", message: { role: "assistant", content: "durable final result", stopReason: "stop" } });
+    emit({ type: "message_end", message: { role: "assistant", content: behavior.startsWith("empty-") ? "" : "durable final result", stopReason: "stop" } });
   }
   if (behavior === "crash-before-settle") process.exit(1);
+  if (behavior === "never-settles") {
+    // Recording text and staying alive beyond the exit grace is NOT settlement.
+    // No successful receipt or EOF-disposal request may be inferred from it.
+    setTimeout(() => process.exit(1), 8_000);
+    return;
+  }
   // Both the leader and a descendant refuse TERM, so cleanup must target the
   // owned process group, not just the immediate Pi pid.
-  if (behavior === "never-exit" && process.platform !== "win32") {
+  if (["never-exit", "empty-never-exit"].includes(behavior) && process.platform !== "win32") {
     const descendant = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); console.log(JSON.stringify({type:"fake_descendant_pid",pid:process.pid})); setInterval(() => {}, 1000);'], { stdio: ["ignore", "inherit", "inherit"] });
     descendant.on("error", (error) => { throw error; });
   }
@@ -75,5 +85,6 @@ process.stdin.on("data", async (chunk) => {
       ...(outcome === "error" ? { errorMessage: "Auto-compaction failed: fixture failure" } : {}) });
     emit({ type: "agent_end", willRetry: false });
   }
+  if (behavior === "receipt-unwritable") fs.mkdirSync(path.join(process.cwd(), process.env.PI_FABRIC_PARENT_RUN, "settlement.json"));
   if (behavior !== "reply-after-settle") emit({ type: "agent_settled", outcome });
 });

@@ -34,6 +34,22 @@ afterEach(() => {
   }
 });
 
+describe("host-only explicit model exceptions (#3134)", () => {
+  it("defaults to Astra and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
+  });
+  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  });
+});
 describe("fleet model policy configuration (#2490)", () => {
   it("normalizes and registers host policy keys", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.deniedModels).toEqual([]);
@@ -80,6 +96,31 @@ describe("host-only actor instruction root (#3819)", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
   });
 });
+describe("host-only processSlice (#4383)", () => {
+  it("defaults off and only accepts a slice unit name", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.processSlice).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { processSlice: "batch.slice" } }).agents.processSlice).toBe("batch.slice");
+    for (const processSlice of ["", "../bad.slice", "bad.service", 12]) {
+      expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
+    }
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
+  });
+});
+
+it("normalizes the reader-only idle coalescing window", () => {
+  expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 0 } }).mesh.idleReadCoalesceMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 3_000 } }).mesh.idleReadCoalesceMs).toBe(3_000);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: -1 } }).mesh.idleReadCoalesceMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 60_000 } }).mesh.idleReadCoalesceMs).toBe(10_000);
+});
+
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
@@ -408,6 +449,8 @@ describe("Fabric configuration", () => {
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
       terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 256 * 1024,
+      legacyRunArchiveEnabled: true,
+      legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
     });
     expect(
       normalizeFabricConfig({
@@ -425,6 +468,8 @@ describe("Fabric configuration", () => {
       actorRunArchiveMs: 30 * 24 * 60 * 60 * 1_000,
       terminalRunEventsAgeMs: 48 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 128 * 1024,
+      legacyRunArchiveEnabled: true,
+      legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
     });
     expect(
       normalizeFabricConfig({ retention: { orphanedTempRunMs: 1 } }).retention.orphanedTempRunMs,

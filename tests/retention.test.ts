@@ -2,6 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import { stageRunArchive } from "../src/agents/archive-custody.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import * as processIdentity from "../src/residency/process-identity.js";
 import {
   canRemoveManagedRunRoot,
@@ -11,6 +14,7 @@ import {
   markRunRootClosed,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeResourceVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
   compactTerminalRunEvents,
@@ -38,6 +42,83 @@ const writeStatus = (
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("persistent archive custody", () => {
+  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
+    const directory = temporaryDirectory();
+    writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
+    const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
+    const file = path.join(directory, "events.jsonl");
+    fs.writeFileSync(file, events);
+    fs.writeFileSync(path.join(directory, "reply.json"), '{"text":"full outcome"}');
+    const status = fs.readFileSync(path.join(directory, "status.json"), "utf8");
+    const pending = path.join(directory, pendingFile);
+    fs.writeFileSync(pending, JSON.stringify({ format: 1, awaitingResult: true }));
+    expect(runTreeResourceVeto(directory, 0, undefined, true)).toBeUndefined();
+    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(false);
+    expect(fs.readFileSync(file, "utf8")).toBe(events);
+    fs.unlinkSync(pending);
+    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(true);
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(201);
+    expect(fs.readFileSync(path.join(directory, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(directory, "reply.json"), "utf8")).toBe('{"text":"full outcome"}');
+  });
+
+  it("never lets committed prelaunch custody exempt an unknown descendant or admitted root", () => {
+    const directory = temporaryDirectory();
+    writeStatus(directory, { status: "stopped", queuedArchiveCommitted: true });
+    expect(canRemoveTerminalRun(directory)).toBe(true);
+    const child = path.join(directory, "nested", "child");
+    writeStatus(child, { status: "stopped", queuedArchiveCommitted: true });
+    expect(runTreeExitVeto(directory, 0, undefined, true)).toMatch(/unknown descendant identity/);
+    fs.rmSync(path.join(directory, "nested"), { recursive: true });
+    writeStatus(directory, { status: "stopped", queuedArchiveCommitted: true, transport: "unknown" });
+    expect(runTreeExitVeto(directory, 0, undefined, true)).toMatch(/unknown root identity/);
+  });
+  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("separates %s from native resource debt without authorizing source deletion", pendingFile => {
+    const parent = temporaryDirectory();
+    writeStatus(parent, { status: "completed", transport: "process", sessionId: "2147483647" });
+    const child = path.join(parent, "nested", "child");
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    fs.writeFileSync(path.join(child, pendingFile), JSON.stringify({ format: 1, awaitingResult: true }));
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    try {
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toBeUndefined();
+      expect(runTreeExitVeto(parent, 0, undefined, true)).toMatch(/archive is pending/);
+      expect(canRemoveTerminalRun(parent)).toBe(false);
+      markUnresolvedWorker(child, "tree exit unknown");
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/unresolved worker/);
+      fs.rmSync(path.join(child, "unresolved-worker.json"));
+      writeStatus(child, { status: "running", transport: "process", sessionId: "2147483647" });
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/nonterminal process/);
+      expect(runTreeResourceVeto(parent, 0, () => true, true)).toMatch(/inspection was incomplete/);
+    } finally { probe.mockRestore(); }
+  });
+  it("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
+    const temp = temporaryDirectory();
+    const root = path.join(temp, "pi-fabric-runs-recovery");
+    const parent = path.join(root, "parent");
+    const id = "b".repeat(32);
+    const source = path.join(parent, "nested", id);
+    writeStatus(parent, { status: "completed", transport: "process", sessionId: "2147483647" });
+    writeStatus(source, { id, status: "stopped", transport: "process", sessionId: "2147483647" });
+    const sessionFile = path.join(temp, "actor", "session.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "");
+    const result = { id, name: "private child", status: "stopped", text: "full outcome".repeat(10000), startedAt: 1,
+      spawner: { id: "actor:review", kind: "actor", runId: "a".repeat(32) } } as AgentRunResult;
+    stageRunArchive(source, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 0, heartbeatAt: 0, orphanedAt: 0 }));
+    expect(runTreeExitVeto(parent)).toMatch(/archive is pending/);
+    const enqueue = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(() => { throw new Error("archive unavailable"); });
+    const sweep = () => sweepTempRunRoots({ tempRoot: temp, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    sweep(); expect(fs.existsSync(source)).toBe(true);
+    enqueue.mockRestore(); sweep();
+    expect(fs.existsSync(root)).toBe(false);
+    const store = new ActorChildCompletionStore(sessionFile);
+    expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
+    expect(store.pending()).toHaveLength(1);
+  });
 });
 
 describe("owned follow-up retention artifacts", () => {
@@ -288,13 +369,14 @@ describe("shared run-tree exit veto", () => {
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
-  it.each(["closed", "orphan"])("R3 collects owned route sessions in expired %s roots without weakening fences", kind => {
+  it.each(["closed", "orphan"])("R3 collects owned route sessions and dispatch receipts in expired %s roots without weakening fences", kind => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     for (const name of ["done", "pending", "live", "unresolved"]) {
       const directory = path.join(root, name);
       writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
       fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n');
+      fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), '{"runId":"owned-receipt"}');
       if (name === "pending") fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), "{}");
       if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
     }

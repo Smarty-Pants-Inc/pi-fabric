@@ -17,9 +17,35 @@ import { applyChildPriority } from "./agents/priority.js";
 import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
+import { processStartTime } from "./residency/process-identity.js";
+import { executionGroup } from "./worker/execution-group.js";
+
+// ProcessTransport's native channel transfers the execution cleanup obligation
+// before spawning. Other transports have no channel and retain normal signals.
+let externalStopRequested = false;
+let externalStop = () => { externalStopRequested = true; };
+const custodyReady = new Promise<void>((resolve) => {
+  if (process.platform === "win32" || !process.send) { resolve(); return; }
+  process.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref?.(); resolve(); }
+    else if (message.type === "fabric-stop") { externalStopRequested = true; externalStop(); }
+  });
+  process.send({ type: "fabric-execution-custody" }, () => undefined);
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.once(signal, () => { externalStopRequested = true; externalStop(); });
+}
+const executionSettled = (): Promise<void> => new Promise(resolve => {
+  if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
+  else resolve();
+});
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
+import type { ActorContextReseed } from "./worker/context-admission.js";
+import { readPiSessionHeader } from "./core/pi-session-header.js";
+import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -219,11 +245,11 @@ const assistantError = (message: Record<string, unknown>): string => {
 const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
+const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
+let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  if (!child.pid) return;
-  try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
-  } catch { /* child process group already exited */ }
+  try { executionGroups.get(child)?.signal(signal); }
+  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -242,18 +268,29 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-process.on("uncaughtException", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
-process.on("unhandledRejection", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`Unhandled rejection: ${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
+let crashPending = false;
+const finishCrash = async (error: unknown): Promise<void> => {
+  if (crashPending) return;
+  crashPending = true;
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  try {
+    // A crash result is not an exit receipt. Do not publish it (or exit this
+    // custodian) until every admitted execution obligation has been drained.
+    await executionCleanup();
+    await executionSettled();
+    writeCrashStatus(error);
+    process.exit(1);
+  } catch (cleanupError) {
+    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
+    // Keep the custodian available to its parent even if no native pipes remain.
+    setInterval(() => {}, 1000);
+  }
+};
+process.on("uncaughtException", (error) => { void finishCrash(error); });
+process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
 const main = async (): Promise<void> => {
+  await custodyReady;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -517,6 +554,9 @@ const main = async (): Promise<void> => {
   const childEnvironment = applyTaskReturnAddress(
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
+  // Native session metadata belongs to this child, never its parent/resident host.
+  delete childEnvironment.PI_SESSION_ID;
+  delete childEnvironment.PI_SESSION_FILE;
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   delete childEnvironment.PI_FABRIC_PINNED_EXTENSION;
   if (options.runner === "pi" && options.fabricExtensionPath) childEnvironment.PI_FABRIC_PINNED_EXTENSION = pinnedFabricExtension;
@@ -535,8 +575,26 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
+  if (externalStopRequested) {
+    record.status = "stopped"; record.error = "Agent stopped before execution launch";
+    record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+    writeRunRecord(options.statusFile, record); terminalWritten = true;
+    await executionSettled();
+    await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+    process.exitCode = 1;
+    return;
+  }
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
   const releaseEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/release-entry.ts" : "./worker/release-entry.js", import.meta.url));
+  const actorSessionEnvironment = (): NodeJS.ProcessEnv => {
+    // Re-read at actual launch (also provider resumes), not from cached actor
+    // runnerSessionId or a resident host's inherited PI_SESSION_ID (#4313).
+    const nativeFile = activationSession?.file ?? piSessionFile;
+    if (options.runner !== "pi" || !options.actorId || !nativeFile || !fs.existsSync(nativeFile)) return {};
+    const header = readPiSessionHeader(nativeFile);
+    if (!header) throw new Error("Actor launch session has no valid native header");
+    return { PI_SESSION_ID: header.id, PI_SESSION_FILE: nativeFile };
+  };
   const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
@@ -544,6 +602,7 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
+      ...actorSessionEnvironment(),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -600,7 +659,44 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // Every provider resume is a new execution obligation. Drain each attempt
+  // before replacement, but retain the worker's custody until the whole run ends.
+  const retainExecutionCustody = (execution: ChildProcess): void => {
+    const executionBirth = execution.pid === undefined ? undefined : processStartTime(execution.pid);
+    let nativeClosed = false;
+    // Windows preserves native-child cleanup, not an execution-tree receipt.
+    const group = process.platform === "win32" ? {
+      observe(): void {},
+      exited: () => nativeClosed,
+      signal: (signal: NodeJS.Signals): void => {
+        if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
+      },
+    } : executionGroup(execution);
+    executionGroups.set(execution, group);
+    execution.once("close", () => { nativeClosed = true; });
+    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    let draining: Promise<void> | undefined;
+    executionCleanup = () => draining ??= (async () => {
+      const exited = () => nativeClosed && group.exited();
+      const wait = async (ms: number) => {
+        const deadline = Date.now() + ms;
+        do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
+        return exited();
+      };
+      if (!exited()) {
+        group.signal("SIGTERM");
+        execution.stdin?.end();
+        if (!await wait(KILL_GRACE_MS)) {
+          group.signal("SIGKILL");
+          if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
+        }
+      }
+      clearInterval(groupObserver);
+    })();
+    if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
+  };
   let child = spawnChild();
+  retainExecutionCustody(child);
   let childExited = false;
   let piControlLive = false;
   let nativeActivity = false;
@@ -609,6 +705,8 @@ const main = async (): Promise<void> => {
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
+  let contextReseedRequest: ActorContextReseed | undefined;
+  let contextReseeded = false;
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -631,6 +729,7 @@ const main = async (): Promise<void> => {
   let sawAgentError = false;
   let retryPending = false;
   let piSettledSuccessfully = false;
+  let piSettlementDurable = false;
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
@@ -639,19 +738,53 @@ const main = async (): Promise<void> => {
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
-  const toolCallStreamGuard = new ToolCallStreamGuard((error) => {
-    if (terminalStatus) return;
+  let whitespaceStalls = 0;
+  let whitespaceAbortAcknowledged = false;
+  let pendingWhitespaceStall: import("./worker/tool-call-stream-guard.js").RunawayToolCallStreamError | undefined;
+  let resumedModel: string | undefined;
+  let resumedThinking: typeof thinking;
+  const createToolCallStreamGuard = (): InstanceType<typeof ToolCallStreamGuard> => new ToolCallStreamGuard((error) => {
+    if (terminalStatus || pendingWhitespaceStall) return;
+    whitespaceStalls++;
+    const canRetry = whitespaceStalls === 1 && options.runner === "pi" && modelControl.ready &&
+      piSessionFile && record.model &&
+      record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight";
+    const stall = { runId: options.id, taskId: options.id, attempt: whitespaceStalls,
+      action: canRetry ? "retry" : "failed", errorCode: error.code, error: error.message,
+      model: error.model, effort: error.effort, bytes: error.bytes,
+      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex };
+    emitLifecycle("stall.whitespace-toolcall", stall);
+    appendLog(`${JSON.stringify({ type: "stall.whitespace-toolcall", ...stall })}\n`);
+    if (canRetry) {
+      // Abort this owned execution, then drain its entire group before the
+      // exact-session restart below. Never replay the original task or tools.
+      pendingWhitespaceStall = error;
+      piControlLive = false;
+      recoveryWatchdog.suspend();
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = undefined;
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      update();
+      // Native abort waits for the assistant to finalize/persist. Close stdin
+      // only after its acknowledgement; SIGTERM + EOF together can race two
+      // shutdowns and exit before an unseeded session becomes durable.
+      child.stdin?.write(`${JSON.stringify({ type: "abort", id: `whitespace-abort-${options.id}` })}\n`);
+      killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+      killTimer.unref();
+      return;
+    }
     terminalStatus = "failed";
-    terminalError = error.message;
-    record.error = error.message;
+    terminalError = `${error.message}; ${whitespaceStalls > 1
+      ? "whitespace tool-call stall repeated after one same-model retry"
+      : "cannot safely retry without an admitted model and idle durable Pi session"}; terminating child`;
+    record.error = terminalError;
     record.errorCode = error.code;
     update();
-    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", errorCode: error.code,
-      error: error.message, model: error.model, effort: error.effort, bytes: error.bytes,
-      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex })}\n`);
-    process.stderr.write(`${error.name}: ${error.message}\n`);
+    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", ...stall, error: terminalError })}\n`);
+    process.stderr.write(`${error.name}: ${terminalError}\n`);
     killChild();
   }, () => ({ model: record.model ?? "unknown", effort: record.thinking ?? "unknown" }));
+  let toolCallStreamGuard = createToolCallStreamGuard();
   const killChild = (): void => {
     recoveryWatchdog.dispose();
     toolCallStreamGuard.dispose();
@@ -680,11 +813,17 @@ const main = async (): Promise<void> => {
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
     closeTimer = setTimeout(() => {
+      if (contextReseedRequest && !terminalStatus) {
+        terminateChild(child, "SIGTERM");
+        killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+        killTimer.unref();
+        return;
+      }
       const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
       // fabric_reply writes after assistant message_end; inspect the durable
       // reply now too. Post-drain reply/schema validation remains authoritative.
       hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
-      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
+      if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
         record.warnings = [...(record.warnings ?? []), warning].slice(-20);
@@ -761,7 +900,7 @@ const main = async (): Promise<void> => {
     // issue a second prompt in that gap; wait for the native agent_start.
     replayAfterStart = true;
   };
-  const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, options.model, thinking, {
+  const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, resumedModel ?? options.model, resumedThinking ?? thinking, {
     send(frame) {
       if (terminalStatus) return;
       child.stdin?.write(`${JSON.stringify(frame)}\n`);
@@ -811,6 +950,15 @@ const main = async (): Promise<void> => {
             send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
             fail(error) { modelControl.fail(error); },
+            reseed(recovery) {
+              if (terminalStatus) return;
+              if (contextReseeded) {
+                modelControl.fail("Actor activation input cannot fit the selected model after bounded session reseed");
+                return;
+              }
+              contextReseedRequest = recovery;
+              closeChild(); // never replace a session beneath a live Pi writer
+            },
             compact(tokens, contextWindow, reason) {
               appendLog(`${JSON.stringify({ type: "fabric_context_compaction", phase: "before_dispatch", tokens, contextWindow, reason })}\n`);
             },
@@ -1229,6 +1377,26 @@ const main = async (): Promise<void> => {
       return;
     }
     runLog.event(line, event);
+    if (pendingWhitespaceStall) {
+      compactControl.observe(event); // Preserve the compaction fence during abort/drain.
+      if (event.type === "response" && event.id === `whitespace-abort-${options.id}` && event.success === true) {
+        whitespaceAbortAcknowledged = true;
+        child.stdin?.end(); // Only one graceful shutdown, after abort persistence.
+      }
+      // Late aborted/settled frames must not close or revive this attempt.
+      // Retain usage emitted during shutdown without treating it as progress.
+      const message = event.message;
+      if (event.type === "message_end" && typeof message === "object" && message !== null &&
+          !Array.isArray(message) && (message as Record<string, unknown>).role === "assistant") {
+        const assistant = message as Record<string, unknown>;
+        const delta = extractUsageDelta(assistant);
+        applyUsage(record, assistant);
+        emitTokenUsage(delta, { model: stringField(assistant.model), provider: stringField(assistant.provider) }, assistant);
+        enforceTokenLimit();
+        update();
+      }
+      return;
+    }
     if (options.runner === "claude") {
       processClaudeEvent(event);
       return;
@@ -1316,6 +1484,7 @@ const main = async (): Promise<void> => {
       });
       retryPending = false;
       piSettledSuccessfully = false;
+      piSettlementDurable = false;
       hasFinalText = false;
       hasFinalResult = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
@@ -1452,6 +1621,16 @@ const main = async (): Promise<void> => {
         // Older Pi frames omit outcome; retain their existing result checks.
         piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted" && !sawAgentError && !terminalError;
         providerAborted ||= event.outcome === "aborted";
+        piSettlementDurable = false;
+        if (piSettledSuccessfully && event.outcome === "completed" && modelControl.ready && !terminalStatus && !lostResult) {
+          try {
+            savePiSettlementReceipt(path.join(path.dirname(options.statusFile), "settlement.json"), options.id, record.text);
+            piSettlementDurable = true;
+          } catch (error) {
+            failStalledChild(`Cannot persist Pi settlement receipt: ${String(error)}`);
+            return;
+          }
+        }
         // Tool-only assistant events precede the tool's durable reply write.
         hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
@@ -1731,6 +1910,26 @@ const main = async (): Promise<void> => {
     child.stderr?.on("data", (chunk: Buffer) => recordStderr(stderrDecoder.write(chunk)));
     child.stderr?.on("error", () => {});
   };
+  const restartPiChild = (): void => {
+    sawAgentError = false;
+    retryPending = false;
+    terminalError = undefined;
+    piSettledSuccessfully = false;
+    piSettlementDurable = false;
+    stderr = "";
+    activationWindowReady = false;
+    outputDecoder = new StringDecoder("utf8");
+    stderrDecoder = new StringDecoder("utf8");
+    eventProjection = new PiEventProjection();
+    contextAdmission = undefined;
+    modelControl = createModelControl();
+    compactControl = createCompactControl();
+    child = spawnChild();
+    retainExecutionCustody(child);
+    childExited = false;
+    attachChildStreams();
+    startChildInput();
+  };
   attachChildStreams();
   startChildInput();
 
@@ -1751,9 +1950,8 @@ const main = async (): Promise<void> => {
     terminalError = "Agent stopped";
     killChild();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  process.once("SIGHUP", stop);
+  externalStop = stop;
+  if (externalStopRequested) stop();
 
   let exitCode: number | null;
   while (true) {
@@ -1763,7 +1961,11 @@ const main = async (): Promise<void> => {
         terminalError = error.message;
         // Wait for close as well: a spawn error still owns its stream handles.
       });
-      child.once("close", (code) => { childExited = true; piControlLive = false; resolve(code); });
+      child.once("close", (code) => {
+        childExited = true;
+        piControlLive = false;
+        void executionCleanup().then(() => resolve(code)).catch(finishCrash);
+      });
     });
     if (closeTimer) clearTimeout(closeTimer);
     closeTimer = undefined;
@@ -1782,66 +1984,101 @@ const main = async (): Promise<void> => {
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
     }
-    if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
-        (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
-        record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
-        !piSessionFile || !fs.existsSync(piSessionFile)) break;
-    const errorMessage = terminalError ?? stderr.trim();
-    if (!errorMessage) break;
-    if (!retryableProviderError(errorMessage)) break;
-    recoveryWatchdog.arm(errorMessage);
-    const delayMs = PI_PROVIDER_RESUME_DELAYS_MS[providerResumeAttempts];
-    if (delayMs === undefined) {
-      terminalError = `${errorMessage}; Pi provider recovery exhausted 3 same-session resumes within the 10-minute bound; session retained: ${piSessionFile}`;
-      sawAgentError = true;
-      break;
+    if (contextReseedRequest && !terminalStatus) {
+      const recovery = contextReseedRequest;
+      contextReseedRequest = undefined;
+      contextReseeded = true;
+      const { reseedActorSession } = await import(import.meta.url.endsWith(".ts")
+        ? "./worker/context-reseed.ts" : "./worker/context-reseed.js") as typeof import("./worker/context-reseed.js");
+      const binding = reseedActorSession(piSessionFile!, options.cwd,
+        { ...recovery, estimate: estimateActorInput!, runId: options.id });
+      const note = { type: "fabric_context_reseed", phase: "before_dispatch",
+        ...binding, tokens: recovery.tokens, contextWindow: recovery.contextWindow, reason: recovery.reason };
+      appendLog(`${JSON.stringify(note)}\n`);
+      emitLifecycle("actor.context_reseed", note);
+      // The activation hasn't been dispatched. Keep its original envelope and
+      // persona, and re-pin model/effort before any business inference.
+      providerAborted = false;
+      restartPiChild();
+      continue;
     }
-    const waitMs = delayMs * recoveryScale;
-    if (waitMs >= recoveryWatchdog.remainingMs) {
-      terminalError = `${errorMessage}; Pi provider recovery cannot resume within the 10-minute bound (600000ms); session retained: ${piSessionFile}`;
-      sawAgentError = true;
-      break;
-    }
-    recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
-    const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
-      delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-    record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
-    update();
-    emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
-    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, waitMs);
-      cancelResumeWait = () => { clearTimeout(timer); resolve(); };
-    });
-    cancelResumeWait = undefined;
     if (terminalStatus) break;
-    providerResumeAttempts++;
-    emitLifecycle("run.resumed", { ...resume, phase: "starting" });
-    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "starting" })}\n`);
+    if (pendingWhitespaceStall) {
+      const error = pendingWhitespaceStall;
+      pendingWhitespaceStall = undefined;
+      const { stalledSessionResumeError } = await import("./worker/stall-session.js");
+      const resumeError = !whitespaceAbortAcknowledged ? "native abort was not acknowledged"
+        : record.compaction?.status === "queued" || record.compaction?.status === "in_flight"
+        ? "native compaction is active"
+        : await stalledSessionResumeError(piSessionFile!, options.cwd, error.model, record.runnerSessionId);
+      if (resumeError) {
+        terminalStatus = "failed";
+        terminalError = `${error.message}; cannot safely retry: ${resumeError}; child drained`;
+        record.error = terminalError;
+        record.errorCode = error.code;
+        update();
+        appendLog(`${JSON.stringify({ type: "fabric_runaway_error", taskId: options.id, attempt: whitespaceStalls,
+          action: "failed", errorCode: error.code, error: terminalError })}\n`);
+        break;
+      }
+      // Pin the actual admitted model/effort, even when the initial request
+      // inherited a launcher default. There is no fallback model.
+      resumedModel = error.model;
+      resumedThinking = record.thinking;
+      const resume = { runId: options.id, taskId: options.id, attempt: 1, maxAttempts: 1,
+        model: resumedModel, effort: resumedThinking, sessionFile: piSessionFile };
+      emitLifecycle("run.resumed", { ...resume, reason: "stall.whitespace-toolcall", phase: "starting" });
+      appendLog(`${JSON.stringify({ type: "fabric_whitespace_toolcall_retry", ...resume })}\n`);
+      toolCallStreamGuard = createToolCallStreamGuard();
+    } else {
+      if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
+          (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
+          record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
+          !piSessionFile || !fs.existsSync(piSessionFile)) break;
+      const errorMessage = terminalError ?? stderr.trim();
+      if (!errorMessage) break;
+      if (!retryableProviderError(errorMessage)) break;
+      recoveryWatchdog.arm(errorMessage);
+      const delayMs = PI_PROVIDER_RESUME_DELAYS_MS[providerResumeAttempts];
+      if (delayMs === undefined) {
+        terminalError = `${errorMessage}; Pi provider recovery exhausted 3 same-session resumes within the 10-minute bound; session retained: ${piSessionFile}`;
+        sawAgentError = true;
+        break;
+      }
+      const waitMs = delayMs * recoveryScale;
+      if (waitMs >= recoveryWatchdog.remainingMs) {
+        terminalError = `${errorMessage}; Pi provider recovery cannot resume within the 10-minute bound (600000ms); session retained: ${piSessionFile}`;
+        sawAgentError = true;
+        break;
+      }
+      recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
+      const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
+        delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      update();
+      emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
+      appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        cancelResumeWait = () => { clearTimeout(timer); resolve(); };
+      });
+      cancelResumeWait = undefined;
+      if (terminalStatus) break;
+      providerResumeAttempts++;
+      emitLifecycle("run.resumed", { ...resume, phase: "starting" });
+      appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "starting" })}\n`);
+    }
     // --session <exact path> is Pi's noninteractive resume selector. --continue
     // alone selects the most recent session, which may belong to another task.
     resumePrompt = true;
     retainedPiQueues = record.pendingMessages ? {
       steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
     } : undefined;
-    sawAgentError = false;
-    retryPending = false;
-    terminalError = undefined;
-    piSettledSuccessfully = false;
-    stderr = "";
-    activationWindowReady = false;
-    outputDecoder = new StringDecoder("utf8");
-    stderrDecoder = new StringDecoder("utf8");
-    eventProjection = new PiEventProjection();
-    contextAdmission = undefined;
-    modelControl = createModelControl();
-    compactControl = createCompactControl();
-    child = spawnChild();
-    childExited = false;
-    attachChildStreams();
-    startChildInput();
+    restartPiChild();
   }
+  await executionSettled();
 
+  if (crashPending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
@@ -2023,8 +2260,4 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  writeCrashStatus(error);
-  process.exit(1);
-});
+main().catch(finishCrash);

@@ -4,6 +4,9 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import { stageRunArchive } from "../src/agents/archive-custody.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -21,6 +24,35 @@ const fixture = () => {
 };
 
 describe("resident recovery startup and lease fence (#3864)", () => {
+  it.each([false, true])("replays full pending child archives after readiness without weakening root custody (live=%s)", async live => {
+    const { root, config, host } = fixture();
+    const id = "b".repeat(32);
+    const run = path.join(config.residencyRoot, "runs", id);
+    const sessionFile = path.join(root, "actor", "session.jsonl");
+    fs.mkdirSync(run, { recursive: true });
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, "");
+    const result = { id, name: "private child", status: "stopped", text: "full outcome".repeat(10000), startedAt: 1, finishedAt: 2,
+      transport: "process", sessionId: live ? String(process.pid) : "2147483647",
+      spawner: { id: "actor:review", kind: "actor", runId: "a".repeat(32) } } as AgentRunResult;
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(result));
+    const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
+    fs.writeFileSync(path.join(run, "events.jsonl"), events);
+    stageRunArchive(run, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    try {
+      await host.start();
+      // Readiness must not inspect even a pending archive. Recovery belongs to
+      // the existing streaming poll, not an eager or background startup walk.
+      expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(true);
+      const store = new ActorChildCompletionStore(sessionFile);
+      await vi.waitFor(() => expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false));
+      expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
+      expect(store.pending()).toHaveLength(1);
+      if (live) expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8")).toBe(events);
+      else await vi.waitFor(() => expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201));
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("publishes a lease without reading a synthetic 10k-run / 8GB archive", { timeout: 30_000 }, async () => {
     const { root, config, host } = fixture();
     const runs = path.join(config.residencyRoot, "runs");

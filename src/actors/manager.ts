@@ -35,6 +35,8 @@ import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
+import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -56,7 +58,7 @@ import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
-import { ActorRegistryStore } from "./registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { publicationGeneration } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
@@ -350,13 +352,29 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+/** A routed event did not reach the receiver's persisted queue; the cursor must keep it (#816). */
+export class ActorQueueCheckpointError extends Error {
+  constructor(actor: { id: string; name: string }) {
+    super(`Fabric actor queue checkpoint failed for ${actor.name} (${actor.id}); retry`);
+    this.name = "ActorQueueCheckpointError";
+  }
+}
+
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Windows metadata work yields after each actor; other platforms retain bounded batches. */
 export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
-/** Three preparation requeues, independent of the owner-restoration/drop budget. */
+/** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+/** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
+export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
+export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
+export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+/** At most one owner alarm per actor per hour while its events dead-letter. */
+const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -392,6 +410,11 @@ export class ActorManager {
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
+  // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the oldest dropped
+  // by the bound, and when each actor last raised its dead-letter owner alarm.
+  readonly #deadLetters = new Map<string, number>();
+  readonly #deadLettersDropped = new Map<string, number>();
+  readonly #deadLetterAlarms = new Map<string, number>();
   // Predecessor queue files taken over, deleted after this lineage's own file is next written.
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
@@ -421,6 +444,8 @@ export class ActorManager {
   readonly #resolvePiModel: ((model: string, requiredPin?: boolean) => string | Promise<string>) | undefined;
   readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
+  readonly #deadRootFilter: (() => FabricDeadRootFilterConfig | undefined) | undefined;
+  #deadRoots: DeadRootCache | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #project: string | undefined;
@@ -534,6 +559,11 @@ export class ActorManager {
       /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
       prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
+      /**
+       * agents.deadRootFilter, read per activation (smarty-dev#6062). The resident host supplies it;
+       * absent or mode "off" never skips. Only durable actors' callerless mesh/host events are checked.
+       */
+      deadRootFilter?: () => FabricDeadRootFilterConfig | undefined;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
@@ -585,6 +615,7 @@ export class ActorManager {
     this.#resolvePiModel = options.resolvePiModel;
     this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
+    this.#deadRootFilter = options.deadRootFilter;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
@@ -643,7 +674,7 @@ export class ActorManager {
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
-    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 1_000);
+    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
@@ -2468,6 +2499,12 @@ export class ActorManager {
       /** Host-owned deterministic child completion id and write-ahead handoff. */
       id?: string;
       deferDrain?: boolean;
+      /** Routed mesh work: acceptance requires the persisted queue to hold it (#816). */
+      requirePersisted?: boolean;
+      /** Durable routed work: past the queue and overflow it waits in the actor's dead-letter file. */
+      deadLetter?: boolean;
+      /** A dead-lettered event returning to the queue; it never goes back to the file. */
+      replaying?: boolean;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2493,7 +2530,8 @@ export class ActorManager {
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
-    if (options.coalesceKey) {
+    // A replayed dead letter is older than anything queued: it never overwrites a queued payload (#816).
+    if (options.coalesceKey && !options.replaying) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
@@ -2510,8 +2548,10 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
-        this.#persistQueue(actor.id);
+        const persisted = this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
+        // Memory already runs the merged item; an unacknowledged replay coalesces again.
+        if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
         return existing;
       }
     }
@@ -2539,6 +2579,14 @@ export class ActorManager {
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
     };
+    if (options.deadLetter && !options.replaying && this.#persistent && (this.#deadLetterCount(actor.id) > 0 ||
+      (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
+      // smarty-dev#816: a sick actor's full queue never holds the shared host cursor. Its further
+      // routed events wait in its own dead-letter file, behind any already there, so order holds.
+      this.#appendDeadLetter(actor, source, payload as MeshEvent);
+      this.#replayDeadLetters(actor);
+      return item;
+    }
     if (actor.queue.length >= this.meshConfig.actorQueueLimit) {
       // A full queue must not hold other actors' delivery (smarty-dev#1065): the item waits in this
       // actor's overflow, and past its cap it is recorded as dropped, never lost silently.
@@ -2555,7 +2603,16 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    this.#persistQueue(actor.id);
+    if (!this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
+      // Not durable in the receiver's queue: do not accept it, so the host cursor
+      // keeps the event and offers it again rather than losing it on a restart.
+      for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
+        const at = held.indexOf(item);
+        if (at >= 0) held.splice(at, 1);
+      }
+      if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
+      throw new ActorQueueCheckpointError(actor);
+    }
     if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -2677,15 +2734,17 @@ export class ActorManager {
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
         ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
-    // A requeued item has not failed its activation yet. Its separate, durable
-    // preparation budget alarms at terminal exhaustion in #drain; counting the
-    // retries here would notify early and persist a consumed alarm across owners.
+    // A requeued item has not consumed an activation. #drain reports prolonged
+    // preparation failure after the initial retries, once per durable streak.
+    // Cleanup of that pending retry must not double-count a failed activation.
     // Failures outside an item retry still need fail-loud host reporting.
-    if (!item) this.#noteFailedActivation(actor, message, undefined, false);
+    if (!item && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
+      (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false);
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
     let retryDrain = false;
+    let retryDelay = this.#preparationRetryMs;
     try {
       while (
         actor.queue.length > 0 &&
@@ -2716,11 +2775,23 @@ export class ActorManager {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
           this.#recordFiltered(actor, item, filteredBy);
           this.#persistQueue(actor.id);
+          this.#replayDeadLetters(actor);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
+        const deadRoot = this.#deadRootSkip(actor, item);
+        if (deadRoot) {
+          // smarty-dev#6062: the owning root is positively dead. Skipped like a filter match.
+          this.#recordDeadRootSkip(actor, item, deadRoot);
+          this.#persistQueue(actor.id);
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           await this.#publishDrainPresence(actor);
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        // Only now: the replay rewrites the queue file, which must still hold this item (round 4 P2).
+        this.#replayDeadLetters(actor);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
         actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
@@ -2978,16 +3049,31 @@ export class ActorManager {
             error.launchOutcome === "unlaunched";
           const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
             (error instanceof ActorPreparationError && error.phase !== "binding")));
-          if (retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES &&
+          const callerless = !item.resolve && !item.reject;
+          if (retryPreparation && (callerless || (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
             // Transfer ownership before cleanup can yield: persistence must never see
             // this activation both in flight and queued (review/astra round 2, #3167).
             this.#inFlight.delete(actor.id);
-            actor.queue.unshift(item);
+            // Rotate, never unshift: a failing item retries behind newer work, so one bad item
+            // cannot block the rest of this actor's queue (smarty-dev#816 round 3).
+            const overflow = this.#overflow.get(actor.id);
+            if (overflow?.length) overflow.push(item);
+            else actor.queue.push(item);
             this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
+            // Retain routed work in the actor's durable queue beyond the ask budget, with
+            // bounded retry pressure. Tests may shorten the base; production uses 5s, 15s,
+            // 60s, then every 5 minutes. The host mesh cursor never waits for this item.
+            if (callerless) {
+              retryDelay = this.#preparationRetryMs * ACTOR_PREPARATION_BACKOFF[
+                Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
+              if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
+                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER, true);
+              }
+            }
             retryDrain = true;
             break;
           }
@@ -3078,7 +3164,7 @@ export class ActorManager {
             this.#drainRetries.delete(live.id);
             const current = this.#actors.get(live.id);
             if (current) this.#ensureDrain(current);
-          }, this.#preparationRetryMs);
+          }, retryDelay);
           timer.unref();
           this.#drainRetries.set(live.id, timer);
         } else if (live !== actor || resetAtExit || rearm) queueMicrotask(() => this.#ensureDrain(live));
@@ -3088,7 +3174,7 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3105,7 +3191,8 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
-    const code = /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
+    const code = preparation ? "failing-preparation"
+      : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
       : /Context exceeds window/i.test(lastError) ? "context-overflow"
       : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
       : "unknown";
@@ -3358,6 +3445,38 @@ export class ActorManager {
   }
 
   /**
+   * The dead-root verdict's reason when this activation must be skipped (smarty-dev#6062), else
+   * undefined. Fail-open: off, exempt, caller-awaited, non-durable, no root, or any doubt runs.
+   */
+  #deadRootSkip(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    if (!this.#deadRootFilter || item.resolve || item.reject || actor.residency !== "durable" || !actor.rootId) return undefined;
+    if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
+    try {
+      const config = normalizeDeadRootFilterConfig(this.#deadRootFilter());
+      if (config.mode !== "on" || deadRootExempt(config, actor)) return undefined;
+      this.#deadRoots ??= new DeadRootCache(this.mesh.root);
+      const verdict = this.#deadRoots.judge(actor.rootId);
+      return verdict.dead ? verdict.reason : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #recordDeadRootSkip(actor: ManagedActor, item: ActorQueueItem, reason: string): void {
+    this.#recordFiltered(actor, item, "dead-root");
+    const event = item.source.startsWith("mesh:") ? item.payload as { id?: unknown; topic?: unknown } | null | undefined : undefined;
+    appendDeadRootSkip(this.mesh.root, {
+      at: new Date().toISOString(),
+      actorId: actor.id,
+      actorName: actor.name,
+      rootId: actor.rootId,
+      eventId: typeof event?.id === "string" ? event.id : item.id,
+      topic: typeof event?.topic === "string" ? event.topic : item.source.slice(item.source.indexOf(":") + 1),
+      reason,
+    });
+  }
+
+  /**
    * Filter a callerless event before it enters the queue (smarty-dev#2004). Coalescing replaces a
    * queued item's payload, so a skippable event (a comment edit) must never reach the queue: it
    * would replace a queued event that should run (the comment's creation) and then be skipped.
@@ -3503,14 +3622,18 @@ export class ActorManager {
     }
   }
 
-  // Returns false when an owned receiver's queue was full; the monitor then offers the event
-  // again while it catches up, and actors that already took it are skipped.
+  // Returns false only when a receiver could not checkpoint the event (or, on a non-persistent
+  // host, a fleet.* receiver's queue was full); the monitor then offers it again and actors that
+  // already took it are skipped. A durable receiver's full queue dead-letters instead (#816).
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
     // Empty polls only observe owners through the idle cache. The matched targets below
     // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
     // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
     this.#ownershipSnapshot = true;
     try {
+      // Acceptance is a checkpoint in the receiver's own queue file, never an
+      // activation outcome: failed preparation retries from that queue and must not
+      // pin this host's single mesh cursor (smarty-dev#816, smarty-dev#1065).
       return this.#deliverMeshEvent(event);
     } finally {
       this.#ownershipSnapshot = false;
@@ -3552,17 +3675,7 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
-          const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
-          // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
-          // so a joined key could merge two topics' subjects. Keeps the value's type.
-          this.#enqueue(actor, `mesh:${event.topic}`, event, {
-            ...(event.verification === "mesh" || event.verification === "bridge"
-              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
-            ownershipChecked: true,
-            // Work waits for room; the monitor offers it again (smarty-dev#754).
-            ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
-            ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
-          });
+          this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -3571,10 +3684,189 @@ export class ActorManager {
         }
       } catch (error) {
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
-        if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
+        if (error instanceof ActorQueueCheckpointError ||
+          (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached"))) full = true;
       }
     }
     return full ? false : handedOn ? true : "ignored";
+  }
+
+  #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
+    const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+    return {
+      ...(event.verification === "mesh" || event.verification === "bridge"
+        ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
+      ownershipChecked: true,
+      requirePersisted: true,
+      // A durable host never holds the shared cursor for one actor's full queue: past it, work
+      // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
+      // which has no such file, keeps fleet.* work in the mesh until there is room (#754).
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+      // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
+      // so a joined key could merge two topics' subjects. Keeps the value's type.
+      ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
+    };
+  }
+
+  #deadLetterFile(actorId: string): string {
+    return path.join(this.#actorRoot, actorId, "dead-letter.jsonl");
+  }
+
+  #readDeadLetters(actorId: string): ActorDeadLetter[] {
+    let text: string;
+    try { text = fs.readFileSync(this.#deadLetterFile(actorId), "utf8"); } catch { return []; }
+    return text.split("\n").flatMap((line) => {
+      if (!line) return [];
+      try {
+        const value = JSON.parse(line) as Partial<ActorDeadLetter>;
+        return typeof value.source === "string" && typeof value.event?.id === "string" ? [value as ActorDeadLetter] : [];
+      } catch { return []; }                                  // a torn final line from a crash
+    });
+  }
+
+  #deadLetterCount(actorId: string): number {
+    let count = this.#deadLetters.get(actorId);
+    if (count === undefined) this.#deadLetters.set(actorId, count = this.#readDeadLetters(actorId).length);
+    return count;
+  }
+
+  #writeDeadLetters(actorId: string, entries: readonly ActorDeadLetter[]): void {
+    const file = this.#deadLetterFile(actorId);
+    if (entries.length === 0) fs.rmSync(file, { force: true });
+    else {
+      const temporary = `${file}.${process.pid}.tmp`;
+      // Synced before the rename: a spill must be durable before the queue file forgets it.
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      fs.renameSync(temporary, file);
+    }
+    this.#deadLetters.set(actorId, entries.length);
+  }
+
+  // Append-only and bounded: past the bound the oldest entries drop (to 90%, so a flood rewrites
+  // the file once per tenth), each drop counted on the actor. A write failure is a checkpoint
+  // failure, as for the queue file: the event stays in the mesh.
+  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
+    const file = this.#deadLetterFile(actor.id);
+    let count = this.#deadLetterCount(actor.id);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, `${JSON.stringify({ at: Date.now(), source, event })}\n`, { mode: 0o600 });
+      this.#deadLetters.set(actor.id, ++count);
+      if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
+        const entries = this.#readDeadLetters(actor.id);
+        const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
+        let bytes = entries.reduce((total, entry) => total + size(entry), 0);
+        let dropped = 0;
+        while (entries.length > 0 && (entries.length > ACTOR_DEAD_LETTER_MAX_ENTRIES * 0.9 || bytes > ACTOR_DEAD_LETTER_MAX_BYTES * 0.9)) {
+          bytes -= size(entries.shift()!);
+          dropped++;
+        }
+        this.#writeDeadLetters(actor.id, entries);
+        count = entries.length;
+        const total = (this.#deadLettersDropped.get(actor.id) ?? 0) + dropped;
+        this.#deadLettersDropped.set(actor.id, total);
+        this.#recordMessage(actor, {
+          id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+          createdAt: Date.now(),
+          error: `Dropped the ${dropped} oldest dead-lettered events: the dead-letter file is bounded at ${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries and ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes (${total} dropped since start)`,
+          data: { deadLetterDropped: dropped, deadLetterDroppedTotal: total },
+        });
+      }
+    } catch {
+      throw new ActorQueueCheckpointError(actor);
+    }
+    if (this.#closing) return;
+    const now = Date.now();
+    const last = this.#deadLetterAlarms.get(actor.id);
+    if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
+    this.#deadLetterAlarms.set(actor.id, now);
+    const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
+      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter file ${file}. ` +
+      `They re-queue automatically once its queue drains below half; other actors are not held. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count, file },
+    };
+    this.#recordMessage(actor, notice);
+    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count, file } }).catch(() => undefined);
+    try {
+      this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+    } catch { /* best effort: the notice stays in the actor's messages */ }
+  }
+
+  // Re-queues dead letters, oldest first, once the actor's queue has drained below half and its
+  // overflow is empty. Never while restored or regained work still waits in #parked: that work is
+  // older and returns first, and it may refill the queue and overflow (round 3 P1). An event still
+  // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
+  // leave the file only after the queue file durably holds what they replayed.
+  #replayDeadLetters(actor: ManagedActor): void {
+    if (!this.#persistent || this.#closing || this.#halted || actor.status === "stopped" || actor.removal ||
+      this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
+    const limit = this.meshConfig.actorQueueLimit;
+    if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
+    const entries = this.#readDeadLetters(actor.id);
+    const inFlight = this.#inFlight.get(actor.id);
+    const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue]
+      .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
+    let taken = 0;
+    let added = 0;
+    try {
+      while (taken < entries.length && actor.queue.length < limit) {
+        const entry = entries[taken]!;
+        if (!held.has(entry.event.id)) {
+          held.add(entry.event.id);
+          this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+          added++;
+        }
+        taken++;
+      }
+    } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
+    if (taken === 0) return;
+    // A single rewrite per batch (the O(N^2) worst case over a 50 MB file is a noted follow-up).
+    if (added === 0 || this.#persistQueue(actor.id, true)) {
+      try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+    }
+    this.#ensureDrain(actor);
+  }
+
+  // Restored work past the queue and its overflow returns to the HEAD of the dead-letter file, ahead
+  // of the later events already there, instead of being dropped (round 3 P1). The file is written
+  // before the queue file forgets them. Returns what could not spill (a resumed run, a non-mesh
+  // item, a write failure): it stays in the overflow past the cap, never dropped.
+  #spillDeadLetters(actor: ManagedActor, items: ActorQueueItem[]): ActorQueueItem[] {
+    const spillable = (item: ActorQueueItem) => this.#persistent && !item.resumed && item.source.startsWith("mesh:") &&
+      typeof (item.payload as { id?: unknown } | undefined)?.id === "string";
+    // Only a run-order tail can go: an item that must stay keeps everything after it in memory too.
+    let from = items.length;
+    while (from > 0 && spillable(items[from - 1]!)) from--;
+    const spilled = items.slice(from);
+    if (spilled.length === 0) return items;
+    try {
+      fs.mkdirSync(path.dirname(this.#deadLetterFile(actor.id)), { recursive: true, mode: 0o700 });
+      this.#writeDeadLetters(actor.id, [
+        ...spilled.map((item) => ({ at: Date.now(), source: item.source, event: item.payload as MeshEvent })),
+        ...this.#readDeadLetters(actor.id),
+      ]);
+    } catch {
+      this.#deadLetters.delete(actor.id);
+      return items;
+    }
+    return items.slice(0, from);
+  }
+
+  // A dead letter is accepted work: a cursor replay of its event (a crash before the cursor passed
+  // it) must neither queue nor dead-letter it a second time (round 3 P3).
+  #seedDeadLetterDeliveries(actor: ManagedActor): void {
+    if (!this.#persistent) return;
+    const entries = this.#readDeadLetters(actor.id);
+    this.#deadLetters.set(actor.id, entries.length);
+    for (const entry of entries.slice(-DELIVERED_EVENT_MEMORY / 2)) this.#delivered.add(`${actor.id}\0${entry.event.id}`);
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
@@ -4058,7 +4350,9 @@ export class ActorManager {
   }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
-    const committed = await this.#registry.update(current => {
+    let committed;
+    try {
+      committed = await this.#registry.update(current => {
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
       const ownershipGeneration = publicationGeneration(this.mesh.root);
@@ -4093,7 +4387,14 @@ export class ActorManager {
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });
-    });
+      });
+    } catch (error) {
+      // A persistent veto committed nothing: keep the state dirty and fail the awaited save.
+      if (error instanceof ActorRegistryUpdateVetoedError) {
+        this.#scheduleRegistrySave(options?.durable === true || removedIds.size > 0);
+      }
+      throw error;
+    }
     if (!committed) return;
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;
@@ -4364,6 +4665,7 @@ export class ActorManager {
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        this.#seedDeadLetterDeliveries(actor);
         firstLoads.push(actor);
       }
       added++;
@@ -4382,6 +4684,11 @@ export class ActorManager {
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();
+    // Dead letters from before a restart re-queue once this host manages an idle actor (#816),
+    // after restored work: #replayDeadLetters waits while any of it is still parked.
+    if (firstLoads.length && this.#persistent) queueMicrotask(() => {
+      for (const actor of firstLoads) { const live = this.#actors.get(actor.id); if (live) this.#replayDeadLetters(live); }
+    });
   }
 
   // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
@@ -4728,7 +5035,8 @@ export class ActorManager {
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status: actor.status === "stopped" ? "stopped"
-        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER ? "failed" : actor.preparing
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER
+        ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
@@ -5246,13 +5554,17 @@ export class ActorManager {
         if (actor.queue.length > room) {
           const excess = actor.queue.splice(room);
           const overflow = [...excess, ...(this.#overflow.get(actor.id) ?? [])];
-          while (overflow.length > this.#overflowCap()) {
-            this.#recordDropped(actor, overflow.pop()!, "the queue and its overflow were full when parked events returned");
+          // Past the cap, the newest go back to the head of the dead-letter file, never dropped (#816).
+          if (overflow.length > this.#overflowCap()) {
+            overflow.push(...this.#spillDeadLetters(actor, overflow.splice(this.#overflowCap())));
+            this.#overflow.set(actor.id, overflow);
+            this.#persistQueue(actor.id, true);
           }
           this.#overflow.set(actor.id, overflow);
         }
         actor.status = "queued";
         actor.updatedAt = Date.now();
+        this.#replayDeadLetters(actor);                         // restored work is back: dead letters may follow
         this.#ensureDrain(actor);
       }
     });

@@ -439,6 +439,8 @@ export class ActorManager {
     | undefined;
   readonly #locallyCreated = new Set<string>();
   readonly #ceded = new Set<string>();
+  // smarty-dev#5919: presence this host withdraws once, after releasing an actor for adoption.
+  readonly #withdrawnPresence = new Set<string>();
   readonly #ownership = new Map<string, boolean>();
   // Lineage rootIds as last read from / written to the registry on disk.
   // Adoption compares against this snapshot so two racing adopters cannot
@@ -873,6 +875,9 @@ export class ActorManager {
       const ids = new Set(pending.keys());
       if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
       const ops: MeshBatchOperation[] = [];
+      const withdrawn = [...this.#withdrawnPresence];
+      for (const id of withdrawn) ids.delete(id);
+      for (const id of withdrawn) ops.push({ kind: "delete", key: this.#presenceKey(id) });
       for (const id of ids) {
         const actor = this.#actors.get(id);
         if (actor) {
@@ -887,6 +892,7 @@ export class ActorManager {
         }
       }
       return { ops, committed: () => {
+        for (const id of withdrawn) this.#withdrawnPresence.delete(id);
         for (const [id, revision] of pending) {
           // A mutation while the shared write waited belongs to the next refresh.
           if (this.#presenceRevisions.get(id) !== revision) continue;
@@ -907,6 +913,85 @@ export class ActorManager {
       `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`);
     if (actor.status !== "stopped") actor.status = "idle";
     actor.updatedAt = Date.now();
+    this.#emitChange();
+    return this.#publicInfo(actor);
+  }
+
+  /**
+   * smarty-dev#5919: a dead root's resident host releases one durable actor for operator
+   * adoption by another root. Its in-flight run is ownership-aborted and ended (the item
+   * parks for retry), queued mesh/host work parks in this lineage's queue file (which the
+   * adopter takes over through adoptedFrom), and this host withdraws its presence once and
+   * never republishes it. The registry row is not edited here: the adopter moves custody.
+   */
+  async releaseForAdoption(id: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    if (actor.residency !== "durable") throw new Error(`Fabric actor ${actor.id} is not durable`);
+    beforeCommit?.(actor.id);
+    this.#ceded.add(actor.id);
+    this.#ownership.set(actor.id, false);
+    const running = this.#runningActor(actor.id);
+    for (const target of new Set([actor, ...(running ? [running] : [])])) {
+      this.#markOwnershipAbort(target);
+      target.abortController?.abort();
+    }
+    if (running?.inFlightRun) await this.agents.stop(running.inFlightRun.id).catch(() => undefined);
+    await running?.drain?.catch(() => undefined);
+    this.#park(actor, this.#takeQueued(actor), `Fabric actor ${actor.name} (${actor.id}) was released for adoption by another root`);
+    if (!this.#persistQueue(actor.id, true) && this.#persistent) {
+      throw new Error(`Fabric actor ${actor.id} queue could not be saved for adoption`);
+    }
+    if (actor.status !== "stopped") actor.status = "idle";
+    actor.updatedAt = Date.now();
+    // The adopter moves the committed row: flush this lineage's final history first.
+    const live = this.#actors.get(actor.id) ?? actor;
+    await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live, releasing: live });
+    this.#withdrawnPresence.add(actor.id);
+    if (this.#presencePublisher) {
+      await this.#presencePublisher.refresh();
+      if (this.#withdrawnPresence.has(actor.id)) throw new Error(`Fabric actor ${actor.id} presence withdrawal is pending; retry`);
+    } else {
+      await this.mesh.delete({ key: this.#presenceKey(actor.id) });
+      this.#withdrawnPresence.delete(actor.id);
+    }
+    this.#emitChange();
+    return this.#publicInfo(actor);
+  }
+
+  /** smarty-dev#5919: this process released the actor for adoption (a retry is idempotent). */
+  releasedForAdoption(id: string): boolean {
+    return this.#ceded.has(id) && this.#actors.has(id);
+  }
+
+  /**
+   * smarty-dev#5919: load an actor whose registry row an operator adoption just moved to
+   * this root (under the registry fence). The fresh claim regains a displaced lineage,
+   * takes over the predecessors' queue files and publishes this host's presence.
+   */
+  acceptAdoption(id: string): FabricActorInfo {
+    const record = this.#registry.records().find((row) => row.id === id);
+    if (!record || record.rootId !== this.#rootId) throw new Error(`Fabric actor ${id} is not adopted by this root`);
+    this.#displacedLineages.delete(id);
+    this.#ceded.delete(id);
+    const stale = this.#actors.get(id);
+    if (stale) {
+      this.#markOwnershipAbort(stale);
+      stale.abortController?.abort();
+      this.#actors.delete(id);
+      this.#ownership.delete(id);
+      this.#locallyCreated.delete(id);
+    }
+    this.#registryFingerprint = undefined;
+    this.#syncActorsFromRegistry();
+    const actor = this.#actors.get(id);
+    if (!actor || actor.rootId !== this.#rootId) throw new Error(`Fabric actor ${id} could not be loaded after adoption`);
+    this.#displacedLineages.delete(id);
+    this.#rememberLineages([record]);
+    this.#takeOverPredecessors(actor);
+    this.#ownership.set(id, this.#ownershipDecision(id));
+    this.#pendingPresence.add(id);
+    this.#schedulePresenceRetry();
+    this.#scheduleRestoreParked();
     this.#emitChange();
     return this.#publicInfo(actor);
   }
@@ -3992,6 +4077,8 @@ export class ActorManager {
 
   async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+    /** smarty-dev#5919: the final row of an actor this host just released for adoption. */
+    releasing?: ManagedActor;
   }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     // Diagnostic changes share the bounded save, but require the durable write barrier.
@@ -4009,7 +4096,8 @@ export class ActorManager {
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
       const owned = [...this.#actors.values()].filter((actor) =>
-        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
+        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) &&
+        (this.#ownershipDecision(actor.id) || actor === options?.releasing),
       );
       if (options?.requiredActor && !owned.includes(options.requiredActor)) {
         // Do not acknowledge a mutation filtered out by a custody change during

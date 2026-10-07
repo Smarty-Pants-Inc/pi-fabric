@@ -146,6 +146,20 @@ export class ResidentActorClient {
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
 
+  /** smarty-dev#5919: dead-root side of an adoption; same confirmation and lease veto as operatorActor. */
+  async releaseActor(id: string, options: { dryRun?: boolean; confirmDeadRoot?: string } = {},
+    signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseActor",
+      id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
+  }
+
+  /** smarty-dev#5919: live-root side; the executor verifies its own lease and participant. */
+  async adoptActor(id: string, fromRootId: string, options: { dryRun?: boolean; confirmDeadRoot?: string } = {},
+    signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "adoptActor",
+      id, fromRootId, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
+  }
+
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     if (!this.isLive()) throw new Error("Root resident host is not live");
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);

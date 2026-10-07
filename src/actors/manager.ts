@@ -35,6 +35,7 @@ import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { hydrateWakeText, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -108,6 +109,8 @@ interface ActorQueueItem {
   deferredHandoff?: boolean;
   /** Snapshot supplied to this run; only inference may consume it. */
   handoffContext?: readonly ActorQueueItem[];
+  /** Bounded wake text hydrated at drain from the local ingress receipt; never persisted (smarty-dev#6144). */
+  wakeText?: ActorWakeText;
 }
 
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -385,6 +388,7 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
+  readonly #wakeTextConfig: FabricWakeTextConfig | undefined;
   // Actors whose queue file this manager has loaded as their owner. Only these may write it: a
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
@@ -563,6 +567,8 @@ export class ActorManager {
       retention?: FabricRetentionConfig;
       /** Reset an actor's session at a run boundary past this size; 0 disables (smarty-dev#1439). */
       maxSessionBytes?: number;
+      /** Host-only agents.wakeText: hydrate projected GitHub webhook text from the local receipt (smarty-dev#6144). */
+      wakeText?: FabricWakeTextConfig;
       /** How long close() waits for running actor turns before it stops them (smarty-dev#1113). */
       closeGraceMs?: number;
       acquireCapabilityView?(
@@ -578,6 +584,7 @@ export class ActorManager {
     this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
+    this.#wakeTextConfig = options.wakeText;
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
     this.#snapshotActorOwnership = options.snapshotActorOwnership;
@@ -2711,6 +2718,10 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        // smarty-dev#6144: read-only, bounded and fail-open; no text leaves the activation as it was.
+        const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload);
+        if (wakeText) item.wakeText = wakeText;
+        else delete item.wakeText;
         const filteredBy = this.#filteredBy(actor, item);
         if (filteredBy) {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
@@ -3180,6 +3191,7 @@ export class ActorManager {
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
+        ...(item.wakeText ? [renderWakeTextBlock(item.wakeText)] : []),
         ...(item.handoffContext?.length ? [
           "Unread child outcomes retained from earlier activations (context only, not current activation facts):",
           JSON.stringify(item.handoffContext.map(({ id, source, payload, activation }) =>
@@ -3341,6 +3353,7 @@ export class ActorManager {
           idle: this.#mainIdle,
           now: Date.now(),
         },
+        ...(item.wakeText ? { wakeText: structuredClone(item.wakeText) } : {}),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3354,7 +3367,11 @@ export class ActorManager {
     this.#expireActivationFilter(actor);
     if (!actor.activationFilter || item.resolve || item.reject) return undefined;
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
-    return activationFilterSkip(actor.activationFilter, item.source, item.payload);
+    // Hydrated wake text is visible to filter paths as wakeText.* (author, authorAssociation, body).
+    const payload = item.wakeText && typeof item.payload === "object" && item.payload !== null && !Array.isArray(item.payload)
+      ? { ...(item.payload as Record<string, unknown>), wakeText: item.wakeText }
+      : item.payload;
+    return activationFilterSkip(actor.activationFilter, item.source, payload);
   }
 
   /**

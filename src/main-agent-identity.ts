@@ -1,4 +1,5 @@
 import type { MeshIdentity } from "./mesh/store.js";
+import { rootParticipantName } from "./topology/participant-name.js";
 
 // Startup needs only identity. Keep the journal/replay controller behind FabricState's
 // first-use runtime import instead of pulling it into a shared eager chunk.
@@ -27,7 +28,7 @@ export const resolveFabricIdentity = (
           kind: "agent",
           sessionId,
         }
-      : { id: `session:${sessionId}`, name: "main", kind: "main", sessionId };
+      : { id: `session:${sessionId}`, name: rootParticipantName(undefined, environment), kind: "main", sessionId };
   const inheritedMainAgentId = environment.PI_FABRIC_MAIN_AGENT_ID?.trim();
   return {
     identity,

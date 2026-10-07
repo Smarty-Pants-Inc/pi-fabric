@@ -93,6 +93,16 @@ afterEach(async () => {
 });
 
 describe("process task role environment (#2998)", () => {
+  it.each([[[]], [["--actor-id", "actor", "--actor-name", "watcher"]]])("drops the root launch name before child exec (%j)", async (args) => {
+    vi.stubEnv("SMARTY_AGENT_NAME", "parent-lead");
+    await withOwnedWorker(`import fs from "node:fs";
+fs.writeFileSync("name.json", JSON.stringify({name: process.env.SMARTY_AGENT_NAME ?? null}));
+setInterval(() => {}, 1000);`, async (_handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "name.json"))).toBe(true));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "name.json"), "utf8"))).toEqual({name: null});
+      expect(process.env.SMARTY_AGENT_NAME).toBe("parent-lead");
+    }, args);
+  });
   it.each(["worktree-agent@0123456789ab", undefined])("sets the worker role before exec from parent %s and strips spawner role overrides", async (parentRole) => {
     vi.stubEnv("SMARTY_ROLE", parentRole);
     vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");

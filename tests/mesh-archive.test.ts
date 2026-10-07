@@ -387,7 +387,7 @@ describe("mesh event archive", () => {
     const livePath = path.join(root, "events.jsonl");
     const seedSize = fs.statSync(livePath).size;
     const recipient: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
-    const inbox = (mesh: MeshStore) => new RootInbox(mesh, recipient, () => [recipient.id], { steerGraceMs: 0, pageSize: 1 });
+    const inbox = (mesh: MeshStore) => new RootInbox(mesh, recipient, { steerGraceMs: 0, pageSize: 1 });
     // Persist the real recipient cursor before its ordinary, acknowledged work arrives.
     await store.put({ key: inbox(store).key, value: { after: 1 }, identity: recipient });
     const ordinary = await store.publish({ topic: "fleet.work.reboot", from, to: recipient.id, text: "acknowledged ordinary work" });

@@ -616,9 +616,10 @@ export class FabricRuntimeState {
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );
-    // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
+    // A Main reconciles missed work addressed to its exact root id (smarty-dev#754).
+    // Published names remain live routing selectors, never durable inbox addresses.
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
+      ? new RootInbox(this.#mesh, identity)
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     let inboxMaintenance: MainInboxMaintenance | undefined;

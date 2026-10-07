@@ -20,6 +20,45 @@ const directory = (meshRoot: string, self = identity): ParticipantDirectory => n
 );
 
 describe("root participant session names", () => {
+  describe.each([false, true])("launch-name roster (mesh enabled=%s)", (enabled) => {
+    it.each([
+      [undefined, undefined, "main"],
+      [undefined, "  explicit-lead  ", "explicit-lead"],
+      ["  fabric-v2  ", undefined, "main"],
+      ["_lead", undefined, "_lead"], ["-lead", undefined, "-lead"],
+      ["a".repeat(61), undefined, "a".repeat(61)],
+      ["a".repeat(64), undefined, "a".repeat(64)],
+      ["a".repeat(65), "explicit-lead", "explicit-lead"],
+      [".lead", "explicit-lead", "explicit-lead"],
+      ["Lead One", "explicit-lead", "explicit-lead"],
+      ["fabric-v2", "explicit-lead", "fabric-v2"],
+      ["bad/name", "  explicit-lead  ", "explicit-lead"],
+      ["fabric-v2@x", "bad/name", "main"],
+    ] as const)("filters agent=%j Pi name=%j as %j, preserving role metadata", async (agentName, sessionName, expected) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-launch-roster-"));
+      vi.stubEnv("SMARTY_AGENT_NAME", agentName);
+      vi.stubEnv("SMARTY_ROLE", "project-agent@x");
+      vi.stubEnv("PI_FABRIC_ROLE", undefined);
+      const owner = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 1000), {
+        enabled, hostId: identity.id, rootId: identity.id, identity,
+      });
+      const record = owner.root(info, true, sessionName);
+      owner.registerSource(() => [record]);
+      try {
+        await owner.start();
+        expect(record).toMatchObject({ name: expected, role: "project-agent", id: identity.id,
+          rootId: identity.id, ownerIdentityId: identity.id });
+        expect(owner.list({ name: expected, kinds: ["root"] }))
+          .toEqual([expect.objectContaining({ name: expected, id: identity.id })]);
+        expect(owner.list({ name: "project-agent", kinds: ["root"] })).toEqual([]);
+        expect(owner.list({ name: expected.toUpperCase(), kinds: ["root"] })).toEqual([]);
+      } finally {
+        await owner.close(); vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it.each([
     [undefined, "main"], ["", "main"], ["  \t ", "main"],
     ["  lucky-ios-lead  ", "lucky-ios-lead"], ["Lead 1_test.ok", "Lead 1_test.ok"],
@@ -87,7 +126,7 @@ const main = (cwd: string, sessionId: string, initialName?: string) => {
     cwd, signal: undefined, parentToolCallId: "root-name-probe", nestedToolCallId: ref,
     extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000,
   });
-  return { runtime, context, invoke, sendMessage, rename: (name: string) => { sessionName = name; } };
+  return { runtime, context, invoke, sendMessage, rename: (name: string | undefined) => { sessionName = name; } };
 };
 
 it("lists the Pi-named Main through agents.peers/members and reaches its current name after a heartbeat rename", async () => {
@@ -103,8 +142,6 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
   const owner = main(root, "aaaaaaaa-0000-4000-8000-000000000001", "lucky-ios-lead");
   const reviewer = main(root, "bbbbbbbb-0000-4000-8000-000000000002");
   const ownerId = "session:aaaaaaaa-0000-4000-8000-000000000001";
-  // A delivered batch is recorded before the following inbox read, as on a real Pi host.
-  const held = { holdsBatch: () => true, holdsSteer: () => false };
   try {
     await owner.runtime.initialize(owner.context, config);
     await reviewer.runtime.initialize(reviewer.context, config);
@@ -118,15 +155,10 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
     expect(await reviewer.invoke("agents.self")).toMatchObject({ name: "main", kind: "root" });
     const label = owner.runtime.participantInfos().find(p => p.id === ownerId)?.label;
     const deliverByName = async (name: string) => {
-      await reviewer.runtime.mesh.publish({ topic: "fleet.work.root-name", kind: "ask", to: name,
-        from: { id: "review-actor", name: "review-actor", kind: "actor" }, text: `hello ${name}` });
-      // Only bypass the inbox's existing 60-second steer grace, not publication or routing.
-      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
-      try {
-        expect((await owner.runtime.nextRootInbox(held))?.events).toEqual(expect.arrayContaining([
-          expect.objectContaining({ to: name, text: `hello ${name}` }),
-        ]));
-      } finally { clock.mockRestore(); }
+      // Names remain live selectors after the mailbox-recovery scope cut.
+      await expect(reviewer.invoke("agents.followUp", { id: name, message: `hello ${name}` }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      received(owner, "session:bbbbbbbb-0000-4000-8000-000000000002", `hello ${name}`, "followUp");
     };
     await deliverByName("lucky-ios-lead");
     owner.rename("renamed-lead");
@@ -196,6 +228,50 @@ const received = (target: ReturnType<typeof main>, senderId: string, text: strin
 };
 
 describe.each([false, true])("cross-root participant name routing (filesOnly=%s)", (filesOnly) => {
+  it("discovers Pi names with role-only launch metadata, reports duplicates and resolves the new session after relaunch (#3860)", async () => {
+    await acrossRoots(filesOnly, async ({ owner, reviewer, duplicate, ownerId, duplicateId, reviewerId }) => {
+      reviewer.rename("reviewer");
+      vi.stubEnv("SMARTY_ROLE", "project-agent@abcdef123456");
+      vi.stubEnv("SMARTY_AGENT_NAME", undefined);
+      owner.rename("fabric-v2");
+      const members = () => reviewer.invoke("agents.members", { kinds: ["root"], name: "fabric-v2" });
+      await vi.waitFor(async () => expect(await members()).toEqual([
+        expect.objectContaining({ id: ownerId, name: "fabric-v2", sessionId: ownerId.slice(8) }),
+      ]), { timeout: 8000, interval: 100 });
+      expect(await reviewer.invoke("agents.members", { name: "absent" })).toEqual([]);
+      expect(reviewer.runtime.participantInfos({ scope: "project", name: "fabric-v2" }))
+        .toEqual([expect.objectContaining({ id: ownerId })]);
+      expect(await reviewer.invoke("mesh.members", { kinds: ["root"], name: "fabric-v2" }))
+        .toEqual([expect.objectContaining({ id: ownerId })]);
+      await expect(reviewer.invoke("agents.followUp", { id: "fabric-v2", message: "role reply" }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      received(owner, reviewerId, "role reply", "followUp");
+      duplicate.rename("fabric-v2");
+      await vi.waitFor(async () => expect(await members()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: ownerId }), expect.objectContaining({ id: duplicateId }),
+      ])), { timeout: 8000, interval: 100 });
+      expect(await members()).toHaveLength(2);
+      for (const action of ["followUp", "steer", "tell"]) {
+        await expect(reviewer.invoke(`agents.${action}`, { id: "fabric-v2", message: "never choose newest" }))
+          .rejects.toThrow(`Ambiguous Fabric participant: fabric-v2 (${[ownerId, duplicateId].sort().join(", ")}); use an exact id`);
+      }
+      expect(duplicate.sendMessage).not.toHaveBeenCalled();
+      await duplicate.runtime.shutdown();
+      const config = owner.runtime.config;
+      await owner.runtime.shutdown();
+      const next = main(owner.context.cwd, "dddddddd-0000-4000-8000-000000000004", "fabric-v2");
+      try {
+        await next.runtime.initialize(next.context, config);
+        const nextId = "session:dddddddd-0000-4000-8000-000000000004";
+        await vi.waitFor(async () => expect(await members()).toEqual([
+          expect.objectContaining({ id: nextId, name: "fabric-v2", sessionId: nextId.slice(8) }),
+        ]), { timeout: 8000, interval: 100 });
+        await expect(reviewer.invoke("agents.followUp", { id: "fabric-v2", message: "relaunch reply" }))
+          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+        received(next, reviewerId, "relaunch reply", "followUp");
+      } finally { await next.runtime.shutdown(); }
+    });
+  }, 30_000);
   it("delivers followUp/steer/tell by published name and forgets the old name after a heartbeat rename", async () => {
     await acrossRoots(filesOnly, async ({ owner, reviewer, ownerId, reviewerId }) => {
       for (const [action, targetKey, delivery] of [["followUp", "id", "followUp"],

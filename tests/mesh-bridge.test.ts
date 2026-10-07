@@ -1569,7 +1569,7 @@ describe("mesh bridge", () => {
     await bridge.start();
     await bridge.step();
     // The hub Main's session name is the remote's canonical id.
-    const inbox = new RootInbox(hub, main.identity, () => [main.identity.id, evil.identity.id], { steerGraceMs: 0 });
+    const inbox = new RootInbox(hub, { ...main.identity, name: evil.identity.id }, { steerGraceMs: 0 });
     const idle = { holdsBatch: () => false, holdsSteer: () => false };
     await inbox.next(idle);
     await hub.publish({ topic: "fleet.work.x.1", kind: "ask", from: main.identity, to: evil.identity.id, text: "to the remote id" });

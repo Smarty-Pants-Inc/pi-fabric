@@ -130,18 +130,18 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
     }
     if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+    // Worker arguments are flag/value pairs. A flag-shaped value is not an
+    // actor identity; explicit actor ids alone retain the parent's role env.
+    const childEnvironment = workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
+      ? { ...process.env } : taskAgentEnvironment();
+    // Actors also own their names; the root launch name is never inherited.
+    delete childEnvironment.SMARTY_AGENT_NAME;
     const processHandle = await spawnDetached(
       selected.workerPath,
       workerArguments,
       request.cwd,
       request,
-      // Worker arguments are flag/value pairs. A flag-shaped value is not an
-      // actor identity; explicit actor ids alone retain the parent's role env.
-      applyTaskReturnAddress(
-        workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
-        workerArguments,
-      ),
+      applyTaskReturnAddress(childEnvironment, workerArguments),
       executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

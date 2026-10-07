@@ -280,7 +280,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "members",
-    description: "List the unified project topology of roots, agents, and actors",
+    description: "List the unified project topology of roots, agents, and actors; exact name filtering retains duplicate ids",
     inputSchema: {
       type: "object",
       properties: {
@@ -289,6 +289,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           type: "array",
           items: { type: "string", enum: ["root", "agent", "actor"] },
         },
+        name: { type: "string" },
         includeStale: { type: "boolean" },
       },
       additionalProperties: false,

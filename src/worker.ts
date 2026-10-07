@@ -554,6 +554,8 @@ const main = async (): Promise<void> => {
   const childEnvironment = applyTaskReturnAddress(
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
+  // Explicit actor launches retain role provenance, but not the root Main's name.
+  delete childEnvironment.SMARTY_AGENT_NAME;
   // Native session metadata belongs to this child, never its parent/resident host.
   delete childEnvironment.PI_SESSION_ID;
   delete childEnvironment.PI_SESSION_FILE;

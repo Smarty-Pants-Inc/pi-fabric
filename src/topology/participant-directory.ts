@@ -743,7 +743,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       const self = this.self(now, options);
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
-      return [...byId.values()];
+      return [...byId.values()].filter((participant) => options.name === undefined || participant.name === options.name);
     }
     const read = { fresh: options.fresh === true, ...(options.background ? { background: true } : {}) };
     const parsed = this.#parsed(read, this.options.listReadCacheMs);
@@ -808,7 +808,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     ) {
       byId.set(self.id, self);
     }
-    return [...byId.values()].sort(
+    return [...byId.values()].filter((participant) => options.name === undefined || participant.name === options.name).sort(
       (left, right) =>
         left.startedAt - right.startedAt || left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
     );

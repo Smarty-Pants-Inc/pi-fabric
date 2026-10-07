@@ -24,7 +24,7 @@ const probe = async () => {
     const keys = ['PI_FABRIC_ACTOR_ID','PI_FABRIC_ACTOR_NAME','PI_FABRIC_ACTOR_SESSION_FILE',
       'PI_FABRIC_PARENT_RUN','PI_FABRIC_MAIN_AGENT_ID','PI_FABRIC_SPAWNER_ID',
       'PI_FABRIC_SPAWNER_KIND','PI_FABRIC_SPAWNER_RUN','PI_FABRIC_REPLY_SCHEMA_FILE',
-      'PI_FABRIC_REPLY_FILE','PI_FABRIC_REPLY_HOOK','SMARTY_ROLE'];
+      'PI_FABRIC_REPLY_FILE','PI_FABRIC_REPLY_HOOK','SMARTY_ROLE','SMARTY_AGENT_NAME'];
     const report = Object.fromEntries(keys.map(key => [key, process.env[key] || '']));
     console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:JSON.stringify(report)}}));
     console.log(JSON.stringify({type:'agent_settled'}));
@@ -36,9 +36,13 @@ const probe = async () => {
     ...(process.env.PI_FABRIC_ACTOR_ID ? { identityId: process.env.PI_FABRIC_ACTOR_ID } : {}),
   });
   managers.push(manager);
+  vi.stubEnv("SMARTY_AGENT_NAME", "parent-lead");
   const result = await manager.run({ task: "report synthetic binding", transport: "process" });
+  expect(process.env.SMARTY_AGENT_NAME).toBe("parent-lead");
   expect(result.status, result.error).toBe("completed");
-  return { result, environment: JSON.parse(result.text) as NodeJS.ProcessEnv };
+  const environment = JSON.parse(result.text) as NodeJS.ProcessEnv;
+  expect(environment.SMARTY_AGENT_NAME).toBe("");
+  return { result, environment };
 };
 
 describe.skipIf(!fs.existsSync(workerPath))("#2643 actual worker spawner environment", () => {

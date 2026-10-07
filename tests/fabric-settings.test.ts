@@ -5,7 +5,7 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig } from "../src/config.js";
-import type { FabricState } from "../src/fabric-state.js";
+import type { FabricLifecycleLease, FabricState } from "../src/fabric-state.js";
 import type { ModelSource } from "../src/ui/model-picker.js";
 import {
   buildFabricSettingsItems,
@@ -27,6 +27,8 @@ const theme = {
 } as unknown as Theme;
 
 const borderLine = (width: number): string => "─".repeat(width);
+
+const liveLease: FabricLifecycleLease = { current: () => true };
 
 const fakeModelSource: ModelSource = {
   models: [
@@ -848,7 +850,7 @@ describe("FabricSettingsComponent", () => {
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     const state = {
       config, kernelReloadRequired: false,
-      ensure: vi.fn(async () => {}),
+      ensure: vi.fn(async () => liveLease),
       reloadConfig: vi.fn(() => { state.kernelReloadRequired = loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.kernel !== config.executor.kernel; }),
       agents: { claudeModels: vi.fn(async () => []) },
     };
@@ -873,6 +875,65 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("drops background settings model failures after session replacement (#5962)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-settings-stale-"));
+    const agentDir = path.join(root, "agent"); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    let reject!: (error: Error) => void;
+    const sessionApprovals = { generation: 1 };
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.agents.runner = "claude";
+    const state = { config, sessionApprovals, ensure: async () => liveLease, agents: {
+      claudeModels: () => new Promise((_yes, no) => { reject = no; }),
+    } } as unknown as FabricState;
+    let staleReads = 0;
+    const context = { mode: "tui", cwd: root, isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async () => {} },
+    } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      sessionApprovals.generation++;
+      Object.defineProperty(context, "ui", { get() { staleReads++; throw new Error("stale ctx"); } });
+      reject(new Error("old discovery failed"));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(staleReads).toBe(0);
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("stops when shutdown resets approvals while ensure is pending (#5962)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-settings-ensure-race-"));
+    const agentDir = path.join(root, "agent"); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    let lifecycle = 1;
+    let resolveEnsure!: () => void;
+    const sessionApprovals = { generation: 1 };
+    const state = { config: structuredClone(DEFAULT_FABRIC_CONFIG), sessionApprovals,
+      ensure: async () => {
+        const bound = lifecycle;
+        await new Promise<void>((resolve) => { resolveEnsure = resolve; });
+        return { current: () => bound === lifecycle };
+      },
+      reloadConfig: vi.fn(), agents: { claudeModels: vi.fn(async () => []) },
+    } as unknown as FabricState;
+    const isProjectTrusted = vi.fn(() => true);
+    const custom = vi.fn(async () => {});
+    const notify = vi.fn();
+    const context = { mode: "tui", cwd: root, isProjectTrusted,
+      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify, custom },
+    } as unknown as ExtensionContext;
+    try {
+      const opening = openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      await vi.waitFor(() => expect(resolveEnsure).toBeTypeOf("function"));
+      // Shutdown/replacement retires the lifecycle and resets approvals; the
+      // pending ensure() still resolves afterwards.
+      lifecycle++; sessionApprovals.generation++;
+      resolveEnsure();
+      await opening;
+      expect(isProjectTrusted).not.toHaveBeenCalled();
+      expect(custom).not.toHaveBeenCalled();
+      expect(notify).not.toHaveBeenCalled();
+      expect(state.reloadConfig).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(agentDir, "fabric.json"))).toBe(false);
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
     const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");
@@ -882,7 +943,7 @@ describe("FabricSettingsComponent", () => {
       const config = structuredClone(DEFAULT_FABRIC_CONFIG);
       const location = { cwd, agentDir, projectTrusted: true };
       const state = {
-        config, ensure: vi.fn().mockResolvedValue(undefined),
+        config, ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -924,7 +985,7 @@ describe("FabricSettingsComponent", () => {
       const onConfigApplied = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(
           config,
           loadFabricConfig({ cwd, agentDir, projectTrusted: true }),
@@ -984,7 +1045,7 @@ describe("FabricSettingsComponent", () => {
       const requestRender = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1042,7 +1103,7 @@ describe("FabricSettingsComponent", () => {
       const config = loadFabricConfig(location);
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1104,7 +1165,7 @@ describe("FabricSettingsComponent", () => {
       const requestRender = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1170,7 +1231,7 @@ describe("FabricSettingsComponent", () => {
       const applyFabricMode = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1230,7 +1291,7 @@ describe("FabricSettingsComponent", () => {
       const applyFabricMode = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => {
           const saved = JSON.parse(
             fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"),
@@ -1305,7 +1366,7 @@ describe("FabricSettingsComponent", () => {
       const applyFabricMode = vi.fn();
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => {
           const saved = JSON.parse(
             fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"),
@@ -1394,7 +1455,7 @@ describe("Fabric RPC settings", () => {
       let changedDisplay = false;
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1460,7 +1521,7 @@ describe("Fabric RPC settings", () => {
       let editedVedaModel = false;
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1548,7 +1609,7 @@ describe("Fabric RPC settings", () => {
       let toggled = false;
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1612,7 +1673,7 @@ describe("Fabric RPC settings", () => {
       let changed = false;
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;
@@ -1675,7 +1736,7 @@ describe("Fabric RPC settings", () => {
       let edited = false;
       const state = {
         config,
-        ensure: vi.fn().mockResolvedValue(undefined),
+        ensure: vi.fn().mockResolvedValue(liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
       } as unknown as FabricState;

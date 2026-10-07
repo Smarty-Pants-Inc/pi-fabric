@@ -86,4 +86,30 @@ describe("participant directory display reads (smarty-dev#4250)", () => {
     await vi.waitFor(() => expect(publish).toHaveBeenCalledTimes(1));
     expect(publish.mock.calls[0]![0]).toMatchObject({ kind: "refused" });
   });
+
+  it("a malformed mirror seen in a display view is refused only after a bound re-read (pi-fabric#560 review)", async () => {
+    const f = await fixture();
+    const remote = { id: "session:forge", name: "main", kind: "main" as const, sessionId: "forge" };
+    // A mirrored record that fails validation (sessionId must be a string).
+    await f.writer.writeBatch({ identity: remote, ops: [
+      { kind: "put", key: "topology/participants/" + hash("session:bad"), value: {
+        format: 1, id: "session:bad", kind: "root", rootId: "session:bad", ownerHostId: remote.id, ownerIdentityId: remote.id,
+        name: "bad", status: "idle", runner: "pi", transport: "host", capabilities: ["fabric"], cwd: "/x",
+        startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1", remoteHost: "forge", sessionId: 42 } },
+    ] });
+    const publish = vi.spyOn(f.mesh, "publish");
+    // A display-only parse alone never publishes the refusal.
+    f.directory.self(Date.now(), { background: true, displayOnly: true });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(publish).not.toHaveBeenCalled();
+    // The display listing sees it and rebuilds from a bound read, which reports it once.
+    f.tokens.mockClear();
+    f.directory.list({ scope: "project", background: true });
+    const modes = f.options().map((read) => read.displayOnly === true);
+    expect(modes[0]).toBe(true);
+    expect(modes.length).toBeGreaterThan(1);
+    expect(modes.slice(1).every((mode) => !mode)).toBe(true);
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledTimes(1));
+    expect(publish.mock.calls[0]![0]).toMatchObject({ kind: "refused", text: expect.stringMatching(/it is malformed$/) });
+  });
 });

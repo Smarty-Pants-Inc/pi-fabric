@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryCheckpointBarrierError, ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorRegistryPayloads } from "../src/actors/registry-payloads.js";
 
 // smarty-dev#6477 L7: payload fsyncs happen before registry custody; under the
@@ -150,4 +150,80 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
     }
     expect([...outcomes].sort()).toEqual(["new", "old"]);
   }, 120_000);
+
+  it("fails closed when both checkpoint barrier attempts fail: update() rejects and readers see a consistent registry (pi-fabric#590 review round 2)", async () => {
+    const { actorRoot, store } = await fixture();
+    const registries = new Set(ids.map(id => path.join(actorRoot, id, "registry")));
+    const paths = new Map<number, string>();
+    const original = { open: fs.openSync, fsync: fs.fsyncSync, rm: fs.rmSync };
+    let unlocked = false, failing = true;
+    const failures = new Map<string, number>();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
+      const fd = (original.open as (...args: unknown[]) => number)(file, ...rest);
+      paths.set(fd, String(file));
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "rmSync").mockImplementation((file: fs.PathLike, options?: fs.RmOptions) => {
+      original.rm(file, options);
+      if (String(file).endsWith("actors.json.lock")) unlocked = true;
+    });
+    // Every checkpoint directory barrier fails AFTER the lock is released, i.e. both
+    // deferred settle() attempts. Pre-custody barriers of the same directory succeed.
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      const file = paths.get(fd);
+      if (failing && unlocked && file && registries.has(file)) {
+        failures.set(file, (failures.get(file) ?? 0) + 1);
+        throw Object.assign(new Error("EIO: checkpoint barrier"), { code: "EIO" });
+      }
+      original.fsync(fd);
+    });
+    const error = await appendAll(store).then(() => undefined, (reason: unknown) => reason);
+    // No success: a clear, retryable error that says the registry already committed.
+    expect(error).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
+    const barrier = error as ActorRegistryCheckpointBarrierError<boolean>;
+    expect(barrier.message).toMatch(/checkpoint barrier failed after the registry commit; the save is not acknowledged/);
+    expect(barrier.retryable).toBe(true);
+    expect(barrier.committed).toEqual({ value: true });
+    expect([...barrier.directories].sort()).toEqual([...registries].sort());
+    for (const directory of registries) expect(failures.get(directory)).toBe(2);
+
+    // The next reader sees one consistent state: every actor selects [m0, m1] and its
+    // checkpoint equals the registry head (never leads, here does not lag either).
+    const consistent = (expected: unknown[]) => {
+      const fresh = new ActorRegistryStore(actorRoot);
+      const payloads = new ActorRegistryPayloads(actorRoot);
+      expect(fresh.records().map(row => row.id).sort()).toEqual(ids);
+      for (const row of fresh.records()) {
+        expect(fresh.messages(row)).toEqual(expected);
+        expect(payloads.savedHead(row.id)).toEqual(row.messageHistory);
+        expect(fs.readdirSync(path.join(actorRoot, row.id, "registry")).filter(file => file.endsWith(".prepared"))).toEqual([]);
+      }
+      // The failing store's own snapshot was invalidated and re-reads the same bytes.
+      expect(store.snapshot().bytes).toBe(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"));
+    };
+    consistent([m0, m1]);
+
+    // While the owed barrier still fails, the next update fails closed BEFORE it
+    // writes anything: no registry rename, no append, no success.
+    const registryBefore = fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8");
+    const logsBefore = ids.map(id => fs.statSync(path.join(actorRoot, id, "registry", "messages.jsonl")).size);
+    let selected = false;
+    const blocked = await store.update(current => { selected = true; return { actors: current.map(row => ({ ...withoutRefs(row),
+      registryMessageAppend: [{ id: "m2", direction: "in", text: "next" }] })), value: true }; }).then(() => undefined, (reason: unknown) => reason);
+    expect(blocked).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
+    expect((blocked as ActorRegistryCheckpointBarrierError).committed).toBeUndefined();
+    expect((blocked as Error).message).toMatch(/still fails; nothing was committed/);
+    expect(selected).toBe(false);
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(registryBefore);
+    expect(ids.map(id => fs.statSync(path.join(actorRoot, id, "registry", "messages.jsonl")).size)).toEqual(logsBefore);
+    consistent([m0, m1]);
+
+    // Once the barrier works again, the owed barrier settles first and the save succeeds.
+    failing = false;
+    await expect(store.update(current => ({ actors: current.map(row => ({ ...withoutRefs(row),
+      registryMessageAppend: [{ id: "m2", direction: "in", text: "next" }] })), value: "ok" }))).resolves.toBe("ok");
+    vi.restoreAllMocks();
+    consistent([m0, m1, { id: "m2", direction: "in", text: "next" }]);
+  });
 });

@@ -49,8 +49,18 @@ it survives a legacy owned-row save that removes `messageHistory`. Unchanged
 checkpoints are not rewritten. A checkpoint rename failure under the lock rolls
 back changed checkpoints and the registry; later commits never select an
 abandoned append. A checkpoint directory barrier that fails after the lock was
-released cannot be rolled back without re-appending accepted messages: it is
-retried once, then warned about and retried by the next save from that store.
+released is retried once; if it still fails the save **fails closed**
+(pi-fabric#590): `update()` rejects with a retryable
+`ActorRegistryCheckpointBarrierError` and never reports success, the store's
+cached snapshot is invalidated, and the barrier stays owed. The registry rename
+is already durable and the checkpoint is already renamed, so every reader sees
+one consistent state (registry and checkpoint agree; after an OS crash the
+checkpoint can only lag). It is not rolled back outside custody, where another
+writer may already build on it. The error carries the committed value, so the
+manager acknowledges exactly the appended prefix instead of appending it again.
+The next update from that store retries every owed barrier before it selects or
+writes anything and, while one still fails, rejects without committing. A
+removed actor directory owes no barrier.
 A crash may leave stray `messages-head.json.*.prepared` temp files; they are
 never read.
 

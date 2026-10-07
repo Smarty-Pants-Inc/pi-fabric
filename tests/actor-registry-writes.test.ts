@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryCheckpointBarrierError, ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -139,6 +139,45 @@ describe("actor registry lazy/status writes (#3752, #4383)", () => {
     const record = f.store.records()[0]!;
     expect(record.registryMessageAppend).toBeUndefined();
     expect(f.store.messages(record)).toHaveLength(100);
+  });
+
+  it("a checkpoint barrier failure after the commit fails the save but never re-appends its messages (pi-fabric#590)", async () => {
+    const f = setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(f.agent, "run").mockImplementation((_request, signal, onSpawned) => {
+      onSpawned?.({ id: "mock-run" } as Parameters<NonNullable<typeof onSpawned>>[0]);
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("fixture abort")), { once: true }));
+    });
+    const actor = await f.manager.create({ name: "barrier", instructions: "Review." });
+    await settle();
+    // The store committed the registry rename, then both deferred checkpoint barriers
+    // failed: update() rejects with the committed value attached (fail closed).
+    const real = ActorRegistryStore.prototype.update;
+    let calls = 0, failed = 0;
+    vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(async function (this: ActorRegistryStore, ...args) {
+      calls++;
+      const value = await real.apply(this, args as Parameters<typeof real>);
+      if (value !== undefined && failed === 0) {
+        failed++;
+        throw new ActorRegistryCheckpointBarrierError(["checkpoint"], { value }, new Error("EIO"));
+      }
+      return value;
+    });
+    f.manager.tell(actor.id, "exactly-once");
+    const deadline = Date.now() + 10_000;
+    while (!(failed === 1 && calls >= 2)) {
+      if (Date.now() > deadline) throw new Error(`no retry after the barrier failure (calls ${calls}, failed ${failed})`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await f.manager.close();
+    const log = fs.readFileSync(path.join(f.actorRoot, actor.id, "registry", "messages.jsonl"), "utf8");
+    const archived = log.split("\n").filter(Boolean).flatMap(line => JSON.parse(line).messages as Array<{ data?: { message?: string } }>);
+    // The failed save already put the message in the registry; the retry and the
+    // close flush acknowledge it instead of appending it again.
+    expect(archived.filter(message => message.data?.message === "exactly-once")).toHaveLength(1);
+    const record = f.store.records()[0]!;
+    expect(f.store.messages(record).filter(message => (message as { data?: { message?: string } }).data?.message === "exactly-once")).toHaveLength(1);
+    expect(warn.mock.calls.some(call => String(call[0]).includes("checkpoint barrier failed after the registry commit"))).toBe(true);
   });
 
   it("coalesces native worker status pulses before acquiring locks and flushes the latest state on close", async () => {

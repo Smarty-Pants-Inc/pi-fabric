@@ -1,5 +1,5 @@
-import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type ExtensionAPI, type MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
@@ -12,7 +12,7 @@ export const INCOMING_MESSAGE_TYPES = [
 ] as const;
 
 type IncomingMessage = Parameters<MessageRenderer>[0];
-type Row = { sender: string; body: string; kind: string; full: boolean; attributes: Record<string, string> };
+type Row = { sender: string; body: string; kind: string; full: boolean; attributes: Record<string, string>; span?: readonly [number, number] };
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const decodeXml = (text: string): string => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, name: string) =>
@@ -44,7 +44,7 @@ const rows = (message: IncomingMessage): Row[] => {
   const items = Array.isArray(details.items) ? details.items : [details];
   // A carrier-level recipient applies to each item that has no marker of its own.
   const carrierTo = Array.isArray(details.items) ? details.to ?? record(details.data).to : undefined;
-  const row = (body: string, attrs: Record<string, string>, index: number): Row => {
+  const row = (body: string, attrs: Record<string, string>, index: number, span?: readonly [number, number]): Row => {
     const item = record(items[index]);
     const from = record(item.from);
     const actor = record(item.actor);
@@ -53,12 +53,13 @@ const rows = (message: IncomingMessage): Row[] => {
     const delivery = attrs.delivery ?? (typeof item.delivery === "string" ? item.delivery : record(item.delivery).mode);
     const kind = /^mail\.inbound\b/.test(body) ? "mail.inbound" : String(attrs.kind ?? delivery ??
       (message.customType === "pi-fabric-actor" ? "actor" : message.customType === "pi-fabric-inbox-summary" ? "inbox" : "agent"));
-    return { sender, body, kind, attributes: attrs,
+    return { sender, body, kind, attributes: attrs, ...(span ? { span } : {}),
       full: orgSender(sender) || (attrs.to ?? item.to ?? data.to ?? carrierTo) === "principal" };
   };
   const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
   return matches.length ? matches.map((match, index) => row(
     decodeXml(match[3]!.replace(/\n<data>[\s\S]*?<\/data>\s*$/, "").trim()), attributes(match[2]!), index,
+    [match.index!, match.index! + match[0].length],
   )) : [row(text, {}, 0)];
 };
 const receipt = (from: string, kind: string, value: string): string =>
@@ -98,9 +99,8 @@ class DeliveredDisplayIndex {
   }
 }
 
-const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): Row[] => {
-  const all = rows(message);
-  if (message.customType !== "pi-fabric-inbox") return all;
+const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: ReadonlySet<string>): Row[] => {
+  if (message.customType !== "pi-fabric-inbox") return [...all];
   const carried = record(message.details).receipts;
   const receipts = Array.isArray(carried) ? carried.filter((value): value is string => typeof value === "string") : [];
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
@@ -120,6 +120,29 @@ const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): R
   });
 };
 
+/** The carrier text without the given rows' source spans (and the line break before each). */
+const withoutRows = (text: string, hidden: readonly Row[]): string => hidden
+  .flatMap(row => row.span ? [row.span] : [])
+  .sort((left, right) => right[0] - left[0])
+  .reduce((current, [start, end]) => {
+    const from = start > 0 && current[start - 1] === "\n" ? start - 1 : start;
+    return current.slice(0, from) + current.slice(end);
+  }, text);
+
+/**
+ * Mirrors Pi's native custom-message rendering (label + full markdown body) for a
+ * carrier from which already-delivered rows were removed. Nothing is collapsed or clipped.
+ */
+const fullCarrier = (message: IncomingMessage, hidden: readonly Row[], theme: Parameters<MessageRenderer>[2]) => {
+  const box = new Box(1, 1, text => theme.bg("customMessageBg", text));
+  box.addChild(new Text(theme.fg("customMessageLabel", `\x1b[1m[${message.customType}]\x1b[22m`), 0, 0));
+  box.addChild(new Spacer(1));
+  box.addChild(new Markdown(withoutRows(contentText(message), hidden), 0, 0, getMarkdownTheme(), {
+    color: text => theme.fg("customMessageText", text),
+  }));
+  return box;
+};
+
 /** No context/message hooks: native expanded fallback keeps the entire current rendering. */
 export const registerIncomingMessageRenderers = (
   pi: ExtensionAPI,
@@ -133,11 +156,15 @@ export const registerIncomingMessageRenderers = (
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
       if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
-      const visible = unseenRows(message, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
+      const all = rows(message);
+      const visible = unseenRows(message, all, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
       if (!visible.length) return { render: () => [], invalidate() {} };
       // A native carrier is the burst boundary. If it mixes a principal reply
-      // with chatter, preserve the entire native rendering rather than clip it.
-      if (visible.some(row => row.full)) return undefined;
+      // with chatter, preserve the entire native rendering rather than clip it,
+      // but never let that fallback restore a delivered shadow filtered above.
+      if (visible.some(row => row.full)) {
+        return visible.length === all.length ? undefined : fullCarrier(message, all.filter(row => !visible.includes(row)), theme);
+      }
       const first = visible[0]!;
       const body = Array.from(safeText(first.body));
       const preview = body.length > 80 ? `${body.slice(0, 80).join("")}…` : body.join("");

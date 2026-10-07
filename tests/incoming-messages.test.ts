@@ -206,6 +206,41 @@ describe("incoming Fabric display projection", () => {
     expect(h.render(mixed, true)).toBeUndefined();
   });
 
+  it.each([
+    ["principal-addressed", (text: string) => text.replace('id="unseen"', 'id="unseen" to="principal"'), { ...sender }],
+    ["org-labeled", (text: string) => text, { id: "session:org", name: "org", kind: "main" as const }],
+  ])("keeps a delivered shadow suppressed when an unseen %s row renders in full", (_name, mark, from) => {
+    initTheme("dark", false);
+    const h = harness(); h.setBranch([entry(message())]);
+    const exempt = { ...event("unseen", "Reply for Paul\nFULL_EXEMPT_REPLY", { key: "different" }), from };
+    const base = inbox([event("shadow-1", "SHADOW_DUPLICATE"), exempt]);
+    const burst = { ...base, content: mark(String(base.content)) };
+    const bytes = JSON.stringify(burst);
+    const lines = new CustomMessageComponent(burst, h.renderers.get(burst.customType)).render(120).map(plain);
+    const text = lines.join("\n");
+    expect(text).toContain("Reply for Paul");
+    expect(text).toContain("FULL_EXEMPT_REPLY"); // In full: not collapsed to a one-line preview.
+    expect(text).not.toContain("SHADOW_DUPLICATE");
+    expect(text).not.toContain("↳");
+    // Exactly the native rendering of the carrier minus the delivered shadow's row.
+    const filtered = { ...burst, content: String(burst.content).replace(/\n<event id="shadow-1"[^\n]*<\/event>/, "") };
+    expect(String(filtered.content)).not.toContain("SHADOW_DUPLICATE");
+    expect(lines).toEqual(new CustomMessageComponent(filtered).render(120).map(plain));
+    expect(JSON.stringify(burst)).toBe(bytes); // The carrier itself is untouched.
+    // Expanding still shows the exact native carrier, shadow included.
+    expect(h.render(burst, true)).toBeUndefined();
+  });
+
+  it("keeps the native fallback unchanged for an exempt burst with no filtered rows", () => {
+    initTheme("dark", false);
+    const h = harness(); h.setBranch([]);
+    const org = { ...event("unseen", "Org reply\nFULL_ORG_REPLY", { key: "different" }), from: { id: "session:org", name: "org", kind: "main" as const } };
+    const burst = inbox([event("peer", "Peer chatter"), org]);
+    expect(h.render(burst)).toBeUndefined();
+    expect(new CustomMessageComponent(burst, h.renderers.get(burst.customType)).render(120))
+      .toEqual(new CustomMessageComponent(burst).render(120));
+  });
+
   it("reindexes branch switches and supports older inboxes without receipt metadata", () => {
     const h = harness(); h.setBranch([entry(message())]);
     const value = inbox([event("legacy", "same old work")]); value.details = { ids: ["legacy"] };

@@ -120,21 +120,60 @@ export async function assertWindowsRequestsDirectoryPrivate(directory: string,
     `is pending; the host recreates it with a private DACL.`);
 }
 
+/** Owner + SYSTEM + Administrators only; otherwise throw `Refusing to serve resident requests: ...`. */
+async function assertPrivateDirectory(directory: string, readAcl: WindowsRequestsAclDeps["readAcl"], role: string): Promise<WindowsDirectoryAcl> {
+  let acl: WindowsDirectoryAcl;
+  try {
+    acl = await readAcl(directory);
+  } catch (error) {
+    throw new Error(`Refusing to serve resident requests: cannot verify the DACL of ${role} ${directory} ` +
+      `(${error instanceof Error ? error.message : String(error)})`);
+  }
+  const extra = windowsRequestsAclViolations(acl);
+  if (extra.length === 0) return acl;
+  throw new Error(`Refusing to serve resident requests: ${role} ${directory} is writable by other accounts (${extra.join(", ")}); ` +
+    `only ${acl.user}, SYSTEM and Administrators may own or write it, because an account that can write it can plant ` +
+    `or replace request files.`);
+}
+
+/**
+ * Identity of a real directory (not a symlink or junction): volume, file id and
+ * creation time. On Windows the bigint `ino` is the NTFS file index, so a
+ * directory removed and recreated under the same name gets a new identity.
+ */
+export function windowsDirectoryIdentity(directory: string): string {
+  const stat = fs.lstatSync(directory, { bigint: true });
+  if (!stat.isDirectory()) throw new Error(`${directory} is not a directory`);
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
 /**
  * Create the residency `requests` directory and, on Windows, prove that no other
  * account can plant a request in it before the host consumes any request file.
- * A new Windows directory is restricted under a private staging name and only
- * then renamed into place, so it is never reachable with inherited write ACEs.
+ * The residency directory and its parent are verified first: an account that can
+ * write either could replace `requests` or plant files during creation. A new
+ * `requests` directory is then created under a private staging name inside the
+ * verified residency directory (so it inherits only private ACEs from its first
+ * moment), restricted to explicit grants, verified private and empty, and only
+ * then renamed into place. Returns the verified directory identity on Windows.
  */
 export async function prepareResidentRequestsDirectory(directory: string, platform: NodeJS.Platform = process.platform,
-  deps: WindowsRequestsAclDeps = windowsRequestsAclAdapters): Promise<void> {
-  if (platform !== "win32") { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); return; }
+  deps: WindowsRequestsAclDeps = windowsRequestsAclAdapters): Promise<string | undefined> {
+  if (platform !== "win32") { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); return undefined; }
+  const residency = path.dirname(directory);
+  fs.mkdirSync(residency, { recursive: true, mode: 0o700 });
+  await assertPrivateDirectory(path.dirname(residency), deps.readAcl, "the residency parent");
+  await assertPrivateDirectory(residency, deps.readAcl, "the residency directory");
   if (!fs.existsSync(directory)) {
     const staging = `${directory}.create-${randomUUID()}`;
     fs.mkdirSync(staging, { mode: 0o700 });
     try {
       const { user } = await deps.readAcl(staging);
       await deps.restrict(staging, user);
+      await assertPrivateDirectory(staging, deps.readAcl, "the requests staging directory");
+      if (fs.readdirSync(staging).length !== 0) {
+        throw new Error(`Refusing to serve resident requests: the requests staging directory ${staging} is not empty`);
+      }
       fs.renameSync(staging, directory);
     } catch (error) {
       fs.rmSync(staging, { recursive: true, force: true });
@@ -142,5 +181,80 @@ export async function prepareResidentRequestsDirectory(directory: string, platfo
       if (!fs.existsSync(directory)) throw error;
     }
   }
+  const identity = windowsDirectoryIdentity(directory);
   await assertWindowsRequestsDirectoryPrivate(directory, deps.readAcl);
+  if (windowsDirectoryIdentity(directory) !== identity) {
+    throw new Error(`Refusing to serve resident requests: ${directory} was replaced while its DACL was verified`);
+  }
+  return identity;
+}
+
+/** A verified requests DACL is trusted for at most this long, and only for the same directory identity. */
+export const WINDOWS_REQUESTS_ACL_TTL_MS = 60_000;
+
+export interface WindowsRequestsGuardOptions {
+  platform?: NodeJS.Platform;
+  deps?: WindowsRequestsAclDeps;
+  now?: () => number;
+  identity?: (directory: string) => string;
+}
+
+/**
+ * Guards consumption from the unauthenticated `requests` directory on Windows.
+ * `prepare()` runs once at startup; `assertBeforeConsume()` runs before each
+ * non-empty request batch. It re-checks the directory identity every time and
+ * re-reads the DACL at most once per TTL for that identity. A replaced
+ * directory or a widened DACL latches a refusal: the host stops serving
+ * requests until it restarts, which re-verifies from scratch. POSIX is unchanged.
+ */
+export class WindowsRequestsGuard {
+  #platform: NodeJS.Platform | undefined;
+  #verified: { identity: string; at: number } | undefined;
+  #refusal: Error | undefined;
+  readonly #deps: () => WindowsRequestsAclDeps;
+  readonly #now: () => number;
+  readonly #identity: (directory: string) => string;
+  readonly #options: WindowsRequestsGuardOptions;
+  readonly directory: string;
+
+  constructor(directory: string, options: WindowsRequestsGuardOptions = {}) {
+    this.directory = directory;
+    this.#options = options;
+    this.#deps = () => options.deps ?? windowsRequestsAclAdapters;
+    this.#now = options.now ?? Date.now;
+    this.#identity = options.identity ?? windowsDirectoryIdentity;
+  }
+
+  /** The latched refusal, once requests are no longer served. */
+  get refusal(): Error | undefined { return this.#refusal; }
+
+  async prepare(): Promise<void> {
+    this.#platform = this.#options.platform ?? process.platform;
+    const identity = await prepareResidentRequestsDirectory(this.directory, this.#platform, this.#deps());
+    if (identity !== undefined) this.#verified = { identity, at: this.#now() };
+  }
+
+  /** Throws (and latches) unless the verified requests directory is still in place and private. */
+  async assertBeforeConsume(): Promise<void> {
+    if (this.#platform !== "win32") return;
+    if (this.#refusal) throw this.#refusal;
+    try {
+      const verified = this.#verified;
+      if (!verified) throw new Error(`Refusing to serve resident requests: ${this.directory} was never verified`);
+      const replaced = () => new Error(`Refusing to serve resident requests: ${this.directory} was replaced after ` +
+        `its DACL was verified; restart the resident host to re-verify it`);
+      let identity: string;
+      try { identity = this.#identity(this.directory); } catch { throw replaced(); }
+      if (identity !== verified.identity) throw replaced();
+      if (this.#now() - verified.at < WINDOWS_REQUESTS_ACL_TTL_MS) return;
+      await assertWindowsRequestsDirectoryPrivate(this.directory, this.#deps().readAcl);
+      let after: string;
+      try { after = this.#identity(this.directory); } catch { throw replaced(); }
+      if (after !== verified.identity) throw replaced();
+      this.#verified = { identity, at: this.#now() };
+    } catch (error) {
+      this.#refusal = error instanceof Error ? error : new Error(String(error));
+      throw this.#refusal;
+    }
+  }
 }

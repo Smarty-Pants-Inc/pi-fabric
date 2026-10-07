@@ -6,6 +6,12 @@ import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
+// A veto that persists under custody is retried with fresh state up to the
+// pre-#554 bound. Backoff happens outside the fence (smarty-dev#816).
+const ACTOR_REGISTRY_VETO_RETRY_MS = 5_000;
+const ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS = 10;
+const ACTOR_REGISTRY_VETO_BACKOFF_MAX_MS = 200;
+const VETOED: unique symbol = Symbol("vetoed");
 
 /** A caller validate() veto that persisted under custody: nothing was committed; retry. */
 export class ActorRegistryUpdateVetoedError extends Error {
@@ -185,6 +191,7 @@ export class ActorRegistryStore {
   }
 
   async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
+    const retryUntil = Date.now() + ACTOR_REGISTRY_VETO_RETRY_MS;
     const snapshot = this.snapshot();
     const mutation = select(snapshot.actors);
     if (!mutation) return undefined;
@@ -200,24 +207,38 @@ export class ActorRegistryStore {
     // One optimistic attempt keeps the uncontended fence cheap. After any race,
     // select and prepare under custody: a slow codec must not starve behind even
     // infrequent writers on a CPU-starved host (smarty-dev#816).
-    return this.withLock(() => {
-      // Caller-local cancellation/ownership validation still vetoes publication. A veto
-      // re-selects once from a fresh snapshot; one that persists is never reported as
-      // success: undefined means only that select() declined to write.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const current = this.snapshot();
-        const selected = select(current.actors);
-        if (!selected) return undefined;
-        const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
-        try {
-          if (locked.valid() && selected.validate?.() !== false) {
-            locked.commit();
-            return selected.value;
-          }
-        } finally { locked.dispose(); }
-      }
-      throw new ActorRegistryUpdateVetoedError();
+    // Caller-local cancellation/ownership validation still vetoes publication. A veto
+    // re-selects from a fresh snapshot; one that persists is never reported as
+    // success: undefined means only that select() declined to write.
+    const attempt = (): T | undefined | typeof VETOED => {
+      const current = this.snapshot();
+      const selected = select(current.actors);
+      if (!selected) return undefined;
+      const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
+      try {
+        if (locked.valid() && selected.validate?.() !== false) {
+          locked.commit();
+          return selected.value;
+        }
+      } finally { locked.dispose(); }
+      return VETOED;
+    };
+    let result = await this.withLock(() => {
+      const first = attempt();
+      return first === VETOED ? attempt() : first;
     });
+    // Under contention (load 50+) the veto can persist across back-to-back tries.
+    // Keep retrying with fresh state until the old 5 s bound, holding the fence
+    // only per attempt and never across the jittered backoff (smarty-dev#816).
+    while (result === VETOED) {
+      const remaining = retryUntil - Date.now();
+      if (remaining <= 0) throw new ActorRegistryUpdateVetoedError();
+      const backoff = ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS +
+        Math.random() * (ACTOR_REGISTRY_VETO_BACKOFF_MAX_MS - ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS);
+      await delay(Math.min(backoff, remaining));
+      result = await this.withLock(attempt);
+    }
+    return result;
   }
 
   records(): Array<Record<string, unknown> & { id: string }> {

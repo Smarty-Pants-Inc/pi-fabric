@@ -47,24 +47,57 @@ describe("#4383 bounded registry holds", () => {
     expect(store.records()[0]?.vetoRetried).toBe(3);
   });
 
-  it("#816 throws a typed retryable error, never undefined, when the veto persists under custody", async () => {
+  it("#816 retries a veto that fails 5 times with fresh state and commits within the 5 s bound", async () => {
+    const { store, lock } = fixture();
+    let selections = 0;
+    const holds: boolean[] = [];
+    const started = performance.now();
+    const result = await store.update(current => {
+      selections++;
+      holds.push(fs.existsSync(lock));
+      return { actors: current.map((row, at) => at === 0 ? { ...row, vetoRetried: selections } : row), value: "committed",
+        validate: () => selections > 5 };
+    });
+    expect(result).toBe("committed");
+    expect(selections).toBe(6);
+    // Optimistic selection outside the fence; every retry selects under custody.
+    expect(holds).toEqual([false, true, true, true, true, true]);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(store.records()[0]?.vetoRetried).toBe(6);
+    expect(fs.existsSync(lock)).toBe(false);
+  }, 15_000);
+
+  it("#816 throws a typed retryable error, never undefined, only after the 5 s bound when the veto persists", async () => {
     const { store, actorRoot, lock } = fixture();
     const before = fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8");
     let selections = 0;
+    const started = performance.now();
     const update = store.update(current => {
       selections++;
       return { actors: current.map((row, at) => at === 0 ? { ...row, vetoed: true } : row), value: "committed", validate: () => false };
     });
+    // The fence is released across the backoff: another writer commits meanwhile.
+    const other = new ActorRegistryStore(actorRoot);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await expect(other.update(current => ({ actors: current.map((row, at) => at === 1 ? { ...row, during: true } : row),
+      value: "other" }))).resolves.toBe("other");
+    expect(performance.now() - started).toBeLessThan(4_000);
     await expect(update).rejects.toBeInstanceOf(ActorRegistryUpdateVetoedError);
     await expect(update).rejects.toMatchObject({ code: "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED", retryable: true });
-    expect(selections).toBe(3);
-    expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(before);
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(4_900);
+    expect(elapsed).toBeLessThan(10_000);
+    expect(selections).toBeGreaterThan(3);
+    const after = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as { actors: Array<Record<string, unknown>> };
+    expect(after.actors[1]?.during).toBe(true);
+    expect(after.actors.some(row => row.vetoed !== undefined)).toBe(false);
+    expect(JSON.parse(before).actors.length).toBe(after.actors.length);
     expect(store.records()[0]?.vetoed).toBeUndefined();
     expect(fs.readdirSync(actorRoot).filter(file => file.endsWith(".prepared"))).toEqual([]);
     expect(fs.existsSync(lock)).toBe(false);
     // select() declining to write is still the only undefined outcome.
     await expect(store.update(() => undefined)).resolves.toBeUndefined();
-  });
+  }, 15_000);
 
   it("#816 an awaited actor save rejects instead of resolving when the registry vetoes it", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-veto-save-")); roots.push(root);

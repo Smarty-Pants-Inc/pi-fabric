@@ -289,19 +289,37 @@ export class ResidentHost {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
-    // Global order: actor registries (sorted path), then mesh, for publication,
-    // adoption and controls. Retain registry custody from the fresh source read
-    // through shared commits AND per-key copies. Mesh acquisition has a 50 ms try:
-    // contention unwinds these fences; one host-level retry waits for mesh admission
-    // OUTSIDE custody, then re-selects its source under fresh fences.
-    // Never move a selected snapshot outside custody: a delayed heartbeat could
-    // otherwise republish a successor's adopted actor.
+    // Global order remains registry -> mesh, with the #535 50 ms mesh try.
+    // Prepare actor/presence observations BEFORE acquisition, then validate exact
+    // atomic registry generations under custody and retain custody through publication.
+    // An invalid preparation is discarded and re-selected outside every fence.
+    // Independent liveness may only renew existing keys with matching lineage tokens;
+    // it never claims, creates, removes, or certifies a shared heartbeat.
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
     const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
       ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
+    const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
+    const actorRenewalAllowed = (record: import("../topology/types.js").FabricParticipantRecord): boolean => {
+      for (const known of knownRegistries) {
+        const snapshot = known.store.snapshot(); // cached last-known view unless the atomic generation moved
+        if (snapshot !== known.snapshot) {
+          known.snapshot = snapshot;
+          known.byId = new Map(snapshot.actors.map(row => [row.id, row]));
+        }
+        const row = known.byId.get(record.id);
+        if (row) return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
+          record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+      }
+      return false;
+    };
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       renewActorParticipants: true,                            // host fence outlives its Main
+      actorRenewalAllowed,
+      preparePublicationFence: () => {
+        const generations = registries.map(store => store.fingerprint());
+        return () => registries.every((store, index) => store.fingerprint() === generations[index]);
+      },
       // Legacy list observations may lag; authority snapshots explicitly request fresh.
       listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
@@ -522,6 +540,8 @@ export class ResidentHost {
         canManageActor,
         snapshotActorOwnership,
         lineageAlive,
+        // smarty-dev#6062: read per activation, so turning mode "off" in config takes effect live.
+        deadRootFilter: () => (currentConfig().agents ?? config.agents)?.deadRootFilter,
         claimResidency: "durable",
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and

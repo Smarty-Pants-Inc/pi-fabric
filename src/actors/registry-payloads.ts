@@ -155,12 +155,17 @@ export class ActorRegistryPayloads {
       }
     } catch (error) { dispose(); throw error; }
     const replaced = (): typeof staged => staged.filter(entry => entry.replaced);
+    // Restore every replaced checkpoint even when one barrier fails; rethrow the first failure.
     const rollback = (): void => {
+      let failure: { error: unknown } | undefined;
       for (const entry of replaced().reverse()) {
-        if (entry.previous !== undefined) writeFileAtomic(entry.file, entry.previous, { durable: true });
-        else { fs.rmSync(entry.file, { force: true }); syncPathNamespace(path.dirname(entry.file)); }
+        try {
+          if (entry.previous !== undefined) writeFileAtomic(entry.file, entry.previous, { durable: true });
+          else { fs.rmSync(entry.file, { force: true }); syncPathNamespace(path.dirname(entry.file)); }
+        } catch (error) { failure ??= { error }; }
         entry.replaced = false;
       }
+      if (failure) throw failure.error;
     };
     return {
       publish: (): string[] => {

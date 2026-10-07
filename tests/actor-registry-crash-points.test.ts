@@ -166,7 +166,7 @@ describe.each(PLATFORMS.map(platform => ({ platform, windows: platform === "win3
     expect([...outcomes].sort()).toEqual(["new", "old"]);
   }, 120_000);
 
-  it("fails closed when both checkpoint barrier attempts fail: update() rejects and readers see a consistent registry (pi-fabric#590 review round 2)", async () => {
+  it("fails closed when every checkpoint barrier attempt fails: the commit is rolled back under the lock, update() rejects and readers see a consistent registry (pi-fabric#590)", async () => {
     usePlatform(platform);
     const { actorRoot, store } = await fixture();
     const registries = new Set(ids.map(id => path.join(actorRoot, id, "registry")));
@@ -184,8 +184,9 @@ describe.each(PLATFORMS.map(platform => ({ platform, windows: platform === "win3
       original.rm(file, options);
       if (String(file).endsWith("actors.json.lock")) unlocked = true;
     });
-    // Every checkpoint directory barrier fails AFTER the lock is released, i.e. both
-    // deferred settle() attempts. Pre-custody barriers of the same directory succeed.
+    // Every checkpoint directory barrier fails AFTER the commit's lock is released: both
+    // deferred settle() attempts and both retries under the reacquired lock.
+    // Pre-custody barriers of the same directory succeed.
     vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
       const file = paths.get(fd);
       if (fs.fstatSync(fd).isDirectory()) directorySyncs++;
@@ -225,15 +226,19 @@ describe.each(PLATFORMS.map(platform => ({ platform, windows: platform === "win3
       return;
     }
     expect(directorySyncs).toBeGreaterThan(0);
-    // No success: a clear, retryable error that says the registry already committed.
+    // No success: a clear, retryable error. Nobody committed on top, so the commit was
+    // rolled back under the lock: nothing is acknowledged and the caller re-appends.
     expect(error).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
     const barrier = error as ActorRegistryCheckpointBarrierError<boolean>;
-    expect(barrier.message).toMatch(/checkpoint barrier failed after the registry commit; the save is not acknowledged/);
+    expect(barrier.message).toMatch(/checkpoint barrier failed under the registry lock; the commit was rolled back/);
     expect(barrier.retryable).toBe(true);
-    expect(barrier.committed).toEqual({ value: true });
+    expect(barrier.rolledBack).toBe(true);
+    expect(barrier.committed).toBeUndefined();
     expect([...barrier.directories].sort()).toEqual([...registries].sort());
-    for (const directory of registries) expect(failures.get(directory)).toBe(2);
-    consistent([m0, m1]);
+    // Two deferred attempts, two retries under the reacquired lock, then the rollback's
+    // own (best-effort) barrier: the directory stays owed.
+    for (const directory of registries) expect(failures.get(directory)).toBe(5);
+    consistent([m0]);
 
     // While the owed barrier still fails, the next update fails closed BEFORE it
     // writes anything: no registry rename, no append, no success.
@@ -248,13 +253,112 @@ describe.each(PLATFORMS.map(platform => ({ platform, windows: platform === "win3
     expect(selected).toBe(false);
     expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(registryBefore);
     expect(ids.map(id => fs.statSync(path.join(actorRoot, id, "registry", "messages.jsonl")).size)).toEqual(logsBefore);
-    consistent([m0, m1]);
+    consistent([m0]);
 
     // Once the barrier works again, the owed barrier settles first and the save succeeds.
     failing = false;
     await expect(store.update(current => ({ actors: current.map(row => ({ ...withoutRefs(row),
       registryMessageAppend: [{ id: "m2", direction: "in", text: "next" }] })), value: "ok" }))).resolves.toBe("ok");
     vi.restoreAllMocks();
-    consistent([m0, m1, { id: "m2", direction: "in", text: "next" }]);
+    consistent([m0, { id: "m2", direction: "in", text: "next" }]);
+  });
+
+  // pi-fabric#590 security round: an OLDER-release writer knows nothing about owed
+  // barriers; only the registry lock stops it. It saves its owned rows without the
+  // selecting `messageHistory` reference, so after an OS crash the checkpoint is the
+  // only selector. Model the crash precisely: a checkpoint rename whose directory
+  // barrier never succeeded is lost, i.e. each checkpoint reverts to its content at
+  // the last successful barrier of its directory.
+  const olderWriterScenario = async (options: { recoverUnderLock: boolean }) => {
+    usePlatform(platform);
+    const { actorRoot, store } = await fixture();
+    const lockPath = path.join(actorRoot, "actors.json.lock");
+    const registries = new Set(ids.map(id => path.join(actorRoot, id, "registry")));
+    const headFile = (directory: string) => path.join(directory, "messages-head.json");
+    const durableHead = new Map([...registries].map(directory => [directory, fs.readFileSync(headFile(directory), "utf8")]));
+    const paths = new Map<number, string>();
+    const original = { open: fs.openSync, fsync: fs.fsyncSync, rm: fs.rmSync, exists: fs.existsSync };
+    let unlocked = false;
+    const failedBarriers: Array<{ directory: string; lockHeld: boolean }> = [];
+    const olderCommits: Array<{ unsynced: string[] }> = [];
+    let olderWriter: Promise<void> | undefined;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
+      const fd = (original.open as (...args: unknown[]) => number)(file, ...rest);
+      paths.set(fd, String(file));
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "rmSync").mockImplementation((file: fs.PathLike, options?: fs.RmOptions) => {
+      original.rm(file, options);
+      if (String(file).endsWith("actors.json.lock")) unlocked = true;
+    });
+    // An older release's owned save: under the registry lock, rows without the selecting
+    // reference and with an empty inline ring, written with its own durable atomic write.
+    const startOlderWriter = () => new ActorRegistryStore(actorRoot).withLock(() => {
+      olderCommits.push({ unsynced: [...registries].filter(directory =>
+        fs.readFileSync(headFile(directory), "utf8") !== durableHead.get(directory)) });
+      const raw = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as { actors: Record<string, unknown>[] };
+      const tmp = path.join(actorRoot, "actors.json.older.tmp");
+      fs.writeFileSync(tmp, JSON.stringify({ format: 1, actors: raw.actors.map(row => ({ ...withoutRefs(row), messages: [] })) }));
+      fs.renameSync(tmp, path.join(actorRoot, "actors.json"));
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      const file = paths.get(fd);
+      if (unlocked && file && registries.has(file)) {
+        const lockHeld = original.exists(lockPath);
+        if (!(options.recoverUnderLock && lockHeld)) {
+          failedBarriers.push({ directory: file, lockHeld });
+          // After both deferred attempts failed, an older writer tries to commit.
+          if (lockHeld && !olderWriter) olderWriter = startOlderWriter();
+          throw Object.assign(new Error("EIO: checkpoint barrier"), { code: "EIO" });
+        }
+      }
+      original.fsync(fd);
+      if (file && registries.has(file)) durableHead.set(file, fs.readFileSync(headFile(file), "utf8"));
+    });
+    const outcome = await appendAll(store).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    if (!olderWriter) olderWriter = startOlderWriter();
+    await olderWriter;
+    vi.restoreAllMocks();
+    // Windows has no directory fsync (renames are not modelled as losable here).
+    if (windows) return { outcome, failedBarriers };
+    // What the manager treats as appended: a success, or an error carrying `committed`.
+    const acknowledged = outcome.ok || (outcome.error instanceof ActorRegistryCheckpointBarrierError && outcome.error.committed)
+      ? [m0, m1] : [m0];
+    // The older writer never committed over a checkpoint whose barrier had not succeeded.
+    expect(olderCommits).toEqual([{ unsynced: [] }]);
+    // OS crash now: unsynced checkpoint renames are lost.
+    for (const directory of registries) fs.writeFileSync(headFile(directory), durableHead.get(directory)!);
+    const fresh = new ActorRegistryStore(actorRoot);
+    expect(fresh.records().map(row => row.id).sort()).toEqual(ids);
+    for (const row of fresh.records()) {
+      expect(row.messageHistory).toBeUndefined();
+      // Recovery selects the checkpoint and keeps every acknowledged message, nothing more.
+      expect(fresh.messages(row)).toEqual(acknowledged);
+    }
+    return { outcome, failedBarriers };
+  };
+
+  it("an older-release writer cannot commit over an unsynced checkpoint after both deferred barriers fail; a crash keeps every acknowledged message (pi-fabric#590 security round)", async () => {
+    const { outcome, failedBarriers } = await olderWriterScenario({ recoverUnderLock: false });
+    if (windows) { expect(outcome.ok).toBe(true); expect(failedBarriers).toEqual([]); return; }
+    expect(outcome.ok).toBe(false);
+    const error = (outcome as { error: unknown }).error as ActorRegistryCheckpointBarrierError;
+    expect(error).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
+    expect(error.rolledBack).toBe(true);
+    expect(error.committed).toBeUndefined();
+    // Per directory: two deferred failures outside the lock, then two retries and the
+    // rollback's barrier under it.
+    for (const directory of new Set(failedBarriers.map(entry => entry.directory))) {
+      expect(failedBarriers.filter(entry => entry.directory === directory).map(entry => entry.lockHeld)).toEqual([false, false, true, true, true]);
+    }
+  });
+
+  it("a deferred barrier that fails twice succeeds under the reacquired lock: the save is acknowledged and survives a crash (pi-fabric#590 security round)", async () => {
+    const { outcome, failedBarriers } = await olderWriterScenario({ recoverUnderLock: true });
+    expect(outcome.ok).toBe(true);
+    if (windows) { expect(failedBarriers).toEqual([]); return; }
+    expect(failedBarriers.length).toBe(ids.length * 2);
+    expect(failedBarriers.every(entry => !entry.lockHeld)).toBe(true);
   });
 });

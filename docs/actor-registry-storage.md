@@ -49,18 +49,31 @@ it survives a legacy owned-row save that removes `messageHistory`. Unchanged
 checkpoints are not rewritten. A checkpoint rename failure under the lock rolls
 back changed checkpoints and the registry; later commits never select an
 abandoned append. A checkpoint directory barrier that fails after the lock was
-released is retried once; if it still fails the save **fails closed**
-(pi-fabric#590): `update()` rejects with a retryable
-`ActorRegistryCheckpointBarrierError` and never reports success, the store's
-cached snapshot is invalidated, and the barrier stays owed. The registry rename
-is already durable and the checkpoint is already renamed, so every reader sees
-one consistent state (registry and checkpoint agree; after an OS crash the
-checkpoint can only lag). It is not rolled back outside custody, where another
-writer may already build on it. The error carries the committed value, so the
-manager acknowledges exactly the appended prefix instead of appending it again.
+released is retried once. If it still fails, the save takes the **slow path**
+(pi-fabric#590 security round): it reacquires the registry lock and retries the
+barrier under it. Older releases know nothing about owed barriers; the registry
+lock is the only thing every supported writer honours, so no writer of any
+release can commit on top of the unsynced checkpoint while the slow path runs.
+The lock is released only after the barrier succeeded (the save is then
+acknowledged normally) or after the commit was rolled back. If the barrier still
+fails under the lock and the registry is still this commit, the registry is
+durably restored to its prior bytes and the checkpoints are restored (best
+effort; their directories stay owed). `update()` then rejects with a retryable
+`ActorRegistryCheckpointBarrierError` whose `rolledBack` is set and whose
+`committed` is undefined: nothing is acknowledged, the store's cached snapshot is
+invalidated, and the manager re-appends the messages on retry. The fast path is
+unchanged: a barrier that succeeds runs outside the lock.
+Only if another writer committed in the short interval between the release and
+the reacquisition (the generation moved) can the commit no longer be rolled back:
+the error then carries the committed value, so the manager acknowledges exactly
+the appended prefix instead of appending it again, and the barrier stays owed.
 The next update from that store retries every owed barrier before it selects or
 writes anything and, while one still fails, rejects without committing. A
-removed actor directory owes no barrier.
+removed actor directory owes no barrier. `tests/actor-registry-crash-points.test.ts`
+proves the slow path with an older-release-shaped writer (drops
+`messageHistory`) and an OS-crash model in which unsynced checkpoint renames are
+lost: the older writer never commits over an unsynced checkpoint and recovery
+keeps every acknowledged message.
 A crash may leave stray `messages-head.json.*.prepared` temp files; they are
 never read.
 

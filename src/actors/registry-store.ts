@@ -23,20 +23,27 @@ export class ActorRegistryUpdateVetoedError extends Error {
   }
 }
 
-/** A checkpoint directory barrier failed twice; the save is NOT acknowledged
- * (smarty-dev#6477 L7, pi-fabric#590 review round 2). `committed` is set when the
- * registry rename already happened: the registry then durably references the new
- * heads (callers must not re-append those messages), but a checkpoint may still lag
- * it after an OS crash. When `committed` is undefined, nothing was written: an
- * earlier owed barrier still fails. The barrier stays owed and is retried before
+/** A checkpoint directory barrier failed; the save is NOT acknowledged
+ * (smarty-dev#6477 L7, pi-fabric#590). A deferred barrier that fails after the lock
+ * was released is retried UNDER the registry lock, so no writer of any release can
+ * commit on top of the unsynced checkpoint meanwhile. If it still fails there and
+ * no other writer committed in between, the commit is rolled back under that same
+ * lock (`rolledBack`, `committed` undefined: callers re-append on retry). `committed`
+ * is set only when another writer already built on the commit before the lock was
+ * reacquired: the registry then references the new heads (callers must not
+ * re-append those messages). When neither is set, nothing was written: an earlier
+ * owed barrier still fails. A failed directory stays owed and is retried before
  * the next update writes anything. */
 export class ActorRegistryCheckpointBarrierError<T = unknown> extends Error {
   readonly code = "FABRIC_ACTOR_REGISTRY_CHECKPOINT_BARRIER";
   readonly retryable = true;
-  constructor(readonly directories: readonly string[], readonly committed: { value: T } | undefined, cause: unknown) {
+  constructor(readonly directories: readonly string[], readonly committed: { value: T } | undefined, cause: unknown,
+    readonly rolledBack = false) {
     super(`${committed
       ? "Actor registry checkpoint barrier failed after the registry commit; the save is not acknowledged as durable"
-      : "An earlier actor registry checkpoint barrier still fails; nothing was committed"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      : rolledBack
+        ? "Actor registry checkpoint barrier failed under the registry lock; the commit was rolled back and nothing was committed"
+        : "An earlier actor registry checkpoint barrier still fails; nothing was committed"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     this.name = "ActorRegistryCheckpointBarrierError";
   }
 }
@@ -201,6 +208,7 @@ export class ActorRegistryStore {
     }
     let renamed = false;
     let owed: string[] = [];
+    let committedGeneration: string | undefined;
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
       /** Under custody: the registry rename plus its one directory barrier, then
@@ -211,6 +219,7 @@ export class ActorRegistryStore {
         try {
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
+          committedGeneration = this.fingerprint();
           if (durable) syncDirectoryChain(this.#actorRoot);
           owed = heads.publish();
           published = true;
@@ -227,9 +236,43 @@ export class ActorRegistryStore {
           throw error;
         }
       },
-      /** Outside custody: complete deferred checkpoint barriers before acknowledging.
-       * Throws (fails closed) when a barrier cannot be completed; see #settleBarriers. */
-      settle: (): void => { const directories = owed; owed = []; this.#settleBarriers(directories); },
+      /** Outside custody (fast path): complete deferred checkpoint barriers before
+       * acknowledging. SLOW PATH (pi-fabric#590 security round): when they fail, the
+       * registry lock is reacquired and the barriers are retried under it, so no writer
+       * (including an older release that knows nothing of owed barriers) commits on
+       * top of an unsynced checkpoint. The lock is released only after the barrier
+       * succeeded or the commit was rolled back. Throws (fails closed) otherwise. */
+      settle: async (): Promise<void> => {
+        const directories = owed; owed = [];
+        let failure: ActorRegistryCheckpointBarrierError;
+        try { this.#settleBarriers(directories); return; }
+        catch (error) { if (!(error instanceof ActorRegistryCheckpointBarrierError)) throw error; failure = error; }
+        try {
+          await this.withLock(() => {
+            try { this.#settleBarriers(failure.directories); return; }
+            catch (error) { if (!(error instanceof ActorRegistryCheckpointBarrierError)) throw error; failure = error; }
+            // Another writer committed on top before custody was reacquired: the commit
+            // can no longer be rolled back; it stays committed and the barrier owed.
+            if (committedGeneration === undefined || this.fingerprint() !== committedGeneration) throw failure;
+            this.#snapshot = undefined;
+            try {
+              if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
+              else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
+            } catch (error) {
+              // Still our registry (the restore did not rename): it remains committed.
+              if (this.fingerprint() === committedGeneration) throw failure;
+              throw new ActorRegistryCheckpointBarrierError(failure.directories, undefined, error, true);
+            }
+            // Best effort: the restored checkpoints sit in the same failing directories,
+            // which stay owed. The registry no longer references the rolled-back heads.
+            try { heads.rollback(); } catch { /* Directories stay owed. */ }
+            throw new ActorRegistryCheckpointBarrierError(failure.directories, undefined, failure.cause, true);
+          });
+        } catch (error) {
+          if (error instanceof ActorRegistryLockTimeoutError) throw failure;
+          throw error;
+        }
+      },
       dispose: () => { fs.rmSync(temporary, { force: true }); heads.dispose(); },
     };
   }
@@ -263,11 +306,11 @@ export class ActorRegistryStore {
   }
 
   /** Post-commit settle: a barrier failure becomes a non-success that still tells the
-   * caller the registry already references this commit. */
-  #settleCommitted<T>(settle: () => void, value: T): void {
-    try { settle(); }
+   * caller the registry already references this commit, unless it was rolled back. */
+  async #settleCommitted<T>(settle: () => Promise<void>, value: T): Promise<void> {
+    try { await settle(); }
     catch (error) {
-      if (!(error instanceof ActorRegistryCheckpointBarrierError)) throw error;
+      if (!(error instanceof ActorRegistryCheckpointBarrierError) || error.rolledBack) throw error;
       throw new ActorRegistryCheckpointBarrierError<T>(error.directories, { value }, error.cause);
     }
   }
@@ -305,7 +348,7 @@ export class ActorRegistryStore {
         prepared.commit({ deferBarriers: true });
         return true;
       });
-      if (committed) { this.#settleCommitted(prepared.settle, mutation.value); return mutation.value; }
+      if (committed) { await this.#settleCommitted(prepared.settle, mutation.value); return mutation.value; }
     } finally { prepared.dispose(); }
     vetoed = true;
     // One optimistic attempt keeps the uncontended fence cheap. After any race,
@@ -316,7 +359,7 @@ export class ActorRegistryStore {
     // success: undefined means only that select() declined to write.
     // Under custody, a fresh preparation also appends under custody: that cost is
     // paid only after a race, never on the uncontended path.
-    let settle: (() => void) | undefined;
+    let settle: (() => Promise<void>) | undefined;
     let settled: T | undefined;
     const attempt = (): T | undefined | typeof VETOED => {
       live();
@@ -352,7 +395,7 @@ export class ActorRegistryStore {
       // locked() rechecks the deadline after the backoff, before trying the fence.
       result = await locked(attempt);
     }
-    if (settle) this.#settleCommitted(settle, settled as T);
+    if (settle) await this.#settleCommitted(settle, settled as T);
     return result;
   }
 

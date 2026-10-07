@@ -41,6 +41,20 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("targeted publish outcomes", () => {
+  it("records unknown-target refusal at the sender, but leaves broadcast publication unchanged", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-publish-failed-")); roots.push(root);
+    const source = { get: () => undefined, list: () => [] } as unknown as FabricParticipantSource;
+    const provider = new MeshProvider(new MeshStore(path.join(root, "mesh"), 64 * 1024, 100), identity, source);
+    await expect(provider.invoke("publish", { topic: "work", to: "missing", text: "hello" }, context)).rejects.toThrow("Unknown Fabric target");
+    const directory = path.join(provider.store.root, "delivery-outcomes");
+    const rows = fs.readdirSync(directory).flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(rows).toEqual([{ eventId: expect.any(String), to: "missing", from: identity.id, mode: "publish", outcome: "failed", reason: "Unknown Fabric target: missing", at: expect.any(Number) }]);
+    expect(provider.store.latestSequence()).toBe(0);
+    await expect(provider.invoke("publish", { topic: "work", text: "broadcast" }, context)).resolves.toMatchObject({ topic: "work", text: "broadcast" });
+  });
+});
+
 describe("MeshProvider membership", () => {
   it("reserves topology state and acknowledged control topics for the host", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-provider-"));

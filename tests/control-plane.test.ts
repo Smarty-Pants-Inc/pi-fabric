@@ -51,6 +51,30 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("sender final delivery outcomes", () => {
+  const outcomes = (root: string) => {
+    const directory = path.join(root, "delivery-outcomes");
+    return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+  };
+  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records a definite refusal (%s) at the sender", async reason => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-failed-")); roots.push(root);
+    const owner = plane(root, "host:owner"), sender = plane(root, "host:sender");
+    owner.start(() => ({ accepted: false, error: reason })); sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:owner", "session:target", "followUp", { message: "later" })).rejects.toThrow(reason);
+    const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "failed", reason, at: expect.any(Number) }]);
+  });
+  it("records timeout unknown without falsely treating admission as delivered", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-unknown-")); roots.push(root);
+    const sender = plane(root, "host:sender", {}, { acknowledgementTimeoutMs: 30, pollMs: 5 });
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:missing", "session:target", "steer", { message: "hello" })).rejects.toThrow("outcome is unknown");
+    const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "steer", outcome: "unknown", reason: expect.stringContaining("outcome is unknown"), at: expect.any(Number) }]);
+  });
+});
+
 describe("FabricControlPlane", () => {
   it.each([false, true])("only sheds an optional warning, not delivery fields or an oversized core (oversized=%s)", async oversized => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-advisory-budget-")); roots.push(root);

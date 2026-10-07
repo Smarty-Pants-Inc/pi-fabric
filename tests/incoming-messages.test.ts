@@ -109,11 +109,30 @@ describe("incoming Fabric display projection", () => {
     expect(h.render(inbox([event("shadow-1", "duplicate")]))).toEqual([]);
     const mixed = inbox([event("shadow-1", "duplicate"), event("unseen", "new work", { key: "different" })]);
     expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: new work");
+    expect(plain(h.render(inbox([event("same-event", "first", {}), event("same-event", "duplicate second", {})]))![0]!))
+      .toBe(" ↳ Build & Test: first");
     const delivery = { ...message(), details: { id: "native-2", from: sender, data: { deliveryId: "D1", key: "same-work" } } };
     h.setBranch([entry(message()), entry(delivery)]);
     expect(h.render(inbox([event("d1", "duplicate D1", { deliveryId: "D1" })]))).toEqual([]);
     expect(plain(h.render(inbox([event("d2", "new D2", { deliveryId: "D2", key: "same-work" })]))![0]!)).toContain("new D2");
     expect(h.render(mixed, true)).toBeUndefined();
+  });
+
+  it("dedupes an inbox event id repeated a minute later, without hiding the original or new rows", () => {
+    const h = harness();
+    const first = inbox([event("ca71cd8c", "first copy", {})]);
+    const second = { ...inbox([event("ca71cd8c", "repeat", {}), event("new", "new work", {})]), timestamp: first.timestamp + 60_000 };
+    h.setBranch([entry(first), entry(second)]);
+    expect(plain(h.render(first)![0]!)).toContain("first copy");
+    expect(plain(h.render(second)![0]!)).toBe(" ↳ Build & Test: new work");
+    expect(plain(h.render(second, true)!.join("\n"))).toContain("new work");
+    expect(plain(h.render(second, true)!.join("\n"))).not.toContain("repeat");
+    h.setMode("expanded");
+    expect(plain(h.render(second)!.join("\n"))).toContain("new work");
+    expect(plain(h.render(second)!.join("\n"))).not.toContain("repeat");
+    h.setMode("collapsed");
+    h.setBranch([entry(second)]);
+    expect(plain(h.render(second)![0]!)).toContain("repeat");
   });
 
   it("reindexes branch switches and supports older inboxes without receipt metadata", () => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -158,6 +159,9 @@ export class RootInbox {
     if (state.pending) {
       const pending = this.#reread(state.after, state.pending);
       if (session.holdsBatch(state.pending.ids)) {
+        for (const event of pending) appendDeliveryOutcome(this.mesh.root, {
+          eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish",
+        }, "delivered", "consumed by Main inbox as itself", this.#now());
         this.#remember(pending.flatMap(eventReceipts));
       } else {
         // A missing retained event proves neither delivery nor expiry. Keep its id pending.
@@ -341,7 +345,7 @@ export class RootInbox {
       if (page.length === 0) break;
       for (const event of page) {
         if (event.sequence > pending.through) return found;
-        if (ids.has(event.id)) found.push(event);
+        if (ids.delete(event.id)) found.push(event);
         cursor = Math.max(cursor, event.sequence);
       }
       if (page.length < pageSize) break;
@@ -510,7 +514,10 @@ export const rootInboxSummary = (batch: RootInboxBatch) => ({
   details: { skippedStale: batch.skippedStale ?? 0, horizonMs: batch.horizonMs ?? INBOX_HORIZON_MS },
 });
 /** The one message that brings a batch into the session. */
-export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
+export const rootInboxMessage = (input: readonly MeshEvent[]) => {
+  const seen = new Set<string>();
+  const events = input.filter(event => !seen.has(event.id) && !!seen.add(event.id));
+  return ({
   customType: ROOT_INBOX_CUSTOM_TYPE,
   content: [
     `<fabric-inbox count="${events.length}">`,
@@ -530,4 +537,5 @@ export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
   ].join("\n"),
   display: true,
   details: { ids: events.map((event) => event.id), receipts: events.flatMap(eventReceipts) },
-});
+  });
+};

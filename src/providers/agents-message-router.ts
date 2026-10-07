@@ -1,3 +1,4 @@
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
@@ -111,7 +112,7 @@ export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -355,6 +356,12 @@ export class AgentMessageRouter {
         : await this.#withDurableRecovery(id, recovering =>
           this.#withDirectory(() => this.#route(id, message, data, kind, context, options, false, !recovering), id, !recovering));
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
+      if (root && !(error instanceof Error && "code" in error && error.code === "FABRIC_CONTROL_REJECTED") && /^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason)) {
+        appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", reason);
+      }
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
@@ -494,6 +501,7 @@ export class AgentMessageRouter {
           principal: options.principal,
           message,
           delivery: kind,
+          outcomeSend: { eventId: options.idempotencyKey!, to: this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
             : {}),
@@ -608,6 +616,7 @@ export class AgentMessageRouter {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
         provenance,
+        outcomeSend: { eventId: options.idempotencyKey!, to: actor.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
         ...(binding ? { overrides: binding } : {}),
       });
       return { queued: true, messageId: result.messageId, routed: "local" };
@@ -735,6 +744,7 @@ export class AgentMessageRouter {
         message,
         delivery: command.operation,
         deliveryId: command.commandId,
+        outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),

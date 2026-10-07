@@ -60,6 +60,7 @@ describe("a bare session UUID (smarty-dev#1729)", () => {
     // The actor ID is unchanged; the registered local producer owns sender metadata.
     // An invocation without a stamped requester must not manufacture a principal.
     expect(tell).toHaveBeenCalledWith(ACTOR, "hi", undefined, {
+      outcomeSend: { eventId: expect.any(String), to: ACTOR, from: "session:self", mode: "followUp" },
       provenance: {
         v: 1, channel: "fabric", via: "followUp",
         sender: { id: "session:self", name: "main", kind: "main", verified: "mesh" },

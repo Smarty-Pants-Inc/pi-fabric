@@ -1,5 +1,5 @@
 import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
@@ -12,7 +12,7 @@ export const INCOMING_MESSAGE_TYPES = [
 ] as const;
 
 type IncomingMessage = Parameters<MessageRenderer>[0];
-type Row = { sender: string; body: string; attributes: Record<string, string> };
+type Row = { sender: string; body: string; fullBody: string; attributes: Record<string, string> };
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const decodeXml = (text: string): string => text.replace(/&(amp|lt|gt|quot|apos);/g, (_match, name: string) =>
@@ -40,13 +40,13 @@ const rows = (message: IncomingMessage): Row[] => {
   const matches = [...text.matchAll(/<(fabric-agent-message|fabric-actor|event)\b([^>]*)>([\s\S]*?)<\/\1>/g)];
   if (matches.length) return matches.map(match => {
     const attrs = attributes(match[2]!);
-    return { sender: attrs.from_name ?? attrs.name ?? "Fabric", attributes: attrs,
+    return { sender: attrs.from_name ?? attrs.name ?? "Fabric", attributes: attrs, fullBody: decodeXml(match[3]!.trim()),
       body: decodeXml(match[3]!.replace(/\n<data>[\s\S]*?<\/data>\s*$/, "").trim()) };
   });
   const details = record(message.details);
   const from = record(details.from);
   const actor = record(details.actor);
-  return [{ sender: String(from.name ?? actor.name ?? "Fabric"), body: text, attributes: {} }];
+  return [{ sender: String(from.name ?? actor.name ?? "Fabric"), body: text, fullBody: text, attributes: {} }];
 };
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
@@ -85,6 +85,20 @@ class DeliveredDisplayIndex {
   }
 }
 
+/** Only earlier inbox carriers count; rendering the first carrier must not hide itself. */
+const priorInboxReceipts = (entries: readonly unknown[], message: IncomingMessage): Set<string> => {
+  const seen = new Set<string>();
+  for (const raw of entries) {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") continue;
+    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
+    if (entry.details === message.details || (entry.content === message.content && at === message.timestamp)) break;
+    const ids = record(entry.details).ids;
+    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") seen.add(receipt("", "event", id));
+  }
+  return seen;
+};
+
 const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): Row[] => {
   const all = rows(message);
   if (message.customType !== "pi-fabric-inbox") return all;
@@ -93,7 +107,11 @@ const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): R
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
   // This lets mixed batches hide only duplicates, including deliveryId-only shadows.
   const boundaries = all.map(row => row.attributes.id ? receipts.indexOf(receipt("", "event", row.attributes.id)) : -1);
+  const seen = new Set<string>();
   return all.filter((row, index) => {
+    const id = row.attributes.id;
+    if (id && (seen.has(id) || delivered.has(receipt("", "event", id)))) return false;
+    if (id) seen.add(id);
     const start = boundaries[index]!;
     if (start >= 0) {
       const next = boundaries.slice(index + 1).find(value => value > start) ?? receipts.length;
@@ -101,8 +119,8 @@ const unseenRows = (message: IncomingMessage, delivered: ReadonlySet<string>): R
       // work key when a distinct deliveryId/messageId says this is unseen work.
       return !receipts.slice(start + 1, next).some(value => delivered.has(value));
     }
-    const { from_id: from, id, key, ref } = row.attributes;
-    return !from || ![["id", id], ["key", key], ["ref", ref]].some(([kind, value]) =>
+    const { from_id: from, id: rowId, key, ref } = row.attributes;
+    return !from || ![["id", rowId], ["key", key], ["ref", ref]].some(([kind, value]) =>
       value && delivered.has(receipt(from, kind!, value)));
   });
 };
@@ -119,8 +137,25 @@ export const registerIncomingMessageRenderers = (
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
-      const visible = unseenRows(message, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
+      const history = type === "pi-fabric-inbox" ? entries() : [];
+      const prior = priorInboxReceipts(history, message);
+      if (options.expanded || !incomingMessagesCollapsed(mode())) {
+        if (type !== "pi-fabric-inbox") return undefined;
+        const all = rows(message); const seen = new Set<string>();
+        const unique = all.filter(row => {
+          const id = row.attributes.id;
+          if (id && (seen.has(id) || prior.has(receipt("", "event", id)))) return false;
+          if (id) seen.add(id);
+          return true;
+        });
+        if (unique.length === all.length) return undefined; // Unchanged native expanded rendering.
+        return { render: width => unique.flatMap(row =>
+          [`${row.sender}:`, ...row.fullBody.split("\n")].flatMap(line =>
+            wrapTextWithAnsi(safeText(line), Math.max(1, width)))), invalidate() {} };
+      }
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history) : []);
+      for (const id of prior) receipts.add(id);
+      const visible = unseenRows(message, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
       const first = visible[0]!;
       const body = Array.from(safeText(first.body));

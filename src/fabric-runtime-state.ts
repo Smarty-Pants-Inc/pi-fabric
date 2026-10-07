@@ -584,6 +584,10 @@ export class FabricRuntimeState {
       !enforceSchema &&
       projectTrusted &&
       this.#config.mesh.enabled;
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    const configuredMeshRoot = this.#config.mesh.root;
+    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (configuredMeshRoot
+      ? path.resolve(projectRoot, configuredMeshRoot) : path.join(projectRoot, ".pi", "fabric", "mesh"));
     const mainAgent = new MainAgentController(
       this.pi,
       mainAgentId,
@@ -592,15 +596,9 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
+      meshRoot,
     );
     this.#mainAgent = mainAgent;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const configuredMeshRoot = this.#config.mesh.root;
-    const meshRoot =
-      process.env.PI_FABRIC_MESH_ROOT ??
-      (configuredMeshRoot
-        ? path.resolve(projectRoot, configuredMeshRoot)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;

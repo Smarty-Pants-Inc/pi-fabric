@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -59,6 +60,8 @@ export interface FabricMainAgentDeliveryRequest {
    * so the sender may delete its record after a return (review round 2 on pi-fabric#160).
    */
   deliveryId?: string;
+  /** Host-owned outcome identity; retained until native consumption. */
+  outcomeSend?: DeliverySend;
 }
 
 /** How far behind a Main is on followUps, so a sender can switch to steer (smarty-dev#1495). */
@@ -197,6 +200,8 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
     deliveryId.startsWith("resident:") && source !== "actor-output");
 
 export interface HeldAgentMessage {
+  outcomeSend?: DeliverySend;
+  supersededSends?: DeliverySend[];
   id: string;
   from: MeshIdentity;
   /** Resident producer evidence, retained even on hosts without Pi provenance support. */
@@ -355,6 +360,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     readonly sessionId?: string,
     readonly interactive = true,
     readonly onProviderWakeReleased?: (event: { until: string; messageIds: string[] }) => void,
+    readonly meshRoot?: string,
   ) {}
 
   matches(id: string): boolean {
@@ -501,6 +507,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     const item: HeldAgentMessage = {
       id: randomUUID(),
+      ...(request.outcomeSend ? { outcomeSend: request.outcomeSend } : {}),
       from: sender,
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
@@ -560,6 +567,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         // smarty-dev#2339 F2: a failed mesh delete can outlive the last 2000 consumed ids.
         // The replacement journals every superseded delivery id until the carrier is consumed.
         item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
+        item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
       }
       // Charge the proposed ancestry before mutating or acknowledging either carrier.
       this.#admit(item, replaced);
@@ -581,6 +589,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
+      this.#recordSuperseded(item);
+      this.#trySave();
       if (providerHeld) this.#scheduleProviderWake();
       else if (this.#context && promptPending(this.#context)) this.#wakeAfterPreflight();
       else if (this.#context?.isIdle()) {
@@ -865,7 +875,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     // not sent again in this process; it stays journalled and a restart replays it.
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
     for (const item of this.#unverified.splice(0)) {
-      if (delivered.has(item.id)) { this.#consume(item); continue; }
+      if (delivered.has(item.id)) {
+        this.#recordSuperseded(item);
+        if (!item.supersededSends?.length && this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) this.#consume(item);
+        else this.#sent.push(item);
+        continue;
+      }
       if (queued.has(item.id) || seen.has(item.id)) this.#sent.push(item);
       else if (item.deliverAs !== undefined) {
         // A direct delivery goes again alone, with its own mode and triggerTurn; a failed send
@@ -885,16 +900,37 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#trySave();
   }
 
+  #recordOutcome(send: DeliverySend | undefined, outcome: DeliveryOutcome, reason: string): boolean {
+    const root = this.meshRoot ?? (this.#journal ? path.dirname(path.dirname(this.#journal)) : undefined);
+    if (!send || !root) return true;
+    try { appendDeliveryOutcome(root, send, outcome, reason); return true; }
+    catch (error) { console.warn("[pi-fabric] cannot append Main delivery outcome; retaining journal", error); return false; }
+  }
+
+  #recordSuperseded(item: HeldAgentMessage): boolean {
+    const pending = item.supersededSends ?? [];
+    const before = pending.length;
+    while (pending.length && this.#recordOutcome(pending[0], "superseded", "replaced by a newer message for the same key before delivery")) pending.shift();
+    if (!pending.length) delete item.supersededSends;
+    return pending.length !== before;
+  }
+
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
-    if (!this.#sent.length) return;
+    let outcomesChanged = false;
+    for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+    if (!this.#sent.length) { if (outcomesChanged) this.#trySave(); return; }
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
-    const kept = this.#sent.filter((item) => !delivered.has(item.id));
-    for (const item of this.#sent) if (delivered.has(item.id)) this.#consume(item);
+    for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+    const kept = this.#sent.filter((item) => {
+      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) return true;
+      this.#consume(item);
+      return false;
+    });
     this.#sent.splice(0, this.#sent.length, ...kept);
-    if (this.#sent.length !== before) this.#trySave();
+    if (this.#sent.length !== before || outcomesChanged) this.#trySave();
   }
 
   /** After a restart: every journalled followUp the session does not hold goes back in the queue. */
@@ -974,9 +1010,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
+        this.#recordSuperseded(item);
+        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"))) {
+          this.#sent.push(item);
+          continue;
+        }
         this.#consume(item);
         continue;
       }
+      this.#recordSuperseded(item);
       last.delete(chainOf(item));                          // a duplicate id goes once
       this.#replayed.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);

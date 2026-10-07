@@ -5306,6 +5306,9 @@ export class ActorManager {
         // #535's order and zero-wait mesh acquisition are unchanged. Generation
         // validation fences the prepared merge; fresh death/owner checks remain
         // under mesh custody and no selected snapshot crosses a retry wait.
+        // Deliberately the mesh lock, not file custody (smarty-dev#6477 L5): the
+        // lineage death proof is shared state, and holding the mesh lock is what
+        // serializes this claim with resumeLineage()'s state delete.
         adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
             if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;

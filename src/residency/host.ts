@@ -938,6 +938,8 @@ export class ResidentHost {
     if (typeof rootId === "function") {
       // Serialize proof+absence, target selection and the irreversible outbox
       // write with resumed-root proof invalidation. Never persist a stale choice.
+      // This stays on the mesh lock, not file custody (smarty-dev#6477 L5):
+      // resumeLineage() invalidates the proof with a shared-state delete.
       try { await this.mesh.exclusive(() => persist(rootId())); }
       catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
     } else persist(rootId);

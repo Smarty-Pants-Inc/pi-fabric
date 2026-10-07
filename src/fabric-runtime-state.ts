@@ -651,7 +651,7 @@ export class FabricRuntimeState {
     // path publishes it. A competing drainer must never see B -> resumed C while
     // C still carries a historical retired owner/successor (for example C -> D).
     // Registration resets root activation only; per-carrier replay fences survive.
-    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.exclusive(() =>
+    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.custody(() =>
       registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.())) : undefined;
     if (this.#config.mesh.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
       predecessor.meshRoot === meshRoot && predecessor.cwd === context.cwd) {

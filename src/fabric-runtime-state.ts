@@ -1793,7 +1793,9 @@ export class FabricRuntimeState {
     if (this.capturedTools.suspended) return;
     this.#repairs.setCatalogSurface({
       providers: this.#registry.providers().map((provider) => provider.name),
-      capturedTools: this.capturedTools.list().map((entry) => entry.name),
+      // The repair digest tracks registrations, not the host's per-turn
+      // visibility, so toggling a tool off cannot churn repair tables.
+      capturedTools: this.capturedTools.listRegistered().map((entry) => entry.name),
     });
   }
 

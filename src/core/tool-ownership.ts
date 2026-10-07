@@ -139,6 +139,18 @@ export const createToolOwnershipReassertion = (options: {
   };
 };
 
+// A registered tool Pi does not offer — absent from the active set and not
+// removed by Fabric's own ownership — was hidden by its extension (or the
+// host's tool allowlist) and must not surface through Fabric (smarty-dev#5492).
+// Returns a per-read snapshot so one listing costs one active-set read.
+export const hostToolVisibility = (
+  host: Pick<FabricToolOwnershipHost, "getActiveTools">,
+  ownership: Pick<FabricToolOwnership, "hiddenByFabric">,
+) => (): ((name: string) => boolean) => {
+  const offered = new Set([...host.getActiveTools(), ...ownership.hiddenByFabric()]);
+  return (name) => offered.has(name);
+};
+
 export class FabricToolOwnership {
   #savedNativeCoreTools: Array<{ name: string; index: number }> | undefined;
   // Captured extension tools stay registered so host extensions (permission
@@ -179,6 +191,15 @@ export class FabricToolOwnership {
 
   release(): boolean {
     return this.#restore(this.host.getActiveTools());
+  }
+
+  // Names Fabric itself removed from Pi's active set and would restore: these
+  // are still offered by their extensions, only routed through fabric_exec.
+  hiddenByFabric(): ReadonlySet<string> {
+    return new Set([
+      ...(this.#savedNativeCoreTools ?? []).map(({ name }) => name),
+      ...this.#savedHiddenExtensionTools.keys(),
+    ]);
   }
 
   #restore(active: string[]): boolean {

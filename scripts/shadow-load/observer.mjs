@@ -75,6 +75,8 @@ setInterval(() => {
 }, Number(args['lease-sample-ms'] ?? 1_000));
 
 // Directory: every expected participant must be listed and fresh in the candidate's own view.
+// Participant count: every listed, non-stale participant (local and mirrored remote) per sample.
+const counts = [];
 const directory = { samples: 0, misses: 0, missEvents: [], missingIds: new Map(), remote: { min: Infinity, max: 0 }, local: { min: Infinity, max: 0 }, listMs: { max: 0, sum: 0 } };
 setInterval(() => {
   reloadExpected();
@@ -93,6 +95,7 @@ setInterval(() => {
   directory.samples++;
   const byId = new Map(listed.map(info => [info.id, info]));
   const remote = listed.filter(info => info.remoteHost !== undefined).length;
+  if (counts.length < 5_000) counts.push({ at: Date.now(), live: listed.filter(info => !info.stale).length, listed: listed.length, remote });
   directory.remote.min = Math.min(directory.remote.min, remote);
   directory.remote.max = Math.max(directory.remote.max, remote);
   directory.local.min = Math.min(directory.local.min, listed.length - remote);
@@ -122,7 +125,7 @@ const summary = () => {
       worst: rows.slice(0, 8).map(row => ({ ...row, name: names.get(row.id)?.name, kind: names.get(row.id)?.kind })), overEvents },
     directory: { samples: directory.samples, misses: directory.misses, missingParticipants: directory.missingIds.size,
       missing: [...directory.missingIds.entries()].slice(0, 20).map(([id, count]) => ({ id, name: names.get(id)?.name, count })),
-      missEvents: directory.missEvents, remote: directory.remote, local: directory.local,
+      missEvents: directory.missEvents, counts, remote: directory.remote, local: directory.local,
       listMeanMs: directory.samples ? Math.round(directory.listMs.sum / directory.samples) : null, listMaxMs: Math.round(directory.listMs.max) },
   };
 };

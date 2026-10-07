@@ -1,16 +1,42 @@
 #!/usr/bin/env bash
-# Full-load shadow test of a Fabric release candidate (smarty-dev#6477 stage 1).
-#   scripts/shadow-load/run.sh <release-dir> [minutes] [orchestrate.mjs flags...]
-# Exit 0 PASS, 1 FAIL, 2 harness error. The report directory is printed at the end.
+# Full-load shadow soak of a Fabric release candidate against a baseline (smarty-dev#6477 stage 1).
+#   scripts/shadow-load/run.sh <candidate-release> <baseline-release> [minutes] [orchestrate.mjs flags...]
+# Default 30 minutes. Exit 0 PASS, 1 FAIL, 2 harness error. The report directory is printed at the end.
 set -euo pipefail
-if [[ $# -lt 1 || "$1" == -h || "$1" == --help ]]; then
+if [[ $# -lt 2 || "$1" == -h || "$1" == --help ]]; then
   sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
-release=$1; shift
-minutes=20
+candidate=$1; baseline=$2; shift 2
+minutes=30
 if [[ $# -gt 0 && "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; then minutes=$1; shift; fi
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 node=${SHADOW_NODE:-node}
-# One host, lowest CPU priority: the shadow mesh must not starve the fleet sharing this machine.
-exec nice -n 19 "$node" --max-old-space-size=512 "$here/orchestrate.mjs" --release "$release" --minutes "$minutes" "$@"
+# The CPU burner runs at nice 0 so the harness (nice 19) is CPU-starved like the fleet's lock holders.
+burn_pct=80
+burn_threads=$(nproc)
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in
+    --burn-pct) burn_pct=${args[i+1]:-80} ;;
+    --burn-threads) burn_threads=${args[i+1]:-$burn_threads} ;;
+  esac
+done
+stats=$(mktemp "${TMPDIR:-/tmp}/shadow-burner-XXXXXX")
+burner=
+cleanup() {
+  if [[ -n $burner ]]; then kill "$burner" 2>/dev/null || true; wait "$burner" 2>/dev/null || true; fi
+  rm -f "$stats" "$stats.tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+if [[ $burn_pct != 0 ]]; then
+  "$node" "$here/burner.mjs" --target-pct "$burn_pct" --threads "$burn_threads" --stats "$stats" &
+  burner=$!
+fi
+set +e
+nice -n 19 "$node" --max-old-space-size=512 "$here/orchestrate.mjs" --release "$candidate" --baseline "$baseline" \
+  --minutes "$minutes" --burner-stats "$stats" "$@"
+code=$?
+set -e
+exit $code

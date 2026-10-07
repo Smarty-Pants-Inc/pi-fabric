@@ -631,6 +631,9 @@ const pidAlive = (pid: number): boolean => {
 };
 // Stage files (*.<pid>.<uuid>.prepared / .retained) of dead attempts are swept at most this often.
 const STAGE_SWEEP_INTERVAL_MS = 60_000;
+// A stage is removed only when its owner pid is gone AND it is older than this (a pid in
+// another pid namespace sharing the root can look dead while its attempt is in flight).
+const STAGE_STALE_MS = 10 * 60_000;
 const stageSweeps = new Map<string, number>();
 const STAGE_NAME = /\.(\d+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:prepared|retained)$/;
 // A foreign owner is presumed live while its pid exists, up to this generous age.
@@ -881,7 +884,10 @@ export class MeshStore {
 
   /** Find an intent's event among the complete live lines by event id (and payload hash or
    * reserved sequence), never at a recorded offset. With `after` and the same inode, only
-   * the suffix appended since that scan is read. Reads only: safe under the lock. */
+   * the suffix appended since that scan is read. Reads only: safe under the lock.
+   * The returned cursor (`end`) is the end of the LAST COMPLETE LINE read, never past a
+   * partial tail: a concurrent writer may complete that line (and die before its receipt)
+   * right after this scan, so a later suffix scan must re-read it (smarty-dev#4383). */
   #scanIntentEvent(intent: MeshDedupeIntent, after?: MeshIntentScan): MeshIntentScan {
     let descriptor: number;
     try { descriptor = fs.openSync(this.#eventsPath, "r"); }
@@ -893,6 +899,7 @@ export class MeshStore {
       const stat = fs.fstatSync(descriptor);
       const rewritten = !!after && (after.dev !== stat.dev || after.ino !== stat.ino || stat.size < after.end);
       let position = after && !rewritten ? after.end : 0;
+      let end = position;
       const needle = Buffer.from(`{"id":${JSON.stringify(intent.eventId)},`, "utf8");
       const chunk = Buffer.allocUnsafe(Math.max(0, Math.min(stat.size - position, Math.max(1 << 20, this.maxEventBytes + 1))));
       let found: MeshEvent | undefined;
@@ -902,8 +909,12 @@ export class MeshStore {
         const bytes = chunk.subarray(0, count);
         const last = bytes.lastIndexOf(0x0a);
         if (last < 0) {
-          if (count < chunk.length) break; // A partial tail line: not committed (yet).
-          position += count; // An oversized line cannot be this event.
+          // No newline up to the end of the file: a partial tail line, not committed (yet).
+          // The cursor stays before it so the next scan re-reads the whole line.
+          if (position + count >= stat.size) break;
+          // A run longer than any event line with more data after it: it cannot be this
+          // event; skip it, but the cursor only advances past a complete line.
+          position += count;
           continue;
         }
         const complete = bytes.subarray(0, last + 1);
@@ -916,8 +927,9 @@ export class MeshStore {
           } catch { /* nested or malformed: not this event's line */ }
         }
         position += last + 1;
+        end = position;
       }
-      return { dev: stat.dev, ino: stat.ino, end: position, rewritten, ...(found ? { event: found } : {}) };
+      return { dev: stat.dev, ino: stat.ino, end, rewritten, ...(found ? { event: found } : {}) };
     } finally { fs.closeSync(descriptor); }
   }
 
@@ -1222,6 +1234,8 @@ export class MeshStore {
     const text = this.#readTextFile(intentPath);
     if (text === undefined) return undefined;
     const intent = this.#parseDedupeIntent(intentPath, text, key);
+    // Housekeeping off the lock (at most once a minute): stale stages of dead attempts.
+    this.#sweepStages();
     // A v1 archive intent, any non-v2 intent beside an archive, or an archive whose reboot
     // recovery has not run yet (its synced lines must go live before any intent is judged
     // abandoned): the coupled locked protocol owns it (#archivedKeyedPublish routes there).
@@ -1268,7 +1282,9 @@ export class MeshStore {
           renameAtomic(temporary, receiptPath);
           return true;
         }
-        // Abandonment must also cover the suffix appended since the off-lock scan. Reads only.
+        // Abandonment must also cover the suffix since the off-lock scan, starting at the end of
+        // its last COMPLETE line: a tail that was partial then (a writer mid-append that has
+        // since completed it and died before its receipt) is re-read here. Reads only, no fsync.
         const rest = scan ? this.#scanIntentEvent(intent, scan) : { event: this.#readEventAtIntent(intent), rewritten: false };
         if (rest.event || rest.rewritten || this.#intentOwnerLive(intent)) return false;
         fs.rmSync(intentPath, { force: true });
@@ -1561,14 +1577,16 @@ export class MeshStore {
     }
   }
 
-  /** Best effort, at most once a minute per root: remove stage files of attempts whose
-   * process is gone (or that are far over age), and same-boot unsynced markers of dead
-   * processes. Repeated deaths cannot accumulate .prepared/.retained stages. */
+  /** Best effort, at most once a minute per root and never under the lock: remove stage
+   * files whose owner pid is gone AND that are older than STAGE_STALE_MS (and the lock
+   * timeout bound), plus same-boot unsynced markers of dead processes. A stage of this
+   * process or of a live pid is never removed. Repeated deaths cannot accumulate
+   * .prepared/.retained stages. */
   #sweepStages(force = false): void {
     const last = stageSweeps.get(this.root) ?? 0;
     if (!force && Date.now() - last < STAGE_SWEEP_INTERVAL_MS) return;
     stageSweeps.set(this.root, Date.now());
-    const staleMs = Math.max(INTENT_OWNER_STALE_MS, 30 * this.#lockTimeoutMs);
+    const staleMs = Math.max(STAGE_STALE_MS, 30 * this.#lockTimeoutMs);
     for (const directory of [this.root, path.join(this.root, "event-receipts")]) {
       let names: string[];
       try { names = fs.readdirSync(directory); } catch { continue; }
@@ -1578,8 +1596,8 @@ export class MeshStore {
         const pid = Number(match[1]);
         const file = path.join(directory, name);
         try {
-          if (pid === process.pid && Date.now() - fs.statSync(file).mtimeMs <= staleMs) continue;
-          if (pid !== process.pid && pidAlive(pid) && Date.now() - fs.statSync(file).mtimeMs <= staleMs) continue;
+          if (pid === process.pid || pidAlive(pid)) continue;
+          if (Date.now() - fs.statSync(file).mtimeMs <= staleMs) continue;
           fs.rmSync(file, { force: true });
         } catch { /* raced: its owner finished or another sweeper removed it */ }
       }

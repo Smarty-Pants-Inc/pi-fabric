@@ -184,7 +184,7 @@ describe("round-6 P3s (smarty-dev#4383)", () => {
     void store;
   });
 
-  it("recovery sweeps dead attempts' .prepared and .retained stages", async () => {
+  it("recovery sweeps .prepared and .retained stages only when their pid is dead and they are over 10 min old", async () => {
     const { root, store } = setup(false);
     const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
     const key = "abandoned";
@@ -193,11 +193,90 @@ describe("round-6 P3s (smarty-dev#4383)", () => {
       owner: { pid: dead, token: "attempt", at: Date.now() } }));
     const stages = [`${intent(root, key)}.${dead}.${randomUUID()}.prepared`, `${intent(root, key, ".json")}.${dead}.${randomUUID()}.prepared`,
       path.join(root, `events.jsonl.${dead}.${randomUUID()}.retained`)];
-    for (const stage of stages) fs.writeFileSync(stage, "x");
+    const old = new Date(Date.now() - 11 * 60_000);
+    for (const stage of stages) { fs.writeFileSync(stage, "x"); fs.utimesSync(stage, old, old); }
+    // A dead pid's fresh stage may belong to an attempt in another pid namespace: kept.
+    const fresh = `${intent(root, "fresh")}.${dead}.${randomUUID()}.prepared`;
+    fs.writeFileSync(fresh, "x");
+    // A live pid's stage is never removed, however old.
     const live = `${intent(root, "live")}.${process.pid}.${randomUUID()}.prepared`;
     fs.writeFileSync(live, "x");
+    fs.utimesSync(live, old, old);
     await store.publish({ topic: "mesh.p3", from, text: "once", dedupeKey: key });
     for (const stage of stages) expect(fs.existsSync(stage)).toBe(false);
-    expect(fs.existsSync(live)).toBe(true); // A fresh stage of this live process is kept.
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(live)).toBe(true);
+  });
+
+  // Code review round 4 P1: a same-key recoverer scans while the owner appends and sees a
+  // PARTIAL tail line; the owner then completes the line and dies before its receipt. The
+  // recovery cursor must stay before the partial line, so the locked suffix re-scan finds
+  // the committed event: no duplicate, and the intent resolves to that event.
+  it.skipIf(process.platform === "win32")("a recoverer that saw a partial tail never duplicates an event its writer then committed and died", async () => {
+    const { root, store } = setup(false);
+    const key = "partial-tail";
+    // The committed event as the writer built it (a fresh mesh: sequence 1).
+    const scratch = setup(false);
+    const committed = await scratch.store.publish({ topic: "mesh.partial", from, text: "once", dedupeKey: key });
+    const line = `${liveLines(scratch.root)[0]!}\n`;
+    fs.copyFileSync(path.join(scratch.root, "sequence"), path.join(root, "sequence")); // the writer's reservation
+    const events = path.join(root, "events.jsonl");
+    const go = path.join(root, "..", "go");
+    const ready = path.join(root, "..", "ready");
+    const half = Math.floor(line.length / 2);
+    // A real writer process, detached (a grandchild reaped by init, so its death is visible
+    // while this process is blocked): it appends half the line, then, on `go`, the rest and
+    // is SIGKILLed before any receipt.
+    const writer = `const fs=require("fs");const [events,partial,rest,go,ready]=process.argv.slice(1);` +
+      `fs.appendFileSync(events,partial);fs.writeFileSync(ready,String(process.pid));` +
+      `setInterval(()=>{if(fs.existsSync(go)){fs.appendFileSync(events,rest);process.kill(process.pid,"SIGKILL");}},2);`;
+    const launcher = `const c=require("child_process").spawn(process.execPath,${JSON.stringify(["-e", writer, events, line.slice(0, half), line.slice(half), go, ready])},` +
+      `{detached:true,stdio:"ignore"});c.unref();process.stdout.write(String(c.pid));`;
+    const pid = Number(spawnSync(process.execPath, ["-e", launcher], { encoding: "utf8" }).stdout);
+    expect(pid).toBeGreaterThan(0);
+    for (const deadline = Date.now() + 10_000; !fs.existsSync(ready) && Date.now() < deadline;) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(fs.readFileSync(events, "utf8")).toBe(line.slice(0, half));
+    const alive = (target: number) => { try { process.kill(target, 0); return true; } catch { return false; } };
+    // The writer's durable v2 intent, owned by the live writer process.
+    fs.mkdirSync(path.join(root, "event-receipts"), { recursive: true });
+    fs.writeFileSync(intent(root, key), JSON.stringify({ version: 2, dedupeKey: key, eventId: committed.id,
+      payloadHash: createHash("sha256").update(JSON.stringify({ ...committed, sequence: undefined })).digest("hex"),
+      owner: { pid, token: randomUUID(), at: Date.now(), store: "writer.process" } }));
+    // The recoverer's off-lock scan reads the partial tail; right after that read the writer
+    // completes its line and dies (the window between the scan and the owner check).
+    const descriptors = new Set<number>();
+    const open = fs.openSync.bind(fs) as (file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => number;
+    const read = fs.readSync.bind(fs) as (...args: unknown[]) => number;
+    let observed = "";
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      const fd = open(file, flags, mode);
+      if (String(file) === events && flags === "r") descriptors.add(fd);
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      const count = read(...args);
+      const bytes = args[1] as Buffer;
+      if (!observed && descriptors.has(args[0] as number) && count > 0 && bytes[count - 1] !== 0x0a) {
+        observed = bytes.subarray(0, count).toString("utf8");
+        fs.writeFileSync(go, "");
+        const sleeper = new Int32Array(new SharedArrayBuffer(4));
+        for (const deadline = Date.now() + 10_000; (alive(pid) || !fs.readFileSync(events, "utf8").endsWith("\n")) && Date.now() < deadline;) {
+          Atomics.wait(sleeper, 0, 0, 5);
+        }
+      }
+      return count;
+    }) as typeof fs.readSync);
+    const recovered = await store.publish({ topic: "mesh.partial", from, text: "once", dedupeKey: key });
+    vi.restoreAllMocks();
+    expect(observed).toBe(line.slice(0, half)); // The recoverer did scan the partial tail.
+    expect(alive(pid)).toBe(false);
+    expect(recovered).toEqual(committed);
+    const live = liveLines(root);
+    expect(live).toEqual([line.trimEnd()]); // No duplicate for the dedupe key.
+    expect(JSON.parse(fs.readFileSync(intent(root, key, ".json"), "utf8"))).toEqual(committed);
+    expect(fs.existsSync(intent(root, key))).toBe(false);
+    // A later same-key publish keeps returning the committed event.
+    expect(await store.publish({ topic: "mesh.partial", from, text: "once", dedupeKey: key })).toEqual(committed);
+    expect(liveLines(root)).toHaveLength(1);
   });
 });

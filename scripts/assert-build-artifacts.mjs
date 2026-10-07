@@ -77,6 +77,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/activation-compaction.js",
   "worker/context-admission.js",
+  "worker/context-reseed.js",
   "worker/reply-tool.js",
   "worker/principal-delivery.js",
   "guards/foreground-wait.js",

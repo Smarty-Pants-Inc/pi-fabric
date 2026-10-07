@@ -206,7 +206,60 @@ export interface FabricAgentConfig {
   sessionExportDir: string;
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
+  /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
+  deadRootFilter: FabricDeadRootFilterConfig;
 }
+
+export type FabricDeadRootFilterMode = "off" | "on";
+
+export interface FabricDeadRootFilterConfig {
+  /** "off" (default) never skips; "on" skips activations of non-exempt actors under a dead root. */
+  mode: FabricDeadRootFilterMode;
+  /** Actor ids, id prefixes or exact actor names that always run, even under a dead root. */
+  exempt: string[];
+}
+
+const MAX_DEAD_ROOT_EXEMPT = 512;
+
+const MAX_DEAD_ROOT_EXEMPT_LENGTH = 200;
+const deadRootExemptWarnings = new Set<string>();
+
+/** An absent list is []; anything but an array of non-blank strings (each <= 200 chars, <= 512) is invalid. */
+const deadRootExemptList = (value: unknown): string[] | undefined => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_DEAD_ROOT_EXEMPT) return undefined;
+  const entries: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") return undefined;
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > MAX_DEAD_ROOT_EXEMPT_LENGTH) return undefined;
+    entries.push(trimmed);
+  }
+  return [...new Set(entries)];
+};
+
+/**
+ * Unknown or malformed input means "off". An invalid `exempt` shape disables the filter (mode off)
+ * with one config warning: dropping a malformed exemption while staying on could skip a keep-actor.
+ */
+export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFilterConfig => {
+  const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const exempt = deadRootExemptList(input.exempt);
+  if (input.mode !== "on") return { mode: "off", exempt: exempt ?? [] };
+  if (exempt) return { mode: "on", exempt };
+  let shape: string;
+  try {
+    shape = String(JSON.stringify(input.exempt)).slice(0, 200);
+  } catch {
+    shape = typeof input.exempt;
+  }
+  if (!deadRootExemptWarnings.has(shape)) {
+    if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
+    deadRootExemptWarnings.add(shape);
+    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+  }
+  return { mode: "off", exempt: [] };
+};
 
 export interface FabricToolCaptureConfig {
   enabled: boolean;
@@ -511,6 +564,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExport: true,
     sessionExportDir: "",
     nice: 0,
+    deadRootFilter: { mode: "off", exempt: [] },
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -1206,6 +1260,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
     },
     jev: normalizeJevConfig(input.jev),
@@ -1674,6 +1729,7 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.processSlice;
       delete agents.placement;
+      delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

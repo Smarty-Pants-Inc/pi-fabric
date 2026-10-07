@@ -91,6 +91,7 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/worker/context-reseed.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",

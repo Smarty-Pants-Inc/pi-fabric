@@ -2,9 +2,11 @@
 
 Refs smarty-dev#4383 (host-lease renewals without fsync).
 
-`ParticipantDirectory.#renewFileLease()` is the sole production caller of
-`writeHostLease()`. It runs before participant publication, between contended
-per-key operations, and at heartbeat/refresh completion. Every host-lease file
+`writeHostLease()` has two production callers. `ParticipantDirectory.#renewFileLease()`
+runs before participant publication, between contended per-key operations, and at
+heartbeat/refresh completion. `StoreBridgeSide.#mirror()` (`src/mesh/bridge.ts`)
+re-stamps mirrored peer leases inside its post-commit, owner-checked transaction;
+that write is the same soft liveness. Every host-lease file
 write, including first publication and replacement identity, uses a temporary
 file followed by atomic rename **without fsync**. These files are soft liveness,
 not ownership or custody receipts. A crash can lose the latest renewal; the
@@ -37,12 +39,18 @@ to remove a barrier that was absent at its starting revision.
 `leaseMs` is the TTL. Defaults stay **5 s / 15 s**. The TTL floor is three nominal
 intervals (formerly two). A SHA-256-derived per-host multiplier in `[0.8, 1.2]`
 spreads periodic timers reproducibly without loading any optional dependency.
-A 5 s nominal interval therefore schedules at 4–6 s; a default TTL allows at
-least two missed actual ticks even at the slowest cadence. Manual/change-driven
+A 5 s nominal interval therefore schedules at 4–6 s. At the slowest cadence the
+default TTL tolerates exactly one missed actual tick, not two: with a renewal at
+t=0 and a 6 s interval, misses at t=6 and t=12 put the next renewal at t=18, after
+the t=15 expiry, so readers may drop a still-running host for up to about 3 s
+until that renewal re-creates it. The same holds for 30 s / 90 s (36 s cadence:
+recovery after two misses at t=108, expiry at t=90) and for the 3x TTL floor. The
+policy is three *nominal* intervals; it is not a two-missed-tick guarantee. Manual/change-driven
 refreshes and per-key liveness renewals remain immediate, not delayed by jitter.
 
 For deployments supplying these constructor options, recommend **30 s renewal /
-90 s TTL** (`{ heartbeatMs: 30_000, leaseMs: 90_000 }`), scheduling at 24–36 s.
+90 s TTL** (`{ heartbeatMs: 30_000, leaseMs: 90_000 }`), scheduling at 24–36 s
+(also one missed tick at the slowest cadence).
 These are internal directory options, not new user-facing mesh config keys.
 
 ## Isolated benchmark

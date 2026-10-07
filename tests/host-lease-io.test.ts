@@ -96,6 +96,26 @@ describe("soft host-lease I/O", () => {
     expect(Math.max(...values)).toBeGreaterThan(33_000);
   });
 
+  it("documents the missed-tick guarantee the slowest jittered cadence actually provides", () => {
+    // A renewal at t=0 lapses at t=TTL. After k missed ticks the next renewal lands at
+    // (k + 1) * interval, so a host survives k misses only while that stays before expiry.
+    const tolerated = (intervalMs: number, ttlMs: number) => Math.ceil(ttlMs / intervalMs) - 2;
+    const words = ["zero", "one", "two", "three", "four"];
+    const doc = fs.readFileSync(path.join(import.meta.dirname, "../docs/host-lease-io.md"), "utf8").replace(/\s+/g, " ");
+    const claim = /(?:allows|tolerates|covers) (?:at least |exactly |only )?(zero|one|two|three|four) missed actual ticks?/.exec(doc);
+    expect(claim, "docs/host-lease-io.md must state its missed-tick guarantee").not.toBeNull();
+    for (const [nominal, ttl] of [[5_000, 15_000], [30_000, 90_000], [100, 300]] as const) {
+      const slowest = Math.max(...Array.from({ length: 128 }, (_, index) => hostLeaseRenewalInterval(nominal, `host:${index}`)));
+      expect(slowest).toBeLessThanOrEqual(nominal * 1.2);
+      // Worst case over the ±20% band and over a real 128-identity fleet agree.
+      expect(tolerated(nominal * 1.2, ttl)).toBe(1);
+      expect(tolerated(slowest, ttl)).toBe(1);
+      expect(words.indexOf(claim![1]!)).toBe(tolerated(nominal * 1.2, ttl));
+    }
+    // Reviewer's boundary: misses at t=6 s and t=12 s put recovery at t=18 s, after the t=15 s expiry.
+    expect(3 * 6_000).toBeGreaterThan(15_000);
+  });
+
   it("raises undersized configured TTL to three nominal renewal intervals", async () => {
     const meshRoot = root();
     await directory(meshRoot, "host:a", { heartbeatMs: 30_000, leaseMs: 1_000 }).start();

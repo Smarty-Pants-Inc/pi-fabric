@@ -6,7 +6,8 @@ import fs from "node:fs";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
+import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
@@ -56,6 +57,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
+import { publicationGeneration } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -533,6 +535,10 @@ export class ActorManager {
   #registrySaveTimer: NodeJS.Timeout | undefined;
   #registrySavePending: Promise<void> | undefined;
   #registrySaveDurable = false;
+  #registrySaveRevision = 0;
+  #registrySaveChain: Promise<void> = Promise.resolve();
+  readonly #registrySaveControllers = new Set<AbortController>();
+  readonly #registryRowEncodings = new Map<string, { instructions: unknown; metadata: string; encoded: string }>();
   #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
 
@@ -898,7 +904,8 @@ export class ActorManager {
       this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped");
   }
 
-  /** Called inside the host's registry -> mesh publication fence, without an await. */
+  /** Prepared synchronously before the host publication fence; its registry
+   * generation is validated under custody before these operations can commit. */
   presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void } {
     this.#syncActorsFromRegistry();
     return this.#withOwnershipRead(() => {
@@ -2393,6 +2400,7 @@ export class ActorManager {
     }
     await Promise.all([...this.#presenceChains.values()]);
     await this.#registrySavePending;
+    await this.#registrySaveChain;
     let checkpointedActor = false;
     for (const actor of this.#actors.values()) {
       if (!this.#ownershipDecision(actor.id)) continue;
@@ -2423,6 +2431,7 @@ export class ActorManager {
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;
     await this.#registrySavePending;
+    await this.#registrySaveChain;
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
     this.#drainRearms.clear();
@@ -2764,8 +2773,17 @@ export class ActorManager {
     }
     this.#emitChange();
     // Preparation is an admission boundary, not a coalescible worker status pulse.
-    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
-      ...(requireCommit ? { requiredActor: actor } : {}) }));
+    try {
+      await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
+        ...(requireCommit ? { requiredActor: actor } : {}) }));
+    } catch (error) {
+      if (error instanceof ActorPreparationTimeoutError) {
+        // Release only process-local serialization. An abandoned acquisition
+        // may settle later, but its preparation must never become commit authority.
+        for (const controller of this.#registrySaveControllers) controller.abort(error);
+      }
+      throw error;
+    }
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
@@ -3900,7 +3918,10 @@ export class ActorManager {
   }
 
   #assertPresenceValue(value: FabricActorInfo): void {
-    const serialized = JSON.stringify(value);
+    // The lineage token belongs to native participant renewal, not the legacy
+    // actors/ wire value. Keep the historical byte limit on the actual payload.
+    const { ownershipToken: _token, ...legacy } = value;
+    const serialized = JSON.stringify(legacy);
     if (serialized === undefined) throw new Error("Actor presence must be JSON-serializable");
     if (Buffer.byteLength(serialized, "utf8") > this.mesh.maxEventBytes) {
       throw new Error(`Actor presence exceeds ${this.mesh.maxEventBytes} bytes; reduce actor metadata`);
@@ -3912,7 +3933,8 @@ export class ActorManager {
     let value: FabricActorInfo;
     try {
       // Exclude our own diagnostic so a repaired value can fit again.
-      value = this.#publicInfo(actor, false);
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false);
+      value = legacy;
       this.#assertPresenceValue(value);
     } catch (error) {
       const diagnostic = `Actor presence omitted: ${error instanceof Error ? error.message : String(error)}`;
@@ -4132,9 +4154,24 @@ export class ActorManager {
     return this.#registry.messageCount(source);
   }
 
+  #registryState(rows: Record<string, unknown>[], critical = false): string {
+    const encoded = rows.map(row => {
+      const { status, updatedAt: _updatedAt, lastRunId: _lastRunId, ...record } = row;
+      const selected = critical ? { ...record, stopped: status === "stopped" } : row;
+      const { instructions, ...metadata } = selected;
+      const signature = JSON.stringify(metadata);
+      const key = `${String(row.id)}:${critical}`;
+      const cached = this.#registryRowEncodings.get(key);
+      if (cached && cached.instructions === instructions && cached.metadata === signature) return cached.encoded;
+      const value = JSON.stringify(selected);
+      this.#registryRowEncodings.set(key, { instructions, metadata: signature, encoded: value });
+      return value;
+    });
+    return `[${encoded.join(",")}]`;
+  }
+
   #criticalRegistryState(rows: Record<string, unknown>[]): string {
-    return JSON.stringify(rows.map(({ status, updatedAt: _updatedAt, lastRunId: _lastRunId, ...record }) =>
-      ({ ...record, stopped: status === "stopped" })));
+    return this.#registryState(rows, true);
   }
 
   #scheduleRegistrySave(durable = false): void {
@@ -4157,7 +4194,7 @@ export class ActorManager {
   #deferSoftRegistrySave(rows: Record<string, unknown>[], forced: boolean): boolean {
     if (forced || this.#closing || !this.#savedActors ||
         this.#registry.fingerprint() !== this.#savedActors.fingerprint) return false;
-    if (JSON.stringify(rows) === this.#savedActors.owned) return true;
+    if (this.#registryState(rows) === this.#savedActors.owned) return true;
     // Only status/timestamps are soft. Creation, stop/start, instructions, messages,
     // configuration, custody and removal bypass the window and retain their barriers.
     if (this.#criticalRegistryState(rows) === this.#savedActors.critical &&
@@ -4189,70 +4226,103 @@ export class ActorManager {
     }
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
+  #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
   }): Promise<void> {
+    ++this.#registrySaveRevision;
+    // Serialization is process-local and OUTSIDE custody. A later preparation
+    // must not select unacknowledged additions from an earlier accepted commit.
+    // Other processes still race via the optimistic generation protocol.
+    const controller = new AbortController();
+    this.#registrySaveControllers.add(controller);
+    let cancel!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", cancel, { once: true });
+    });
+    const operation = this.#registrySaveChain.then(() => {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      return this.#saveActorsNow(removedIds, options, controller.signal);
+    });
+    const saved = Promise.race([operation, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", cancel);
+      this.#registrySaveControllers.delete(controller);
+    });
+    this.#registrySaveChain = saved.catch(() => undefined);
+    return saved;
+  }
+
+  async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
+    durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+  }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
-    // Diagnostic changes share the bounded save, but require the durable write barrier.
     if (this.#registrySaveDurable) options = { ...options, durable: true };
-    if (removedIds.size === 0 && !options?.durable && !options?.requiredActor && this.#savedActors) {
-      const owned = [...this.#actors.values()].filter((actor) =>
-        !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
-      if (this.#deferSoftRegistrySave(owned.map((actor) => this.#serializedActor(actor)), options?.flush === true)) return;
-    }
-    const committed = await this.#registry.withLock(() => this.#withOwnershipRead(() => {
-      // Reload custody under the mutation fence, not before its asynchronous lock wait.
-      const current = this.#registry.records();
-      this.#rememberLineages(current);
-      // Finalization fences reloads and serialization, but only this save's explicit ids
-      // are authorized to revoke: their own durable write-ahead markers already exist.
-      // Preserve every other finalizer's current registry row, prepared or not.
-      const owned = [...this.#actors.values()].filter((actor) =>
-        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
-      );
-      if (options?.requiredActor && !owned.includes(options.requiredActor)) {
-        // Do not acknowledge a mutation filtered out by a custody change during
-        // the lock wait. Refuse before any write; the successor's full row stays intact.
-        throw new ActorRegistryOwnershipError();
-      }
-      const rows = owned.map((actor) => this.#serializedActor(actor));
-      // Recheck after the lock wait: concurrent soft callers share one commit window.
-      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
-        options?.flush === true || options?.requiredActor !== undefined)) return false;
-      if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
-      this.#registrySaveTimer = undefined;
-      const revoked = [...removedIds].filter((id) => {
-        const record = current.find((row) => row.id === id);
-        const owner = this.#removalCleanup.get(id)?.owner;
-        return !record || (owner && record.rootId === owner.rootId &&
-          (record.residency ?? "session") === owner.residency &&
-          this.#lineage(record) === options?.removedLineages?.get(id));
+    const committed = await this.#registry.update(current => {
+      if (signal?.aborted) return undefined;
+      const revision = this.#registrySaveRevision;
+      const ownershipGeneration = publicationGeneration(this.mesh.root);
+      return this.#withOwnershipRead(() => {
+        // Source selection is speculative. update validates the atomic registry
+        // generation AND the ownership observation after acquisition, or retries.
+        this.#rememberLineages(current);
+        const owned = [...this.#actors.values()].filter(actor =>
+          !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
+        if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
+        const rows = owned.map(actor => this.#serializedActor(actor));
+        if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
+          options?.flush === true || options?.requiredActor !== undefined)) return undefined;
+        const revoked = [...removedIds].filter(id => {
+          const record = current.find(row => row.id === id);
+          const owner = this.#removalCleanup.get(id)?.owner;
+          return !record || (owner && record.rootId === owner.rootId &&
+            (record.residency ?? "session") === owner.residency && this.#lineage(record) === options?.removedLineages?.get(id));
+        });
+        const replaced = new Set([...revoked, ...owned.map(actor => actor.id)]);
+        const actors = [...current.filter(record => !replaced.has(record.id)), ...rows.map((row, index) => ({ ...row,
+          registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
+        }))];
+        const saved = { owned: this.#registryState(rows), critical: this.#criticalRegistryState(rows) };
+        const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
+          append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
+        return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+            states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
+              actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
+              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
+          value: { owned, revoked, actors, saved, revision,
+            appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });
-      const replaced = new Set([...revoked, ...owned.map((actor) => actor.id)]);
-      const preserved = current.filter((record) => !replaced.has(record.id));
-      const actors = [...preserved, ...rows.map((row, index) => ({ ...row,
-        registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
-      }))];
-      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable });
-      this.#registrySaveDurable = false;
-      this.#registryFingerprint = this.#registry.fingerprint();
-      for (const actor of owned) {
-        this.#unarchivedMessages.delete(actor);
-        this.#resetMessages.delete(actor);
-      }
-      this.#lastRegistrySaveAt = Date.now();
-      this.#savedActors = { owned: JSON.stringify(rows), critical: this.#criticalRegistryState(rows),
-        fingerprint: this.#registryFingerprint };
-      for (const id of revoked) {
-        this.#persistedRoots.delete(id);
-        this.#persistedLineages.delete(id);
-      }
-      this.#rememberLineages(actors);
-      return true;
-    }));
+    });
     if (!committed) return;
-    // The locked merge can preserve a remote owner write that raced this host.
-    // Force one reload so passive views reflect the exact records just written.
+    if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
+    this.#registrySaveTimer = undefined;
+    this.#registrySaveDurable = false;
+    this.#registryFingerprint = this.#registry.fingerprint();
+    // A continuation may run after another mutation has started. Acknowledge
+    // exactly the selected prefix, not later additions; keeping the whole prefix
+    // would append already-committed messages again after an ownership reload.
+    for (const actor of committed.owned) {
+      const accepted = new Set(committed.appends.get(actor)?.map(message => `${message.id}:${message.direction}`));
+      // Ownership reload may have replaced the object and carried its pending
+      // prefix while the commit continuation was waiting. Both objects owe the
+      // same acknowledgement; otherwise the carried prefix is archived twice.
+      const live = this.#actors.get(actor.id);
+      for (const instance of new Set([actor, ...(live ? [live] : [])])) {
+        const pending = (this.#unarchivedMessages.get(instance) ?? []).filter(message => !accepted.has(`${message.id}:${message.direction}`));
+        if (pending.length) this.#unarchivedMessages.set(instance, pending);
+        else this.#unarchivedMessages.delete(instance);
+        if (committed.revision === this.#registrySaveRevision) this.#resetMessages.delete(instance);
+      }
+    }
+    this.#lastRegistrySaveAt = Date.now();
+    this.#savedActors = { ...committed.saved, fingerprint: this.#registryFingerprint };
+    for (const id of committed.revoked) {
+      this.#registryRowEncodings.delete(`${id}:false`);
+      this.#registryRowEncodings.delete(`${id}:true`);
+      this.#persistedRoots.delete(id);
+      this.#persistedLineages.delete(id);
+    }
+    this.#rememberLineages(committed.actors);
     this.#registryFingerprint = undefined;
     this.#syncActorsFromRegistry();
   }
@@ -4850,6 +4920,7 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
       ...(actor.project ? { project: actor.project } : {}),
@@ -5056,48 +5127,41 @@ export class ActorManager {
     try {
       if (this.#closing) return;
       const expectedRootId = actor.rootId;
-      // Global order: actor registries (sorted path), then mesh, matching resident
-      // publication and mutation. Resume invalidates death proof under the mesh
-      // lock; retain both fences from the fresh recheck through custody commit.
-      // Try mesh custody without waiting under the registry fence; contention
-      // retries the WHOLE fresh check on a later ownership poll.
-      const adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() => {
-        // Both custody waits may outlive this owner. No mutation is authorized
-        // once close begins, even when the previous lineage is provably dead.
-        if (this.#closing) return false;
-        const records = this.#registry.records();
-        const current = records.find((record) => record.id === actor.id);
-        // A racing adopter rewrote the lineage since we loaded it; they win.
-        if (!current || current.rootId !== expectedRootId) return false;
-        // A live owner opinion appeared while we waited for the lock.
-        if (this.#canManageActor?.(actor.id) !== undefined) return false;
-        // The lineage root turned out to be alive or unknown after all.
-        if (this.#lineageMayBeAlive(expectedRootId)) return false;
-        // Another adoption just landed; its adopter deserves the grace window.
-        if (
-          typeof current.adoptedAt === "number" &&
-          Date.now() - current.adoptedAt < this.#adoptionGraceMs
-        ) {
-          return false;
-        }
-        // Directory hooks above are synchronous but may re-enter shutdown.
-        if (this.#closing) return false;
-        this.#rememberLineages(records);
-        // The claim and the queue copy cannot commit together, so the claim names the roots whose
-        // files still hold work; the copy completes on adoption, or on this lineage's next load.
-        const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
-        // Never this lineage itself: a returning predecessor keeps its own file (F7).
-        actor.adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
-          typeof root === "string" && root !== this.#rootId &&
-          fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
-        actor.rootId = this.#rootId;
-        actor.adoptedAt = Date.now();
-        actor.updatedAt = Date.now();
-        const preserved = records.filter((record) => record.id !== actor.id);
-        this.#registry.write([...preserved, this.#serializedActor(actor)], { durable: true });
-        this.#registryFingerprint = this.#registry.fingerprint();
-        return true;
-      }, 0));
+      const participantKey = `topology/participants/${createHash("sha256").update(actor.id).digest("hex")}`;
+      const incarnation = await ownProcessIncarnation();
+      await prepareParticipantFileLock(this.mesh, participantKey);
+      if (this.#closing || this.#actors.get(actor.id) !== actor) return;
+      // Prepare the claim without custody; no actor object changes until commit.
+      const snapshot = this.#registry.snapshot();
+      const current = snapshot.actors.find(record => record.id === actor.id);
+      if (!current || current.rootId !== expectedRootId) return;
+      const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
+      const adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
+        typeof root === "string" && root !== this.#rootId && fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
+      const adoptedAt = Date.now();
+      const previousUpdatedAt = actor.updatedAt;
+      const row = { ...this.#serializedActor(actor), rootId: this.#rootId, adoptedAt, adoptedFrom, updatedAt: adoptedAt };
+      const prepared = this.#registry.prepare([...snapshot.actors.filter(record => record.id !== actor.id), row], { durable: true }, snapshot);
+      let adopted: boolean;
+      try {
+        // #535's order and zero-wait mesh acquisition are unchanged. Generation
+        // validation fences the prepared merge; fresh death/owner checks remain
+        // under mesh custody and no selected snapshot crosses a retry wait.
+        adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
+          withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
+            if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
+            if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;
+            if (typeof current.adoptedAt === "number" && Date.now() - current.adoptedAt < this.#adoptionGraceMs) return false;
+            if (this.#closing) return false;
+            prepared.commit();
+            actor.adoptedFrom = adoptedFrom;
+            actor.rootId = this.#rootId;
+            actor.adoptedAt = adoptedAt;
+            actor.updatedAt = adoptedAt;
+            this.#registryFingerprint = this.#registry.fingerprint();
+            return true;
+          }), 0));
+      } finally { prepared.dispose(); }
       this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release
       // resumes us. Do not take over queues or resync/notify a disposed owner.

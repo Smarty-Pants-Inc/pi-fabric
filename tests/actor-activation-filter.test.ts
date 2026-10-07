@@ -394,12 +394,16 @@ describe("actor activation filter in ActorManager", () => {
   it("coalesces a burst of host skips into one soft registry write without fsync", async () => {
     const { root, actors } = setup();
     const actor = await actors.create({ name: "burst", instructions: "x", events: ["tool_error"], activationFilter: BOTH });
-    const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
+    // The optimistic path stages via prepare(), then atomically renames once.
+    const writes = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+    const registryPath = path.join(root, "actors/actors.json");
+    const renames = vi.spyOn(fs, "renameSync");
     const syncs = vi.spyOn(fs, "fsyncSync");
     try {
       for (let i = 0; i < 30; i++) actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
       expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 30, lastKey: "host:tool_error", lastTopic: "tool_error" });
       expect(writes).not.toHaveBeenCalled();
+      expect(renames.mock.calls.filter(([, target]) => String(target) === registryPath)).toHaveLength(0);
       await waitFor(() => {
         const record = JSON.parse(fs.readFileSync(path.join(root, "actors/actors.json"), "utf8")).actors.find((a: { id: string }) => a.id === actor.id);
         return record.filterSkipped?.count === 30;
@@ -407,7 +411,8 @@ describe("actor activation filter in ActorManager", () => {
       expect(writes).toHaveBeenCalledTimes(1);
       expect(writes.mock.calls[0]?.[1]).toMatchObject({ durable: false });
       expect(syncs).not.toHaveBeenCalled();
-    } finally { writes.mockRestore(); syncs.mockRestore(); }
+      expect(renames.mock.calls.filter(([, target]) => String(target) === registryPath)).toHaveLength(1);
+    } finally { writes.mockRestore(); renames.mockRestore(); syncs.mockRestore(); }
   });
 
   it("expires on the next host event, resets telemetry, and audits the clear", async () => {

@@ -635,8 +635,7 @@ export class FabricRuntimeState {
       identity,
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
-        fabricWarn(`[pi-fabric] ${warning}`);
-        if (context.hasUI && context.mode === "rpc") context.ui.notify(warning, "warning");
+        if (!fabricWarn(`[pi-fabric] ${warning}`) && context.hasUI) context.ui.notify(warning, "warning");
       },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }

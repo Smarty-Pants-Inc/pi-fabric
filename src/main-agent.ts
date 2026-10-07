@@ -759,8 +759,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (pending && !pending.warned) {
         pending.warned = true;
         const message = `Cannot persist Main halt index ${this.#consumedPath()}; keeping Main halted across reload and retrying at the next opportunity`;
-        fabricWarn(`[pi-fabric] ${message}`, error);
-        try { if (this.#context?.hasUI && this.#context.mode === "rpc") this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
+        const handled = fabricWarn(`[pi-fabric] ${message}`, error);
+        try { if (!handled && this.#context?.hasUI) this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
       }
     }
   }

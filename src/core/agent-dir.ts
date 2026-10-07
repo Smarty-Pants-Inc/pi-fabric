@@ -94,11 +94,15 @@ export const configureFabricDiagnostics = (context?: DiagnosticContext): void =>
     ? context.ui : undefined;
 };
 
-/** No host imports, timers, I/O or optional engines until an interactive warning occurs. */
-export const fabricWarn = (...args: unknown[]): void => {
+/** No host imports, timers, I/O or optional engines until an interactive warning occurs.
+ * Returns true when the bound terminal UI owns the diagnostic (logged and, unless
+ * deduplicated, notified); callers then must not notify it again. False means it went
+ * to console.warn, so a caller's explicit UI notice is still the only user-visible one.
+ */
+export const fabricWarn = (...args: unknown[]): boolean => {
   if (!interactive) {
     console.warn(...args);
-    return;
+    return false;
   }
   let message: string;
   try {
@@ -130,12 +134,13 @@ export const fabricWarn = (...args: unknown[]): void => {
   const key = /mesh lock timeout|FABRIC_MESH_LOCK_TIMEOUT/.test(message) ? "mesh-lock-timeout" : message;
   const now = Date.now();
   const last = notices.get(key);
-  if (last !== undefined && now - last < NOTICE_WINDOW_MS) return;
+  if (last !== undefined && now - last < NOTICE_WINDOW_MS) return true;
   for (const [oldKey, at] of notices) if (now - at >= NOTICE_WINDOW_MS) notices.delete(oldKey);
   // Bound memory without evicting live dedup keys (which would re-enable a notice storm).
-  if (notices.size >= 1024) return;
+  if (notices.size >= 1024) return true;
   notices.set(key, now);
   try {
     interactive.notify(`${key === "mesh-lock-timeout" ? "[pi-fabric] Mesh lock contention; background operations are retrying." : message.split("\n")[0]} ${logFailed ? "Diagnostic log unavailable:" : "Details:"} ${logPath}`, "warning");
   } catch { /* A stale UI must not change operation or retry semantics. */ }
+  return true;
 };

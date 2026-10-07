@@ -76,6 +76,19 @@ describe("terminal-safe Fabric diagnostics", () => {
     expect(fs.existsSync(logPath)).toBe(false);
   });
 
+  it("reports whether the bound UI owns the notice so callers neither drop nor duplicate it", () => {
+    expect(fabricWarn("owned by the TUI")).toBe(true);
+    expect(fabricWarn("owned by the TUI")).toBe(true); // Deduplicated, still owned: no caller re-notify.
+    expect(notify).toHaveBeenCalledTimes(1);
+    for (const context of [undefined, { hasUI: true, mode: "rpc", ui: { notify } }]) {
+      configureFabricDiagnostics(context);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(fabricWarn("headless or rpc")).toBe(false); // The caller's explicit UI notice must still fire.
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    }
+  });
+
   it("formats objects and error stacks into one physical log line", () => {
     const error = new Error("stack regression");
     fabricWarn("diagnostic %s", "format", { value: 42 }, error);

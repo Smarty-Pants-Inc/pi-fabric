@@ -9,6 +9,7 @@ export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
 import path from "node:path";
 import { renameAtomic } from "./core/atomic-write.js";
+import { fabricWarn } from "./core/diagnostics.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
 import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
@@ -255,7 +256,7 @@ export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFil
   if (!deadRootExemptWarnings.has(shape)) {
     if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
     deadRootExemptWarnings.add(shape);
-    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+    fabricWarn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
   }
   return { mode: "off", exempt: [] };
 };

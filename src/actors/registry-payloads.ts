@@ -23,14 +23,12 @@ type PreparedTail = {
 /** A durable append's location: the log's file identity and the end of its last byte. */
 type LandedTail = { identity: string; end: number };
 
-/** Staged checkpoint replacements; temp files are written and fsynced before custody. */
+/** Checkpoint temp files written and fsynced before custody (smarty-dev#6477 L7). */
 export interface StagedHeads {
-  /** Under custody: rename the staged checkpoints. Returns the directories of the renamed
-   * checkpoints; the caller runs their directory barriers before it releases custody. */
-  publish(): string[];
-  /** Under custody: restore the checkpoints a failed commit replaced (durably). */
-  rollback(): void;
-  /** Remove staged temp files that were not published (no-op after publication). */
+  /** Under custody: exactly publishHeads (same order, barriers and failure handling),
+   * renaming the pre-fsynced temp files instead of writing them under the lock. */
+  publish(): void;
+  /** Remove staged temp files that were not renamed. */
   dispose(): void;
 }
 
@@ -62,10 +60,9 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
  * failed/unpublished appends are harmless archives, never a predecessor of a later
  * commit. Instructions stay inline for mixed-release readers. A durable per-actor
  * checkpoint preserves accepted heads when an old owned-row serializer drops
- * unknown fields. Payload data and namespace barriers complete BEFORE registry
- * custody; under the lock only the registry and checkpoint renames and their
- * directory barriers remain
- * (smarty-dev#6477 L7). A crash anywhere leaves at most unreferenced bytes/files. */
+ * unknown fields. Payload data and temp-file fsyncs complete BEFORE registry
+ * custody (smarty-dev#6477 L7); under the lock the registry rename, its barrier and
+ * publishHeads run exactly as before, with the same failure handling. */
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
   #preparing: Map<string, PreparedTail> | undefined;
@@ -128,15 +125,12 @@ export class ActorRegistryPayloads {
   }
 
   /** Before custody: write and fsync a temp file for every changed accepted head.
-   * Under custody only a rename and its directory barrier remain. */
+   * Only the data fsync moves; publishHeads runs unchanged under custody. */
   stageHeads(rows: readonly Row[]): StagedHeads {
-    const staged: Array<{ file: string; next: string; temporary?: string; previous?: string | undefined; replaced?: boolean }> = [];
-    const read = (file: string): string | undefined => {
-      try { return fs.readFileSync(file, "utf8"); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return undefined; }
-    };
+    const staged = new Map<string, string>(); // checkpoint file -> fsynced temp file
     const dispose = (): void => {
-      for (const entry of staged) if (entry.temporary && !entry.replaced) fs.rmSync(entry.temporary, { force: true });
+      for (const temporary of staged.values()) fs.rmSync(temporary, { force: true });
+      staged.clear();
     };
     try {
       for (const row of rows) {
@@ -144,48 +138,19 @@ export class ActorRegistryPayloads {
         if (!ref || typeof row.id !== "string") continue;
         const file = path.join(this.directory(row.id), "messages-head.json");
         const next = JSON.stringify(ref);
-        const entry: (typeof staged)[number] = { file, next };
-        staged.push(entry);
-        if (read(file) === next) continue; // Rechecked under custody.
+        try { if (fs.readFileSync(file, "utf8") === next) continue; } // Rechecked under custody.
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         const created = fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        entry.temporary = `${file}.${process.pid}.${randomUUID()}.prepared`;
-        const fd = fs.openSync(entry.temporary, "wx", 0o600);
+        const temporary = `${file}.${process.pid}.${randomUUID()}.prepared`;
+        staged.set(file, temporary);
+        const fd = fs.openSync(temporary, "wx", 0o600);
         try { fs.writeFileSync(fd, next, { encoding: "utf8" }); fs.fsyncSync(fd); }
         finally { fs.closeSync(fd); }
         // A new directory chain must be linked before a later rename can be durable.
         if (created !== undefined) syncDirectoryChain(path.dirname(file));
       }
     } catch (error) { dispose(); throw error; }
-    const replaced = (): typeof staged => staged.filter(entry => entry.replaced);
-    // Restore every replaced checkpoint even when one barrier fails; rethrow the first failure.
-    const rollback = (): void => {
-      let failure: { error: unknown } | undefined;
-      for (const entry of replaced().reverse()) {
-        try {
-          if (entry.previous !== undefined) writeFileAtomic(entry.file, entry.previous, { durable: true });
-          else { fs.rmSync(entry.file, { force: true }); syncPathNamespace(path.dirname(entry.file)); }
-        } catch (error) { failure ??= { error }; }
-        entry.replaced = false;
-      }
-      if (failure) throw failure.error;
-    };
-    return {
-      publish: (): string[] => {
-        try {
-          for (const entry of staged) {
-            entry.previous = read(entry.file);
-            if (entry.previous === entry.next) continue;
-            if (entry.temporary) renameAtomic(entry.temporary, entry.file);
-            // Rare: the checkpoint changed after staging. Durable inline fallback.
-            else writeFileAtomic(entry.file, entry.next, { durable: true });
-            entry.replaced = true;
-          }
-        } catch (error) { rollback(); throw error; }
-        return [...new Set(replaced().filter(entry => entry.temporary).map(entry => path.dirname(entry.file)))];
-      },
-      rollback,
-      dispose,
-    };
+    return { publish: () => this.publishHeads(rows, staged), dispose };
   }
 
   savedHead(id: string): ActorMessageHistory | undefined {
@@ -224,8 +189,10 @@ export class ActorRegistryPayloads {
 
   /** Complete before acknowledging the registry commit, under its shared lock.
    * Explicit registry heads still win, including during an interrupted publish.
-   * Failed publishes restore checkpoints as well as the registry. */
-  publishHeads(rows: readonly Row[]): void {
+   * Failed publishes restore checkpoints as well as the registry. A `staged` temp
+   * (stageHeads, smarty-dev#6477 L7) holds exactly `next`, already fsynced: it is
+   * renamed and gets the same directory barrier writeFileAtomic would take. */
+  publishHeads(rows: readonly Row[], staged?: Map<string, string>): void {
     const updates: Array<{ file: string; previous: string | undefined; next: string }> = [];
     for (const row of rows) {
       const ref = history(row.messageHistory);
@@ -241,7 +208,12 @@ export class ActorRegistryPayloads {
     try {
       for (const update of updates) {
         attempted.push(update);
-        writeFileAtomic(update.file, update.next, { durable: true });
+        const temporary = staged?.get(update.file);
+        if (temporary !== undefined && fs.existsSync(temporary)) {
+          renameAtomic(temporary, update.file);
+          staged!.delete(update.file);
+          syncDirectoryChain(path.dirname(update.file));
+        } else writeFileAtomic(update.file, update.next, { durable: true });
       }
     } catch (error) {
       for (const update of attempted.reverse()) {

@@ -23,41 +23,6 @@ export class ActorRegistryUpdateVetoedError extends Error {
   }
 }
 
-/** A commit's directory barrier failed twice UNDER the registry lock (smarty-dev#6477 L7,
- * pi-fabric#590 scope cut). The commit was rolled back under that same lock before it
- * was released, so no writer of any release ever saw it: `rolledBack` (and therefore
- * `retryable`) means the previous registry was restored durably and nothing was
- * committed; callers re-append on retry. If even that restore failed, `rolledBack`
- * is false and `restoreFailure` holds the reason; the save is still never
- * acknowledged. */
-export class ActorRegistryCheckpointBarrierError extends Error {
-  readonly code = "FABRIC_ACTOR_REGISTRY_CHECKPOINT_BARRIER";
-  readonly retryable: boolean;
-  readonly rolledBack: boolean;
-  constructor(readonly directory: string, cause: unknown, readonly restoreFailure?: unknown) {
-    super(`${restoreFailure === undefined
-      ? "Actor registry directory barrier failed under the registry lock; the commit was rolled back and nothing was committed"
-      : "Actor registry directory barrier failed under the registry lock and restoring the previous registry failed"}: ${
-      cause instanceof Error ? cause.message : String(cause)}`, { cause });
-    this.name = "ActorRegistryCheckpointBarrierError";
-    this.rolledBack = this.retryable = restoreFailure === undefined;
-  }
-}
-
-/** Under custody: one directory-chain barrier, retried once. Errors are classified by
- * code: only ENOENT for a checkpoint directory (its actor was removed, so there is
- * no rename left to persist) is ignored. Every other error (EIO, EACCES, ENOTDIR, a
- * namespace change, ENOENT for the registry directory) fails the commit. */
-const commitBarrier = (directory: string, options: { checkpoint: boolean }): void => {
-  for (let attempt = 1; ; attempt++) {
-    try { syncDirectoryChain(directory); return; }
-    catch (error) {
-      if (options.checkpoint && errorCode(error) === "ENOENT") return;
-      if (attempt >= 2) throw error;
-    }
-  }
-};
-
 /** The fence wait expired before custody was acquired. */
 class ActorRegistryLockTimeoutError extends Error {
   constructor() { super("Timed out waiting for the Fabric actor registry lock"); }
@@ -205,7 +170,8 @@ export class ActorRegistryStore {
     const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
     // Message appends (payload.prepare), checkpoint temp files and the registry temp
     // file are all written and fsynced here, outside custody (smarty-dev#6477 L7).
-    // A crash before the registry rename leaves only unreferenced bytes or files.
+    // Data is durable before any pointer rename, as before; a crash before the
+    // registry rename leaves only unreferenced bytes or files.
     const heads = this.#payloads.stageHeads(changedHeads);
     try { writeFileAtomic(temporary, serialized, { durable }); }
     catch (error) {
@@ -216,39 +182,22 @@ export class ActorRegistryStore {
     let renamed = false;
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
-      /** Under custody: the registry rename and its directory barrier, then the
-       * checkpoint renames and their directory barriers, all before the lock is
-       * released (as before smarty-dev#6477 L7). Only the payload and temp-file fsyncs
-       * moved before custody. A barrier is retried once; if it still fails, the
-       * commit is rolled back under this same lock and the save throws. */
+      // Under custody exactly as before smarty-dev#6477 L7, including the failure
+      // path: only the payload appends no longer run here.
       commit: (): void => {
-        let published = false;
-        let barrier: string | undefined; // The directory whose barrier is running.
         try {
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
-          if (durable) { barrier = this.#actorRoot; commitBarrier(barrier, { checkpoint: false }); barrier = undefined; }
-          const directories = heads.publish();
-          published = true;
-          for (const directory of directories) { barrier = directory; commitBarrier(directory, { checkpoint: true }); }
-          barrier = undefined;
+          if (durable) syncDirectoryChain(this.#actorRoot);
+          heads.publish();
           this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
         } catch (error) {
-          this.#snapshot = undefined;
-          // Checkpoints first, then the registry: a crash in between leaves a
-          // checkpoint lagging the registry, never leading it. Restoring a checkpoint
-          // is best effort (its directory may be the failing one); the restored
-          // registry is the authority and does not reference the rolled-back heads.
-          if (published) { try { heads.rollback(); } catch { /* Best effort, see above. */ } }
-          let restoreFailure: unknown;
           if (renamed) {
-            try {
-              if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
-              else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
-            } catch (failure) { restoreFailure = failure; }
+            if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
+            else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
           }
-          if (barrier !== undefined) throw new ActorRegistryCheckpointBarrierError(barrier, error, restoreFailure);
-          throw restoreFailure ?? error;
+          this.#snapshot = undefined;
+          throw error;
         }
       },
       dispose: () => { fs.rmSync(temporary, { force: true }); heads.dispose(); },

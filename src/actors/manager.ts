@@ -2520,7 +2520,8 @@ export class ActorManager {
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
-    if (options.coalesceKey) {
+    // A replayed dead letter is older than anything queued: it never overwrites a queued payload (#816).
+    if (options.coalesceKey && !options.replaying) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
@@ -3742,30 +3743,72 @@ export class ActorManager {
   }
 
   // Re-queues dead letters, oldest first, once the actor's queue has drained below half and its
-  // overflow is empty. The file is rewritten right after the synchronous enqueue, and an event
-  // still held in memory is skipped, so each dead letter runs once.
+  // overflow is empty. Never while restored or regained work still waits in #parked: that work is
+  // older and returns first, and it may refill the queue and overflow (round 3 P1). An event still
+  // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
+  // leave the file only after the queue file durably holds what they replayed.
   #replayDeadLetters(actor: ManagedActor): void {
     if (!this.#persistent || this.#closing || actor.status === "stopped" || actor.removal ||
-      !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
+      this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
     const entries = this.#readDeadLetters(actor.id);
     const inFlight = this.#inFlight.get(actor.id);
-    const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actor.id) ?? [])]
+    const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue]
       .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
     let taken = 0;
+    let added = 0;
     try {
       while (taken < entries.length && actor.queue.length < limit) {
         const entry = entries[taken]!;
         if (!held.has(entry.event.id)) {
+          held.add(entry.event.id);
           this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+          added++;
         }
         taken++;
       }
     } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
     if (taken === 0) return;
-    try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+    // A single rewrite per batch (the O(N^2) worst case over a 50 MB file is a noted follow-up).
+    if (added === 0 || this.#persistQueue(actor.id, true)) {
+      try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+    }
     this.#ensureDrain(actor);
+  }
+
+  // Restored work past the queue and its overflow returns to the HEAD of the dead-letter file, ahead
+  // of the later events already there, instead of being dropped (round 3 P1). The file is written
+  // before the queue file forgets them. Returns what could not spill (a resumed run, a non-mesh
+  // item, a write failure): it stays in the overflow past the cap, never dropped.
+  #spillDeadLetters(actor: ManagedActor, items: ActorQueueItem[]): ActorQueueItem[] {
+    const spillable = (item: ActorQueueItem) => this.#persistent && !item.resumed && item.source.startsWith("mesh:") &&
+      typeof (item.payload as { id?: unknown } | undefined)?.id === "string";
+    // Only a run-order tail can go: an item that must stay keeps everything after it in memory too.
+    let from = items.length;
+    while (from > 0 && spillable(items[from - 1]!)) from--;
+    const spilled = items.slice(from);
+    if (spilled.length === 0) return items;
+    try {
+      fs.mkdirSync(path.dirname(this.#deadLetterFile(actor.id)), { recursive: true, mode: 0o700 });
+      this.#writeDeadLetters(actor.id, [
+        ...spilled.map((item) => ({ at: Date.now(), source: item.source, event: item.payload as MeshEvent })),
+        ...this.#readDeadLetters(actor.id),
+      ]);
+    } catch {
+      this.#deadLetters.delete(actor.id);
+      return items;
+    }
+    return items.slice(0, from);
+  }
+
+  // A dead letter is accepted work: a cursor replay of its event (a crash before the cursor passed
+  // it) must neither queue nor dead-letter it a second time (round 3 P3).
+  #seedDeadLetterDeliveries(actor: ManagedActor): void {
+    if (!this.#persistent) return;
+    const entries = this.#readDeadLetters(actor.id);
+    this.#deadLetters.set(actor.id, entries.length);
+    for (const entry of entries.slice(-DELIVERED_EVENT_MEMORY / 2)) this.#delivered.add(`${actor.id}\0${entry.event.id}`);
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
@@ -4564,6 +4607,7 @@ export class ActorManager {
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        this.#seedDeadLetterDeliveries(actor);
         firstLoads.push(actor);
       }
       added++;
@@ -4580,12 +4624,13 @@ export class ActorManager {
     this.#schedulePresenceRetry();
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
-    // Dead letters from before a restart re-queue once this host manages an idle actor (#816).
+    if (added > 0) this.#emitChange();
+    this.#scheduleRestoreParked();
+    // Dead letters from before a restart re-queue once this host manages an idle actor (#816),
+    // after restored work: #replayDeadLetters waits while any of it is still parked.
     if (firstLoads.length && this.#persistent) queueMicrotask(() => {
       for (const actor of firstLoads) { const live = this.#actors.get(actor.id); if (live) this.#replayDeadLetters(live); }
     });
-    if (added > 0) this.#emitChange();
-    this.#scheduleRestoreParked();
   }
 
   // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
@@ -5451,13 +5496,17 @@ export class ActorManager {
         if (actor.queue.length > room) {
           const excess = actor.queue.splice(room);
           const overflow = [...excess, ...(this.#overflow.get(actor.id) ?? [])];
-          while (overflow.length > this.#overflowCap()) {
-            this.#recordDropped(actor, overflow.pop()!, "the queue and its overflow were full when parked events returned");
+          // Past the cap, the newest go back to the head of the dead-letter file, never dropped (#816).
+          if (overflow.length > this.#overflowCap()) {
+            overflow.push(...this.#spillDeadLetters(actor, overflow.splice(this.#overflowCap())));
+            this.#overflow.set(actor.id, overflow);
+            this.#persistQueue(actor.id, true);
           }
           this.#overflow.set(actor.id, overflow);
         }
         actor.status = "queued";
         actor.updatedAt = Date.now();
+        this.#replayDeadLetters(actor);                         // restored work is back: dead letters may follow
         this.#ensureDrain(actor);
       }
     });

@@ -50,9 +50,9 @@ const world = (actorQueueLimit: number) => {
     }
     return run(request, signal, ...callbacks);
   });
-  const manager = () => {
+  const manager = (queueLimit = actorQueueLimit) => {
     const value = new ActorManager("test", identity, mesh,
-      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit }, agents, () => {}, {
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {}, {
         actorRoot: path.join(root, "actors"), persistent: true,
         meshCursorPath: path.join(root, "mesh-cursor.json"), meshReplayAgeMs: 10 * 60_000,
       });
@@ -61,8 +61,16 @@ const world = (actorQueueLimit: number) => {
   };
   const events = (actor: string) => tasks.filter((entry) => entry.actor === actor)
     .flatMap((entry) => entry.task.match(/ev-\d+/g) ?? []);
-  return { root, mesh, agents, manager, release: () => release(), events };
+  // smarty-dev#816: past the queue and its overflow, an actor's routed events wait in its dead-letter file.
+  const deadLetters = (actorId: string) => {
+    const file = path.join(root, "actors", actorId, "dead-letter.jsonl");
+    return fs.existsSync(file)
+      ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => (JSON.parse(line) as { event: { text?: string } }).event.text ?? "")
+      : [];
+  };
+  return { root, mesh, agents, manager, release: () => release(), events, deadLetters };
 };
+const evs = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => `ev-${from + index}`);
 
 // smarty-dev#1065: after a restart a manager catches up from its cursor, and an event one actor's
 // full queue rejected held the cursor for every actor of the manager: one slow supervisor with a
@@ -118,6 +126,7 @@ describe("actor queue overflow", () => {
     expect(w.events("slow")).toEqual(newer ? ["ev-1", "ev-2"] : ["ev-1"]);
   }, 60_000);
 
+  // smarty-dev#816: past the queue and its overflow an event is dead-lettered, then processed in order.
   it("records, and never silently loses, an event past the queue and its overflow", async () => {
     const w = world(1);                                           // overflow cap: 8
     const actors = w.manager();
@@ -126,12 +135,63 @@ describe("actor queue overflow", () => {
     // BLOCK pauses the injected run before a worker launches.
     await waitFor(() => actors.status(slow.id).status === "preparing");
     for (let n = 1; n <= 12; n++) await w.mesh.publish({ topic: "team.events", from, text: `ev-${n}` });
-    await waitFor(() => actors.messages(slow.id).filter((message) => message.error?.startsWith("Dropped")).length === 3, 10_000);
+    await waitFor(() => w.deadLetters(slow.id).length === 3, 10_000);
+    expect(w.deadLetters(slow.id)).toEqual(evs(10, 12));
     expect(actors.status(slow.id).queued).toBe(9);                // 1 queued and 8 in its overflow
-    expect(actors.messages(slow.id).filter((message) => message.error?.startsWith("Dropped"))
-      .every((message) => message.error!.includes("overflow"))).toBe(true);
+    expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toEqual([]);
     w.release();
-    await waitFor(() => w.events("slow").length === 9, 30_000);
-    expect(w.events("slow")).toEqual(["ev-1", "ev-2", "ev-3", "ev-4", "ev-5", "ev-6", "ev-7", "ev-8", "ev-9"]);
+    await waitFor(() => w.events("slow").length === 12 && w.deadLetters(slow.id).length === 0, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(w.events("slow")).toEqual(evs(1, 12));
+    expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toEqual([]);
+  }, 60_000);
+
+  // PR #554 round 3 P1: restored work waits in #parked after a restart. Dead letters must not replay
+  // ahead of it, and work past the cap on restore goes back to the dead-letter head, never dropped.
+  it.each([
+    ["the same queue limit", 2],
+    ["a smaller queue limit, so restored work spills back to the dead-letter head", 1],
+  ] as const)("restarts a full queue, full overflow and dead letters with %s: each event runs once, in order", async (_case, restartLimit) => {
+    const w = world(2);                                           // queue 2, overflow cap 16
+    const first = w.manager();
+    const slow = await first.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => first.status(slow.id).status === "preparing");
+    for (let n = 1; n <= 22; n++) await w.mesh.publish({ topic: "team.events", from, text: `ev-${n}` });
+    await waitFor(() => w.deadLetters(slow.id).length === 4, 10_000);
+    expect(first.status(slow.id).queued).toBe(18);
+    await first.close();
+    expect(w.deadLetters(slow.id)).toEqual(evs(19, 22));
+    const second = w.manager(restartLimit);
+    await waitFor(() => second.status(slow.id).queued > 0, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Nothing replayed ahead of the restored work; with the smaller limit its tail spilled back.
+    expect(w.deadLetters(slow.id)).toEqual(restartLimit === 2 ? evs(19, 22) : evs(10, 22));
+    w.release();
+    await waitFor(() => w.events("slow").length >= 22 && w.deadLetters(slow.id).length === 0, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(w.events("slow")).toEqual(evs(1, 22));
+    expect(second.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toEqual([]);
+  }, 60_000);
+
+  // Round 3 P3: a crash before the cursor passed dead-lettered events offers them again on restart.
+  it("does not run a dead-lettered event twice when the cursor replays it after a restart", async () => {
+    const w = world(1);
+    const first = w.manager();
+    const slow = await first.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => first.status(slow.id).status === "preparing");
+    const cursorFile = path.join(w.root, "mesh-cursor.json");
+    const cursor = fs.readFileSync(cursorFile, "utf8");           // before any ev-N
+    for (let n = 1; n <= 12; n++) await w.mesh.publish({ topic: "team.events", from, text: `ev-${n}` });
+    await waitFor(() => w.deadLetters(slow.id).length === 3, 10_000);
+    await first.close();
+    fs.writeFileSync(cursorFile, cursor);                         // the crash lost the cursor's advance
+    const second = w.manager();
+    w.release();
+    await waitFor(() => w.events("slow").length >= 12 && w.deadLetters(slow.id).length === 0, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(w.events("slow")).toEqual(evs(1, 12));
+    void second;
   }, 60_000);
 });

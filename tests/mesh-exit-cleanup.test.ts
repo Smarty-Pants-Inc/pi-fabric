@@ -1,0 +1,211 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { trackedTemporaries, writeFileAtomic } from "../src/core/atomic-write.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { sweepAbandonedStateTemporaries } from "../src/mesh/temp-janitor.js";
+import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import { readHostLeases } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readParticipantFiles } from "../src/topology/participant-files.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
+
+// smarty-dev#6622: under mesh-lock load, exits abandoned in-flight state temps and left
+// the exiting participant's directory entries fresh.
+
+const roots: string[] = [];
+const directories: ParticipantDirectory[] = [];
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(directories.splice(0).map((directory) => directory.close().catch(() => undefined)));
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+const tempRoot = (): string => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-exit-cleanup-"));
+  roots.push(root);
+  return path.join(root, "mesh");
+};
+const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
+const preparedTemps = (meshRoot: string): string[] =>
+  fs.readdirSync(meshRoot).filter((name) => name.includes(".prepared.tmp"));
+// A live holder that never releases: the store must not take its lock over.
+const holdLock = (meshRoot: string): (() => void) => {
+  const lockPath = path.join(meshRoot, ".lock");
+  fs.mkdirSync(lockPath, { mode: 0o700 });
+  fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+  return () => fs.rmSync(lockPath, { recursive: true, force: true });
+};
+
+// A child Fabric process: `write` stages a large state write that waits for the busy lock;
+// `directory` publishes a participant, then begins close() while the lock is busy.
+const CHILD = `
+  import { createJiti } from "jiti";
+  import { pathToFileURL } from "node:url";
+  import fs from "node:fs";
+  const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+  const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+  const { ParticipantDirectory } = await jiti.import("./src/topology/participant-directory.ts");
+  const [mode, root, ready, go] = process.argv.slice(1);
+  const waitFor = async (check) => { const end = Date.now() + 20000; while (!check()) { if (Date.now() > end) process.exit(3); await new Promise(r => setTimeout(r, 10)); } };
+  if (mode === "write") {
+    const mesh = new MeshStore(root, 8 * 1024 * 1024, 1000, { lockTimeoutMs: 60000 });
+    void mesh.put({ key: "big", value: "x".repeat(1024 * 1024), identity: { id: "session:child", name: "c", kind: "main" } }).catch(() => undefined);
+    await waitFor(() => fs.readdirSync(root).some(n => n.startsWith("state.json." + process.pid + ".") && n.endsWith(".prepared.tmp")));
+    fs.writeFileSync(ready, "");
+    await waitFor(() => fs.existsSync(go));
+    process.exit(0); // a Main /quit or a worker exit while the write still waits
+  } else {
+    const identity = { id: "session:quit", name: "main", kind: "agent", sessionId: "quit" };
+    const directory = new ParticipantDirectory(new MeshStore(root, 65536, 1000, { lockTimeoutMs: 60000 }), {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60000, leaseMs: 120000, reapDeadHosts: false,
+    });
+    directory.registerSource(() => [{ format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id,
+      ownerIdentityId: identity.id, name: "main", status: "idle", runner: "pi", transport: "host", capabilities: [],
+      cwd: "/tmp", sessionId: "quit", startedAt: 1, updatedAt: 2, pendingMessages: false, controlProtocol: "v1" }]);
+    await directory.start();
+    fs.writeFileSync(ready, "");
+    await waitFor(() => fs.existsSync(go));
+    void directory.close(); // its withdrawal now waits for the busy lock
+    await new Promise(r => setTimeout(r, 200));
+    process.exit(0); // the host's bounded shutdown ends before close finishes
+  }`;
+
+const runChild = (mode: "write" | "directory", meshRoot: string) => {
+  const ready = path.join(meshRoot, `../${mode}.ready`);
+  const go = path.join(meshRoot, `../${mode}.go`);
+  const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD, mode, meshRoot, ready, go],
+    { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  closed.catch(() => undefined);
+  return {
+    child, closed, stderr: () => stderr,
+    ready: () => vi.waitFor(() => expect(fs.existsSync(ready), stderr).toBe(true), { timeout: 20_000, interval: 20 }),
+    go: () => fs.writeFileSync(go, ""),
+  };
+};
+
+describe("state temp cleanup (smarty-dev#6622)", () => {
+  it("an exit while a staged write waits for the busy mesh lock leaves no prepared temp", async () => {
+    const meshRoot = tempRoot();
+    await new MeshStore(meshRoot, 8 * 1024 * 1024, 1_000).put({ key: "seed", value: 1, identity: writer });
+    const release = holdLock(meshRoot);
+    try {
+      const run = runChild("write", meshRoot);
+      await run.ready();
+      expect(preparedTemps(meshRoot).filter((name) => name.startsWith(`state.json.${run.child.pid}.`))).toHaveLength(1);
+      run.go();
+      expect(await run.closed, run.stderr()).toEqual({ code: 0, signal: null });
+      expect(preparedTemps(meshRoot)).toEqual([]);
+    } finally { release(); }
+  }, 30_000);
+
+  it("kill -9 mid-write leaves a temp that the host reaper's janitor removes once its pid is dead and 60 s old", async () => {
+    const meshRoot = tempRoot();
+    const mesh = new MeshStore(meshRoot, 8 * 1024 * 1024, 1_000, { lockTimeoutMs: 5_000 });
+    await mesh.put({ key: "seed", value: 1, identity: writer });
+    const release = holdLock(meshRoot);
+    let orphan: string;
+    try {
+      const run = runChild("write", meshRoot);
+      await run.ready();
+      run.child.kill("SIGKILL");
+      expect(await run.closed).toMatchObject({ signal: "SIGKILL" });
+      const left = preparedTemps(meshRoot);
+      expect(left).toHaveLength(1); // no hook runs on SIGKILL
+      orphan = left[0]!;
+      expect(fs.statSync(path.join(meshRoot, orphan)).size).toBeGreaterThan(1024 * 1024);
+    } finally { release(); }
+    // A live pid's temp (our parent's) and a fresh dead-pid temp are never touched.
+    const live = `state.json.${process.ppid}.${randomUUID()}.prepared.tmp`;
+    fs.writeFileSync(path.join(meshRoot, live), "live");
+    await mesh.put({ key: "after", value: 2, identity: writer });
+    // Too young: kept.
+    expect(sweepAbandonedStateTemporaries(meshRoot)).toEqual([]);
+    const old = new Date(Date.now() - 2 * 60_000);
+    fs.utimesSync(path.join(meshRoot, orphan), old, old);
+    fs.utimesSync(path.join(meshRoot, live), old, old);
+    // The existing host-reaper path runs the janitor (no new unit).
+    await reapDeadHostRecords(mesh, writer, { ownHostId: "session:writer" });
+    expect(preparedTemps(meshRoot)).toEqual([live]);
+    expect(mesh.get("after", { fresh: true })?.value).toBe(2);
+  }, 30_000);
+
+  it("own-pid temps are tracked only while staged; a failed staging leaves nothing", () => {
+    const meshRoot = tempRoot();
+    fs.mkdirSync(meshRoot, { recursive: true });
+    writeFileAtomic(path.join(meshRoot, "ok.json"), "{}");
+    expect(trackedTemporaries()).toEqual([]);
+    // The target is a directory: the rename fails, the temp is removed and released.
+    fs.mkdirSync(path.join(meshRoot, "dir"));
+    fs.writeFileSync(path.join(meshRoot, "dir", "child"), "");
+    expect(() => writeFileAtomic(path.join(meshRoot, "dir"), "{}", { renameRetries: 1 })).toThrow();
+    expect(trackedTemporaries()).toEqual([]);
+    expect(fs.readdirSync(meshRoot).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    // Our own pid's temp is never janitor work, however old.
+    const own = path.join(meshRoot, `state.json.${process.pid}.${randomUUID()}.prepared.tmp`);
+    fs.writeFileSync(own, "");
+    const old = new Date(Date.now() - 10 * 60_000);
+    fs.utimesSync(own, old, old);
+    expect(sweepAbandonedStateTemporaries(meshRoot, { dead: () => true })).toEqual([]);
+  });
+});
+
+const record = (id: string, kind: "root" | "agent", hostId: string): FabricParticipantRecord => ({
+  format: 1, id, kind, rootId: hostId, ownerHostId: hostId, ownerIdentityId: hostId,
+  ...(kind === "agent" ? { parentId: hostId } : {}),
+  name: id, status: kind === "root" ? "idle" : "running", runner: "pi", transport: kind === "root" ? "host" : "process",
+  capabilities: [], cwd: "/tmp/project", ...(kind === "root" ? { sessionId: "reload", pendingMessages: false } : {}),
+  startedAt: 1, updatedAt: 2, controlProtocol: "v1",
+} as FabricParticipantRecord);
+
+describe("directory withdrawal on exit (smarty-dev#6622)", () => {
+  it("/reload while the mesh lock is busy leaves no stale entry", async () => {
+    const meshRoot = tempRoot();
+    const identity: MeshIdentity = { id: "session:reload", name: "main", kind: "main", sessionId: "reload" };
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 300 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000, reapDeadHosts: false,
+    });
+    directory.registerSource(() => [record(identity.id, "root", identity.id), record("agent:child", "agent", identity.id)]);
+    directories.push(directory);
+    await directory.start();
+    const ids = () => mesh.listAll("topology/participants/", { fresh: true })
+      .map((entry) => (entry.value as { id: string }).id).sort();
+    expect(ids()).toEqual(["agent:child", identity.id]);
+    await directory.quiesce("reload");
+    // A peer's write holds the lock across this runtime's first withdrawal attempt.
+    const release = holdLock(meshRoot);
+    const freed = new Promise<void>((resolve) => setTimeout(() => { release(); resolve(); }, 450));
+    await directory.close();
+    await freed;
+    // Only the reloading root survives, as a bounded reload lease; the child is withdrawn.
+    expect(ids()).toEqual([identity.id]);
+    const root = mesh.listAll("topology/participants/", { fresh: true })[0]!.value as { status: string; reloadUntil?: number };
+    expect(root.status).toBe("reloading");
+    expect(root.reloadUntil).toBeGreaterThan(Date.now());
+    expect(readParticipantFiles(meshRoot, { maxAgeMs: 0 }).map((entry) => (entry.value as { id: string }).id))
+      .not.toContain("agent:child");
+  }, 15_000);
+
+  it("an exit while close() waits for the busy lock does not leave the host lease fresh", async () => {
+    const meshRoot = tempRoot();
+    const run = runChild("directory", meshRoot);
+    await run.ready();
+    expect(readHostLeases(meshRoot).get("session:quit")?.expiresAt).toBeGreaterThan(Date.now());
+    const release = holdLock(meshRoot);
+    try {
+      run.go();
+      expect(await run.closed, run.stderr()).toEqual({ code: 0, signal: null });
+      expect(readHostLeases(meshRoot).has("session:quit")).toBe(false);
+    } finally { release(); }
+  }, 30_000);
+});

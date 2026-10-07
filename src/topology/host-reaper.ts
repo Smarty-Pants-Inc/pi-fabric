@@ -4,6 +4,7 @@ import { type FabricHostLease, hostEntryLiveness, readHostLeases, removeHostLeas
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
+import { sweepAbandonedStateTemporaries } from "../mesh/temp-janitor.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -160,6 +161,9 @@ export const reapDeadHostRecords = async (
     // between the detach and the recovery recheck (smarty-dev#2570, P3 sweep).
     await sweepParticipantLockLeftovers({ root, exclusive: (operation) => mesh.exclusive(operation) }, 60 * 60 * 1000)
       .catch(() => undefined);
+    // State temps staged by a writer that died mid-write (kill -9): dead pid, older than 60 s
+    // (smarty-dev#6622). Live pids' temps, including ours, are never touched.
+    try { sweepAbandonedStateTemporaries(root); } catch { /* Best-effort; the next sweep retries. */ }
   }
   if (found.length === 0 && bookkeeping.length === 0) return 0;
   const dead = found.filter((item) => !item.file);

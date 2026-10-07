@@ -50,6 +50,9 @@ import {
 } from "./participant-files.js";
 
 const PARTICIPANT_PREFIX = "topology/participants/";
+/** A clean close retries its withdrawal batch this often when the mesh lock is busy
+ * (smarty-dev#6622): a swallowed lock timeout used to leave the entry fresh. */
+const CLOSE_WITHDRAW_ATTEMPTS = 3;
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
 const PEER_SEQ_KEY = "topology/peer-seq";
 const HOST_PREFIX = "topology/hosts/";
@@ -478,6 +481,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #reloadPublished = false;
   /** When a committed write last carried this host's participant records. */
   #recordsWrittenAt = 0;
+  /** Set once close() has withdrawn this host's records (or published its reload). */
+  #withdrawn = false;
+  #exitHook: (() => void) | undefined;
 
   constructor(
     readonly mesh: MeshStore,
@@ -536,8 +542,42 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }, this.#heartbeatMs);
       this.#timer.unref();
+      this.#installExitHook();
     }
     await this.refresh();
+  }
+
+  // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
+  // while close waits for a busy mesh lock, or a shutdown step that threw first) must not
+  // leave this host fresh: synchronously drop its lease file so its records expire with
+  // the stored lease, as close() would (smarty-dev#6622). A published reload keeps both.
+  #installExitHook(): void {
+    this.#withdrawn = false;
+    if (this.#exitHook) return;
+    this.#exitHook = () => {
+      if (this.#withdrawn || this.#reloadPublished || !this.options.enabled) return;
+      try { removeHostLease(this.mesh.root, this.options.hostId); } catch { /* Best-effort exit cleanup. */ }
+    };
+    process.once("exit", this.#exitHook);
+  }
+
+  #removeExitHook(): void {
+    if (this.#exitHook) process.removeListener("exit", this.#exitHook);
+    this.#exitHook = undefined;
+  }
+
+  /** One version-fenced batch per attempt, retried while the mesh lock is busy. */
+  async #withdraw(select: () => MeshBatchOperation[]): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      const ops = select();
+      if (ops.length === 0) return;
+      try {
+        await this.mesh.writeBatch({ identity: this.options.identity, ops });
+        return;
+      } catch (error) {
+        if (!isMeshLockTimeout(error) || attempt >= CLOSE_WITHDRAW_ATTEMPTS) throw error;
+      }
+    }
   }
 
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
@@ -1450,22 +1490,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
     await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
       .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own, this.#fileLockOptions())));
-    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(own);
-    await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
+    // ONE batch (one lock acquisition) for every shared record, reread fresh and retried
+    // while the lock is busy: under mesh-lock load, per-entry deletes each timed out and
+    // were swallowed, which left this host's entries fresh after a clean exit (#6622).
     const legacySessionKey = this.#legacySessionKey();
-    if (legacySessionKey) {
-      const legacy = this.mesh.get(legacySessionKey);
+    await this.#withdraw(() => {
+      const ops: MeshBatchOperation[] = this.mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }).filter(own)
+        .map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const }));
+      const legacy = legacySessionKey ? this.mesh.get(legacySessionKey, { fresh: true }) : undefined;
       if (legacy?.updatedBy.id === this.options.identity.id) {
-        await this.mesh.delete({ key: legacy.key, ifVersion: legacy.version }).catch(() => undefined);
+        ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
       }
-    }
+      return ops;
+    }).catch(() => undefined);
     // A reload leaves only its root and fixed host lease; the next session_start replaces both.
-    if (this.#reloadPublished) return;
+    if (this.#reloadPublished) { this.#withdrawn = true; this.#removeExitHook(); return; }
     removeHostLease(this.mesh.root, this.options.hostId);
-    const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
-    if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
-      await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
-    }
+    // The lease file is gone: an exit from here on leaves nothing fresh.
+    this.#withdrawn = true;
+    this.#removeExitHook();
+    await this.#withdraw(() => {
+      const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true });
+      return hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined
+        ? [{ kind: "delete" as const, key: hostEntry.key, ifVersion: hostEntry.version, onConflict: "skip" as const }] : [];
+    }).catch(() => undefined);
   }
 
   // Return the actual shared commit/acquisition time, not the completion time

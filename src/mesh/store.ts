@@ -9,7 +9,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, renameAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, renameAtomic, syncPathNamespace, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
@@ -416,6 +416,8 @@ interface PreparedStateCommit {
   namespaces: Record<string, string> | undefined;
   serializedText: string;
   temporary?: string;
+  /** Unregisters the staged temp from the process-exit cleanup hook. */
+  releaseTemporary?: () => void;
 }
 const WRITE_SNAPSHOT_CHANGED = Symbol("mesh write snapshot changed");
 
@@ -1846,8 +1848,18 @@ export class MeshStore {
         // State remains a soft-state atomic replacement (no durability policy change).
         // Stage the large write off-lock too; custody only compares identity and renames.
         const temporary = `${this.#statePath}.${process.pid}.${randomUUID()}.prepared.tmp`;
-        writeFileAtomic(temporary, prepared.encoded.serialized);
+        // Registered before staging: an exit while this write awaits the mesh lock (a Main
+        // /quit, a worker/resident exit or SIGTERM) removes it (smarty-dev#6622). A kill -9
+        // leaves it to the host reaper's janitor (sweepAbandonedStateTemporaries).
+        const release = trackTemporary(temporary);
+        try { writeFileAtomic(temporary, prepared.encoded.serialized); }
+        catch (error) {
+          try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+          release();
+          throw error;
+        }
         prepared.temporary = temporary;
+        prepared.releaseTemporary = release;
       }
       return { state, ...outcome, prepared };
     }, ({ state, result, keys, prepared }) => {
@@ -1857,6 +1869,7 @@ export class MeshStore {
     }, ({ prepared }) => {
       if (prepared?.temporary) {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+        prepared.releaseTemporary?.();
       }
     });
   }

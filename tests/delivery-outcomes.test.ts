@@ -49,6 +49,32 @@ describe("durable delivery outcomes", () => {
     expect(fs.readFileSync(path.join(directory, fs.readdirSync(directory)[0]!), "utf8").trim().split("\n")).toHaveLength(1);
   });
 
+  it("fsyncs a dedup receipt through a writable append handle (Windows rejects a read-only fsync)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-delivery-receipt-")); roots.push(root);
+    const send = { eventId: "receipt", to: "t", from: "f", mode: "followUp" as const };
+    appendDeliveryOutcome(root, send, "failed", "expired");
+    const open = fs.openSync.bind(fs); const sync = fs.fsyncSync.bind(fs);
+    const flags = new Map<number, number>(); const synced: number[] = [];
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation((file, mode, permissions) => {
+      const fd = open(file, mode, permissions);
+      if (String(file).endsWith(".jsonl")) flags.set(fd, mode as number);
+      return fd;
+    });
+    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const mode = flags.get(fd);
+      if (mode !== undefined && fs.fstatSync(fd).isFile()) synced.push(mode);
+      sync(fd);
+    });
+    try { appendDeliveryOutcome(root, send, "failed", "expired again"); }
+    finally { openSpy.mockRestore(); syncSpy.mockRestore(); }
+    expect(synced).toHaveLength(1);
+    expect(synced[0]! & (fs.constants.O_WRONLY | fs.constants.O_RDWR)).not.toBe(0);
+    expect(synced[0]! & fs.constants.O_APPEND).toBe(fs.constants.O_APPEND);
+    expect(synced[0]! & fs.constants.O_TRUNC).toBe(0);
+    const directory = path.join(root, "delivery-outcomes");
+    expect(fs.readFileSync(path.join(directory, fs.readdirSync(directory)[0]!), "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
   it("opens with O_APPEND and does not acquire the mesh lock", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-delivery-append-")); roots.push(root);
     fs.mkdirSync(path.join(root, ".lock"));

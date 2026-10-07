@@ -80,7 +80,9 @@ export const appendDeliveryOutcome = (
   for (const file of retained.sort().reverse()) {
     if (indexedOutcomes(file).has(key)) {
       // A restart can repeat a final observation after append but before queue cleanup.
-      const receipt = fs.openSync(file, fs.constants.O_RDONLY);
+      // Windows FlushFileBuffers needs a writable handle (a read-only fsync is EPERM);
+      // O_APPEND without a write keeps the receipt barrier unable to alter the journal.
+      const receipt = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND);
       try { fs.fsyncSync(receipt); } finally { fs.closeSync(receipt); }
       syncDirectoryChain(directory);
       return;

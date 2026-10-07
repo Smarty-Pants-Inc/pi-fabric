@@ -563,9 +563,12 @@ export class FabricState {
             if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
-        // Background timers read this ctx only while this activation's lifecycle holds.
-        candidate.bindLifecycle?.(context, () => generation === this.#generation && !this.#shutDown);
-        await candidate.initialize(context, config);
+        // Background timers read this ctx only while this activation's lifecycle holds. The
+        // runtime installs it only after the predecessor's teardown: old sources never see
+        // the successor ctx during session replacement (smarty-dev#5962).
+        await candidate.initialize(context, config, {
+          lifecycle: () => generation === this.#generation && !this.#shutDown,
+        });
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {
           candidate.registerExternal(provider, { overwrite: true });

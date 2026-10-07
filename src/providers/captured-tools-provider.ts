@@ -180,6 +180,11 @@ export class CapturedToolsProvider implements FabricProvider {
     let thrown: unknown;
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
+    // A retired invocation (provider closed, turn cancelled, or execute already settled) must
+    // never touch the turn's context: a non-cooperative tool's late onUpdate is dropped, the
+    // same way runner emits are fenced by the combined signal (smarty-dev#5962).
+    let settled = false;
+    const retired = (): boolean => settled || context.signal?.aborted === true;
     try {
       const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
         type: "tool_call",
@@ -198,8 +203,11 @@ export class CapturedToolsProvider implements FabricProvider {
         : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
+        if (retired()) return;
         const progress = textFromContent(partialResult.content).trim();
-        if (progress) context.update(`${entry.name}: ${progress.slice(0, 500)}`);
+        if (progress) {
+          try { context.update(`${entry.name}: ${progress.slice(0, 500)}`); } catch { /* progress is advisory */ }
+        }
         updateTail = updateTail
           .then(() =>
             runAbortable(context.signal, () => runner.emit({
@@ -227,6 +235,7 @@ export class CapturedToolsProvider implements FabricProvider {
       };
     }
 
+    settled = true;
     await updateTail;
     throwIfAborted(context.signal);
     const patch = await runAbortable(context.signal, () => runner.emitToolResult({

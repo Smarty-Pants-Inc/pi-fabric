@@ -152,4 +152,100 @@ describe("participant heartbeat across ctx.reload() (smarty-dev#5962)", () => {
     expect(staleWarnings(warn)).toEqual([]);
     expect(faults.map(String)).toEqual([]);
   }, 30_000);
+
+  it("during session replacement, old sources never read the successor ctx (teardown or late refresh)", async () => {
+    const { FabricRuntimeState } = await import("../src/fabric-runtime-state.js");
+    const { CapturedToolCatalog } = await import("../src/capture/catalog.js");
+    const { normalizeFabricConfig } = await import("../src/config.js");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-hb-replace-"));
+    roots.push(base);
+    const meshRoot = path.join(base, "mesh");
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", base);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(base, "agent"));
+    // Spy: every property read of the successor ctx, and every Pi session-name read, while armed.
+    let armed = false;
+    const successorReads: string[] = [];
+    const nameReads: string[] = [];
+    let sessionName = "first-main";
+    const session = (sessionId: string, model: string, spy: boolean) => {
+      const target = {
+        cwd: base, hasUI: true, mode: "rpc", model: { provider: "faux", id: model },
+        isIdle: () => true, hasPendingMessages: () => false, isProjectTrusted: () => true, abort: () => {},
+        modelRegistry: { getAvailable: () => [], find: () => undefined },
+        sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined, getBranch: () => [],
+          getLeafId: () => null, getEntries: () => [] },
+        ui: { setStatus: () => {}, notify: () => {} },
+      };
+      return spy ? new Proxy(target, {
+        get(object, key, receiver) {
+          if (armed) successorReads.push(String(key));
+          return Reflect.get(object, key, receiver);
+        },
+      }) : target;
+    };
+    const host = {
+      on: () => () => {}, events: { emit: () => {}, on: () => () => {} },
+      sendMessage: () => {}, appendEntry: () => {}, getThinkingLevel: () => "off",
+      getSessionName: () => { if (armed) nameReads.push(sessionName); return sessionName; },
+    };
+    const config = () => normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: meshRoot, actorPollMs: 20 }, agents: { enabled: false }, residency: { enabled: false },
+      mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false } });
+    const runtime = new FabricRuntimeState(host as unknown as ExtensionAPI, new CapturedToolCatalog(), { paths: {
+      extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"),
+      residentHost: path.join(base, "unused.mjs"), skills: base,
+    } });
+    cleanup.push(() => runtime.shutdown("exit").catch(() => undefined));
+    const directories: ParticipantDirectory[] = [];
+    const sources = new Map<ParticipantDirectory, Array<() => FabricParticipantRecord[]>>();
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      if (!sources.has(this)) { directories.push(this); sources.set(this, []); }
+      sources.get(this)!.push(source);
+      return register.call(this, source);
+    });
+    const quiesce = ParticipantDirectory.prototype.quiesce;
+    vi.spyOn(ParticipantDirectory.prototype, "quiesce").mockImplementation(async function (this: ParticipantDirectory, reason) {
+      if (this === directories[0]) armed = true;
+      return quiesce.call(this, reason);
+    });
+    const close = ParticipantDirectory.prototype.close;
+    vi.spyOn(ParticipantDirectory.prototype, "close").mockImplementation(async function (this: ParticipantDirectory) {
+      try { return await close.call(this); } finally { if (this === directories[0]) armed = false; }
+    });
+
+    let generation = 1;
+    const first = session("5962aaaa-0000-0000-0000-000000000001", "m1", false);
+    await runtime.initialize(first as unknown as ExtensionContext, config(), { lifecycle: () => generation === 1 });
+    const [old] = directories;
+    expect(old).toBeDefined();
+    const oldRoot = (): FabricParticipantRecord | undefined =>
+      sources.get(old!)!.flatMap((source) => source()).find((record) => record.kind === "root");
+    expect(oldRoot()).toMatchObject({ name: "first-main", model: "faux/m1" });
+
+    // Session replacement: the successor lease is current before the old runtime is torn down.
+    // Even the pre-fix order (successor bound first, as FabricState did) must not leak it.
+    generation = 2;
+    sessionName = "second-main";
+    const second = session("5962aaaa-0000-0000-0000-000000000002", "m2", true);
+    runtime.bindLifecycle(second as unknown as ExtensionContext, () => generation === 2);
+    await runtime.initialize(second as unknown as ExtensionContext, config(), { lifecycle: () => generation === 2 });
+    expect(directories.length).toBeGreaterThan(1);
+    expect(vi.mocked(ParticipantDirectory.prototype.quiesce).mock.contexts).toContain(old);
+    expect(successorReads).toEqual([]);
+    expect(nameReads).toEqual([]);
+
+    // An in-flight old refresh that lands after the successor is live still reads no successor ctx.
+    armed = true;
+    const late = oldRoot();
+    armed = false;
+    expect(successorReads).toEqual([]);
+    expect(nameReads).toEqual([]);
+    expect(late).toMatchObject({ name: "first-main", model: "faux/m1" });
+    // The successor's own source does read its live ctx.
+    const successorRoot = sources.get(directories.at(-1)!)!.flatMap((source) => source()).find((record) => record.kind === "root");
+    expect(successorRoot).toMatchObject({ name: "second-main", model: "faux/m2" });
+  }, 30_000);
 });

@@ -261,7 +261,9 @@ export class FabricRuntimeState {
   // a ctx: each tick reads the ctx bound by the latest activation/ensure, and only while
   // that lifecycle lease is current. A retired lease skips the tick quietly.
   #binding: { context: ExtensionContext; current: () => boolean } | undefined;
-  #sessionNameSnapshot: string | undefined;
+  // Each initialize() starts a new epoch. Sources and closures built by an older epoch never
+  // read the live ctx again, even after the runtime is rebound to a successor session.
+  #epoch = 0;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -455,24 +457,54 @@ export class FabricRuntimeState {
     try { return binding.current(); } catch { return false; }
   }
 
-  /** Reads session-bound state through the live ctx/pi; a retired lease or stale read yields undefined. */
-  #readLive<T>(read: (context: ExtensionContext) => T): T | undefined {
-    const context = this.lifecycleCurrent ? this.#binding?.context : undefined;
-    if (!context) return undefined;
-    // The token cannot observe every host invalidation; a stale read is a quiet skip too.
-    try { return read(context); } catch { return undefined; }
+  /**
+   * Session-bound reads for one initialize() epoch. Reads go through the live ctx/pi only while
+   * the epoch and the bound lease are current; a retired epoch, a retired lease, or a stale read
+   * yields undefined, and the session name falls back to this epoch's own last live value.
+   */
+  #liveReads(epoch: number): {
+    current: () => boolean;
+    read: <T>(read: (context: ExtensionContext) => T) => T | undefined;
+    sessionName: () => string | undefined;
+  } {
+    const current = (): boolean => epoch === this.#epoch && this.lifecycleCurrent;
+    const read = <T>(read: (context: ExtensionContext) => T): T | undefined => {
+      const context = current() ? this.#binding?.context : undefined;
+      if (!context) return undefined;
+      // The token cannot observe every host invalidation; a stale read is a quiet skip too.
+      try { return read(context); } catch { return undefined; }
+    };
+    let sessionName: string | undefined;
+    return {
+      current,
+      read,
+      sessionName: () => {
+        const live = read(() => ({ name: this.pi.getSessionName?.() }));
+        if (live) sessionName = live.name;
+        return sessionName;
+      },
+    };
   }
 
-  /** The Pi session name, re-read while live; the last live value otherwise. */
-  #liveSessionName(): string | undefined {
-    const live = this.#readLive(() => ({ name: this.pi.getSessionName?.() }));
-    if (live) this.#sessionNameSnapshot = live.name;
-    return this.#sessionNameSnapshot;
-  }
-
-  async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
-    // Direct callers (tests, standalone hosts) bind here; FabricState binds its lease first.
-    if (this.#binding?.context !== context) this.#binding = { context, current: () => true };
+  async initialize(
+    context: ExtensionContext,
+    bootstrapConfig?: FabricConfig,
+    options: { lifecycle?: () => boolean } = {},
+  ): Promise<void> {
+    // FabricState passes its activation lease; direct callers (tests, standalone hosts) keep a
+    // lease bound to this same ctx, else bind for the runtime's life.
+    const successor = {
+      context,
+      current: options.lifecycle
+        ?? (this.#binding?.context === context ? this.#binding.current : () => true),
+    };
+    // Session replacement (smarty-dev#5962): retire the predecessor binding and epoch BEFORE
+    // teardown. Quiesce, close and in-flight old sources then read no ctx at all, never the
+    // successor's; the successor lease is installed only once the old runtime is torn down.
+    this.#epoch += 1;
+    const epoch = this.#epoch;
+    this.#binding = undefined;
+    const live = this.#liveReads(epoch);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
     this.#suppressResidentGuidanceSync = true;
@@ -483,6 +515,8 @@ export class FabricRuntimeState {
     } finally {
       this.#suppressResidentGuidanceSync = false;
     }
+    // A newer initialize() owns the binding now; this superseded one must not install its ctx.
+    if (epoch === this.#epoch) this.#binding = successor;
     for (const name of this.#builtinComponentNames) this.componentCatalog.unregister(name);
     this.#builtinComponentNames.clear();
     this.prewalk.cancel();
@@ -645,7 +679,7 @@ export class FabricRuntimeState {
       this.#config.mesh.maxReadEvents,
       {
         backgroundReadCacheMs: this.#config.mesh.idleReadCoalesceMs,
-        readActive: () => this.#readLive(live => !live.isIdle() || live.hasPendingMessages()) === true ||
+        readActive: () => live.read(ctx => !ctx.isIdle() || ctx.hasPendingMessages()) === true ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
@@ -653,7 +687,7 @@ export class FabricRuntimeState {
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.#liveSessionName() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     let inboxMaintenance: MainInboxMaintenance | undefined;
@@ -670,9 +704,9 @@ export class FabricRuntimeState {
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
         console.warn(`[pi-fabric] ${warning}`);
-        this.#readLive(live => { if (live.hasUI) live.ui.notify(warning, "warning"); });
+        live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
       },
-      live: () => this.lifecycleCurrent,
+      live: live.current,
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -1077,7 +1111,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
-          mainName: () => rootParticipantName(this.#liveSessionName()),
+          mainName: () => rootParticipantName(live.sessionName()),
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
@@ -1086,11 +1120,12 @@ export class FabricRuntimeState {
       // The presence heartbeat rereads the Pi name (renames, clearing) and model through the
       // live binding only. A retired ctx keeps the last live snapshot (smarty-dev#5962).
       let rootInfo = mainAgent.info(context);
-      this.#sessionNameSnapshot = this.pi.getSessionName?.();
-      this.#participants.registerSource(() => {
-        const live = this.#readLive(ctx => mainAgent.info(ctx));
-        rootInfo = live ?? { ...rootInfo, updatedAt: Date.now() };
-        return [this.#participants!.root(rootInfo, mainAgent.interactive, this.#liveSessionName(), { role })];
+      live.sessionName();
+      const participants = this.#participants;
+      participants.registerSource(() => {
+        const current = live.read(ctx => mainAgent.info(ctx));
+        rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
+        return [participants.root(rootInfo, mainAgent.interactive, live.sessionName(), { role })];
       });
     }
     this.#participants.registerSource(() =>

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js";
 import { ActorRegistryPayloads } from "../src/actors/registry-payloads.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
@@ -32,6 +32,57 @@ const burn = (ms: number) => { const end = performance.now() + ms; while (perfor
 // descheduled at any instruction. Structural assertions also catch slow codecs
 // even on a host too busy to make a meaningful wall-time measurement.
 describe("#4383 bounded registry holds", () => {
+  it("#816 re-selects a vetoed locked fallback from a fresh snapshot and commits it", async () => {
+    const { store } = fixture();
+    let selections = 0;
+    let validations = 0;
+    // Veto the optimistic attempt and the first locked selection; the fresh re-selection passes.
+    const result = await store.update(current => {
+      selections++;
+      return { actors: current.map((row, at) => at === 0 ? { ...row, vetoRetried: selections } : row), value: "committed",
+        validate: () => ++validations > 2 };
+    });
+    expect(result).toBe("committed");
+    expect(selections).toBe(3);
+    expect(store.records()[0]?.vetoRetried).toBe(3);
+  });
+
+  it("#816 throws a typed retryable error, never undefined, when the veto persists under custody", async () => {
+    const { store, actorRoot, lock } = fixture();
+    const before = fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8");
+    let selections = 0;
+    const update = store.update(current => {
+      selections++;
+      return { actors: current.map((row, at) => at === 0 ? { ...row, vetoed: true } : row), value: "committed", validate: () => false };
+    });
+    await expect(update).rejects.toBeInstanceOf(ActorRegistryUpdateVetoedError);
+    await expect(update).rejects.toMatchObject({ code: "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED", retryable: true });
+    expect(selections).toBe(3);
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(before);
+    expect(store.records()[0]?.vetoed).toBeUndefined();
+    expect(fs.readdirSync(actorRoot).filter(file => file.endsWith(".prepared"))).toEqual([]);
+    expect(fs.existsSync(lock)).toBe(false);
+    // select() declining to write is still the only undefined outcome.
+    await expect(store.update(() => undefined)).resolves.toBeUndefined();
+  });
+
+  it("#816 an awaited actor save rejects instead of resolving when the registry vetoes it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-veto-save-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+    const actors = new ActorManager("veto", { id: "session:veto", name: "main", kind: "main" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, agents, () => {}, { actorRoot: path.join(root, "actors"), persistent: true });
+    try {
+      const update = vi.spyOn(ActorRegistryStore.prototype, "update").mockRejectedValueOnce(new ActorRegistryUpdateVetoedError());
+      await expect(actors.create({ name: "veto", instructions: "Reply" })).rejects.toThrow(/vetoed/);
+      expect(update).toHaveBeenCalled();
+      update.mockRestore();
+      // Not committed, so nothing claims the actor; the retried creation commits.
+      const created = await actors.create({ name: "veto-retry", instructions: "Reply" });
+      expect(new ActorRegistryStore(path.join(root, "actors")).records().some(row => row.id === created.id)).toBe(true);
+    } finally { await actors.close(); await agents.close(); }
+  });
+
   it("#816 commits a 300ms preparation in at most two selections while two writers contend", async () => {
     const { store, actorRoot, lock } = fixture();
     const writers = [new ActorRegistryStore(actorRoot), new ActorRegistryStore(actorRoot)];

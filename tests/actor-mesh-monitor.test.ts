@@ -122,30 +122,6 @@ describe("ActorMeshMonitor", () => {
     expect(s.onEvent).toHaveBeenCalledTimes(2); // owner deduplication handles replay
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
   });
-  it.each(["success", "throw", "lease"] as const)("#816 offers a pending page suffix but fences its cursor on %s", async mode => {
-    const s = setup('{"format":1,"cursor":3,"last":{"sequence":1,"id":"prior"}}');
-    const first = { id: "pending", sequence: 2, topic: "github.review" } as MeshEvent;
-    const second = { id: "healthy", sequence: 3, topic: "team.work" } as MeshEvent;
-    s.mesh.tail.mockReturnValue({ events: [first, second], nextOffset: 20, cursors: [10, 20] });
-    let admitted = false;
-    let leased = true;
-    Object.assign(s.monitor.callbacks, { canConsumeMesh: () => leased });
-    s.onEvent.mockImplementation((event: MeshEvent) => {
-      if (event.id === first.id && !admitted) return "pending";
-      if (!admitted && mode === "throw") throw new Error("suffix dispatch unavailable");
-      if (!admitted && mode === "lease") leased = false;
-      return true;
-    });
-    s.monitor.start(); await flush();
-    const held = fs.readFileSync(s.cursorPath, "utf8");
-    expect(JSON.parse(held)).toMatchObject({ cursor: 3, last: { id: "prior", sequence: 1 } });
-    expect(s.onEvent.mock.calls.map(([event]) => event.id)).toEqual(["pending", "healthy"]);
-    admitted = true; leased = true;
-    s.monitor.schedule(); await flush();
-    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toMatchObject({ cursor: 20, last: { id: "healthy" } });
-    expect(s.onEvent.mock.calls.map(([event]) => event.id)).toEqual(["pending", "healthy", "pending", "healthy"]);
-  });
-
   it("does not persist a cursor when disabled or never started", () => {
     const disabled = setup();
     disabled.monitor.config.enabled = false;

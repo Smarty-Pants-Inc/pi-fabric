@@ -56,7 +56,7 @@ import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
-import { ActorRegistryStore } from "./registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { publicationGeneration } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
@@ -350,12 +350,22 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+/** A routed event did not reach the receiver's persisted queue; the cursor must keep it (#816). */
+export class ActorQueueCheckpointError extends Error {
+  constructor(actor: { id: string; name: string }) {
+    super(`Fabric actor queue checkpoint failed for ${actor.name} (${actor.id}); retry`);
+    this.name = "ActorQueueCheckpointError";
+  }
+}
+
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Windows metadata work yields after each actor; other platforms retain bounded batches. */
 export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
 /** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+/** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
+export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
 
 export class ActorPreparationError extends Error {
@@ -2468,6 +2478,8 @@ export class ActorManager {
       /** Host-owned deterministic child completion id and write-ahead handoff. */
       id?: string;
       deferDrain?: boolean;
+      /** Routed mesh work: acceptance requires the persisted queue to hold it (#816). */
+      requirePersisted?: boolean;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2510,8 +2522,10 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
-        this.#persistQueue(actor.id);
+        const persisted = this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
+        // Memory already runs the merged item; an unacknowledged replay coalesces again.
+        if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
         return existing;
       }
     }
@@ -2555,7 +2569,16 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    this.#persistQueue(actor.id);
+    if (!this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
+      // Not durable in the receiver's queue: do not accept it, so the host cursor
+      // keeps the event and offers it again rather than losing it on a restart.
+      for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
+        const at = held.indexOf(item);
+        if (at >= 0) held.splice(at, 1);
+      }
+      if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
+      throw new ActorQueueCheckpointError(actor);
+    }
     if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -2818,7 +2841,6 @@ export class ActorManager {
               item.launchEvidenceVersion = 1;
               item.executionStarted = true;
               this.#persistQueue(actor.id);
-              this.#meshMonitor.schedule();
               delete actor.preparing;
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2992,10 +3014,12 @@ export class ActorManager {
             actor.queue.unshift(item);
             this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
-            // Retain routed work beyond the ask budget, with bounded retry pressure.
-            // Tests may shorten the base; production uses 5s, 15s, then 60s.
+            // Retain routed work in the actor's durable queue beyond the ask budget, with
+            // bounded retry pressure. Tests may shorten the base; production uses 5s, 15s,
+            // 60s, then every 5 minutes. The host mesh cursor never waits for this item.
             if (callerless) {
-              retryDelay = this.#preparationRetryMs * (item.preparationAttempts === 1 ? 1 : item.preparationAttempts === 2 ? 3 : 12);
+              retryDelay = this.#preparationRetryMs * ACTOR_PREPARATION_BACKOFF[
+                Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
                 this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER, true);
               }
@@ -3518,31 +3542,16 @@ export class ActorManager {
 
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
-  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" | "pending" {
+  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
     // Empty polls only observe owners through the idle cache. The matched targets below
     // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
     // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
     this.#ownershipSnapshot = true;
     try {
-      const delivered = this.#deliverMeshEvent(event);
-      // Enqueue is acceptance, not successful preparation. Hold the mesh boundary
-      // through failed activation retries; replay sees the existing item, not a duplicate.
-      let accepted = false;
-      for (const actor of this.#actors.values()) {
-        if (!this.#delivered.has(`${actor.id}\0${event.id}`)) continue;
-        if (actor.residency !== "durable") continue;
-        accepted = true;
-        if (!this.#canManageCached(actor.id)) continue;
-        const active = this.#inFlight.get(actor.id);
-        const pending = [...(active ? [active] : []), ...actor.queue,
-          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])];
-        if (pending.some(item => !item.executionStarted && item.source === `mesh:${event.topic}` &&
-          typeof item.payload === "object" && item.payload !== null &&
-          (item.payload as { id?: unknown }).id === event.id)) return "pending";
-      }
-      // A replay of an accepted event that has now launched is relevant progress,
-      // not ignored noise: checkpoint its released boundary immediately.
-      return delivered === "ignored" && accepted ? true : delivered;
+      // Acceptance is a checkpoint in the receiver's own queue file, never an
+      // activation outcome: failed preparation retries from that queue and must not
+      // pin this host's single mesh cursor (smarty-dev#816, smarty-dev#1065).
+      return this.#deliverMeshEvent(event);
     } finally {
       this.#ownershipSnapshot = false;
     }
@@ -3590,6 +3599,7 @@ export class ActorManager {
             ...(event.verification === "mesh" || event.verification === "bridge"
               ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
             ownershipChecked: true,
+            requirePersisted: true,
             // Work waits for room; the monitor offers it again (smarty-dev#754).
             ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
             ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
@@ -3602,7 +3612,8 @@ export class ActorManager {
         }
       } catch (error) {
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
-        if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
+        if (error instanceof ActorQueueCheckpointError ||
+          (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached"))) full = true;
       }
     }
     return full ? false : handedOn ? true : "ignored";
@@ -4089,7 +4100,9 @@ export class ActorManager {
   }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
-    const committed = await this.#registry.update(current => {
+    let committed;
+    try {
+      committed = await this.#registry.update(current => {
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
       const ownershipGeneration = publicationGeneration(this.mesh.root);
@@ -4124,7 +4137,14 @@ export class ActorManager {
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });
-    });
+      });
+    } catch (error) {
+      // A persistent veto committed nothing: keep the state dirty and fail the awaited save.
+      if (error instanceof ActorRegistryUpdateVetoedError) {
+        this.#scheduleRegistrySave(options?.durable === true || removedIds.size > 0);
+      }
+      throw error;
+    }
     if (!committed) return;
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;

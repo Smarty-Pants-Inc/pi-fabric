@@ -839,11 +839,13 @@ independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
 not the execution/restart `attempts` counter. Callerless work (mesh, host, and tells) retries
-with 5-second, 15-second, then capped 60-second backoff; preparation failure never discards
+with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
 its pending activation. After three preparation requeues, further failures report
 `failing-preparation` and raise one owner alarm until a successful activation clears it.
-For durable actors, the mesh cursor stays before an accepted, unlaunched event through preparation retries;
-replay deduplicates the pending item. A confirmed worker launch releases that boundary.
+A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
+does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
+the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a
+restart restores the pending item without replaying already processed events.
 Caller-owned asks retain three preparation requeues and terminal exhaustion so a waiting
 caller receives a finite failure. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model

@@ -7,6 +7,16 @@ import { ActorRegistryPayloads } from "./registry-payloads.js";
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
 
+/** A caller validate() veto that persisted under custody: nothing was committed; retry. */
+export class ActorRegistryUpdateVetoedError extends Error {
+  readonly code = "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED";
+  readonly retryable = true;
+  constructor() {
+    super("Actor registry update was vetoed by its validation and not committed; retry");
+    this.name = "ActorRegistryUpdateVetoedError";
+  }
+}
+
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -191,16 +201,22 @@ export class ActorRegistryStore {
     // select and prepare under custody: a slow codec must not starve behind even
     // infrequent writers on a CPU-starved host (smarty-dev#816).
     return this.withLock(() => {
-      const current = this.snapshot();
-      const selected = select(current.actors);
-      if (!selected) return undefined;
-      const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
-      try {
-        // Caller-local cancellation/ownership validation still vetoes publication.
-        if (!locked.valid() || selected.validate?.() === false) return undefined;
-        locked.commit();
-        return selected.value;
-      } finally { locked.dispose(); }
+      // Caller-local cancellation/ownership validation still vetoes publication. A veto
+      // re-selects once from a fresh snapshot; one that persists is never reported as
+      // success: undefined means only that select() declined to write.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const current = this.snapshot();
+        const selected = select(current.actors);
+        if (!selected) return undefined;
+        const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
+        try {
+          if (locked.valid() && selected.validate?.() !== false) {
+            locked.commit();
+            return selected.value;
+          }
+        } finally { locked.dispose(); }
+      }
+      throw new ActorRegistryUpdateVetoedError();
     });
   }
 

@@ -396,7 +396,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
 });
 
 describe("actor preparation (#3167)", () => {
-  it.each([1, 4])("#816 holds a durable routed event cursor through %i failed preparations and processes it once", async failures => {
+  it.each([1, 4])("#816 advances the host cursor past a routed event queued through %i failed preparations and processes it once", async failures => {
     const cursorRoot = fs.mkdtempSync(path.join(os.tmpdir(), "preparation-cursor-"));
     const cursorPath = path.join(cursorRoot, "cursor.json");
     cleanups.push(async () => { fs.rmSync(cursorRoot, { recursive: true, force: true }); });
@@ -423,11 +423,11 @@ describe("actor preparation (#3167)", () => {
     expect(items[0]).toMatchObject({ payload: { id: event.id }, preparationAttempts: failures, attempts: 0 });
     expect(run).not.toHaveBeenCalled();
     const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { last?: { sequence: number; id: string } };
-    expect(cursor().last?.sequence ?? 0).toBeLessThan(event.sequence);
+    // Accepted into the actor's persisted queue: the host cursor is not pinned on it.
+    expect(cursor().last?.sequence ?? 0).toBeGreaterThanOrEqual(event.sequence);
     if (failures === 4) expect(actors.status(actor.id).status).toBe("failing-preparation");
     recover = true;
     await waitFor(() => run.mock.calls.length > 0 && actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
-    await waitFor(() => (cursor().last?.sequence ?? 0) >= event.sequence);
     expect(run).toHaveBeenCalledTimes(1);
     expect(actors.messages(actor.id).filter(message => message.direction === "in" && message.source === "mesh:github.review")).toHaveLength(1);
     expect(actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
@@ -676,5 +676,151 @@ describe("actor preparation (#3167)", () => {
     await agents.stop(blockers[0]!.id);
     await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0);
     expect(all.every((actor) => actors.status(actor.id).queued === 0 && actors.status(actor.id).inFlightRun === undefined)).toBe(true);
+  });
+});
+
+// Round 2 of PR #554: acceptance is the receiver's persisted queue, never an activation
+// outcome. A failing preparation retries from that queue and never pins the host cursor.
+describe("#816 per-actor queue acceptance", () => {
+  const from = { id: "router", name: "router", kind: "main" as const };
+  type Preparation = { ok: boolean; failures: number };
+  const fixture = (archive = false) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-queue-acceptance-"));
+    cleanups.push(async () => { fs.rmSync(root, { recursive: true, force: true }); });
+    const meshRoot = path.join(root, "mesh");
+    if (archive) {
+      fs.mkdirSync(meshRoot, { recursive: true });
+      fs.mkdirSync(path.join(root, "archive"));
+      fs.writeFileSync(path.join(meshRoot, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(root, "archive") }));
+    }
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const cursorPath = path.join(root, "cursor.json");
+    let generation = 0;
+    const host = (preparation: Preparation, maxReadEvents = 2) => {
+      const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, `runs-${generation++}`),
+      });
+      const actors = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, maxReadEvents }, agents, () => {}, {
+          actorRoot: path.join(root, "actors"), persistent: true, meshCursorPath: cursorPath,
+          preparationTimeoutMs: 80, preparationRetryMs: 20,
+          acquireCapabilityView: async () => {
+            if (!preparation.ok) { preparation.failures++; throw new Error("temporary preparation unavailable"); }
+            return { satisfied: true, missing: [], optionalMissing: [],
+              view: { id: "ok", digest: "ok", semanticDigest: "ok", bindings: {} }, release: async () => {} };
+          },
+        });
+      let closed = false;
+      const close = async () => { if (closed) return; closed = true; await actors.close(); await agents.close(); };
+      cleanups.push(close);
+      return { actors, agents, close };
+    };
+    const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { last?: { sequence: number; id: string } };
+    return { root, mesh, cursorPath, host, cursor };
+  };
+  const create = async (actors: ActorManager, failingTopic: string, healthyTopic: string) => ({
+    failing: await actors.create({ name: "failing-prep", instructions: "Reply", topics: [failingTopic], responseMode: "text",
+      coalesce: false, residency: "durable", requires: ["demo.echo"] }),
+    healthy: await actors.create({ name: "healthy", instructions: "Reply", topics: [healthyTopic], responseMode: "text",
+      coalesce: false, residency: "durable" }),
+  });
+  const replies = (actors: ActorManager, id: string) =>
+    actors.messages(id, 500).filter(message => message.direction === "out" && !message.error).length;
+  const queued = (sessionFile: string) => {
+    const directory = path.dirname(sessionFile);
+    const file = fs.readdirSync(directory).find(name => name.startsWith("queue-"));
+    return file ? JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")).items as Array<{ payload: { id?: string }; preparationAttempts: number }> : [];
+  };
+  // Seed the actors, stop the first host, then publish while no host reads: the next
+  // host must read the backlog in several pages of two events.
+  const backlog = async () => {
+    const f = fixture();
+    const seed = f.host({ ok: true, failures: 0 });
+    const ids = await create(seed.actors, "github.review", "team.work");
+    await seed.close();
+    const review = await f.mesh.publish({ topic: "github.review", from, data: { pr: 816 } });
+    const later = [];
+    for (let index = 0; index < 5; index++) later.push(await f.mesh.publish({ topic: "team.work", from, data: { n: index } }));
+    return { ...f, ...ids, review, later };
+  };
+
+  it("(1) a failing early item does not stop later pages reaching other actors; it retries from its queue once", async () => {
+    const f = await backlog();
+    const preparation = { ok: false, failures: 0 };
+    const { actors, agents, mesh } = { ...f.host(preparation), mesh: f.mesh };
+    const tail = vi.spyOn(mesh, "tail");
+    const run = vi.spyOn(agents, "run");
+    await waitFor(() => replies(actors, f.healthy.id) === 5 && preparation.failures >= 1);
+    expect(tail.mock.results.filter(result => (result.value as { events: unknown[] }).events.length === 2).length).toBeGreaterThanOrEqual(2);
+    expect(f.cursor().last?.sequence ?? 0).toBeGreaterThanOrEqual(f.later.at(-1)!.sequence);
+    expect(actors.status(f.failing.id).queued).toBe(1);
+    expect(queued(f.failing.sessionFile!)).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: f.review.id }) })]);
+    expect(queued(f.failing.sessionFile!)[0]!.preparationAttempts).toBeGreaterThanOrEqual(1);
+    expect(run).toHaveBeenCalledTimes(5);
+    preparation.ok = true;
+    await waitFor(() => replies(actors, f.failing.id) === 1 && actors.status(f.failing.id).queued === 0);
+    await pause(100);
+    expect(run).toHaveBeenCalledTimes(6);
+    expect(replies(actors, f.failing.id)).toBe(1);
+    expect(replies(actors, f.healthy.id)).toBe(5);
+    expect(actors.messages(f.failing.id, 500).filter(message => message.direction === "in" && message.source === "mesh:github.review")).toHaveLength(1);
+  });
+
+  it("(3) a restart while the item is pending does not re-run processed events and processes it exactly once", async () => {
+    const f = await backlog();
+    const before = f.host({ ok: false, failures: 0 });
+    // Processed means finished: the healthy actor's queue checkpoint no longer holds its work.
+    await waitFor(() => replies(before.actors, f.healthy.id) === 5 && queued(f.healthy.sessionFile!).length === 0 &&
+      (queued(f.failing.sessionFile!)[0]?.preparationAttempts ?? 0) >= 1 &&
+      (f.cursor().last?.sequence ?? 0) >= f.later.at(-1)!.sequence);
+    // Crash bytes: neither a close-time queue rewrite nor a close-time cursor flush.
+    const directory = path.dirname(f.failing.sessionFile!);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(name => name.startsWith("queue-"))!);
+    const [queueBytes, cursorBytes] = [fs.readFileSync(queueFile, "utf8"), fs.readFileSync(f.cursorPath, "utf8")];
+    await before.close();
+    fs.writeFileSync(queueFile, queueBytes);
+    fs.writeFileSync(f.cursorPath, cursorBytes);
+    const after = f.host({ ok: true, failures: 0 });
+    const run = vi.spyOn(after.agents, "run");
+    await waitFor(() => replies(after.actors, f.failing.id) === 1 && after.actors.status(f.failing.id).queued === 0);
+    await pause(200);
+    expect(run).toHaveBeenCalledTimes(1);                       // only the pending item
+    expect(replies(after.actors, f.failing.id)).toBe(1);
+    expect(replies(after.actors, f.healthy.id)).toBe(5);         // nothing processed is re-run
+    expect(after.actors.messages(f.healthy.id, 500).filter(message => message.direction === "in")).toHaveLength(5);
+    expect(queued(f.failing.sessionFile!)).toEqual([]);
+  });
+
+  it("(2) archive catch-up with one pending work item does not stop live reads", async () => {
+    const f = fixture(true);
+    const seed = f.host({ ok: true, failures: 0 }, 50);
+    const ids = await create(seed.actors, "fleet.work.review", "fleet.work.ok");
+    await seed.close();
+    const pending = await f.mesh.publish({ topic: "fleet.work.review", from, data: { pr: 816 } });
+    const archived = [await f.mesh.publish({ topic: "fleet.work.ok", from, data: { n: 1 } }),
+      await f.mesh.publish({ topic: "fleet.work.ok", from, data: { n: 2 } })];
+    const retained = await f.mesh.publish({ topic: "team.noise", from, text: "retained" });
+    // A live-log rewrite drops the work: only the archive still holds it.
+    const live = path.join(f.mesh.root, "events.jsonl");
+    const suffix = fs.readFileSync(live, "utf8").split("\n").filter(line => line && JSON.parse(line).sequence >= retained.sequence);
+    fs.writeFileSync(`${live}.tmp`, suffix.join("\n") + "\n");
+    fs.renameSync(`${live}.tmp`, live);
+    fs.writeFileSync(path.join(f.mesh.root, "generation"), "1");
+    const preparation = { ok: false, failures: 0 };
+    const { actors } = f.host(preparation, 50);
+    await waitFor(() => replies(actors, ids.healthy.id) === 2 && preparation.failures >= 1);
+    expect(queued(ids.failing.sessionFile!)).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: pending.id }) })]);
+    // Live reads continue while the archived item still fails preparation.
+    const fresh = await f.mesh.publish({ topic: "fleet.work.ok", from, data: { n: 3 } });
+    await waitFor(() => replies(actors, ids.healthy.id) === 3);
+    await waitFor(() => (f.cursor().last?.sequence ?? 0) >= fresh.sequence);
+    expect(actors.status(ids.failing.id).queued).toBe(1);
+    expect(archived.every(event => actors.messages(ids.healthy.id, 500).some(message =>
+      (message.data as { id?: string } | undefined)?.id === event.id))).toBe(true);
+    preparation.ok = true;
+    await waitFor(() => replies(actors, ids.failing.id) === 1 && actors.status(ids.failing.id).queued === 0);
+    await pause(100);
+    expect(replies(actors, ids.failing.id)).toBe(1);
+    expect(replies(actors, ids.healthy.id)).toBe(3);
   });
 });

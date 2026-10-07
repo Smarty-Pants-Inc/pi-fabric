@@ -16,7 +16,10 @@ vi.mock("../src/agents/transports/process-utils.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/agents/transports/process-utils.js")>(),
   spawnDetached: async () => {
     calls.local++;
-    return { pid: 12345, isAlive: async () => false, stop: async () => {} };
+    return {
+      pid: 12345, isAlive: async () => false, lostContact: () => false,
+      waitForClose: async () => {}, stop: async () => {}, closed: Promise.resolve(),
+    };
   },
 }));
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -101,7 +104,8 @@ describe("placement import/registration/idle boundary", () => {
     expect(fixture.runtimeLoader).not.toHaveBeenCalled();
     const log = path.join(cwd, "events.jsonl");
     const handle = await new ProcessTransport(undefined, fixture.state.config.agents.placement).launch({
-      id: "fallback", name: "probe", cwd, workerPath: path.join(cwd, "unused-worker"), workerArguments: ["--log-file", log],
+      id: "fallback", name: "probe", cwd, workerPath: path.join(cwd, "unused-worker"),
+      workerArguments: ["--log-file", log, "--status-file", path.join(cwd, "status.json")],
     });
     expect(calls).toEqual({ loads, launches: 0, local: 1 });
     const events = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));

@@ -13,6 +13,8 @@ import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -1035,18 +1037,29 @@ describe("ActorManager across a session reload", () => {
     };
     const owner = host("owner", true);
     const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
-    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
-    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
-    await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
-    await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
-    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
-    const passive = passiveHost("passive");                   // loads the foreign actor
-    await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
-    passive.listOwned();                                                // ... that the passive view picks up
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const files = queueFiles(root, actor.id);
-    expect(files).toHaveLength(1);                                      // the owner's, and only it
-    expect(JSON.parse(files[0]!.text).items).toHaveLength(3);
+    const workerRelease = path.join(root, "release-owner-worker");
+    try {
+      // Hold the real worker until the passive-refresh assertions finish. The
+      // ordinary LIVE fixture completes after 1.5 s: on a slow Windows host a
+      // legitimate owner settlement used to look like a passive queue deletion.
+      await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first", data: { fakeWorkerReleasePath: workerRelease } });
+      await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+      await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
+      await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
+      await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+      const accepted = JSON.parse(queueFiles(root, actor.id)[0]!.text).items;
+      expect(accepted).toHaveLength(3);
+      const passive = passiveHost("passive");                   // loads the foreign actor
+      await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
+      passive.listOwned();                                                // ... that the passive view picks up
+      // Cross the old fixture lifetime deliberately; accepted work must still
+      // be byte-for-byte intact while the owner worker is held, on every OS.
+      await new Promise((resolve) => setTimeout(resolve, 1_800));
+      const files = queueFiles(root, actor.id);
+      expect(files).toHaveLength(1);                                      // the owner's, and only it
+      expect(JSON.parse(files[0]!.text).items).toEqual(accepted);
+      expect(runs.filter((run) => run.finishedAt !== undefined)).toEqual([]);
+    } finally { fs.writeFileSync(workerRelease, "release"); }
     await owner.close();
     host("owner", true);                                                // the owner restarts
     await waitFor(() => runs.filter((run) => /held-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
@@ -2866,6 +2879,61 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
+  it.each(scratchPlatforms)("preserves the scratch contract per real actor activation ($label)", async ({ windows, simulate }) => {
+    const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    const dispose = vi.spyOn(runScratch, "disposeRunTmpDirectory");
+    if (simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      return launchWithScratchPlatform(this, request, true);
+    });
+    const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
+    const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
+    const reports: Array<{ tmpdir: string; osTmpdir: string; scratch: string }> = [];
+    try {
+      for (const message of ["first review", "second review"]) {
+        const reply = await actors.ask(actor.id, `REPORT_RUN_TMPDIR ${message}`);
+        const report = JSON.parse(reply.text!);
+        reports.push(report);
+        const run = path.join(root, "runs", reply.runId!);
+        if (windows) {
+          expect({ tmpdir: report.tmpdir, tmp: report.tmp, temp: report.temp, osTmpdir: report.osTmpdir }).toEqual(parentTemp);
+          expect(allocate).not.toHaveBeenCalled();
+          expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
+          expect(fs.existsSync(report.osTmpdir)).toBe(true);
+          expect(fs.existsSync(report.scratch)).toBe(true);
+        } else {
+          expect(report.tmpdir).toBe(path.join(run, "tmp"));
+          expect(report.mode).toBe(0o700);
+          // POSIX replies must join the owned disposal, not rely on actor
+          // archival/cleanup eventually running after ask() has resolved.
+          expect(dispose).toHaveBeenCalledWith(run);
+          expect(fs.existsSync(report.tmpdir)).toBe(false);
+        }
+        expect(path.dirname(report.scratch)).toBe(report.osTmpdir);
+        expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+        await waitFor(() => actors.status(actor.id).status === "idle");
+      }
+      if (windows) expect(reports[0]!.osTmpdir).toBe(reports[1]!.osTmpdir);
+      else expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
+      // Actor lifecycle copies logs and collects terminal originals even when
+      // the AgentManager alone would retain them.
+      expect(actors.readLog(actor.id, { type: "all" }).retainedRuns).toHaveLength(2);
+      expect(agents.list()).toEqual([]);
+      await actors.close();
+      await agents.close();
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      if (windows) {
+        expect(fs.existsSync(parentTemp.osTmpdir)).toBe(true);
+        expect(allocate).not.toHaveBeenCalled();
+        for (const report of reports) expect(fs.existsSync(report.scratch)).toBe(true);
+      }
+    } finally {
+      await actors.close();
+      await agents.close();
+      if (windows) for (const report of reports) fs.rmSync(report.scratch, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({
@@ -3251,7 +3319,6 @@ describe("ActorManager", () => {
       error: expect.stringContaining("Structured agent output was invalid"),
     });
 
-    // Removing the actor releases the retained run.
     await actors.remove(actor.id);
     expect(agents.list()).toEqual([]);
   });
@@ -3704,8 +3771,7 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("message_end");
     expect(log.run!.status?.status).toBe("completed");
     expect(log.retainedRuns).toHaveLength(1);
-    // Completed runs are released from the in-memory registry, but the log
-    // copy in the actor directory survives.
+    // Log copies survive collection of the terminal original run.
     expect(agents.list()).toEqual([]);
   });
 

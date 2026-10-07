@@ -10,8 +10,9 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
+import { executeFile, findExecutable, spawnDetached, WorkerNotStartedError } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
+import { allocateRunTmpDirectory } from "../../storage/run-scratch.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe } from "../placement-config.js";
@@ -106,6 +107,18 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
     }
+    // The status file is the existing run-directory address; cwd is the project/worktree.
+    const statusIndex = request.workerArguments.findIndex((arg, index) => index % 2 === 0 && arg === "--status-file");
+    const statusFile = statusIndex < 0 ? undefined : request.workerArguments[statusIndex + 1];
+    if (!statusFile) throw new Error("Process transport requires a run status file for private scratch");
+    // ponytail: smarty-dev#4800 — Windows inherits the user's normal TEMP;
+    // per-run private scratch/ACL work is deferred to the Windows isolation follow-up.
+    const allocation = process.platform === "win32" ? undefined : allocateRunTmpDirectory(path.dirname(statusFile));
+    // taskAgentEnvironment already clones the parent. Do not clone it again
+    // on Windows, where there is no temporary environment override.
+    const environment = request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
+      ? { ...process.env } : taskAgentEnvironment();
+    if (allocation) environment.TMPDIR = allocation.directory;
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
@@ -137,15 +150,15 @@ export class ProcessTransport implements AgentTransportAdapter {
       request,
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
-      applyTaskReturnAddress(
-        workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
-        workerArguments,
-      ),
+      applyTaskReturnAddress(environment, workerArguments),
       executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
-      process.platform !== "win32", // Windows retains its native-close/helper contract
-    );
+      process.platform !== "win32", // preserve Windows native-close/helper contract
+      allocation?.scope,
+    ).catch(error => {
+      if (error instanceof WorkerNotStartedError) allocation?.neverStarted();
+      throw error;
+    });
     return {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
@@ -153,9 +166,15 @@ export class ProcessTransport implements AgentTransportAdapter {
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
-      waitForClose: processHandle.waitForClose,
+      waitForClose: allocation ? async () => {
+        await processHandle.waitForClose();
+        if (!processHandle.lostContact()) allocation.workerClosed(processHandle.pid);
+      } : processHandle.waitForClose,
+      stop: allocation ? async () => {
+        await processHandle.stop();
+        if (!processHandle.lostContact()) allocation.workerClosed(processHandle.pid);
+      } : processHandle.stop,
       closed: processHandle.closed,
-      stop: processHandle.stop,
     };
   }
 }

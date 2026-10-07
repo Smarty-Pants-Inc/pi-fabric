@@ -4,13 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createScratch } from "../src/storage/scratch.js";
+import { createRunTmpDirectory, prepareRunRoot } from "../src/storage/run-scratch.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
+import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
 
-// A normal Windows drive root may allow Users to create directories. Do not weaken
-// ancestor checks or rewrite the runner's C:/D: ACLs to get a positive control.
-// windows-latest runs elevated: use an isolated, disposable 64 MiB NTFS VHD instead.
-// Setup failure on Windows is a failure, never a silent skip of native ACL evidence.
+// Use a private directory on the normal temp filesystem, not a mounted volume.
+// Keep every native hostile-ACL assertion; no shared drive ACL is rewritten.
+// Foreign-owner evidence still requires the elevated Windows runner.
 const native = (source: string, values: Record<string, string | number> = {}): string => {
   const command = windowsSecurityPowerShell(`
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -71,23 +73,7 @@ Set-Acl -LiteralPath $p.path -AclObject $acl
 (Get-Acl -LiteralPath $p.path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 `;
 
-let backing = "";
 let volume = "";
-let letter = "";
-let diskpartSequence = 0;
-const diskpart = (commands: string[]) => {
-  const script = path.join(backing, `diskpart-${diskpartSequence++}.txt`);
-  fs.writeFileSync(script, commands.join("\r\n") + "\r\nexit\r\n");
-  return childProcess.execFileSync(path.join(process.env.SystemRoot!, "System32", "diskpart.exe"), ["/s", script], { encoding: "utf8", timeout: 90_000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-};
-const detach = () => {
-  if (!backing) return;
-  const vhd = path.join(backing, "acl-fixture.vhd");
-  // Setup may already have detached the fixture. Ignore that diskpart error,
-  // but still fail below if the volume remains mounted after the command.
-  if (fs.existsSync(vhd)) diskpart([`select vdisk file="${vhd}"`, "detach vdisk noerr"]);
-  if (volume && fs.existsSync(volume)) throw new Error(`Native ACL test VHD did not detach: ${volume}`);
-};
 const privateDirectory = (name = "private") => {
   const directory = fs.mkdtempSync(path.join(volume, name + "-"));
   native(PRIVATE_ACL, { path: directory });
@@ -104,34 +90,36 @@ Set-Acl -LiteralPath $p.path -AclObject $acl
 
 describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL contract (requires elevated Windows runner)", () => {
   beforeAll(() => {
-    backing = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-acl-"));
-    if (/["\r\n]/.test(backing)) throw new Error("Unsafe diskpart fixture path");
-    const drives = JSON.parse(native("ConvertTo-Json -Compress -InputObject @([System.IO.Directory]::GetLogicalDrives())")) as string[];
-    letter = [..."ZYXWVUTSRQPONMLKJIHGFE"].find(candidate => !drives.some(drive => drive[0]!.toUpperCase() === candidate))!;
-    if (!letter) throw new Error("No unused drive letter for native ACL fixture");
-    volume = `${letter}:\\`;
-    const vhd = path.join(backing, "acl-fixture.vhd");
-    try {
-      const output = diskpart([
-        `create vdisk file="${vhd}" maximum=64 type=expandable`, `select vdisk file="${vhd}"`,
-        "attach vdisk", "create partition primary", 'format fs=ntfs label="fabric-acl-test" quick', `assign letter=${letter}`,
-      ]);
-      // diskpart can exit 0 on a command failure, so prove the actual fixture exists.
-      if (!fs.existsSync(volume)) throw new Error(`Native NTFS fixture setup failed: ${output}`);
-      native(PRIVATE_ACL, { path: volume });
-      vi.stubEnv("PI_FABRIC_TMPDIR", volume);
-      expect(fabricDataRoot()).toBe(volume);
-    } catch (error) {
-      detach();
-      throw error;
-    } finally { vi.unstubAllEnvs(); }
-  }, 120_000);
+    volume = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-acl-"));
+    native(PRIVATE_ACL, { path: volume });
+    vi.stubEnv("PI_FABRIC_TMPDIR", volume);
+    try { expect(fabricDataRoot()).toBe(volume); }
+    finally { vi.unstubAllEnvs(); }
+  });
 
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
   afterAll(() => {
-    detach();
-    if (backing) fs.rmSync(backing, { recursive: true, force: true });
-  }, 120_000);
+    if (volume) fs.rmSync(volume, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+
+  it("D5 launcher fixtures use a natively accepted private OS-temp namespace", () => {
+    // This is the namespace inherited by worker-e2e/process-utils/actor tests,
+    // not this suite's separate adversarial ACL directory.
+    expect(windowsDataRoot(os.tmpdir(), { private: true })).toBe(path.resolve(os.tmpdir()));
+  }, 30_000);
+
+  it("reuses the native inspector but never reuses an ACL decision after a real grant", () => {
+    const directory = privateDirectory("warm-inspector");
+    const spawn = vi.spyOn(childProcess, "spawn");
+    expect(windowsDataRoot(directory, { private: true })).toBe(directory);
+    grant(directory, "S-1-1-0", 0x1);
+    const before = sddl(directory);
+    expect(() => windowsDataRoot(directory, { private: true })).toThrow(/not private/);
+    expect(sddl(directory)).toBe(before);
+    // beforeAll already opened this process's inspector. Changing policy on the
+    // filesystem must not require spawning/compiling another PowerShell process.
+    expect(spawn).not.toHaveBeenCalled();
+  }, 30_000);
 
   it("accepts a private per-user directory and places actual scratch data there", () => {
     const directory = privateDirectory("quote'$;日本語");
@@ -143,6 +131,79 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     expect(fs.existsSync(scratch)).toBe(true);
     expect(sddl(directory)).toBe(before);
   }, 30_000);
+
+  it("leaves per-run scratch off and inherits the normal user temp environment", async () => {
+    const directory = privateDirectory("inherited-run-temp");
+    const environment = path.join(directory, "environment.json");
+    const worker = path.join(directory, "worker.mjs");
+    fs.writeFileSync(worker, `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(environment)}, JSON.stringify({tmpdir:process.env.TMPDIR,tmp:process.env.TMP,temp:process.env.TEMP}));`);
+    const expected = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP };
+    const nativeSpawn = vi.spyOn(childProcess, "spawnSync");
+    const handle = await new ProcessTransport().launch({ id: "inherited", name: "inherited", cwd: directory,
+      workerPath: worker, workerArguments: ["--status-file", path.join(directory, "status.json")] });
+    try {
+      await handle.waitForClose!();
+      expect(JSON.parse(fs.readFileSync(environment, "utf8"))).toEqual(expected);
+      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(false);
+      expect(nativeSpawn).not.toHaveBeenCalled();
+    } finally { await handle.stop(); }
+  }, 30000);
+
+  it.skipIf(process.platform === "win32")("exports private run scratch only under a natively proven private explicit run root", async () => {
+    const directory = privateDirectory("explicit-run");
+    const before = sddl(directory);
+    const worker = path.join(directory, "worker.mjs");
+    fs.writeFileSync(worker, `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JSON.stringify({tmpdir:process.env.TMPDIR,tmp:process.env.TMP,temp:process.env.TEMP}));`);
+    const handle = await new ProcessTransport().launch({ id: "private", name: "private", cwd: directory, workerPath: worker,
+      workerArguments: ["--status-file", path.join(directory, "status.json")] });
+    try {
+      await vi.waitFor(async () => expect(await handle.isAlive()).toBe(false), { timeout: 10000 });
+      const tmp = path.join(directory, "tmp");
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "environment.json"), "utf8"))).toEqual({tmpdir:tmp,tmp:tmp,temp:tmp});
+      expect(createRunTmpDirectory(directory)).toBe(tmp);
+      expect(sddl(directory)).toBe(before);
+    } finally {
+      await handle.stop();
+      await vi.waitFor(async () => expect(await handle.isAlive()).toBe(false), { timeout: 10000 });
+    }
+  }, 60000);
+
+  it.skipIf(process.platform === "win32").each([0x1, 0x3])("rejects explicit run roots with another ordinary user's read/read-write grant (%s) before spawn", async mask => {
+    const directory = privateDirectory("foreign-grant");
+    const sid = native("([System.Security.Principal.WindowsIdentity]::GetCurrent().User.AccountDomainSid.Value) + '-424242'");
+    grant(directory, sid, mask);
+    const before = sddl(directory);
+    await expect(new ProcessTransport().launch({ id: "unsafe", name: "unsafe", cwd: directory,
+      workerPath: path.join(directory, "must-not-launch.mjs"), workerArguments: ["--status-file", path.join(directory, "status.json")] })).rejects.toThrow(/not private|untrusted principal/);
+    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+    expect(sddl(directory)).toBe(before);
+  }, 30000);
+
+  it("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
+    const directory = privateDirectory("existing-scratch");
+    const tmp = path.join(directory, "tmp");
+    fs.mkdirSync(tmp);
+    grant(tmp, "S-1-1-0", 0x1);
+    fs.writeFileSync(path.join(tmp, "foreign-data"), "do not mutate");
+    const before = sddl(tmp), entries = fs.readdirSync(directory);
+    expect(() => createRunTmpDirectory(directory)).toThrow(/not private/);
+    expect(sddl(tmp)).toBe(before);
+    expect(fs.readFileSync(path.join(tmp, "foreign-data"), "utf8")).toBe("do not mutate");
+    expect(fs.readdirSync(directory)).toEqual(entries);
+  }, 30000);
+
+  it.each(["dot", "parent", "trailing-dot", "reserved"])("refuses invalid explicit %s spelling before allocation or ACL mutation", kind => {
+    const directory = privateDirectory("invalid-spelling"), before = sddl(directory);
+    const missing = path.join(directory, "must-not-create");
+    const spelling = kind === "dot" ? `${missing}\\.\\child` : kind === "parent" ? `${missing}\\..\\child`
+      : kind === "trailing-dot" ? `${missing}.` : `${missing}\\NUL.txt`;
+    expect(() => prepareRunRoot(spelling)).toThrow(/ambiguous Windows path component/);
+    expect(fs.readdirSync(directory)).toEqual([]);
+    expect(sddl(directory)).toBe(before);
+  }, 30000);
 
   it("rejects a foreign-owned root without changing ownership or ACLs", () => {
     const directory = privateDirectory();
@@ -170,7 +231,7 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     expect(fs.existsSync(missing)).toBe(false);
   }, 30_000);
 
-  it("rejects an untrusted writable volume root even with a private descendant", () => {
+  it("rejects an untrusted writable fixture root even with a private descendant", () => {
     const directory = privateDirectory();
     try {
       grant(volume, "S-1-1-0", 0x2);

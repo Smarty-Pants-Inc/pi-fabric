@@ -21,6 +21,8 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -1191,6 +1193,86 @@ describe("AgentManager", () => {
     ).toBe("2");
   });
 
+  it.each(["stop", "caller abort"] as const)("D12 cancels hung relaunch preparation on %s without a late worker", async (operation) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const prepare = vi.fn(async (model: string | undefined) => {
+      if (prepare.mock.calls.length === 2) await gate;
+      return model;
+    });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel: prepare,
+    });
+    managers.push(manager);
+    const caller = new AbortController();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    let stopping: Promise<AgentRunResult> | undefined;
+    try {
+      const handle = await manager.spawn({ task: "Recover startup", model: "test/retry", transport: "process" }, caller.signal);
+      await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+      if (operation === "caller abort") { caller.abort(); stopping = manager.wait(handle.id); }
+      else stopping = manager.stop(handle.id);
+      let settled = false;
+      void stopping.then(() => { settled = true; });
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 1_000 });
+      await stopping;
+      expect(manager.runningCount()).toBe(0);
+      expect(launch).toHaveBeenCalledTimes(1);
+      // The cancelled preparation must neither poison same-model admission nor
+      // retain the only native permit, even while its underlying promise hangs.
+      const next = await manager.spawn({ task: "Reject startup", model: "test/retry", transport: "process" });
+      await manager.wait(next.id);
+      expect(prepare).toHaveBeenCalledTimes(3);
+      release();
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(launch).toHaveBeenCalledTimes(2);
+      expect(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "startup-attempts"), "utf8")).toBe("1");
+    } finally { release(); await stopping; launch.mockRestore(); }
+  });
+
+  it("D12 still joins a replacement whose creation was already attempted", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let releaseHandle!: () => void;
+    let releaseStop!: () => void;
+    const handleGate = new Promise<void>(resolve => { releaseHandle = resolve; });
+    const stopGate = new Promise<void>(resolve => { releaseStop = resolve; });
+    const launch = ProcessTransport.prototype.launch;
+    const replacementStop = vi.fn();
+    let attempts = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const attempt = ++attempts;
+      const transport = await launch.call(this, request);
+      if (attempt === 2) {
+        replacementStop.mockImplementation(async () => { await stopGate; await transport.stop(); });
+        await handleGate;
+        return { ...transport, stop: replacementStop };
+      }
+      return transport;
+    });
+    let stopping: Promise<AgentRunResult> | undefined;
+    try {
+      const handle = await manager.spawn({ task: "Recover startup", transport: "process" });
+      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 10_000 });
+      let settled = false;
+      stopping = manager.stop(handle.id).then(result => { settled = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(settled, "an attempted worker still owes its handle join").toBe(false);
+      releaseHandle();
+      await vi.waitFor(() => expect(replacementStop).toHaveBeenCalledOnce());
+      expect(settled, "the replacement still owes its stop join").toBe(false);
+      releaseStop();
+      await stopping;
+      expect(attempts).toBe(2);
+      expect(manager.runningCount()).toBe(0);
+    } finally { releaseHandle(); releaseStop(); await stopping; spy.mockRestore(); }
+  });
   it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-pin-"));
     roots.push(root);
@@ -1610,7 +1692,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const runRoot = path.join(root, "runs");
     const untracked = path.join(runRoot, "previous-host-worker");
-    fs.mkdirSync(untracked, { recursive: true });
+    fs.mkdirSync(untracked, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(untracked, "evidence"), "still in use");
     const child = spawn("sleep", ["60"], { stdio: "ignore" });
     const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
@@ -1852,7 +1934,6 @@ describe("AgentManager", () => {
     (["clean", "uncertain", "failed-result"] as const).map(outcome => ({ platform, outcome })),
   ))("keeps stop settlement separate from joined process custody ($outcome, $platform)", async ({ outcome, platform }) => {
     const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -1894,6 +1975,10 @@ describe("AgentManager", () => {
     let stopping: Promise<AgentRunResult> | undefined;
     try {
       const handle = await manager.spawn({ task: "joined stop", transport: "process" });
+      // Emulate Windows teardown, not a Windows filesystem on a POSIX host.
+      // The actual host still validates the private run namespace at launch;
+      // every settlement, stop, helper and cleanup assertion below stays intact.
+      if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
       statusFile = path.join(manager.runDirectory(handle.id)!, "status.json");
       writeJsonAtomic(statusFile, {
         id: handle.id, name: "joined stop", task: "joined stop", status: "running", runner: "pi", transport: "process", sessionId,
@@ -2002,6 +2087,75 @@ describe("AgentManager", () => {
       expect(await stopping).toMatchObject({ status: "completed", text: "finished before native close" });
       expect(joined).toBe(true);
     } finally { release(); spy.mockRestore(); }
+  });
+
+  it.each(scratchPlatforms)("joins deadline release without changing the scratch platform contract ($label)", async ({ windows, simulate }) => {
+    const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1_000, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let joining = false;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await launchWithScratchPlatform(new ProcessTransport(), request, simulate);
+      return { ...transport, async waitForClose() {
+        joining = true;
+        await gate;
+        await transport.waitForClose!();
+      } };
+    });
+    const results: Array<Promise<unknown>> = [];
+    try {
+      const handle = await manager.spawn({ task: "HANG REPORT_RUN_TMPDIR until deadline", transport: "process" });
+      const run = manager.runDirectory(handle.id)!;
+      let report!: { tmpdir: string; tmp?: string; temp?: string; osTmpdir: string };
+      await vi.waitFor(() => {
+        const record = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+        expect(record.status).toBe("running");
+        report = JSON.parse(record.text);
+      });
+      if (windows) {
+        expect(report).toEqual(parentTemp);
+        expect(allocate).not.toHaveBeenCalled();
+      } else {
+        expect(report.tmpdir).toBe(path.join(run, "tmp"));
+        expect(report.osTmpdir).toBe(report.tmpdir);
+      }
+      let early = false, late = false, joined = false;
+      results.push(manager.wait(handle.id).then(result => { early = true; return result; }));
+      await vi.waitFor(() => expect(joining).toBe(true), { timeout: 10_000 });
+      expect(manager.isSettled(handle.id)).toBe(true);
+      expect(manager.status(handle.id).status).toBe("timed_out");
+      results.push(manager.wait(handle.id).then(result => { late = true; return result; }));
+      results.push(manager.join(handle.id).then(() => { joined = true; }));
+      await Promise.resolve();
+      expect([early, late, joined], "a claimed settlement cannot bypass the owned release").toEqual([false, false, false]);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(!windows);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(!windows);
+      await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+      release();
+      expect(await Promise.all(results)).toEqual([expect.objectContaining({ status: "timed_out" }), expect.objectContaining({ status: "timed_out" }), undefined]);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+      await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
+      await manager.close();
+      expect(fs.existsSync(root)).toBe(false);
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      if (windows) {
+        expect(fs.existsSync(report.osTmpdir)).toBe(true);
+        expect(allocate).not.toHaveBeenCalled();
+      }
+    } finally {
+      release();
+      await Promise.allSettled(results);
+      await manager.close();
+      spy.mockRestore();
+    }
   });
 
   it("never resumes a run an operator stopped, and aborts only unused runs", async () => {

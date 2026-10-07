@@ -11,7 +11,8 @@ import type { FabricRegistryInvocationContext } from "../src/core/action-registr
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
-import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots } from "../src/storage/retention.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots, runTreeExitVeto } from "../src/storage/retention.js";
 
 const workerPath = path.resolve("dist/worker.js");
 const pin = { model: "openai-codex/gpt-5.6-sol", effort: "high" as const };
@@ -340,7 +341,13 @@ function expire(fixture: Awaited<ReturnType<typeof setup>>) {
 describe("SR-6 real routed worker artifacts are safely retained or collected", () => {
   it.each(["empty", "nonempty"])("collects a closed expired successful run with provenance and %s deliveries", async contents => {
     const fixture = await setup("allow", contents === "nonempty");
+    const allocation = vi.spyOn(runScratch, "allocateRunTmpDirectory");
     const { run } = await fixture.spawn();
+    if (process.platform === "win32") {
+      expect(allocation).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+    }
     expect(fs.statSync(path.join(run, "task.txt.provenance.json")).isFile()).toBe(true);
     const deliveries = path.join(run, "deliveries"); expect(fs.statSync(deliveries).isDirectory()).toBe(true);
     // The real worker writes the envelope; the fake RPC peer intentionally does
@@ -360,7 +367,22 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
       fs.unlinkSync(path.join(deliveries, envelopes[0]!));
     }
     const result = expire(fixture);
-    expect(result.removedRuns).toEqual([run]); expect(result.removedRoots).toEqual([fixture.runRoot]);
+    // Native Windows cannot be certified by a POSIX branch simulation. Keep
+    // the exact safety veto/artifacts in an assertion failure rather than just [].
+    const evidence = () => JSON.stringify({ platform: process.platform,
+      exists: fs.existsSync(run), files: fs.existsSync(run) ? fs.readdirSync(run) : [],
+      veto: runTreeExitVeto(run, 0, undefined, true) });
+    if (process.platform === "win32" && fs.existsSync(path.join(run, "unresolved-worker.json"))) {
+      // Main's unresolved-worker veto is independent of the Windows scratch
+      // scope cut. Native close uncertainty is retained, never forged into exit.
+      expect(result, evidence()).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unresolved worker marker/);
+      expect(fs.existsSync(path.join(run, "task.txt.provenance.json"))).toBe(true);
+      expect(fs.existsSync(deliveries)).toBe(true);
+      return;
+    }
+    expect(result.removedRuns, result.removedRuns.length ? undefined : evidence()).toEqual([run]);
+    expect(result.removedRoots).toEqual([fixture.runRoot]);
     expect(fs.existsSync(run)).toBe(false);
   });
   it.each(["pending", "live", "unresolved", "unknown", "unknown-sidecar", "delivery-unknown", "delivery-directory", "delivery-symlink", "delivery-hardlink", "deliveries-symlink", "provenance-symlink", "provenance-hardlink", "provenance-directory"])("keeps the %s veto with known artifacts present", async veto => {

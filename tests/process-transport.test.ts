@@ -1,5 +1,6 @@
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
+import * as scratchScopes from "../src/storage/process-scratch-scope.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -231,12 +232,16 @@ const args = new Map();`));
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const fixture = (script = 'while [ "$1" != "--" ]; do shift; done; shift; exec "$@"') => {
+  // Exercise systemd admission independently of optional delegated scratch
+  // placement. Scratch allocation/isolation still runs; coexistence has its
+  // own fixed-gate regression in process-utils.test.ts.
+  vi.spyOn(scratchScopes, "createProcessScratchScope").mockReturnValue(undefined);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-slice-")); roots.push(root);
   const worker = path.join(root, "worker.mjs");
   fs.writeFileSync(worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); setInterval(() => {}, 1000);');
   fs.writeFileSync(path.join(root, "systemd-run"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${root}/scope-args"\n${script}\n`, { mode: 0o700 });
   vi.stubEnv("PATH", root); // runtime is process.execPath, never PATH
-  return { root, worker, request: { id: "test", name: "test", cwd: root, workerPath: worker, workerArguments: [] } };
+  return { root, worker, request: { id: "test", name: "test", cwd: root, workerPath: worker, workerArguments: ["--status-file", path.join(root, "status.json")] } };
 };
 const workerStarted = async (root: string) => { await vi.waitFor(() => expect(fs.existsSync(path.join(root, "started"))).toBe(true)); return Number(fs.readFileSync(path.join(root, "started"), "utf8").trim()); };
 

@@ -5,6 +5,20 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
+import { prepareRunRoot } from "../src/storage/run-scratch.js";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
+
+// Policy unit tests supply raw snapshots; transport/cold-vs-warm checks live in
+// windows-acl-inspector.test.ts, and native ACL mutations still use the real bridge.
+vi.mock("../src/storage/windows-acl-inspector.js", () => ({
+  inspectWindowsAclChain: (source: string, env: NodeJS.ProcessEnv) => {
+    const command = windowsSecurityPowerShell(source, env);
+    return childProcess.execFileSync(command.file, command.args, {
+      env: command.env, encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  },
+}));
 
 type Ace = { type: number; flags: number; sid: string; mask: number };
 type Directory = { path: string; attributes: number; owner: string; dacl: Ace[] | null };
@@ -15,13 +29,15 @@ const root = "R:\\private\\data";
 const paths = ["R:\\", "R:\\private", root];
 const allow = (sid = userSid, mask = 0x1f01ff, flags = 0): Ace => ({ type: 0, flags, sid, mask });
 let directories: Directory[];
+let normalTemp: string | undefined;
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 
 beforeEach(() => {
+  normalTemp = undefined;
   directories = paths.map(path => ({ path, attributes: 0x10, owner: userSid, dacl: [allow()] }));
   vi.stubEnv("SystemRoot", "C:\\Windows");
   vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
-  vi.spyOn(childProcess, "execFileSync").mockImplementation(() => JSON.stringify({ userSid, device: "\\Device\\HarddiskVolume7", directories }));
+  vi.spyOn(childProcess, "execFileSync").mockImplementation(() => JSON.stringify({ userSid, device: "\\Device\\HarddiskVolume7", normalTemp, directories }));
 });
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
@@ -30,6 +46,13 @@ afterEach(() => {
 });
 
 describe("Windows file-data namespace ACL policy", () => {
+  it.each(["R:relative", "R:\\private\\missing\\.\\child", "R:\\private\\missing\\..\\child", "R:\\private\\missing.", "R:\\private\\missing\\NUL.txt"])("refuses explicit spelling %s before filesystem/ACL access", spelling => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const lstat = vi.spyOn(fs, "lstatSync"), mkdir = vi.spyOn(fs, "mkdirSync"), chmod = vi.spyOn(fs, "chmodSync");
+    expect(() => prepareRunRoot(spelling)).toThrow(/absolute local drive path|ambiguous Windows path component/);
+    expect(lstat).not.toHaveBeenCalled(); expect(mkdir).not.toHaveBeenCalled(); expect(chmod).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+  });
   it("accepts a private user namespace through fabricDataRoot without using mode bits or writing", () => {
     Object.defineProperty(process, "platform", { value: "win32" });
     vi.stubEnv("PI_FABRIC_TMPDIR", root + "\\");
@@ -76,10 +99,56 @@ describe("Windows file-data namespace ACL policy", () => {
     expect(() => windowsDataRoot(root)).toThrow(/untrusted principal/);
   });
 
+  it("permits sibling creation and inherit-only grants only above native normal temp", () => {
+    normalTemp = paths[1];
+    directories[0]!.dacl!.push(allow(users, 0x06), allow("S-1-3-0", 0x1f01ff, 0x0b));
+    expect(windowsDataRoot(root, { private: true })).toBe(root);
+    directories[1]!.dacl!.push(allow(users, 0x04));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it.each([0x10, 0x40, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000])("rejects ancestor mutation/replacement above normal temp (%s)", mask => {
+    normalTemp = paths[1]; directories[0]!.dacl!.push(allow(users, mask));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it.each([0, 1, 2])("keeps ownership and reparse checks above/at/below normal temp (%s)", index => {
+    normalTemp = paths[1]; directories[index]!.owner = users;
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/owned by another user/);
+    directories[index]!.owner = userSid; directories[index]!.attributes |= 0x400;
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not a real directory/);
+  });
+
+  it("does not infer normal temp from caller-controlled environment paths", () => {
+    normalTemp = "R:\\unrelated";
+    vi.stubEnv("TMP", paths[1]); vi.stubEnv("TEMP", paths[1]);
+    directories[0]!.dacl!.push(allow(users, 0x04));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it("checks inherited grants at/below normal temp despite harmless grants above it", () => {
+    normalTemp = paths[1]; directories[0]!.dacl!.push(allow(users, 0x1f01ff, 0x0b));
+    directories[1]!.dacl!.push(allow(users, 0x2, 0x0b));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+    directories[1]!.dacl!.pop(); directories[2]!.dacl!.push(allow(users, 0x1, 0x0b));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not private/);
+  });
   it("fails closed even when a deny could cancel an unsafe allow", () => {
     directories[1]!.dacl!.unshift({ ...allow(everyone), type: 1 });
     directories[1]!.dacl!.push(allow(everyone));
     expect(() => windowsDataRoot(root)).toThrow(/untrusted principal/);
+  });
+
+  it.each([0x1, 0x80, 0x20000, 0x80000000, 0xa01200a9])("private scratch rejects untrusted read grants (%s)", mask => {
+    directories[2]!.dacl!.push(allow(everyone, mask));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not private/);
+  });
+
+  it("private scratch still allows read/traverse-only ancestors, not writable ancestors", () => {
+    directories[0]!.dacl!.push(allow(everyone, 0xa01200a9));
+    expect(windowsDataRoot(root, { private: true })).toBe(root);
+    directories[0]!.dacl!.push(allow(everyone, 0x2));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
   });
 
   it("permits known untrusted read/traverse rights and standard denies", () => {
@@ -147,7 +216,8 @@ describe("Windows file-data namespace ACL policy", () => {
     const source = Buffer.from((args as string[])[4]!, "base64").toString("utf16le");
     expect(source.startsWith("$ErrorActionPreference = 'Stop'\nImport-Module Microsoft.PowerShell.Security -ErrorAction Stop\n")).toBe(true);
     expect(source).toContain("RawSecurityDescriptor");
-    expect(source).toContain("Get-Acl -LiteralPath");
+    expect(source).toContain("[System.IO.Directory]::GetAccessControl($directory)");
+    expect(source).toContain("[System.IO.File]::GetAttributes($directory)");
     expect(source).not.toContain(unusual);
     expect(options).toMatchObject({ timeout: 15000, windowsHide: true, encoding: "utf8", env: { PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules", PI_FABRIC_ACL_CHAIN: JSON.stringify([paths[0], paths[1], unusual]) } });
   });

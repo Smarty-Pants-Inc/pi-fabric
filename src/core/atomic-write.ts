@@ -550,9 +550,9 @@ const renameAtomicAsync = async (
   }
 };
 
-const writeFileAtomicAsync = async (
+export const writeFileAtomicAsync = async (
   filePath: string,
-  contents: string,
+  contents: string | Buffer,
   options?: Omit<AtomicWriteOptions, 'durable'>,
 ): Promise<void> => {
   await fs.promises.mkdir(path.dirname(filePath), {

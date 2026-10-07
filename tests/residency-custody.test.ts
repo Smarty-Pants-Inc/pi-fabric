@@ -29,7 +29,7 @@ const fixture = () => {
     piBinary: path.resolve("tests/fixtures/refusing-execution.mjs"), claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
-  fs.mkdirSync(config.residencyRoot);
+  fs.mkdirSync(config.residencyRoot, { mode: 0o700 });
   const host = new ResidentHost(config);
   const options = { config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget };
   return { root, config, host, options };
@@ -86,6 +86,7 @@ describe.skipIf(process.platform !== "linux")("round 2 execution custody", () =>
       // Seed host ran in this still-live test process; clear only its diagnostic
       // bytes after its confirmed close, retaining the established fence inode.
       fs.writeFileSync(path.join(config.residencyRoot, "host.lock"), "");
+      fs.unlinkSync(path.join(config.residencyRoot, "maintenance-ready.json"));
       const lineage = createHash("sha256").update([config.rootId, "durable"].join("\0")).digest("hex").slice(0, 16);
       const now = Date.now();
       // Persisted predecessor work; this fixture does not leave a live prior worker
@@ -100,11 +101,17 @@ describe.skipIf(process.platform !== "linux")("round 2 execution custody", () =>
       const starting = client.ensureHost().catch(error => error);
       await vi.waitFor(() => expect(fs.existsSync(path.join(root, "restored-execution.json"))).toBe(true), { timeout: 10_000 }).catch(error => {
         const diagnostics = ["restore-error.json", "restore-state.json", "launcher.log"].map(file => { try { return fs.readFileSync(path.join(config.residencyRoot, file), "utf8"); } catch { return "absent"; } });
+        for (const file of ["actors.json.lock/owner", `messages-${lineage}.jsonl`, "actors.json"]) {
+          try { diagnostics.push(`${file}: ${fs.readFileSync(path.join(config.actorRoot, file), "utf8")}`); } catch { diagnostics.push(`${file}: absent`); }
+        }
         throw new Error(`${error}\n${diagnostics.join("\n")}`);
       });
       expect(live().some(owned => owned.argv[0] === config.workerPath)).toBe(true);
       expect(live().some(owned => owned.argv[0] === config.piBinary)).toBe(true);
-      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      // Preserve the authoritative owner used by restored actor publication;
+      // withhold only the client's same-token startup receipt.
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(true);
+      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
       await client.close();
       expect(await starting).toMatchObject({ message: "Fabric residency client is closed" });
       expect(live(), "aborted startup must join restored execution, not just the launcher group").toEqual([]);

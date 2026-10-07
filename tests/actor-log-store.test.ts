@@ -44,6 +44,24 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual([]);
   });
 
+  it("resumes at most one run per step and refreshes the mutable latest-run fence", () => {
+    const { root, actor, store } = setup();
+    for (const id of ["a", "b", "latest"]) {
+      const run = path.join(root, "actor", "runs", id);
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
+    }
+    const slices = store.pruneRunsInSlices(actor, 1000);
+    expect(slices.next().done).toBe(false); // session backups only
+    expect(slices.next().done).toBe(false); // directory census only
+    expect(store.retainedRunIds(actor)).toEqual(["a", "b", "latest"]);
+    expect(slices.next().done).toBe(false); // a only
+    expect(store.retainedRunIds(actor)).toEqual(["b", "latest"]);
+    actor.lastRunId = "b"; // New lastRunId between yields is not collectible.
+    while (!slices.next().done) {}
+    expect(store.retainedRunIds(actor)).toEqual(["b", "latest"]);
+  });
+
   it("passes terminal event retention settings to its existing archive sweep without touching lastRunId", () => {
     const { root, actor } = setup();
     const retention = { actorRunArchiveMs: 10000, terminalRunEventsAgeMs: 100, terminalRunEventsMaxBytes: 1024 };

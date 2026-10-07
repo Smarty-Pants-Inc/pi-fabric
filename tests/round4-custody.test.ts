@@ -1,4 +1,18 @@
 import fs from "node:fs";
+
+// Inject custody branches, not a foreign filesystem. This POSIX-host adapter
+// supplies the private test inode; native Windows retains the real DACL policy.
+vi.mock("../src/storage/windows-temp-root.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/windows-temp-root.js")>();
+  return { ...actual, windowsDataRoot: process.platform === "win32" ? actual.windowsDataRoot :
+    (root: string) => {
+      const stat = fs.lstatSync(root);
+      if (!path.isAbsolute(root) || !stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700) {
+        throw new Error("Unsafe simulated Windows test root");
+      }
+      return fs.realpathSync(root);
+    } };
+});
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -149,7 +163,11 @@ describe("round 4 execution custody", () => {
   it("F5 Windows process admission uses the legacy native-child path, not the tree-custody channel", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: 123, closed: Promise.resolve(), stop: async () => {}, isAlive: async () => false, lostContact: () => undefined, waitForClose: async () => {} });
-    await new ProcessTransport().launch({ id: "windows", name: "windows", cwd: process.cwd(), workerPath: "worker.js", workerArguments: [] });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-r4-admission-"));
+    try {
+      await new ProcessTransport().launch({ id: "windows", name: "windows", cwd: process.cwd(), workerPath: "worker.js",
+        workerArguments: ["--status-file", path.join(root, "status.json")] });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
     expect(spawn.mock.calls[0]?.[5]).toBeUndefined();
     expect(spawn.mock.calls[0]?.[6]).toBe(7_000);
     expect(spawn.mock.calls[0]?.[7]).toBe(false);

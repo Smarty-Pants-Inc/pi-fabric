@@ -48,6 +48,7 @@ const testControls = new Set([
   "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM",
   "PI_FABRIC_ACTIVATION_TEST_PI_BINARY", "PI_FABRIC_ACTIVATION_TEST_WORKER",
   "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS",
+  "PI_FABRIC_SCRATCH_EVIDENCE_DIR",
 ]);
 
 /** Run at config evaluation AND before each test file's source imports. */
@@ -91,7 +92,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     MCPORTER_CONFIG: join(root, "mcporter.json"),
   };
   for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
-    mkdirSync(join(root, directory), { recursive: true });
+    mkdirSync(join(root, directory), { recursive: true, mode: 0o700 });
   }
   writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');
   Object.assign(process.env, environment);

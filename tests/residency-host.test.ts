@@ -8,6 +8,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ACTOR_RETENTION_BATCH_SIZE } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import * as modelRefresh from "../src/core/model-refresh.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
@@ -45,7 +46,7 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
     retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
-  fs.mkdirSync(config.residencyRoot, { recursive: true });
+  fs.mkdirSync(config.residencyRoot, { recursive: true, mode: 0o700 });
   const configPath = path.join(config.residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
   const idle = vi.fn();
@@ -165,15 +166,24 @@ describe("fresh startup ownership batches", () => {
         registry.write(registry.records().map((record) => record.id === target.id ? { ...record, instructions: "remote-owner-state" } : record));
       };
       let published = false, writerError: unknown;
-      const prune = ActorLogStore.prototype.pruneRuns;
-      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
-        prune.call(this, actor, now);
-        if (actor.sessionFile === actors[7]!.sessionFile && !published) {
+      // Publish before the next actor batch, not after a fixed number of turns.
+      // Main yields after one Windows actor or eight actors on other platforms.
+      const boundary = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"] - 1;
+      const scheduleOwner = (actor: { sessionFile: string }) => {
+        if (actor.sessionFile === actors[boundary]!.sessionFile && !published) {
           setImmediate(() => {
             try { publishOwner(victim); published = true; }
             catch (error) { writerError = error; }
           });
         }
+      };
+      const prune = ActorLogStore.prototype.pruneRuns;
+      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+        prune.call(this, actor, now); scheduleOwner(actor);
+      });
+      const slices = ActorLogStore.prototype.pruneRunsInSlices;
+      vi.spyOn(ActorLogStore.prototype, "pruneRunsInSlices").mockImplementation(function*(this: ActorLogStore, actor, now) {
+        yield* slices.call(this, actor, now); scheduleOwner(actor);
       });
       expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
       const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
@@ -915,12 +925,14 @@ describe("resident orphan retention", () => {
     }));
     const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
     fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+    const expiredMtime = fs.statSync(run).mtimeMs;
     const resultPath = residentResultPath(config.residencyRoot, id);
     try {
       // Lost host: the detached worker wrote status.json, but onSettled never saved results/id.
       await host.start();
       expect(fs.existsSync(run)).toBe(true);
       expect(fs.existsSync(resultPath)).toBe(false);
+      expect(fs.statSync(run).mtimeMs).toBe(expiredMtime);
       fs.mkdirSync(path.dirname(resultPath), { recursive: true });
       for (const malformed of [
         "{", "null", "[]", JSON.stringify({ ...result, id: "b".repeat(32) }),
@@ -949,6 +961,7 @@ describe("resident orphan retention", () => {
         expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
       }
       fs.writeFileSync(metadataPath, metadata);
+      expect(fs.statSync(run).mtimeMs).toBe(expiredMtime);
       // Counterexample: this SAME public task becomes collectable once its authoritative copy exists.
       expect(sweepResidentRuns(runs)).toEqual([run]);
       expect(fs.existsSync(run)).toBe(false);
@@ -1143,6 +1156,81 @@ describe("resident host ownership", () => {
     }
   });
 
+  it("D12 releases a stop admission during hung relaunch preparation and closes without a late worker", async () => {
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker-startup-retry.mjs");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const prepare = vi.spyOn(modelRefresh, "resolvePiModel").mockImplementation(async () => {
+      if (prepare.mock.calls.length === 2) await gate;
+      return { provider: "test", id: "retry" };
+    });
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation(accept => { handler = accept; });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    let admission: ReturnType<typeof handler> | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await host.start();
+      control.mockRestore();
+      const handle = await host.agents.spawn({ task: "Recover startup", model: "test/retry", transport: "process" });
+      await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+      admission = handler({ operation: "stop", targetId: handle.id, commandId: "D12-stop" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal);
+      closing = host.close();
+      let closed = false;
+      void closing.then(() => { closed = true; });
+      await vi.waitFor(() => expect(closed).toBe(true), { timeout: 2_000 });
+      await expect(admission).resolves.toMatchObject({ accepted: true });
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      release();
+      await delay(150);
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally {
+      release(); await admission; await closing; await host.close();
+      control.mockRestore(); prepare.mockRestore(); launch.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("D12 cancels preparation before waiting for an in-flight control admission on shutdown", async () => {
+    const { root, config, host } = fixture();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const prepare = vi.spyOn(modelRefresh, "resolvePiModel").mockImplementation(async () => {
+      await gate;
+      return { provider: "test", id: "retry" };
+    });
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation(accept => { handler = accept; });
+    let admission: ReturnType<typeof handler> | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await host.start();
+      control.mockRestore();
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockImplementation(async () => ({
+        model: (await host.agents.prepareModelForAdmission("test/retry", "pi"))!,
+      }));
+      const tell = vi.spyOn(host.actors, "tell");
+      admission = handler({ operation: "followUp", targetId: "actor", commandId: "D12-admission", message: "keep working" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal);
+      await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+      closing = host.close();
+      let closed = false;
+      void closing.then(() => { closed = true; });
+      await vi.waitFor(() => expect(closed).toBe(true), { timeout: 2_000 });
+      await expect(admission).resolves.toMatchObject({ accepted: false });
+      expect(tell).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      release();
+      await delay(150);
+      expect(tell).not.toHaveBeenCalled();
+    } finally {
+      release(); await admission; await closing; await host.close();
+      control.mockRestore(); prepare.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("rejects delayed and new admissions during ordinary close", async () => {
     const { root, config, host } = fixture();
     let handler!: Parameters<typeof host.control.start>[0];

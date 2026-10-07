@@ -1,4 +1,18 @@
 import fs from "node:fs";
+
+// Inject custody branches, not a foreign filesystem. This POSIX-host adapter
+// supplies the private test inode; native Windows retains the real DACL policy.
+vi.mock("../src/storage/windows-temp-root.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/windows-temp-root.js")>();
+  return { ...actual, windowsDataRoot: process.platform === "win32" ? actual.windowsDataRoot :
+    (root: string) => {
+      const stat = fs.lstatSync(root);
+      if (!path.isAbsolute(root) || !stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700) {
+        throw new Error("Unsafe simulated Windows test root");
+      }
+      return fs.realpathSync(root);
+    } };
+});
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";

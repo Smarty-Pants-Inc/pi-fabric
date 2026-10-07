@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { processIsAlive, spawnDetached } from "../src/agents/transports/process-utils.js";
 import { same, startTime } from "./helpers/owned-processes.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 import { taskReturnAddressArguments } from "../src/agents/task-return-address.js";
 
 // Preserve native spawn, but capture its exact ChildProcess before it can close.
@@ -75,7 +77,8 @@ async function withOwnedWorker(
     const worker = path.join(root, "worker.mjs");
     fs.writeFileSync(worker, source);
     const launched = workerArguments === undefined ? undefined : await new ProcessTransport().launch({
-      id: "role-test", name: "role-test", cwd: root, workerPath: worker, workerArguments,
+      id: "role-test", name: "role-test", cwd: root, workerPath: worker,
+      workerArguments: [...workerArguments, "--status-file", path.join(root, "status.json")],
     });
     const handle = launched ? { ...launched, pid: Number(launched.sessionId), lostContact: () => launched.lostContact?.() } : await spawnDetached(worker, [], root);
     await run(handle, root, children[0]!.child as ChildProcess);
@@ -175,6 +178,39 @@ fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,overri
   });
 });
 
+describe("process private scratch (#3076)", () => {
+  for (const platform of scratchPlatforms) {
+    it.each([{ args: [] }, { args: ["--actor-id", "scratch-review"] }])(`preserves the task/actor worker temp contract (${platform.label}; %j)`, async ({ args }) => {
+      const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+      const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+      if (platform.simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+        return launchWithScratchPlatform(this, request, true);
+      });
+      await withOwnedWorker(`import fs from "node:fs";
+import os from "node:os";
+fs.writeFileSync("env.json", JSON.stringify({tmpdir:process.env.TMPDIR,osTmpdir:os.tmpdir(),tmp:process.env.TMP,temp:process.env.TEMP,mode:fs.statSync(os.tmpdir()).mode & 0o777}));
+setInterval(() => {}, 1000);`, async (_handle, root) => {
+        await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+        const report = JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"));
+        if (platform.windows) {
+          expect({ tmpdir: report.tmpdir, tmp: report.tmp, temp: report.temp, osTmpdir: report.osTmpdir }).toEqual(parentTemp);
+          expect(fs.existsSync(path.join(root, "tmp"))).toBe(false);
+          expect(fs.existsSync(path.join(root, "unresolved-scratch.json"))).toBe(false);
+          expect(allocate).not.toHaveBeenCalled();
+        } else {
+          expect(report.tmpdir).toBe(path.join(root, "tmp"));
+          expect(report.osTmpdir).toBe(report.tmpdir);
+          expect(report.mode).toBe(0o700);
+        }
+        expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      }, args);
+      // withOwnedWorker joins the captured child's native close before returning.
+      if (platform.windows) expect(fs.existsSync(parentTemp.osTmpdir)).toBe(true);
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+    });
+  }
+});
+
 describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => {
   const owned = { pid: 123, started: "456" };
   const stat = (state = "S", started = owned.started) =>
@@ -211,6 +247,31 @@ describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => 
 });
 
 describe("spawnDetached", () => {
+  it("retains the fixed scratch gate rather than migrating custody into a configured slice", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
+    vi.mocked(spawn).mockClear().mockReturnValueOnce(child as unknown as ChildProcess);
+    const scratch = { directory: "/sys/fs/cgroup/private-test", dev: 1, ino: 1, bootId: "test", joinedFile: "joined", launchNonce: "nonce" };
+    const warn = vi.fn();
+    const handle = await spawnDetached("worker.mjs", [], process.cwd(), undefined, {}, { executable: "systemd-run", slice: "batch.slice", warn }, scratch);
+    try {
+      expect(warn).toHaveBeenCalledExactlyOnceWith("private scratch containment takes precedence over systemd slice placement");
+      expect(spawn).toHaveBeenCalledExactlyOnceWith("/bin/sh", expect.arrayContaining(["-p", "pi-fabric-scratch-gate", scratch.directory]), expect.any(Object));
+      const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+      expect(args[2]).toContain('"$1/cgroup.procs"');
+      expect(args).not.toContain("--scope");
+    } finally {
+      child.emit("exit", 0); child.emit("close", 0);
+      await handle.waitForClose();
+    }
+  });
+  it.each(["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_ORIGIN_PATH", "GCONV_PATH"])("refuses a scoped launch before spawn when the explicit environment has %s", async key => {
+    vi.mocked(spawn).mockClear();
+    const scope = { directory: "unused", dev: 1, ino: 1, bootId: "unused", joinedFile: "unused", launchNonce: "unused" };
+    await expect(spawnDetached("worker.mjs", [], process.cwd(), undefined, { ...process.env, [key]: "synthetic-preload" }, scope))
+      .rejects.toMatchObject({ name: "WorkerNotStartedError", message: expect.stringContaining("launch gate has a loader hook") });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("accepts a Bun-shaped IPC channel without unref while retaining custody messages", async () => {
     const child = Object.assign(new EventEmitter(), {
       pid: process.pid, unref: vi.fn(), channel: {}, connected: true,

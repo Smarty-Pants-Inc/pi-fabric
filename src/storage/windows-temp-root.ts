@@ -1,6 +1,5 @@
-import childProcess from "node:child_process";
 import path from "node:path";
-import { windowsSecurityPowerShell } from "./windows-powershell.js";
+import { inspectWindowsAclChain } from "./windows-acl-inspector.js";
 
 // Use SIDs, not localized names or the caller's group membership. These principals
 // can already administer the machine. Services and ordinary user groups are not trusted.
@@ -26,6 +25,7 @@ try {
   $paths = ConvertFrom-Json -InputObject $env:PI_FABRIC_ACL_CHAIN
   # A mapped network drive or SUBST alias can hide the physical ancestor chain.
   # Query the DOS device before any path access; only direct local volumes qualify.
+  if (-not ('FabricTempRootDevice' -as [type])) {
   Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -41,11 +41,15 @@ public static class FabricTempRootDevice {
   }
 }
 '@
+  }
   $device = [FabricTempRootDevice]::Resolve([System.IO.Path]::GetPathRoot($paths[0]).Substring(0, 2))
   if ($device -notmatch '^\\Device\\HarddiskVolume[0-9]+$') { throw 'Not a direct local volume' }
   $directories = @(foreach ($directory in $paths) {
-    $item = Get-Item -Force -LiteralPath $directory
-    $acl = Get-Acl -LiteralPath $directory
+    # Windows PowerShell 5.1 uses .NET Framework: these are the same native
+    # descriptors/attributes as the filesystem provider, without a cmdlet
+    # pipeline for every ancestor in every launch/retirement snapshot.
+    $attributes = [int][System.IO.File]::GetAttributes($directory)
+    $acl = [System.IO.Directory]::GetAccessControl($directory)
     $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
     $dacl = $null
     if ($null -ne $raw.DiscretionaryAcl) {
@@ -59,28 +63,34 @@ public static class FabricTempRootDevice {
         @{ type = [int]$ace.AceType; flags = [int]$ace.AceFlags; sid = $sid; mask = $mask }
       })
     }
-    @{ path = $directory; attributes = [int]$item.Attributes; owner = $raw.Owner.Value; dacl = $dacl }
+    @{ path = $directory; attributes = $attributes; owner = $raw.Owner.Value; dacl = $dacl }
   })
-  @{ userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; device = $device; directories = $directories } | ConvertTo-Json -Compress -Depth 8
+  $normalTemp = [System.IO.Path]::Combine([Environment]::GetFolderPath('LocalApplicationData'), 'Temp')
+  @{ userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; device = $device; normalTemp = $normalTemp; directories = $directories } | ConvertTo-Json -Compress -Depth 8
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
-  exit 1
+  throw
 }
 `;
 
-/** Existing, local Windows directories only; no repair or writes on uncertain ACLs. */
-export const windowsDataRoot = (root: string): string => {
-  const fail = (directory: string, reason: string): never => {
-    throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
-  };
-  // Drive-relative, UNC, device and Win32-normalized names need different namespace
-  // proofs. Do not accept those aliases, alternate data streams or reserved devices.
+const fail = (directory: string, reason: string): never => {
+  throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
+};
+
+/** Lexical policy must run before allocation or native inspection: resolving a
+ * dot/reserved component first would erase the caller's unsupported spelling. */
+export const windowsRootSpelling = (root: string): string => {
   if (!/^[a-z]:[\\/]/i.test(root)) fail(root, "must be an absolute local drive path");
   const components = root.slice(3).split(/[\\/]/).filter(Boolean);
   if (components.some(component => /[<>:"|?*\x00-\x1f]|[. ]$/.test(component) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(component))) {
     fail(root, "has an ambiguous Windows path component");
   }
-  const directory = path.win32.resolve(root);
+  return path.win32.resolve(root);
+};
+
+/** Existing, local Windows directories only; no repair or writes on uncertain ACLs. */
+export const windowsDataRoot = (root: string, options: { private?: boolean } = {}): string => {
+  const directory = windowsRootSpelling(root);
   const chain: string[] = [];
   for (let current = directory; ; current = path.win32.dirname(current)) {
     chain.unshift(current);
@@ -88,12 +98,7 @@ export const windowsDataRoot = (root: string): string => {
   }
   let snapshot: unknown;
   try {
-    const command = windowsSecurityPowerShell(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
-    const output = childProcess.execFileSync(command.file, command.args, {
-      env: command.env,
-      encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const output = inspectWindowsAclChain(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
     snapshot = JSON.parse(output);
   } catch {
     return fail(directory, "could not prove native Windows ACL safety (directories must already exist)");
@@ -103,6 +108,13 @@ export const windowsDataRoot = (root: string): string => {
   }
   if (typeof snapshot.device !== "string" || !/^\\Device\\HarddiskVolume[0-9]+$/i.test(snapshot.device)) return fail(directory, "is not a proven direct local volume");
   const trusted = (sid: string) => sid === snapshot.userSid || SYSTEM_SIDS.has(sid);
+  // Directory-only Windows isolation uses the native per-user normal temp
+  // hierarchy. Above it, sibling creation cannot mutate an existing directory,
+  // and inherit-only grants do not apply to those ancestors. Every owner and
+  // reparse check still applies; every ACL at/below normal temp stays strict.
+  // Never infer this boundary from TMP/TEMP or a caller-selected override.
+  const normalTempIndex = typeof snapshot.normalTemp === "string"
+    ? chain.findIndex(current => current.toLowerCase() === (snapshot.normalTemp as string).toLowerCase()) : -1;
   for (const [index, current] of chain.entries()) {
     const entry: unknown = snapshot.directories[index];
     if (!record(entry) || entry.path !== current || !uint32(entry.attributes)) fail(current, "has an invalid native Windows directory snapshot");
@@ -115,10 +127,18 @@ export const windowsDataRoot = (root: string): string => {
       if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0 || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) {
         fail(current, "has an unsupported or unproven ACE");
       }
-      const rule = ace as { type: number; sid: string; mask: number };
-      // Include inherited/inherit-only grants: later scratch children must be private
-      // too. Rejecting a deny+allow pair is deliberate conservative fail-closed policy.
-      if (rule.type === 0 && !trusted(rule.sid) && (rule.mask & ~READ_ONLY_RIGHTS) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
+      const rule = ace as { type: number; flags: number; sid: string; mask: number };
+      // Rejecting a deny+allow pair is deliberate conservative fail-closed policy.
+      if (rule.type === 0 && !trusted(rule.sid)) {
+        const aboveNormalTemp = normalTempIndex > index;
+        if (aboveNormalTemp && (rule.flags & 0x08) !== 0) continue; // INHERIT_ONLY_ACE
+        const allowed = READ_ONLY_RIGHTS | (aboveNormalTemp ? 0x06 : 0);
+        if ((rule.mask & ~allowed) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
+        // Read/list/traverse grants are harmless for ancestor custody, but not
+        // for a namespace exported as private TMPDIR/TMP/TEMP. Include
+        // inherit-only grants so newly allocated files cannot leak either.
+        if (options.private && index === chain.length - 1 && rule.mask !== 0) fail(current, "is not private (untrusted principal has access)");
+      }
     }
   }
   return directory;

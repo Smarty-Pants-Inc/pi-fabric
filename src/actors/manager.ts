@@ -3600,6 +3600,8 @@ export class ActorManager {
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
     const actors = [...this.#actors.values()];
+    // Windows scope cut (#4010): no additional per-run scratch custody queue,
+    // inspection or disposal; retain main's platform-specific actor yield.
     // NTFS metadata/deletion can make eight actors (72 expired runs in the
     // startup fixture) monopolize a turn. Keep each run's work unchanged,
     // but re-enter the publication/ownership fences between Windows actors.

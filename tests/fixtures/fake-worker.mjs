@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import os from "node:os";
 
 const args = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {
@@ -68,7 +69,9 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       updatedAt: Date.now(),
       turns: 0,
       toolCalls: 0,
-      text: "",
+      text: task.includes("REPORT_RUN_TMPDIR") ? JSON.stringify({
+        tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir(),
+      }) : "",
       exitCode: null,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     }),
@@ -265,7 +268,12 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     : undefined;
   const now = Date.now();
   const largeText = task.includes("LARGE_RESULT") ? "x".repeat(100_000) : undefined;
-  const text = largeText ?? (directive && !fail
+  const scratchReport = task.includes("REPORT_RUN_TMPDIR") ? JSON.stringify({
+    tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir(),
+    mode: fs.statSync(os.tmpdir()).mode & 0o777,
+    scratch: fs.mkdtempSync(path.join(os.tmpdir(), "actor-scratch-")),
+  }) : undefined;
+  const text = scratchReport ?? largeText ?? (directive && !fail
     ? JSON.stringify(directive)
     : task.includes("ECHO_MODEL") ? `model ${args.get("model")}` : "fake worker complete");
   const record = {

@@ -7,6 +7,7 @@ import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_RETENTION_BATCH_SIZE, ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorLogStore } from "../src/actors/log-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -124,6 +125,42 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 
+  it("keeps Windows startup on main's synchronous per-actor sweep, without an added custody queue", async () => {
+    const f = fixture(9);
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const asyncQueue = vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync");
+    const sync = vi.spyOn(ActorLogStore.prototype, "pruneRuns");
+    try {
+      f.make({ canManageActor: () => true,
+        snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, true])) });
+      await eventually(() => !fs.existsSync(f.runDir(8, 8)));
+      expect(sync).toHaveBeenCalledTimes(9);
+      expect(asyncQueue).not.toHaveBeenCalled();
+      for (let actor = 0; actor < 9; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
+    } finally { platform.mockRestore(); }
+  });
+
+  it.each(["ownership", "publication"] as const)("keeps main's fresh Windows %s veto between actor batches", async fence => {
+    const f = fixture(9);
+    const boundary = ACTOR_RETENTION_BATCH_SIZE.win32 - 1;
+    let owned = true, published = true;
+    const prune = ActorLogStore.prototype.pruneRuns;
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+      prune.call(this, actor, now);
+      if (path.dirname(actor.sessionFile) === path.join(f.actorRoot, f.records[boundary]!.id)) setImmediate(() => {
+        if (fence === "ownership") owned = false; else published = false;
+      });
+    });
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      f.make({ snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, owned])),
+        canConsumeMesh: () => published });
+      await eventually(() => !fs.existsSync(f.runDir(boundary, 8)));
+      await turn(); await turn();
+      for (let run = 0; run < 10; run++) expect(fs.existsSync(f.runDir(8, run))).toBe(true);
+    } finally { platform.mockRestore(); }
+  });
+
   it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
     const f = fixture(17);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
@@ -133,9 +170,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
         statusProbes++;
         // Controlled metadata latency, independent of whether this host has NTFS.
-        // Eight actors share 72 candidates: four status probes/run at 2 ms each
-        // exceed the existing heartbeat bound. One actor still does identical work.
-        const until = performance.now() + 2;
+        // A Windows actor slice shares one checked status observation per
+        // candidate between the exit and allowlist proofs; no cross-turn cache.
+        // At 4 ms/probe, eight actors still exceed the 250 ms heartbeat gate.
+        const until = performance.now() + 4;
         while (performance.now() < until) { /* slow filesystem metadata */ }
       }
       return Reflect.apply(lstat, fs, [file, ...args]);
@@ -153,7 +191,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
       process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
-      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
+      expect(statusProbes).toBe(17 * 9); // One status metadata probe per candidate; tighter than main.
       expect(longest).toBeLessThan(250);
       for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { active = false; clearImmediate(heartbeat!); }

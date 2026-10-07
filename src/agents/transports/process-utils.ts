@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { SCRATCH_GATE_LOADER_HOOKS, scopedWorkerArguments, type ScopedScratchLaunch } from "../../storage/process-scratch-scope.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
@@ -255,6 +256,13 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
+/** Proof that no worker-creation side effect was attempted. */
+export class WorkerNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "WorkerNotStartedError";
+  }
+}
 type LinuxGroupMember = { pid: number; parent: number; group: number; started: string; state: string };
 const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
   try {
@@ -282,25 +290,56 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-  scope?: { executable: string; slice: string; warn: (reason: string) => void },
-  /** Ordinary workers need time to run their five-second execution-child cleanup. */
-  termGraceMs = STOP_TERM_MS,
+  scope?: { executable: string; slice: string; warn: (reason: string) => void } | ScopedScratchLaunch,
+  termGraceMs: number | ScopedScratchLaunch = STOP_TERM_MS,
   executionCustodian = false,
+  scratchScope?: ScopedScratchLaunch,
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
-  const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
-  const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
-  assertTransportLaunchAllowed(authority);
+  // Retain the existing sixth-argument scratch seam for direct callers.
+  if (scope && "directory" in scope) { scratchScope = scope; scope = undefined; }
+  if (typeof termGraceMs !== "number") { scratchScope = termGraceMs; termGraceMs = STOP_TERM_MS; }
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
-  // Scope admission execs in place: the captured PID and custody IPC stay owned.
+  let runtime: string;
+  let treeOwner: typeof import("../../residency/launcher-owner.js") | undefined;
+  try {
+    runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+    treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
+    assertTransportLaunchAllowed(authority);
+    // No loader may run before the fixed scratch attachment gate.
+    if (scratchScope && SCRATCH_GATE_LOADER_HOOKS.some(key => (environment ?? process.env)[key]?.trim())) {
+      throw new Error("Unproved scratch attachment: launch gate has a loader hook");
+    }
+  } catch (error) {
+    throw new WorkerNotStartedError(error);
+  }
+  if (scope && scratchScope) {
+    // A process belongs to only one cgroup-v2 placement. Migrating it into a
+    // systemd slice would leave the pinned scratch scope and invalidate custody.
+    // Placement is best-effort; containment must never be silently bypassed.
+    scope.warn("private scratch containment takes precedence over systemd slice placement");
+    scope = undefined;
+  }
+  // Attach BEFORE runtime startup, including Bun/project preloads. Only fixed
+  // shell builtins execute before attachment; positional arguments retain argv.
+  const arguments_ = scratchScope ? ["-p", "-c", `
+printf '%s' "$$" > "$1/cgroup.procs" || exit 125
+IFS= read -r membership < /proc/self/cgroup || exit 125
+[ "$membership" = "0::\${1#/sys/fs/cgroup}" ] || exit 125
+shift
+exec "$@"
+`, "pi-fabric-scratch-gate", scratchScope.directory, runtime, ...scopedWorkerArguments(scratchScope, workerPath, workerArguments, cwd)] : [workerPath, ...workerArguments];
+  const workerExecutable = scratchScope ? "/bin/sh" : runtime;
+  // systemd admission execs in place, preserving captured PID/PGID. A marker
+  // distinguishes failed admission from an admitted worker that exits nonzero.
   const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
-  const child = spawn(scope?.executable ?? runtime, scope ? [
+  const child = spawn(scope?.executable ?? workerExecutable, scope ? [
     "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
     "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
-    "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
-  ] : [workerPath, ...workerArguments], {
+    "fabric-scope", marker!, workerExecutable, ...arguments_,
+  ] : arguments_, {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
@@ -314,7 +353,7 @@ export const spawnDetached = async (
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
     assertTransportLaunchAllowed(authority);
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
-    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian, scratchScope);
   }
   const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
@@ -602,7 +641,7 @@ export const spawnDetached = async (
       assertTransportLaunchAllowed(authority);
       if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
-      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian, scratchScope);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
   }
   return handle;

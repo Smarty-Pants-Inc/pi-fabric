@@ -11,16 +11,17 @@
  * Everything else runs (fail-open): a live lease, a live participant, a lease that expired only
  * recently, an unreadable or invalid lease or participant file, a missing lease file, a lease
  * stamped in the future (clock doubt), or any read error. Reads are file-only and lock-free
- * (the lease and participant readers); verdicts are cached for DEAD_ROOT_CACHE_MS per root.
+ * (the lease and participant readers). Only "alive" verdicts are cached (DEAD_ROOT_CACHE_MS per
+ * root); a "dead" verdict is never reused, so every skip re-reads the lease and participants.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricDeadRootFilterConfig } from "../config.js";
-import { hostLeasePath, readHostLease, readHostLeaseSnapshot, type FabricHostLease } from "../topology/host-leases.js";
+import { readHostLease, readHostLeaseSnapshot, type FabricHostLease } from "../topology/host-leases.js";
 import { participantFilePresent, readParticipantFile } from "../topology/participant-files.js";
 
-/** How long one root's verdict is reused. */
+/** How long one root's "alive" verdict is reused. A "dead" verdict is never cached. */
 export const DEAD_ROOT_CACHE_MS = 60_000;
 /** A root lease must have expired at least this long ago before the root counts as dead. */
 export const DEAD_ROOT_GRACE_MS = 10 * 60_000;
@@ -81,22 +82,14 @@ export const judgeRoot = (meshRoot: string, rootId: string, now = Date.now()): D
   }
 };
 
-// The lease file's identity; a renewal (atomic replace) changes it.
-const leaseStamp = (meshRoot: string, rootId: string): string => {
-  try {
-    const stat = fs.statSync(hostLeasePath(meshRoot, rootId));
-    return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
-  } catch {
-    return "absent";
-  }
-};
-
 /**
- * Per-root verdicts for DEAD_ROOT_CACHE_MS. A cached "dead" is also dropped as soon as the root's
- * lease file changes (one stat), so a root that comes back is never skipped for the rest of the window.
+ * Per-root "alive" verdicts for DEAD_ROOT_CACHE_MS (a cached alive only ever runs, which is the
+ * fail-open direction). A "dead" verdict is never cached or reused: every skip is decided by fresh
+ * reads of the root lease and the participants (file reads; dead roots are rare), so a root that
+ * comes back through a lease renewal or a new live participant on any host runs its next event.
  */
 export class DeadRootCache {
-  readonly #entries = new Map<string, { at: number; verdict: DeadRootVerdict; stamp?: string }>();
+  readonly #entries = new Map<string, { at: number; verdict: DeadRootVerdict }>();
 
   constructor(
     readonly meshRoot: string,
@@ -107,12 +100,14 @@ export class DeadRootCache {
   judge(rootId: string): DeadRootVerdict {
     const now = this.now();
     const hit = this.#entries.get(rootId);
-    if (hit && now >= hit.at && now - hit.at < this.ttlMs &&
-      (!hit.verdict.dead || hit.stamp === leaseStamp(this.meshRoot, rootId))) return hit.verdict;
-    const stamp = leaseStamp(this.meshRoot, rootId);
+    if (hit && !hit.verdict.dead && now >= hit.at && now - hit.at < this.ttlMs) return hit.verdict;
     const verdict = judgeRoot(this.meshRoot, rootId, now);
+    if (verdict.dead) {
+      this.#entries.delete(rootId);
+      return verdict;
+    }
     if (this.#entries.size >= MAX_CACHED_ROOTS && !this.#entries.has(rootId)) this.#entries.clear();
-    this.#entries.set(rootId, { at: now, verdict, ...(verdict.dead ? { stamp } : {}) });
+    this.#entries.set(rootId, { at: now, verdict });
     return verdict;
   }
 }

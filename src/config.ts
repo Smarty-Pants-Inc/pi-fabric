@@ -220,14 +220,44 @@ export interface FabricDeadRootFilterConfig {
 
 const MAX_DEAD_ROOT_EXEMPT = 512;
 
-/** Unknown or malformed input means "off"; exemptions keep every non-blank string up to 200 chars. */
+const MAX_DEAD_ROOT_EXEMPT_LENGTH = 200;
+const deadRootExemptWarnings = new Set<string>();
+
+/** An absent list is []; anything but an array of non-blank strings (each <= 200 chars, <= 512) is invalid. */
+const deadRootExemptList = (value: unknown): string[] | undefined => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_DEAD_ROOT_EXEMPT) return undefined;
+  const entries: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") return undefined;
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > MAX_DEAD_ROOT_EXEMPT_LENGTH) return undefined;
+    entries.push(trimmed);
+  }
+  return [...new Set(entries)];
+};
+
+/**
+ * Unknown or malformed input means "off". An invalid `exempt` shape disables the filter (mode off)
+ * with one config warning: dropping a malformed exemption while staying on could skip a keep-actor.
+ */
 export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFilterConfig => {
   const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  const exempt = Array.isArray(input.exempt)
-    ? [...new Set(input.exempt.flatMap((entry) => typeof entry === "string" && entry.trim() && entry.trim().length <= 200 ? [entry.trim()] : []))]
-      .slice(0, MAX_DEAD_ROOT_EXEMPT)
-    : [];
-  return { mode: input.mode === "on" ? "on" : "off", exempt };
+  const exempt = deadRootExemptList(input.exempt);
+  if (input.mode !== "on") return { mode: "off", exempt: exempt ?? [] };
+  if (exempt) return { mode: "on", exempt };
+  let shape: string;
+  try {
+    shape = String(JSON.stringify(input.exempt)).slice(0, 200);
+  } catch {
+    shape = typeof input.exempt;
+  }
+  if (!deadRootExemptWarnings.has(shape)) {
+    if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
+    deadRootExemptWarnings.add(shape);
+    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+  }
+  return { mode: "off", exempt: [] };
 };
 
 export interface FabricToolCaptureConfig {

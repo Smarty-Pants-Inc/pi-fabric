@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import {
@@ -97,19 +97,28 @@ describe("dead-root verdicts (fail-open)", () => {
     expect(judgeRoot(future, "", now).dead).toBe(false);
   });
 
-  it("the cache keeps a verdict for 60 s, and a lease renewal drops a cached dead verdict", () => {
+  it("the cache never reuses a dead verdict; it keeps an alive verdict for 60 s", () => {
     const mesh = tmp();
     let clock = now;
     const cache = new DeadRootCache(mesh, () => clock);
     lease(mesh, ROOT, now - 20 * MIN);
     expect(cache.judge(ROOT).dead).toBe(true);
+    expect(cache.judge(ROOT).dead).toBe(true);                      // re-read, still dead
     // A live participant on another host appears; the root lease file is unchanged.
     lease(mesh, "session:other-host", now + 10 * MIN, ROOT);
     participant(mesh, ROOT, "session:other-host", now);
+    expect(cache.judge(ROOT)).toEqual({ dead: false, reason: "live participant" });   // same instant: re-read
+
+    // An alive verdict is reused within 60 s (fail-open), then re-read.
+    const alive = tmp();
+    const third = new DeadRootCache(alive, () => clock);
+    lease(alive, ROOT, now + 15_000);
+    expect(third.judge(ROOT)).toEqual({ dead: false, reason: "live lease" });
+    lease(alive, ROOT, now - 20 * MIN);
     clock = now + DEAD_ROOT_CACHE_MS - 1;
-    expect(cache.judge(ROOT).dead).toBe(true);                      // within the 60 s bound: cached
+    expect(third.judge(ROOT).dead).toBe(false);                     // within the 60 s bound: cached alive
     clock = now + DEAD_ROOT_CACHE_MS;
-    expect(cache.judge(ROOT)).toEqual({ dead: false, reason: "live participant" });   // re-read at 60 s
+    expect(third.judge(ROOT).dead).toBe(true);                      // re-read at 60 s
 
     const renewed = tmp();
     const second = new DeadRootCache(renewed, () => now);
@@ -131,9 +140,32 @@ describe("dead-root verdicts (fail-open)", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.deadRootFilter).toEqual({ mode: "off", exempt: [] });
     expect(normalizeDeadRootFilterConfig(undefined)).toEqual({ mode: "off", exempt: [] });
     expect(normalizeDeadRootFilterConfig({ mode: "ON", exempt: "x" })).toEqual({ mode: "off", exempt: [] });
-    expect(normalizeDeadRootFilterConfig({ mode: "on", exempt: [" a ", "a", "", 3] })).toEqual({ mode: "on", exempt: ["a"] });
+    expect(normalizeDeadRootFilterConfig({ mode: "on", exempt: [" a ", "a"] })).toEqual({ mode: "on", exempt: ["a"] });
+    expect(normalizeDeadRootFilterConfig({ mode: "on" })).toEqual({ mode: "on", exempt: [] });
     expect(normalizeFabricConfig({ agents: { deadRootFilter: { mode: "on", exempt: ["abc"] } } }).agents.deadRootFilter)
       .toEqual({ mode: "on", exempt: ["abc"] });
+  });
+
+  it("an invalid exempt shape disables the filter and logs one config warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(normalizeDeadRootFilterConfig({ mode: "on", exempt: "bad" })).toEqual({ mode: "off", exempt: [] });
+      expect(normalizeDeadRootFilterConfig({ mode: "on", exempt: "bad" })).toEqual({ mode: "off", exempt: [] });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]![0])).toContain("agents.deadRootFilter.exempt");
+      expect(String(warn.mock.calls[0]![0])).toContain("disabled");
+      for (const exempt of [null, 3, { keep: "x" }, ["keep", ""], ["keep", 3], ["  "], ["x".repeat(201)], Array(513).fill("x")]) {
+        expect(normalizeDeadRootFilterConfig({ mode: "on", exempt }), JSON.stringify(exempt)?.slice(0, 40)).toEqual({ mode: "off", exempt: [] });
+      }
+      expect(normalizeFabricConfig({ agents: { deadRootFilter: { mode: "on", exempt: "bad" } } }).agents.deadRootFilter)
+        .toEqual({ mode: "off", exempt: [] });
+      // Mode off with a bad shape is simply off; nothing to warn about.
+      warn.mockClear();
+      expect(normalizeDeadRootFilterConfig({ mode: "off", exempt: "other-bad" })).toEqual({ mode: "off", exempt: [] });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -188,9 +220,18 @@ describe("dead-root filter in the actor activation path", () => {
       topic: "github.demo", reason: "root lease expired 30 min ago; no live participant",
     });
     expect(Number.isFinite(Date.parse(lines[0]!.at as string))).toBe(true);
+    // The root becomes live right after the dead verdict (a participant on another host appears; the
+    // root lease file is unchanged): the next event runs; no dead verdict is reused.
+    lease(meshRoot, "session:other-host", Date.now() + 10 * MIN, ROOT);
+    participant(meshRoot, ROOT, "session:other-host", Date.now());
+    await mesh.publish({ topic: "github.demo", kind: "github.webhook", from, text: "wake again" });
+    await waitFor(() => outs(actors, actor.id) === 1 && actors.status(actor.id).status === "idle");
+    expect(runDirs(root, actor.id)).toHaveLength(1);
+    expect(deadRootSkips(actors, actor.id)).toHaveLength(1);
+    expect(skipLines(meshRoot)).toHaveLength(1);
     // A caller's own ask is never skipped.
     await expect(actors.ask(actor.id, "direct")).resolves.toBeDefined();
-    expect(runDirs(root, actor.id)).toHaveLength(1);
+    expect(runDirs(root, actor.id)).toHaveLength(2);
   }, 30_000);
 
   it("runs under a live root, under doubt, when exempt, and with mode off", async () => {
@@ -208,6 +249,8 @@ describe("dead-root filter in the actor activation path", () => {
       } },
       { name: "exempt", filter: () => on(["keep-me"]), prepare: (m) => lease(m, ROOT, Date.now() - 30 * MIN) },
       { name: "mode-off", filter: () => ({ mode: "off", exempt: [] }), prepare: (m) => lease(m, ROOT, Date.now() - 30 * MIN) },
+      { name: "invalid-exempt", filter: () => ({ mode: "on", exempt: "bad" }) as unknown as FabricDeadRootFilterConfig,
+        prepare: (m) => lease(m, ROOT, Date.now() - 30 * MIN) },
       { name: "unconfigured", filter: () => undefined, prepare: (m) => lease(m, ROOT, Date.now() - 30 * MIN) },
       { name: "config-throws", filter: () => { throw new Error("unreadable config"); }, prepare: (m) => lease(m, ROOT, Date.now() - 30 * MIN) },
     ];

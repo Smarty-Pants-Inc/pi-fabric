@@ -14,6 +14,23 @@ export interface ActorMessageHistory {
 
 type Row = Record<string, unknown>;
 type Transaction = { previous?: ActorMessageHistory; reset?: boolean; messages: unknown[] };
+type PreparedTail = {
+  size: number;
+  generation: string | undefined;
+  appends: Array<{ contents: Buffer; transaction: Transaction; ref: ActorMessageHistory }>;
+};
+
+const tailSnapshot = (file: string): { size: number; generation: string } | undefined => {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    const size = Number(stat.size);
+    if (!Number.isSafeInteger(size)) throw new Error("Actor message log is too large");
+    return { size, generation: `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+};
 
 const history = (value: unknown): ActorMessageHistory | undefined => {
   if (value === undefined) return undefined;
@@ -34,6 +51,38 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
  * unknown fields. Payload barriers precede the registry rename. */
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
+  #preparing: Map<string, PreparedTail> | undefined;
+
+  /** Encode and read histories before registry acquisition. Offsets are speculative;
+   * commit validates every append tail under custody before writing any bytes. */
+  prepare(rows: readonly Row[], prior: ReadonlyMap<unknown, Row>) {
+    const tails = new Map<string, PreparedTail>();
+    this.#preparing = tails;
+    let metadata: Row[];
+    try { metadata = rows.map(row => row === prior.get(row.id) ? row : this.compact(row, prior.get(row.id))); }
+    finally { this.#preparing = undefined; this.#rings.clear(); }
+    return {
+      metadata,
+      valid: (): boolean => [...tails].every(([file, tail]) => tailSnapshot(file)?.generation === tail.generation),
+      commit: (): void => {
+        for (const [file, tail] of tails) {
+          const fd = fs.openSync(file, "a", 0o600);
+          try {
+            for (const append of tail.appends) {
+              let written = 0;
+              while (written < append.contents.length) {
+                const bytes = fs.writeSync(fd, append.contents, written, append.contents.length - written);
+                if (!bytes) throw new Error("Incomplete actor message append");
+                written += bytes;
+              }
+            }
+            fs.fsyncSync(fd);
+          } finally { fs.closeSync(fd); }
+          syncPathNamespace(file);
+        }
+      },
+    };
+  }
 
   savedHead(id: string): ActorMessageHistory | undefined {
     try { return history(JSON.parse(fs.readFileSync(path.join(this.directory(id), "messages-head.json"), "utf8"))); }
@@ -128,11 +177,20 @@ export class ActorRegistryPayloads {
     if (limit === HISTORY_LIMIT && cached?.head === key) return structuredClone(cached.messages);
     const chunks: unknown[][] = [];
     let count = 0, current: ActorMessageHistory | undefined = ref;
-    const fd = fs.openSync(path.join(this.directory(row.id), "messages.jsonl"), "r");
+    const file = path.join(this.directory(row.id), "messages.jsonl");
+    let fd: number | undefined;
     try {
-      const size = fs.fstatSync(fd).size;
+      const tail = this.#preparing?.get(file);
       while (current && count < limit) {
-        if (current.offset + current.bytes > size) throw new Error("Truncated actor message history");
+        const pending = tail?.appends.find(append => append.ref.offset === current!.offset && append.ref.bytes === current!.bytes);
+        if (pending) {
+          chunks.push(pending.transaction.messages);
+          count += pending.transaction.messages.length;
+          current = pending.transaction.reset ? undefined : pending.transaction.previous;
+          continue;
+        }
+        fd ??= fs.openSync(file, "r");
+        if (current.offset + current.bytes > fs.fstatSync(fd).size) throw new Error("Truncated actor message history");
         const buffer = Buffer.alloc(current.bytes);
         let read = 0;
         while (read < buffer.length) {
@@ -148,7 +206,7 @@ export class ActorRegistryPayloads {
         if (previous && previous.offset + previous.bytes > current.offset) throw new Error("Invalid actor history predecessor");
         current = previous;
       }
-    } finally { fs.closeSync(fd); }
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
     const messages = chunks.reverse().flat().slice(-limit);
     if (limit === HISTORY_LIMIT) this.#rings.set(row.id, { head: key, messages: structuredClone(messages) });
     return messages;
@@ -159,7 +217,22 @@ export class ActorRegistryPayloads {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     // A leading newline isolates a prior torn append. Offsets select only a complete
     // transaction, so neither abandoned tails nor later appends affect old readers.
-    const contents = Buffer.from(`\n${JSON.stringify({ ...(previous ? { previous } : {}), ...(reset ? { reset: true } : {}), messages })}\n`);
+    const transaction: Transaction = { ...(previous ? { previous } : {}), ...(reset ? { reset: true } : {}), messages };
+    const contents = Buffer.from(`\n${JSON.stringify(transaction)}\n`);
+    if (this.#preparing) {
+      let tail = this.#preparing.get(file);
+      if (!tail) {
+        const snapshot = tailSnapshot(file);
+        tail = { size: snapshot?.size ?? 0, generation: snapshot?.generation, appends: [] };
+        this.#preparing.set(file, tail);
+      }
+      const ref: ActorMessageHistory = { version: 1,
+        offset: tail.size + tail.appends.reduce((bytes, append) => bytes + append.contents.length, 0),
+        bytes: contents.length,
+        count: Math.min(HISTORY_LIMIT, (reset ? 0 : previous?.count ?? 0) + messages.length) };
+      tail.appends.push({ contents, transaction, ref });
+      return ref;
+    }
     const fd = fs.openSync(file, "a", 0o600);
     let offset: number;
     try {

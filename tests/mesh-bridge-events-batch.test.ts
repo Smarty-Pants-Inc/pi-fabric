@@ -63,7 +63,8 @@ const setup = async (wire: boolean) => {
 
 describe("bounded durable bridge event batches", () => {
   it("takes one lock for 256 events, pins the peer, and shares one durability barrier", async () => {
-    const mesh = store(), side = new StoreBridgeSide(mesh, "forge");
+    // Canonicalize the fixture so the expected chain has no additional symlink parents.
+    const mesh = new MeshStore(fs.realpathSync(scratch()), 65536, 500), side = new StoreBridgeSide(mesh, "forge");
     // Deterministic count bound independent of this machine's fsync latency.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);

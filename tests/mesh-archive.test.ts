@@ -579,6 +579,20 @@ describe("mesh event archive", () => {
     expect(lines(file(today(), "fabric.actor.output"))).toEqual([live()[1]]);
   });
 
+  it("catches a lagging archive up on the two-hold keyed path from an off-lock read", async () => {
+    const { root, store, enable, file, lines, live } = setup({ archive: false });
+    enable();
+    await store.publish({ topic: "ops.owner", from, text: "archived" });
+    // A store without the archive appends while the configuration is absent.
+    fs.rmSync(path.join(root, MESH_ARCHIVE_CONFIG));
+    await store.publish({ topic: "ops.owner", from, text: "unarchived" });
+    enable();
+    expect(MeshArchive.fromRoot(root)!.rebootPending()).toBe(false);
+    const keyed = await store.publish({ topic: "ops.owner", from, text: "keyed", dedupeKey: "lagging-archive" });
+    expect(keyed.sequence).toBe(3);
+    expect(lines(file(today(), "ops.owner"))).toEqual(live());
+  });
+
   it("adds nothing when a catch-up repeats events it already archived", async () => {
     const { store, dir, root, file, lines, live } = setup();
     await store.publish({ topic: "ops.owner", from, text: "one" });

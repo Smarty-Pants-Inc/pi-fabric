@@ -40,10 +40,11 @@ const fileOf = (meshRoot: string, key: string): string | undefined => {
  * judged on an earlier read cannot overwrite a newer owner (review/astra F1 on #142). The lock is
  * per record, not the mesh lock: routine owner updates never wait on other keys.
  */
-/** The store whose lock serializes the rare recovery of a dead holder's per-key lock. */
+/** The store whose file custody lock serializes the rare recovery of a dead holder's per-key
+ * lock and the sweep (smarty-dev#6477 L5: MeshStore.custody, not the shared mesh lock alone). */
 export interface ParticipantFileMesh {
   readonly root: string;
-  exclusive<T>(operation: () => T): Promise<T>;
+  custody<T>(operation: () => T): Promise<T>;
 }
 
 /** Prepared unknown is distinct from an absent (lazy) identity. */
@@ -234,9 +235,9 @@ const readOwner = (lock: string): string | undefined => {
 const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, registryFenced = false): Promise<void> => {
   const seen = readOwner(lock);
   if (seen === undefined || await holderAlive(seen, lock, registryFenced)) return;
-  await mesh.exclusive(() => {
+  await mesh.custody(() => {
     // Compare, then delete by a rename to a unique name and a second compare: a lock that is not
-    // the one judged dead goes back (it cannot be, while recoveries share the mesh lock).
+    // the one judged dead goes back (it cannot be, while recoveries share the custody lock).
     if (readOwner(lock) !== seen) return;
     const tombstone = `${lock}.${randomUUID()}.dead`;
     // A sibling read/scanner can briefly deny a Windows directory rename. Keep
@@ -244,7 +245,7 @@ const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, regis
     renameAtomic(lock, tombstone);
     if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
     else renameAtomic(tombstone, lock);
-  }); // A mesh timeout unwinds the publication fence; retry on the next refresh.
+  }); // A custody/mesh timeout unwinds the publication fence; retry on the next refresh.
 };
 
 /** Recover only this adoption key before taking registry/mesh custody. */
@@ -255,7 +256,7 @@ export const prepareParticipantFileLock = async (mesh: ParticipantFileMesh, key:
 };
 
 /** Retry preparation only: fresh native key-holder evidence/recovery occurs outside
- * registry custody. Recovery compares the exact receipt under mesh custody;
+ * registry custody. Recovery compares the exact receipt under file custody;
  * no participant/source selection crosses this wait. */
 export const prepareParticipantFileLocks = async (mesh: ParticipantFileMesh): Promise<void> => {
   const locks = path.join(mesh.root, DIR, ".locks");
@@ -419,7 +420,7 @@ export const participantFilePresent = (meshRoot: string, key: string): boolean =
  */
 export const sweepParticipantLockLeftovers = (
   mesh: ParticipantFileMesh, olderThanMs: number, now = Date.now(),
-): Promise<void> => mesh.exclusive(() => {
+): Promise<void> => mesh.custody(() => {
   // Share recovery's lock for the entire scan/removal: never unlink the owner of
   // a detached lock between recovery's rename and its compare/restore decision.
   const locks = path.join(mesh.root, DIR, ".locks");

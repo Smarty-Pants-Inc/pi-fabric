@@ -44,6 +44,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
+import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 
@@ -748,6 +749,8 @@ const main = async (): Promise<void> => {
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
+  let contextReseedRequest: ActorContextReseed | undefined;
+  let contextReseeded = false;
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -870,6 +873,12 @@ const main = async (): Promise<void> => {
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
     closeTimer = setTimeout(() => {
+      if (contextReseedRequest && !terminalStatus) {
+        terminateChild(child, "SIGTERM");
+        killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+        killTimer.unref();
+        return;
+      }
       const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
       // fabric_reply writes after assistant message_end; inspect the durable
       // reply now too. Post-drain reply/schema validation remains authoritative.
@@ -1001,6 +1010,15 @@ const main = async (): Promise<void> => {
             send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
             fail(error) { modelControl.fail(error); },
+            reseed(recovery) {
+              if (terminalStatus) return;
+              if (contextReseeded) {
+                modelControl.fail("Actor activation input cannot fit the selected model after bounded session reseed");
+                return;
+              }
+              contextReseedRequest = recovery;
+              closeChild(); // never replace a session beneath a live Pi writer
+            },
             compact(tokens, contextWindow, reason) {
               appendLog(`${JSON.stringify({ type: "fabric_context_compaction", phase: "before_dispatch", tokens, contextWindow, reason })}\n`);
             },
@@ -2025,6 +2043,26 @@ const main = async (): Promise<void> => {
     child.stderr?.on("data", (chunk: Buffer) => recordStderr(stderrDecoder.write(chunk)));
     child.stderr?.on("error", () => {});
   };
+  const restartPiChild = (): void => {
+    sawAgentError = false;
+    retryPending = false;
+    terminalError = undefined;
+    piSettledSuccessfully = false;
+    piSettlementDurable = false;
+    stderr = "";
+    activationWindowReady = false;
+    outputDecoder = new StringDecoder("utf8");
+    stderrDecoder = new StringDecoder("utf8");
+    eventProjection = new PiEventProjection();
+    contextAdmission = undefined;
+    modelControl = createModelControl();
+    compactControl = createCompactControl();
+    child = spawnChild();
+    retainExecutionCustody(child);
+    childExited = false;
+    attachChildStreams();
+    startChildInput();
+  };
   attachChildStreams();
   startChildInput();
 
@@ -2078,6 +2116,24 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.clear();
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
+    }
+    if (contextReseedRequest && !terminalStatus) {
+      const recovery = contextReseedRequest;
+      contextReseedRequest = undefined;
+      contextReseeded = true;
+      const { reseedActorSession } = await import(import.meta.url.endsWith(".ts")
+        ? "./worker/context-reseed.ts" : "./worker/context-reseed.js") as typeof import("./worker/context-reseed.js");
+      const binding = reseedActorSession(piSessionFile!, options.cwd,
+        { ...recovery, estimate: estimateActorInput!, runId: options.id });
+      const note = { type: "fabric_context_reseed", phase: "before_dispatch",
+        ...binding, tokens: recovery.tokens, contextWindow: recovery.contextWindow, reason: recovery.reason };
+      appendLog(`${JSON.stringify(note)}\n`);
+      emitLifecycle("actor.context_reseed", note);
+      // The activation hasn't been dispatched. Keep its original envelope and
+      // persona, and re-pin model/effort before any business inference.
+      providerAborted = false;
+      restartPiChild();
+      continue;
     }
     if (terminalStatus) break;
     if (pendingWhitespaceStall) {
@@ -2151,24 +2207,7 @@ const main = async (): Promise<void> => {
     retainedPiQueues = record.pendingMessages ? {
       steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
     } : undefined;
-    sawAgentError = false;
-    retryPending = false;
-    terminalError = undefined;
-    piSettledSuccessfully = false;
-    piSettlementDurable = false;
-    stderr = "";
-    activationWindowReady = false;
-    outputDecoder = new StringDecoder("utf8");
-    stderrDecoder = new StringDecoder("utf8");
-    eventProjection = new PiEventProjection();
-    contextAdmission = undefined;
-    modelControl = createModelControl();
-    compactControl = createCompactControl();
-    child = spawnChild();
-    retainExecutionCustody(child);
-    childExited = false;
-    attachChildStreams();
-    startChildInput();
+    restartPiChild();
   }
   await executionSettled();
 

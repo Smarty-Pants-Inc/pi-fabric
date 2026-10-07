@@ -130,6 +130,7 @@ const lazyEntryPoints = [
   "src/worker/context-admission.ts",
   "src/agents/write-guard.ts",
   "src/worker/stall-session.ts",
+  "src/worker/context-reseed.ts",
   "src/worker/options.ts",
   "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",

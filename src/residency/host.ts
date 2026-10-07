@@ -604,6 +604,8 @@ export class ResidentHost {
         canManageActor,
         snapshotActorOwnership,
         lineageAlive,
+        // smarty-dev#6062: read per activation, so turning mode "off" in config takes effect live.
+        deadRootFilter: () => (currentConfig().agents ?? config.agents)?.deadRootFilter,
         claimResidency: "durable",
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and

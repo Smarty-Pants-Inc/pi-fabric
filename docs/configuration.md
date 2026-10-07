@@ -282,7 +282,8 @@ where absent values do not participate, and outside interactive Main time spent 
     "sessionExportDir": "",
     "nice": 0,
     "childQuestions": "cancel",
-    "childQuestionTimeoutMs": 600000
+    "childQuestionTimeoutMs": 600000,
+    "deadRootFilter": { "mode": "off", "exempt": [] }
   },
   "components": [
     {
@@ -676,6 +677,7 @@ Other agent settings:
 - `budgetUsd`: shared append-only cost ledger across a recursion tree (0 disables).
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).
 - `nice`: Unix niceness 0-19 for every child agent: task agents, actors (supervisors, review agents) and durable resident children. The default, `0`, leaves priority unchanged. Fabric calls `os.setPriority(child, nice)` right after the spawn. On Linux it also sets best-effort IO priority with `ionice -c2 -n7`, when `ionice` is installed. The child's own tools (its bash commands) inherit both on Linux and macOS. On Windows `os.setPriority` maps to a priority class. A failure is logged once per worker in the run's `events.jsonl` (`fabric_priority_error`) and never stops the run. Values outside 0-19 are clamped; there is no environment override. A per-call `nice` on `agents.run`/`agents.spawn`, actor creation or `agents.setNice` can only raise it.
+- `deadRootFilter`: **host-only** skip of durable-actor activations whose owning root is positively dead (smarty-dev#6062). `mode`: `"off"` (default) or `"on"`; `exempt`: actor ids, id prefixes or exact names that always run. Fail-open: only an expired-for-over-10-minutes root lease with no live participant skips. See [agents](agents.md#dead-root-activation-filter).
 - `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
 - `processSlice`: optional **host-only** Linux systemd user slice for process-transport workers, for example `"batch.slice"`. Unset by default; workspace configuration (even a trusted project) cannot enable or override it, and other platforms keep direct launches. When enabled, Fabric uses `systemd-run --user --scope --slice=<slice> --quiet --collect -- <worker command>`. Scope admission and the worker execute in place, preserving worker PID/PGID and the existing exit/custody fences. If the executable is unavailable or admission fails, Fabric logs one warning per transport instance and launches directly, only after the failed attempt confirms native close; an already-admitted worker is never replayed. Admission is bounded to five seconds; an unconfirmed teardown vetoes fallback. This changes placement only: configure CPU/IO limits on the slice separately.
 - `instructionsRoot`: host-only allowed root for actor `instructionsFile` inputs (unset defaults to `~/.local/share/smarty-dev/factory/current/`). Configure it in the host agent directory's `fabric.json`; workspace config cannot widen or replace it. Main and resident owners realpath the root at first use, so `current` may point to an installed factory generation.

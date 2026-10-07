@@ -62,7 +62,8 @@ const setup = async (wire: boolean) => {
 
 describe("bounded durable bridge event batches", () => {
   it("takes one lock for 256 events, pins the peer, and shares one durability barrier", async () => {
-    const mesh = store(), side = new StoreBridgeSide(mesh, "forge");
+    // Canonicalize the fixture so the expected chain has no additional symlink parents.
+    const mesh = new MeshStore(fs.realpathSync(scratch()), 65536, 500), side = new StoreBridgeSide(mesh, "forge");
     // Deterministic count bound independent of this machine's fsync latency.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
@@ -78,11 +79,17 @@ describe("bounded durable bridge event batches", () => {
     expect(count()).toBe(1);
     expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
-    // One event-file sync, never per-event receipts. The fleet confirms the
-    // whole namespace ancestry, so directory count depends on TMPDIR depth.
+    // One event-file sync plus exactly one barrier per namespace ancestor, not receipts
+    // per event. A fixed threshold depends on TMPDIR depth and fails on fleet task roots.
+    let namespaceBarriers = 0;
+    if (process.platform !== "win32") {
+      for (let directory = mesh.root; ; directory = path.dirname(directory)) {
+        namespaceBarriers++;
+        if (path.dirname(directory) === directory) break;
+      }
+    }
     expect(syncedFiles.filter(Boolean)).toHaveLength(1);
-    const ancestorCount = path.resolve(mesh.root).split(path.sep).filter(Boolean).length + 1;
-    expect(sync.mock.calls.length).toBeLessThanOrEqual(ancestorCount + 1);
+    expect(sync.mock.calls.length).toBe(namespaceBarriers + 1);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");
   }, 30000);

@@ -7,6 +7,7 @@ import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { ActorWakeText } from "./wake-text.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
 
@@ -195,6 +196,8 @@ export interface FabricActorValidityFacts {
     idle: boolean;
     now: number;
   };
+  /** Untrusted, bounded GitHub text from the local ingress receipt, when agents.wakeText hydrated it (smarty-dev#6144). */
+  wakeText?: ActorWakeText;
 }
 
 /** Public creation input; file instructions are resolved only by the actor owner. */

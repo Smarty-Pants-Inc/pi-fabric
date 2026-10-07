@@ -104,7 +104,11 @@ const workReceipts = (fromId: string, data: unknown): string[] => {
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
 const eventReceipts = (event: MeshEvent): string[] => [
-  eventReceipt(event.id), receipt(event.from.id, "id", event.id), ...workReceipts(event.from.id, event.data),
+  eventReceipt(event.id), receipt(event.from.id, "id", event.id),
+  // Host-only publication keys are mesh-wide, even when a different maintenance owner
+  // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
+  ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
+  ...workReceipts(event.from.id, event.data),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
@@ -385,6 +389,27 @@ export class RootInbox {
 
 const matchesInboxReceipt = (line: string): boolean =>
   line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE);
+
+const matchesMainReceipt = (line: string): boolean => line.includes(AGENT_MESSAGE_CUSTOM_TYPE) || line.includes('\"session\"');
+/** Original native carrier IDs, for a retired/dead Main's inbox rotation. This uses
+ * the same cached canonical receipt/barrier path as the root shadow inbox. */
+export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId: string): Set<string> => {
+  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt);
+  const ids = new Set<string>();
+  if (!snapshot.count) return ids;
+  type Entry = { type?: string; id?: string; customType?: string; details?: { id?: string; chain?: string; items?: Array<{ id?: string; chain?: string }> } };
+  const header = snapshot.entries.get(0) as Entry | undefined;
+  if (header?.type !== "session" || header.id !== sessionId) throw new Error("Main inbox session receipt identity mismatch");
+  for (const value of snapshot.entries.values()) {
+    const entry = value as Entry;
+    if (entry.type !== "custom_message" || entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    for (const item of [entry.details, ...(entry.details?.items ?? [])]) {
+      if (typeof item?.id === "string") ids.add(item.id);
+      if (typeof item?.chain === "string") ids.add(item.chain);
+    }
+  }
+  return ids;
+};
 
 /** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */

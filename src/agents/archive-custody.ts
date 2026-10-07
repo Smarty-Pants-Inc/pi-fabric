@@ -5,6 +5,7 @@ import type { AgentRunResult } from "./types.js";
 import type { CompletionRecipient } from "./completion-journal.js";
 
 export const ARCHIVE_PENDING_FILE = "archive-pending.json";
+export const ACTOR_RUN_ARCHIVE_PENDING_FILE = "actor-run-archive-pending.json";
 export interface PendingRunArchive {
   format: 1;
   kind: "settlement" | "shutdown";
@@ -19,8 +20,9 @@ const read = (directory: string): { format: number; pending?: Partial<Record<Pen
   try { return JSON.parse(fs.readFileSync(path.join(directory, ARCHIVE_PENDING_FILE), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { format: 1 }; throw error; }
 };
-export const readPendingRunArchives = (directory: string): PendingRunArchive[] => {
-  const record = read(directory);
+export const parsePendingRunArchives = (text: string): PendingRunArchive[] => archives(JSON.parse(text));
+export const readPendingRunArchives = (directory: string): PendingRunArchive[] => archives(read(directory));
+const archives = (record: ReturnType<typeof read>): PendingRunArchive[] => {
   if (record.format !== 1) throw new Error("Unknown archive custody format");
   return record.pending ? Object.values(record.pending) : record.result ? [record as PendingRunArchive] : [];
 };

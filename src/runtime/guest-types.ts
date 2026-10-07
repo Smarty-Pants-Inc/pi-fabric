@@ -62,6 +62,8 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
+  /** Required placement capabilities; any unmet need keeps process tasks local. */
+  needs?: string[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
@@ -769,7 +771,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   validWhile?: { version: 1; source: string };
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
-type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 interface FabricActorInfo {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -900,7 +902,13 @@ type FabricMessageTarget =
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
 /** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
-type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
+type FabricMessageArgs = FabricMessageTarget & {
+  message: string;
+  /** See FabricMessageData. */ data?: unknown;
+  /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
+  idempotencyKey?: string;
+};
+type FabricMessageSteerArgs = FabricMessageArgs;
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -950,7 +958,7 @@ interface FabricMessageDelivery {
   replacedMessageId?: string;
 }
 interface FabricAgentsApi {
-  run(args: FabricAgentRequest): Promise<FabricAgentResult>;
+  run(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
@@ -1015,7 +1023,7 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
-  steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
   cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;

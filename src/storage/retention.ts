@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -123,7 +124,10 @@ const runTreeVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -195,7 +199,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
-  "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl",
+  "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
 ]);
@@ -483,8 +487,8 @@ export const compactTerminalRunEvents = (
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
-      !canRemoveTerminalRun(directory, expired)) return false;
+  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
+      (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -524,6 +528,11 @@ export const compactTerminalRunEvents = (
     if (stat.size <= maxBytes && (retained.length === stat.size ||
         (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
          tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
+    // four redundant status reads for that no-op (native directory order can
+    // put the historical prefix inside the resident run phase).
+    // A real replacement still requires both independent fresh safety walks.
+    if (retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired))) return false;
     // Truncation is now known to be necessary. Reserve the marker's space and
     // drop only complete prefix lines; look behind by one byte so an exactly
     // aligned final event is kept. An oversized final event leaves only a marker.

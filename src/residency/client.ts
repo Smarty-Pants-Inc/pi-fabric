@@ -24,6 +24,7 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
+import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -51,7 +52,6 @@ import {
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
-  isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
   residentHostStateNote,
@@ -173,6 +173,7 @@ export class ResidencyClient {
   readonly #hostPath: string;
   readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
+  #watchdogTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
@@ -223,13 +224,14 @@ export class ResidencyClient {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
-      () => {
-        void this.#backgroundDelivery.run(() => this.#drainDeliveries());
-        void this.#watchdog().catch(() => undefined);
-      },
-      Math.max(20, this.options.config.mesh.actorPollMs),
+      () => { void this.#backgroundDelivery.run(() => this.#drainDeliveries()); },
+      Math.max(1_000, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
+    // File-only recovery stays independent of the state-reading delivery cadence/backoff.
+    this.#watchdogTimer = setInterval(() => { void this.#watchdog().catch(() => undefined); },
+      Math.max(20, this.options.config.mesh.actorPollMs));
+    this.#watchdogTimer.unref();
     void this.#backgroundDelivery.run(() => this.#drainDeliveries());
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
@@ -250,6 +252,8 @@ export class ResidencyClient {
     this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
+    if (this.#watchdogTimer) clearInterval(this.#watchdogTimer);
+    this.#watchdogTimer = undefined;
     // Await the owned pass itself, not a timer polling its state. Real async file
     // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
     await this.#deliveryPass?.catch(() => undefined);
@@ -300,6 +304,7 @@ export class ResidencyClient {
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#readyOwner();
     if (existing) return existing;
+    assertNoWatchdogCustody(this.options.config.residencyRoot);
     // The detached launcher already owns the exact attempt/fallback. Neither
     // ensureHost nor the watchdog may become a competing handover executor.
     const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
@@ -320,6 +325,9 @@ export class ResidencyClient {
       if (Date.now() >= attachDeadline) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
       await delay(STATUS_POLL_MS);
     }
+    // Recheck after the attachment wait: the old launcher may have entered
+    // destructive watchdog custody while we still saw its live owner.
+    assertNoWatchdogCustody(this.options.config.residencyRoot);
     fs.rmSync(this.#errorPath, { force: true });
     const launchToken = randomUUID();
     const launcher = await spawnDetached(
@@ -1119,7 +1127,12 @@ export class ResidencyClient {
       let fault: unknown;
       for (const entry of entries) {
         try {
-          if (entry.key.startsWith(this.#deliveryPrefix)) await this.#deliver(entry);
+          // Exact-owner actor recovery also scans a stale foreign mailbox key: an
+          // upgraded host may have written it before the exact-root contract.
+          const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
+          const ownerActorRecord = value?.format === RESIDENT_HOST_FORMAT && value.from?.kind === "actor" &&
+            entry.updatedBy.id === this.hostId;
+          if (entry.key.startsWith(this.#deliveryPrefix) || ownerActorRecord) await this.#deliver(entry);
           else await this.#adoptCompletion(entry);
         } catch (error) {
           // The record remains durable. Back off a locked mesh; retain ordinary failed senders
@@ -1144,17 +1157,18 @@ export class ResidencyClient {
     const value = entry.value as Partial<ResidentDeliveryRecord>;
     if (
       value.format !== RESIDENT_HOST_FORMAT ||
-      value.rootId !== this.options.config.rootId ||
+      (value.rootId !== this.options.config.rootId &&
+        !(value.from && value.from.kind === "actor" && entry.updatedBy.id === this.hostId)) ||
       typeof value.id !== "string" ||
       typeof value.message !== "string" ||
       (value.delivery !== "steer" && value.delivery !== "followUp") ||
       typeof value.triggerTurn !== "boolean" ||
       typeof value.from !== "object" ||
       value.from === null ||
-      // This root's resident host, or for an actor's message another root's resident host whose
-      // root is gone: its actors' messages go to the project agent (smarty-dev#878).
-      (entry.updatedBy.id !== this.hostId &&
-        !(value.from.kind === "actor" && isResidentHostId(entry.updatedBy.id)))
+      // Only the exact owner's resident host may admit a delivery. In particular,
+      // retained actor output from an older inferred route stays durable until the
+      // producing root returns; a foreign Main never consumes it.
+      entry.updatedBy.id !== this.hostId
     ) {
       return;
     }

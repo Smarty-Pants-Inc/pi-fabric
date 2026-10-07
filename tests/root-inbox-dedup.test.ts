@@ -99,6 +99,36 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
+  it("does not re-deliver a replayed dedupeKey with a new event id, even across reload", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const packet = { topic: "fleet.work.inbox-receipts", kind: "rerouted", from: peer, to: me.id,
+      dedupeKey: "inbox-disposition:replayed", text: "rerouted notification" };
+    const first = await h.mesh.publish(packet);
+    h.advance(1);
+    const delivered = await inbox.next(h.session());
+    expect(delivered.events.map(event => event.id)).toEqual([first.id]);
+    const execute = vi.fn();
+    delivered.events.forEach(execute);
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(delivered.events) });
+    await inbox.next(h.session()); // Confirm and persist the consumer's key receipt.
+    h.entries.length = 0;
+    // Replay at the consumer boundary, not via publish (which now returns its receipt).
+    const replay = { ...first, id: "replayed-with-a-new-id", sequence: first.sequence + 1 };
+    fs.appendFileSync(path.join(h.mesh.root, "events.jsonl"), `${JSON.stringify(replay)}\n`);
+    fs.writeFileSync(path.join(h.mesh.root, "sequence"), `${replay.sequence}\n`);
+    const batch = await h.box().next(h.session());
+    batch.events.forEach(execute);
+    expect(batch.events).toEqual([]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    // A different maintenance owner replaying the same host-only key is also suppressed;
+    // an unrelated publication key remains deliverable.
+    const other = await h.mesh.publish({ ...packet, from: { ...peer, id: "session:other-sender" }, dedupeKey: "other-publication" });
+    const otherReplay = { ...other, id: "other-sender-replay", sequence: other.sequence + 1, dedupeKey: packet.dedupeKey };
+    fs.appendFileSync(path.join(h.mesh.root, "events.jsonl"), `${JSON.stringify(otherReplay)}\n`);
+    h.advance(1);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([other.id]);
+  });
+
   it("recognises pre-upgrade inbox receipts beyond the recent-entry window", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const event = await h.publish(); h.advance(1);

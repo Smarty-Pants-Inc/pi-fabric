@@ -26,6 +26,32 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore", () => {
+  it("orders and deduplicates multiple real registry fences before publication, retaining them across awaits", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-registry-order-"));
+    roots.push(root);
+    const a = new ActorRegistryStore(path.join(root, "a"));
+    const b = new ActorRegistryStore(path.join(root, "b"));
+    const alias = new ActorRegistryStore(path.join(root, "a", "."));
+    const acquisitions: string[] = [];
+    for (const [store, label] of [[a, "a"], [b, "b"], [alias, "a"]] as const) {
+      const acquire = store.withLock.bind(store);
+      vi.spyOn(store, "withLock").mockImplementation(operation => {
+        acquisitions.push(label);
+        return acquire(operation);
+      });
+    }
+    await expect(ActorRegistryStore.withLocks([b, a, alias, b], async () => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      for (const name of ["a", "b"]) {
+        expect(fs.readFileSync(path.join(root, name, "actors.json.lock", "owner"), "utf8").split("\n")[1]).toBe(String(process.pid));
+      }
+      return 42;
+    })).resolves.toBe(42);
+    expect(acquisitions).toEqual(["a", "b"]);
+    for (const name of ["a", "b"]) expect(fs.existsSync(path.join(root, name, "actors.json.lock"))).toBe(false);
+    await expect(ActorRegistryStore.withLocks([b, a], () => { throw new Error("publication failed"); })).rejects.toThrow("publication failed");
+    for (const name of ["a", "b"]) expect(fs.existsSync(path.join(root, name, "actors.json.lock"))).toBe(false);
+  });
   it("round-trips format 1 records and fingerprints atomic replacements", async () => {
     const { store, lockPath } = setup();
     expect(store.fingerprint()).toBeUndefined();

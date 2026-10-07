@@ -32,6 +32,7 @@ const stable = [
   "providers/memory-provider.js",
 ];
 const lazy = [
+  "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",
@@ -43,6 +44,7 @@ const lazy = [
   "agents/compact-control.js",
   "agents/result.js",
   "agents/veda-cli.js",
+  "agents/transports/placement.js",
   "fabric-runtime-state.js",
   "components/configuration.js",
   "providers/jev-provider.js",
@@ -74,6 +76,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/activation-compaction.js",
   "worker/context-admission.js",
+  "worker/context-reseed.js",
   "worker/reply-tool.js",
   "worker/principal-delivery.js",
   "guards/foreground-wait.js",

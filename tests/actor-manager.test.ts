@@ -1,5 +1,6 @@
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
@@ -47,6 +49,7 @@ const setup = (
   },
   meshOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {},
   agentOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {},
+  snapshotActorOwnership?: (fresh?: boolean) => ReadonlyMap<string, boolean>,
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
@@ -80,6 +83,7 @@ const setup = (
       actorRoot: path.join(root, "actors"),
       persistent,
       ...(canManageActor ? { canManageActor } : {}),
+      ...(snapshotActorOwnership ? { snapshotActorOwnership } : {}),
       ...(acquireCapabilityView ? { acquireCapabilityView } : {}),
       ...(modelValidation?.resolvePiModel
         ? { resolvePiModel: modelValidation.resolvePiModel }
@@ -96,6 +100,110 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager idle observer versus canonical authority (#4383)", () => {
+  it("coalesces an ownership view but refuses tell after canonical ownership moved", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, agents } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle." });
+    decision.mockClear();
+    canonical = false;
+    expect(actors.listOwned().map(row => row.id)).toContain(actor.id); // Observer can still show the old owner.
+    expect(decision.mock.calls.some(([, fresh]) => fresh === false)).toBe(true);
+    expect(() => actors.tell(actor.id, "must not be delivered")).toThrow("owned by another host");
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+
+  it("does not use a cached owner for matched mesh delivery, or revalidate unrelated traffic", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, mesh, agents, identity } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle.", topics: ["owner.work"] });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    decision.mockClear(); canonical = false;
+    await mesh.publish({ topic: "unrelated", from: identity });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.every(([, fresh]) => fresh === false)).toBe(true); // Empty/no-match observation only.
+    decision.mockClear();
+    await mesh.publish({ topic: "owner.work", from: identity, text: "must not be delivered" });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+
+  // Astra #468 F1: fresh-positive delivery can replace ALL persistent actor objects
+  // while the idle view is stale-negative. Outstanding preparation retries then
+  // drain only the new objects, so accepting work on old queues loses it forever.
+  it("re-resolves every subscriber after persistent ownership reacquisition", async () => {
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read");
+    let observed = true;
+    const ids: string[] = [];
+    const snapshot = vi.fn((fresh = true) => new Map(ids.map(id => [id, fresh || observed])));
+    let failures = 2;
+    const acquire = vi.fn(async (): Promise<FabricCapabilityViewLease> => {
+      if (failures-- > 0) throw new Error("transient preparation");
+      return {
+        satisfied: true, missing: [], optionalMissing: [],
+        view: {
+          id: "view-reacquisition", digest: "digest-reacquisition", semanticDigest: "semantic-reacquisition",
+          bindings: { "demo.echo": { ref: "demo.echo", provider: "demo", providerBindingId: "binding-reacquisition", generation: 1, descriptorHash: "descriptor-reacquisition" } },
+        },
+        release: async () => {},
+      };
+    });
+    try {
+      const { actors, mesh, root, identity, agents } = setup(true, () => true, acquire,
+        undefined, {}, {}, snapshot);
+      for (const name of ["first-subscriber", "second-subscriber"]) {
+        ids.push((await actors.create({ name, instructions: "Review.", requires: ["demo.echo"],
+          topics: ["owner.work"], responseMode: "text", coalesce: false })).id);
+      }
+      const runs = recordRuns(agents);
+      const seed = await mesh.publish({ topic: "owner.work", from: identity, text: "retry seed" });
+      expect(dispatch(seed)).toBe(true);
+      await waitFor(() => acquire.mock.calls.length === 2 && actors.inFlightCount() === 0);
+      expect(ids.map(id => actors.status(id).queued)).toEqual([1, 1]);
+      expect(runs).toHaveLength(0); // preparation retries, not worker attempts
+      const registry = path.join(root, "actors", "actors.json");
+      const unchanged = fs.readFileSync(registry, "utf8");
+      observed = false;
+      expect(actors.listOwned()).toEqual([]); // stale-negative observer parks seeds
+      expect(fs.readFileSync(registry, "utf8")).toBe(unchanged);
+      const event = await mesh.publish({ topic: "owner.work", from: identity, text: "reacquired event" });
+      read.mockClear(); snapshot.mockClear();
+      expect(dispatch(event)).toBe(true);
+      expect(read).toHaveBeenCalledTimes(1); // proves the replacement branch ran
+      expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(snapshot).toHaveBeenCalledWith(true); // one canonical snapshot for both
+      for (const id of ids) {
+        expect(actors.status(id).queued).toBe(1); // NEW registered object's queue
+        const pending = queueFiles(root, id).flatMap(({ text }) => JSON.parse(text).items ?? []);
+        expect(pending.filter((item: { payload?: { id?: string } }) => item.payload?.id === event.id)).toHaveLength(1);
+      }
+      snapshot.mockClear();
+      expect(dispatch(event)).toBe("ignored");
+      expect(snapshot).not.toHaveBeenCalled(); // accepted delivery IDs stay deduplicated
+      observed = true;
+      await waitFor(() => ids.every(id => actors.messages(id).filter(message =>
+        message.direction === "out" && message.runId && !message.error).length === 2), 15_000);
+      expect(runs).toHaveLength(4); // each seed + reacquired event runs once per subscriber
+      for (const id of ids) {
+        expect(actors.messages(id).filter(message => message.direction === "in" &&
+          (message.data as { id?: string } | undefined)?.id === event.id)).toHaveLength(1);
+        expect(actors.status(id).queued).toBe(0);
+      }
+    } finally { start.mockRestore(); schedule.mockRestore(); read.mockRestore(); }
+  }, 30_000);
+});
+
 describe("ActorManager idle registry writes (#4383)", () => {
   it("reloads and polls unchanged actors without saving observational timestamps back to the registry", async () => {
     const state = setup(true);
@@ -103,7 +211,7 @@ describe("ActorManager idle registry writes (#4383)", () => {
     await state.actors.close();
     const file = path.join(state.root, "actors", "actors.json");
     const before = fs.readFileSync(file, "utf8");
-    const saves = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
     try {
       const reloaded = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
         actorRoot: path.join(state.root, "actors"), persistent: true,
@@ -376,20 +484,37 @@ describe("ActorManager presence under a stalled mesh lock", () => {
 
   // review/astra F1 on #72: a matching event also enqueued, started a drain and recorded the
   // message, and each of those re-decided every actor's ownership.
-  it("decides ownership once per matching mesh event too, with several subscribers and full queues", async () => {
+  it.each([false, true])("decides ownership once per matching mesh event too, with several subscribers and full queues (snapshot %s)", async (batched) => {
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
     const decisions = vi.fn((_id: string) => true as boolean | undefined);
-    const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 });
-    for (let index = 0; index < 8; index++) {
-      await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    decisions.mockClear();
-    const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
-    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "team.pulls", from, data: { index } });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // Before: each delivery re-decided all 8 actors 4 times (enqueue, drain, record twice).
-    expect(decisions.mock.calls.length).toBeGreaterThan(0);
-    expect(decisions.mock.calls.length).toBeLessThan(1_200);
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const ids: string[] = [];
+    const snapshot = vi.fn((_fresh = true) => new Map(ids.map(id => [id, true])));
+    try {
+      const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 }, {}, batched ? snapshot : undefined);
+      for (let index = 0; index < 8; index++) {
+        ids.push((await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false })).id);
+      }
+      const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
+      for (let index = 0; index < 20; index++) {
+        const event = await mesh.publish({ topic: "team.pulls", from, data: { index } });
+        decisions.mockClear(); snapshot.mockClear();
+        dispatch(event);
+        // Measure this synchronous event, not async activation/presence checks
+        // (which must revalidate after awaits) or platform-dependent idle polls.
+        expect(decisions).toHaveBeenCalledTimes(batched ? 0 : 8);
+        expect(snapshot).toHaveBeenCalledTimes(batched ? 1 : 0);
+        if (batched) expect(snapshot).toHaveBeenCalledWith(true);
+        for (const call of decisions.mock.calls) expect(call).toHaveLength(1); // fresh authority
+        decisions.mockClear(); snapshot.mockClear();
+        dispatch(event);
+        expect(snapshot).not.toHaveBeenCalled();
+        expect(decisions).not.toHaveBeenCalled(); // already-delivered subscribers
+      }
+    } finally { start.mockRestore(); schedule.mockRestore(); }
   });
 
   // smarty-dev#918: callers verify setInstructions by digest, without reading the registry file.
@@ -2381,6 +2506,44 @@ describe("ActorManager", () => {
     expect(created.id).toBeTruthy();
   });
 
+  it("backs off whole adoption attempts outside registry custody while mesh is held", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "contended-orphan", instructions: "Wait.", residency: "session" });
+    await state.actors.close();
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), state.mesh.root, "3000"],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    let successor: ActorManager | undefined;
+    const registry = new ActorRegistryStore(path.join(state.root, "actors"));
+    const exclusive = state.mesh.exclusive.bind(state.mesh);
+    const attempts = vi.spyOn(state.mesh, "exclusive").mockImplementation((operation, timeout) => {
+      expect(fs.existsSync(path.join(state.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+      expect(timeout).toBe(0);
+      return exclusive(operation, timeout);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const identity: MeshIdentity = { id: "session:contended-successor", name: "main", kind: "main", sessionId: "contended-successor" };
+      successor = new ActorManager(identity.sessionId!, identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session", rootId: identity.id,
+        canManageActor: () => undefined, lineageAlive: () => false,
+      });
+      actorManagers.push(successor);
+      await waitFor(() => attempts.mock.calls.length > 0);
+      const started = performance.now();
+      await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent mutation" }))));
+      expect(performance.now() - started).toBeLessThan(1000);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(attempts).toHaveBeenCalledOnce(); // not an immediate retry storm
+      expect(registry.records()[0]!.rootId).toBe(state.identity.id);
+      expect(await exited).toBe(0);
+      await waitFor(() => successor!.owns(actor.id), 5000);
+      expect(registry.records()[0]!.rootId).toBe(identity.id);
+    } finally {
+      await exited; attempts.mockRestore(); await successor?.close();
+    }
+  }, 10000);
+
   it("settles exactly one adopter when concurrent starters race an orphan", async () => {
     const state = setup(true);
     const actor = await state.actors.create({
@@ -2845,6 +3008,36 @@ describe("ActorManager", () => {
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
 
+  it("5256 excludes a failed streak from routing presence across restart and flags pending effects until a successful probe", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "review-shard", instructions: "Review.", responseMode: "text" });
+    const run = vi.spyOn(s.agents, "run").mockRejectedValue(new Error("real activation failed"));
+    const presence = () => s.mesh.get(`actors/test/${actor.id}`)?.value as { status?: string } | undefined;
+    for (let attempt = 1; attempt <= ACTOR_FAILURE_NOTICE_AFTER; attempt++) {
+      await expect(s.actors.ask(actor.id, "review")).rejects.toThrow("real activation failed");
+      await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
+      if (attempt < ACTOR_FAILURE_NOTICE_AFTER) expect(s.actors.status(actor.id).status).toBe("idle");
+    }
+    expect(s.actors.status(actor.id).status).toBe("failed");
+    await waitFor(() => presence()?.status === "failed");
+    // Factory review_routing._snapshot admits ONLY idle/running/queued.
+    expect(["idle", "running", "queued"]).not.toContain(presence()?.status);
+    await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC }).length === 1);
+    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC })[0]!.data)
+      .toMatchObject({ actorId: actor.id, routingStatus: "failed", pendingEffects: "reconcile-required" });
+    expect(s.deliveries.at(-1)).toContain("Reconcile any prepared external effects");
+    await s.actors.close();
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id).status).toBe("failed");
+    run.mockRestore();
+    await restored.ask(actor.id, "successful repair probe");
+    await waitFor(() => restored.status(actor.id).status === "idle" && presence()?.status === "idle");
+    expect(restored.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
   it("creates, reconfigures and runs activation actors without a host turn-provenance capability gate", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "legacy-host", instructions: "Activate.", inferenceContext: "activation" });
@@ -2870,7 +3063,7 @@ describe("ActorManager", () => {
     const actor = await actors.create({ name: "failed-activation", instructions: "Activate.", inferenceContext: "activation", responseMode: "text" });
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await expect(actors.ask(actor.id, "activate")).rejects.toThrow(error);
-      await waitFor(() => actors.status(actor.id).status === "idle");
+      await waitFor(() => !actors.status(actor.id).inFlightRun && !actors.status(actor.id).preparing);
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
@@ -2891,7 +3084,7 @@ describe("ActorManager", () => {
     await expect(restored.ask(actor.id, "caller")).rejects.toThrow("Activation window lost current activation messages");
     await restored.tell(actor.id, "event-one");
     await restored.tell(actor.id, "event-two");
-    await waitFor(() => restored.status(actor.id).status === "idle");
+    await waitFor(() => restored.status(actor.id).status === "failed" && !restored.status(actor.id).inFlightRun);
     expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
     expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(3);
     await restored.close();
@@ -2899,9 +3092,9 @@ describe("ActorManager", () => {
       actorRoot: path.join(s.root, "actors"), persistent: true,
     });
     actorManagers.push(next);
-    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    expect(next.status(actor.id)).toMatchObject({ status: "failed", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
     await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
-    await waitFor(() => next.status(actor.id).status === "idle");
+    await waitFor(() => next.status(actor.id).status === "failed" && !next.status(actor.id).inFlightRun);
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
     expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
   });
@@ -2911,7 +3104,7 @@ describe("ActorManager", () => {
     const actor = await s.actors.create({ name: "restart-streak", instructions: "Respond.", responseMode: "text" });
     let manager = s.actors;
     const restart = async () => {
-      await waitFor(() => manager.status(actor.id).status === "idle");
+      await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
       await manager.close();
       manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
         actorRoot: path.join(s.root, "actors"), persistent: true,
@@ -2920,7 +3113,7 @@ describe("ActorManager", () => {
     };
     const fail = async () => {
       await expect(manager.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
-      await waitFor(() => manager.status(actor.id).status === "idle");
+      await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
     };
     const alarms = () => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
     await fail(); await fail();
@@ -3257,8 +3450,8 @@ describe("ActorManager", () => {
       .filter((message) => message.direction === "out" && message.runId)
       .map((message) => String((message as { text?: string }).text ?? "") + " " + message.source);
     await waitFor(() => ran().length >= 3, 20_000);
-    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in").length;
-    expect(inbound).toBe(3);
+    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in");
+    expect(inbound, JSON.stringify(inbound)).toHaveLength(3);
     expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
   }, 30_000);
 
@@ -3946,7 +4139,12 @@ describe("ActorManager", () => {
     });
     const registry = fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8");
     expect(registry).not.toContain(data);
-    expect(registry).toContain('"redacted": true');
+    const store = new ActorRegistryStore(path.join(root, "actors"));
+    const persisted = JSON.stringify(store.messages(store.records().find(record => record.id === actor.id)!));
+    expect(persisted).not.toContain(data);
+    expect(persisted).toContain('"redacted":true');
+    const archive = fs.readFileSync(path.join(root, "actors", actor.id, "registry", "messages.jsonl"), "utf8");
+    expect(archive).not.toContain(data);
   });
 
   it("setEvents replaces an actor's host-event subscriptions and dedupes", async () => {
@@ -4515,6 +4713,9 @@ describe("ActorManager removal behind an in-flight run", () => {
       else replacements.at(-1)?.directories.push(file);
     });
     const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      // The prepared inode may have been renamed from its data-fsynced temp.
+      // Carry the receipt through that rename; do not require fsync to occur in custody.
+      if (syncedFiles.has(String(from))) syncedFiles.add(String(to));
       if (String(to) === registry) {
         const records = JSON.parse(fs.readFileSync(from, "utf8")).actors as Array<{ removal?: unknown }>;
         replacements.push({ pending: records.some((record) => !!record.removal),
@@ -4831,7 +5032,11 @@ describe("#169 round 2 removal coordination", () => {
     const actor = await actors.create({ name: "uncommitted", instructions: "Work." });
     await actors.stop(actor.id);
     const dir = path.join(root, "actors", actor.id);
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => {});
+    const prepare = ActorRegistryStore.prototype.prepare;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementation(function (this: ActorRegistryStore, ...args) {
+      const prepared = prepare.apply(this, args);
+      return { ...prepared, commit: () => {} };
+    });
     try {
       await expect(actors.remove(actor.id)).rejects.toThrow("registry revocation did not commit");
       expect(fs.existsSync(dir)).toBe(true);

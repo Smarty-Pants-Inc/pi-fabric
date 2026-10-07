@@ -6,9 +6,9 @@ import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../c
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
-import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
+import type { FabricParticipantSource } from "../topology/types.js";
 
-/** Captured while the addressed Main is alive; directory reaping cannot erase its lane. */
+/** Captured at spawn; directory reaping cannot erase or transfer this exact address. */
 export interface CompletionRecipient {
   rootId: string;
   sessionId: string;
@@ -40,46 +40,12 @@ const canonical = (value: string): string => {
 const canonicalAsync = async (value: string): Promise<string> => {
   try { return await fs.promises.realpath(value); } catch { return path.resolve(value); }
 };
-const sameRecipientLane = (a: CompletionRecipient, b: CompletionRecipient): boolean =>
-  canonical(a.cwd) === canonical(b.cwd) && canonical(a.projectRoot) === canonical(b.projectRoot) &&
-  a.name === b.name && a.role === b.role;
-const sameRecipientLaneAsync = async (a: CompletionRecipient, b: CompletionRecipient): Promise<boolean> =>
-  await canonicalAsync(a.cwd) === await canonicalAsync(b.cwd) &&
-  await canonicalAsync(a.projectRoot) === await canonicalAsync(b.projectRoot) &&
-  a.name === b.name && a.role === b.role;
-const sameLane = (recipient: CompletionRecipient, root: FabricParticipantInfo): boolean =>
-  root.remoteHost === undefined && root.kind === "root" && root.cwd !== undefined &&
-  canonical(root.cwd) === canonical(recipient.cwd) &&
-  canonical(root.projectRoot ?? root.cwd) === canonical(recipient.projectRoot) &&
-  root.name === recipient.name && root.role === recipient.role;
-const sameLaneAsync = async (recipient: CompletionRecipient, root: FabricParticipantInfo): Promise<boolean> =>
-  root.remoteHost === undefined && root.kind === "root" && root.cwd !== undefined &&
-  await canonicalAsync(root.cwd) === await canonicalAsync(recipient.cwd) &&
-  await canonicalAsync(root.projectRoot ?? root.cwd) === await canonicalAsync(recipient.projectRoot) &&
-  root.name === recipient.name && root.role === recipient.role;
-
-/** Fresh, live roots only. A reload lease is live, not permission to steal its results. */
-export const completionSuccessor = (
-  recipient: CompletionRecipient, roots: readonly FabricParticipantInfo[],
-): FabricParticipantInfo | undefined => {
-  if (!(recipient.startedAt > 0) || roots.some(root => root.id === recipient.rootId && !root.stale)) return undefined;
-  return roots.filter(root => !root.stale && sameLane(recipient, root) && root.sessionId !== recipient.sessionId &&
-    root.startedAt > recipient.startedAt && root.interactive !== false &&
-    root.capabilities.includes("steer") && root.capabilities.includes("followUp"))
-    .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))[0];
-};
-const completionSuccessorAsync = async (
-  recipient: CompletionRecipient, roots: readonly FabricParticipantInfo[],
-): Promise<FabricParticipantInfo | undefined> => {
-  if (!(recipient.startedAt > 0) || roots.some(root => root.id === recipient.rootId && !root.stale)) return undefined;
-  const eligible: FabricParticipantInfo[] = [];
-  for (const root of roots) {
-    if (!root.stale && root.sessionId !== recipient.sessionId && root.startedAt > recipient.startedAt &&
-      root.interactive !== false && root.capabilities.includes("steer") && root.capabilities.includes("followUp") &&
-      await sameLaneAsync(recipient, root)) eligible.push(root);
-  }
-  return eligible.sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))[0];
-};
+/** Lane metadata and lease absence never grant another principal completion authority.
+ * There is no completion adoption/rotation record in this protocol: keep the exact
+ * spawn-time root AND session bound, including across renames or stale leases.
+ */
+const sameRecipient = (a: CompletionRecipient, b: CompletionRecipient): boolean =>
+  a.rootId === b.rootId && a.sessionId === b.sessionId;
 const key = (id: string): string => createHash("sha256").update(id).digest("hex");
 const directory = (meshRoot: string): string => path.join(meshRoot, "agent-completions");
 const envelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), `${key(id)}.json`);
@@ -186,9 +152,23 @@ const readRecipient = (file: string): CompletionRecipient | undefined => {
   finally { if (fd !== undefined) fs.closeSync(fd); }
   return undefined;
 };
-const readRecipientAsync = async (file: string): Promise<CompletionRecipient | undefined> => {
+// Idle discovery visits every lane's envelopes twice per poll. Keep only parsed routing
+// metadata, never bodies, receipts, canonical-path decisions or durability confirmations.
+// Directory mtime alone is insufficient: legacy/in-place writers need per-file validation.
+const recipientCache = new Map<string, { stamp: string; address: CompletionRecipient }>();
+const recipientStamp = (stat: fs.BigIntStats): string =>
+  `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+const RECIPIENT_CACHE_LIMIT = 1024;
+const readRecipientAsync = async (file: string, reuse = false): Promise<CompletionRecipient | undefined> => {
   let handle: fs.promises.FileHandle | undefined;
+  let stamp: string | undefined;
   try {
+    if (reuse) {
+      stamp = recipientStamp(await fs.promises.stat(file, { bigint: true }));
+      const cached = recipientCache.get(file);
+      if (cached?.stamp === stamp) return cached.address;
+      recipientCache.delete(file);
+    }
     handle = await fs.promises.open(file, "r");
     const buffer = Buffer.alloc(addressBuffer.length);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -206,12 +186,21 @@ const readRecipientAsync = async (file: string): Promise<CompletionRecipient | u
       else if (character === "{") depth++;
       else if (character === "}" && --depth === 0) {
         const address = JSON.parse(prefix.slice(start, i + 1)) as CompletionRecipient;
-        return typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
+        if (!(typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
           typeof address.rootId === "string" && typeof address.sessionId === "string" &&
-          typeof address.name === "string" ? address : undefined;
+          typeof address.name === "string")) return undefined;
+        // Bind the cache to the inode actually read. A replace or in-place write between
+        // the path stat and the read must not label those bytes with a different stamp.
+        if (reuse && stamp === recipientStamp(await handle.stat({ bigint: true }))) {
+          recipientCache.set(file, { stamp, address });
+          if (recipientCache.size > RECIPIENT_CACHE_LIMIT) recipientCache.delete(recipientCache.keys().next().value!);
+        }
+        return address;
       }
     }
-  } catch { /* Missing, torn or oversized addresses cannot authorize body/fence access. */ }
+  } catch {
+    recipientCache.delete(file); // Unknown/missing files are retried, never a stale answer.
+  }
   finally { await handle?.close(); }
   return undefined;
 };
@@ -349,8 +338,8 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
 const promoteOrphanAsync = async (meshRoot: string, projectRoot: string, project: string, target: string,
   accepts: (recipient: CompletionRecipient) => Promise<boolean>): Promise<void> => {
   const file = path.basename(target);
-  const address = await readRecipientAsync(target);
-  if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) return;
+  const address = await readRecipientAsync(target, true);
+  if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) return;
   const fence = path.join(directory(meshRoot), "receipts", file);
   if (await readReceiptAsync(fence)) return;
   const candidate = await readAsync<CompletionCandidate>(target);
@@ -427,8 +416,8 @@ const pendingCompletionAsync = async (meshRoot: string, projectRoot: string, pro
   accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
   const file = path.basename(target);
   if (consumed?.has(file)) return [];
-  const recipient = await readRecipientAsync(target);
-  if (!recipient || await canonicalAsync(recipient.projectRoot) !== project || !await accepts(recipient)) return [];
+  const recipient = await readRecipientAsync(target, true);
+  if (!recipient || !await accepts(recipient) || await canonicalAsync(recipient.projectRoot) !== project) return [];
   if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) return [];
   const value = await readAsync<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
@@ -576,8 +565,8 @@ export class CompletionJournal {
     // scans or async canonicalization on the ordinary empty-root idle path.
     // Existing journals and bodyless claims still use bounded asynchronous scans.
     if (!claims.length && !fs.existsSync(directory(this.meshRoot))) return;
-    // Gate before reading a fence, even without a body. The authenticated claim retains
-    // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
+    // Gate before reading a fence, even without a body. Only the authenticated
+    // exact owner may retire a claim; a missing lease does not transfer authority.
     let retired = 0;
     for await (const claim of scanSlices(claims)) {
       if (!await this.#canRetireClaimAsync(claim)) continue;
@@ -590,20 +579,23 @@ export class CompletionJournal {
       }
     }
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
-      (address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || await sameRecipientLaneAsync(address, recipient);
+      sameRecipient(address, recipient);
     // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
     let pruned = 0;
     const project = await canonicalAsync(recipient.projectRoot);
     for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
       const file = path.basename(target);
-      const address = await readRecipientAsync(target);
-      if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) continue;
+      let address = await readRecipientAsync(target, true);
+      if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
+      // Reuse only rejects unchanged foreign entries. Cleanup authority always reopens
+      // the exact address, then confirms the exact receipt and full namespace below.
+      address = await readRecipientAsync(target);
+      if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
       const fence = path.join(directory(this.meshRoot), "receipts", file);
       const receipt = await readReceiptAsync(fence);
       if (!receipt) continue;
-      // A legacy claim has no address of its own: the envelope is its last lane
-      // evidence. Do not unlink that evidence while an ineligible predecessor
-      // still owns the claim; otherwise no later Main can authorize retirement.
+      // Keep crash-left evidence while a foreign claim remains. Only its exact
+      // authenticated owner can retire that claim; no lease-based inheritance.
       const claim = this.mesh.get(claimKey(receipt.id), { fresh: true });
       if (claim) {
         if (!await this.#canRetireClaimAsync(claim)) continue;
@@ -623,31 +615,27 @@ export class CompletionJournal {
     for (const id of this.#enqueued) suppressed.add(`${key(id)}.json`);
     const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, suppressed);
     if (!pending.length) return;
-    const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
     for await (const envelope of scanSlices(pending)) {
-      if (this.#enqueued.has(envelope.result.id) || !await this.#canDeliverAsync(envelope, roots)) continue;
+      if (this.#enqueued.has(envelope.result.id) || !await this.#canDeliverAsync(envelope)) continue;
       const ck = claimKey(envelope.result.id);
       const claim = this.mesh.get(ck, { fresh: true });
-      const owner = (claim?.value as { rootId?: string } | undefined)?.rootId;
-      if (owner && owner !== this.recipient.rootId && roots.some(root => root.id === owner)) continue;
-      if (owner !== this.recipient.rootId) {
+      const owner = claim?.value as Partial<CompletionClaim> | undefined;
+      // Repair pre-fix foreign claims too: they never had authority over this
+      // exact-addressed body. CAS still fences concurrent admission/retirement.
+      if (owner?.rootId !== recipient.rootId || owner.sessionId !== recipient.sessionId || claim?.updatedBy.id !== recipient.rootId) {
         try {
           await this.mesh.put({ key: ck, ifVersion: claim?.version ?? 0,
             identity: { id: this.recipient.rootId, name: "main", kind: "main" },
             value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
-        } catch { continue; } // Another live successor owns admission; leave the source pending.
+        } catch { continue; } // Another admission changed the claim; leave the source pending.
       }
       if (await completionConsumedAsync(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
-      // Notification policy suppresses only inbox enqueue, not exact-lane recovery ownership.
-      // A quiet successor can still list and explicitly consume its settled result.
+      // Notification policy suppresses only inbox enqueue, not exact-root ownership.
+      // A quiet owner can still list and explicitly consume its settled result.
       if (!deliver) continue;
-      const redelivered = envelope.recipient.rootId !== this.recipient.rootId;
       this.#enqueued.add(envelope.result.id);
       try {
-        this.enqueue({ ...envelope.result, ...(redelivered ? {
-          completionDelivery: { status: "undelivered", addressedTo: envelope.recipient.sessionId,
-            redeliveredFrom: envelope.recipient.sessionId },
-        } : {}) }, () => {
+        this.enqueue(envelope.result, () => {
           try {
             consumeCompletion(this.meshRoot, envelope.result.id, this.recipient.sessionId);
             this.#remember(envelope);
@@ -662,17 +650,7 @@ export class CompletionJournal {
     const owner = snapshot.value as Partial<CompletionClaim> | undefined;
     if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return false;
     const recipient = this.recipient;
-    if (owner.rootId === recipient.rootId && owner.sessionId === recipient.sessionId) return true;
-    // Older claims can use the bounded envelope address; new claims retain this
-    // address themselves, including after unlink. Never infer a lane from a session id.
-    const address = owner.recipient ?? await readRecipientAsync(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
-    if (!address ||
-      (owner.recipient && (address.rootId !== owner.rootId || address.sessionId !== owner.sessionId)) ||
-      typeof address.cwd !== "string" || typeof address.projectRoot !== "string" || typeof address.name !== "string" ||
-      typeof address.startedAt !== "number" || !Number.isFinite(address.startedAt) ||
-      (address.role !== undefined && typeof address.role !== "string") || !await sameRecipientLaneAsync(address, recipient)) return false;
-    const successor = await completionSuccessorAsync(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
-    return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && await sameLaneAsync(recipient, successor);
+    return owner.rootId === recipient.rootId && owner.sessionId === recipient.sessionId;
   }
   async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<boolean> {
     if (snapshot && !await this.#canRetireClaimAsync(snapshot)) return false;
@@ -689,9 +667,9 @@ export class CompletionJournal {
     for (const target of [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)]) {
       const address = await readRecipientAsync(target);
       if (address && await canonicalAsync(address.projectRoot) === await canonicalAsync(recipient.projectRoot) &&
-        ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || await sameRecipientLaneAsync(address, recipient))) targets.push(target);
+        sameRecipient(address, recipient)) targets.push(target);
     }
-    // The envelope is the last lane evidence for legacy claims. Keep it until the
+    // Keep the exact-addressed envelope until the
     // versioned deletion commits; a failed/interrupted delete is retried by drain.
     if (snapshot) {
       try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); }
@@ -703,23 +681,9 @@ export class CompletionJournal {
   #canRead(envelope: CompletionEnvelope): boolean {
     // Unknown legacy fences block body access and acknowledgment as well as idle delivery.
     legacyCompletionConsumed(this.meshRoot, envelope.recipient.rootId, envelope.result.id);
-    if (envelope.recipient.rootId === this.recipient.rootId && envelope.recipient.sessionId === this.recipient.sessionId) return true;
-    if (!sameRecipientLane(envelope.recipient, this.recipient) || this.recipient.startedAt <= envelope.recipient.startedAt) return false;
-    const receipt = readReceipt(receiptPath(this.meshRoot, envelope.result.id), envelope.result.id);
-    if (receipt?.sessionId === this.recipient.sessionId) return true;
-    const claim = this.mesh.get(claimKey(envelope.result.id), { fresh: true });
-    const owner = claim?.value as { rootId?: string; sessionId?: string } | undefined;
-    return owner?.rootId === this.recipient.rootId && owner.sessionId === this.recipient.sessionId &&
-      claim?.updatedBy.id === owner.rootId && this.participants.list({ scope: "project", kinds: ["root"], fresh: true })
-        .some(root => !root.stale && root.id === owner.rootId && root.sessionId === owner.sessionId &&
-          root.interactive !== false && sameLane(envelope.recipient, root)) &&
-      !this.participants.list({ scope: "project", kinds: ["root"], fresh: true })
-        .some(root => !root.stale && root.id === envelope.recipient.rootId);
+    return sameRecipient(envelope.recipient, this.recipient);
   }
-  async #canDeliverAsync(envelope: CompletionEnvelope, roots?: FabricParticipantInfo[]): Promise<boolean> {
-    if (envelope.recipient.rootId === this.recipient.rootId && envelope.recipient.sessionId === this.recipient.sessionId) return true;
-    if (!await sameRecipientLaneAsync(envelope.recipient, this.recipient)) return false;
-    return (await completionSuccessorAsync(envelope.recipient, roots ??
-      this.participants.list({ scope: "project", kinds: ["root"], fresh: true })))?.id === this.recipient.rootId;
+  async #canDeliverAsync(envelope: CompletionEnvelope): Promise<boolean> {
+    return sameRecipient(envelope.recipient, this.recipient);
   }
 }

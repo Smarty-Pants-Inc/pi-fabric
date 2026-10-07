@@ -11,6 +11,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { compactTerminalRunEvents } from "../src/storage/retention.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
@@ -45,6 +46,74 @@ describe("resident terminal event retention", () => {
     fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
     return run;
   };
+
+  it("does not repeat exit/removal status proofs for an already bounded historical event log", () => {
+    const dir = root(), run = make(dir, "history-0", "completed");
+    fs.writeFileSync(path.join(run, "events.jsonl"), '{"text":"small"}\n');
+    const read = fs.readFileSync; let reads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(run, "status.json")) reads++;
+      return read(...args);
+    });
+    const rename = vi.spyOn(fs, "renameSync");
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    // Windows keeps main's five proof reads; optimization is in smarty-dev#5132.
+    expect(reads).toBe(process.platform === "win32" ? 5 : 1);
+    expect(rename).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32").each(["age threshold", "byte cap"])("POSIX-only (Windows: smarty-dev#5132): completes a bounded run transaction after live %s reload despite consistently slow status reads", change => {
+    const dir = root(), run = make(dir, "reload-retention", "completed", now - 8 * 60 * 60 * 1000);
+    const events = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
+    fs.writeFileSync(path.join(run, "events.jsonl"), events);
+    const policy = { terminalRunEventsAgeMs: change === "age threshold" ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,
+      terminalRunEventsMaxBytes: change === "byte cap" ? 512 * 1024 : 128 * 1024 };
+    const collector = new ResidentRequestRetention(dir, [], policy);
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const result = read(...args);
+      if (String(args[0]) === path.join(run, "status.json")) elapsed += 1;
+      return result;
+    });
+    const before = ["status.json", "reply.json"].map(name => fs.readFileSync(path.join(run, name)));
+    try {
+      for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(events);
+      policy.terminalRunEventsAgeMs = 6 * 60 * 60 * 1000;
+      policy.terminalRunEventsMaxBytes = 128 * 1024;
+      collector.resample();
+      for (let i = 0; i < 20 && collector.due(now + 60_001); i++) collector.sweep(now + 60_001, new Set(), 5);
+      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      for (const [i, name] of ["status.json", "reply.json"].entries()) expect(fs.readFileSync(path.join(run, name))).toEqual(before[i]);
+    } finally { collector.close(); }
+  });
+
+  it.each(["none", "pending archive", "live worker", "new latest"])("keeps fresh %s safety after recovery exceeds the slice deadline", change => {
+    const dir = root(), actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [] });
+    const run = make(dir, "slow-recovery", "completed");
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const recover = vi.fn((directory: string) => {
+      elapsed += 6;
+      if (change === "pending archive") fs.writeFileSync(path.join(directory, "archive-pending.json"), "{}");
+      if (change === "live worker") write(directory, ".", "status", {
+        status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid),
+      });
+      if (change === "new latest") write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "slow-recovery" }] });
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot], { terminalRunEventsMaxBytes: 128 * 1024 }, recover);
+    try {
+      for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(recover).toHaveBeenCalled();
+      const events = fs.readFileSync(path.join(run, "events.jsonl"));
+      if (change === "none") expect(events.length).toBeLessThanOrEqual(128 * 1024);
+      else expect(events).toEqual(log);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
+    } finally { collector.close(); }
+  });
 
   it.each(([undefined, "unknown", "herdr", "localterm"] as const).flatMap(transport =>
     (["startup", "streaming"] as const).map(phase => ({ transport, phase }))))(
@@ -194,9 +263,22 @@ describe("resident terminal event retention", () => {
     const collector = new ResidentRequestRetention(dir, [actorRoot]);
     try {
       for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
+      // Even consistently slow safety reads complete a count-bounded unit.
+      // A deadline alone must not restart the same fresh proof forever.
       expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
       for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);
+    } finally { collector.close(); }
+  });
+
+  it.skipIf(process.platform === "win32")("POSIX-only (Windows: smarty-dev#5132): retains an oversized run transaction without starving the next small run", () => {
+    const dir = root(), large = make(dir, "large", "completed"), small = make(dir, "small", "completed");
+    for (let i = 0; i < 65; i++) fs.writeFileSync(path.join(large, `oversized-event-prefix-${i}.txt`), "keep");
+    const collector = new ResidentRequestRetention(dir);
+    try {
+      for (let i = 0; i < 100 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(large, "events.jsonl")).equals(log)).toBe(true);
+      expect(fs.statSync(path.join(small, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
     } finally { collector.close(); }
   });
 

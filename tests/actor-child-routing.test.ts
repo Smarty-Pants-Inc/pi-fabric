@@ -7,6 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
@@ -353,6 +354,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
   });
 
   it("reconciles committed native live completion ids before a mailbox activation", async () => {
+    // Reconciliation belongs to the completion boundary, not a lucky monitor poll.
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
     const h = await setup(residency);
     const child = await h.spawn();
     const store = new ActorChildCompletionStore(h.actor.sessionFile!);

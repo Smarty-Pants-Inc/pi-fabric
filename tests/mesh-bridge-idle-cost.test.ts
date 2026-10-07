@@ -73,7 +73,7 @@ describe("warm mesh bridge idle state cost (smarty-dev#2854)", () => {
     if (traffic) expect(commits).toBe(30);
   }, 20_000);
 
-  it("still reads canonical authority for a nonempty page after idle polls", async () => {
+  it("still revalidates canonical authority for a nonempty page after idle polls", async () => {
     const { bridge, writer, local, fullReads } = await fixture();
     for (let tick = 0; tick < 4; tick++) await bridge.step();
     const owned = vi.spyOn(local, "owned");
@@ -83,6 +83,9 @@ describe("warm mesh bridge idle state cost (smarty-dev#2854)", () => {
     const before = fullReads();
     expect(await bridge.step()).toEqual({ toRemote: 0, toLocal: 0, dropped: 0 });
     expect(owned).toHaveBeenCalledTimes(1);
-    expect(fullReads() - before).toBe(5); // presence + owned (four), then canonical mirrored lookup
+    // The five authority observations still run (including owned above), but state.json
+    // did not change when the event was published. Physical-generation revalidation shares
+    // the already-captured canonical snapshot rather than parsing it five more times.
+    expect(fullReads() - before).toBe(0);
   });
 });

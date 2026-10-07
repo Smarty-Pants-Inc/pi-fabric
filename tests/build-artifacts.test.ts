@@ -14,7 +14,7 @@ const fixture = (): string => {
   temporary.push(dir);
   fs.cpSync(path.join(root, "dist"), path.join(dir, "dist"), { recursive: true });
   fs.cpSync(path.join(root, "bin"), path.join(dir, "bin"), { recursive: true });
-  for (const file of ["package.json", "scripts/assert-build-artifacts.mjs", "src/verified/generated/manifest.json"]) {
+  for (const file of ["package.json", "config/landlock-roles.json", "scripts/assert-build-artifacts.mjs", "src/verified/generated/manifest.json"]) {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     fs.copyFileSync(path.join(root, file), path.join(dir, file));
   }
@@ -35,6 +35,11 @@ describe("published build artifact guards", () => {
     manifest.exports["./missing"] = { import: "./dist/missing.js" };
     fs.writeFileSync(file, JSON.stringify(manifest));
     rejected(dir, "Missing or unpackaged public entrypoint: ./dist/missing.js");
+  });
+  it("rejects a missing lazy process-tree owner entry", () => {
+    const dir = fixture();
+    fs.rmSync(path.join(dir, "dist/residency/launcher-owner.js"));
+    rejected(dir, "residency/launcher-owner.js");
   });
   it("rejects a missing lazy Bend grammar entry", () => {
     const dir = fixture();

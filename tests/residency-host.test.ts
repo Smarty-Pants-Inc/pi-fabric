@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
+import { ACTOR_RETENTION_BATCH_SIZE } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -52,7 +53,82 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   return { root, config, host, idle };
 };
 
+describe("watchdog custody at host admission", () => {
+  it("refuses custody before initialization and releases the acquired host fence", async () => {
+    const { root, config, host } = fixture();
+    const marker = path.join(config.residencyRoot, "watchdog-custody.json");
+    fs.writeFileSync(marker, "uncertain attempt, not a PID lease");
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(host.start()).rejects.toThrow("watchdog custody");
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
+      // Refusal must not strand our fence. Explicit fixture drain, not PID expiry.
+      fs.rmSync(marker);
+      await successor.start();
+      expect(successor.agents).toBeDefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not initialize while a custody publisher owns the transaction lock", async () => {
+    const { root, config, host } = fixture();
+    const publisher = await lockFile(path.join(config.residencyRoot, "handover.lock"), 0, process.platform === "linux");
+    try {
+      await expect(host.start()).rejects.toBeInstanceOf(fileLock.FileLockBusy);
+      expect(host.agents).toBeUndefined();
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      // The publisher may now commit custody; a subsequent host must observe it.
+      fs.writeFileSync(path.join(config.residencyRoot, "watchdog-custody.json"), "retained");
+    } finally { fs.closeSync(publisher); }
+    const successor = new ResidentHost(config, () => {});
+    try {
+      await expect(successor.start()).rejects.toThrow("watchdog custody");
+      expect(successor.agents).toBeUndefined();
+    } finally {
+      await host.close(); await successor.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("fresh startup ownership batches", () => {
+  it.each([0, 5_000])("keeps shared state exact and the explicit list TTL un-floored (%i ms)", async ttl => {
+    const { root, config, host } = fixture();
+    config.mesh = { ...config.mesh, idleReadCoalesceMs: ttl };
+    const identity = { id: "session:peer-writer", name: "peer", kind: "main" as const };
+    try {
+      await host.start();
+      expect(host.mesh.readCacheMs).toBe(0);
+      expect(host.mesh.backgroundReadCacheMs).toBe(Math.max(1_000, ttl));
+      expect(host.participants.options.listReadCacheMs).toBe(ttl);
+      const peer = new MeshStore(config.meshRoot, 65536, 100);
+      await peer.put({ key: "test/exact-state", value: "before", identity });
+      expect(host.mesh.get("test/exact-state")?.value).toBe("before");
+      await peer.put({ key: "test/exact-state", value: "after", identity });
+      expect(host.mesh.get("test/exact-state")?.value).toBe("after");
+      const actor = await host.actors.create({ name: "before", instructions: "idle", residency: "durable" });
+      await host.participants.refresh();
+      host.participants.list({ scope: "project", fresh: true });
+      const key = "topology/participants/" + createHash("sha256").update(actor.id).digest("hex");
+      const file = path.join(config.meshRoot, "participants", key.split("/").at(-1)! + ".json");
+      const entry = JSON.parse(fs.readFileSync(file, "utf8"));
+      entry.updatedAt += 1_000; entry.value.name = "after";
+      // A file-only external replacement does not invalidate the reader's process cache.
+      fs.writeFileSync(file + ".new", JSON.stringify(entry)); fs.renameSync(file + ".new", file);
+      expect(host.participants.list({ scope: "project" }).find(row => row.id === actor.id)?.name)
+        .toBe(ttl === 0 ? "after" : "before");
+      expect(host.participants.list({ scope: "project", fresh: true }).find(row => row.id === actor.id)?.name).toBe("after");
+    } finally {
+      await host.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
     const { root, config, host } = fixture();
     const peerIdentity = { id: "session:peer-owner", name: "peer", kind: "main" as const };
@@ -100,7 +176,10 @@ describe("fresh startup ownership batches", () => {
         }
       });
       expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
-      for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+      const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+      // Reach every maintenance batch and the writer queued at the batch boundary.
+      const maintenanceTurns = Math.ceil(actors.length / batchSize) + 2;
+      for (let i = 0; i < maintenanceTurns; i++) await new Promise<void>((resolve) => setImmediate(resolve));
       expect(writerError).toBeUndefined();
       expect(published).toBe(true);
       expect(fs.existsSync(expiredRun)).toBe(true);
@@ -317,7 +396,8 @@ describe("#3662 resident actor delivery routing", () => {
         await send("after repair", 2);
         expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
         expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
-        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        // Confirmed withdrawal still does not permit actor-output succession: the owner root
+        // remains the only custody address, even when its recorded lineage is closed.
         expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
         expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
         await host.mesh.put({
@@ -327,8 +407,8 @@ describe("#3662 resident actor delivery routing", () => {
         });
         expect(host.participants.lineageAlive(config.rootId)).toBe(false);
         await send("after withdrawal", 3);
-        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
-        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
       } finally {
         readFault?.mockRestore();
         statFault?.mockRestore();
@@ -341,9 +421,9 @@ describe("#3662 resident actor delivery routing", () => {
   it.each([
     ["expired lease with live lineage", true, true, "root"],
     ["dead root without bound integrator", false, false, "root"],
-    ["dead root with exact bound integrator", false, true, "integrator"],
-    ["dead root with actor repository different from host cwd", false, true, "integrator"],
-  ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
+    ["dead root with exact bound integrator", false, true, "root"],
+    ["dead root with actor repository different from host cwd", false, true, "root"],
+  ] as const)("keeps %s at the exact actor-owner mailbox", async (_case, rootPresent, bound, target) => {
     const { root, config, host } = fixture();
     const integratorId = "session:11111111-1111-4111-8111-111111111111";
     config.cwd = root;
@@ -398,7 +478,7 @@ describe("#3662 resident actor delivery routing", () => {
         delivery: "steer", triggerTurn: true,
       });
       await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
-      const expected = target === "integrator" ? integratorId : config.rootId;
+      const expected = config.rootId;
       const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });
@@ -590,13 +670,23 @@ describe("resident retention config reload", () => {
       reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
     { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
       reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
-  ])("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change)", async ({ initial, reloaded }) => {
+  ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ initial, reloaded, recoveryMs }) => {
     // The streamed first sweep must genuinely retain this fixture: unlike the
     // former startup sweep, it runs after the log is created. Set the initial
     // policy before constructing the host, which takes its own shared copy.
     const { root, config, host } = fixture(initial);
     const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
+    let elapsed = 0;
+    if (process.platform === "win32") {
+      // This is a policy-reload test, not a native filesystem throughput test.
+      // A cold Windows status read can exhaust the 2-ms reference-proof slice
+      // and keep a protective live hint for this safely terminal fixture. Freeze
+      // the monotonic clock from the first scan; only injected recovery below
+      // advances it. Date.now/finishedAt and the host poll stay real; the 2-ms
+      // reference and 5-ms sweep budget values are unchanged.
+      vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    }
     try {
       await host.start();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
@@ -619,6 +709,21 @@ describe("resident retention config reload", () => {
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
+      // Model consistently slow Windows filesystem recovery separately from age:
+      // no wall-clock sleep, age/mtime adjustment, open handle, or rename failure.
+      // Keep the native host poll and the unchanged production 5-ms slice.
+      if (recoveryMs) {
+        if (process.platform !== "win32") {
+          const nativeNow = performance.now.bind(performance);
+          vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+        }
+        const recover = host.agents.recoverPendingArchives.bind(host.agents);
+        vi.spyOn(host.agents, "recoverPendingArchives").mockImplementation((...args) => {
+          const result = recover(...args);
+          elapsed += recoveryMs;
+          return result;
+        });
+      }
       // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
       const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       const nativeSweep = ResidentRequestRetention.prototype.sweep;
@@ -882,6 +987,14 @@ describe("resident orphan retention", () => {
       await host.start();
       // Startup does not inspect archives; the streaming collector runs later.
       expect(fs.existsSync(old)).toBe(true);
+      // This case tests streaming collection, not the separately covered
+      // reference-preparation budget. Finish that synchronous preparation before
+      // the first collector tick so transient live hints cannot skip this sample.
+      const references = host.agents.retentionReferences({ budgetMs: 100, maxEntries: 64 });
+      // Malformed/live fixtures deliberately retain the wildcard; neither
+      // collectable ID may be a transient per-run hint in this first sample.
+      expect(references.has("terminal-old")).toBe(false);
+      expect(references.has("actor-old")).toBe(false);
       await vi.waitFor(() => {
         expect(fs.existsSync(old)).toBe(false);
         expect(fs.existsSync(actor)).toBe(false);

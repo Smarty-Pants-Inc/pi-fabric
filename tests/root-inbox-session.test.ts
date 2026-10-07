@@ -24,7 +24,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
   const sessions: AgentSession[] = [];
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   afterEach(async () => {
-    for (const session of sessions.splice(0)) session.dispose();
+    for (const session of sessions.splice(0)) {
+      // dispose() invalidates host contexts; it does not emit the extension shutdown
+      // hook. Close Fabric's observers and delayed compiles before invalidating them.
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    }
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -126,6 +131,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     h.missedWork("retry unseen work");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
+    sessions.splice(sessions.indexOf(session), 1);
     await loader.reload();
     const { session: reloaded } = await createAgentSession({
       cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
@@ -298,7 +304,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     while (!done() && Date.now() < deadline) await sleep(50);
   };
 
-  it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s, not for the stream error alone (#4012)", async (timing) => {
+  it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s before automatic stream-error recovery (#4012)", async (timing) => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
     session.setAutoRetryEnabled(false);
     const calls = faux.state.callCount;
@@ -313,7 +319,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await session.prompt("fail the stream");
     expect(session.isStreaming).toBe(false);
     if (timing === "after-error") {
-      await sleep(300); // An error with no new work must not retry itself.
+      await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
       missedWork("Follow up after stream disconnect.");
     }

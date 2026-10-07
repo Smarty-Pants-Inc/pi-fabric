@@ -104,6 +104,10 @@ export const buildUiSection = (
             "Show full Fabric TypeScript or a compact intent-and-tools transcript; the tool-expand key (ctrl+o) expands a compact card to full.",
           values: TOOL_DISPLAY_MODES,
         }),
+        setting("ui.principalView", "Principal view", config.ui.principalView, {
+          description: "Auto enables for org roles. On collapses incoming chatter and tool output; Ctrl+O expands temporarily. /principal-view or Ctrl+Alt+P toggles. Display only.",
+          values: ["auto", "on", "off"],
+        }),
         setting(
           "ui.showAgentToolPreview",
           "Agent tool preview",

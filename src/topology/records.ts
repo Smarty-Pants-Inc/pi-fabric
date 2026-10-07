@@ -101,6 +101,7 @@ export const actorParticipantRecord = (
   ...(actor.thinking ? { thinking: actor.thinking } : {}),
   startedAt: actor.createdAt,
   updatedAt: actor.updatedAt,
+  ...(actor.ownershipToken !== undefined ? { actorOwnershipToken: actor.ownershipToken } : {}),
   actorQueued: actor.queued,
   actorMessages: actor.messages,
   ...(actor.preparing ? { actorPreparing: { ...actor.preparing } } : {}),

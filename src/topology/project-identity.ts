@@ -11,6 +11,42 @@ export const participantRole = (env: NodeJS.ProcessEnv = process.env): string | 
   return value || undefined;
 };
 
+/**
+ * A launch role is authority for one native session/project tuple, not for every session a
+ * long-lived Pi process opens (smarty-dev#5242). Capture once, before lazy activation, and
+ * carry the same grant through runtime replacement. Never use Fabric identity overrides here.
+ *
+ * Launchers may supply both PI_FABRIC_ROLE_SESSION (bare native session id) and
+ * PI_FABRIC_ROLE_PROJECT (exact projectOf(cwd)). Legacy launches bind their first session;
+ * recording that tuple in the process env also fences a fresh extension factory after /reload.
+ * An explicit/inherited tuple can retain the grant on a same-session process restart, but
+ * cannot grant a different history. Partial metadata fails closed. Values compare verbatim.
+ */
+export class ParticipantRoleGrant {
+  #grant: { role: string | undefined; sessionId: string; project: string } | undefined;
+
+  roleFor(sessionId: string, cwd: string, env: NodeJS.ProcessEnv = process.env, recordLaunch = false): string | undefined {
+    if (!this.#grant) {
+      const role = participantRole(env);
+      const hasBinding = env.PI_FABRIC_ROLE_SESSION !== undefined || env.PI_FABRIC_ROLE_PROJECT !== undefined;
+      const project = role ? projectOf(cwd) : "";
+      this.#grant = {
+        role,
+        sessionId: hasBinding ? env.PI_FABRIC_ROLE_SESSION ?? "" : sessionId,
+        project: hasBinding ? env.PI_FABRIC_ROLE_PROJECT ?? "" : project,
+      };
+      if (role && !hasBinding && recordLaunch) {
+        env.PI_FABRIC_ROLE_SESSION = sessionId;
+        env.PI_FABRIC_ROLE_PROJECT = project;
+      }
+    }
+    const grant = this.#grant;
+    if (!grant.role) return undefined;
+    return sessionId !== "" && sessionId === grant.sessionId && projectOf(cwd) === grant.project
+      ? grant.role : "area-lead";
+  }
+}
+
 const projects = new Map<string, string>();
 
 // One spelling per directory: Windows reports a temp or home path in 8.3 short form (RUNNER~1)
@@ -216,31 +252,25 @@ interface ProjectRoot {
 }
 
 /**
- * A resident actor's messages stay at its root until its lineage is provably dead. A lease
- * lapse is not death (smarty-dev#3662). Only an exact launch-bound integrator may inherit;
- * without an available binding the record still waits in the root's mailbox. Never elect.
+ * A resident actor's messages stay at its exact owner root. A lease lapse is not death
+ * (smarty-dev#3662), and confirmed death still does not authorize role/name-based succession:
+ * the old root mailbox is the only safe recipient. Never elect another Main here.
  */
 export const deliveryRoot = (
   rootId: string,
   liveRoots: readonly ProjectRoot[],
-  project: string,
-  options: {
-    /** The same lineage test used by orphan adoption, not a lease-filtered root listing. */
+  _project: string,
+  _options: {
+    /** Retained for source compatibility; delivery never elects a successor. */
     lineageAlive?: (rootId: string) => boolean;
-    /** Read launch metadata only after confirmed death, never during idle registration. */
+    /** Retained for source compatibility; an actor output is not re-homed by metadata. */
     boundIntegrator?: () => { repository?: string; leadId?: string };
   } = {},
 ): string => {
-  if (liveRoots.some((root) => root.id === rootId)) return rootId;
-  try {
-    if (options.lineageAlive?.(rootId) !== false) return rootId;
-    const binding = options.boundIntegrator?.();
-    if (!binding?.leadId) return rootId;
-    return resolveProjectAgent(liveRoots, project, binding).id;
-  } catch {
-    // Unknown liveness or invalid/unavailable metadata must never elect another project agent.
-    return rootId;
-  }
+  // Keep the parameters for callers from older releases, but deliberately do not inspect
+  // liveness, cwd, project, repository or launch markers: those are selectors, not custody.
+  void liveRoots;
+  return rootId;
 };
 
 export class FabricProjectAgentUnresolvedError extends Error {

@@ -8,7 +8,7 @@ import { trackedTemporaries, writeFileAtomic } from "../src/core/atomic-write.js
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { sweepAbandonedStateTemporaries } from "../src/mesh/temp-janitor.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
-import { readHostLeases } from "../src/topology/host-leases.js";
+import { readHostLeaseCurrent, readHostLeases } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFiles } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -167,7 +167,118 @@ const record = (id: string, kind: "root" | "agent", hostId: string): FabricParti
   startedAt: 1, updatedAt: 2, controlProtocol: "v1",
 } as FabricParticipantRecord);
 
+// A reloading Main with one child, under a short mesh lock timeout; its exit hook is returned.
+const reloadingDirectory = async (meshRoot: string, warnings: string[]) => {
+  const identity: MeshIdentity = { id: "session:reload", name: "main", kind: "main", sessionId: "reload" };
+  const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 200 });
+  const directory = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 200, reapDeadHosts: false,
+    onWithdrawalFailure: (message) => warnings.push(message),
+  });
+  directory.registerSource(() => [record(identity.id, "root", identity.id), record("agent:child", "agent", identity.id)]);
+  directories.push(directory);
+  const listeners = process.listeners("exit");
+  await directory.start();
+  const added = process.listeners("exit").filter((listener) => !listeners.includes(listener));
+  expect(added).toHaveLength(1);
+  await directory.quiesce("reload");
+  // A peer reads the shared directory: is the child still listed, and is it fresh?
+  const observer = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: "session:observer", rootId: "session:observer", reapDeadHosts: false,
+    identity: { id: "session:observer", name: "observer", kind: "main", sessionId: "observer" },
+  });
+  const child = (now: number) => observer.list({ includeStale: true, fresh: true }, now).find((entry) => entry.id === "agent:child");
+  return { identity, mesh, directory, hook: added[0]!, child, hooked: () => process.listeners("exit").includes(added[0]!) };
+};
+
+// A failed withdrawal keeps its entries, stops renewing the lease and keeps the exit hook,
+// so the entries lapse within that lease, and log once (smarty-dev#6622, review round 2).
+const expectLapse = async (setup: Awaited<ReturnType<typeof reloadingDirectory>>, meshRoot: string, warnings: string[]) => {
+  const { identity, child, hook, hooked } = setup;
+  expect(child(Date.now())).toMatchObject({ stale: false });
+  expect(hooked()).toBe(true);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(/participant withdrawal for session:reload did not commit/);
+  const lease = readHostLeaseCurrent(meshRoot, identity.id)!;
+  expect(lease).toBeDefined();
+  // Several heartbeats later nothing renewed the lease.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  expect(readHostLeaseCurrent(meshRoot, identity.id)).toEqual(lease);
+  // Within one (reload) lease the leftover child lapses on its own.
+  expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
+  expect(child(lease.expiresAt + 1)).toMatchObject({ stale: true });
+  await setup.directory.close();
+  expect(warnings).toHaveLength(1);
+  // An exit drops this incarnation's lease file; the stored lease bounds the rest.
+  (hook as () => void)();
+  expect(readHostLeaseCurrent(meshRoot, identity.id)).toBeUndefined();
+  expect(child(lease.expiresAt + 1)).toMatchObject({ stale: true });
+  process.removeListener("exit", hook);
+};
+
 describe("directory withdrawal on exit (smarty-dev#6622)", () => {
+  it("a reload withdrawal that exhausts its lock retries lets the entries expire with their unrenewed lease", async () => {
+    const meshRoot = tempRoot();
+    const warnings: string[] = [];
+    const setup = await reloadingDirectory(meshRoot, warnings);
+    const release = holdLock(meshRoot);
+    try { await setup.directory.close(); } finally { release(); }
+    expect(setup.mesh.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id))
+      .toContain("agent:child");
+    await expectLapse(setup, meshRoot, warnings);
+  }, 20_000);
+
+  it("a reload withdrawal whose delete is always skipped on a conflict counts as not done", async () => {
+    const meshRoot = tempRoot();
+    const warnings: string[] = [];
+    const setup = await reloadingDirectory(meshRoot, warnings);
+    const { mesh, identity } = setup;
+    const writeBatch = mesh.writeBatch.bind(mesh);
+    let contended = 0;
+    // A concurrent rewrite of the child moves its version before every withdrawal commit.
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async (input) => {
+      if (input.ops.length > 0 && input.ops.every((op) => op.kind === "delete")) {
+        for (const op of input.ops) {
+          const current = mesh.get(op.key, { fresh: true });
+          if ((current?.value as { id?: string } | undefined)?.id !== "agent:child") continue;
+          contended++;
+          await mesh.put({ key: op.key, value: { ...(current!.value as object), updatedAt: Date.now() }, identity });
+        }
+      }
+      return writeBatch(input);
+    });
+    await setup.directory.close();
+    expect(contended).toBeGreaterThanOrEqual(3);
+    vi.mocked(mesh.writeBatch).mockRestore();
+    expect(mesh.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id))
+      .toContain("agent:child");
+    await expectLapse(setup, meshRoot, warnings);
+  }, 20_000);
+
+  it("a skipped delete is retried: one conflict still withdraws and retires the exit hook", async () => {
+    const meshRoot = tempRoot();
+    const warnings: string[] = [];
+    const setup = await reloadingDirectory(meshRoot, warnings);
+    const { mesh, identity } = setup;
+    const writeBatch = mesh.writeBatch.bind(mesh);
+    let contended = 0;
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async (input) => {
+      const op = input.ops.find((candidate) => candidate.kind === "delete" &&
+        (mesh.get(candidate.key, { fresh: true })?.value as { id?: string } | undefined)?.id === "agent:child");
+      if (op && contended++ === 0) {
+        const current = mesh.get(op.key, { fresh: true })!;
+        await mesh.put({ key: op.key, value: { ...(current.value as object), updatedAt: Date.now() }, identity });
+      }
+      return writeBatch(input);
+    });
+    await setup.directory.close();
+    expect(contended).toBe(2);
+    expect(mesh.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id))
+      .toEqual([identity.id]);
+    expect(setup.hooked()).toBe(false);
+    expect(warnings).toEqual([]);
+  }, 20_000);
+
   it("/reload while the mesh lock is busy leaves no stale entry", async () => {
     const meshRoot = tempRoot();
     const identity: MeshIdentity = { id: "session:reload", name: "main", kind: "main", sessionId: "reload" };
@@ -185,8 +296,11 @@ describe("directory withdrawal on exit (smarty-dev#6622)", () => {
     // A peer's write holds the lock across this runtime's first withdrawal attempt.
     const release = holdLock(meshRoot);
     const freed = new Promise<void>((resolve) => setTimeout(() => { release(); resolve(); }, 450));
+    const listeners = process.listeners("exit").length;
     await directory.close();
     await freed;
+    // A committed withdrawal retires the exit hook.
+    expect(process.listeners("exit").length).toBe(listeners - 1);
     // Only the reloading root survives, as a bounded reload lease; the child is withdrawn.
     expect(ids()).toEqual([identity.id]);
     const root = mesh.listAll("topology/participants/", { fresh: true })[0]!.value as { status: string; reloadUntil?: number };

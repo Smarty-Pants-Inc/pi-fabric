@@ -128,10 +128,11 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const f = fixture(17);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const lstat = fs.lstatSync;
-    let statusProbes = 0;
+    let statusProbes = 0, probesThisTurn = 0;
+    const probesPerTurn: number[] = [];
     vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
       if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
-        statusProbes++;
+        statusProbes++; probesThisTurn++;
         // Controlled metadata latency, independent of whether this host has NTFS.
         // Eight actors share 72 candidates: four status probes/run at 2 ms each
         // exceed the existing heartbeat bound. One actor still does identical work.
@@ -143,8 +144,13 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     await turn();
     let previous = performance.now(), longest = 0, active = true;
     let heartbeat: NodeJS.Immediate;
+    // A recurring setImmediate observes every maintenance turn. Count the slow
+    // metadata work each turn performs instead of timing it: a shared Windows
+    // runner can deschedule any turn for seconds, but cannot change this count.
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (probesThisTurn) probesPerTurn.push(probesThisTurn);
+      probesThisTurn = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -152,9 +158,15 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       f.make();
       await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
-      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
-      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
-      expect(longest).toBeLessThan(250);
+      const probesPerActor = 9 * 4; // Nine expired runs, four status metadata probes each.
+      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest,
+        maxProbesPerTurn: Math.max(...probesPerTurn), workTurns: probesPerTurn.length }) + "\n");
+      expect(statusProbes).toBe(17 * probesPerActor); // Same four status metadata probes per candidate as main.
+      // Windows yields after every actor: no turn may carry a second actor's metadata
+      // work (8 actors/turn would be 288 probes), and the sweep spans one turn per actor.
+      expect(Math.max(...probesPerTurn)).toBe(probesPerActor);
+      expect(probesPerTurn.length).toBe(17);
+      expect(probesPerTurn.every((count) => count === probesPerActor)).toBe(true);
       for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { active = false; clearImmediate(heartbeat!); }
   });

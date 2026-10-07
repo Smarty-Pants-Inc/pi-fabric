@@ -187,6 +187,17 @@ export const hostLeasesStamp = (meshRoot: string): string | undefined => {
 export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined =>
   readHostLeaseSnapshot(meshRoot, hostId)?.lease;
 
+/** Strict current read for destructive operator checks: never consult/update the
+ * peer cache or return its last answer when current bytes are unreadable/invalid.
+ * Callers must distinguish an absent file from an existing but invalid one. */
+export const readHostLeaseCurrent = (meshRoot: string, hostId: string): FabricHostLease | undefined => {
+  try {
+    return leaseOf(fs.readFileSync(hostLeasePath(meshRoot, hostId), "utf8"), fileName(hostId));
+  } catch {
+    return undefined;
+  }
+};
+
 /** Stat and parsed lease from one filesystem observation, never the shared state. */
 export const readHostLeaseSnapshot = (meshRoot: string, hostId: string): {
   lease: FabricHostLease | undefined; mtimeMs: number;

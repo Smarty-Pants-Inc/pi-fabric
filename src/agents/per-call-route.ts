@@ -6,14 +6,14 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
-import type { JevClient } from "../jev/client.js";
+import type { JevClient, JevGatewayUse } from "../jev/client.js";
 import type { FabricJevConfig } from "../jev/config.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { appendRouteRecord, ROUTE_DEADLINE_MS, ROUTE_THRESHOLD } from "./model-route.js";
 import type { PerCallRoutingConfig } from "./per-call-config.js";
 
 /** The gateway use that budgets, validates and meters these questions (see the PR notes). */
-export const PER_CALL_GATEWAY_USE = "percall_route";
+export const PER_CALL_GATEWAY_USE = "percall_route" satisfies JevGatewayUse;
 export const PER_CALL_LEDGER = "per-call-routing.jsonl";
 export const PER_CALL_RETENTION_DAYS = 7;
 const CACHE_LIMIT = 256;
@@ -210,7 +210,8 @@ export interface PerCallRouterOptions {
   settings: () => PerCallSettings | undefined;
   /** Ledger path; defaults to <agentDir>/fabric/per-call-routing.jsonl at write time. */
   ledger?: string;
-  /** Test seam; production builds Fabric's JevClient (gateway transport when jev.gatewaySocket is set). */
+  /** Test seam; production builds Fabric's JevClient: bound to the gateway use percall_route over
+   * jev.gatewaySocket in "gateway" mode, the direct client in "direct" mode. */
   evaluate?: PerCallEvaluate;
   now?: () => Date;
 }
@@ -380,10 +381,12 @@ export class PerCallShadowRouter {
     return async (request, signal, deadline) => {
       const client = await (this.#client ??= (async () => {
         const [{ JevClient }, { resolveJevModelRoute }] = await Promise.all([import("../jev/client.js"), import("../jev/routes.js")]);
-        return new JevClient(jev, undefined, undefined, resolveJevModelRoute(jev.model).route);
+        // Only this router opts in to the socket, under its own use; "direct" keeps the key-holding client.
+        return new JevClient(jev, undefined, undefined, resolveJevModelRoute(jev.model).route,
+          config.jev === "gateway" ? { use: PER_CALL_GATEWAY_USE } : undefined);
       })());
       if (config.jev === "gateway" && !client.viaGateway) throw new Error("Jev gateway not configured");
-      return client.evaluate(request, signal, { use: PER_CALL_GATEWAY_USE, deadline });
+      return client.evaluate(request, signal, { deadline });
     };
   }
 

@@ -3,7 +3,10 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { JevClient, JevCredentials } from "../src/jev/client.js";
+import { JevClient, JevCredentials, JEV_GATEWAY_USES, type JevGatewayUse } from "../src/jev/client.js";
+import { JevProvider } from "../src/providers/jev-provider.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { normalizeFabricConfig } from "../src/config.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig } from "../src/jev/config.js";
 import { checkGatewaySocket, createGatewaySocketTransport, type JevGatewayTransport } from "../src/jev/gateway-transport.js";
 import type { JevRequest } from "../src/jev/types.js";
@@ -12,6 +15,9 @@ const request: JevRequest = { state: { ops: ["bash"] }, questions: { simple: { t
 const signal = () => new AbortController().signal;
 /** A credential source that fails the test if the gateway path ever reads a key. */
 const noKey = () => new JevCredentials([], {}, { configured: () => true, resolve: async () => { throw new Error("credential read"); } });
+const bound = (transport?: JevGatewayTransport) => ({ use: "percall_route" as const, ...(transport ? { transport } : {}) });
+/** A direct-route TypeSafe reply for `request`. */
+const directReply = () => new Response(JSON.stringify({ model: "jev-1.13.0", answers: { simple: { type: "noul", noul: 0.42 } }, usage: { input_tokens: 3, output_tokens: 1 } }));
 
 describe("Jev gateway transport (test double)", () => {
   it("sends the exact typed body to the gateway's systemone op and reads its Noul projection; no credential", async () => {
@@ -21,7 +27,7 @@ describe("Jev gateway transport (test double)", () => {
       return { status: 200, body: JSON.stringify({ model: "jev-1.13.0", answers: { simple: { noul: 0.93 } } }) };
     } };
     const fetcher = vi.fn() as unknown as typeof fetch;
-    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0" }, fetcher, noKey(), undefined, double);
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0" }, fetcher, noKey(), undefined, bound(double));
     expect(client.viaGateway).toBe(true);
     expect(await client.evaluate(request, signal(), { use: "percall_route" })).toEqual({
       model: "jev-1.13.0", answers: { simple: { type: "noul", noul: 0.93 } }, usage: { input_tokens: 0, output_tokens: 0 } });
@@ -33,7 +39,7 @@ describe("Jev gateway transport (test double)", () => {
 
   it("refuses non-Noul questions before sending, and rejects HTTP errors, unpinned models and bad answers", async () => {
     const reply = vi.fn(async () => ({ status: 200, body: "" }));
-    const client = new JevClient(DEFAULT_JEV_CONFIG, undefined, noKey(), undefined, { systemone: reply });
+    const client = new JevClient(DEFAULT_JEV_CONFIG, undefined, noKey(), undefined, bound({ systemone: reply }));
     await expect(client.evaluate({ state: "x", questions: { c: { type: "choice", instructions: "which", criteria: { a: null, b: null } } } }, signal()))
       .rejects.toThrow(/Noul questions only/);
     expect(reply).not.toHaveBeenCalled();
@@ -43,7 +49,10 @@ describe("Jev gateway transport (test double)", () => {
     await expect(client.evaluate(request, signal())).rejects.toThrow(/unpinned model/);
     reply.mockResolvedValueOnce({ status: 200, body: JSON.stringify({ model: "jev-1.13.0", answers: {} }) });
     await expect(client.evaluate(request, signal())).rejects.toThrow(/invalid typed response/);
-    await expect(client.evaluate(request, signal(), { use: "../x" })).rejects.toThrow(/Invalid Jev gateway use/);
+    // A bound client spends only its own use; a caller cannot name another one per request.
+    await expect(client.evaluate(request, signal(), { use: "fabric" })).rejects.toThrow(/use mismatch: this client is bound to percall_route/);
+    await expect(client.evaluate(request, signal(), { use: "../x" })).rejects.toThrow(/use mismatch/);
+    expect(reply).toHaveBeenCalledTimes(3);
   });
 
   it("a caller deadline caps the gateway's expiresAt and the local timeout; without one, jev.requestTimeoutMs applies", async () => {
@@ -52,7 +61,7 @@ describe("Jev gateway transport (test double)", () => {
       expires.push(expiresAt);
       return { status: 200, body: JSON.stringify({ model: "jev-1.13.0", answers: { simple: { noul: 0.5 } } }) };
     } };
-    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", requestTimeoutMs: 120_000 }, undefined, noKey(), undefined, double);
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", requestTimeoutMs: 120_000 }, undefined, noKey(), undefined, bound(double));
     const before = Date.now();
     await client.evaluate(request, signal(), { deadline: before + 2_500 });
     await client.evaluate(request, signal());
@@ -68,7 +77,26 @@ describe("Jev gateway transport (test double)", () => {
     expect(normalizeJevConfig({ gatewaySocket: "/srv/org/state/jev-gateway.sock" }).gatewaySocket).toBe("/srv/org/state/jev-gateway.sock");
     expect(normalizeJevConfig({ gatewaySocket: "state/jev.sock" }).gatewaySocket).toBeUndefined();
     expect(new JevClient(DEFAULT_JEV_CONFIG).viaGateway).toBe(false);
-    expect(new JevClient({ ...DEFAULT_JEV_CONFIG, gatewaySocket: "/nonexistent/jev.sock" }).viaGateway).toBe(true);
+    // The socket is opt-in per use: configuring it alone reroutes no client.
+    expect(new JevClient({ ...DEFAULT_JEV_CONFIG, gatewaySocket: "/nonexistent/jev.sock" }).viaGateway).toBe(false);
+    expect(new JevClient({ ...DEFAULT_JEV_CONFIG, gatewaySocket: "/nonexistent/jev.sock" }, undefined, undefined, undefined, bound()).viaGateway).toBe(true);
+  });
+
+  it("only registered gateway uses may bind; other uses and a missing socket are refused explicitly", () => {
+    expect([...JEV_GATEWAY_USES]).toEqual(["percall_route"]);
+    const config = { ...DEFAULT_JEV_CONFIG, gatewaySocket: "/nonexistent/jev.sock" };
+    for (const use of ["fabric", "approvals", "jev_provider", "../x"]) {
+      expect(() => new JevClient(config, undefined, undefined, undefined, { use: use as JevGatewayUse }))
+        .toThrow(/is refused: jev.gatewaySocket serves only percall_route/);
+    }
+    expect(() => new JevClient(DEFAULT_JEV_CONFIG, undefined, undefined, undefined, bound())).toThrow(/jev.gatewaySocket is unset/);
+  });
+
+  it("with jev.gatewaySocket configured, the Jev provider (programs, jev.evaluate) keeps its direct client", async () => {
+    const config = normalizeFabricConfig({ jev: { gatewaySocket: "/srv/org/state/jev-gateway.sock" } });
+    expect(config.jev.gatewaySocket).toBe("/srv/org/state/jev-gateway.sock");
+    const provider = new JevProvider({ registry: new ActionRegistry(), config });
+    expect(provider.client.viaGateway).toBe(false);
   });
 });
 
@@ -103,8 +131,19 @@ describe.skipIf(process.platform === "win32")("Jev gateway Unix socket (a local 
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("with jev.gatewaySocket configured, a non-router Jev client keeps the direct route and never touches the socket", async () => {
+    const fetcher = vi.fn(async () => directReply()) as unknown as typeof fetch;
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", gatewaySocket: socket }, fetcher,
+      new JevCredentials([], { TYPESAFE_API_KEY: "test-only-never-a-real-key" }));
+    expect(client.viaGateway).toBe(false);
+    const response = await client.evaluate(request, signal(), { use: "percall_route" });
+    expect(response.answers.simple).toEqual({ type: "noul", noul: 0.42 });
+    expect(vi.mocked(fetcher).mock.calls[0]![0]).toBe("https://api.typesafe.ai/v1/systemone");
+    expect(lines).toHaveLength(0);
+  });
+
   it("speaks the gateway's line protocol through jev.gatewaySocket", async () => {
-    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", gatewaySocket: socket }, undefined, noKey());
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", gatewaySocket: socket }, undefined, noKey(), undefined, bound());
     const response = await client.evaluate(request, signal(), { use: "percall_route" });
     expect(response.answers.simple).toEqual({ type: "noul", noul: 0.97 });
     expect(lines).toHaveLength(1);

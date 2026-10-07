@@ -7,10 +7,20 @@ import { JEV_TYPESAFE_ROUTE, resolveJevUpstreamModel, type JevRoute } from "./ro
 import { checkRequest, checkResponse, jsonText } from "./validation.js";
 import { createGatewaySocketTransport, JevGatewayError, type JevGatewayTransport } from "./gateway-transport.js";
 
-/** The gateway use a caller spends when it names none; the gateway refuses uses it does not register. */
-export const JEV_GATEWAY_DEFAULT_USE = "fabric";
+/** The only gateway uses Fabric may spend over jev.gatewaySocket. Every other Jev client (provider, programs,
+ * approvals classifier, model-route owner, judge CLI) keeps its direct route even when the socket is configured;
+ * a client is put on the socket only by naming one of these uses (opt-in, per use). */
+export const JEV_GATEWAY_USES = ["percall_route"] as const;
+export type JevGatewayUse = typeof JEV_GATEWAY_USES[number];
+/** Opt-in gateway binding: the use is fixed per client; the transport defaults to jev.gatewaySocket. */
+export interface JevGatewayBinding {
+  use: JevGatewayUse;
+  /** Test seam; defaults to the Unix-socket transport over config.gatewaySocket. */
+  transport?: JevGatewayTransport;
+}
 export interface JevEvaluateOptions {
-  /** Gateway use (budget, validator, meter) for this request; ignored on the direct HTTPS route. */
+  /** Gateway use for this request; on a gateway-bound client it must equal the bound use (or be omitted).
+   * Ignored on the direct HTTPS route. */
   use?: string;
   /** Absolute deadline (epoch ms) for ALL of this request's work. It caps jev.requestTimeoutMs and is sent
    * to the gateway as `expiresAt`, so neither side keeps working (or charging) past the caller's decision. */
@@ -150,23 +160,36 @@ export class JevClient {
   readonly credentials: JevCredentials;
   /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
   readonly #pendingCredentials = new Set<Promise<string>>();
-  readonly #gateway: JevGatewayTransport | undefined;
+  readonly #gateway: { use: JevGatewayUse; transport: JevGatewayTransport } | undefined;
   constructor(
     readonly config: FabricJevConfig,
     private readonly fetcher: typeof fetch = fetch,
     credentials?: JevCredentials,
     readonly route: JevRoute = JEV_TYPESAFE_ROUTE,
-    gateway?: JevGatewayTransport,
+    gateway?: JevGatewayBinding,
   ) {
     this.credentials = credentials ?? new JevCredentials(config.credentialCommand, process.env, undefined, route.envKeys);
-    this.#gateway = gateway ?? (config.gatewaySocket ? createGatewaySocketTransport(config.gatewaySocket) : undefined);
+    // jev.gatewaySocket alone never reroutes a client: only an explicit binding to a registered use does.
+    if (gateway) {
+      if (!(JEV_GATEWAY_USES as readonly string[]).includes(gateway.use)) {
+        throw new Error(`Jev gateway use "${String(gateway.use).slice(0, 64)}" is refused: jev.gatewaySocket serves only ${JEV_GATEWAY_USES.join(", ")}`);
+      }
+      const transport = gateway.transport ?? (config.gatewaySocket ? createGatewaySocketTransport(config.gatewaySocket) : undefined);
+      if (!transport) throw new Error("Jev gateway not configured: jev.gatewaySocket is unset");
+      this.#gateway = { use: gateway.use, transport };
+    }
   }
   /** True when evaluations go through the Node's Jev gateway and no credential is read. */
   get viaGateway(): boolean { return this.#gateway !== undefined; }
   async evaluate(request: JevRequest, signal: AbortSignal, options: JevEvaluateOptions = {}): Promise<JevResponse> {
     checkRequest(request, this.config.maxRequestBytes);
     const deadline = jevDeadline(this.config.requestTimeoutMs, options.deadline);
-    if (this.#gateway) return this.#evaluateViaGateway(this.#gateway, request, signal, options.use ?? JEV_GATEWAY_DEFAULT_USE, deadline);
+    if (this.#gateway) {
+      if (options.use !== undefined && options.use !== this.#gateway.use) {
+        throw new Error(`Jev gateway use mismatch: this client is bound to ${this.#gateway.use}`);
+      }
+      return this.#evaluateViaGateway(this.#gateway.transport, request, signal, this.#gateway.use, deadline);
+    }
     const requestedModel = request.model ?? this.config.model;
     const model = resolveJevUpstreamModel(this.route, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available on the ${this.route.label} route`);

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ArchiveSha256, type Sha256State } from "./archive-sha256.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -34,6 +34,49 @@ import type { MeshEvent } from "./store.js";
  */
 export const MESH_ARCHIVE_CONFIG = "event-archive.json";
 const MESH_ARCHIVE_SEQUENCE_INDEX = "sequence-index";
+const MESH_ARCHIVE_UNSYNCED = "unsynced";
+
+/**
+ * Durability work a deferred begin/commit leaves for AFTER the mesh lock is released
+ * (smarty-dev#4383): no archive fsync runs while the fleet-wide lock is held. A publish
+ * returns only after runArchiveBarrier() succeeds, so an acknowledged event is as durable
+ * as before. Absolute paths only.
+ */
+export interface MeshArchiveBarrier {
+  /** Topic files whose appended lines need a data barrier. */
+  data: Set<string>;
+  /** Small metadata files (sequence index, digest checkpoint, seal) written by rename. */
+  files: Set<string>;
+  /** Directories whose new names need a barrier (opened as O_RDONLY). */
+  dirs: Set<string>;
+  /** A new topic file's day chain, synced as #syncDays does (opened "r"). */
+  chains: Set<string>;
+}
+
+export const newArchiveBarrier = (): MeshArchiveBarrier => ({ data: new Set(), files: new Set(), dirs: new Set(), chains: new Set() });
+
+const syncDirectoryHandle = (directory: string): void => {
+  if (process.platform === "win32") return;
+  const descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+};
+
+/** Off-lock: one grouped pass, data first, then metadata files, then their names. */
+export const runArchiveBarrier = (barrier: MeshArchiveBarrier): void => {
+  for (const file of barrier.data) {
+    const descriptor = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try { fs.fdatasyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+  }
+  for (const file of barrier.files) {
+    let descriptor: number;
+    // A later writer may already have replaced this name; its own barrier covers it.
+    try { descriptor = fs.openSync(file, process.platform === "win32" ? "r+" : "r"); }
+    catch (error) { if (errorCode(error) === "ENOENT") continue; throw error; }
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+  }
+  for (const directory of barrier.chains) syncDirectory(directory);
+  for (const directory of barrier.dirs) syncDirectoryHandle(directory);
+};
 
 export interface MeshArchiveEntry {
   event: MeshEvent;
@@ -262,7 +305,7 @@ export class MeshArchive {
    * Archives a publish's event before it goes live: records where it goes, writes the whole
    * line and syncs it. On any failure it cuts the line back out and throws.
    */
-  begin(entry: MeshArchiveEntry): MeshArchivePending {
+  begin(entry: MeshArchiveEntry, barrier?: MeshArchiveBarrier): MeshArchivePending {
     this.#requireRoot();
     const relative = this.#fileFor(entry.event, this.#headDay());
     const absolute = path.join(this.dir, relative);
@@ -283,9 +326,14 @@ export class MeshArchive {
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
       const bytes = Buffer.from(`${entry.line}\n`, "utf8");
       writeAll(descriptor, bytes);
-      fs.fdatasyncSync(descriptor);
-      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) });
-      if (fresh) this.#syncDays(relative);
+      // Deferred: the caller syncs after releasing the mesh lock and before acknowledging.
+      if (barrier) barrier.data.add(absolute);
+      else fs.fdatasyncSync(descriptor);
+      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) }, barrier);
+      if (fresh) {
+        if (barrier) for (const directory of this.#dayChain(relative)) barrier.chains.add(directory);
+        else this.#syncDays(relative);
+      }
     } catch (error) {
       if (descriptor !== undefined) fs.closeSync(descriptor);
       descriptor = undefined;
@@ -298,23 +346,23 @@ export class MeshArchive {
   }
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
-  commit(pending: MeshArchivePending, sealClosedDays = true): void {
-    if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)));
-    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id);
+  commit(pending: MeshArchivePending, sealClosedDays = true, barrier?: MeshArchiveBarrier): void {
+    if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)), barrier);
+    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id, barrier);
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
-    if (sealClosedDays) this.#sealClosedDays(pending.file);
+    if (sealClosedDays) this.#sealClosedDays(pending.file, barrier);
   }
 
   /** A direct live anchor (or a synced reboot promotion) proves publication, not just append. */
-  confirmLive(sequence: number, id: string): void {
+  confirmLive(sequence: number, id: string, barrier?: MeshArchiveBarrier): void {
     const indexed = this.#readJson<MeshArchiveIndexEntry | { absent: true }>(path.relative(this.dir, this.#indexPath(sequence)));
     // Old catch-ups had no sidecar; only new reserved entries need this transition.
     if (!indexed || "absent" in indexed) return;
     if (indexed.id !== id) throw new MeshArchiveLookupUnavailableError("Cannot commit a mismatched archive sequence index");
-    if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true });
+    if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true }, barrier);
   }
 
   /** The event never went live: cut it back out of its file. */
@@ -501,6 +549,99 @@ export class MeshArchive {
       fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     }
     return { rebooted: true, promote: plan.promote.filter(entry => entry.event.sequence > lastLive) };
+  }
+
+  /** True when this boot has not yet run the archive's reboot recovery (BOOT names another boot). */
+  rebootPending(): boolean {
+    return this.#readText("BOOT") !== currentBoot();
+  }
+
+  /**
+   * Off-lock, BEFORE a deferred (no fsync under the lock) begin: a durable note that live
+   * events after `since` may have archive lines that are not yet synced. A power loss can
+   * keep such a live line (any later data barrier or writeback syncs the live log) while
+   * losing its archive line; reboot recovery then restores those lines from the live log
+   * (restoreUnsynced). Removed once the publication's archive barrier has succeeded.
+   */
+  stageUnsynced(since: number): string {
+    this.#requireRoot();
+    const directory = path.join(this.dir, MESH_ARCHIVE_UNSYNCED);
+    const fresh = !fs.existsSync(directory);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const file = path.join(directory, `${process.pid}.${randomUUID()}.json`);
+    const descriptor = fs.openSync(file, "wx", 0o600);
+    try {
+      writeAll(descriptor, Buffer.from(JSON.stringify({ since, pid: process.pid, boot: currentBoot(), at: Date.now() }), "utf8"));
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    syncDirectoryHandle(directory);
+    if (fresh) syncDirectoryHandle(this.dir);
+    return file;
+  }
+
+  clearUnsynced(file: string): void {
+    fs.rmSync(file, { force: true });
+  }
+
+  #unsyncedMarkers(): Array<{ file: string; since?: number; pid?: number; boot?: string; at?: number }> {
+    const directory = path.join(this.dir, MESH_ARCHIVE_UNSYNCED);
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return []; throw error; }
+    return names.filter(name => name.endsWith(".json")).map(name => {
+      const file = path.join(directory, name);
+      try { return { file, ...(JSON.parse(fs.readFileSync(file, "utf8")) as { since?: number; pid?: number; boot?: string; at?: number }) }; }
+      catch { return { file }; } // Torn or vanished: an unsynced marker of a dead attempt.
+    });
+  }
+
+  /** Under the mesh lock, in reboot recovery only: markers of earlier boots and the lowest
+   * live sequence they cover. A marker of THIS boot may belong to a waiting publisher. */
+  previousBootUnsynced(): { since: number; files: string[] } | undefined {
+    const boot = currentBoot();
+    const markers = this.#unsyncedMarkers().filter(marker => marker.boot !== boot);
+    if (!markers.length) return undefined;
+    const since = Math.min(...markers.map(marker => Number.isSafeInteger(marker.since) && marker.since! >= 0 ? marker.since! : 0));
+    return { since, files: markers.map(marker => marker.file) };
+  }
+
+  /** Same boot only: a dead process's marker is moot, its page-cache writes survived. */
+  sweepUnsynced(alive: (pid: number) => boolean): void {
+    const boot = currentBoot();
+    for (const marker of this.#unsyncedMarkers()) {
+      if (marker.boot !== boot || !Number.isSafeInteger(marker.pid) || marker.pid === process.pid || alive(marker.pid!)) continue;
+      fs.rmSync(marker.file, { force: true });
+    }
+  }
+
+  /**
+   * Reboot recovery, under the mesh lock: re-archive live events (after an earlier boot's
+   * unsynced marker) whose archive lines a power loss took. A present line (by its sequence
+   * index or its exact bytes in its topic file) is never written twice; the head never moves
+   * back. Synced here, before the markers go: this path is once per boot.
+   */
+  restoreUnsynced(entries: MeshArchiveEntry[], markers: string[]): void {
+    const missing = entries.filter(entry => !this.#holdsLine(entry));
+    if (missing.length) {
+      const head = this.head();
+      this.catchUp(missing);
+      if (head && (this.head()?.sequence ?? 0) < head.sequence) writeDurable(path.join(this.dir, "HEAD.json"), `${JSON.stringify(head)}\n`);
+    }
+    for (const file of markers) fs.rmSync(file, { force: true });
+    syncDirectoryHandle(path.join(this.dir, MESH_ARCHIVE_UNSYNCED));
+  }
+
+  #holdsLine(entry: MeshArchiveEntry): boolean {
+    try { if (this.lookupEntry(entry.event.sequence)?.event.id === entry.event.id) return true; }
+    catch { /* an unsynced index is not evidence either way: read the topic files */ }
+    const candidates = new Set([this.#fileFor(entry.event, undefined), this.#fileFor(entry.event, this.#headDay())]);
+    for (const relative of candidates) {
+      let text: string;
+      try { text = fs.readFileSync(path.join(this.dir, relative), "utf8"); }
+      catch (error) { if (errorCode(error) === "ENOENT") continue; throw error; }
+      if (text.startsWith(`${entry.line}\n`) || text.includes(`\n${entry.line}\n`)) return true;
+    }
+    return false;
   }
 
   /** After a new boot's recovery: the promoted events are live. Records the boot, durably. */
@@ -739,7 +880,7 @@ export class MeshArchive {
 
   // Every day before the current one is closed. Sealed days form a prefix, because days are
   // sealed oldest first, so the scan back stops at the first sealed day.
-  #sealClosedDays(currentFile: string): void {
+  #sealClosedDays(currentFile: string, barrier?: MeshArchiveBarrier): void {
     const current = currentFile.split("/").slice(0, 3).join("/");
     const unsealed: string[] = [];
     for (const day of this.#days().reverse()) {
@@ -749,7 +890,7 @@ export class MeshArchive {
     }
     const budget = { bytes: ARCHIVE_DIGEST_SLICE_BYTES };
     for (const day of unsealed) {
-      if (!this.#seal(day, budget)) break; // Preserve the sealed-prefix invariant.
+      if (!this.#seal(day, budget, barrier)) break; // Preserve the sealed-prefix invariant.
     }
   }
 
@@ -766,17 +907,23 @@ export class MeshArchive {
   }
 
   /** Install a durable proof of non-append before creating a publication intent. */
-  reserveLookup(sequence: number): void {
+  reserveLookup(sequence: number, barrier?: MeshArchiveBarrier): void {
     this.#requireRoot();
-    this.#writeIndex(sequence, { sequence, absent: true });
+    this.#writeIndex(sequence, { sequence, absent: true }, barrier);
   }
 
   #indexPath(sequence: number): string {
     return path.join(this.dir, MESH_ARCHIVE_SEQUENCE_INDEX, String(Math.floor(sequence / 1024)), `${sequence}.json`);
   }
 
-  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }): void {
-    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable: true });
+  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }, barrier?: MeshArchiveBarrier): void {
+    const file = this.#indexPath(sequence);
+    if (!barrier) { writeFileAtomic(file, JSON.stringify(entry), { durable: true }); return; }
+    const bucket = path.dirname(file);
+    if (!fs.existsSync(bucket)) { barrier.dirs.add(path.dirname(bucket)); barrier.dirs.add(this.dir); }
+    writeFileAtomic(file, JSON.stringify(entry));
+    barrier.files.add(file);
+    barrier.dirs.add(bucket);
   }
 
   #readJson<T>(relative: string): T | undefined {
@@ -800,8 +947,12 @@ export class MeshArchive {
   // root, so the whole path survives a power loss. Run whenever the file was empty before its
   // first line, so a retry after an interrupted attempt finishes the job.
   #syncDays(relative: string): void {
+    for (const directory of this.#dayChain(relative)) syncDirectory(directory);
+  }
+
+  #dayChain(relative: string): string[] {
     const [year, month, day] = relative.split("/");
-    for (const directory of [`${year}/${month}/${day}`, `${year}/${month}`, `${year}`, ""]) syncDirectory(path.join(this.dir, directory));
+    return [`${year}/${month}/${day}`, `${year}/${month}`, `${year}`, ""].map(directory => path.join(this.dir, directory));
   }
 
   #readText(relative: string): string | undefined {
@@ -919,12 +1070,14 @@ export class MeshArchive {
     this.#countLine(digest, entry.event);
   }
 
-  #saveDigest(relative: string, digest: DigestCheckpoint, stat: fs.Stats): void {
+  #saveDigest(relative: string, digest: DigestCheckpoint, stat: fs.Stats, barrier?: MeshArchiveBarrier): void {
     digest.identity = fileIdentity(stat);
-    writeFileAtomic(path.join(this.dir, this.#digestPath(relative)), `${JSON.stringify(digest)}\n`, { durable: true });
+    const file = path.join(this.dir, this.#digestPath(relative));
+    writeFileAtomic(file, `${JSON.stringify(digest)}\n`, barrier ? undefined : { durable: true });
+    if (barrier) { barrier.files.add(file); barrier.dirs.add(path.dirname(file)); }
   }
 
-  #seal(day: string, budget: { bytes: number }): boolean {
+  #seal(day: string, budget: { bytes: number }, barrier?: MeshArchiveBarrier): boolean {
     const directory = path.join(this.dir, day);
     const files: Record<string, SealFile> = {};
     let complete = true;
@@ -937,7 +1090,7 @@ export class MeshArchive {
         if (digest.hash.bytes !== stat.size) {
           const before = digest.hash.bytes;
           this.#advanceDigest(descriptor, relative, digest, budget);
-          if (digest.hash.bytes !== before) this.#saveDigest(relative, digest, stat);
+          if (digest.hash.bytes !== before) this.#saveDigest(relative, digest, stat, barrier);
         }
         if (digest.hash.bytes !== stat.size) { complete = false; continue; }
         if (digest.lines) files[name] = { lines: digest.lines, firstSequence: digest.firstSequence,
@@ -945,7 +1098,9 @@ export class MeshArchive {
       } finally { fs.closeSync(descriptor); }
     }
     if (!complete) return false;
-    writeFileAtomic(path.join(directory, "SEAL.json"), `${JSON.stringify({ version: 1, day, files })}\n`, { durable: true });
+    const sealFile = path.join(directory, "SEAL.json");
+    writeFileAtomic(sealFile, `${JSON.stringify({ version: 1, day, files })}\n`, barrier ? undefined : { durable: true });
+    if (barrier) { barrier.files.add(sealFile); barrier.dirs.add(directory); }
     return true;
   }
 }

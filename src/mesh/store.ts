@@ -11,7 +11,7 @@ import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, renameAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
-import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
+import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, newArchiveBarrier, runArchiveBarrier, type MeshArchiveBarrier, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -609,10 +609,30 @@ interface MeshDedupeIntent {
   owner?: MeshIntentOwner;
 }
 
-interface MeshIntentOwner { pid: number; token: string; at: number }
+/** `store` is the publishing MeshStore instance's token, prefixed by its isolate's token. */
+interface MeshIntentOwner { pid: number; token: string; at: number; store?: string }
 
-// Publish attempts of THIS process whose canonical intent may still be unappended.
+// One per module instance (isolate): another worker or a second copy of this module in the
+// same PID has its own token and its own attempt set (smarty-dev#4383, P3).
+const ISOLATE_TOKEN = randomUUID();
+// Publish attempts of THIS isolate whose canonical intent may still be unappended,
+// keyed "<store token>:<attempt token>".
 const liveIntentOwners = new Set<string>();
+
+/** Test-only crash fences. Inert unless the test fixture sets this global symbol (never
+ * set by a service) AND the named environment variable is "1". */
+export const MESH_TEST_CRASH_HOOKS = Symbol.for("pi-fabric.mesh.test-crash-hooks");
+const crashFence = (name: string): void => {
+  if ((globalThis as Record<symbol, unknown>)[MESH_TEST_CRASH_HOOKS] === true && process.env[name] === "1") process.kill(process.pid, "SIGKILL");
+};
+const pidAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return errorCode(error) === "EPERM"; }
+};
+// Stage files (*.<pid>.<uuid>.prepared / .retained) of dead attempts are swept at most this often.
+const STAGE_SWEEP_INTERVAL_MS = 60_000;
+const stageSweeps = new Map<string, number>();
+const STAGE_NAME = /\.(\d+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:prepared|retained)$/;
 // A foreign owner is presumed live while its pid exists, up to this generous age.
 const INTENT_OWNER_STALE_MS = 5 * 60_000;
 // At most one best-effort compaction per live log per process (smarty-dev#4383).
@@ -681,6 +701,8 @@ const rememberReadSnapshot = (file: string, snapshot: ParsedStateSnapshot): void
 };
 
 export class MeshStore {
+  /** Per store instance, prefixed by its isolate: names the owner of this store's intents. */
+  readonly #ownerToken = `${ISOLATE_TOKEN}.${randomUUID()}`;
   readonly #eventsPath: string;
   readonly #statePath: string;
   readonly #counterPath: string;
@@ -916,7 +938,8 @@ export class MeshStore {
           ? !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence! < 1 ||
             !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset! < 0
           : intent.version !== 2 || typeof intent.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.payloadHash) ||
-            intent.reservedSequence !== undefined || intent.liveOffset !== undefined || intent.archiveDir !== undefined) ||
+            intent.liveOffset !== undefined || (intent.reservedSequence === undefined) !== (intent.archiveDir === undefined) ||
+            (intent.reservedSequence !== undefined && (!Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1))) ||
         (intent.archiveDir !== undefined && (typeof intent.archiveDir !== "string" || !path.isAbsolute(intent.archiveDir))) ||
         file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
       throw new Error("Invalid event publication intent");
@@ -960,7 +983,8 @@ export class MeshStore {
           let liveOffset = 0;
           try { liveOffset = fs.statSync(this.#eventsPath).size; }
           catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
+          // A v2 intent finds the restored line by identity; only v1 needs the new anchor.
+          if (intent.version !== 2) writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
         }
@@ -979,8 +1003,8 @@ export class MeshStore {
     if (event && !prior) {
       if (live) {
         this.#confirmEventFile(this.#eventsPath);
-        // A position-independent intent never reserved an archive slot.
-        if (intent.version !== 2) {
+        // Only an intent that reserved an archive slot (v1, or a v2 archive hint) confirms it.
+        if (intent.reservedSequence !== undefined) {
           archive?.confirmLive(live.sequence, live.id);
           const pending = archive?.pending();
           if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
@@ -1004,7 +1028,7 @@ export class MeshStore {
   }
 
   #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number },
-    confirmReceiptAfterRelease = false): () => MeshEvent {
+    confirmReceiptAfterRelease = false, barrier?: MeshArchiveBarrier): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     input.signal?.throwIfAborted();
@@ -1076,7 +1100,7 @@ export class MeshStore {
       if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
         throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
       }
-      return this.#commitPublication(input, event, line, archive, batch);
+      return this.#commitPublication(input, event, line, archive, batch, barrier);
     };
   }
 
@@ -1105,16 +1129,17 @@ export class MeshStore {
   }
 
   #commitPublication(input: MeshPublishInput, event: MeshEvent, line: string, archive?: MeshArchive,
-    batch?: { appendStarted: boolean; bytes: number }): MeshEvent {
+    batch?: { appendStarted: boolean; bytes: number }, barrier?: MeshArchiveBarrier): MeshEvent {
       const sequence = event.sequence;
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
       // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive holds the event durably before it goes live (smarty-dev#754); the live
-      // append commits it. If either step fails, the event is cut back out of the archive.
-      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
+      // The live append commits the event; if it fails, the event is cut back out of the archive.
+      // An unkeyed publication (barrier given) defers every archive barrier until after the
+      // lock is released and acknowledges only after them (smarty-dev#4383); a power loss in
+      // between is covered by the caller's off-lock unsynced marker. The legacy keyed (v1
+      // intent) protocol still syncs the archive line before the live append (smarty-dev#754).
+      if (intentPath) barrier = undefined;
       atomicWrite(this.#counterPath, sequence);
       let liveOffset = 0;
       try { liveOffset = fs.statSync(this.#eventsPath).size; }
@@ -1129,9 +1154,9 @@ export class MeshStore {
           ...(archive ? { archiveDir: archive.dir } : {}),
         } satisfies MeshDedupeIntent), { durable: true });
       }
-      const pending = archive?.begin({ event, line });
+      const pending = archive?.begin({ event, line }, barrier);
       // Test-only process-death fence: unlike an append exception, no rollback can run.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
+      if (pending) crashFence("PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN");
       try {
         if (batch) batch.appendStarted = true;
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
@@ -1140,10 +1165,10 @@ export class MeshStore {
         throw error;
       }
       // This distinct fence leaves the live event complete but the sidecar unconfirmed.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-      if (pending) archive!.commit(pending);
+      if (pending) crashFence("PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT");
+      if (pending) archive!.commit(pending, true, barrier);
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
-      if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+      if (receiptPath || pending) crashFence("PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND");
       if (receiptPath) {
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
@@ -1197,8 +1222,11 @@ export class MeshStore {
     const text = this.#readTextFile(intentPath);
     if (text === undefined) return undefined;
     const intent = this.#parseDedupeIntent(intentPath, text, key);
-    // An archive appeared (or this is an archive intent): the coupled locked protocol owns it.
-    if (intent.archiveDir !== undefined || fs.existsSync(path.join(this.root, "event-archive.json"))) {
+    // A v1 archive intent, any non-v2 intent beside an archive, or an archive whose reboot
+    // recovery has not run yet (its synced lines must go live before any intent is judged
+    // abandoned): the coupled locked protocol owns it (#archivedKeyedPublish routes there).
+    const archive = MeshArchive.fromRoot(this.root);
+    if ((intent.version !== 2 && (intent.archiveDir !== undefined || archive)) || archive?.rebootPending()) {
       throw new MeshArchiveRecoveryChanged();
     }
     // A legacy positional intent (older releases) keeps its direct read at the recorded offset.
@@ -1206,8 +1234,19 @@ export class MeshStore {
     const event = scan ? scan.event : this.#readEventAtIntent(intent);
     // Never treat a live owner's unappended reservation as abandoned: wait for it.
     if (!event && this.#intentOwnerLive(intent)) throw new MeshArchiveRecoveryChanged();
+    if (!event && intent.archiveDir !== undefined) {
+      // A dead owner's archive hint without a live line: archive evidence decides, exactly
+      // as for a v1 intent (restored and receipted, or provably absent and discarded). Rare
+      // recovery work; it keeps the original locked protocol and its barriers.
+      return this.#withLock(() => {
+        input.signal?.throwIfAborted();
+        if (this.#readTextFile(intentPath) !== text) throw new MeshArchiveRecoveryChanged();
+        return this.#settleDedupeIntent(intentPath, key, MeshArchive.fromRoot(this.root));
+      });
+    }
     const receiptPath = this.#dedupePath(key, ".json");
     const temporary = `${receiptPath}.${process.pid}.${randomUUID()}.prepared`;
+    const barrier = newArchiveBarrier();
     try {
       if (event) {
         await this.#confirmEventsAfterRelease();
@@ -1216,7 +1255,19 @@ export class MeshStore {
       const committed = await this.#withLock(() => {
         input.signal?.throwIfAborted();
         if (fs.existsSync(receiptPath) || this.#readTextFile(intentPath) !== text) return false;
-        if (event) { renameAtomic(temporary, receiptPath); return true; }
+        const current = MeshArchive.fromRoot(this.root);
+        if (current?.dir !== archive?.dir || current?.rebootPending()) return false;
+        if (event) {
+          if (current) {
+            // As the locked settle does: the live line proves its reserved archive line
+            // published. Metadata only; its barriers run after release.
+            current.confirmLive(event.sequence, event.id, barrier);
+            const pending = current.pending();
+            if (pending?.id === event.id && pending.sequence === event.sequence) current.commit(pending, false, barrier);
+          }
+          renameAtomic(temporary, receiptPath);
+          return true;
+        }
         // Abandonment must also cover the suffix appended since the off-lock scan. Reads only.
         const rest = scan ? this.#scanIntentEvent(intent, scan) : { event: this.#readEventAtIntent(intent), rewritten: false };
         if (rest.event || rest.rewritten || this.#intentOwnerLive(intent)) return false;
@@ -1224,8 +1275,13 @@ export class MeshStore {
         return true;
       });
       if (!committed) throw new MeshArchiveRecoveryChanged();
-      if (event) return this.#confirmReceiptAfterRelease(input, event);
+      if (event) {
+        runArchiveBarrier(barrier);
+        return this.#confirmReceiptAfterRelease(input, event);
+      }
       syncPathNamespace(path.dirname(intentPath));
+      // An abandoned attempt may also have left stage files (and an unsynced marker).
+      this.#sweepStages(true);
       return undefined;
     } finally { fs.rmSync(temporary, { force: true }); }
   }
@@ -1264,19 +1320,35 @@ export class MeshStore {
     const owner = intent.owner;
     if (!owner || typeof owner !== "object" || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 ||
       typeof owner.token !== "string" || typeof owner.at !== "number") return false;
-    if (owner.pid === process.pid) return liveIntentOwners.has(owner.token);
-    if (Date.now() - owner.at > Math.max(INTENT_OWNER_STALE_MS, 30 * this.#lockTimeoutMs)) return false;
-    try { process.kill(owner.pid, 0); return true; }
-    catch (error) { return errorCode(error) === "EPERM"; }
+    const stale = Date.now() - owner.at > Math.max(INTENT_OWNER_STALE_MS, 30 * this.#lockTimeoutMs);
+    if (owner.pid === process.pid) {
+      // This isolate knows its own attempts exactly (any of its store instances). Another
+      // isolate in this PID (a worker or a second module copy), or an owner record without a
+      // store token, is unknown here: preserve it like a live foreign owner, up to the age bound.
+      if (typeof owner.store === "string" && owner.store.startsWith(`${ISOLATE_TOKEN}.`)) {
+        return liveIntentOwners.has(`${owner.store}:${owner.token}`);
+      }
+      return !stale;
+    }
+    if (stale) return false;
+    return pidAlive(owner.pid);
   }
 
-  /** Archive-configured stores, and a pending v1 archive intent, keep the one-lock protocol:
-   * the archive's durable index reservation is a barrier under the lock by design
-   * (smarty-dev#754). A malformed intent also takes it, which reports the error. */
+  /** The one-lock (v1 intent) protocol remains only for a pending v1/positional intent beside
+   * an archive, an invalid archive configuration, or the first publish after a reboot (archive
+   * promotion must precede any intent decision). A malformed intent also takes it, which
+   * reports the error. Ordinary archive-configured keyed publishes use the two-hold v2
+   * protocol with deferred archive barriers (smarty-dev#4383). */
   #archivedKeyedPublish(intentPath: string): boolean {
-    if (fs.existsSync(path.join(this.root, "event-archive.json"))) return true;
-    try { return (JSON.parse(fs.readFileSync(intentPath, "utf8")) as { archiveDir?: unknown }).archiveDir !== undefined; }
-    catch (error) { return errorCode(error) !== "ENOENT"; }
+    let archive: MeshArchive | undefined;
+    try { archive = MeshArchive.fromRoot(this.root); }
+    catch { return true; } // The locked path reports an invalid configuration.
+    let intent: { archiveDir?: unknown; version?: unknown } | undefined;
+    try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as typeof intent; }
+    catch (error) { if (errorCode(error) !== "ENOENT") return true; }
+    if (intent && intent.version !== 2 && (intent.archiveDir !== undefined || archive)) return true;
+    // Reboot promotion (once per boot) stays on the original locked recovery path.
+    return !!archive && archive.rebootPending();
   }
 
   /** Keyed publish without an archive (smarty-dev#4383). The durable intent is position
@@ -1304,23 +1376,33 @@ export class MeshStore {
     }
     const recovered = await this.#recoverLiveReceipt(input);
     if (recovered) return recovered;
+    // Archive-configured (the live fleet): the same two holds. The archive begin/commit runs
+    // in the second hold with every archive barrier deferred until after release.
+    const archive = MeshArchive.fromRoot(this.root);
+    const barrier = newArchiveBarrier();
+    let marker: string | undefined;
     // Everything but the sequence is fixed now; the payload hash covers it.
     const staged = this.#buildEvent(input, 0, Date.now());
     if (Buffer.byteLength(JSON.stringify({ ...staged, sequence: this.#readSequence() + 1 }), "utf8") > this.maxEventBytes) {
       throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
     // The attempt token marks this intent live until the attempt ends (P2-2).
-    const owner: MeshIntentOwner = { pid: process.pid, token: randomUUID(), at: Date.now() };
-    const intentText = JSON.stringify({ version: 2, dedupeKey: key, eventId: staged.id,
+    const owner: MeshIntentOwner = { pid: process.pid, token: randomUUID(), at: Date.now(), store: this.#ownerToken };
+    const ownerKey = `${owner.store}:${owner.token}`;
+    let intentText = JSON.stringify({ version: 2, dedupeKey: key, eventId: staged.id,
       payloadHash: eventDigest(staged), owner } satisfies MeshDedupeIntent);
     let appendStarted = false;
-    liveIntentOwners.add(owner.token);
+    liveIntentOwners.add(ownerKey);
     const intentStage = `${intentPath}.${process.pid}.${randomUUID()}.prepared`;
     const receiptStage = `${receiptPath}.${process.pid}.${randomUUID()}.prepared`;
     const ownsIntent = (): boolean => this.#readTextFile(intentPath) === intentText;
     try {
       writePreparedFile(intentStage, intentText);
-      if (process.env.PI_FABRIC_TEST_CRASH_AFTER_INTENT_PREPARE === "1") process.kill(process.pid, "SIGKILL");
+      crashFence("PI_FABRIC_TEST_CRASH_AFTER_INTENT_PREPARE");
+      if (archive) {
+        marker = archive.stageUnsynced(this.latestSequence());
+        crashFence("PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_STAGE");
+      }
       const installed = await this.#withLock((): MeshEvent | boolean => {
         input.signal?.throwIfAborted();
         const prior = this.#readDedupeReceipt(key, false);
@@ -1345,21 +1427,51 @@ export class MeshStore {
         // live log in THIS hold, so a compaction or replacement before it (new inode or
         // generation) is already reflected: nothing staged depends on the log position.
         if (!ownsIntent() || fs.existsSync(receiptPath)) return undefined;
+        const current = MeshArchive.fromRoot(this.root);
+        if (current?.dir !== archive?.dir) return undefined; // Configuration changed: retry.
         this.#repairEventLog();
+        // Same boot: settle a dead peer's pending archive line exactly as today (cut back, and
+        // re-archived by catch-up if it went live). A reboot not yet recovered throws Changed
+        // and the retry takes the locked reboot path.
+        if (current) this.#recoverArchive(current, false);
         const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
         const event: MeshEvent = { ...staged, sequence };
         const line = JSON.stringify(event);
         if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         atomicWrite(this.#counterPath, sequence);
+        if (current) {
+          // Archive hint, as v1 recovery uses it: a negative index for the slot, then the
+          // intent names the slot and archive, both before begin and by rename only. A process
+          // death keeps them (page cache); after a power loss reboot promotion runs first.
+          current.reserveLookup(sequence, barrier);
+          intentText = JSON.stringify({ ...JSON.parse(intentText) as MeshDedupeIntent, reservedSequence: sequence, archiveDir: current.dir });
+          writeFileAtomic(intentPath, intentText);
+          barrier.files.add(intentPath);
+          barrier.dirs.add(path.dirname(intentPath));
+        }
+        // Writes, index rename and PENDING only: the archive barriers run after release.
+        const pending = current?.begin({ event, line }, barrier);
+        if (pending) crashFence("PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN");
         appendStarted = true;
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        try { fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 }); }
+        catch (error) {
+          if (pending) current!.rollback(pending);
+          throw error;
+        }
+        if (pending) {
+          crashFence("PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT");
+          current!.commit(pending, true, barrier);
+        }
         // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
-        if (process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+        crashFence("PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND");
         return event;
       });
       if (!event) throw new MeshArchiveRecoveryChanged();
-      // No receipt before the grouped data barrier; a failed barrier fails the publish.
+      crashFence("PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_BARRIER");
+      // No receipt before the grouped barriers: the archive line, index and names, then the
+      // live log. A failed barrier fails the publish; its intent stays for recovery.
+      runArchiveBarrier(barrier);
       await this.#confirmEventsAfterRelease();
       writePreparedFile(receiptStage, JSON.stringify(event));
       // This key has committed exactly this identity. A recovery writer may
@@ -1367,9 +1479,12 @@ export class MeshStore {
       renameAtomic(receiptStage, receiptPath);
       syncPathNamespace(receiptPath);
       if (ownsIntent()) this.#removeDedupeIntent(intentPath);
+      if (marker) { archive!.clearUnsynced(marker); marker = undefined; }
       return event;
     } finally {
-      liveIntentOwners.delete(owner.token);
+      liveIntentOwners.delete(ownerKey);
+      // Nothing appended: this attempt's unsynced marker covers nothing.
+      if (marker && !appendStarted) { try { archive!.clearUnsynced(marker); } catch { /* swept later */ } }
       // A failed attempt that never began its append withdraws its own reservation,
       // so peers need not wait for its age bound. Best effort: recovery covers the rest.
       if (!appendStarted) { try { if (ownsIntent()) fs.rmSync(intentPath, { force: true }); } catch { /* recovery */ } }
@@ -1387,8 +1502,7 @@ export class MeshStore {
     // a racing receipt or recovery): peer appends never void its intent.
     for (let conflicts = 0; ; conflicts++) {
       try {
-        event = input.dedupeKey ? await this.#publishKeyed(input)
-          : await this.#withLock(this.#preparePublish(input));
+        event = input.dedupeKey ? await this.#publishKeyed(input) : await this.#publishUnkeyed(input);
         break;
       } catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
@@ -1400,9 +1514,77 @@ export class MeshStore {
     // Once append has committed, a compaction/barrier failure must NEVER retry
     // an unkeyed publication and accidentally append it a second time.
     if (input.durable && !input.dedupeKey) await this.#confirmEventsAfterRelease();
-    // Committed: compaction is best effort and runs after this publish returns.
+    // Committed: compaction and stage sweeping are best effort, after this publish returns.
     this.#scheduleCompaction();
     return event;
+  }
+
+  /** The archive (if any) of an unkeyed publication or batch, its off-lock unsynced marker
+   * and its deferred barrier. Without an archive there is nothing to defer. */
+  #deferArchive(): { archive: MeshArchive; marker: string } | undefined {
+    let archive: MeshArchive | undefined;
+    try { archive = MeshArchive.fromRoot(this.root); }
+    catch { return undefined; } // The locked path reports an invalid configuration.
+    if (!archive) return undefined;
+    const marker = archive.stageUnsynced(this.latestSequence());
+    crashFence("PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_STAGE");
+    return { archive, marker };
+  }
+
+  /** After release: the grouped archive barrier (data, index/digest files, then names). Only
+   * then is the marker withdrawn; a failed barrier keeps it for reboot recovery. */
+  #finishArchive(barrier: MeshArchiveBarrier, deferred: { archive: MeshArchive; marker: string } | undefined): void {
+    crashFence("PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_BARRIER");
+    // Also runs when an archive appeared between staging and the hold (no marker then).
+    runArchiveBarrier(barrier);
+    deferred?.archive.clearUnsynced(deferred.marker);
+  }
+
+  /** Unkeyed publish: ONE hold with no fsync (smarty-dev#4383). Archive-configured, the line,
+   * index, PENDING, live append and HEAD are written under the lock exactly as before, but
+   * the archive's barriers run after release, before this publish returns. */
+  async #publishUnkeyed(input: MeshPublishInput): Promise<MeshEvent> {
+    const barrier = newArchiveBarrier();
+    const commit = this.#preparePublish(input, undefined, false, barrier);
+    const deferred = this.#deferArchive();
+    let committed = false;
+    try {
+      const event = await this.#withLock(() => {
+        const event = commit();
+        committed = true;
+        return event;
+      });
+      this.#finishArchive(barrier, deferred);
+      return event;
+    } finally {
+      if (deferred && !committed) { try { deferred.archive.clearUnsynced(deferred.marker); } catch { /* swept later */ } }
+    }
+  }
+
+  /** Best effort, at most once a minute per root: remove stage files of attempts whose
+   * process is gone (or that are far over age), and same-boot unsynced markers of dead
+   * processes. Repeated deaths cannot accumulate .prepared/.retained stages. */
+  #sweepStages(force = false): void {
+    const last = stageSweeps.get(this.root) ?? 0;
+    if (!force && Date.now() - last < STAGE_SWEEP_INTERVAL_MS) return;
+    stageSweeps.set(this.root, Date.now());
+    const staleMs = Math.max(INTENT_OWNER_STALE_MS, 30 * this.#lockTimeoutMs);
+    for (const directory of [this.root, path.join(this.root, "event-receipts")]) {
+      let names: string[];
+      try { names = fs.readdirSync(directory); } catch { continue; }
+      for (const name of names) {
+        const match = STAGE_NAME.exec(name);
+        if (!match) continue;
+        const pid = Number(match[1]);
+        const file = path.join(directory, name);
+        try {
+          if (pid === process.pid && Date.now() - fs.statSync(file).mtimeMs <= staleMs) continue;
+          if (pid !== process.pid && pidAlive(pid) && Date.now() - fs.statSync(file).mtimeMs <= staleMs) continue;
+          fs.rmSync(file, { force: true });
+        } catch { /* raced: its owner finished or another sweeper removed it */ }
+      }
+    }
+    try { MeshArchive.fromRoot(this.root)?.sweepUnsynced(pidAlive); } catch { /* best effort */ }
   }
 
   /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
@@ -1413,16 +1595,26 @@ export class MeshStore {
   async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
+    // A keyed event takes the keyed protocol (staged v2 intent, two holds, no fsync under
+    // either): a keyed head commits alone, and an unkeyed prefix stops before the first key.
+    // The contract already returns a committed prefix for the caller to continue from.
+    const keyed = inputs.findIndex(input => input.dedupeKey);
+    if (keyed === 0) return [await this.publish({ ...inputs[0]!, durable: true })];
+    if (keyed > 0) inputs = inputs.slice(0, keyed);
     const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
     let events: MeshEvent[];
+    const barrier = newArchiveBarrier();
+    let deferred: { archive: MeshArchive; marker: string } | undefined;
     for (;;) {
       try {
         const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number } }> = [];
         for (const input of inputs) {
           const outcome = { appendStarted: false, bytes: 0 };
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome), outcome }); }
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, false, barrier), outcome }); }
           catch (error) { if (!prepared.length) throw error; break; }
         }
+        // One off-lock unsynced marker covers the whole batch.
+        deferred ??= this.#deferArchive();
         events = await this.#withLock(() => {
           const started = performance.now();
           const events: MeshEvent[] = [];
@@ -1444,10 +1636,18 @@ export class MeshStore {
         });
         break;
       } catch (error) {
-        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) {
+          // Nothing of this batch committed unless append began (then the marker must stay).
+          if (deferred && !(error instanceof Error && /outcome is uncertain/.test(error.message))) {
+            try { deferred.archive.clearUnsynced(deferred.marker); } catch { /* swept later */ }
+          }
+          throw error;
+        }
         await delay(0);
       }
     }
+    // ONE grouped barrier per batch, after release: archive, then the live log.
+    this.#finishArchive(barrier, deferred);
     await this.#confirmEventsAfterRelease();
     // Committed: never fail or delay the batch; unkeyed retries would duplicate it.
     this.#scheduleCompaction();
@@ -1542,6 +1742,11 @@ export class MeshStore {
         atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
       }
       archive.recovered(last, recovery.promote);
+      // Deferred archive barriers (smarty-dev#4383): a power loss may have kept a live line
+      // whose archive line was never synced. Markers of the earlier boot bound that window;
+      // restore exactly the missing lines from the live log (synced here, once per boot).
+      const unsynced = archive.previousBootUnsynced();
+      if (unsynced) archive.restoreUnsynced(this.#liveEntriesAfter(unsynced.since), unsynced.files);
     }
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
@@ -2737,6 +2942,8 @@ export class MeshStore {
   #scheduleCompaction(): void {
     try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
     catch { return; }
+    // Recovery housekeeping rides on compaction: dead attempts' stage files and markers.
+    this.#sweepStages();
     const backoff = compactionBackoff.get(this.#eventsPath);
     if (backoff && Date.now() < backoff.until) return;
     void this.#startCompaction();

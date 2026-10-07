@@ -256,15 +256,17 @@ describe("mesh event archive", () => {
     expect(sequences(file(today(), "ops.blocked"))).toEqual([3]);
   });
 
-  it("cuts a written but unsynced event back out when its sync fails (review F2)", async () => {
+  it("fails the publish when its post-release archive sync fails, never cutting back a committed line (smarty-dev#4383)", async () => {
     const { store, file, live, sequences } = setup();
     await store.publish({ topic: "ops.owner", from, text: "one" });
     vi.spyOn(fs, "fdatasyncSync").mockImplementationOnce(() => { throw Object.assign(new Error("EIO"), { code: "EIO" }); });
     await expect(store.publish({ topic: "ops.owner", from, text: "unsynced" })).rejects.toThrow("EIO");
-    expect(sequences(file(today(), "ops.owner"))).toEqual([1]);
+    // Committed under the lock before the barrier: the line stays in both logs (a later
+    // publisher may already follow it), like a failed post-commit live barrier.
+    expect(sequences(file(today(), "ops.owner"))).toEqual([1, 2]);
     await store.publish({ topic: "ops.owner", from, text: "three" });
-    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 3]);
-    expect(sequences(file(today(), "ops.owner"))).toEqual([1, 3]);
+    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3]);
+    expect(sequences(file(today(), "ops.owner"))).toEqual([1, 2, 3]);
   });
 
   it("cuts the event back out of the archive when its live append fails", async () => {
@@ -451,14 +453,18 @@ describe("mesh event archive", () => {
     expect(sequences(target)).toEqual([1, 3]);
   });
 
-  it("syncs the archive line before the event goes live", async () => {
+  it("syncs the archive line after the lock is released and before the publish returns (smarty-dev#4383)", async () => {
     const { store, root } = setup();
-    const sync = vi.spyOn(fs, "fdatasyncSync");
+    const held: boolean[] = [];
+    const data = fs.fdatasyncSync.bind(fs);
+    const sync = vi.spyOn(fs, "fdatasyncSync").mockImplementation(fd => { held.push(fs.existsSync(path.join(root, ".lock"))); data(fd); });
     const append = vi.spyOn(fs, "appendFileSync");
     await store.publish({ topic: "ops.owner", from, text: "one" });
     const liveAppend = append.mock.calls.findIndex(([target]) => target === path.join(root, "events.jsonl"));
     expect(liveAppend).toBeGreaterThanOrEqual(0);
-    expect(sync.mock.invocationCallOrder[0]).toBeLessThan(append.mock.invocationCallOrder[liveAppend]!);
+    expect(sync).toHaveBeenCalled();
+    expect(sync.mock.invocationCallOrder[0]).toBeGreaterThan(append.mock.invocationCallOrder[liveAppend]!);
+    expect(held.filter(Boolean)).toEqual([]);
   });
 
   const syncedDirectories = () => {

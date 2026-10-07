@@ -99,6 +99,126 @@ describe("#4383 bounded registry holds", () => {
     await expect(store.update(() => undefined)).resolves.toBeUndefined();
   }, 15_000);
 
+  // One injected monotonic clock (real time plus a test-controlled skew) drives the
+  // shared update deadline; the fence wait itself still uses real time.
+  const skewed = (actorRoot: string) => {
+    const clock = { skew: 0, start: undefined as number | undefined };
+    const store = new ActorRegistryStore(actorRoot, { now: () => {
+      const now = performance.now() + clock.skew;
+      clock.start ??= now; // update() reads the clock first to fix its one deadline
+      return now;
+    } });
+    const now = () => performance.now() + clock.skew;
+    const deadline = () => clock.start! + 5_000;
+    const commits: number[] = [];
+    const prepare = store.prepare.bind(store);
+    vi.spyOn(store, "prepare").mockImplementation((...args) => {
+      const prepared = prepare(...args);
+      return { ...prepared, commit: () => { commits.push(now()); prepared.commit(); } };
+    });
+    return { store, clock, now, deadline, commits };
+  };
+
+  it("#577 a veto persisting until the budget is nearly gone throws at the deadline and never commits after it", async () => {
+    const { actorRoot } = fixture();
+    const before = fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8");
+    const { store, clock, now, deadline, commits } = skewed(actorRoot);
+    const validations: number[] = [];
+    const update = store.update(current => ({
+      actors: current.map((row, at) => at === 0 ? { ...row, late: true } : row), value: "committed",
+      validate: () => {
+        const at = now();
+        validations.push(at);
+        // After four vetoes leave 2 ms: shorter than any jittered backoff. The veto
+        // clears only once the deadline has passed, so a late attempt WOULD commit.
+        if (validations.length === 4) clock.skew += deadline() - at - 2;
+        return at >= deadline();
+      },
+    }));
+    await expect(update).rejects.toBeInstanceOf(ActorRegistryUpdateVetoedError);
+    const thrown = now();
+    expect(validations.length).toBeGreaterThanOrEqual(4);
+    expect(validations.every(at => at < deadline())).toBe(true);
+    expect(commits).toEqual([]);
+    expect(thrown).toBeGreaterThanOrEqual(deadline());
+    expect(thrown - deadline()).toBeLessThan(1_000); // at the deadline, not a fresh 5 s later
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(before);
+    expect(store.records()[0]?.late).toBeUndefined();
+    expect(fs.readdirSync(actorRoot).filter(file => file.endsWith(".prepared"))).toEqual([]);
+    expect(fs.existsSync(path.join(actorRoot, "actors.json.lock"))).toBe(false);
+  }, 15_000);
+
+  it("#577 a fence acquired after the deadline aborts before select/validate and never commits", async () => {
+    const { actorRoot } = fixture();
+    const before = fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8");
+    const { store, clock, now, deadline, commits } = skewed(actorRoot);
+    const other = new ActorRegistryStore(actorRoot);
+    const acquire = store.withLock.bind(store);
+    const timeouts: Array<number | undefined> = [];
+    let calls = 0, waited = false;
+    vi.spyOn(store, "withLock").mockImplementation(async (operation, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      if (++calls !== 3) return acquire(operation, timeoutMs);
+      // First backoff retry: a foreign holder keeps the fence while the shared
+      // deadline passes, then releases it; our wait (real time) still acquires.
+      let entered!: () => void;
+      const inside = new Promise<void>(resolve => { entered = resolve; });
+      const foreign = other.withLock(async () => {
+        entered();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        clock.skew += 10_000;
+        waited = true;
+      });
+      await inside;
+      const [, value] = await Promise.all([foreign, acquire(operation, timeoutMs)]);
+      return value;
+    });
+    let selections = 0;
+    const validations: number[] = [];
+    const update = store.update(current => {
+      selections++;
+      return { actors: current.map((row, at) => at === 0 ? { ...row, late: true } : row), value: "committed",
+        validate: () => { validations.push(now()); return now() >= deadline(); } };
+    });
+    await expect(update).rejects.toBeInstanceOf(ActorRegistryUpdateVetoedError);
+    expect(waited).toBe(true);
+    expect(calls).toBe(3);
+    // Optimistic + two locked selections; nothing is selected after the late acquisition.
+    expect(selections).toBe(3);
+    expect(validations).toHaveLength(3);
+    expect(validations.every(at => at < deadline())).toBe(true);
+    expect(commits).toEqual([]);
+    // Retries wait only for the remaining budget, never a fresh 5 s.
+    expect(timeouts.every(timeout => timeout !== undefined && timeout <= 5_000)).toBe(true);
+    expect(timeouts[2]!).toBeLessThan(timeouts[0]!);
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")).toBe(before);
+    expect(fs.readdirSync(actorRoot).filter(file => file.endsWith(".prepared"))).toEqual([]);
+    expect(fs.existsSync(path.join(actorRoot, "actors.json.lock"))).toBe(false);
+    // The released fence is usable: a later update commits normally.
+    await expect(other.update(current => ({ actors: current.map((row, at) => at === 1 ? { ...row, after: true } : row),
+      value: "after" }))).resolves.toBe("after");
+  }, 15_000);
+
+  it("#577 the happy path is unchanged: one selection, one fenced commit within the budget", async () => {
+    const { actorRoot } = fixture();
+    const { store, deadline, commits } = skewed(actorRoot);
+    const acquire = store.withLock.bind(store);
+    const timeouts: Array<number | undefined> = [];
+    vi.spyOn(store, "withLock").mockImplementation((operation, timeoutMs) => { timeouts.push(timeoutMs); return acquire(operation, timeoutMs); });
+    let selections = 0;
+    await expect(store.update(current => {
+      selections++;
+      return { actors: current.map((row, at) => at === 0 ? { ...row, happy: true } : row), value: "committed", validate: () => true };
+    })).resolves.toBe("committed");
+    expect(selections).toBe(1);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]!).toBeGreaterThan(4_000);
+    expect(timeouts[0]!).toBeLessThanOrEqual(5_000);
+    expect(commits).toHaveLength(1);
+    expect(commits[0]!).toBeLessThan(deadline());
+    expect(store.records()[0]?.happy).toBe(true);
+  });
+
   it("#816 an awaited actor save rejects instead of resolving when the registry vetoes it", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-veto-save-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);

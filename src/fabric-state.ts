@@ -53,6 +53,15 @@ import type { FabricLoadedFileIdentity } from "./build-identity.js";
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
+/**
+ * Proof that one `ensure()` call bound to a still-live session lifecycle.
+ * Shutdown, session replacement, and a cwd rebootstrap retire it, including one
+ * that lands while `ensure()` itself is pending (smarty-dev#5962).
+ */
+export interface FabricLifecycleLease {
+  current(): boolean;
+}
+
 export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
@@ -238,10 +247,18 @@ export class FabricState {
     await this.#activate(context, true);
   }
 
-  async ensure(context: ExtensionContext): Promise<void> {
+  async ensure(context: ExtensionContext): Promise<FabricLifecycleLease> {
     this.#assertOpen();
-    if (!this.#config || this.#cwd !== context.cwd) await this.bootstrap(context);
+    // Sample the lifecycle before the first await; only this call's own
+    // bootstrap may advance it. bootstrap() claims its generation synchronously.
+    let generation = this.#generation;
+    if (!this.#config || this.#cwd !== context.cwd) {
+      const booting = this.bootstrap(context);
+      generation = this.#generation;
+      await booting;
+    }
     await this.#activate(context, false);
+    return { current: () => generation === this.#generation && !this.#shutDown };
   }
 
   shouldEagerlyActivate(context: ExtensionContext): boolean {

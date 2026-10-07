@@ -60,9 +60,12 @@ export async function openFabricSettings(
   context: ExtensionContext,
   deps: FabricSettingsDeps,
 ): Promise<void> {
-  await deps.state.ensure(context);
+  // The lease spans ensure(): a shutdown or replacement that resets approvals
+  // while ensure() is pending retires this flow before it touches `context`.
+  const lease = await deps.state.ensure(context);
+  if (!lease.current()) return;
   const generation = deps.state.sessionApprovals?.generation;
-  const live = (): boolean => generation === deps.state.sessionApprovals?.generation;
+  const live = (): boolean => lease.current() && generation === deps.state.sessionApprovals?.generation;
 
   const agentDir = resolveAgentDir();
   const projectTrusted = context.isProjectTrusted();
@@ -188,7 +191,8 @@ export async function openFabricSettings(
   }
 
   if (!live()) return;
-  if (dirty) {    if (deps.state.kernelReloadRequired) {
+  if (dirty) {
+    if (deps.state.kernelReloadRequired) {
       if (deps.reloadResources) {
         context.ui.notify("Kernel saved. Reloading Pi to switch execution and skill resources together.", "info");
         await deps.reloadResources();

@@ -842,6 +842,12 @@ not the execution/restart `attempts` counter. Callerless work (mesh, host, and t
 with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
 its pending activation. After three preparation requeues, further failures report
 `failing-preparation` and raise one owner alarm until a successful activation clears it.
+A preparation that hangs without failing (outside these deadlines) raises no failure alarm,
+so the resident host's maintenance tick reports any actor in `preparing` for longer than the
+host-only `agents.stuckPreparingMs` (default ten minutes) once per episode to its root Main:
+`actor NAME stuck in preparing for N min (since T); its queued events are waiting.`
+The episode ends when the actor leaves preparing; each notice appends a line to
+`<mesh>/metrics/stuck-preparing.jsonl` (smarty-dev#6337).
 A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
 does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
 the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a

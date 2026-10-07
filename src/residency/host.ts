@@ -32,6 +32,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/stuck-preparing.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -226,6 +227,7 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #stuckPreparingCheckedAt = 0;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
@@ -1030,8 +1032,19 @@ export class ResidentHost {
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() ||
-        (!retentionV2Enabled() && !this.#requestRetention.due(now))) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
+    // smarty-dev#6337: a hung preparation never fails, so the failure-streak notice
+    // cannot fire. Check on this tick, at most every 10 s (or the threshold, if shorter).
+    const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
+    if (now - this.#stuckPreparingCheckedAt >= Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)) {
+      this.#stuckPreparingCheckedAt = now;
+      try {
+        this.actors.reportStuckPreparing(stuckPreparingMs, now);
+      } catch {
+        // Best effort: the next tick retries; retention below must still run.
+      }
+    }
+    if (!retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.

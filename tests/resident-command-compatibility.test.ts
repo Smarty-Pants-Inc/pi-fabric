@@ -217,6 +217,9 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       const beforeRegistry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
       const actor = beforeRegistry.actors[0];
       const actorDir = path.join(config.actorRoot, actor.id);
+      const headFile = path.join(actorDir, "registry", "messages-head.json");
+      const historyHead = () => fs.existsSync(headFile) ? fs.readFileSync(headFile, "utf8") : undefined;
+      const beforeHistoryHead = historyHead();
       const queues = () => !fs.existsSync(actorDir) ? [] : fs.readdirSync(actorDir).filter(file => file.startsWith("queue-")).flatMap(file =>
         JSON.parse(fs.readFileSync(path.join(actorDir, file), "utf8")).items);
       const beforeItems = queues();
@@ -241,9 +244,14 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       expect.soft(registry.actors).toHaveLength(beforeRegistry.actors.length);
       // Recovery legitimately updates running status, timestamps and run history,
       // but must not rewrite identity or any of the actor's persistent settings.
-      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId,
-        messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      // B70 predates the external message journal: its rewrite drops the registry's
+      // messageHistory reference, which the current release re-reads from the
+      // untouched messages-head.json (a legacy rewrite never clears history).
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages,
+        messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
       expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
+      if (beforeRegistry.actors[0]?.messageHistory) expect.soft(beforeHistoryHead).toBe(JSON.stringify(beforeRegistry.actors[0].messageHistory));
+      expect.soft(historyHead()).toBe(beforeHistoryHead);
       expect.soft(registry.actors[0]?.removal).toBeUndefined();
       const afterItems = queues();
       // B70 retries recovered deliveries and predates bindingVersion. Preserve

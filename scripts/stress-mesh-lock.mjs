@@ -56,7 +56,7 @@ if (args.worker === 'load') {
     const completion = new Promise(done => child.once('exit', (code, signal) => done({ worker, code, signal })));
     completions.push(completion);
     child.on('error', reject);
-    child.on('message', value => { if (value === 'ready') resolve(child); else reports.push(value); });
+    child.on('message', value => { if (value === 'ready') resolve(child); else reports.push({ ...value, legacy: module !== args.module }); });
     child.once('exit', () => reject(new Error('Child exited before ready')));
   });
   const started = performance.now();
@@ -80,8 +80,28 @@ if (args.worker === 'load') {
     if (typeof meshLockQueueDirectory !== 'function') throw new Error('Snapshot must export meshLockQueueDirectory (or supply --queueModule)');
     const queue = meshLockQueueDirectory(root);
     const remainingTickets = fs.existsSync(queue) ? fs.readdirSync(queue).length : 0;
-    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock')) || fs.readdirSync(root).length !== 0) throw new Error('Leaked lock/tickets or mesh-root sidecars');
-    console.log(JSON.stringify({ n, rounds, load, cpuMs, legacyN, budgetMs: 7000, acquisitions: reports.reduce((sum, r) => sum + r.waits.length, 0), timeouts: reports.reduce((sum, r) => sum + r.timeouts, 0), waitMs: summarize(reports.flatMap(r => r.waits)), timeoutWaitMs: summarize(reports.flatMap(r => r.timeoutWaits)), holdMs: summarize(reports.flatMap(r => r.holds)), elapsedMs: Math.round(performance.now() - started), mutualExclusion: true, remainingTickets }, null, 2));
+    // lock-stats/ is the intended per-process lock diagnostics sidecar (smarty-dev#6477 L8). Every
+    // current contender's file must count exactly its own acquisitions; nothing else may remain.
+    const statsDir = path.join(root, 'lock-stats');
+    const lockStats = { files: 0, acquisitions: 0, timeouts: 0, holdMs: 0 };
+    for (const name of fs.existsSync(statsDir) ? fs.readdirSync(statsDir) : []) {
+      if (!name.endsWith('.json')) throw new Error(`Leaked lock-stats entry ${name}`);
+      lockStats.files++;
+      for (const { classes } of JSON.parse(fs.readFileSync(path.join(statsDir, name), 'utf8')).minutes) {
+        for (const bucket of Object.values(classes)) {
+          lockStats.acquisitions += bucket.n;
+          lockStats.timeouts += bucket.timeouts;
+          lockStats.holdMs += bucket.holdMs;
+        }
+      }
+    }
+    lockStats.holdMs = Math.round(lockStats.holdMs * 100) / 100;
+    const current = reports.filter(report => !report.legacy);
+    if (!/^(?:0|off|false|no)$/i.test(process.env.PI_FABRIC_LOCK_STATS ?? '') && (lockStats.files !== current.length ||
+      lockStats.acquisitions !== current.reduce((sum, r) => sum + r.waits.length, 0) ||
+      lockStats.timeouts !== current.reduce((sum, r) => sum + r.timeouts, 0))) throw new Error(`Lock stats disagree: ${JSON.stringify(lockStats)}`);
+    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock')) || fs.readdirSync(root).some(name => name !== 'lock-stats')) throw new Error('Leaked lock/tickets or mesh-root sidecars');
+    console.log(JSON.stringify({ n, rounds, load, cpuMs, legacyN, budgetMs: 7000, acquisitions: reports.reduce((sum, r) => sum + r.waits.length, 0), timeouts: reports.reduce((sum, r) => sum + r.timeouts, 0), waitMs: summarize(reports.flatMap(r => r.waits)), timeoutWaitMs: summarize(reports.flatMap(r => r.timeoutWaits)), holdMs: summarize(reports.flatMap(r => r.holds)), elapsedMs: Math.round(performance.now() - started), mutualExclusion: true, remainingTickets, lockStats }, null, 2));
   } finally {
     clearTimeout(timer);
     for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');

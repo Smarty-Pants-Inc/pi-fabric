@@ -25,6 +25,8 @@ const repo = process.cwd();
 const sentinel = process.env.FLEET_ISOLATION_SENTINEL;
 const entry = process.env.FLEET_ISOLATION_ENTRY;
 const testControls = JSON.parse(process.env.FLEET_ISOLATION_TEST_CONTROLS);
+// Fixed test-environment opt-outs, not fleet authority (lock diagnostics, smarty-dev#6477 L8).
+const fixed = { PI_FABRIC_LOCK_STATS: "0" };
 const baseline = fs.readFileSync(path.join(sentinel, "agent", "fabric.json"), "utf8");
 const module = await import(pathToFileURL(entry).href);
 // These selectors grant WRITE locations; semantic project attribution is deliberately absent.
@@ -44,8 +46,8 @@ const assertIsolated = () => {
   assert.equal(process.env.PI_FABRIC_PROJECT, undefined, "inherited semantic project must be scrubbed, not replaced");
   const safe = new Set(keys.filter(key => key.startsWith("PI_FABRIC_")));
   // Test controls are separate from the private writable roots, not fleet authority.
-  for (const [key, value] of Object.entries(testControls)) assert.equal(process.env[key], value);
-  assert.deepEqual(Object.keys(process.env).filter(key => key.toUpperCase().startsWith("PI_FABRIC_") && !safe.has(key) && !Object.hasOwn(testControls, key)), []);
+  for (const [key, value] of Object.entries({ ...testControls, ...fixed })) assert.equal(process.env[key], value);
+  assert.deepEqual(Object.keys(process.env).filter(key => key.toUpperCase().startsWith("PI_FABRIC_") && !safe.has(key) && !Object.hasOwn(testControls, key) && !Object.hasOwn(fixed, key)), []);
   for (const key of ["SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID"])
     assert.equal(process.env[key], undefined, key + " inherited fleet authority");
   return root;
@@ -55,8 +57,8 @@ const assertChildSnapshot = () => {
   assert.equal(child.status, 0, child.stderr);
   const inherited = JSON.parse(child.stdout);
   for (const key of keys) assert.equal(inherited[key], process.env[key]);
-  for (const [key, value] of Object.entries(testControls)) assert.equal(inherited[key], value);
-  assert.deepEqual(Object.keys(inherited).sort(), [...keys, ...Object.keys(testControls)].sort());
+  for (const [key, value] of Object.entries({ ...testControls, ...fixed })) assert.equal(inherited[key], value);
+  assert.deepEqual(Object.keys(inherited).sort(), [...keys, ...Object.keys(testControls), ...Object.keys(fixed)].sort());
 };
 const configRoot = assertIsolated(); // MUST fail on HEAD before any real runtime writes.
 assertChildSnapshot();

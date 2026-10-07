@@ -124,8 +124,11 @@ export interface BridgeSide {
   holds?(id: string): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
   mirrored?(id: string): boolean;
-  /** Replace this side's mirror of the peer's presence. */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
+  /**
+   * Replace this side's mirror of the peer's presence. `observedAt` (this side's clock, never a
+   * peer's) is when the snapshot was requested; liveness is judged then, not at commit.
+   */
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
   bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
@@ -392,9 +395,9 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> {
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#mirror(presence, false));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -430,9 +433,13 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean): Promise<void> {
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
+    // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
+    // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
+    // root of such a spoke on every pass (smarty-dev#6477). Never later than now.
+    const liveAt = Math.min(now, observedAt ?? now);
     const leases: Array<{ id: string; rootId: string; identityId: string; expiresAt: number }> = [];
     const removed: Array<{ key: string; id: string }> = [];
     await this.store.writeBatch({
@@ -456,7 +463,7 @@ export class StoreBridgeSide implements BridgeSide {
           // not until the source's absolute expiry. Even a final observation just before
           // the source expires can therefore extend a stopped host by at most one TTL.
           const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
-          if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
+          if (expiresAt <= liveAt || !Number.isFinite(ttl) || ttl <= 0) continue;
           const until = now + ttl;
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
@@ -978,7 +985,7 @@ export class MeshBridge {
     const outbound = boundPresence(local);
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
+    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];

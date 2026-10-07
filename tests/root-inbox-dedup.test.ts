@@ -400,6 +400,52 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
 });
 
 describe("addressed-shadow age horizon (smarty-dev#3036)", () => {
+  it.each(["answer", "blocker", "handoff", "completion"])("delivers an addressed %s three hours late with its age", async (kind) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const event = await h.mesh.publish({ topic: "fleet.work.tasks", kind, to: me.id,
+      from: { id: "fleet-tool:smarty-task-ryzen2", name: "smarty-task-ryzen2", kind: "agent" },
+      text: "BLOCKED lane result", data: { key: "ryzen2-task-lane-1" } });
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(e => e.id)).toEqual([event.id]);
+    expect(batch).not.toHaveProperty("skippedStale");
+    const prefix = `(delivered late: created ${new Date(event.createdAt).toISOString()}, 3 h ago)`;
+    expect(rootInboxMessage(batch.events).content).toContain(`${prefix} BLOCKED lane result`);
+    // An unconfirmed injection remains recoverable, including through the pending reread.
+    const retry = await h.box().next(h.session());
+    expect(retry.events[0]?.text).toBe(`${prefix} BLOCKED lane result`);
+    expect(h.mesh.read({ after: 0, limit: 10 })[0]?.text).toBe("BLOCKED lane result");
+  });
+
+  it("does not deliver an old broadcast answer or progress shadow", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    await h.mesh.publish({ topic: "fleet.work.tasks", kind: "answer", from: peer, text: "broadcast" });
+    await h.mesh.publish({ topic: "fleet.work.tasks", kind: "progress", from: peer, to: me.id, text: "ping" });
+    h.advance(3 * HOUR);
+    expect(await inbox.next(h.session())).toMatchObject({ events: [], skippedStale: 1 });
+    expect(await inbox.wake(h.session(), () => true)).toBeUndefined();
+  });
+
+  it("remembers a late answer at delivery time and never repeats it across drains and reloads", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const packet = { topic: "fleet.work.tasks", kind: "answer", from: peer, to: me.id,
+      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2" } };
+    await h.mesh.publish(packet);
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events).toHaveLength(1);
+    h.entries.push({ type: "custom_message", timestamp: new Date(Date.now()).toISOString(), ...rootInboxMessage(batch.events) });
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const saved = h.mesh.get(inbox.key)!.value as { delivered: string[]; deliveredAt: number[] };
+    expect(saved.delivered.length).toBeGreaterThan(0);
+    expect(saved.deliveredAt.every(at => at === Date.now())).toBe(true);
+    h.entries.length = 0; // Persisted receipts suppress a new shadow even without session history.
+    await h.mesh.publish(packet); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+    h.advance(3 * HOUR); // Receipt trimming cannot rewind the committed cursor.
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
   it("skips a 20-hour backlog on the first drain in one summary, without idle wakes", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     for (let index = 0; index < 65; index++) await h.publish({ key: `old:${index}` });

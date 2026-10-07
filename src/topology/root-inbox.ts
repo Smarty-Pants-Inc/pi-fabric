@@ -15,7 +15,8 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  * survives a stop between the save and the session's write: delivery is at least once. A work
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
- * older than the configurable horizon are expired on first drain without buying model turns.
+ * older than the configurable horizon are expired on first drain without buying model turns,
+ * except answers, blockers, handoffs and completions: those remain actionable work.
  */
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
@@ -32,6 +33,8 @@ const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 const STEER_GRACE_MS = 60_000;
 /** Expire addressed work on first drain, including cursors saved by older runtimes. */
 const INBOX_HORIZON_MS = 2 * 60 * 60_000;
+const NEVER_EXPIRE_KINDS = new Set(["answer", "blocker", "handoff", "completion"]);
+const LATE_DELIVERY_HOUR_MS = 60 * 60_000;
 const inboxHorizonMs = (): number => {
   const text = process.env.PI_FABRIC_INBOX_HORIZON_MS;
   const value = Number(text);
@@ -170,7 +173,7 @@ export class RootInbox {
           if (!this.#steered(event, session)) return true;
           this.#remember(eventReceipts(event));
           return false;
-        });
+        }).map((event) => this.#late(event));
         if (events.length || missing.length) {
           state.pending.ids = [...events.map((event) => event.id), ...missing];
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
@@ -266,7 +269,7 @@ export class RootInbox {
             if (bounded && (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES))) {
               return result();
             }
-            events.push(event);
+            events.push(this.#late(event));
             bytes += size;
             for (const id of eventReceipts(event)) seen.add(id);
           }
@@ -330,7 +333,21 @@ export class RootInbox {
 
   #horizon(): number { return this.options.horizonMs ?? inboxHorizonMs(); }
 
-  #stale(event: MeshEvent): boolean { return event.createdAt < this.#now() - this.#horizon(); }
+  #neverExpire(event: MeshEvent): boolean {
+    if (event.to === undefined) return false;
+    return NEVER_EXPIRE_KINDS.has(event.kind);
+  }
+
+  #stale(event: MeshEvent): boolean {
+    return event.createdAt < this.#now() - this.#horizon() && !this.#neverExpire(event);
+  }
+
+  #late(event: MeshEvent): MeshEvent {
+    const age = this.#now() - event.createdAt;
+    if (age <= this.#horizon() || !this.#neverExpire(event)) return event;
+    const hours = Math.floor(age / LATE_DELIVERY_HOUR_MS);
+    return { ...event, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
+  }
 
   #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
     const ids = new Set(pending.ids);

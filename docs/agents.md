@@ -35,11 +35,11 @@ A Main can route ordinary `transport: "process"` Pi task agents through a host-c
 Declare locality requirements explicitly, for example:
 
 ```ts
-const handle = await agents.spawn({ task: "Inspect the private corpus", transport: "process", needs: ["corpus"] });
+const handle = await agents.spawn({ task: "Inspect the private corpus", transport: "process", needs: ["corpus"], localReason: "private-corpus" });
 const result = await agents.wait({ id: handle.id });
 ```
 
-Any need absent from the configured target's guaranteed capabilities keeps the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
+Any need absent from the configured target's guaranteed capabilities keeps the task local, and under the default `localGuard: "enforce"` that requires `localReason: "github-write" | "private-corpus" | "mac" | "ryzen1-service"` (optionally `"mac: <text>"`); otherwise the spawn is refused. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
 
 Remote handles still use `agents.status`, `wait`, `run`, and `stop`. `wait` bounds still detach observations without cancelling the task. A terminal native `rc` receipt—not a partial `result.md`—settles the run. A failed filesystem-only startup executable probe keeps tasks local with an audited `placement-probe-failed` reason. Once a launcher is invoked, its failures never cause local fallback or automatic relaunch. Ambiguous launch/exit outcomes retain execution custody and local run files. The configured cancellation command requests stop; only the terminal receipt confirms exit.
 

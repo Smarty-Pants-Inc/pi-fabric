@@ -86,12 +86,64 @@ describe("host process task placement", () => {
     for(const needs of ["corpus",[1],[""]]) expect(()=>normalizeAgentRunRequest({task:"x",needs},defaults)).toThrow("needs");
     for (const name of ["run","spawn"]) expect((AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,unknown>}).properties.needs).toBeDefined();
   });
-  it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
-    const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
+  const localLines = (f: ReturnType<typeof fixture>, id: string) => fs.readFileSync(path.join(f.manager.runDirectory(id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
+  const REFUSAL = "local placement on this host needs localReason (github-write|private-corpus|mac|ryzen1-service); otherwise drop the need for remote placement, or use smarty-task-ryzen2 --host auto";
+  it.each(["github-write","private-corpus","mac","ryzen1-service","mac: needs the Xcode simulator"])("keeps unmet needs local with localReason %s and one audit line", async localReason => {
+    const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:["unknown"],localReason});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
-    const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
-    expect(lines).toEqual([expect.objectContaining({reason:`unmet needs: ${need}`,needs:[need]})]);
+    expect(localLines(f,h.id)).toEqual([expect.objectContaining({reason:"unmet needs: unknown",needs:["unknown"],localReason,localGuard:"enforce"})]);
     expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each([undefined,"convenience","macbook","github-writes:x"])("refuses unmet needs under enforce without a named localReason (%s)", async localReason => {
+    const f=fixture(); const runs=path.join(f.root,"runs");
+    for (const transport of ["process","tmux"] as const) {
+      await expect(f.manager.spawn({task:"x",transport,needs:["unknown"],...(localReason?{localReason}:{})})).rejects.toThrow(REFUSAL);
+      await expect(f.manager.run({task:"x",transport,needs:["unknown"],...(localReason?{localReason}:{})})).rejects.toThrow("unmet needs: unknown");
+    }
+    expect(f.manager.list()).toEqual([]);
+    expect(fs.existsSync(runs) ? fs.readdirSync(runs).filter(entry=>!entry.startsWith(".")) : []).toEqual([]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("warn mode logs, runs local and audits without a reason", async () => {
+    const f=fixture(); f.config.placement.localGuard="warn";
+    const warn=vi.spyOn(console,"warn").mockImplementation(()=>undefined);
+    const h=await f.manager.spawn({task:"x",transport:"process",needs:["unknown"]});
+    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(REFUSAL));
+    expect(localLines(f,h.id)).toEqual([{type:"placement.local",ts:expect.any(Number),id:h.id,reason:"unmet needs: unknown",needs:["unknown"],localGuard:"warn"}]);
+  });
+  it("off mode keeps the unguarded local fallback", async () => {
+    const f=fixture(); f.config.placement.localGuard="off";
+    const warn=vi.spyOn(console,"warn");
+    const h=await f.manager.spawn({task:"x",transport:"process",needs:["unknown"]});
+    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("localGuard"));
+    expect(localLines(f,h.id)).toEqual([expect.objectContaining({reason:"unmet needs: unknown",needs:["unknown"]})]);
+  });
+  it("sends needs within the capabilities remote without a localReason", async () => {
+    const f=fixture(); f.config.placement.capabilities=["compute"];
+    const result=await f.manager.run({task:"remote need",transport:"process",needs:["compute"]});
+    expect(result).toMatchObject({status:"completed",text:"REMOTE: remote need"});
+    expect(localLines(f,result.id)).toEqual([]);
+    expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8")).toContain("placement.remote");
+  });
+  it("does not guard a configured local default", async () => {
+    const f=fixture(); f.config.placement.default="local";
+    expect((await f.manager.run({task:"x",transport:"process",needs:["unknown"]})).text).toBe("LOCAL");
+  });
+  it("parses localGuard and registers localReason on run/spawn", () => {
+    const f=fixture();
+    expect(f.config.placement.localGuard).toBe("enforce");
+    for (const mode of ["warn","off","enforce"]) expect(normalizeFabricConfig({agents:{placement:{...f.raw,localGuard:mode}}}).agents.placement?.localGuard).toBe(mode);
+    expect(()=>normalizeFabricConfig({agents:{placement:{...f.raw,localGuard:"strict"}}})).toThrow("localGuard");
+    expect(normalizeAgentRunRequest({task:"x",localReason:"mac: sim"},{runner:"pi",timeoutMs:1000}).localReason).toBe("mac: sim");
+    expect(()=>normalizeAgentRunRequest({task:"x",localReason:1},{runner:"pi",timeoutMs:1000})).toThrow("localReason");
+    for (const name of ["run","spawn"]) {
+      const schema=(AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,{pattern:string}>}).properties.localReason!;
+      const pattern=new RegExp(schema.pattern);
+      for (const ok of ["github-write","private-corpus","mac","ryzen1-service","ryzen1-service: systemd unit"]) expect(pattern.test(ok)).toBe(true);
+      for (const bad of ["","macbook","local","x mac"]) expect(pattern.test(bad)).toBe(false);
+    }
   });
   it.each([false,true])("preserves argv and maps spawn/wait results (command polling=%s)", async pollCommand => {
     const f=fixture(pollCommand); f.config.placement.capabilities=["compute"];

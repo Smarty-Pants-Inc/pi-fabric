@@ -126,6 +126,7 @@ const removeManagedRunRoot = async (root: string, managed: boolean): Promise<voi
   }
 };
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
+import { assertLocalPlacementAllowed } from "./placement-config.js";
 import {
   isFabricLifecycleEventType,
   type FabricLifecycleEventType,
@@ -1085,6 +1086,9 @@ export class AgentManager {
     assertAgentTask(request);
     if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
     request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}) };
+    // Refuse before admission/queueing: no run directory, worktree or worker exists yet.
+    // Every transport: only process exists today (#2566), so no explicit local override bypasses this.
+    assertLocalPlacementAllowed(this.config.placement, request.needs, request.localReason, request.transport ?? this.config.transport);
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1433,6 +1437,7 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           ...(request.needs ? { needs: [...request.needs] } : {}),
+          ...(request.localReason ? { localReason: request.localReason } : {}),
           placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe

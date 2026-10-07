@@ -64,6 +64,8 @@ interface FabricAgentRequest {
   task: string;
   /** Required placement capabilities; any unmet need keeps process tasks local. */
   needs?: string[];
+  /** Required for unmet needs under placement localGuard enforce: github-write|private-corpus|mac|ryzen1-service, optional ":text". */
+  localReason?: string;
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;

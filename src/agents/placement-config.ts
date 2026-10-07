@@ -17,7 +17,26 @@ export interface AgentPlacementConfig {
   cancelCommand: string[];
   pollIntervalMs: number;
   commandTimeoutMs: number;
+  /** Unmet needs fall back local only with a named localReason (smarty-dev#6155). */
+  localGuard: "enforce" | "warn" | "off";
 }
+
+const LOCAL_REASON = /^(?:github-write|private-corpus|mac|ryzen1-service)(?::[\s\S]*)?$/;
+const LOCAL_GUARD_REFUSAL = "local placement on this host needs localReason (github-write|private-corpus|mac|ryzen1-service); otherwise drop the need for remote placement, or use smarty-task-ryzen2 --host auto";
+
+/** Needs outside the remote capabilities, when they would force a configured placement local. */
+const unmetPlacementNeeds = (config: AgentPlacementConfig | undefined, needs: readonly string[] | undefined): string[] =>
+  config && config.default === "remote" ? (needs ?? []).filter(need => !config.capabilities.includes(need)) : [];
+
+/** Throws in enforce mode, warns in warn mode, when an unmet-needs local fallback lacks a named reason. */
+export const assertLocalPlacementAllowed = (config: AgentPlacementConfig | undefined, needs: readonly string[] | undefined, localReason: string | undefined, via = "process"): void => {
+  if (!config || config.localGuard === "off") return;
+  const unmet = unmetPlacementNeeds(config, needs);
+  if (!unmet.length || typeof localReason === "string" && LOCAL_REASON.test(localReason)) return;
+  const message = `${LOCAL_GUARD_REFUSAL} (unmet needs: ${unmet.join(", ")}; transport: ${via})`;
+  if (config.localGuard === "enforce") throw new Error(message);
+  console.warn(`[pi-fabric] agents.placement.localGuard=warn: running local anyway: ${message}`);
+};
 
 const placeholders = new Set(["id", "cwd", "task", "minutes", "model", "thinking", "host", "sshAlias", "resultDir"]);
 const template = (value: unknown, key: string): string => {
@@ -41,6 +60,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid agents.placement");
   const input = value as Record<string, unknown>;
   if (input.default !== undefined && input.default !== "local" && input.default !== "remote") throw new Error("Invalid agents.placement.default");
+  if (input.localGuard !== undefined && input.localGuard !== "enforce" && input.localGuard !== "warn" && input.localGuard !== "off") throw new Error("Invalid agents.placement.localGuard");
   const capabilities = input.capabilities ?? [];
   if (!Array.isArray(capabilities) || !capabilities.every(entry => typeof entry === "string" && !!entry.trim())) throw new Error("Invalid agents.placement.capabilities");
   if ((input.resultDirectory === undefined) === (input.resultCommand === undefined)) throw new Error("agents.placement requires exactly one of resultDirectory or resultCommand");
@@ -67,6 +87,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
     cancelCommand: argv(input.cancelCommand, "cancelCommand"),
     pollIntervalMs: bound(input.pollIntervalMs, 1_000, 10, 60_000, "pollIntervalMs"),
     commandTimeoutMs: bound(input.commandTimeoutMs, 30_000, 100, 120_000, "commandTimeoutMs"),
+    localGuard: input.localGuard ?? "enforce",
   };
 };
 

@@ -104,7 +104,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
       const log = args.get("--log-file");
       if (!log) throw new Error("Placement audit requires a run event log");
-      fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
+      fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [],
+        ...(request.localReason ? { localReason: request.localReason } : {}), localGuard: this.placement.localGuard }) + "\n", { mode: 0o600 });
     }
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");

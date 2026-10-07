@@ -12,7 +12,8 @@ import type { FabricActionDescriptor } from "../protocol.js";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited; under agents.placement.localGuard enforce (default) that needs localReason." },
+  localReason: { type: "string", maxLength: 200, pattern: "^(github-write|private-corpus|mac|ryzen1-service)(:[\\s\\S]*)?$", description: "Why unmet needs may run locally under configured placement: github-write, private-corpus, mac or ryzen1-service, optionally followed by :text. Without it, enforce mode refuses the spawn; drop the need for remote placement instead." },
   runner: {
     type: "string",
     enum: ["pi", "claude", "veda"],

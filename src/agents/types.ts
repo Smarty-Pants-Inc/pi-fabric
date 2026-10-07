@@ -74,6 +74,8 @@ export interface AgentRunRequest {
   task: string;
   /** Required target capabilities. Unknown needs force configured placement local. */
   needs?: string[];
+  /** Why a configured placement may run unmet needs locally: github-write|private-corpus|mac|ryzen1-service, optional ":text". */
+  localReason?: string;
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -370,6 +372,8 @@ export interface AgentTransportLaunch {
   workerPath: string;
   workerArguments: string[];
   needs?: string[];
+  /** Caller's named local-placement reason, audited with placement.local. */
+  localReason?: string;
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */

@@ -13,6 +13,8 @@ Pi Fabric reads configuration from two JSON files. Project values override globa
 
 `agents.placement` is **host-only**: put it in the selected `PI_CODING_AGENT_DIR/fabric.json`, never a workspace override. Absent means unchanged local spawns. When configured, `default` is `"local"` unless explicitly `"remote"`. A remote Main task launches through `command` rather than the local worker; `needs?: string[]` on spawn/run routes unmet needs locally. `capabilities` defaults to `[]` and must describe guarantees on every target selected by the launcher.
 
+`localGuard` (`"enforce"` by default, `"warn"` or `"off"`) guards that unmet-needs fallback when `default` is `"remote"`: the spawn must carry `localReason` naming `github-write`, `private-corpus`, `mac` or `ryzen1-service` (optionally `:<text>`). Without one, `enforce` refuses the spawn before admission with "local placement on this host needs localReason (github-write|private-corpus|mac|ryzen1-service); otherwise drop the need for remote placement, or use smarty-task-ryzen2 --host auto"; `warn` logs that line and runs local; `off` keeps the unguarded fallback. Every local fallback appends `placement.local` with its reason, needs, `localReason` and `localGuard` (smarty-dev#6155). Revert: set `agents.placement.localGuard` to `"off"`.
+
 Ryzen 1 example (the existing fleet launcher, **not executed by the offline tests**):
 
 ```json

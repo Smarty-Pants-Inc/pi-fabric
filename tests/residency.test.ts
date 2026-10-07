@@ -2266,18 +2266,31 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000,
     });
     control.start(() => ({ accepted: false }));
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
     try {
       const request = { name: "hung reviewer", instructions: "Review.", residency: "durable" as const, delivery: "mailbox" as const };
       const actor = await client.createActor(request);
+      await lifecycle.subscribe({ from: actor.id, to: state.identity.id, events: ["pi.turn_end"], delivery: "followUp", triggerTurn: false });
       await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
       await waitFor(() => state.participants.get(actor.id, undefined, { fresh: true })?.actorRun !== undefined, 30_000);
       const runId = state.participants.get(actor.id, undefined, { fresh: true })!.actorRun!.id;
+      // A launch handle precedes worker progress. Removing then can abort the worker rather
+      // than detach it, legitimately clearing the pending note before the client reads it.
+      // This forwarded turn event proves the host monitor has observed the fixture's progress;
+      // its publication is queued until after that monitor's synchronous status read.
+      await waitFor(() => state.mesh.read({ topic: "fabric.participant.lifecycle", limit: 100 }).some(event =>
+        event.kind === "pi.turn_end" && (event.data as { runId?: string })?.runId === runId), 30_000);
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "runs", runId, "status.json"), "utf8")))
+        .toMatchObject({ status: "running", turns: 3, toolCalls: 1 });
 
       const started = Date.now();
       const removed = await client.removeActor(actor.id);
       expect(Date.now() - started).toBeLessThan(2_000);
       expect(removed.pending).toContain(`pending behind its in-flight run ${runId}`);
       expect(client.hostStateNote()).toContain(`removal of hung reviewer (${actor.id}) is pending behind its in-flight run ${runId}`);
+      // Informational retention samples and durable removal diagnostics coexist.
+      expect(client.hostStateNote()).toMatch(/residency retention:.*entries.*bytes/);
 
       // The queue is free: a same-name create right after the removal succeeds.
       const successor = await client.createActor(request);
@@ -2306,6 +2319,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(client.hostStateNote()).toMatch(/residency retention:.*entries.*bytes/);
       await client.removeActor(successor.id);
     } finally {
+      await lifecycle.close();
       await control.close();
       await client.close();
       await stopResident(state.config);

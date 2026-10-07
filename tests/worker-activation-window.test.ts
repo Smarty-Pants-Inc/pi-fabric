@@ -335,7 +335,7 @@ describe("native activation window (offline; opted-in success needs exact native
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
     api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false, runtimeTool = false,
-    finalText = "useful current result") => {
+    contextWindow = fabric || runtimeTool ? 128000 : 8000, finalText = "useful current result") => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -379,7 +379,7 @@ describe("native activation window (offline; opted-in success needs exact native
     // Fake local credentials only. No model or fleet credential is read.
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
       "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api, models: [{
-        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: fabric || runtimeTool ? 128000 : 8000, maxTokens: 1024,
+        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow, maxTokens: 1024,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }] },
     } }));
@@ -405,12 +405,16 @@ describe("native activation window (offline; opted-in success needs exact native
 
   // A real native Bash execution witnesses the review publisher's PI_SESSION_ID,
   // not a guessed worker argument or a mocked identity (#4313).
-  const installBindingProbe = (dir: string) => {
+  const installBindingProbe = (dir: string, compaction?: "refuse" | "ineffective") => {
     const probes = path.join(dir, "binding-probes.jsonl");
     fs.writeFileSync(path.join(dir, "noop.ts"), `
       import fs from 'node:fs';
       import { createBashToolDefinition } from '@earendil-works/pi-coding-agent';
       export default function(pi) {
+        ${compaction === "refuse" ? "pi.on('session_before_compact', () => ({cancel: true}));" : compaction === "ineffective" ? `pi.on('session_before_compact', event => ({compaction: {
+          summary: 'INEFFECTIVE_SUMMARY ' + 'x'.repeat(1_200_000),
+          firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore
+        }}));` : ""}
         const observe = async (event, ctx) => {
           const file = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
           if (!file) return;
@@ -550,6 +554,69 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(log).not.toContain('"type":"auto_retry_start"');
   }, TEST_GUARD_MS);
 
+  it.skipIf(!selectedNativeBinary).each(["native", "refuse", "ineffective"] as const)("3238 a 300k-token actor on a 272k model activates with review binding intact (%s)", async mode => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS", "openai-completions", false, false, 272_000);
+    const probesFile = installBindingProbe(s.dir, mode === "native" ? undefined : mode);
+    fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 64 * 1024, 100);
+    const actors = new ActorManager("window-3238", { id: "owner", name: "owner", kind: "main", sessionId: "window-3238" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, s.manager, () => {},
+      { actorRoot: path.join(s.dir, "actors"), persistent: true, maxSessionBytes: 0 });
+    managers.push(actors);
+    const actor = await actors.create({ name: "ops.retro", instructions: "INSTRUCTIONS_SENTINEL: Review the current event and preserve pending work.",
+      model: "window-test/offline", inferenceContext: "full-history", tools: [], extensions: false, transport: "process", residency: "durable", delivery: "mailbox" });
+    const session = SessionManager.open(actor.sessionFile!);
+    for (let index = 0; index < 40; index++) {
+      session.appendMessage(user(`OLD_OBJECTIVE_${index} ` + "x".repeat(30_000)));
+      session.appendMessage(assistant(`old decision ${index}`));
+    }
+    session.appendMessage(user("RECENT_STATE_SENTINEL: pending review at /tmp/report.md; do not publish yet."));
+    session.appendMessage(assistant("Continue the pending review."));
+    const before = readJournal(actor.sessionFile!);
+    const oldId = session.getSessionId();
+    expect(estimateTextTokens(JSON.stringify(buildSessionContext(session.getBranch()).messages))).toBeGreaterThanOrEqual(300_000);
+    await actors.ask(actor.id, "CURRENT_3238_ACTIVATION");
+    const info = actors.status(actor.id);
+    const result = await s.manager.wait(info.lastRunId!);
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log).toContain('"type":"fabric_context_compaction"');
+    expect(log).not.toContain("Context exceeds window");
+    const dispatches = s.requests.filter(payload => JSON.stringify(payload.messages).includes("CURRENT_3238_ACTIVATION"));
+    expect(dispatches).toHaveLength(1);
+    expect(estimateTextTokens(JSON.stringify(dispatches[0]))).toBeLessThan(272_000 * 0.85);
+    expect(JSON.stringify(dispatches[0])).toContain("INSTRUCTIONS_SENTINEL");
+    const finalId = SessionManager.open(actor.sessionFile!).getSessionId();
+    expect(result.runnerSessionId).toBe(finalId);
+    expect(info.sessionFile).toBe(actor.sessionFile);
+    expect(SessionManager.open(info.sessionFile!).getSessionId()).toBe(finalId);
+    const probes = expectBindingProbes(probesFile, `native-3238-${mode}`);
+    expect(probes.at(-1)?.registeredId).toBe(finalId);
+    if (mode === "native") {
+      expect(finalId).toBe(oldId);
+      expect(log).not.toContain('"type":"fabric_context_reseed"');
+      expectJournalAppended(actor.sessionFile!, before, true);
+    } else {
+      expect(finalId).not.toBe(oldId);
+      expect(result.runnerSessionIds).toEqual([oldId, finalId]);
+      expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
+      const note = SessionManager.open(actor.sessionFile!).getBranch().find(entry => entry.type === "custom" && entry.customType === "fabric-context-reseed");
+      expect(note?.type).toBe("custom");
+      if (note?.type === "custom") {
+        const data = note.data as { archived: string; oldSessionId: string; sessionId: string };
+        expect(data).toMatchObject({ oldSessionId: oldId, sessionId: finalId });
+        expect(fs.readFileSync(data.archived).subarray(0, before.bytes.length)).toEqual(before.bytes);
+      }
+      expect(JSON.stringify(dispatches[0])).toContain("RECENT_STATE_SENTINEL");
+    }
+    const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
+    if (evidence) {
+      fs.mkdirSync(evidence, { recursive: true });
+      fs.writeFileSync(path.join(evidence, `native-3238-${mode}-result.json`), JSON.stringify({ oldId, finalId, requestCount: s.requestCount, result, info }, null, 2));
+      fs.copyFileSync(result.logFile!, path.join(evidence, `native-3238-${mode}-events.jsonl`));
+    }
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary).each(["reducible", "irreducible"])("over-cap full-history admission recovers explicitly and is bounded (%s)", async mode => {
     const s = await setup();
     fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
@@ -586,9 +653,58 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
       expectJournalAppended(journal, before, true);
     } else {
-      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringMatching(/Context exceeds window|Actor context admission compact failed/) });
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
       expect(log.match(/"type":"fabric_context_compaction"/g)).toHaveLength(1);
-      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(false);
+      expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
+      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
+      expect(fs.readdirSync(s.dir).some(name => name.endsWith(".context-reseed.bak"))).toBe(true);
+      expect(result.runnerSessionId).toBe(SessionManager.open(journal).getSessionId());
+    }
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each(["omit", "replace", "inactive-branch"] as const)("over-cap reseed dispatch preserves native-visible state and replacement binding (%s)", async mode => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const probesFile = installBindingProbe(s.dir, "refuse");
+    const journal = path.join(s.dir, "edited-over-cap-history.jsonl");
+    const session = SessionManager.open(journal);
+    const rootId = session.appendMessage(user("ACTIVE_ROOT " + "x".repeat(5_100_000)));
+    const removed = session.appendMessage(user("REMOVED_STATE_SENTINEL"));
+    if (mode === "omit") session.appendContextEdit(removed, null);
+    if (mode === "replace") session.appendContextEdit(removed, { content: "REPLACED_CURRENT_STATE" });
+    if (mode === "inactive-branch") session.branch(rootId);
+    session.appendMessage(user("CURRENT_PENDING_WORK at /tmp/report.md"));
+    session.appendMessage(assistant("Keep the current pending review."));
+    const nativeVisible = JSON.stringify(buildSessionContext(session.getBranch()).messages);
+    expect(nativeVisible.length).toBeGreaterThan(5_000_000);
+    expect(nativeVisible).not.toContain("REMOVED_STATE_SENTINEL");
+    const oldId = session.getSessionId();
+    const before = readJournal(journal);
+    const result = await s.manager.run({ task: "CURRENT_VISIBLE_ACTIVATION", model: "window-test/offline", actorId: "visible-over-cap-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 30_000 });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
+    const dispatches = s.requests.filter(payload => JSON.stringify(payload.messages).includes("CURRENT_VISIBLE_ACTIVATION"));
+    expect(dispatches).toHaveLength(1);
+    const dispatched = JSON.stringify(dispatches[0]);
+    expect(dispatched).toContain("CURRENT_PENDING_WORK");
+    expect(dispatched).not.toContain("REMOVED_STATE_SENTINEL");
+    if (mode === "replace") expect(dispatched).toContain("REPLACED_CURRENT_STATE");
+    const replacement = SessionManager.open(journal);
+    const finalId = replacement.getSessionId();
+    expect(finalId).not.toBe(oldId);
+    expect(result.runnerSessionIds).toEqual([oldId, finalId]);
+    expect(result.runnerSessionId).toBe(finalId);
+    expect(expectBindingProbes(probesFile, `native-visible-${mode}`).at(-1)?.registeredId).toBe(finalId);
+    const note = replacement.getBranch().find(entry => entry.type === "custom" && entry.customType === "fabric-context-reseed");
+    expect(note).toMatchObject({ data: { oldSessionId: oldId, sessionId: finalId } });
+    if (note?.type === "custom") expect(fs.readFileSync((note.data as { archived: string }).archived).subarray(0, before.bytes.length)).toEqual(before.bytes);
+    const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
+    if (evidence) {
+      fs.mkdirSync(evidence, { recursive: true });
+      fs.writeFileSync(path.join(evidence, `native-visible-${mode}-result.json`), JSON.stringify({ oldId, finalId,
+        removedStateDispatched: dispatched.includes("REMOVED_STATE_SENTINEL"), pendingWorkDispatched: dispatched.includes("CURRENT_PENDING_WORK"), result }, null, 2));
+      fs.copyFileSync(result.logFile!, path.join(evidence, `native-visible-${mode}-events.jsonl`));
     }
   }, TEST_GUARD_MS);
 
@@ -753,11 +869,17 @@ describe("native activation window (offline; opted-in success needs exact native
     const session = SessionManager.open(journal);
     session.appendMessage(user("OLD_DEFAULT_HISTORY"));
     session.appendMessage(assistant("old reply"));
+    const before = readJournal(journal);
+    const registeredId = session.getSessionId();
     const result = await s.manager.run({ task: "CURRENT_DEFAULT", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, tools: [], extensions: false, transport: "process" });
     expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).toContain("OLD_DEFAULT_HISTORY");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_DEFAULT");
+    expectJournalAppended(journal, before);
+    expect(SessionManager.open(journal).getSessionId()).toBe(registeredId);
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log).not.toMatch(/fabric_context_compaction|fabric_context_reseed/);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 
@@ -788,18 +910,12 @@ describe("native activation window (offline; opted-in success needs exact native
     const extensionDir = path.join(s.dir, "agent", "extensions");
     fs.mkdirSync(extensionDir);
     fs.writeFileSync(path.join(extensionDir, "window-preflight.ts"), `
-      import { buildSessionContext, convertToLlm, getPackageDir } from '@earendil-works/pi-coding-agent';
+      import { buildSessionContext, convertToLlm } from '@earendil-works/pi-coding-agent';
       import fs from 'node:fs';
-      import path from 'node:path';
-      import { pathToFileURL } from 'node:url';
-      import * as nodeModule from 'node:module';
       export default async function(pi) {
-        let estimatorUrl = '@earendil-works/pi-ai/utils/estimate';
-        if (typeof nodeModule.findPackageJSON === 'function') {
-          const aiPackage = nodeModule.findPackageJSON('@earendil-works/pi-ai', pathToFileURL(path.join(getPackageDir(), 'package.json')));
-          estimatorUrl = pathToFileURL(path.join(path.dirname(aiPackage), 'dist', 'utils', 'estimate.js')).href;
-        }
-        const { estimateContextTokens } = await import(estimatorUrl);
+        // Discovered hooks run under Jiti too: its pi-ai barrel alias must not
+        // turn a pure estimator subpath into compat.js/utils/estimate.
+        const { estimateContextTokens } = await import(${JSON.stringify(pathToFileURL(path.resolve(path.dirname(fs.realpathSync(nativeBinary)), "../../pi-ai/dist/utils/estimate.js")).href)});
         pi.on('before_agent_start', (event, ctx) => {
           const carried = convertToLlm(buildSessionContext(ctx.sessionManager.getBranch()).messages);
           const tokens = estimateContextTokens([...carried, {role:'user', content:event.prompt, timestamp:Date.now()}]).tokens;
@@ -1197,7 +1313,7 @@ describe("native activation window (offline; opted-in success needs exact native
 
   it.skipIf(!selectedNativeBinary).each([false, true])("5256 process task keeps its full settlement under an 8s mesh holder (slow exit: %s)", async slowExit => {
     const finalText = "Full task result:\n" + "durable line with full-text sentinel\n".repeat(800) + "TASK_FINAL_END";
-    const s = await setup(0, 0, undefined, "openai-completions", false, true, finalText);
+    const s = await setup(0, 0, undefined, "openai-completions", false, true, undefined, finalText);
     const meshRoot = path.join(s.dir, "mesh");
     const lock = path.join(meshRoot, ".lock");
     const requested = path.join(s.dir, "hold-requested");

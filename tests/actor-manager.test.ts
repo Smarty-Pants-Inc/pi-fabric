@@ -1,5 +1,6 @@
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -210,7 +211,7 @@ describe("ActorManager idle registry writes (#4383)", () => {
     await state.actors.close();
     const file = path.join(state.root, "actors", "actors.json");
     const before = fs.readFileSync(file, "utf8");
-    const saves = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
     try {
       const reloaded = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
         actorRoot: path.join(state.root, "actors"), persistent: true,
@@ -2505,6 +2506,44 @@ describe("ActorManager", () => {
     expect(created.id).toBeTruthy();
   });
 
+  it("backs off whole adoption attempts outside registry custody while mesh is held", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "contended-orphan", instructions: "Wait.", residency: "session" });
+    await state.actors.close();
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), state.mesh.root, "3000"],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    let successor: ActorManager | undefined;
+    const registry = new ActorRegistryStore(path.join(state.root, "actors"));
+    const exclusive = state.mesh.exclusive.bind(state.mesh);
+    const attempts = vi.spyOn(state.mesh, "exclusive").mockImplementation((operation, timeout) => {
+      expect(fs.existsSync(path.join(state.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+      expect(timeout).toBe(0);
+      return exclusive(operation, timeout);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      const identity: MeshIdentity = { id: "session:contended-successor", name: "main", kind: "main", sessionId: "contended-successor" };
+      successor = new ActorManager(identity.sessionId!, identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session", rootId: identity.id,
+        canManageActor: () => undefined, lineageAlive: () => false,
+      });
+      actorManagers.push(successor);
+      await waitFor(() => attempts.mock.calls.length > 0);
+      const started = performance.now();
+      await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent mutation" }))));
+      expect(performance.now() - started).toBeLessThan(1000);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(attempts).toHaveBeenCalledOnce(); // not an immediate retry storm
+      expect(registry.records()[0]!.rootId).toBe(state.identity.id);
+      expect(await exited).toBe(0);
+      await waitFor(() => successor!.owns(actor.id), 5000);
+      expect(registry.records()[0]!.rootId).toBe(identity.id);
+    } finally {
+      await exited; attempts.mockRestore(); await successor?.close();
+    }
+  }, 10000);
+
   it("settles exactly one adopter when concurrent starters race an orphan", async () => {
     const state = setup(true);
     const actor = await state.actors.create({
@@ -3411,8 +3450,8 @@ describe("ActorManager", () => {
       .filter((message) => message.direction === "out" && message.runId)
       .map((message) => String((message as { text?: string }).text ?? "") + " " + message.source);
     await waitFor(() => ran().length >= 3, 20_000);
-    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in").length;
-    expect(inbound).toBe(3);
+    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in");
+    expect(inbound, JSON.stringify(inbound)).toHaveLength(3);
     expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
   }, 30_000);
 
@@ -4674,6 +4713,9 @@ describe("ActorManager removal behind an in-flight run", () => {
       else replacements.at(-1)?.directories.push(file);
     });
     const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      // The prepared inode may have been renamed from its data-fsynced temp.
+      // Carry the receipt through that rename; do not require fsync to occur in custody.
+      if (syncedFiles.has(String(from))) syncedFiles.add(String(to));
       if (String(to) === registry) {
         const records = JSON.parse(fs.readFileSync(from, "utf8")).actors as Array<{ removal?: unknown }>;
         replacements.push({ pending: records.some((record) => !!record.removal),
@@ -4990,7 +5032,11 @@ describe("#169 round 2 removal coordination", () => {
     const actor = await actors.create({ name: "uncommitted", instructions: "Work." });
     await actors.stop(actor.id);
     const dir = path.join(root, "actors", actor.id);
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => {});
+    const prepare = ActorRegistryStore.prototype.prepare;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementation(function (this: ActorRegistryStore, ...args) {
+      const prepared = prepare.apply(this, args);
+      return { ...prepared, commit: () => {} };
+    });
     try {
       await expect(actors.remove(actor.id)).rejects.toThrow("registry revocation did not commit");
       expect(fs.existsSync(dir)).toBe(true);

@@ -2210,11 +2210,23 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     await f.directory.refresh();                               // nothing unseen: a real, witnessed acquisition
     expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
     const before = second.confirmedAt(), baseline = f.acquisitions();
+    // That real confirmation left its witness, on the file clock, after the second's receipt:
+    // the proof the second may use. Checked here, so a missing proof cannot pass for a lock race.
+    const witnessAt = Math.floor(fs.lstatSync(plantedWitness(f.mesh.root)).mtimeMs);
+    expect(witnessAt).toBeGreaterThan(before);
+    // CI flake on #592: the second's heartbeat read Date.now() several times (evidence age, the
+    // post-read recheck) on a loaded runner. Pin its clock one millisecond after the witness: the
+    // proof is fresh by construction, so the product must confirm without the lock. Age limits
+    // and the fallback to the lock keep their own tests above (real and advanced clocks).
+    const clock = vi.spyOn(Date, "now").mockReturnValue(witnessAt + 1);
     const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
-    await second.refresh();
+    try {
+      await second.refresh();
+    } finally { clock.mockRestore(); }
     expect(f.acquisitions() - baseline).toBe(0);
     expect(secondConfirms).not.toHaveBeenCalled();
     expect(second.confirmedAt()).toBeGreaterThan(before);
+    expect(second.confirmedAt()).toBeLessThanOrEqual(witnessAt + 1);
   });
 
   // Security round on #592: only this user's own regular witness file under the mesh root is proof.

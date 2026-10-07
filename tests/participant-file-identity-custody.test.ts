@@ -60,24 +60,37 @@ it.each(cases)("cold ResidentHost files=$files protocol=$protocol reader=$platfo
     timeoutMs: outcome === "timeout" ? 50 : 2000 });
   vi.spyOn(atomic, "ownProcessIncarnation").mockImplementation(reader.own);
   const custodyMs: number[] = [];
+  let publicationDepth = 0;
   const start = ParticipantDirectory.prototype.start;
   vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(function(this: ParticipantDirectory) {
     const fence = this.options.withPublicationFence!;
     this.options.withPublicationFence = publish => fence(async () => {
-      const begin = performance.now();
-      try { return await publish(); } finally { custodyMs.push(performance.now() - begin); }
+      const begin = performance.now(); publicationDepth++;
+      try { return await publish(); } finally { publicationDepth--; custodyMs.push(performance.now() - begin); }
     });
     return start.call(this);
   });
   let copying!: () => void;
   const copied = new Promise<void>(resolve => { copying = resolve; });
-  let bothFences = false;
+  let bothFences = false, copiedOutsideRegistry = false, copiesUnderKey = true, copyTokensMatch = true;
   const receipts: Array<{ prepared: boolean; incarnation: string | undefined }> = [];
   const write = participantFiles.writeParticipantFileIf;
   vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation((...args) => {
     bothFences ||= s.actorRoots.every(root => fs.existsSync(path.join(root, "actors.json.lock", "owner")));
     receipts.push({ prepared: Object.prototype.hasOwnProperty.call(args[3] ?? {}, "ownIncarnation"), incarnation: args[3]?.ownIncarnation });
-    copying(); return write(...args);
+    copying();
+    return write(args[0], args[1], current => {
+      const selected = args[2](current);
+      const record = selected?.value as { kind?: string; id?: string; actorOwnershipToken?: string } | undefined;
+      if (record?.kind === "actor" && record.id) {
+        const lock = path.join(s.config.meshRoot, "participants", ".locks", args[1].split("/").at(-1)!);
+        copiesUnderKey &&= fs.existsSync(path.join(lock, "owner"));
+        copiedOutsideRegistry ||= publicationDepth === 0;
+        const row = s.actorRoots.flatMap(root => new ActorRegistryStore(root).records()).find(row => row.id === record.id);
+        copyTokensMatch &&= !!row && record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+      }
+      return selected;
+    }, args[3]);
   });
   const host = new ResidentHost(s.config); hosts.push(host);
   const starting = host.start(); void starting.catch(() => undefined);
@@ -90,7 +103,10 @@ it.each(cases)("cold ResidentHost files=$files protocol=$protocol reader=$platfo
     simulatedNativeMs: 1200, setterMs, registryCustodyMs: Math.max(...custodyMs), nativeUnderCustody, durable: true }));
   expect(s.actorRoots.every(root => new ActorRegistryStore(root).records()[0]?.instructions === "durable setter during cold publication")).toBe(true);
   expect(nativeUnderCustody).toBe(false);
-  expect(bothFences).toBe(true);
+  if (files) expect(bothFences).toBe(true); // files-first migration/publication retains the registry fence
+  else expect(copiedOutsideRegistry).toBe(true); // accepted shared actor copies use token+key custody instead
+  expect(copiesUnderKey).toBe(true);
+  expect(copyTokensMatch).toBe(true);
   expect(receipts.every(receipt => receipt.prepared && receipt.incarnation === (outcome === "known" ? `${platform}:${nativeValue}` : undefined))).toBe(true);
   expect(run).toHaveBeenCalledOnce();
   // ponytail: 600 ms, half the injected 1,200 ms native read. A read awaited under custody costs >= 1,200 ms
@@ -104,6 +120,10 @@ it.each(cases)("cold ResidentHost files=$files protocol=$protocol reader=$platfo
 it.each([1, 2] as const)("busy participant-key native recovery prepares outside both registry fences (protocol=%s)", async protocol => {
   const s = await fixture(protocol, true);
   const host = new ResidentHost(s.config); hosts.push(host); await host.start();
+  // An actual record change exercises fenced publication, not the independent
+  // unchanged actor liveness lane introduced by #4383.
+  const owned = host.actors.listOwned.bind(host.actors);
+  vi.spyOn(host.actors, "listOwned").mockImplementation(() => owned().map((actor, index) => index === 0 ? { ...actor, status: "running" } : actor));
   // Hold off the automatic retry only; each explicit refresh still uses production custody.
   let releaseRetry!: () => void;
   const retryGate = new Promise<void>(resolve => { releaseRetry = resolve; });
@@ -123,7 +143,7 @@ it.each([1, 2] as const)("busy participant-key native recovery prepares outside 
   });
   try {
     const begin = performance.now();
-    await expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await expect(host.participants.refreshPresence()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     expect(performance.now() - begin).toBeLessThan(150);
     expect(read).not.toHaveBeenCalled();
     const retry = host.participants.refresh().catch(error => error);
@@ -158,4 +178,42 @@ it("a fenced caller missing its prepared own receipt fails closed instead of rea
       .resolves.toBe(false); // explicit prepared UNKNOWN is conservative, not unprepared
   });
   expect(own).not.toHaveBeenCalled();
+});
+
+it("#4383 an adopter cannot cross a renewal's token-check/rename window and never waits on its key under registry custody", async () => {
+  const s = await fixture(1, false);
+  const mesh = new MeshStore(s.config.meshRoot, 65536, 100);
+  const registry = new ActorRegistryStore(s.actorRoots[0]!);
+  const snapshot = registry.snapshot();
+  const key = `topology/participants/${createHash("sha256").update(s.rows[0]!.id).digest("hex")}`;
+  const keyLock = path.join(s.config.meshRoot, "participants", ".locks", key.split("/").at(-1)!);
+  const own = vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
+  const native = vi.spyOn(atomic, "processIncarnation").mockResolvedValue(undefined);
+  const prepared = registry.prepare(snapshot.actors.map(row => ({ ...row, rootId: "session:successor", adoptedAt: Date.now() })), { durable: true }, snapshot);
+  let claimed = false;
+  try {
+    // This is exactly the renewal decision boundary: the generation has been
+    // checked, but its participant envelope has not yet been renamed.
+    await participantFiles.writeParticipantFileIf(mesh, key, () => {
+      const receipt = fs.readFileSync(path.join(keyLock, "owner"), "utf8");
+      expect(() => participantFiles.withParticipantFileTryLock(mesh, key, undefined, () => {
+        claimed = true; prepared.commit();
+      })).toThrow(participantFiles.ParticipantFileLockBusyError);
+      expect(claimed).toBe(false);
+      expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(receipt);
+      expect(registry.records()[0]!.rootId).toBe(s.config.rootId);
+      return { key, value: { id: s.rows[0]!.id }, version: 1, updatedAt: Date.now(),
+        updatedBy: { id: s.config.rootId, name: "owner", kind: "agent" } };
+    }, { registryFenced: true, ownIncarnation: undefined });
+    // The real ordering: registry -> mesh -> nonblocking key, synchronous claim.
+    await registry.withLock(() => mesh.exclusive(() => participantFiles.withParticipantFileTryLock(mesh, key, undefined, () => {
+      expect(prepared.valid()).toBe(true);
+      prepared.commit(); claimed = true;
+    }), 0));
+    expect(claimed).toBe(true);
+    expect(registry.records()[0]!.rootId).toBe("session:successor");
+    expect(fs.existsSync(keyLock)).toBe(false);
+    expect(own).not.toHaveBeenCalled();
+    expect(native).not.toHaveBeenCalled();
+  } finally { prepared.dispose(); }
 });

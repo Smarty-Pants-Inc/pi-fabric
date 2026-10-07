@@ -49,6 +49,8 @@ export interface ParticipantFileMesh {
 /** Prepared unknown is distinct from an absent (lazy) identity. */
 export interface ParticipantFileLockOptions {
   ownIncarnation?: string | undefined;
+  /** No native holder read or ordinary key wait: registry custody and the
+   * independent zero-wait renewal lane both require this prepared mode. */
   registryFenced?: boolean;
 }
 
@@ -147,50 +149,78 @@ const holderAlive = async (owner: string, lock: string, registryFenced = false):
 // out and its refresh retries. A dead holder's lock is removed under the mesh lock, after reading
 // its owner again, so concurrent recoveries cannot remove a successor's lock (review/astra round 3
 // on #142). Recovery is rare; routine writes never take the mesh lock.
+const keyReceipt = (mesh: ParticipantFileMesh, file: string, incarnation: string | undefined) => {
+  const locks = path.join(mesh.root, DIR, ".locks");
+  const lock = path.join(locks, path.basename(file, ".json"));
+  fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
+  const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
+  return {
+    lock,
+    acquire: (): void => {
+      const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
+      fs.mkdirSync(staging, { mode: 0o700 });
+      try {
+        fs.writeFileSync(path.join(staging, "owner"), token, { mode: 0o600 });
+        fs.renameSync(staging, lock);
+      } catch (error) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        throw error;
+      }
+    },
+    release: (): void => {
+      // Detach our complete receipt before deleting. Never delete canonical,
+      // including when Windows readers briefly deny the directory rename.
+      const tombstone = `${lock}.${randomUUID()}.dead`;
+      renameAtomic(lock, tombstone);
+      fs.rmSync(tombstone, { recursive: true, force: true });
+    },
+  };
+};
+
+/** Synchronous zero-wait key custody for registry lineage commits. Adoption
+ * shares this receipt with independent renewal, closing the token-check/rename
+ * race. Native identity and dead-holder recovery MUST be prepared before taking
+ * registry/mesh custody; a busy key unwinds both fences, never waits under them. */
+export const withParticipantFileTryLock = <T>(
+  mesh: ParticipantFileMesh, key: string, ownIncarnation: string | undefined, operation: () => T,
+): T => {
+  const file = fileOf(mesh.root, key);
+  if (!file) throw new Error(`Not a participant key: ${key}`);
+  const receipt = keyReceipt(mesh, file, ownIncarnation);
+  try { receipt.acquire(); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(code ?? "")) throw new ParticipantFileLockBusyError(receipt.lock);
+    throw error;
+  }
+  try { return operation(); }
+  finally { receipt.release(); }
+};
+
 const withKeyLock = async <T>(
   mesh: ParticipantFileMesh,
   file: string,
   operation: () => T,
   options: ParticipantFileLockOptions = {},
 ): Promise<T> => {
-  const locks = path.join(mesh.root, DIR, ".locks");
-  const lock = path.join(locks, path.basename(file, ".json"));
-  fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
   const prepared = Object.prototype.hasOwnProperty.call(options, "ownIncarnation");
-  // A future fenced caller that forgets preparation must unwind, never fall
-  // through to a native self read. Explicit prepared UNKNOWN is still safe.
-  if (options.registryFenced && !prepared) throw new ParticipantFileLockBusyError(lock);
+  if (options.registryFenced && !prepared) throw new ParticipantFileLockBusyError(file);
   const incarnation = prepared ? options.ownIncarnation : await ownProcessIncarnation();
-  const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
+  const receipt = keyReceipt(mesh, file, incarnation);
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
-    const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
-    fs.mkdirSync(staging, { mode: 0o700 });
-    fs.writeFileSync(path.join(staging, "owner"), token, { mode: 0o600 });
-    try {
-      fs.renameSync(staging, lock);                         // fails while another lock holds the name
-      break;
-    } catch (error) {
-      fs.rmSync(staging, { recursive: true, force: true });
-      const code = (error as { code?: unknown }).code;
+    try { receipt.acquire(); break; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
-      await recoverDeadKeyLock(mesh, lock, options.registryFenced);
-      if (options.registryFenced && fs.existsSync(lock)) throw new ParticipantFileLockBusyError(lock);
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for the participant file lock ${lock}`);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await recoverDeadKeyLock(mesh, receipt.lock, options.registryFenced);
+      if (options.registryFenced && fs.existsSync(receipt.lock)) throw new ParticipantFileLockBusyError(receipt.lock);
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for the participant file lock ${receipt.lock}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
     }
   }
-  try {
-    return operation();
-  } finally {
-    // Unlinking the owner before rmdir leaves an empty canonical directory that a successor
-    // can replace on POSIX. Detach our whole lock first; recursive cleanup touches only it.
-    const tombstone = `${lock}.${randomUUID()}.dead`;
-    // A sibling read/scanner can briefly deny a Windows directory rename. Keep
-    // the unique target and bounded retry; never fall back to deleting the lock.
-    renameAtomic(lock, tombstone);
-    fs.rmSync(tombstone, { recursive: true, force: true });
-  }
+  try { return operation(); }
+  finally { receipt.release(); }
 };
 
 const readOwner = (lock: string): string | undefined => {
@@ -215,6 +245,13 @@ const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, regis
     if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
     else renameAtomic(tombstone, lock);
   }); // A mesh timeout unwinds the publication fence; retry on the next refresh.
+};
+
+/** Recover only this adoption key before taking registry/mesh custody. */
+export const prepareParticipantFileLock = async (mesh: ParticipantFileMesh, key: string): Promise<void> => {
+  const file = fileOf(mesh.root, key);
+  if (!file) throw new Error(`Not a participant key: ${key}`);
+  await recoverDeadKeyLock(mesh, path.join(mesh.root, DIR, ".locks", path.basename(file, ".json")));
 };
 
 /** Retry preparation only: fresh native key-holder evidence/recovery occurs outside

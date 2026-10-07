@@ -42,6 +42,81 @@ const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const own = (object: object, key: string): boolean => Object.hasOwn(object, key);
 
+/*
+ * Kernel ctime witness (smarty-dev#4250, pi-fabric#560).
+ *
+ * Problem: an authoritative read must bind a journal-followed terminal endpoint to the bytes of
+ * state.json (security review of #560, P2). Hashing the 4-5 MB payload once per change in every
+ * idle reader (lifecycle broker, residency drain, heartbeat, inbox) costs ~3.9 MB/s per reader.
+ *
+ * Witness: right after the canonical writer renames state.json into place, still under the mesh
+ * lock, it records (dev, ino, size, ctimeNs, mtimeNs) of its own inode (fstat on a descriptor
+ * opened on the staged file before the rename) together with the payload hash it just wrote, the
+ * chain hash and the generation, in the read signal
+ * (state.read-signal.json, header first). A reader fstats the descriptor it opened (never the
+ * path) and, on an exact tuple match with a witness for the same generation, chain hash and
+ * chain-bound payload hash, accepts that payload hash without reading state.json. Any mismatch,
+ * a missing, damaged or old-format signal, or Windows (where a user process can set the change
+ * time) falls back to the full streaming hash: fail closed.
+ *
+ * Why the tuple binds the bytes: user processes cannot set ctime. utimes/futimens set only
+ * atime/mtime, and every write, truncate, chmod, link or rename updates ctime; a replacement is a
+ * new inode. So "same dev+ino, same size, same ctimeNs" means no change since the writer's stat.
+ * The copied-marker replacement (new inode), an mtime-restored replacement (ctime/inode differ)
+ * and an in-place rewrite with the mtime restored (ctime differs) are all detected.
+ *
+ * Trust model, stated precisely:
+ *  - A same-UID process can rewrite any file here, but cannot forge a kernel ctime without root or
+ *    a system clock change. The tuple therefore proves "unchanged since the writer recorded it"
+ *    against every writer that does not also rewrite the witness: legacy Pi writers, restores,
+ *    sync tools, editors and the copied-marker forger of the P2 review (which rewrites the
+ *    journal's terminal record but cannot make the witness match a new ctime).
+ *  - The witness itself is a same-UID file. A forger who rewrites state.json AND the signal's
+ *    witness to the new tuple is accepted: readers that follow the journal then serve the chain
+ *    state while a canonical parse serves the forged bytes. This is a divergence, not an
+ *    escalation: the same principal can already write any state (with a self-consistent header and
+ *    chain), replace this package's code or ptrace the reader, so no file-based binding can
+ *    exclude it. The full re-hash excluded only the divergence, at ~3.9 MB/s per idle reader.
+ *  - Timestamp granularity: kernels before 6.13 (no multigrain timestamps) stamp ctime from the
+ *    coarse clock (one timer tick, 1-4 ms). A same-size IN-PLACE rewrite (no Pi writer does that:
+ *    they rename) that lands in the same tick as the writer's rename keeps the tuple. Rename-based
+ *    replacements are always detected (new inode).
+ */
+const WITNESS_HEADER = /^\{"generation":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})","witness":(\{[^{}]{1,1024}\})/;
+const WITNESS_HEADER_BYTES = 1536;
+/** The kernel tuple of a just-renamed state.json plus the hashes its writer just wrote. */
+export interface StateWitness { dev: string; ino: string; size: string; ctimeNs: string; mtimeNs: string; chainHash: string; payloadHash: string }
+const tupleOf = (stat: fs.BigIntStats) => ({ dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+  ctimeNs: String(stat.ctimeNs), mtimeNs: String(stat.mtimeNs) });
+/** Writer side, under the mesh lock right after the rename. Undefined where ctime is not a kernel witness. */
+export const stateWitnessOf = (stat: fs.BigIntStats, chainHash: string, payloadHash: string): StateWitness | undefined =>
+  process.platform === "win32" || typeof stat.ctimeNs !== "bigint" || stat.ctimeNs <= 0n || stat.ino <= 0n
+    ? undefined : { ...tupleOf(stat), chainHash, payloadHash };
+export const sameWitnessTuple = (stat: fs.BigIntStats, witness: StateWitness): boolean => {
+  const tuple = tupleOf(stat);
+  return tuple.dev === witness.dev && tuple.ino === witness.ino && tuple.size === witness.size &&
+    tuple.ctimeNs === witness.ctimeNs && tuple.mtimeNs === witness.mtimeNs;
+};
+/** Reader side: the signal's witness when it names exactly this fstat tuple, else undefined (fall back). */
+export const readStateWitness = (root: string, stat: fs.BigIntStats): (StateWitness & { generation: string }) | undefined => {
+  if (process.platform === "win32" || typeof stat.ctimeNs !== "bigint" || stat.ctimeNs <= 0n || stat.ino <= 0n) return undefined;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(path.join(root, "state.read-signal.json"), "r");
+    const buffer = Buffer.allocUnsafe(WITNESS_HEADER_BYTES);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const match = WITNESS_HEADER.exec(buffer.toString("utf8", 0, read));
+    if (!match) return undefined;
+    const witness: unknown = JSON.parse(match[2]!);
+    if (!record(witness) || !["dev", "ino", "size", "ctimeNs", "mtimeNs"].every(key => typeof witness[key] === "string" && /^\d+$/.test(witness[key] as string)) ||
+      typeof witness.chainHash !== "string" || !/^[0-9a-f]{64}$/.test(witness.chainHash) ||
+      typeof witness.payloadHash !== "string" || !/^[0-9a-f]{64}$/.test(witness.payloadHash)) return undefined;
+    const parsed = witness as unknown as StateWitness;
+    return sameWitnessTuple(stat, parsed) ? { ...parsed, generation: match[1]! } : undefined;
+  } catch { return undefined; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
+};
+
 /** Nanosecond metadata includes rename/in-place identity, not just lossy mtime milliseconds.
  * Usable Windows file ids and change/creation times need no payload read. Adapters without
  * nanosecond metadata retain the conservative header/payload fallback; Windows adapters
@@ -128,6 +203,15 @@ const verifyCanonicalPayload = (root: string, generation: string, chainHash: str
     const generationField = `{"readGeneration":"${generation}"`;
     const prefix = Buffer.from(`${generationField},"readJournalHash":"${chainHash}"`);
     const physical = identityOf(stat);
+    // Kernel witness (see above): the writer's own record that THIS inode, unchanged since its
+    // stat (same ctime), carries exactly this generation, chain head and payload hash.
+    if (physical === identity) {
+      const witness = readStateWitness(root, stat);
+      if (witness && witness.generation === generation && witness.chainHash === chainHash && witness.payloadHash === expected) {
+        fs.closeSync(fd); fd = undefined;
+        return stateReadIdentity(file) === identity; // the path still names the witnessed inode
+      }
+    }
     if (physical !== identity) {
       // A no-file-id Windows adapter uses the conservative content identity. Only
       // that recovery path needs a full path read, with no handle retained across it.
@@ -161,7 +245,7 @@ const verifyCanonicalPayload = (root: string, generation: string, chainHash: str
 export const verifyStateJournalEndpoint = (root: string, endpoint: JournalEndpoint): boolean =>
   verifyCanonicalPayload(root, endpoint.generation, endpoint.chainHash, endpoint.identity, endpoint.payloadHash);
 
-interface PreparedStateJournal { hash: string; text: string }
+interface PreparedStateJournal { hash: string; text: string; payloadHash: string }
 /** Prepare a hash chain before the canonical rename. Its hash is committed IN state.json's
  * bounded header, so a forged/self-checksummed sidecar cannot supply fresh authority. */
 export const prepareStateJournal = (state: JournalState, base: JournalBase | undefined,
@@ -181,8 +265,9 @@ export const prepareStateJournal = (state: JournalState, base: JournalBase | und
     // Format 2 chains the predecessor's whole endpoint: its physical identity AND its stat stamp
     // are inside this record's hash, which the canonical header commits. A record's own endpoint
     // is only known after the rename, so the terminal endpoint is bound by its payload hash.
+    const payloadHash = digest(canonicalPayload);
     const head = JSON.stringify({ format: 2, previous: base.generation, previousIdentity: base.identity, previousStamp: base.stamp,
-      previousHash: base.hash ?? null, generation: state.readGeneration, canonicalPayloadHash: digest(canonicalPayload), envelope });
+      previousHash: base.hash ?? null, generation: state.readGeneration, canonicalPayloadHash: payloadHash, envelope });
     const members = Object.keys(entries).map(key => `${JSON.stringify(key)}:${entries[key]}`).join(",");
     const tombstones = JSON.stringify(tombstoneOrder);
     // A changed order is published as a patch when that is smaller: a delete or a recreate
@@ -195,7 +280,7 @@ export const prepareStateJournal = (state: JournalState, base: JournalBase | und
     const text = `${head.slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
       (tombstones === base.tombstoneOrder ? "" : usePatch ? `,"tombstonePatch":${patchText}` : `,"tombstoneOrder":${tombstones ?? "[]"}`) + "}";
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES - 1024) return undefined;
-    return { hash: digest(text), text };
+    return { hash: digest(text), text, payloadHash };
   } catch { return undefined; }
 };
 

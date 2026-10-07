@@ -2,7 +2,7 @@ import { createCommitStats } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
-  type JournalBase, type JournalCursor, type JournalEndpoint } from "./read-journal.js";
+  readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -1730,6 +1730,15 @@ export class MeshStore {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#statePath, "r");
+      // Kernel witness (read-journal.ts): an fstat tuple the writer recorded with this generation
+      // and chain head proves the header bytes too, so they need not be read.
+      const witness = readStateWitness(this.root, fs.fstatSync(descriptor, { bigint: true }));
+      if (witness) {
+        if (identity !== undefined && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity) {
+          this.#canonicalHeader = { identity, generation: witness.generation, journalHash: witness.chainHash };
+        }
+        return witness.generation;
+      }
       const buffer = Buffer.alloc(192);
       const read = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
       const header = buffer.toString("latin1", 0, read);
@@ -1898,14 +1907,27 @@ export class MeshStore {
 
   #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
-    if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
-    else writeFileAtomic(this.#statePath, encoded.serialized);
+    // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
+    // on the staged file before the rename, so a replacement right after the rename cannot borrow
+    // this payload's hash. ctime is read after the rename (rename updates it).
+    let staged: number | undefined;
+    if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
+    let witnessStat: fs.BigIntStats | undefined;
+    try {
+      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
+      else writeFileAtomic(this.#statePath, encoded.serialized);
+      if (journal) {
+        try { witnessStat = staged !== undefined ? fs.fstatSync(staged, { bigint: true }) : fs.statSync(this.#statePath, { bigint: true }); }
+        catch { /* no witness: readers hash */ }
+      }
+    } finally { closeQuietly(staged); }
     commitStats?.record(encoded.serialized.byteLength, keys);
     const stamp = statStamp(this.#statePath);
     let journalCursor: JournalCursor | undefined;
     if (stamp !== undefined) {
       if (this.#writeReadJournal) journalCursor = appendStateJournal(this.root, journal, stamp);
-      this.#writeSignal(encoded.entries, stamp, generation, namespaces);
+      const witness = journal && witnessStat ? stateWitnessOf(witnessStat, journal.hash, journal.payloadHash) : undefined;
+      this.#writeSignal(encoded.entries, stamp, generation, namespaces, witness);
     }
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
     // Under the lock our record ends the journal: the next read follows from there by offset.
@@ -1942,11 +1964,14 @@ export class MeshStore {
   }
 
   #writeSignal(entries: Map<string, EncodedStateEntry>, stamp: string, generation: string,
-    namespaces = this.#signalNamespaces(entries)): boolean {
+    namespaces = this.#signalNamespaces(entries), witness?: StateWitness): boolean {
     try {
       if (!namespaces || statStamp(this.#statePath) !== stamp) return false;   // replaced while preparing: publish nothing
+      // The witness only while the path still names exactly the witnessed inode, unchanged.
+      if (witness && !sameWitnessTuple(fs.statSync(this.#statePath, { bigint: true }), witness)) witness = undefined;
       // `generation` first: readers take it from the file's first HEADER_BYTES; it must equal the canonical readGeneration.
-      const serialized = JSON.stringify({ generation, stamp, namespaces });
+      // The kernel witness second, so a reader binds it from one bounded header read.
+      const serialized = JSON.stringify({ generation, ...(witness ? { witness } : {}), stamp, namespaces });
       if (Buffer.byteLength(serialized, "utf8") > MAX_SIGNAL_BYTES) return false;
       writeFileAtomic(this.#signalPath, serialized);
       return true;

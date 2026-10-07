@@ -29,6 +29,8 @@ const fixture = async (options: ConstructorParameters<typeof MeshStore>[3] = {})
   return { root, writer, reader, file, journal, bytes, parses, rows };
 };
 const disk = (file: string) => JSON.parse(fs.readFileSync(file, "utf8"));
+// Drop the kernel witness (smarty-dev#4250), so a read must take the streaming payload hash fallback.
+const noWitness = (root: string) => fs.rmSync(path.join(root, "state.read-signal.json"), { force: true });
 const display = { displayOnly: true } as const;
 const stampOf = (file: string) => { const stat = fs.statSync(file); return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`; };
 const reseal = (row: { checksum: string; delta: unknown }) => {
@@ -56,10 +58,11 @@ describe("read journal offset follow (smarty-dev#4250)", () => {
     expect(f.reader.listAll("bulk/")).toEqual(new MeshStore(f.root, 256 * 1024, 1000).listAll("bulk/"));
   });
 
-  it.each([{}, { fresh: true }])("an authoritative read (%o) binds the display-followed endpoint to the canonical payload once", async options => {
+  it.each([{}, { fresh: true }])("without a kernel witness an authoritative read (%o) binds the display-followed endpoint by one payload hash", async options => {
     const f = await fixture();
     await f.writer.put({ key: "field/heartbeat", value: 1, identity });
     expect(f.reader.get("field/heartbeat", display)?.value).toBe(1);
+    noWitness(f.root);
     const before = f.bytes();
     expect(f.reader.get("field/heartbeat", options)?.value).toBe(1);
     expect(f.bytes() - before).toBeGreaterThan(fs.statSync(f.file).size - 1024); // one payload hash
@@ -69,10 +72,11 @@ describe("read journal offset follow (smarty-dev#4250)", () => {
     expect(f.bytes() - again).toBeLessThan(1024); // bound once, not per read
   });
 
-  it("an ordinary read binds every followed endpoint before serving it", async () => {
+  it("without a kernel witness an ordinary read binds every followed endpoint by a payload hash", async () => {
     const f = await fixture();
     for (let n = 1; n <= 3; n++) {
       await f.writer.put({ key: "field/heartbeat", value: n, identity });
+      noWitness(f.root);
       const before = f.bytes(), parses = f.parses();
       expect(f.reader.get("field/heartbeat")?.value).toBe(n);
       expect(f.parses()).toBe(parses); // still a journal follow, not a full parse
@@ -147,6 +151,7 @@ describe("read journal offset follow (smarty-dev#4250)", () => {
     const rotated = f.journal + ".next";
     fs.writeFileSync(rotated, fs.readFileSync(f.journal)); // same records, new inode
     fs.renameSync(rotated, f.journal);
+    noWitness(f.root);
     const parses = f.parses(), before = f.bytes();
     expect(f.reader.get("field/heartbeat")?.value).toBe(2);
     expect(f.parses()).toBe(parses);

@@ -381,6 +381,8 @@ describe("incremental state read journal", () => {
     if (mode === "win32") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
       const f = await fixture(); await f.writer.put({ key: "field/bulk/utf8", value: "雪😀".repeat(15000), identity });
+      // No kernel witness (smarty-dev#4250): this exercises the streaming payload hash fallback.
+      fs.rmSync(path.join(f.root, "state.read-signal.json"), { force: true });
       const state = f.disk(), read = fs.readSync.bind(fs), before = f.count();
       let injected = false;
       const replace = () => {

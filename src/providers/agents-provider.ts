@@ -10,7 +10,7 @@ import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } fr
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
-import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
+import { normalizeActorActivationFilter, normalizeActorActivationReservation, normalizeActorActivationObservation } from "../actors/activation-filter.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -1474,18 +1474,24 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
       }
       case "setActivationFilter": {
-        if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
-        const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        if (args.activationFilter === undefined && args.observation === undefined) throw new Error("activationFilter is required (or provide observation)");
+        const activationFilter = args.activationFilter === undefined ? undefined : args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        const reservation = args.reservation === undefined ? undefined : normalizeActorActivationReservation(args.reservation, Date.now());
+        const observation = args.observation === undefined ? undefined : normalizeActorActivationObservation(args.observation);
+        if (observation && (activationFilter !== undefined || reservation !== undefined || args.expiresAt !== undefined)) throw new Error("activationFilter observation cannot replace a filter");
+        const reservationToken = args.reservationToken;
+        if (reservationToken !== undefined && (typeof reservationToken !== "string" || reservationToken.length === 0 || reservationToken.length > 512)) throw new Error("reservationToken must be the capability string returned when the reservation was set");
         const expiresAt = args.expiresAt;
         if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
         if (args.scope === "global") {
-          if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
-          return this.globalActors.update(String(args.id), { activationFilter });
+          if (expiresAt !== undefined || reservation || observation || reservationToken !== undefined) throw new Error("expiresAt and reservation lifecycle are only supported for live actors");
+          return this.globalActors.update(String(args.id), { activationFilter: activationFilter! });
         }
-        const expiry = expiresAt === undefined ? {} : { expiresAt };
+        const expiry = { ...(expiresAt === undefined ? {} : { expiresAt }), ...(reservation ? { reservation } : {}), ...(observation ? { observation } : {}),
+          ...(reservationToken === undefined ? {} : { reservationToken: reservationToken as string }) };
         const resident = await this.#residentActorOwner(String(args.id));
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, ...(activationFilter === undefined ? {} : { activationFilter }), ...expiry }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, reservation, observation, reservationToken as string | undefined);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)

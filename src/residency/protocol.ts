@@ -13,6 +13,7 @@ import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { ActorActivationFilterReservationRequest, ActorActivationFilterObservation } from "../actors/activation-filter.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
@@ -531,7 +532,7 @@ export type ResidentActorMutation =
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
-  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number };
+  | { operation: "setActivationFilter"; id: string; activationFilter?: FabricActorActivationFilter | null; expiresAt?: number; reservation?: ActorActivationFilterReservationRequest; observation?: ActorActivationFilterObservation; reservationToken?: string };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;

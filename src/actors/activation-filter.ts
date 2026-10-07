@@ -261,3 +261,186 @@ export function activationFilterSkip(
   }
   return undefined;
 }
+
+/** P0 reservations are bounded independently of model/run timeouts. */
+export const ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS = 4 * 60 * 60 * 1_000;
+
+interface ActorActivationFilterSubject {
+  repository: string;
+  pr: number;
+  /** Full GitHub head SHA, never an abbreviation. */
+  head: string;
+}
+
+export interface ActorActivationFilterIdentity extends ActorActivationFilterSubject {
+  /**
+   * Manager-issued, never caller-supplied generation (a random UUID). It fences a
+   * successor reservation even at the same repository/PR/head and creation millisecond.
+   */
+  generation: string;
+}
+
+/** Caller input for a new P0 reservation: the owning manager issues its generation and token. */
+export interface ActorActivationFilterReservationRequest extends ActorActivationFilterSubject {
+  /** Creation time; bounds the hard TTL. Not an identity fence. */
+  createdAt: number;
+  expiresAt: number;
+  runId?: string;
+  requiredSecurity: string[];
+}
+
+export interface ActorActivationFilterReservation extends ActorActivationFilterIdentity {
+  createdAt: number;
+  expiresAt: number;
+  /** Native run identity whose terminal outcome releases this reservation. */
+  runId?: string;
+  requiredSecurity: string[];
+  /** Accumulated exact-identity verdict evidence; set only by native observations. */
+  reviewTerminal?: true;
+  securityTerminal?: string[];
+}
+
+export interface ActorActivationFilterObservation extends ActorActivationFilterIdentity {
+  currentHead?: string;
+  prState?: "open" | "closed" | "merged";
+  reviewTerminal?: true;
+  securityTerminal?: string[];
+  /** Trusted terminal evidence for a run on a different owning host. */
+  runId?: string;
+  runStatus?: "completed" | "failed" | "stopped" | "timed_out";
+}
+
+export interface ActorActivationFilterRelease {
+  reservation: ActorActivationFilterReservation;
+  reason: "explicit" | "replaced" | "expired" | "head-changed" | "pr-closed" | "verdicts-terminal" | "run-terminal";
+  at: number;
+  observation?: ActorActivationFilterObservation;
+  runStatus?: "completed" | "failed" | "stopped" | "timed_out";
+}
+
+const FULL_HEAD = /^[a-f0-9]{40}$/;
+/** Manager-issued generation: a random UUID. */
+export const ACTOR_ACTIVATION_GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** SHA-256 hex of a reservation capability token. Only the digest is stored. */
+export const ACTOR_ACTIVATION_TOKEN_DIGEST = /^[0-9a-f]{64}$/;
+function filterSubject(value: unknown): ActorActivationFilterSubject {
+  if (!isRecord(value) || typeof value.repository !== "string" ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.repository) || value.repository.length > 200 ||
+    !Number.isSafeInteger(value.pr) || (value.pr as number) < 1 ||
+    typeof value.head !== "string" || !FULL_HEAD.test(value.head)) {
+    throw new Error("Invalid activationFilter identity: repository, positive PR and full head SHA are required");
+  }
+  return { repository: value.repository.toLowerCase(), pr: value.pr as number, head: value.head };
+}
+function filterIdentity(value: unknown): ActorActivationFilterIdentity {
+  const subject = filterSubject(value);
+  const generation = (value as Record<string, unknown>).generation;
+  if (typeof generation !== "string" || !ACTOR_ACTIVATION_GENERATION.test(generation)) {
+    throw new Error("Invalid activationFilter identity: the manager-issued reservation generation is required");
+  }
+  return { ...subject, generation };
+}
+function creationTime(value: unknown): number {
+  const createdAt = (value as Record<string, unknown>).createdAt;
+  if (typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt < 0) {
+    throw new Error("Invalid activationFilter reservation: creation time is required");
+  }
+  return createdAt;
+}
+
+function securityNames(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 32 ||
+    !value.every(name => typeof name === "string" && RULE_ID.test(name)) || new Set(value).size !== value.length) {
+    throw new Error("Invalid activationFilter security verdict names");
+  }
+  return [...value] as string[];
+}
+
+function reservationBounds(value: unknown, now: number | undefined): Omit<ActorActivationFilterReservationRequest, keyof ActorActivationFilterSubject> {
+  const createdAt = creationTime(value);
+  const row = value as Record<string, unknown>;
+  if (typeof row.expiresAt !== "number" || !Number.isSafeInteger(row.expiresAt) ||
+    row.expiresAt <= createdAt || row.expiresAt - createdAt > ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS ||
+    (now !== undefined && (createdAt > now || row.expiresAt <= now))) {
+    throw new Error("Invalid activationFilter reservation: hard TTL must be positive, unexpired and at most 4 hours from creation");
+  }
+  if (row.runId !== undefined && (typeof row.runId !== "string" || row.runId.length === 0 || row.runId.length > 200)) {
+    throw new Error("Invalid activationFilter reservation runId");
+  }
+  return { createdAt, expiresAt: row.expiresAt, requiredSecurity: securityNames(row.requiredSecurity),
+    ...(row.runId === undefined ? {} : { runId: row.runId as string }) };
+}
+
+/**
+ * Validate a caller's reservation request. Generation and verdict evidence are never
+ * accepted from the caller: the owning manager issues the generation and capability,
+ * and only authorized observations accumulate evidence.
+ */
+export function normalizeActorActivationReservation(value: unknown, now?: number): ActorActivationFilterReservationRequest {
+  const subject = filterSubject(value);
+  const row = value as Record<string, unknown>;
+  if (row.generation !== undefined) throw new Error("Invalid activationFilter reservation: the generation is manager-issued, never supplied by the caller");
+  if (row.reviewTerminal !== undefined || row.securityTerminal !== undefined) throw new Error("Set verdict evidence through activationFilter observation, not reservation");
+  return { ...subject, ...reservationBounds(value, now) };
+}
+
+/** Validate a persisted reservation written by the owning manager (generation included). */
+export function normalizeStoredActorActivationReservation(value: unknown): ActorActivationFilterReservation {
+  const identity = filterIdentity(value);
+  const bounds = reservationBounds(value, undefined);
+  const row = value as Record<string, unknown>;
+  if (row.reviewTerminal !== undefined && row.reviewTerminal !== true) throw new Error("Invalid activationFilter reviewTerminal");
+  const securityTerminal = row.securityTerminal === undefined ? undefined : securityNames(row.securityTerminal);
+  if (securityTerminal?.some(name => !bounds.requiredSecurity.includes(name))) throw new Error("Unknown activationFilter security verdict");
+  return { ...identity, ...bounds,
+    ...(row.reviewTerminal === true ? { reviewTerminal: true } : {}),
+    ...(securityTerminal === undefined ? {} : { securityTerminal }) };
+}
+
+export function normalizeActorActivationObservation(value: unknown): ActorActivationFilterObservation {
+  const identity = filterIdentity(value);
+  const row = value as Record<string, unknown>;
+  if (row.currentHead !== undefined && (typeof row.currentHead !== "string" || !FULL_HEAD.test(row.currentHead))) throw new Error("Invalid activationFilter currentHead");
+  if (row.prState !== undefined && !["open", "closed", "merged"].includes(row.prState as string)) throw new Error("Invalid activationFilter prState");
+  if (row.reviewTerminal !== undefined && row.reviewTerminal !== true) throw new Error("Invalid activationFilter reviewTerminal");
+  if (row.runId !== undefined || row.runStatus !== undefined) {
+    if (typeof row.runId !== "string" || row.runId.length === 0 || row.runId.length > 200 ||
+      !["completed", "failed", "stopped", "timed_out"].includes(row.runStatus as string)) throw new Error("Invalid activationFilter terminal run evidence");
+  }
+  if (row.currentHead === undefined && row.prState === undefined && row.reviewTerminal === undefined && row.securityTerminal === undefined && row.runStatus === undefined) {
+    throw new Error("activationFilter observation requires lifecycle evidence");
+  }
+  return { ...identity,
+    ...(row.currentHead === undefined ? {} : { currentHead: row.currentHead as string }),
+    ...(row.prState === undefined ? {} : { prState: row.prState as "open" | "closed" | "merged" }),
+    ...(row.reviewTerminal === true ? { reviewTerminal: true } : {}),
+    ...(row.securityTerminal === undefined ? {} : { securityTerminal: securityNames(row.securityTerminal) }),
+    ...(row.runId === undefined ? {} : { runId: row.runId as string, runStatus: row.runStatus as NonNullable<ActorActivationFilterObservation["runStatus"]> }) };
+}
+
+export function sameActorActivationIdentity(a: ActorActivationFilterIdentity, b: ActorActivationFilterIdentity): boolean {
+  return a.repository === b.repository && a.pr === b.pr && a.head === b.head && a.generation === b.generation;
+}
+
+/** Pure cached-state check. Missing webhook/projected identity means deliver, never guess. */
+export function activationPrInvalidReason(
+  reservation: ActorActivationFilterReservation | undefined,
+  release: ActorActivationFilterRelease | undefined,
+  source: string,
+  payload: unknown,
+): string | undefined {
+  if (!source.startsWith("mesh:") || (!reservation && release?.reason !== "head-changed" && release?.reason !== "pr-closed")) return undefined;
+  const state = reservation ?? release?.reservation;
+  if (!state) return undefined;
+  const first = (paths: string[]) => paths.flatMap(path => valuesAt(payload, path))[0];
+  const repository = first(["data.payload.repository.full_name", "data.payload.repository", "data.repository"]);
+  const pr = first(["data.payload.pull_request.number", "data.payload.number"]);
+  const head = first(["data.payload.pull_request.head.sha", "data.payload.head", "data.payload.headSha"]);
+  if (typeof repository !== "string" || repository.toLowerCase() !== state.repository || pr !== state.pr || typeof head !== "string" || !FULL_HEAD.test(head)) return undefined;
+  const observation = !reservation ? release?.observation : undefined;
+  if (observation?.prState === "closed" || observation?.prState === "merged") return "PR closed or merged";
+  const currentHead = observation?.currentHead ?? state.head;
+  // A released old-head reservation invalidates that old head, not future
+  // ordinary heads. It is not a permanent PR-head registry.
+  return head !== currentHead && (reservation !== undefined || head === state.head) ? "PR head changed" : undefined;
+}

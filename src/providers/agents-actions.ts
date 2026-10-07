@@ -215,6 +215,34 @@ const activationFilterSchema = {
     ],
   },
 };
+const activationSubjectProperties = {
+  repository: { type: "string", pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", maxLength: 200 },
+  pr: { type: "integer", minimum: 1 },
+  head: { type: "string", pattern: "^[a-f0-9]{40}$" },
+};
+const securityVerdictsSchema = { type: "array", maxItems: 32, uniqueItems: true, items: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$" } };
+const activationReservationSchema = {
+  type: "object", additionalProperties: false,
+  properties: { ...activationSubjectProperties,
+    createdAt: { type: "integer", minimum: 0, description: "Epoch ms creation time; bounds the hard TTL (not an identity fence: the owning manager issues the generation)." },
+    expiresAt: { type: "integer", description: "Hard deadline, positive and at most 4h after createdAt; must be unexpired when setting." },
+    runId: { type: "string", minLength: 1, maxLength: 200 },
+    requiredSecurity: securityVerdictsSchema },
+  required: ["repository", "pr", "head", "createdAt", "expiresAt", "requiredSecurity"],
+};
+const activationObservationSchema = {
+  type: "object", additionalProperties: false,
+  properties: { ...activationSubjectProperties,
+    generation: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", description: "Manager-issued activationFilterReservation.generation." },
+    currentHead: { type: "string", pattern: "^[a-f0-9]{40}$" },
+    prState: { type: "string", enum: ["open", "closed", "merged"] },
+    reviewTerminal: { const: true }, securityTerminal: securityVerdictsSchema,
+    runId: { type: "string", minLength: 1, maxLength: 200 },
+    runStatus: { type: "string", enum: ["completed", "failed", "stopped", "timed_out"] } },
+  required: ["repository", "pr", "head", "generation"],
+  dependentRequired: { runId: ["runStatus"], runStatus: ["runId"] },
+  anyOf: ["currentHead", "prState", "reviewTerminal", "securityTerminal", "runStatus"].map(key => ({ required: [key] })),
+};
 const actorInstructionsProperties = {
   instructions: { type: "string" },
   instructionsFile: { type: "string", minLength: 1, description: "Instructions file on the owning host under agents.instructionsRoot (default ~/.local/share/smarty-dev/factory/current/). Regular UTF-8 file, max 512 KB; no '..' or symlink escape." },
@@ -725,16 +753,23 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setActivationFilter",
-    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. Applies from the next queued event and resets filterSkipped. Optional expiresAt (epoch ms, live actors only) clears on the next event or poll, with an actor audit message.",
+    description: "Set/clear the skip-only activation filter, or submit an exact-identity lifecycle observation instead of activationFilter. A live P0 reservation binds repository/PR/full head plus a manager-issued generation, returns a one-time activationFilterReservationToken (required for observations and to replace/clear the reserved filter), requires a hard TTL <=4h, and releases on PR change/close, exact terminal review plus all required security verdicts, matching terminal run, or TTL. Returns owning-host status with retained release evidence; retry uncertain observations and verify actorStatus readback.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
         expiresAt: { type: "number", description: "Epoch milliseconds; clear at/after this time on the next event or poll. Live actors only." },
+        reservation: activationReservationSchema,
+        observation: activationObservationSchema,
+        reservationToken: { type: "string", minLength: 1, maxLength: 512, description: "Capability returned once as activationFilterReservationToken when the reservation was set. Required for observations, and to replace or clear a reserved filter." },
         scope: { type: "string", enum: ["project", "global"] },
       },
-      required: ["id", "activationFilter"],
+      required: ["id"],
+      oneOf: [
+        { required: ["activationFilter"], not: { required: ["observation"] } },
+        { required: ["observation", "reservationToken"], not: { anyOf: [{ required: ["activationFilter"] }, { required: ["reservation"] }, { required: ["expiresAt"] }] } },
+      ],
       additionalProperties: false,
     },
     risk: "agent",

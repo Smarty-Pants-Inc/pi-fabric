@@ -918,7 +918,42 @@ await agents.setActivationFilter({
 });
 ```
 
-At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. `clearWhen` verdict-based clearing is not implemented: use expiry or explicitly clear after observing the PR's complete verdict.
+At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. Unscoped filters still use expiry or an explicit clear; scoped P0 reservations additionally support the native lifecycle below.
+
+#### Scoped P0 reservations and native lifecycle receipts
+
+For a P0 reservation, use the existing live-actor control with `reservation`. This adds identity and a **hard TTL of at most four hours from creation**; it does not change the skip rules or add a factory command protocol:
+
+```ts
+const createdAt = Date.now();
+const subject = { repository: "smarty/demo", pr: 7, head: "0123456789abcdef0123456789abcdef01234567" };
+const reserved = await agents.setActivationFilter({
+  id: "release-reviewer", activationFilter: [{ id: "p0", topic: ["github.demo"] }],
+  reservation: { ...subject, createdAt, expiresAt: createdAt + 60 * 60 * 1000, requiredSecurity: ["security"] },
+});
+// Issued by the owning manager and returned ONCE: keep the token with the native controller.
+const reservationToken = reserved.activationFilterReservationToken!;
+const identity = { ...subject, generation: reserved.activationFilterReservation!.generation };
+// The owning runtime persists each exact-identity observation. No registry-file edits.
+await agents.setActivationFilter({ id: reserved.id, reservationToken, observation: { ...identity, reviewTerminal: true } });
+const receipt = await agents.setActivationFilter({ id: reserved.id, reservationToken,
+  observation: { ...identity, securityTerminal: ["security"] } });
+const readback = await agents.actorStatus({ id: reserved.id });
+return { release: receipt.activationFilterRelease, readback: readback.activationFilterRelease };
+```
+
+The native factory-control consumer must submit authoritative lifecycle facts, not infer verdicts from prompt text, supervisor acknowledgments, or arbitrary mesh messages. `repository` is normalized to lowercase, `pr` is positive and `head` is a full lowercase 40-character SHA. `createdAt` only bounds the TTL.
+
+- **Generation.** The owning manager issues `activationFilterReservation.generation` (a random UUID); a caller cannot supply or reuse one. Even a same-millisecond successor at the same head gets a fresh generation, so a delayed observation for a different repository, PR, head, or generation cannot clear the successor.
+- **Capability (provenance).** The call that sets the reservation returns `activationFilterReservationToken` exactly once; status, lists and the registry never contain it (the registry stores only its SHA-256 digest, compared in constant time). Every observation must carry it as `reservationToken`; ordinary `agent`-risk callers without it are refused, so fabricated review, security, closed-PR or run evidence cannot release the filter.
+- **Guarded replacement.** While a reservation is held, setting another filter, a successor reservation, or clearing it requires the same `reservationToken`. The release is then recorded as `replaced` (or `explicit` for a clear) with the accumulated evidence retained and one audit message. An elapsed reservation is released as `expired` first and never blocks the next set; the hard TTL is the recovery path for a lost token. If the commit that issued a reservation fails, the issuance is rolled back, so no reservation is left whose token the caller never received.
+
+- Terminal review **and every named required security verdict** accumulate for that exact identity and release the reservation. Neither review alone nor incomplete security is sufficient. Names absent from `requiredSecurity` are rejected.
+- `observation: { ...identity, currentHead: "<full current SHA>" }` releases on a head change. `prState: "closed"` or `"merged"` releases immediately. Authoritative state must arrive through this supported control; dispatch never fetches GitHub. For mesh activations carrying that repository/PR/full-head identity, the cached binding refuses a stale event before it is enqueued (so a late old-head webhook never coalesces over newer-head work), drops stale queued work before a run, and rechecks after any asynchronous `validWhile`, immediately before delivering its result. Webhook `data.payload.repository.full_name`, `pull_request.number` and `pull_request.head.sha`, or projected repository/number/head fields are supported. Missing identity is not guessed. A released old-head binding invalidates its old head, not unrelated PRs or later ordinary heads.
+- Optional `reservation.runId` binds a native run claim. All terminal outcomes (`completed`, `failed`, `stopped`, `timed_out`, including thrown errors after launch) release it. Local actor completion releases immediately; other local runs are checked on maintenance polls. Remote run evidence uses the same observation with matching `runId` and `runStatus`; unknown runs are not terminal evidence and remain bounded by TTL.
+- The hard deadline persists across restart and clears before event filtering or on the existing idle poll, independent of run timeouts. No new timers, network calls, or per-event registry lock holds are added.
+
+`actorStatus` exposes `activationFilterReservation` and the retained `activationFilterRelease` (identity, accumulated verdicts, reason, time and final observation/run status). Await the owning-host receipt and verify readback; a failed/uncertain clear is **not** an acknowledgment. Retry the same exact-identity observation: retained evidence is republished without a second release audit and cannot clear a successor. Existing `filterSkipped.count`, `lastKey`, `lastTopic` and `lastAt` distinguish actual exclusion from no progress; clearing resets these per-filter counters, not the lifetime count. Global templates do not support reservation lifecycle controls.
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
 

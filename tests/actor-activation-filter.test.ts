@@ -1,13 +1,26 @@
 import fs from "node:fs";
 import os from "node:os";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
+import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import * as predicate from "../src/actors/predicate.js";
 import {
+  ACTOR_ACTIVATION_GENERATION,
+  normalizeStoredActorActivationReservation,
+  type ActorActivationFilterReservationRequest,
   activationFilterSkip,
   normalizeActorActivationFilter,
+  normalizeActorActivationReservation,
+  normalizeActorActivationObservation,
+  activationPrInvalidReason,
+  ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS,
+  type ActorActivationFilterReservation,
+  type ActorActivationFilterObservation,
   type FabricActorActivationFilter,
 } from "../src/actors/activation-filter.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -219,14 +232,15 @@ afterEach(async () => {
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-"))) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-")),
+  actorOptions: NonNullable<ConstructorParameters<typeof ActorManager>[6]> = {}, maxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-    actorRoot: path.join(root, "actors"), persistent: true,
+    actorRoot: path.join(root, "actors"), persistent: true, ...actorOptions,
   });
   closers.push(async () => { await actors.close(); await agents.close(); });
   return { root, mesh, agents, actors };
@@ -433,6 +447,426 @@ describe("actor activation filter in ActorManager", () => {
     const reset = await again.setActivationFilter(actor.id, []);
     expect(reset.activationFilterExpiresAt).toBeUndefined();
     expect(reset.filterSkipped.count).toBe(0);
+  });
+});
+
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+const p0Request = (changes: Partial<ActorActivationFilterReservationRequest> = {}): ActorActivationFilterReservationRequest => {
+  const createdAt = Date.now();
+  return { repository: "smarty/demo", pr: 7, head: HEAD_A, createdAt, expiresAt: createdAt + 60_000,
+    requiredSecurity: ["security", "dependencies"], ...changes };
+};
+interface HeldP0 { reservation: ActorActivationFilterReservation; token: string }
+/** Reserve through the owning manager: it issues the generation and the one-time capability. */
+const reserveP0 = async (actors: ActorManager, id: string, request: ActorActivationFilterReservationRequest,
+  filter: FabricActorActivationFilter = BOTH, reservationToken?: string): Promise<HeldP0> => {
+  const info = await actors.setActivationFilter(id, filter, undefined, undefined, request, undefined, reservationToken);
+  expect(info.activationFilterReservation).toMatchObject({ ...request, generation: expect.stringMatching(ACTOR_ACTIVATION_GENERATION) });
+  expect(info.activationFilterReservationToken).toEqual(expect.any(String));
+  return { reservation: info.activationFilterReservation!, token: info.activationFilterReservationToken! };
+};
+const identityOf = ({ repository, pr, head, generation }: ActorActivationFilterReservation) => ({ repository, pr, head, generation });
+const observeP0 = (actors: ActorManager, id: string, held: HeldP0,
+  evidence: Partial<ActorActivationFilterObservation>, token: string | null = held.token) =>
+  actors.setActivationFilter(id, undefined, undefined, undefined, undefined, { ...identityOf(held.reservation), ...evidence }, token ?? undefined);
+const prEvent = (head: string, extra: Record<string, unknown> = {}) => ({
+  event: "pull_request", payload: { repository: { full_name: "smarty/demo" }, number: 7,
+    pull_request: { number: 7, head: { sha: head } }, ...extra },
+});
+
+// smarty-dev#4440: P0 state is native, exact-identity fenced and independently bounded.
+describe("native P0 activation reservations", () => {
+  it("rejects unbounded, expired, abbreviated, caller-generated and forged verdict reservations", async () => {
+    const request = p0Request();
+    expect(normalizeActorActivationReservation({ ...request, repository: "Smarty/Demo" })).toEqual(request);
+    for (const changes of [{ head: "abc" }, { pr: 0 }, { repository: "demo" },
+      { createdAt: request.createdAt + 100_000 }, { expiresAt: request.createdAt },
+      { expiresAt: request.createdAt + ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS + 1 }]) {
+      expect(() => normalizeActorActivationReservation({ ...request, ...changes }, request.createdAt)).toThrow();
+    }
+    expect(() => normalizeActorActivationReservation(request, request.expiresAt)).toThrow("hard TTL");
+    // The generation is manager-issued: a caller can never pick (or reuse) one.
+    expect(() => normalizeActorActivationReservation({ ...request, generation: randomUUID() })).toThrow("manager-issued");
+    expect(() => normalizeActorActivationObservation({ ...request, generation: randomUUID() })).toThrow("lifecycle evidence");
+    expect(() => normalizeActorActivationObservation({ ...request, createdAt: request.createdAt, reviewTerminal: true })).toThrow("generation");
+    const { actors } = setup();
+    const actor = await actors.create({ name: "bounded", instructions: "x" });
+    await expect(actors.setActivationFilter(actor.id, [], undefined, undefined, request)).rejects.toThrow("non-empty");
+    await expect(actors.setActivationFilter(actor.id, BOTH, undefined, request.expiresAt + 1, request)).rejects.toThrow("matching expiresAt");
+    await expect(actors.setActivationFilter(actor.id, BOTH, undefined, undefined, { ...request, reviewTerminal: true } as never)).rejects.toThrow("observation");
+    const held = await reserveP0(actors, actor.id, request);
+    await expect(observeP0(actors, actor.id, held, { runId: "run", runStatus: "running" as never })).rejects.toThrow("terminal run evidence");
+  });
+
+  it("security P1: accepts lifecycle evidence only with the manager-issued capability, never from ordinary callers", async () => {
+    const { actors, root } = setup();
+    const actor = await actors.create({ name: "provenance", instructions: "x" });
+    const other = await actors.create({ name: "other", instructions: "x" });
+    const held = await reserveP0(actors, actor.id, p0Request({ requiredSecurity: [] }));
+    const foreign = await reserveP0(actors, other.id, p0Request({ requiredSecurity: [] }));
+    // Status reads never disclose the capability or its digest.
+    expect(actors.status(actor.id).activationFilterReservationToken).toBeUndefined();
+    expect(JSON.stringify(actors.status(actor.id))).not.toContain(held.token);
+    expect(JSON.stringify(actors.list())).not.toMatch(/TokenSha256/);
+    for (const token of [null, "", "forged", foreign.token, held.token + "x"]) {
+      for (const evidence of [{ reviewTerminal: true as const }, { prState: "closed" as const }, { currentHead: HEAD_B }, { runId: "run", runStatus: "completed" as const }]) {
+        await expect(observeP0(actors, actor.id, held, evidence, token)).rejects.toThrow("not authorized");
+      }
+    }
+    expect(actors.status(actor.id).activationFilterReservation).toEqual(held.reservation);
+    expect(actors.status(actor.id).activationFilter).toEqual(BOTH);
+    // The registry keeps only the SHA-256 digest; the raw token is never persisted.
+    const registry = fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8");
+    expect(registry).not.toContain(held.token);
+    expect(registry).toContain(createHash("sha256").update(held.token).digest("hex"));
+    const receipt = await observeP0(actors, actor.id, held, { reviewTerminal: true });
+    expect(receipt.activationFilterRelease).toMatchObject({ reason: "verdicts-terminal", reservation: { ...held.reservation, reviewTerminal: true } });
+    // A retained receipt is republished only for its capability holder too.
+    await expect(observeP0(actors, actor.id, held, { reviewTerminal: true }, foreign.token)).rejects.toThrow("not authorized");
+    await expect(observeP0(actors, actor.id, held, { reviewTerminal: true })).resolves.toMatchObject({ activationFilterRelease: receipt.activationFilterRelease });
+  });
+
+  it("security P1: refuses unscoped replacement or clear while reserved; the capability holder's release retains evidence", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "guarded", instructions: "x" });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    await observeP0(actors, actor.id, held, { reviewTerminal: true });
+    const permissive: FabricActorActivationFilter = [{ id: "unrelated", topic: ["other.topic"] }];
+    for (const filter of [permissive, null, []] as const) {
+      await expect(actors.setActivationFilter(actor.id, filter as FabricActorActivationFilter | null)).rejects.toThrow("held by P0 reservation");
+      await expect(actors.setActivationFilter(actor.id, filter as FabricActorActivationFilter | null, undefined, undefined, undefined, undefined, "forged")).rejects.toThrow("held by P0 reservation");
+    }
+    await expect(actors.setActivationFilter(actor.id, BOTH, undefined, undefined, p0Request())).rejects.toThrow("held by P0 reservation");
+    expect(actors.status(actor.id)).toMatchObject({ activationFilter: BOTH, activationFilterReservation: { ...held.reservation, reviewTerminal: true } });
+    expect(actors.messages(actor.id).filter(message => message.source === "actor:activation-filter")).toEqual([]);
+    // Authorized replacement: predecessor released as "replaced" with its accumulated evidence and one audit.
+    const replaced = await actors.setActivationFilter(actor.id, permissive, undefined, undefined, undefined, undefined, held.token);
+    expect(replaced).toMatchObject({ activationFilter: permissive, activationFilterRelease: { reason: "replaced", reservation: { ...held.reservation, reviewTerminal: true } } });
+    expect(replaced.activationFilterReservation).toBeUndefined();
+    expect(actors.messages(actor.id).filter(message => message.reason === "activationFilter cleared: replaced")).toHaveLength(1);
+    // An elapsed reservation never blocks the next ordinary set: it is released as expired first.
+    const now = Date.now();
+    const short = await reserveP0(actors, actor.id, p0Request({ createdAt: now, expiresAt: now + 200 }));
+    await expect(actors.setActivationFilter(actor.id, null)).rejects.toThrow("held by P0 reservation");
+    await waitFor(() => Date.now() >= short.reservation.expiresAt);
+    const cleared = await actors.setActivationFilter(actor.id, null);
+    expect(cleared.activationFilterRelease).toMatchObject({ reason: "expired", reservation: short.reservation });
+  });
+
+  it("reproduces s2: three ordinary heads skipped until exact review AND every required security verdict", async () => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "s2", instructions: "x", topics: ["github.demo"], coalesceKey: "payload.number" });
+    const request = p0Request();
+    const held = await reserveP0(actors, actor.id, request, [{ id: "p0", topic: ["github.demo"] }]);
+    for (const head of [HEAD_B, "c".repeat(40), "d".repeat(40)]) {
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(head) });
+    }
+    await waitFor(() => actors.status(actor.id).filterSkipped.count === 3);
+    expect(runDirs(root, actor.id)).toHaveLength(0);
+    expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 3,
+      lastKey: JSON.stringify(["mesh", "github.demo", 7]), lastAt: expect.any(Number) });
+    // Older head, another PR/repository, or another generation cannot clear.
+    for (const stale of [{ head: HEAD_B }, { pr: 8 }, { repository: "smarty/other" }, { generation: randomUUID() }]) {
+      await observeP0(actors, actor.id, held, { ...stale, reviewTerminal: true, securityTerminal: ["security", "dependencies"] });
+      expect(actors.status(actor.id).activationFilterReservation).toEqual(held.reservation);
+    }
+    await expect(observeP0(actors, actor.id, held, { securityTerminal: ["unknown"] })).rejects.toThrow("required security");
+    await observeP0(actors, actor.id, held, { securityTerminal: ["security"] });
+    await observeP0(actors, actor.id, held, { reviewTerminal: true });
+    expect(actors.status(actor.id).activationFilterReservation).toMatchObject({ reviewTerminal: true, securityTerminal: ["security"] });
+    const receipt = await observeP0(actors, actor.id, held, { securityTerminal: ["dependencies"] });
+    expect(receipt.activationFilter).toBeUndefined();
+    expect(receipt.activationFilterRelease).toMatchObject({ reason: "verdicts-terminal", reservation: {
+      ...held.reservation, reviewTerminal: true, securityTerminal: ["security", "dependencies"] } });
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_B) });
+    await waitFor(() => runDirs(root, actor.id).length === 1 && actors.status(actor.id).status === "idle");
+    expect(actors.status(actor.id).filterSkipped.count).toBe(0);
+    expect(actors.status(actor.id).filteredCount).toBe(3);
+  });
+
+  it("security P2: a same-millisecond successor at the same head gets a fresh generation that delayed evidence cannot clear", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "generation", instructions: "x" });
+    const request = p0Request({ requiredSecurity: [] });
+    const first = await reserveP0(actors, actor.id, request);
+    // Identical caller input (same createdAt): replaced by the capability holder.
+    const second = await reserveP0(actors, actor.id, request, BOTH, first.token);
+    expect(second.reservation.generation).not.toBe(first.reservation.generation);
+    expect(second.token).not.toBe(first.token);
+    expect(actors.status(actor.id).activationFilterRelease).toMatchObject({ reason: "replaced", reservation: first.reservation });
+    // Delayed predecessor evidence, even with the predecessor's own capability, is inert.
+    for (const evidence of [{ reviewTerminal: true as const }, { prState: "merged" as const }, { currentHead: HEAD_B }]) {
+      await observeP0(actors, actor.id, first, evidence);
+      expect(actors.status(actor.id).activationFilterReservation).toEqual(second.reservation);
+    }
+    // Predecessor capability cannot authorize evidence for the successor generation either.
+    await expect(observeP0(actors, actor.id, second, { reviewTerminal: true }, first.token)).rejects.toThrow("not authorized");
+    expect(actors.status(actor.id).activationFilter).toEqual(BOTH);
+    // Many same-millisecond issues never reuse a generation.
+    const generations = new Set([first.reservation.generation, second.reservation.generation]);
+    let token = second.token;
+    for (let i = 0; i < 20; i++) {
+      const next = await reserveP0(actors, actor.id, request, BOTH, token);
+      generations.add(next.reservation.generation);
+      token = next.token;
+    }
+    expect(generations.size).toBe(22);
+  });
+
+  it("reloads the generation and capability digest across restart; a reservation missing them is never honoured", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "restart-capability", instructions: "x" });
+    const held = await reserveP0(first.actors, actor.id, p0Request({ requiredSecurity: [] }));
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+    const again = setup(first.root).actors;
+    expect(again.status(actor.id).activationFilterReservation).toEqual(held.reservation);
+    await expect(observeP0(again, actor.id, held, { reviewTerminal: true }, "forged")).rejects.toThrow("not authorized");
+    await expect(observeP0(again, actor.id, held, { reviewTerminal: true })).resolves.toMatchObject({ activationFilterRelease: { reason: "verdicts-terminal" } });
+    // A hand-edited/legacy stored reservation without its manager-issued generation is rejected.
+    const { generation: _generation, ...legacy } = held.reservation;
+    expect(() => normalizeStoredActorActivationReservation(legacy)).toThrow("generation");
+    expect(normalizeStoredActorActivationReservation(held.reservation)).toEqual(held.reservation);
+  });
+
+  it.each(["closed", "merged", "head-changed"] as const)("drops queued PR work on %s, but keeps unrelated PRs eligible", async change => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "queued-pr", instructions: "x", topics: ["github.demo"], coalesce: false });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    await mesh.publish({ topic: "github.demo", from, text: "LIVE_WITH_PROGRESS" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    const receipt = await observeP0(actors, actor.id, held, change === "head-changed" ? { currentHead: HEAD_B } : { prState: change });
+    expect(receipt.activationFilterRelease?.reason).toBe(change === "head-changed" ? "head-changed" : "pr-closed");
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0);
+    expect(runDirs(root, actor.id)).toHaveLength(1); // only the earlier unrelated run
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: change === "head-changed" ? "PR head changed" : "PR closed or merged" }));
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A, { number: 8, pull_request: { number: 8, head: { sha: HEAD_A } } }) });
+    await waitFor(() => runDirs(root, actor.id).length === 2);
+  });
+
+  it("review P2: a late old-head event never coalesces over queued current-head work", async () => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "coalesce-pr", instructions: "x", topics: ["github.demo", "busy.demo"], coalesceKey: "payload.number" });
+    const held = await reserveP0(actors, actor.id, p0Request(), [{ id: "none", topic: ["never.demo"] }]);
+    const releasePath = path.join(root, "release-busy");
+    await mesh.publish({ topic: "busy.demo", from, text: "LIVE_WITH_PROGRESS", data: { fakeWorkerReleasePath: releasePath } });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await observeP0(actors, actor.id, held, { currentHead: HEAD_B });
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_B, { marker: "CURRENT_HEAD_WORK" }) });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    // The delayed old-head webhook shares the coalesce key: it must not replace the queued item.
+    await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A, { marker: "LATE_OLD_HEAD" }) });
+    await waitFor(() => actors.messages(actor.id).some(message => message.stale && message.reason === "PR head changed"));
+    expect(actors.status(actor.id).queued).toBe(1);
+    fs.writeFileSync(releasePath, "release");
+    await waitFor(() => runDirs(root, actor.id).length === 2 && actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0);
+    const tasks = runTasks(root, actor.id);
+    expect(tasks.some(task => task.includes("CURRENT_HEAD_WORK"))).toBe(true);
+    expect(tasks.some(task => task.includes("LATE_OLD_HEAD"))).toBe(false);
+    expect(actors.messages(actor.id).filter(message => message.stale)).toHaveLength(1);
+  });
+
+  it("drops a result when the current PR head changes while its run is in flight", async () => {
+    const { actors, mesh, root } = setup();
+    const actor = await actors.create({ name: "inflight-pr", instructions: "x", topics: ["github.demo"] });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    const releasePath = path.join(root, "release-worker");
+    await mesh.publish({ topic: "github.demo", from, text: "LIVE_WITH_PROGRESS", data: prEvent(HEAD_A, { fakeWorkerReleasePath: releasePath }) });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await observeP0(actors, actor.id, held, { currentHead: HEAD_B });
+    fs.writeFileSync(releasePath, "release");
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed", runId: expect.any(String) }));
+    expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+  });
+
+  it("security P1: rechecks PR freshness after an asynchronous validWhile, before delivering the result", async () => {
+    const { actors, mesh } = setup();
+    const actor = await actors.create({ name: "late-valid-while", instructions: "x", topics: ["github.demo"],
+      validWhile: { version: 1, source: "() => true" } });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    let calls = 0, evaluating = false, finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const evaluate = vi.spyOn(predicate, "evaluateActorValidWhile").mockImplementation(async () => {
+      // The first call is the before-run check; the second is before delivery.
+      if (++calls === 2) { evaluating = true; await gate; }
+      return { valid: true };
+    });
+    try {
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+      await waitFor(() => evaluating);
+      await observeP0(actors, actor.id, held, { currentHead: HEAD_B });
+      finish();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(calls).toBe(2);
+      expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed", runId: expect.any(String) }));
+      expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+    } finally { finish(); evaluate.mockRestore(); }
+  });
+
+  it("rechecks PR freshness after asynchronous model preparation, before allocating a run", async () => {
+    let stalled = false, preparing = false, finish!: () => void;
+    const binding = new Promise<void>(resolve => { finish = resolve; });
+    const { actors, agents, mesh } = setup(undefined, { resolvePiModel: model => {
+      if (!stalled) return model;
+      preparing = true;
+      return binding.then(() => model);
+    } });
+    const actor = await actors.create({ name: "late-preparation", instructions: "x", topics: ["github.demo"], model: "provider/test" });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    const run = vi.spyOn(agents, "run");
+    try {
+      stalled = true;
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+      await waitFor(() => preparing);
+      await observeP0(actors, actor.id, held, { currentHead: HEAD_B });
+      finish();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(run).not.toHaveBeenCalled();
+      expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR head changed" }));
+    } finally { stalled = false; finish(); run.mockRestore(); }
+  });
+
+  it("rechecks PR freshness after waiting for a native admission permit, before launching a worker", async () => {
+    const { actors, agents, mesh, root } = setup(undefined, {}, 1);
+    const releasePath = path.join(root, "release-permit");
+    const blocker = await agents.spawn({ task: `LIVE_WITH_PROGRESS ${JSON.stringify({ fakeWorkerReleasePath: releasePath })}` });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const actor = await actors.create({ name: "late-admission", instructions: "x", topics: ["github.demo"] });
+      const held = await reserveP0(actors, actor.id, p0Request());
+      await mesh.publish({ topic: "github.demo", from, data: prEvent(HEAD_A) });
+      await waitFor(() => actors.status(actor.id).status === "waiting");
+      await observeP0(actors, actor.id, held, { prState: "closed" });
+      fs.writeFileSync(releasePath, "release");
+      await agents.wait(blocker.id);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(launch).not.toHaveBeenCalled();
+      expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ stale: true, reason: "PR closed or merged" }));
+    } finally { fs.writeFileSync(releasePath, "release"); launch.mockRestore(); }
+  });
+
+  it("validates known PR identity without network or registry reads and never guesses missing identity", () => {
+    const reservation = { ...p0Request(), generation: randomUUID() };
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: prEvent(HEAD_B) })).toBe("PR head changed");
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: prEvent(HEAD_A) })).toBeUndefined();
+    expect(activationPrInvalidReason(reservation, undefined, "mesh:github.demo", { data: { payload: { number: 7 } } })).toBeUndefined();
+    expect(activationPrInvalidReason(reservation, undefined, "host:tool_error", { data: prEvent(HEAD_B) })).toBeUndefined();
+  });
+
+  it.each(["completed", "failed", "stopped", "timed_out", "throw"] as const)("releases a matching native run on %s", async outcome => {
+    const { actors, agents } = setup();
+    const actor = await actors.create({ name: "terminal", instructions: "x", responseMode: "directive" });
+    let finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    const runId = `terminal-${outcome}`;
+    const run = vi.spyOn(agents, "run").mockImplementation(async (_request, _signal, launched) => {
+      launched?.({ id: runId, status: "running" } as AgentHandleInfo);
+      await done;
+      if (outcome === "throw") throw new Error("transport failed after launch");
+      return { id: runId, status: outcome, text: "", toolCalls: 0, turns: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } as AgentRunResult;
+    });
+    try {
+      actors.tell(actor.id, "run");
+      await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+      const held = await reserveP0(actors, actor.id, p0Request({ runId }));
+      finish();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();
+      expect(actors.status(actor.id).activationFilterRelease).toMatchObject({ reason: "run-terminal", reservation: held.reservation, runStatus: outcome === "throw" ? "failed" : outcome });
+    } finally { finish(); run.mockRestore(); }
+  });
+
+  it("polls external run claims, ignores non-terminal/unknown and wrong-run evidence, and releases timeout", async () => {
+    const { actors, agents } = setup();
+    const actor = await actors.create({ name: "external-claim", instructions: "x" });
+    const status = vi.spyOn(agents, "status").mockImplementation(() => { throw new Error("unknown run"); });
+    try {
+      const held = await reserveP0(actors, actor.id, p0Request({ runId: "external" }));
+      await observeP0(actors, actor.id, held, { runId: "old", runStatus: "completed" });
+      expect(actors.status(actor.id).activationFilterReservation?.runId).toBe("external");
+      for (const nonterminal of ["running", "queued"] as const) {
+        status.mockReturnValue({ id: "external", status: nonterminal } as AgentHandleInfo);
+        await new Promise(resolve => setTimeout(resolve, 60));
+        expect(actors.status(actor.id).activationFilterReservation).toBeDefined();
+      }
+      status.mockReturnValue({ id: "external", status: "timed_out" } as AgentHandleInfo);
+      await waitFor(() => actors.status(actor.id).activationFilterReservation === undefined);
+      expect(actors.status(actor.id).activationFilterRelease).toMatchObject({ reason: "run-terminal", runStatus: "timed_out" });
+    } finally { status.mockRestore(); }
+  });
+
+  it("retries an uncertain clear with retained exact evidence and one release audit", async () => {
+    const { actors, root } = setup();
+    const actor = await actors.create({ name: "retry", instructions: "x" });
+    const held = await reserveP0(actors, actor.id, p0Request({ requiredSecurity: [] }));
+    // The required commit stages via prepare() (smarty-dev#4383); fail that stage once.
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    try {
+      await expect(observeP0(actors, actor.id, held, { reviewTerminal: true })).rejects.toThrow("disk unavailable");
+      const receipt = actors.status(actor.id).activationFilterRelease;
+      expect(receipt).toMatchObject({ reason: "verdicts-terminal", observation: { reviewTerminal: true } });
+      write.mockRestore();
+      const retry = await observeP0(actors, actor.id, held, { reviewTerminal: true });
+      expect(retry.activationFilterRelease).toEqual(receipt);
+      expect(actors.messages(actor.id).filter(message => message.reason === "activationFilter cleared: verdicts-terminal")).toHaveLength(1);
+      const row = JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors.find((row: { id: string }) => row.id === actor.id);
+      expect(row.activationFilterRelease).toEqual(receipt);
+      expect(row.activationFilterReservation).toBeUndefined();
+    } finally { write.mockRestore(); }
+  });
+
+  it("rolls back an issued reservation whose commit failed, so no unreleasable claim is left behind", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "issue-rollback", instructions: "x" });
+    // The required commit stages via prepare() (smarty-dev#4383); fail that stage once.
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare").mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    try {
+      await expect(actors.setActivationFilter(actor.id, BOTH, undefined, undefined, p0Request())).rejects.toThrow("disk unavailable");
+      expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();
+      expect(actors.status(actor.id).activationFilter).toBeUndefined();
+      write.mockRestore();
+      await reserveP0(actors, actor.id, p0Request());
+    } finally { write.mockRestore(); }
+  });
+
+  it.each([false, true])("enforces the reservation deadline after restart (expired while offline: %s)", async expiredWhileOffline => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "restart-p0", instructions: "x" });
+    const held = await reserveP0(first.actors, actor.id, p0Request({ expiresAt: Date.now() + 500 }));
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+    if (expiredWhileOffline) await waitFor(() => Date.now() >= held.reservation.expiresAt);
+    const again = setup(first.root).actors;
+    expect(again.status(actor.id).activationFilterReservation).toEqual(held.reservation);
+    await waitFor(() => again.status(actor.id).activationFilterReservation === undefined);
+    expect(Date.now()).toBeGreaterThanOrEqual(held.reservation.expiresAt);
+    expect(again.status(actor.id).activationFilterRelease).toMatchObject({ reason: "expired", reservation: held.reservation });
+    expect(again.status(actor.id).activationFilterExpiresAt).toBeUndefined();
+  });
+
+  it("expires before a synchronous event dispatch, with no additional per-event registry lock", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "hot-p0", instructions: "x", events: ["tool_error"] });
+    const held = await reserveP0(actors, actor.id, p0Request());
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock");
+    const now = vi.spyOn(Date, "now");
+    try {
+      for (let i = 0; i < 30; i++) actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+      expect(actors.status(actor.id).filterSkipped.count).toBe(30);
+      expect(lock).not.toHaveBeenCalled();
+      now.mockReturnValue(held.reservation.expiresAt);
+      actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+      expect(actors.status(actor.id).activationFilterReservation).toBeUndefined();
+      expect(actors.status(actor.id).activationFilterRelease?.reason).toBe("expired");
+      expect(actors.status(actor.id).filterSkipped.count).toBe(0);
+    } finally { now.mockRestore(); lock.mockRestore(); }
   });
 });
 

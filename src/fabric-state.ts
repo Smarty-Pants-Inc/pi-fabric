@@ -53,6 +53,15 @@ import type { FabricLoadedFileIdentity } from "./build-identity.js";
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
+/**
+ * Proof that one `ensure()` call bound to a still-live session lifecycle.
+ * Shutdown, session replacement, and a cwd rebootstrap retire it, including one
+ * that lands while `ensure()` itself is pending (smarty-dev#5962).
+ */
+export interface FabricLifecycleLease {
+  current(): boolean;
+}
+
 export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
@@ -210,7 +219,7 @@ export class FabricState {
     this.prewalk.cancel();
     this.prewalkDrift.clear();
     this.activity.reset();
-    this.sessionApprovals.approvedRisks.clear();
+    this.sessionApprovals.reset();
     this.#widgetDismissedAt = 0;
     context.ui.setStatus("fabric-prewalk", undefined);
 
@@ -238,10 +247,21 @@ export class FabricState {
     await this.#activate(context, true);
   }
 
-  async ensure(context: ExtensionContext): Promise<void> {
+  async ensure(context: ExtensionContext): Promise<FabricLifecycleLease> {
     this.#assertOpen();
-    if (!this.#config || this.#cwd !== context.cwd) await this.bootstrap(context);
-    await this.#activate(context, false);
+    // Sample the lifecycle before the first await; only this call's own
+    // bootstrap may advance it. bootstrap() claims its generation synchronously.
+    let generation = this.#generation;
+    if (!this.#config || this.#cwd !== context.cwd) {
+      const booting = this.bootstrap(context);
+      generation = this.#generation;
+      await booting;
+    }
+    const runtime = await this.#activate(context, false);
+    const lease: FabricLifecycleLease = { current: () => generation === this.#generation && !this.#shutDown };
+    // Rebind background reads to the newest live ctx; never to a lease already retired.
+    if (lease.current()) runtime.bindLifecycle?.(context, lease.current);
+    return lease;
   }
 
   shouldEagerlyActivate(context: ExtensionContext): boolean {
@@ -467,6 +487,7 @@ export class FabricState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
+    this.sessionApprovals.reset();
     this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -542,6 +563,8 @@ export class FabricState {
             if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
+        // Background timers read this ctx only while this activation's lifecycle holds.
+        candidate.bindLifecycle?.(context, () => generation === this.#generation && !this.#shutDown);
         await candidate.initialize(context, config);
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {

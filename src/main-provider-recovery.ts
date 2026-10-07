@@ -53,7 +53,9 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
         { deliverAs: "followUp", triggerTurn: false });
       context.ui.notify(message, "error");
       try { await options.report(message, context); }
-      catch (error) { context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error"); }
+      catch (error) {
+        if (generation === current) context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error");
+      }
       return;
     }
     // An owner input, another turn, session replacement, or Escape cancels this wake.

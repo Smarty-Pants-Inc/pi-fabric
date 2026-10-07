@@ -429,15 +429,20 @@ export class FabricUiController {
     // must be true before this refresh so the first dashboard frame renders
     // from full activity runs rather than stripped summaries.
     this.#dashboardOpen = true;
+    const epoch = this.#epoch;
+    const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
     const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }] =
       await Promise.all([import("./dashboard.js"), import("./model-picker.js")]);
+    if (!current()) return;
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
     if (this.#snapshot.actors.some((actor) => actor.runner === "claude")) {
       try {
         claudeModelSource = buildClaudeModelSource(await this.state.agents.claudeModels());
+        if (!current()) return;
       } catch (error) {
+        if (!current()) return;
         context.ui.notify(
           `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
           "warning",
@@ -447,12 +452,13 @@ export class FabricUiController {
     const reportUpdate = (message: string, update: Promise<unknown>): void => {
       void update
         .then(() => {
+          if (!current()) return;
           context.ui.notify(message, "info");
           this.#refresh();
         })
-        .catch((error) =>
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-        );
+        .catch((error) => {
+          if (current()) context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        });
     };
     const onTargetMessage = (
       target: FabricDashboardMessageTarget,
@@ -545,12 +551,13 @@ export class FabricUiController {
       this.state.actors
         .create(this.state.globalActors.toRequest(def))
         .then((actor) => {
+          if (!current()) return;
           context.ui.notify(`Imported global actor "${def.name}" as ${actor.name}`, "info");
           this.#refresh();
         })
-        .catch((error) =>
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-        );
+        .catch((error) => {
+          if (current()) context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        });
     };
     const onExportActor = (actorId: string): void => {
       try {
@@ -576,10 +583,10 @@ export class FabricUiController {
     };
     this.#schedulePoll(true);
     let conversationTarget: string | undefined;
-    const epoch = this.#epoch;
     try {
       await context.ui.custom<void>(
         (tui, theme, keybindings, done) => {
+          if (!current()) { done(undefined); return { render: () => [], invalidate() {} }; }
           this.#dashboardTui = tui;
           return new FabricDashboard(tui, theme, () => this.#snapshot, () => done(undefined), {
             modelSource,

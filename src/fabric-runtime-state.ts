@@ -256,6 +256,12 @@ export class FabricRuntimeState {
   readonly #entryIdentity: FabricLoadedFileIdentity | undefined;
   #widgetDismissedAt = 0;
   #suppressResidentGuidanceSync = false;
+  // smarty-dev#5962: background timers (participant heartbeat/change refresh, mesh read
+  // pacing, root inbox naming) outlive a /reload or session replacement. They never hold
+  // a ctx: each tick reads the ctx bound by the latest activation/ensure, and only while
+  // that lifecycle lease is current. A retired lease skips the tick quietly.
+  #binding: { context: ExtensionContext; current: () => boolean } | undefined;
+  #sessionNameSnapshot: string | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -437,7 +443,36 @@ export class FabricRuntimeState {
     return this.#repairs;
   }
 
+  /** Rebinds session-bound background reads to this ctx while `current()` holds (smarty-dev#5962). */
+  bindLifecycle(context: ExtensionContext, current: () => boolean): void {
+    this.#binding = { context, current };
+  }
+
+  /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
+  get lifecycleCurrent(): boolean {
+    const binding = this.#binding;
+    if (!binding) return false;
+    try { return binding.current(); } catch { return false; }
+  }
+
+  /** Reads session-bound state through the live ctx/pi; a retired lease or stale read yields undefined. */
+  #readLive<T>(read: (context: ExtensionContext) => T): T | undefined {
+    const context = this.lifecycleCurrent ? this.#binding?.context : undefined;
+    if (!context) return undefined;
+    // The token cannot observe every host invalidation; a stale read is a quiet skip too.
+    try { return read(context); } catch { return undefined; }
+  }
+
+  /** The Pi session name, re-read while live; the last live value otherwise. */
+  #liveSessionName(): string | undefined {
+    const live = this.#readLive(() => ({ name: this.pi.getSessionName?.() }));
+    if (live) this.#sessionNameSnapshot = live.name;
+    return this.#sessionNameSnapshot;
+  }
+
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
+    // Direct callers (tests, standalone hosts) bind here; FabricState binds its lease first.
+    if (this.#binding?.context !== context) this.#binding = { context, current: () => true };
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
     this.#suppressResidentGuidanceSync = true;
@@ -456,7 +491,7 @@ export class FabricRuntimeState {
     this.#speculation?.reset();
     this.#speculation = undefined;
     this.activity.reset();
-    this.sessionApprovals.approvedRisks.clear();
+    this.sessionApprovals.reset();
     this.#cwd = context.cwd;
     const projectTrusted = this.#managedHost ? false : context.isProjectTrusted();
     this.#managedHost?.seal();
@@ -610,7 +645,7 @@ export class FabricRuntimeState {
       this.#config.mesh.maxReadEvents,
       {
         backgroundReadCacheMs: this.#config.mesh.idleReadCoalesceMs,
-        readActive: () => !context.isIdle() || context.hasPendingMessages() ||
+        readActive: () => this.#readLive(live => !live.isIdle() || live.hasPendingMessages()) === true ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
@@ -618,7 +653,7 @@ export class FabricRuntimeState {
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.#liveSessionName() ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     let inboxMaintenance: MainInboxMaintenance | undefined;
@@ -635,8 +670,9 @@ export class FabricRuntimeState {
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
         console.warn(`[pi-fabric] ${warning}`);
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        this.#readLive(live => { if (live.hasUI) live.ui.notify(warning, "warning"); });
       },
+      live: () => this.lifecycleCurrent,
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -1042,16 +1078,21 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
-          mainName: () => rootParticipantName(this.pi.getSessionName?.()),
+          mainName: () => rootParticipantName(this.#liveSessionName()),
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
-      this.#participants.registerSource(() => [
-        // The existing presence heartbeat rereads the Pi name, including renames and clearing.
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.(), { role }),
-      ]);
+      // The presence heartbeat rereads the Pi name (renames, clearing) and model through the
+      // live binding only. A retired ctx keeps the last live snapshot (smarty-dev#5962).
+      let rootInfo = mainAgent.info(context);
+      this.#sessionNameSnapshot = this.pi.getSessionName?.();
+      this.#participants.registerSource(() => {
+        const live = this.#readLive(ctx => mainAgent.info(ctx));
+        rootInfo = live ?? { ...rootInfo, updatedAt: Date.now() };
+        return [this.#participants!.root(rootInfo, mainAgent.interactive, this.#liveSessionName(), { role })];
+      });
     }
     this.#participants.registerSource(() =>
       agentParticipantRecords(
@@ -1669,6 +1710,18 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    try {
+      await this.#shutdownSteps(reason, targetSessionFile);
+    } catch (error) {
+      // A failed teardown step must not leave the heartbeat timer running past this
+      // session's ctx (smarty-dev#5962): stop presence, then surface the failure.
+      await this.#participants?.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #shutdownSteps(reason?: string, targetSessionFile?: string): Promise<void> {
+    this.sessionApprovals.reset();
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
     // behind the shared mesh lock before local teardown stops its timers (#5256).

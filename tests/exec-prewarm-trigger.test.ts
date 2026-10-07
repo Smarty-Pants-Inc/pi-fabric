@@ -10,7 +10,7 @@ afterEach(() => { vi.restoreAllMocks(); });
 
 const spyRuntime = () => {
   const prewarm = vi.fn(async () => {});
-  const ensure = vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue(undefined);
+  const ensure = vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue({ current: () => true });
   vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue({ prewarm } as unknown as FabricState["execution"]);
   return { ensure, prewarm };
 };

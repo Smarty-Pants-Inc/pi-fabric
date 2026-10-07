@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { formatWithOptions } from "node:util";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,3 +74,73 @@ export const activeFabricRoot = (settingsPath: string): string | undefined => {
 };
 
 export const releaseLabel = (root: string): string => path.basename(root);
+
+const LOG_CAP_BYTES = 5 * 1024 * 1024;
+const NOTICE_WINDOW_MS = 10 * 60 * 1000;
+type DiagnosticContext = {
+  hasUI: boolean;
+  mode?: string;
+  ui: { notify(message: string, level: "warning"): void };
+};
+let interactive: DiagnosticContext["ui"] | undefined;
+const notices = new Map<string, number>();
+
+/** Bind the supplied host UI before bootstrap. RPC has UI APIs, but no terminal TUI.
+ * Keep the binding through shutdown so late background settlements cannot paint stderr.
+ * The next session replaces it (including switching back to headless mode).
+ */
+export const configureFabricDiagnostics = (context?: DiagnosticContext): void => {
+  interactive = context?.hasUI && (context.mode === undefined || context.mode === "tui" || context.mode === "interactive")
+    ? context.ui : undefined;
+};
+
+/** No host imports, timers, I/O or optional engines until an interactive warning occurs.
+ * Returns true when the bound terminal UI owns the diagnostic (logged and, unless
+ * deduplicated, notified); callers then must not notify it again. False means it went
+ * to console.warn, so a caller's explicit UI notice is still the only user-visible one.
+ */
+export const fabricWarn = (...args: unknown[]): boolean => {
+  if (!interactive) {
+    console.warn(...args);
+    return false;
+  }
+  let message: string;
+  try {
+    message = formatWithOptions({ colors: false }, ...args);
+  } catch {
+    message = "[pi-fabric] Diagnostic arguments could not be formatted";
+  }
+  const logPath = process.env.PI_FABRIC_LOG || path.join(resolveAgentDir(), "fabric", "logs", "diagnostics.log");
+  let logFailed = false;
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    // One physical line per diagnostic, retaining stacks and multiline messages as escapes.
+    const line = `${new Date().toISOString()} ${message.replaceAll("\r", "\\r").replaceAll("\n", "\\n")}\n`;
+    let size = 0;
+    try { size = fs.statSync(logPath).size; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (size && size + Buffer.byteLength(line) > LOG_CAP_BYTES) {
+      // Remove only the previous rotation, never a directory or unrelated state.
+      try { fs.unlinkSync(`${logPath}.1`); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      fs.renameSync(logPath, `${logPath}.1`);
+    }
+    fs.appendFileSync(logPath, line, { mode: 0o600 });
+  } catch {
+    // Disk failure is not permission to paint over the editor or alter caller retry logic.
+    logFailed = true;
+  }
+  // Randomized delays, holders, attempts and labels must not create a notice per retry.
+  const key = /mesh lock timeout|FABRIC_MESH_LOCK_TIMEOUT/.test(message) ? "mesh-lock-timeout" : message;
+  const now = Date.now();
+  const last = notices.get(key);
+  if (last !== undefined && now - last < NOTICE_WINDOW_MS) return true;
+  for (const [oldKey, at] of notices) if (now - at >= NOTICE_WINDOW_MS) notices.delete(oldKey);
+  // Bound memory without evicting live dedup keys (which would re-enable a notice storm).
+  if (notices.size >= 1024) return true;
+  notices.set(key, now);
+  try {
+    interactive.notify(`${key === "mesh-lock-timeout" ? "[pi-fabric] Mesh lock contention; background operations are retrying." : message.split("\n")[0]} ${logFailed ? "Diagnostic log unavailable:" : "Details:"} ${logPath}`, "warning");
+  } catch { /* A stale UI must not change operation or retry semantics. */ }
+  return true;
+};

@@ -1,3 +1,4 @@
+import { fabricWarn } from "../../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -44,7 +45,7 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   if (version === WORKER_PROTOCOL_VERSION && regularFile(selectedWorker) && regularFile(selectedExtension)) {
     return { workerPath: selectedWorker, fabricRelease: current, extensionPath: selectedExtension };
   }
-  console.warn(`[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
+  fabricWarn(`[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
   return fallback;
 };
 
@@ -57,7 +58,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
-    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+    fabricWarn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {

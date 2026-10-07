@@ -110,6 +110,10 @@ const result = await build({
   plugins: [{
     name: "host-metadata-facades",
     setup(pluginBuild) {
+      // Diagnostics shares the existing cheap agent-dir chunk: no eager facade-only chunk.
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
+      }));
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
       }));

@@ -1,3 +1,4 @@
+import { fabricWarn } from "../core/diagnostics.js";
 import fs from "node:fs";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { syncPathNamespace } from "../core/atomic-write.js";
@@ -155,7 +156,7 @@ export class AgentCompletionInbox {
       this.#receiptFault = undefined;
     } catch (error) {
       const diagnostic = `Fabric completion carrier remains unconfirmed: ${String(error).slice(0, 1000)}`;
-      if (diagnostic !== this.#receiptFault) console.warn(diagnostic);
+      if (diagnostic !== this.#receiptFault) fabricWarn(diagnostic);
       this.#receiptFault = diagnostic;
     }
   }

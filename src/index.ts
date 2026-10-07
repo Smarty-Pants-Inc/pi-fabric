@@ -1,3 +1,4 @@
+import { fabricWarn, configureFabricDiagnostics } from "./core/diagnostics.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
@@ -323,6 +324,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   );
 
   pi.on("resources_discover", async (_event, context) => {
+    configureFabricDiagnostics(context);
     if (!state.bootstrapped) await state.bootstrap(context);
     return { skillPaths: fabricSkillPaths(FABRIC_SKILLS_DIR, state.config.executor.kernel) };
   });
@@ -588,7 +590,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
         if (request.signal.aborted) return;
-        console.warn(
+        fabricWarn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
@@ -674,6 +676,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
   pi.on("session_start", async (event, context) => {
+    configureFabricDiagnostics(context);
     fabricPrewarm = undefined;
     stopInboxWake();
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
@@ -695,8 +698,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       compatibilityWarningShown = true;
       const warning = piHostCompatibilityWarning();
       if (warning) {
-        console.warn(`[pi-fabric] ${warning}`);
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        fabricWarn(`[pi-fabric] ${warning}`);
+        if (context.hasUI && context.mode === "rpc") context.ui.notify(warning, "warning");
       }
     }
     await state.bootstrap(context);

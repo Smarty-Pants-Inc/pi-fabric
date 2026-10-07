@@ -257,8 +257,11 @@ export class FabricState {
       generation = this.#generation;
       await booting;
     }
-    await this.#activate(context, false);
-    return { current: () => generation === this.#generation && !this.#shutDown };
+    const runtime = await this.#activate(context, false);
+    const lease: FabricLifecycleLease = { current: () => generation === this.#generation && !this.#shutDown };
+    // Rebind background reads to the newest live ctx; never to a lease already retired.
+    if (lease.current()) runtime.bindLifecycle?.(context, lease.current);
+    return lease;
   }
 
   shouldEagerlyActivate(context: ExtensionContext): boolean {
@@ -560,6 +563,8 @@ export class FabricState {
             if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
+        // Background timers read this ctx only while this activation's lifecycle holds.
+        candidate.bindLifecycle?.(context, () => generation === this.#generation && !this.#shutDown);
         await candidate.initialize(context, config);
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {

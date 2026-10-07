@@ -56,8 +56,9 @@ function fixture(count: number) {
 }
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function eventually(predicate: () => boolean) {
-  const deadline = Date.now() + 10_000;
+// A failure deadline, not a performance budget: the asserted bounds are per-turn work.
+async function eventually(predicate: () => boolean, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) { if (Date.now() >= deadline) throw new Error("Retention did not complete"); await turn(); }
 }
 
@@ -105,7 +106,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       // No archive traversal or deletion on the constructor stack.
       expect(totalRuns).toBe(0);
       expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
-      await eventually(() => !fs.existsSync(f.runDir(199, 8)));
+      // 2,000 real archive sweeps (plus the 6,000-file fixture above) are filesystem
+      // bound: a loaded Linux runner or Windows (Defender, NTFS) can take tens of
+      // seconds. Wall time stays unasserted; the per-turn work bounds below are the gate.
+      await eventually(() => !fs.existsSync(f.runDir(199, 8)), 45_000);
       await turn();
       // A recurring setImmediate observes every maintenance turn. A microtask
       // yield (or no yield) cannot reset the counter, even on a fast filesystem.
@@ -122,7 +126,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
         longestSliceMs: longest, totalRuns, maxRunsPerTurn: Math.max(...runsPerTurn),
         runsPerTurnLimit: batchSize * runsPerActor, workTurns: runsPerTurn.length }) + "\n");
     } finally { active = false; clearImmediate(heartbeat!); }
-  });
+  }, 60_000);
 
   it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
     const f = fixture(17);

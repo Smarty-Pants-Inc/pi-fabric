@@ -21,14 +21,48 @@ Existing actor/root retention and removal delete these files together with the
 actor directory; this change adds no periodic archive rewrite or retention job.
 
 An append is synced, including namespace barriers, before publishing its
-reference. New payload heads, custody and removal decisions are committed
-immediately with the existing durable atomic registry rename and rollback
-protocol. Before acknowledging a save, the writer also durably checkpoints each
-changed accepted head to `<actor-id>/registry/messages-head.json`, under the same
-registry lock. This small checkpoint is independent of unknown registry fields:
+reference, and **before the registry lock is taken** (smarty-dev#6477 L7). A
+save prepares outside custody: it appends every new transaction at its
+speculative offset, fsyncs the log and its namespace, then reads the bytes back.
+Another appender that won the tail makes that preparation invalid; its bytes
+stay behind as an unreferenced archive and the save re-selects under the lock.
+Each changed checkpoint and the new registry are also written to fsynced
+`*.prepared` temp files before custody. Under the registry lock a save then only
+checks the registry generation and the log identities (a `stat`), renames the
+registry, runs the registry's one directory barrier (durable saves), and renames
+the changed checkpoints. The checkpoint directory barriers run right after the
+lock is released and before the save is acknowledged. Only a save that already
+lost a race prepares, and therefore appends, under the lock.
+
+A crash at any point leaves the registry selecting only complete, durable
+payloads: before the registry rename the new bytes and temp files are
+unreferenced; after it they were already fsynced. Checkpoints are renamed after
+the durable registry rename, so after a crash a checkpoint can lag the registry
+but never lead it. `tests/actor-registry-crash-points.test.ts` crashes at every
+file-system step and checks this, plus the barrier order under the lock.
+
+New payload heads, custody and removal decisions are committed with the
+existing durable atomic registry rename and rollback protocol. Before
+acknowledging a save, the writer also checkpoints each changed accepted head to
+`<actor-id>/registry/messages-head.json`. This small checkpoint is independent of unknown registry fields:
 it survives a legacy owned-row save that removes `messageHistory`. Unchanged
-checkpoints are not rewritten. A checkpoint failure rolls back changed
-checkpoints and the registry; later commits never select an abandoned append.
+checkpoints are not rewritten. A checkpoint rename failure under the lock rolls
+back changed checkpoints and the registry; later commits never select an
+abandoned append. A checkpoint directory barrier that fails after the lock was
+released is retried once; if it still fails the save **fails closed**
+(pi-fabric#590): `update()` rejects with a retryable
+`ActorRegistryCheckpointBarrierError` and never reports success, the store's
+cached snapshot is invalidated, and the barrier stays owed. The registry rename
+is already durable and the checkpoint is already renamed, so every reader sees
+one consistent state (registry and checkpoint agree; after an OS crash the
+checkpoint can only lag). It is not rolled back outside custody, where another
+writer may already build on it. The error carries the committed value, so the
+manager acknowledges exactly the appended prefix instead of appending it again.
+The next update from that store retries every owed barrier before it selects or
+writes anything and, while one still fails, rejects without committing. A
+removed actor directory owes no barrier.
+A crash may leave stray `messages-head.json.*.prepared` temp files; they are
+never read.
 
 Explicit registry references take precedence over checkpoints, so interrupted
 publication remains readable by new releases. If a process dies between the

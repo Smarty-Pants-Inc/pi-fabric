@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
+import { renameAtomic, syncDirectoryChain, syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
 
 const HISTORY_LIMIT = 100;
 
@@ -16,16 +16,29 @@ type Row = Record<string, unknown>;
 type Transaction = { previous?: ActorMessageHistory; reset?: boolean; messages: unknown[] };
 type PreparedTail = {
   size: number;
-  generation: string | undefined;
+  identity: string | undefined;
   appends: Array<{ contents: Buffer; transaction: Transaction; ref: ActorMessageHistory }>;
 };
 
-const tailSnapshot = (file: string): { size: number; generation: string } | undefined => {
+/** A durable append's location: the log's file identity and the end of its last byte. */
+type LandedTail = { identity: string; end: number };
+
+/** Staged checkpoint replacements; temp files are written and fsynced before custody. */
+export interface StagedHeads {
+  /** Under custody: rename the staged checkpoints. Returns the directories that owe a barrier. */
+  publish(): string[];
+  /** Under custody: restore the checkpoints a failed commit replaced. */
+  rollback(): void;
+  /** Remove staged temp files that were not published (no-op after publication). */
+  dispose(): void;
+}
+
+const tailSnapshot = (file: string): { size: number; identity: string } | undefined => {
   try {
     const stat = fs.statSync(file, { bigint: true });
     const size = Number(stat.size);
     if (!Number.isSafeInteger(size)) throw new Error("Actor message log is too large");
-    return { size, generation: `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` };
+    return { size, identity: `${stat.dev}:${stat.ino}` };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -48,39 +61,123 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
  * failed/unpublished appends are harmless archives, never a predecessor of a later
  * commit. Instructions stay inline for mixed-release readers. A durable per-actor
  * checkpoint preserves accepted heads when an old owned-row serializer drops
- * unknown fields. Payload barriers precede the registry rename. */
+ * unknown fields. Payload data and namespace barriers complete BEFORE registry
+ * custody; under the lock only the registry rename (and checkpoint renames) remain
+ * (smarty-dev#6477 L7). A crash anywhere leaves at most unreferenced bytes/files. */
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
   #preparing: Map<string, PreparedTail> | undefined;
 
-  /** Encode and read histories before registry acquisition. Offsets are speculative;
-   * commit validates every append tail under custody before writing any bytes. */
+  /** Encode, append and fsync histories before registry acquisition. Offsets are
+   * speculative until the append lands; it is read back after its fsync, so a racing
+   * appender only abandons bytes (an unreferenced archive) and invalidates this
+   * preparation. Nothing payload-related is written under custody. */
   prepare(rows: readonly Row[], prior: ReadonlyMap<unknown, Row>) {
     const tails = new Map<string, PreparedTail>();
     this.#preparing = tails;
     let metadata: Row[];
     try { metadata = rows.map(row => row === prior.get(row.id) ? row : this.compact(row, prior.get(row.id))); }
     finally { this.#preparing = undefined; this.#rings.clear(); }
+    const landed = this.#stage(tails);
     return {
       metadata,
-      valid: (): boolean => [...tails].every(([file, tail]) => tailSnapshot(file)?.generation === tail.generation),
-      commit: (): void => {
-        for (const [file, tail] of tails) {
-          const fd = fs.openSync(file, "a", 0o600);
-          try {
-            for (const append of tail.appends) {
-              let written = 0;
-              while (written < append.contents.length) {
-                const bytes = fs.writeSync(fd, append.contents, written, append.contents.length - written);
-                if (!bytes) throw new Error("Incomplete actor message append");
-                written += bytes;
-              }
-            }
-            fs.fsyncSync(fd);
-          } finally { fs.closeSync(fd); }
-          syncPathNamespace(file);
+      /** Cheap stat under custody: every append landed durably and its log is still that file. */
+      valid: (): boolean => landed !== undefined && [...landed].every(([file, mark]) => {
+        const now = tailSnapshot(file);
+        return now !== undefined && now.identity === mark.identity && now.size >= mark.end;
+      }),
+    };
+  }
+
+  /** Durable appends at the exact speculative offsets, or undefined when the tail moved. */
+  #stage(tails: ReadonlyMap<string, PreparedTail>): Map<string, LandedTail> | undefined {
+    const landed = new Map<string, LandedTail>();
+    for (const [file, tail] of tails) {
+      if (!tail.appends.length) continue;
+      const contents = Buffer.concat(tail.appends.map(append => append.contents));
+      const fd = fs.openSync(file, "a+", 0o600);
+      let identity: string;
+      try {
+        const before = fs.fstatSync(fd, { bigint: true });
+        identity = `${before.dev}:${before.ino}`;
+        if (Number(before.size) !== tail.size || (tail.identity !== undefined && tail.identity !== identity)) return undefined;
+        let written = 0;
+        while (written < contents.length) {
+          const bytes = fs.writeSync(fd, contents, written, contents.length - written);
+          if (!bytes) throw new Error("Incomplete actor message append");
+          written += bytes;
         }
+        fs.fsyncSync(fd);
+        // O_APPEND placement is atomic per write, but another appender may have won
+        // the tail between the size check and our write. Accept only our exact bytes.
+        const check = Buffer.alloc(contents.length);
+        let read = 0;
+        while (read < check.length) {
+          const bytes = fs.readSync(fd, check, read, check.length - read, tail.size + read);
+          if (!bytes) break;
+          read += bytes;
+        }
+        if (read !== check.length || !check.equals(contents)) return undefined;
+      } finally { fs.closeSync(fd); }
+      syncPathNamespace(file);
+      landed.set(file, { identity, end: tail.size + contents.length });
+    }
+    return landed;
+  }
+
+  /** Before custody: write and fsync a temp file for every changed accepted head.
+   * Under custody only a rename remains; its directory barrier may follow the lock. */
+  stageHeads(rows: readonly Row[]): StagedHeads {
+    const staged: Array<{ file: string; next: string; temporary?: string; previous?: string | undefined; replaced?: boolean }> = [];
+    const read = (file: string): string | undefined => {
+      try { return fs.readFileSync(file, "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return undefined; }
+    };
+    const dispose = (): void => {
+      for (const entry of staged) if (entry.temporary && !entry.replaced) fs.rmSync(entry.temporary, { force: true });
+    };
+    try {
+      for (const row of rows) {
+        const ref = history(row.messageHistory);
+        if (!ref || typeof row.id !== "string") continue;
+        const file = path.join(this.directory(row.id), "messages-head.json");
+        const next = JSON.stringify(ref);
+        const entry: (typeof staged)[number] = { file, next };
+        staged.push(entry);
+        if (read(file) === next) continue; // Rechecked under custody.
+        const created = fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        entry.temporary = `${file}.${process.pid}.${randomUUID()}.prepared`;
+        const fd = fs.openSync(entry.temporary, "wx", 0o600);
+        try { fs.writeFileSync(fd, next, { encoding: "utf8" }); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        // A new directory chain must be linked before a later rename can be durable.
+        if (created !== undefined) syncDirectoryChain(path.dirname(file));
+      }
+    } catch (error) { dispose(); throw error; }
+    const replaced = (): typeof staged => staged.filter(entry => entry.replaced);
+    const rollback = (): void => {
+      for (const entry of replaced().reverse()) {
+        if (entry.previous !== undefined) writeFileAtomic(entry.file, entry.previous, { durable: true });
+        else { fs.rmSync(entry.file, { force: true }); syncPathNamespace(path.dirname(entry.file)); }
+        entry.replaced = false;
+      }
+    };
+    return {
+      publish: (): string[] => {
+        try {
+          for (const entry of staged) {
+            entry.previous = read(entry.file);
+            if (entry.previous === entry.next) continue;
+            if (entry.temporary) renameAtomic(entry.temporary, entry.file);
+            // Rare: the checkpoint changed after staging. Durable inline fallback.
+            else writeFileAtomic(entry.file, entry.next, { durable: true });
+            entry.replaced = true;
+          }
+        } catch (error) { rollback(); throw error; }
+        return [...new Set(replaced().filter(entry => entry.temporary).map(entry => path.dirname(entry.file)))];
       },
+      rollback,
+      dispose,
     };
   }
 
@@ -223,7 +320,7 @@ export class ActorRegistryPayloads {
       let tail = this.#preparing.get(file);
       if (!tail) {
         const snapshot = tailSnapshot(file);
-        tail = { size: snapshot?.size ?? 0, generation: snapshot?.generation, appends: [] };
+        tail = { size: snapshot?.size ?? 0, identity: snapshot?.identity, appends: [] };
         this.#preparing.set(file, tail);
       }
       const ref: ActorMessageHistory = { version: 1,

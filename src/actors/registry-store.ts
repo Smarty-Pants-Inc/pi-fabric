@@ -23,6 +23,24 @@ export class ActorRegistryUpdateVetoedError extends Error {
   }
 }
 
+/** A checkpoint directory barrier failed twice; the save is NOT acknowledged
+ * (smarty-dev#6477 L7, pi-fabric#590 review round 2). `committed` is set when the
+ * registry rename already happened: the registry then durably references the new
+ * heads (callers must not re-append those messages), but a checkpoint may still lag
+ * it after an OS crash. When `committed` is undefined, nothing was written: an
+ * earlier owed barrier still fails. The barrier stays owed and is retried before
+ * the next update writes anything. */
+export class ActorRegistryCheckpointBarrierError<T = unknown> extends Error {
+  readonly code = "FABRIC_ACTOR_REGISTRY_CHECKPOINT_BARRIER";
+  readonly retryable = true;
+  constructor(readonly directories: readonly string[], readonly committed: { value: T } | undefined, cause: unknown) {
+    super(`${committed
+      ? "Actor registry checkpoint barrier failed after the registry commit; the save is not acknowledged as durable"
+      : "An earlier actor registry checkpoint barrier still fails; nothing was committed"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "ActorRegistryCheckpointBarrierError";
+  }
+}
+
 /** The fence wait expired before custody was acquired. */
 class ActorRegistryLockTimeoutError extends Error {
   constructor() { super("Timed out waiting for the Fabric actor registry lock"); }
@@ -85,6 +103,9 @@ export class ActorRegistryStore {
   readonly #payloads: ActorRegistryPayloads;
   readonly #ownProcessStart: string | undefined;
   #snapshot: ActorRegistrySnapshot | undefined;
+  /** Checkpoint directories whose post-commit barrier failed; the next update retries
+   * them before it prepares anything and fails closed while they still fail. */
+  readonly #owedBarriers = new Set<string>();
   readonly #encoded = new WeakMap<Record<string, unknown>, string>();
   readonly #now: () => number;
 
@@ -168,24 +189,36 @@ export class ActorRegistryStore {
       return row;
     }));
     const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
-    // File data and pre-rename namespace barriers happen outside custody.
+    // Message appends (payload.prepare), checkpoint temp files and the registry temp
+    // file are all written and fsynced here, outside custody (smarty-dev#6477 L7).
+    // A crash before the registry rename leaves only unreferenced bytes or files.
+    const heads = this.#payloads.stageHeads(changedHeads);
     try { writeFileAtomic(temporary, serialized, { durable }); }
     catch (error) {
       try { fs.rmSync(temporary, { force: true }); } catch { /* Preserve the failed preparation barrier. */ }
+      heads.dispose();
       throw error;
     }
     let renamed = false;
+    let owed: string[] = [];
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
-      commit: (): void => {
+      /** Under custody: the registry rename plus its one directory barrier, then
+       * checkpoint renames. With deferBarriers the checkpoint directory barriers
+       * run in settle(), after the lock is released and before acknowledgment. */
+      commit: (options?: { deferBarriers?: boolean }): void => {
+        let published = false;
         try {
-          payload.commit();
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
           if (durable) syncDirectoryChain(this.#actorRoot);
-          this.#payloads.publishHeads(changedHeads);
+          owed = heads.publish();
+          published = true;
+          if (!options?.deferBarriers) { for (const directory of owed) syncDirectoryChain(directory); owed = []; }
           this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
         } catch (error) {
+          if (published) heads.rollback();
+          owed = [];
           if (renamed) {
             if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
             else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
@@ -194,8 +227,49 @@ export class ActorRegistryStore {
           throw error;
         }
       },
-      dispose: () => fs.rmSync(temporary, { force: true }),
+      /** Outside custody: complete deferred checkpoint barriers before acknowledging.
+       * Throws (fails closed) when a barrier cannot be completed; see #settleBarriers. */
+      settle: (): void => { const directories = owed; owed = []; this.#settleBarriers(directories); },
+      dispose: () => { fs.rmSync(temporary, { force: true }); heads.dispose(); },
     };
+  }
+
+  /** Directory barriers for renamed checkpoints, each tried twice. FAIL CLOSED: any
+   * barrier that still fails is recorded as owed and throws, so no save is reported
+   * as successful until its registry AND its checkpoints are durable. The registry
+   * rename is already durable and the checkpoint temp was fsynced, so after a crash a
+   * checkpoint can only lag (never lead) the registry; it is not rolled back outside
+   * custody (another writer may already build on this commit). A directory that no
+   * longer exists (the actor was removed) owes nothing. */
+  #settleBarriers(directories: readonly string[]): void {
+    const failed: string[] = [];
+    let cause: unknown;
+    for (const directory of new Set(directories)) {
+      try { syncDirectoryChain(directory); this.#owedBarriers.delete(directory); continue; }
+      catch { /* Retried once below. */ }
+      try { syncDirectoryChain(directory); this.#owedBarriers.delete(directory); }
+      catch (error) {
+        if (!fs.existsSync(directory)) { this.#owedBarriers.delete(directory); continue; }
+        this.#owedBarriers.add(directory);
+        failed.push(directory);
+        cause ??= error;
+      }
+    }
+    if (!failed.length) return;
+    // The registry on disk is the source of truth; never serve a cached snapshot
+    // from a save that was not acknowledged.
+    this.#snapshot = undefined;
+    throw new ActorRegistryCheckpointBarrierError(failed, undefined, cause);
+  }
+
+  /** Post-commit settle: a barrier failure becomes a non-success that still tells the
+   * caller the registry already references this commit. */
+  #settleCommitted<T>(settle: () => void, value: T): void {
+    try { settle(); }
+    catch (error) {
+      if (!(error instanceof ActorRegistryCheckpointBarrierError)) throw error;
+      throw new ActorRegistryCheckpointBarrierError<T>(error.directories, { value }, error.cause);
+    }
   }
 
   async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
@@ -217,6 +291,9 @@ export class ActorRegistryStore {
         throw error;
       }
     };
+    // Fail closed BEFORE writing anything while an earlier checkpoint barrier is
+    // still owed: nothing is committed, so the caller simply retries.
+    if (this.#owedBarriers.size) this.#settleBarriers([...this.#owedBarriers]);
     const snapshot = this.snapshot();
     const mutation = select(snapshot.actors);
     if (!mutation) return undefined;
@@ -225,10 +302,10 @@ export class ActorRegistryStore {
       const committed = await locked(() => {
         if (!prepared.valid() || mutation.validate?.() === false) return false;
         live();
-        prepared.commit();
+        prepared.commit({ deferBarriers: true });
         return true;
       });
-      if (committed) return mutation.value;
+      if (committed) { this.#settleCommitted(prepared.settle, mutation.value); return mutation.value; }
     } finally { prepared.dispose(); }
     vetoed = true;
     // One optimistic attempt keeps the uncontended fence cheap. After any race,
@@ -237,6 +314,10 @@ export class ActorRegistryStore {
     // Caller-local cancellation/ownership validation still vetoes publication. A veto
     // re-selects from a fresh snapshot; one that persists is never reported as
     // success: undefined means only that select() declined to write.
+    // Under custody, a fresh preparation also appends under custody: that cost is
+    // paid only after a race, never on the uncontended path.
+    let settle: (() => void) | undefined;
+    let settled: T | undefined;
     const attempt = (): T | undefined | typeof VETOED => {
       live();
       const current = this.snapshot();
@@ -247,7 +328,9 @@ export class ActorRegistryStore {
         live();
         if (prepared.valid() && selected.validate?.() !== false) {
           live();
-          prepared.commit();
+          prepared.commit({ deferBarriers: true });
+          settle = prepared.settle;
+          settled = selected.value;
           return selected.value;
         }
       } finally { prepared.dispose(); }
@@ -269,6 +352,7 @@ export class ActorRegistryStore {
       // locked() rechecks the deadline after the backoff, before trying the fence.
       result = await locked(attempt);
     }
+    if (settle) this.#settleCommitted(settle, settled as T);
     return result;
   }
 

@@ -156,3 +156,12 @@ describe("public fabric_exec exact-id missed-delivery recovery (#3860 scope cut)
     }
   }, 30_000);
 });
+
+// pi-fabric#405 review P3: the agents guide must not promise the removed name aliases.
+describe("docs/agents.md RootInbox recovery contract (#3860 scope cut)", () => {
+  it("documents exact-root-id-only missed-delivery recovery", () => {
+    const guide = fs.readFileSync(path.resolve(import.meta.dirname, "..", "docs", "agents.md"), "utf8");
+    expect(guide).not.toMatch(/RootInbox uses the same validated name/);
+    expect(guide).toMatch(/RootInbox recovers a missed `fleet\.\*` delivery only when it is addressed to the root's exact canonical participant ID/);
+  });
+});

@@ -8,8 +8,19 @@ import { ActorRegistryPayloads } from "../src/actors/registry-payloads.js";
 // smarty-dev#6477 L7: payload fsyncs happen before registry custody; under the
 // lock only the registry rename (one directory barrier) and checkpoint renames.
 
+// Windows has no directory fsync: syncDirectoryChain skips every directory barrier on
+// win32 (src/core/atomic-write.ts). Each test runs on the host platform; POSIX hosts also
+// run it on a simulated win32 (process.platform is read at call time), so the Windows
+// path is covered on every CI host, and Windows CI runs it natively.
+const hostPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+const PLATFORMS: NodeJS.Platform[] = process.platform === "win32" ? ["win32"] : [process.platform, "win32"];
+const usePlatform = (platform: NodeJS.Platform) => {
+  if (platform !== hostPlatform.value) Object.defineProperty(process, "platform", { ...hostPlatform, value: platform });
+};
+
 const roots: string[] = [];
 afterEach(() => {
+  Object.defineProperty(process, "platform", hostPlatform);
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -31,8 +42,9 @@ const fixture = async () => {
 const appendAll = (store: ActorRegistryStore) => store.update(current => ({
   actors: current.map(row => ({ ...withoutRefs(row), registryMessageAppend: [m1] })), value: true }));
 
-describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
+describe.each(PLATFORMS.map(platform => ({ platform, windows: platform === "win32" })))("actor registry payload staging (smarty-dev#6477 L7) on $platform", ({ platform, windows }) => {
   it("fsyncs appends and checkpoint temps before custody; under the lock only renames and one registry barrier", async () => {
+    usePlatform(platform);
     const { actorRoot, store } = await fixture();
     const events: string[] = [];
     const paths = new Map<number, string>();
@@ -75,9 +87,11 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
       expect(before).toContain(`fsync file ${path.join(id, "registry", "messages.jsonl")}`);
       expect(before.some(event => event.startsWith(`fsync file ${path.join(id, "registry", "messages-head.json.")}`) &&
         event.endsWith(".prepared"))).toBe(true);
-      // The checkpoint directory barrier is deferred past the lock, before acknowledgment.
-      expect(after).toContain(`fsync dir ${path.join(id, "registry")}`);
+      // POSIX: the checkpoint directory barrier is deferred past the lock, before acknowledgment.
+      if (!windows) expect(after).toContain(`fsync dir ${path.join(id, "registry")}`);
     }
+    // Windows: no directory barrier is taken anywhere (none exists); file barriers stay.
+    if (windows) expect(events.filter(event => event.startsWith("fsync dir"))).toEqual([]);
     expect(before.some(event => /^fsync file actors\.json\..*\.prepared\..*\.tmp$/.test(event))).toBe(true);
     for (const id of ids) {
       const row = store.records().find(record => record.id === id)!;
@@ -93,6 +107,7 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
     // Barrier ORDER is proven by the test above; this one checks the visible state at
     // every crash point, so data barriers are counted as steps but not paid for.
     real.fsyncSync = () => undefined;
+    usePlatform(platform);
     const quiet = () => vi.spyOn(fs, "fsyncSync").mockImplementation(() => undefined);
     // Arm a simulated crash at the n-th call; the process is "dead" afterwards, so no
     // rollback or cleanup runs either (that is what distinguishes a crash from an error).
@@ -152,11 +167,12 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
   }, 120_000);
 
   it("fails closed when both checkpoint barrier attempts fail: update() rejects and readers see a consistent registry (pi-fabric#590 review round 2)", async () => {
+    usePlatform(platform);
     const { actorRoot, store } = await fixture();
     const registries = new Set(ids.map(id => path.join(actorRoot, id, "registry")));
     const paths = new Map<number, string>();
     const original = { open: fs.openSync, fsync: fs.fsyncSync, rm: fs.rmSync };
-    let unlocked = false, failing = true;
+    let unlocked = false, failing = true, directorySyncs = 0;
     const failures = new Map<string, number>();
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
@@ -172,24 +188,15 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
     // deferred settle() attempts. Pre-custody barriers of the same directory succeed.
     vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
       const file = paths.get(fd);
+      if (fs.fstatSync(fd).isDirectory()) directorySyncs++;
       if (failing && unlocked && file && registries.has(file)) {
         failures.set(file, (failures.get(file) ?? 0) + 1);
         throw Object.assign(new Error("EIO: checkpoint barrier"), { code: "EIO" });
       }
       original.fsync(fd);
     });
-    const error = await appendAll(store).then(() => undefined, (reason: unknown) => reason);
-    // No success: a clear, retryable error that says the registry already committed.
-    expect(error).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
-    const barrier = error as ActorRegistryCheckpointBarrierError<boolean>;
-    expect(barrier.message).toMatch(/checkpoint barrier failed after the registry commit; the save is not acknowledged/);
-    expect(barrier.retryable).toBe(true);
-    expect(barrier.committed).toEqual({ value: true });
-    expect([...barrier.directories].sort()).toEqual([...registries].sort());
-    for (const directory of registries) expect(failures.get(directory)).toBe(2);
-
-    // The next reader sees one consistent state: every actor selects [m0, m1] and its
-    // checkpoint equals the registry head (never leads, here does not lag either).
+    // The next reader sees one consistent state: every actor selects the expected history
+    // and its checkpoint equals the registry head (never leads, here does not lag either).
     const consistent = (expected: unknown[]) => {
       const fresh = new ActorRegistryStore(actorRoot);
       const payloads = new ActorRegistryPayloads(actorRoot);
@@ -199,9 +206,33 @@ describe("actor registry payload staging (smarty-dev#6477 L7)", () => {
         expect(payloads.savedHead(row.id)).toEqual(row.messageHistory);
         expect(fs.readdirSync(path.join(actorRoot, row.id, "registry")).filter(file => file.endsWith(".prepared"))).toEqual([]);
       }
-      // The failing store's own snapshot was invalidated and re-reads the same bytes.
+      // The store's own snapshot (invalidated after a failed barrier) matches the disk.
       expect(store.snapshot().bytes).toBe(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"));
     };
+    const m2 = { id: "m2", direction: "in", text: "next" };
+    const error = await appendAll(store).then(() => undefined, (reason: unknown) => reason);
+    if (windows) {
+      // Windows has no directory fsync, so there is no checkpoint barrier to fail: the
+      // save is acknowledged, nothing is owed, and the next save is not blocked.
+      expect(error).toBeUndefined();
+      expect(directorySyncs).toBe(0);
+      expect(failures.size).toBe(0);
+      consistent([m0, m1]);
+      await expect(store.update(current => ({ actors: current.map(row => ({ ...withoutRefs(row),
+        registryMessageAppend: [m2] })), value: "ok" }))).resolves.toBe("ok");
+      vi.restoreAllMocks();
+      consistent([m0, m1, m2]);
+      return;
+    }
+    expect(directorySyncs).toBeGreaterThan(0);
+    // No success: a clear, retryable error that says the registry already committed.
+    expect(error).toBeInstanceOf(ActorRegistryCheckpointBarrierError);
+    const barrier = error as ActorRegistryCheckpointBarrierError<boolean>;
+    expect(barrier.message).toMatch(/checkpoint barrier failed after the registry commit; the save is not acknowledged/);
+    expect(barrier.retryable).toBe(true);
+    expect(barrier.committed).toEqual({ value: true });
+    expect([...barrier.directories].sort()).toEqual([...registries].sort());
+    for (const directory of registries) expect(failures.get(directory)).toBe(2);
     consistent([m0, m1]);
 
     // While the owed barrier still fails, the next update fails closed BEFORE it

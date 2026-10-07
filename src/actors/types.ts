@@ -294,6 +294,11 @@ export interface FabricActorInfo {
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;
   activationFilterReservation?: ActorActivationFilterReservation;
+  /**
+   * The reservation capability, returned exactly once by the setActivationFilter call that
+   * issued it (never by status reads). Required for observations and to replace/clear it.
+   */
+  activationFilterReservationToken?: string;
   /** Last release evidence/receipt; retained for retry and watchdog readback. */
   activationFilterRelease?: ActorActivationFilterRelease;
   /** Lifetime events the activation filter skipped without a model run (legacy). */

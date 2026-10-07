@@ -707,9 +707,13 @@ interface FabricActorActivationSkipRule {
   unless?: FabricActorActivationFilterPredicate[];
 }
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
-interface ActorActivationFilterIdentity { repository: string; pr: number; head: string; createdAt: number; }
+/** generation is manager-issued (never caller-supplied); it fences successors at the same head. */
+interface ActorActivationFilterIdentity { repository: string; pr: number; head: string; generation: string; }
+interface ActorActivationFilterReservationRequest {
+  repository: string; pr: number; head: string; createdAt: number; expiresAt: number; runId?: string; requiredSecurity: string[];
+}
 interface ActorActivationFilterReservation extends ActorActivationFilterIdentity {
-  expiresAt: number; runId?: string; requiredSecurity: string[]; reviewTerminal?: true; securityTerminal?: string[];
+  createdAt: number; expiresAt: number; runId?: string; requiredSecurity: string[]; reviewTerminal?: true; securityTerminal?: string[];
 }
 interface ActorActivationFilterObservation extends ActorActivationFilterIdentity {
   currentHead?: string; prState?: "open" | "closed" | "merged"; reviewTerminal?: true; securityTerminal?: string[];
@@ -717,7 +721,7 @@ interface ActorActivationFilterObservation extends ActorActivationFilterIdentity
 }
 interface ActorActivationFilterRelease {
   reservation: ActorActivationFilterReservation;
-  reason: "explicit" | "expired" | "head-changed" | "pr-closed" | "verdicts-terminal" | "run-terminal";
+  reason: "explicit" | "replaced" | "expired" | "head-changed" | "pr-closed" | "verdicts-terminal" | "run-terminal";
   at: number; observation?: ActorActivationFilterObservation; runStatus?: "completed" | "failed" | "stopped" | "timed_out";
 }
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
@@ -815,6 +819,8 @@ interface FabricActorInfo {
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;
   activationFilterReservation?: ActorActivationFilterReservation;
+  /** Returned once, only by the setActivationFilter call that issued the reservation. */
+  activationFilterReservationToken?: string;
   activationFilterRelease?: ActorActivationFilterRelease;
   filteredCount?: number;
   lastFilteredAt?: number;
@@ -1020,7 +1026,7 @@ interface FabricAgentsApi {
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; scope?: "project" | "global" } & ({ activationFilter: FabricActorActivationFilter | null; expiresAt?: number; reservation?: ActorActivationFilterReservation; observation?: never } | { observation: ActorActivationFilterObservation; activationFilter?: never; reservation?: never; expiresAt?: never })): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; scope?: "project" | "global" } & ({ activationFilter: FabricActorActivationFilter | null; expiresAt?: number; reservation?: ActorActivationFilterReservationRequest; reservationToken?: string; observation?: never } | { observation: ActorActivationFilterObservation; reservationToken: string; activationFilter?: never; reservation?: never; expiresAt?: never })): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

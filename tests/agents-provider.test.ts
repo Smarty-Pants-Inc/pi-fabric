@@ -5314,13 +5314,20 @@ describe("AgentsProvider steering", () => {
     const actor = await actors.create({ name: "p0-control", instructions: "x" });
     const createdAt = Date.now();
     const reservation = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt, expiresAt: createdAt + 60_000, requiredSecurity: ["security"] };
-    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], reservation }, context))
-      .resolves.toMatchObject({ activationFilterReservation: reservation, activationFilterExpiresAt: reservation.expiresAt });
-    const observation = { ...reservation, reviewTerminal: true, securityTerminal: ["security"] };
-    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null, observation }, context)).rejects.toThrow("cannot replace");
+    const reserved = await provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], reservation }, context) as FabricActorInfo;
+    expect(reserved).toMatchObject({ activationFilterReservation: { ...reservation, generation: expect.any(String) }, activationFilterExpiresAt: reservation.expiresAt,
+      activationFilterReservationToken: expect.any(String) });
+    const reservationToken = reserved.activationFilterReservationToken!;
+    const { repository, pr, head, generation } = reserved.activationFilterReservation!;
+    const observation = { repository, pr, head, generation, reviewTerminal: true, securityTerminal: ["security"] };
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null, observation, reservationToken }, context)).rejects.toThrow("cannot replace");
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], reservation, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
-    const receipt = await provider.invoke("setActivationFilter", { id: actor.id, observation }, context);
-    expect(receipt).toMatchObject({ activationFilterRelease: { reason: "verdicts-terminal", reservation: { ...reservation, reviewTerminal: true, securityTerminal: ["security"] } } });
+    // Ordinary agent-risk callers without the capability can neither observe nor replace.
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, observation, reservationToken: "forged" }, context)).rejects.toThrow("not authorized");
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null }, context)).rejects.toThrow("held by P0 reservation");
+    const receipt = await provider.invoke("setActivationFilter", { id: actor.id, observation, reservationToken }, context);
+    expect(receipt).toMatchObject({ activationFilterRelease: { reason: "verdicts-terminal", reservation: { ...reservation, generation, reviewTerminal: true, securityTerminal: ["security"] } } });
+    expect(receipt).not.toHaveProperty("activationFilterReservationToken");
     await expect(provider.invoke("actorStatus", { id: actor.id }, context)).resolves.toEqual(receipt);
     expect(actors.status(actor.id).activationFilter).toBeUndefined();
   });
@@ -6118,9 +6125,9 @@ describe("own-root resident setters and authoritative status", () => {
     const reservation = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt, expiresAt: createdAt + 60_000, requiredSecurity: [] };
     await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], reservation }, context);
     expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], reservation });
-    const observation = { repository: reservation.repository, pr: reservation.pr, head: reservation.head, createdAt, prState: "merged" };
-    await state.provider.invoke("setActivationFilter", { id: state.actor.id, observation }, context);
-    expect(state.setActor.mock.calls[1]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, observation });
+    const observation = { repository: reservation.repository, pr: reservation.pr, head: reservation.head, generation: "0b0b0b0b-0000-4000-8000-000000000000", prState: "merged" };
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, observation, reservationToken: "capability" }, context);
+    expect(state.setActor.mock.calls[1]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, observation, reservationToken: "capability" });
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {

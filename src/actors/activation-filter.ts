@@ -265,16 +265,32 @@ export function activationFilterSkip(
 /** P0 reservations are bounded independently of model/run timeouts. */
 export const ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS = 4 * 60 * 60 * 1_000;
 
-export interface ActorActivationFilterIdentity {
+interface ActorActivationFilterSubject {
   repository: string;
   pr: number;
   /** Full GitHub head SHA, never an abbreviation. */
   head: string;
-  /** Generation fence: a delayed receipt cannot clear a replacement at the same head. */
+}
+
+export interface ActorActivationFilterIdentity extends ActorActivationFilterSubject {
+  /**
+   * Manager-issued, never caller-supplied generation (a random UUID). It fences a
+   * successor reservation even at the same repository/PR/head and creation millisecond.
+   */
+  generation: string;
+}
+
+/** Caller input for a new P0 reservation: the owning manager issues its generation and token. */
+export interface ActorActivationFilterReservationRequest extends ActorActivationFilterSubject {
+  /** Creation time; bounds the hard TTL. Not an identity fence. */
   createdAt: number;
+  expiresAt: number;
+  runId?: string;
+  requiredSecurity: string[];
 }
 
 export interface ActorActivationFilterReservation extends ActorActivationFilterIdentity {
+  createdAt: number;
   expiresAt: number;
   /** Native run identity whose terminal outcome releases this reservation. */
   runId?: string;
@@ -296,22 +312,40 @@ export interface ActorActivationFilterObservation extends ActorActivationFilterI
 
 export interface ActorActivationFilterRelease {
   reservation: ActorActivationFilterReservation;
-  reason: "explicit" | "expired" | "head-changed" | "pr-closed" | "verdicts-terminal" | "run-terminal";
+  reason: "explicit" | "replaced" | "expired" | "head-changed" | "pr-closed" | "verdicts-terminal" | "run-terminal";
   at: number;
   observation?: ActorActivationFilterObservation;
   runStatus?: "completed" | "failed" | "stopped" | "timed_out";
 }
 
 const FULL_HEAD = /^[a-f0-9]{40}$/;
-function filterIdentity(value: unknown): ActorActivationFilterIdentity {
+/** Manager-issued generation: a random UUID. */
+export const ACTOR_ACTIVATION_GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** SHA-256 hex of a reservation capability token. Only the digest is stored. */
+export const ACTOR_ACTIVATION_TOKEN_DIGEST = /^[0-9a-f]{64}$/;
+function filterSubject(value: unknown): ActorActivationFilterSubject {
   if (!isRecord(value) || typeof value.repository !== "string" ||
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.repository) || value.repository.length > 200 ||
     !Number.isSafeInteger(value.pr) || (value.pr as number) < 1 ||
-    typeof value.head !== "string" || !FULL_HEAD.test(value.head) ||
-    typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0) {
-    throw new Error("Invalid activationFilter identity: repository, positive PR, full head SHA and creation time are required");
+    typeof value.head !== "string" || !FULL_HEAD.test(value.head)) {
+    throw new Error("Invalid activationFilter identity: repository, positive PR and full head SHA are required");
   }
-  return { repository: value.repository.toLowerCase(), pr: value.pr as number, head: value.head, createdAt: value.createdAt };
+  return { repository: value.repository.toLowerCase(), pr: value.pr as number, head: value.head };
+}
+function filterIdentity(value: unknown): ActorActivationFilterIdentity {
+  const subject = filterSubject(value);
+  const generation = (value as Record<string, unknown>).generation;
+  if (typeof generation !== "string" || !ACTOR_ACTIVATION_GENERATION.test(generation)) {
+    throw new Error("Invalid activationFilter identity: the manager-issued reservation generation is required");
+  }
+  return { ...subject, generation };
+}
+function creationTime(value: unknown): number {
+  const createdAt = (value as Record<string, unknown>).createdAt;
+  if (typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt < 0) {
+    throw new Error("Invalid activationFilter reservation: creation time is required");
+  }
+  return createdAt;
 }
 
 function securityNames(value: unknown): string[] {
@@ -322,23 +356,43 @@ function securityNames(value: unknown): string[] {
   return [...value] as string[];
 }
 
-export function normalizeActorActivationReservation(value: unknown, now?: number): ActorActivationFilterReservation {
-  const identity = filterIdentity(value);
+function reservationBounds(value: unknown, now: number | undefined): Omit<ActorActivationFilterReservationRequest, keyof ActorActivationFilterSubject> {
+  const createdAt = creationTime(value);
   const row = value as Record<string, unknown>;
   if (typeof row.expiresAt !== "number" || !Number.isSafeInteger(row.expiresAt) ||
-    row.expiresAt <= identity.createdAt || row.expiresAt - identity.createdAt > ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS ||
-    (now !== undefined && (identity.createdAt > now || row.expiresAt <= now))) {
+    row.expiresAt <= createdAt || row.expiresAt - createdAt > ACTOR_ACTIVATION_RESERVATION_MAX_TTL_MS ||
+    (now !== undefined && (createdAt > now || row.expiresAt <= now))) {
     throw new Error("Invalid activationFilter reservation: hard TTL must be positive, unexpired and at most 4 hours from creation");
   }
   if (row.runId !== undefined && (typeof row.runId !== "string" || row.runId.length === 0 || row.runId.length > 200)) {
     throw new Error("Invalid activationFilter reservation runId");
   }
+  return { createdAt, expiresAt: row.expiresAt, requiredSecurity: securityNames(row.requiredSecurity),
+    ...(row.runId === undefined ? {} : { runId: row.runId as string }) };
+}
+
+/**
+ * Validate a caller's reservation request. Generation and verdict evidence are never
+ * accepted from the caller: the owning manager issues the generation and capability,
+ * and only authorized observations accumulate evidence.
+ */
+export function normalizeActorActivationReservation(value: unknown, now?: number): ActorActivationFilterReservationRequest {
+  const subject = filterSubject(value);
+  const row = value as Record<string, unknown>;
+  if (row.generation !== undefined) throw new Error("Invalid activationFilter reservation: the generation is manager-issued, never supplied by the caller");
+  if (row.reviewTerminal !== undefined || row.securityTerminal !== undefined) throw new Error("Set verdict evidence through activationFilter observation, not reservation");
+  return { ...subject, ...reservationBounds(value, now) };
+}
+
+/** Validate a persisted reservation written by the owning manager (generation included). */
+export function normalizeStoredActorActivationReservation(value: unknown): ActorActivationFilterReservation {
+  const identity = filterIdentity(value);
+  const bounds = reservationBounds(value, undefined);
+  const row = value as Record<string, unknown>;
   if (row.reviewTerminal !== undefined && row.reviewTerminal !== true) throw new Error("Invalid activationFilter reviewTerminal");
-  const requiredSecurity = securityNames(row.requiredSecurity);
   const securityTerminal = row.securityTerminal === undefined ? undefined : securityNames(row.securityTerminal);
-  if (securityTerminal?.some(name => !requiredSecurity.includes(name))) throw new Error("Unknown activationFilter security verdict");
-  return { ...identity, expiresAt: row.expiresAt, requiredSecurity,
-    ...(row.runId === undefined ? {} : { runId: row.runId as string }),
+  if (securityTerminal?.some(name => !bounds.requiredSecurity.includes(name))) throw new Error("Unknown activationFilter security verdict");
+  return { ...identity, ...bounds,
     ...(row.reviewTerminal === true ? { reviewTerminal: true } : {}),
     ...(securityTerminal === undefined ? {} : { securityTerminal }) };
 }
@@ -365,7 +419,7 @@ export function normalizeActorActivationObservation(value: unknown): ActorActiva
 }
 
 export function sameActorActivationIdentity(a: ActorActivationFilterIdentity, b: ActorActivationFilterIdentity): boolean {
-  return a.repository === b.repository && a.pr === b.pr && a.head === b.head && a.createdAt === b.createdAt;
+  return a.repository === b.repository && a.pr === b.pr && a.head === b.head && a.generation === b.generation;
 }
 
 /** Pure cached-state check. Missing webhook/projected identity means deliver, never guess. */

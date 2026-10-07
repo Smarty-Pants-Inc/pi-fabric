@@ -71,30 +71,44 @@ describe("guest agents surface", () => {
   });
   it.each([false, true])("types scoped P0 reservation/observation and release readback (fullCodeMode=%s)", fullCodeMode => {
     const code = `const createdAt = Date.now();
-      const identity = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt };
-      await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], reservation: { ...identity, expiresAt: createdAt + 60000, requiredSecurity: ["security"] } });
-      const receipt = await agents.setActivationFilter({ id: "reviewer", observation: { ...identity, reviewTerminal: true, securityTerminal: ["security"] } });
+      const subject = { repository: "smarty/demo", pr: 7, head: "a".repeat(40) };
+      const reserved = await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], reservation: { ...subject, createdAt, expiresAt: createdAt + 60000, requiredSecurity: ["security"] } });
+      const generation: string = reserved.activationFilterReservation!.generation;
+      const reservationToken: string = reserved.activationFilterReservationToken!;
+      const receipt = await agents.setActivationFilter({ id: "reviewer", reservationToken, observation: { ...subject, generation, reviewTerminal: true, securityTerminal: ["security"] } });
+      await agents.setActivationFilter({ id: "reviewer", activationFilter: null, reservationToken });
       const actor = await agents.actorStatus({ id: "reviewer" });
       const head: string | undefined = actor.activationFilterReservation?.head;
       const releasedAt: number | undefined = receipt.activationFilterRelease?.at;
       const reason: string | undefined = actor.activationFilterRelease?.reason;
       return { head, reason, releasedAt };`;
     expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
-    const invalid = `await agents.setActivationFilter({ id: "reviewer", activationFilter: null, observation: { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: 0, prState: "closed" } });`;
-    expect(typeCheckFabricCode(invalid, guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    for (const invalid of [
+      `await agents.setActivationFilter({ id: "reviewer", activationFilter: null, observation: { repository: "smarty/demo", pr: 7, head: "a".repeat(40), generation: "g", prState: "closed" } });`,
+      // Observations need the capability, and the identity is the manager-issued generation.
+      `await agents.setActivationFilter({ id: "reviewer", observation: { repository: "smarty/demo", pr: 7, head: "a".repeat(40), generation: "g", prState: "closed" } });`,
+      `await agents.setActivationFilter({ id: "reviewer", reservationToken: "t", observation: { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: 0, prState: "closed" } });`]) {
+      expect(typeCheckFabricCode(invalid, guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    }
   });
   it("validates the native P0 set/observe union and terminal evidence schema", () => {
     const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!.inputSchema;
-    const identity = { repository: "smarty/demo", pr: 7, head: "a".repeat(40), createdAt: 10 };
-    const reservation = { ...identity, expiresAt: 20, requiredSecurity: ["security"] };
+    const subject = { repository: "smarty/demo", pr: 7, head: "a".repeat(40) };
+    const identity = { ...subject, generation: "0b0b0b0b-0000-4000-8000-000000000000" };
+    const reservation = { ...subject, createdAt: 10, expiresAt: 20, requiredSecurity: ["security"] };
+    const reservationToken = "capability";
     expect(validationMessage(schema, { id: "reviewer", activationFilter: ["hold"], reservation })).toBeUndefined();
-    expect(validationMessage(schema, { id: "reviewer", observation: { ...identity, reviewTerminal: true } })).toBeUndefined();
-    expect(validationMessage(schema, { id: "reviewer", observation: { ...identity, runId: "run", runStatus: "timed_out" } })).toBeUndefined();
+    expect(validationMessage(schema, { id: "reviewer", activationFilter: null, reservationToken })).toBeUndefined();
+    expect(validationMessage(schema, { id: "reviewer", reservationToken, observation: { ...identity, reviewTerminal: true } })).toBeUndefined();
+    expect(validationMessage(schema, { id: "reviewer", reservationToken, observation: { ...identity, runId: "run", runStatus: "timed_out" } })).toBeUndefined();
     for (const invalid of [{ id: "reviewer" },
-      { id: "reviewer", activationFilter: null, observation: { ...identity, prState: "closed" } },
-      { id: "reviewer", observation: identity },
-      { id: "reviewer", observation: { ...identity, runStatus: "timed_out" } },
-      { id: "reviewer", observation: { ...identity, prState: "open", runId: "run" } },
+      { id: "reviewer", activationFilter: null, reservationToken, observation: { ...identity, prState: "closed" } },
+      { id: "reviewer", reservationToken, observation: identity },
+      { id: "reviewer", observation: { ...identity, reviewTerminal: true } },
+      { id: "reviewer", reservationToken, observation: { ...subject, createdAt: 10, reviewTerminal: true } },
+      { id: "reviewer", activationFilter: ["hold"], reservation: { ...reservation, generation: identity.generation } },
+      { id: "reviewer", reservationToken, observation: { ...identity, runStatus: "timed_out" } },
+      { id: "reviewer", reservationToken, observation: { ...identity, prState: "open", runId: "run" } },
       { id: "reviewer", activationFilter: ["hold"], reservation: { ...reservation, head: "short" } }]) {
       expect(validationMessage(schema, invalid)).toBeDefined();
     }

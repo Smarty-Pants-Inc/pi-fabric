@@ -152,7 +152,7 @@ describe("principal view", () => {
     const actual = new CustomMessageComponent(custom, renderers.get(custom.customType));
     const native = new CustomMessageComponent(custom);
     const plain = (text: string) => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-    expect(plain(actual.render(120).join("\n"))).toContain("↳ Builder: Visible summary FULL_BODY_5049");
+    expect(plain(actual.render(120).join("\n"))).toContain("↳ Builder: [1 agent] Visible summary FULL_BODY_5049");
     await h.command("off"); actual.setExpanded(true); actual.setExpanded(false);
     expect(actual.render(120)).toEqual(native.render(120));
     await h.command("on"); actual.setExpanded(true); actual.setExpanded(false);

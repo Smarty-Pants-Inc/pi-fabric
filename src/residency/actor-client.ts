@@ -139,6 +139,13 @@ export class ResidentActorClient {
       ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
 
+  /** Same-user operator control; the resident executor requires root confirmation and vetoes live leases. */
+  async operatorActor(action: "stop" | "remove", id: string,
+    options: { dryRun?: boolean; confirmDeadRoot?: string } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "operatorActor",
+      action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
+  }
+
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     if (!this.isLive()) throw new Error("Root resident host is not live");
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);

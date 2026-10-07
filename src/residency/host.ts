@@ -18,6 +18,7 @@ interface ResidentHostLaunchContext {
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
+import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -721,6 +722,9 @@ export class ResidentHost {
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
+    // Observed below by closeWithActors, but only after further awaits: a rejection
+    // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
+    void actorsClosed?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
@@ -1305,7 +1309,8 @@ export class ResidentHost {
       entry = { result: Promise.resolve().then(() => this.#executeRequest(command)) };
       this.#creations.set(key, entry);
       const tracked = entry;
-      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); });
+      // The caller awaits the result; this bookkeeping branch must not leak its rejection.
+      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); }, () => undefined);
     }
     const response = await entry.result;
     if (response.requestId !== command.requestId) {
@@ -1426,6 +1431,35 @@ export class ResidentHost {
           actor: actor as FabricActorInfo,
           completedAt: Date.now(),
         };
+      } else if (command.operation === "operatorActor") {
+        if ((command.action !== "stop" && command.action !== "remove") ||
+            typeof command.id !== "string" || !command.id.trim() ||
+            (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+          throw new Error("Invalid resident operator actor request");
+        }
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh);
+        const check = () => assertResidentOperatorConfirmed(
+          readResidentOperatorEvidence(this.config, this.mesh), command.confirmDeadRoot);
+        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
+        // Exact id/name within this executor's root only; never resolve via the caller's root.
+        const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
+          actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
+        if (candidates.length !== 1) throw new Error(candidates.length
+          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
+        const actor = candidates[0]!;
+        if (command.dryRun === true) {
+          response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
+        } else {
+          // Re-read the uncached current lease immediately before each mutation.
+          // This is a lease veto, not a proof that no Main exists or can restart.
+          const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
+          boundaryAdmitted?.();
+          const stopped = await pending;
+          response = command.action === "stop"
+            ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
+            : await this.#removeResidentActor(actor.id, requestId, () => check());
+        }
       } else if (command.operation === "actors") {
         response = {
           format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -1474,28 +1508,7 @@ export class ResidentHost {
         }
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
-        const cleanup = this.actors.cleanupObligation(command.id);
-        if (!this.actors.owns(command.id) || (cleanup && cleanup.residency !== "durable")) {
-          throw new Error(`Resident host does not own ${command.id}`);
-        }
-        // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
-        commit(command.id);
-        const removed = await this.actors.remove(command.id, { wait: false });
-        this.#writeRemovals();
-        if (removed.pending) {
-          void this.actors.removalSettled(command.id)?.finally(() => {
-            this.#writeRemovals();
-            this.participants.scheduleRefresh();
-          });
-        }
-        response = {
-          format: RESIDENT_HOST_FORMAT,
-          requestId,
-          ok: true,
-          ...(removed.pending ? { pending: removed.pending } : {}),
-          ...(removed.cleaned !== undefined ? { cleaned: removed.cleaned } : {}),
-          completedAt: Date.now(),
-        };
+        response = await this.#removeResidentActor(command.id, requestId, commit);
       }
     } catch (error) {
       response = {
@@ -1513,6 +1526,26 @@ export class ResidentHost {
       };
     }
     return response;
+  }
+
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {
+    const cleanup = this.actors.cleanupObligation(id);
+    if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
+      throw new Error(`Resident host does not own ${id}`);
+    }
+    // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
+    commit(id);
+    const removed = await this.actors.remove(id, { wait: false });
+    this.#writeRemovals();
+    if (removed.pending) {
+      void this.actors.removalSettled(id)?.finally(() => {
+        this.#writeRemovals();
+        this.participants.scheduleRefresh();
+      });
+    }
+    return { format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+      ...(removed.pending ? { pending: removed.pending } : {}),
+      ...(removed.cleaned !== undefined ? { cleaned: removed.cleaned } : {}), completedAt: Date.now() };
   }
 
   /** Pending removals for clients' error messages (smarty-dev#2184 item 8). */

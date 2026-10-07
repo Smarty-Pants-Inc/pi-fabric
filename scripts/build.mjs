@@ -10,6 +10,7 @@ const primaryEntryPoints = [
   "src/mesh.ts",
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
+  "src/actors-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
   "src/mcp.ts",

@@ -120,7 +120,8 @@ describe("per-call shadow ledger", () => {
     // An open call is written at close without usage; an estimate replaces a missing Pi figure.
     expect(second).toMatchObject({ callIndex: 2, decision: "main", rule: "user-message", contextTokensSource: "estimate",
       previousCallModel: null, sameAsPrevious: null, usage: null, responseModel: null });
-    expect(fs.statSync(ledger).mode & 0o777).toBe(0o600);
+    // Windows has no POSIX modes: stat reports 0o666 for any writable file, whatever mode open() was given.
+    if (process.platform !== "win32") expect(fs.statSync(ledger).mode & 0o777).toBe(0o600);
   });
 
   it("records a model change against the previous call", async () => {

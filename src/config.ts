@@ -205,7 +205,30 @@ export interface FabricAgentConfig {
   sessionExportDir: string;
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
+  /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
+  deadRootFilter: FabricDeadRootFilterConfig;
 }
+
+export type FabricDeadRootFilterMode = "off" | "on";
+
+export interface FabricDeadRootFilterConfig {
+  /** "off" (default) never skips; "on" skips activations of non-exempt actors under a dead root. */
+  mode: FabricDeadRootFilterMode;
+  /** Actor ids, id prefixes or exact actor names that always run, even under a dead root. */
+  exempt: string[];
+}
+
+const MAX_DEAD_ROOT_EXEMPT = 512;
+
+/** Unknown or malformed input means "off"; exemptions keep every non-blank string up to 200 chars. */
+export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFilterConfig => {
+  const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const exempt = Array.isArray(input.exempt)
+    ? [...new Set(input.exempt.flatMap((entry) => typeof entry === "string" && entry.trim() && entry.trim().length <= 200 ? [entry.trim()] : []))]
+      .slice(0, MAX_DEAD_ROOT_EXEMPT)
+    : [];
+  return { mode: input.mode === "on" ? "on" : "off", exempt };
+};
 
 export interface FabricToolCaptureConfig {
   enabled: boolean;
@@ -510,6 +533,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExport: true,
     sessionExportDir: "",
     nice: 0,
+    deadRootFilter: { mode: "off", exempt: [] },
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -1204,6 +1228,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
     },
     jev: normalizeJevConfig(input.jev),
@@ -1672,6 +1697,7 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.processSlice;
       delete agents.placement;
+      delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

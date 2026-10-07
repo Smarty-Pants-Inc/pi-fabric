@@ -915,6 +915,88 @@ At or after that time, the next event or existing poll clears the filter **befor
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
 
+### Dead-root activation filter
+
+A durable actor keeps running on its resident host after the Main that owns it (its root) is gone, and every event it reacts to then spends a model run that nobody reads (smarty-dev#6062). With `agents.deadRootFilter.mode: "on"`, the resident host checks the actor's owning root just before a callerless mesh or host event would run a durable actor, and skips the run only on a **positive** dead verdict:
+
+- the root's own host lease file (`<meshRoot>/host-leases/`, the Main's lease) is present, readable, names that root and expired **more than 10 minutes** ago; **and**
+- the root has no live participant record (`<meshRoot>/participants/`): none, or one whose owner host lease has expired.
+
+Everything else runs (fail-open): a live lease or participant, a lease that expired within 10 minutes, a missing lease file, an unreadable or invalid lease or participant file, a lease stamped in the future (clock doubt), an unreadable config or any read error. The check reads only those files (no lock is taken); each root's verdict is cached for 60 seconds, and a cached dead verdict is dropped as soon as the root's lease file changes. Session actors and a caller's own `ask`/`tell` are never skipped.
+
+A skipped event is acknowledged like an activation-filter skip: no model call, an actor message with reason `filtered: dead-root`, the `filterSkipped` counters, and one JSONL line in `<meshRoot>/metrics/dead-root-skips.jsonl`:
+
+```json
+{"at":"2026-10-07T12:00:00.000Z","actorId":"…","actorName":"…","rootId":"session:…","eventId":"…","topic":"github.demo","reason":"root lease expired 42 min ago; no live participant"}
+```
+
+`agents.deadRootFilter.exempt` lists actor ids, id prefixes or exact actor names that always run. There are no implicit exemptions: a `*-supervisor` actor is exempt only if it is listed. The setting is host-only (a project config cannot change it) and is read on every activation, so setting `mode: "off"` reverts it at once. The fleet configuration, whose exemptions are the only reviewers for some repositories and live under dead roots on purpose:
+
+```json
+{
+  "agents": {
+    "deadRootFilter": {
+      "mode": "on",
+      "exempt": [
+        "0536f1ea",
+        "138dd545",
+        "217018c8",
+        "2cec34f4",
+        "383647f6",
+        "456dad01",
+        "5942be83",
+        "71930014",
+        "858ac32a",
+        "bf8a8562",
+        "dd0b33fb",
+        "e3a27c5b",
+        "0b824536",
+        "0e3ac75e",
+        "38299985",
+        "494f6a92",
+        "4a5465de",
+        "59f84b67",
+        "62af2ccd",
+        "6b0e76ad",
+        "d8b9e555",
+        "e1dab9b7",
+        "ecc95aa7",
+        "f2636e75",
+        "07d2fd0a",
+        "0ad8d77f",
+        "0dfe1b06",
+        "169bc23e",
+        "16a07279",
+        "34756a40",
+        "6299ef69",
+        "68ef4a63",
+        "7d4da881",
+        "c1542385",
+        "cedf8dc2",
+        "e8385d7d",
+        "edf67040",
+        "efb3e192",
+        "f1522fcb",
+        "0d966f8e",
+        "e0920925",
+        "4c3cfdc7",
+        "9d82f91a",
+        "81bde9b4",
+        "9d401c1a",
+        "2824d795",
+        "30883604",
+        "97a31058",
+        "ead7988f",
+        "f9640b3b",
+        "25ceadc1"
+      ]
+    }
+  }
+}
+```
+
+`tools/meters/dead_root_skips_24h.py [meshRoot-or-jsonl ...]` prints the number of skip lines in the last 24 hours (the last line is the number); it only reads.
+
 ### Native asynchronous vision handoff
 
 A vision handoff does not require a separate extension that watches events. Create one persistent actor, select a multimodal model, and subscribe to `input`. Fabric automatically detects and attaches images from the prompt. Passive `steer` sends the description to Main without starting an unrelated idle turn. Set `coalesce: false` to preserve separate image prompts while the vision actor is busy:

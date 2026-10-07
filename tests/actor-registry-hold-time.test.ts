@@ -366,9 +366,19 @@ describe("#4383 bounded registry holds", () => {
     expect(selections).toBe(2);
     expect(store.records().at(-1)?.futureField).toBe("keep");
     expect(store.messages(store.records()[0]!)).toEqual([{ id: "accepted", direction: "in", text: "once" }]);
-    const transactions = fs.readFileSync(path.join(actorRoot, "0".repeat(32), "registry", "messages.jsonl"), "utf8").trim().split("\n");
-    expect(transactions).toHaveLength(1);
+    // Appends are durable before custody (smarty-dev#6477 L7): the losing optimistic
+    // preparation leaves one abandoned, unreferenced transaction. The accepted head
+    // and its checkpoint select only the re-selected transaction, with no predecessor.
+    const registry = path.join(actorRoot, "0".repeat(32), "registry");
+    const log = fs.readFileSync(path.join(registry, "messages.jsonl"));
+    const transactions = log.toString("utf8").split("\n").filter(Boolean);
+    expect(transactions).toHaveLength(2);
+    const head = store.records()[0]!.messageHistory as { offset: number; bytes: number };
+    expect(head.offset).toBeGreaterThan(0);
+    expect(JSON.parse(log.subarray(head.offset, head.offset + head.bytes).toString("utf8"))).toEqual({ messages: [{ id: "accepted", direction: "in", text: "once" }] });
+    expect(JSON.parse(fs.readFileSync(path.join(registry, "messages-head.json"), "utf8"))).toEqual(head);
     expect(fs.readdirSync(actorRoot).filter(file => file.endsWith(".prepared"))).toEqual([]);
+    expect(fs.readdirSync(registry).filter(file => file.endsWith(".prepared"))).toEqual([]);
   });
 
   it("real concurrent setters over a 50-actor registry complete inside the 5 s acquisition window", async () => {

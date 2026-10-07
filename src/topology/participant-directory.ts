@@ -88,13 +88,17 @@ function touchConfirmWitness(meshRoot: string): void {
   try { fs.writeFileSync(path.join(meshRoot, CONFIRM_WITNESS_FILE), "", { mode: 0o600 }); } catch { /* no evidence */ }
 }
 
-/** The latest commit witness mtime under the mesh root, or 0 when none can be read. Lock-free. */
+/** The latest commit witness mtime under the mesh root, or 0 when none can be read. Lock-free.
+ * Floored to whole milliseconds: mtimeMs is fractional, but every time it is compared with
+ * (receipts, Date.now()) is an integer millisecond, and a fractional witness in the same
+ * millisecond would read as later than a receipt or clock that already includes it. Flooring
+ * only ages the evidence, so a same-millisecond tie fails safe: not newer, take the lock. */
 function latestCommitWitness(meshRoot: string): number {
   let latest = 0;
   for (const name of COMMIT_WITNESS_FILES) {
     try { latest = Math.max(latest, fs.statSync(path.join(meshRoot, name)).mtimeMs); } catch { /* absent: no evidence */ }
   }
-  return latest;
+  return Math.floor(latest);
 }
 /**
  * Activity counters change on almost every turn and tool call. A change in them alone does not

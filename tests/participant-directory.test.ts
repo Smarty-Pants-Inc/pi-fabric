@@ -2092,10 +2092,23 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     return { directory, mesh, writer, other, lockPath, acquisitions, confirmations, writes };
   };
   afterEach(() => { vi.restoreAllMocks(); });
+  // Witness times are whole milliseconds of file time (latestCommitWitness floors mtimeMs), so a
+  // commit in the same millisecond as a receipt is, by design, no evidence. Before a commit that
+  // must count as evidence, wait until file time passes every receipt and witness so far.
+  const fileClockPast = (meshRoot: string, ...receipts: number[]) => {
+    const latest = Math.max(...receipts, ...fs.readdirSync(meshRoot).map(name => Math.floor(fs.statSync(path.join(meshRoot, name)).mtimeMs)));
+    const probe = path.join(path.dirname(meshRoot), "clock.probe");
+    for (let i = 0; i < 100_000; i++) {
+      fs.writeFileSync(probe, "");
+      if (Math.floor(fs.statSync(probe).mtimeMs) > latest && Date.now() > latest) return;
+    }
+    throw new Error("file clock did not advance");
+  };
 
   it("takes no mesh lock for an idle confirmation after another writer's commit, and still advances confirmedAt", async () => {
     const f = await idleFixture();
     const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
     await f.writer.put({ key: "bench/other", value: { at: 1 }, identity: f.other });
     const committedAt = Date.now();
     const baseline = f.acquisitions();
@@ -2162,6 +2175,7 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     await second.refresh();
     await f.directory.refresh();                               // absorbs the second's first commits
     const confirmationsBefore = f.confirmations.mock.calls.length;
+    fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
     await f.directory.refresh();                               // nothing unseen: a real, witnessed acquisition
     expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
     const before = second.confirmedAt(), baseline = f.acquisitions();

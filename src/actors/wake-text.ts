@@ -21,9 +21,13 @@ import path from "node:path";
  * receipt store id; (3) AUTHORIZED REPOSITORY: the receipt's full owner/repository equals the
  * envelope's, the GitHub payload's repository.full_name agrees, the topic names it
  * (github.<repository name>[.<suffix>]), the actor subscribes to that topic AND the full owner/repository
- * is on the actor's host-only allowlist (agents.wakeText.repositories, keyed by actor name or id). The
+ * is on the actor's host-only allowlist (agents.wakeText.repositories, keyed by the exact actor ID). The
  * topic carries no owner, so acme/demo and other/demo share github.demo: the topic alone never
  * authorizes. An actor without an allowlist entry gets no text (fail closed).
+ *
+ * Only the immutable actor ID authorizes (smarty-dev#6144 security round 2). Actor names are not
+ * unique: another session, project or root can create an actor with the same name, so a name is
+ * never a grant. A configured key that is not an actor ID is dropped, never matched against names.
  */
 
 export const WAKE_TEXT_MAX_CHARS = 2_000;
@@ -45,6 +49,14 @@ export const DEFAULT_WAKE_TEXT_TRUSTED_PUBLISHERS: readonly string[] = Object.fr
 export const WAKE_TEXT_MAX_ACTORS = 64;
 export const WAKE_TEXT_MAX_REPOSITORIES_PER_ACTOR = 32;
 
+/** An actor ID as the actor manager mints it (randomUUID without dashes): never a name. */
+const ACTOR_ID = /^[0-9a-f]{32}$/;
+
+/** True for an exact actor ID; an actor name, wildcard or anything else is not one. */
+export function isWakeTextActorId(value: unknown): value is string {
+  return typeof value === "string" && ACTOR_ID.test(value);
+}
+
 /** A full GitHub owner/repository name, never a bare repository name, wildcard or path. */
 const FULL_REPOSITORY = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/;
 
@@ -64,16 +76,17 @@ export interface FabricWakeTextConfig {
    */
   trustedPublishers: readonly string[];
   /**
-   * Per-actor allowlist of full owner/repository names (lowercased), keyed by actor name or id.
-   * An actor hydrates only receipts of a repository listed under its name or id. Empty: no hydration.
+   * Per-actor allowlist of full owner/repository names (lowercased), keyed by exact actor ID (32
+   * lowercase hex characters). An actor hydrates only receipts of a repository listed under its own
+   * ID; an actor name never grants. Empty: no hydration.
    */
   repositories: Readonly<Record<string, readonly string[]>>;
 }
 
 /** The actor an activation belongs to, as hydration authorizes it. */
 export interface WakeTextActor {
+  /** The actor's immutable ID: the only identity that authorizes. Names are never consulted. */
   id: string;
-  name: string;
   /** The actor's subscribed mesh topics. */
   topics: readonly string[];
 }
@@ -116,8 +129,9 @@ export function normalizeWakeTextConfig(value: unknown): FabricWakeTextConfig | 
 }
 
 /**
- * `{ "<actor name or id>": ["owner/repo", ...] }`: exact keys and full owner/repository names only.
- * A bare repository name, a wildcard or any other malformed entry is dropped, never widened.
+ * `{ "<actor id>": ["owner/repo", ...] }`: exact actor IDs and full owner/repository names only.
+ * An actor name, a wildcard, a bare repository name or any other malformed entry is dropped, never
+ * widened: a name is not unique across sessions, projects and roots, so it can never grant.
  */
 function normalizeWakeTextRepositories(value: unknown): Record<string, readonly string[]> {
   const result: Record<string, readonly string[]> = Object.create(null) as Record<string, readonly string[]>;
@@ -125,8 +139,8 @@ function normalizeWakeTextRepositories(value: unknown): Record<string, readonly 
   let actors = 0;
   for (const [rawKey, list] of Object.entries(value)) {
     if (actors >= WAKE_TEXT_MAX_ACTORS) break;
-    const key = rawKey.trim();
-    if (!key || key.length > 256 || key.includes("*") || !Array.isArray(list)) continue;
+    const key = rawKey.trim().toLowerCase();
+    if (!isWakeTextActorId(key) || !Array.isArray(list)) continue;
     const repositories = [...new Set(list
       .filter((entry): entry is string => typeof entry === "string")
       .map((entry) => entry.trim())
@@ -139,13 +153,15 @@ function normalizeWakeTextRepositories(value: unknown): Record<string, readonly 
   return result;
 }
 
-/** The full owner/repository names (lowercased) this actor may hydrate: its id's and its name's entries. */
-export function wakeTextActorRepositories(config: Pick<FabricWakeTextConfig, "repositories"> | undefined, actor: Pick<WakeTextActor, "id" | "name">): string[] {
+/**
+ * The full owner/repository names (lowercased) this actor may hydrate: the entries under its exact
+ * actor ID only. The actor's name is never consulted, so a namesake in another scope gets nothing.
+ */
+export function wakeTextActorRepositories(config: Pick<FabricWakeTextConfig, "repositories"> | undefined, actor: Pick<WakeTextActor, "id">): string[] {
   const table = config && isRecord(config.repositories) ? config.repositories : undefined;
-  if (!table) return [];
-  const own = (key: string): readonly string[] =>
-    key && Object.prototype.hasOwnProperty.call(table, key) && Array.isArray(table[key]) ? table[key]! : [];
-  return [...new Set([...own(actor.id), ...own(actor.name)].filter(isFullRepository).map((entry) => entry.toLowerCase()))];
+  if (!table || !isWakeTextActorId(actor.id) || !Object.prototype.hasOwnProperty.call(table, actor.id)) return [];
+  const own = table[actor.id];
+  return Array.isArray(own) ? [...new Set(own.filter(isFullRepository).map((entry) => entry.toLowerCase()))] : [];
 }
 
 interface ReceiptKey {

@@ -2819,9 +2819,10 @@ export class ActorManager {
         if (!item) break;
         // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
         // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
-        // actor's host-only allowlist; otherwise the activation runs as it was.
+        // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
+        // another scope can share); otherwise the activation runs as it was.
         const wakeText = hydrateWakeText(this.#wakeTextConfig, item.source, item.payload,
-          { id: actor.id, name: actor.name, topics: actor.topics });
+          { id: actor.id, topics: actor.topics });
         if (wakeText) item.wakeText = wakeText;
         else delete item.wakeText;
         const filteredBy = this.#filteredBy(actor, item);

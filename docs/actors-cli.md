@@ -1,4 +1,4 @@
-# Stop or remove a dead Main's durable actor
+# Stop, remove or adopt a dead Main's durable actor
 
 Run on the resident's machine, as its OS user, from any Fabric session or shell:
 
@@ -58,3 +58,39 @@ This requires a resident binary advertising `operatorActor`. Older binaries
 are refused before a request is dispatched; no unsafe legacy command fallback
 is used. Existing dead-root resident binaries need an explicit deployment of a
 compatible host before this operator path is available.
+
+## Adopt a dead root's durable actor into a live root (smarty-dev#5919)
+
+```sh
+fabric-actors adopt --resident <dead-directory-or-prefix> --actor <id-or-name> \
+  --into <live-rootId-or-resident> --dry-run
+fabric-actors adopt --resident <dead-directory-or-prefix> --actor <id-or-name> \
+  --into <live-rootId-or-resident> --confirm-dead-root <deadRootId>
+```
+
+Adoption moves the actor's custody to the live root's resident host and keeps
+its id, name, instructions, model, topics, message history and queued mailbox
+work; it does not replay old mesh events (future-only delivery). The dead root
+gets exactly the stop/remove checks above: `--confirm-dead-root` must equal its
+root ID and an unexpired (or unreadable) root lease always refuses. `--into`
+must be another root in the same mesh whose resident host is live; its executor
+refuses unless that root has a live root lease and a live root participant
+(a live Main). Actors of another project are refused.
+
+Both hosts' request channels are used. If the dead root's resident host still
+runs, it first releases the actor (`releaseActor`: ends its run, parks queued
+work in its queue file, flushes the row and withdraws its presence). If it is
+down, the CLI proves it is not running and holds its `host-fence-establish.lock`
+and `host.lock` for the whole operation, so it cannot restart while its registry
+is edited offline. The live host (`adoptActor`) then moves the row under the
+registry locks and loads the actor.
+
+The move is two-phase with an intent file at
+`<live residency>/adoptions/<actorId>.json`: intent, copy of the actor
+directory (session scope only), remove from the dead root's registry, add to the
+live root's registry, cleanup. The first registry write is the commit point.
+Recovery runs at live-host start and before every adopt: an uncommitted move
+rolls back, a crash between remove and add rolls forward from the intent
+snapshot, a committed one finishes cleanup. A crash never leaves the actor lost
+or in two registries. A released actor whose adoption was rolled back stays
+released (not running) until the adopt is retried.

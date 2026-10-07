@@ -19,6 +19,7 @@ interface ResidentHostLaunchContext {
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
+import { actorAdoptionIntentPath, moveActorCustody, recoverActorAdoptions, type ActorAdoptionPhase } from "./actor-adoption.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -65,6 +66,7 @@ import {
   residentHostId,
   residentRemovalsPath,
   residentResultPath,
+  residentRoot,
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
@@ -130,6 +132,11 @@ const testResidentRequestDelay = async (stage: "before_commit" | "after_commit")
   if (process.env.PI_FABRIC_TEST_RESIDENT_DELAY_STAGE !== stage) return;
   const ms = Number(process.env.PI_FABRIC_TEST_RESIDENT_DELAY_MS);
   if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
+};
+
+/** Test-only crash point for the adoption move (smarty-dev#5919). */
+const testAdoptionFault = (phase: ActorAdoptionPhase): void => {
+  if (process.env.PI_FABRIC_TEST_ADOPTION_CRASH === phase) throw new Error(`test adoption crash after ${phase}`);
 };
 
 const atomicWrite = (filePath: string, value: unknown): void => {
@@ -578,6 +585,10 @@ export class ResidentHost {
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
+      // smarty-dev#5919: finish or undo an interrupted adoption before the registries load,
+      // so a committed move loads as this root's own lineage. Failure keeps the intent.
+      try { await recoverActorAdoptions(this.config.residencyRoot); }
+      catch (error) { console.warn(`[pi-fabric] actor adoption recovery: ${errorMessage(error)}`); }
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -1414,12 +1425,7 @@ export class ResidentHost {
         const check = () => assertResidentOperatorConfirmed(
           readResidentOperatorEvidence(this.config, this.mesh), command.confirmDeadRoot);
         assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
-        // Exact id/name within this executor's root only; never resolve via the caller's root.
-        const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
-          actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
-        if (candidates.length !== 1) throw new Error(candidates.length
-          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
-        const actor = candidates[0]!;
+        const actor = this.#operatorActorTarget(command.id);
         if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
@@ -1432,6 +1438,33 @@ export class ResidentHost {
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
             : await this.#removeResidentActor(actor.id, requestId, () => check());
         }
+      } else if (command.operation === "releaseActor") {
+        if (typeof command.id !== "string" || !command.id.trim() ||
+            (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+          throw new Error("Invalid resident release actor request");
+        }
+        // smarty-dev#5919: the same dead-root proof and lease veto as stop/remove.
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh);
+        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
+        // A retry after an interrupted adoption finds the actor already released here.
+        const releasedBefore = this.actors.list().filter(actor => actor.residency === "durable" &&
+          (actor.id === command.id || actor.name === command.id) && this.actors.releasedForAdoption(actor.id));
+        const actor = releasedBefore.length === 1 && !this.actors.listOwned().some(owned => owned.id === releasedBefore[0]!.id)
+          ? releasedBefore[0]! : this.#operatorActorTarget(command.id);
+        if (command.dryRun === true || this.actors.releasedForAdoption(actor.id)) {
+          response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
+        } else {
+          const pending = this.actors.releaseForAdoption(actor.id, id => {
+            assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, this.mesh), command.confirmDeadRoot);
+            commit(id);
+          });
+          boundaryAdmitted?.();
+          response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: await pending,
+            operatorEvidence: evidence, completedAt: Date.now() };
+        }
+      } else if (command.operation === "adoptActor") {
+        response = await this.#adoptActor(command, requestId, commit, boundaryAdmitted);
       } else if (command.operation === "actors") {
         response = {
           format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -1498,6 +1531,110 @@ export class ResidentHost {
       };
     }
     return response;
+  }
+
+  /** Exact id/name within this executor's root only; never resolve via the caller's root. */
+  #operatorActorTarget(selector: string): FabricActorInfo {
+    const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
+      actor.residency === "durable" && (actor.id === selector || actor.name === selector));
+    if (candidates.length !== 1) throw new Error(candidates.length
+      ? `Ambiguous resident actor: ${selector}` : `Unknown Fabric actor: ${selector}`);
+    return candidates[0]!;
+  }
+
+  /** smarty-dev#5919: an adoption target must be a live Main's root: a live lease and root participant. */
+  #assertAdoptionTarget(): void {
+    const own = readResidentOperatorEvidence(this.config, this.mesh);
+    if (!own.liveLease) {
+      throw new ResidentActorAuthorizationError(`Adoption target root ${this.config.rootId} has no live root lease; adopt only into a live Main`);
+    }
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (!root || root.kind !== "root" || root.rootId !== this.config.rootId || root.stale) {
+      throw new ResidentActorAuthorizationError(`Adoption target root ${this.config.rootId} has no live root participant`);
+    }
+  }
+
+  /**
+   * smarty-dev#5919: move a dead root's durable actor into this (live) root. The dead root
+   * gets the same confirmation and lease veto as stop/remove, re-read under the registry
+   * fences right before the commit; its host must have released the actor (or be down, which
+   * leaves its presence stale). The move itself is the two-phase intent protocol.
+   */
+  async #adoptActor(command: Extract<ResidentCommand, { operation: "adoptActor" }>, requestId: string,
+    commit: (id: string) => void, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
+    if (typeof command.id !== "string" || !command.id.trim() || typeof command.fromRootId !== "string" ||
+        !command.fromRootId.trim() || (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
+        (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+      throw new Error("Invalid resident adopt actor request");
+    }
+    if (command.fromRootId === this.config.rootId) throw new Error("An actor cannot be adopted into its own root");
+    // An interrupted earlier move finishes (or rolls back) before any new decision.
+    const recovered = await recoverActorAdoptions(this.config.residencyRoot);
+    const liveRoots = residentActorRoots(this.config);
+    // A move an earlier attempt committed (or this recovery rolled forward) is loaded now;
+    // a retry of that same adoption then reports it instead of failing on the moved row.
+    for (const [id, outcome] of Object.entries(recovered)) {
+      if (outcome !== "rolledForward" && outcome !== "completed") continue;
+      for (const scope of ["project", "session"] as const) {
+        const row = new ActorRegistryStore(liveRoots[scope]).records().find(candidate => candidate.id === id);
+        if (row?.rootId !== this.config.rootId) continue;
+        const actor = this.actors.acceptAdoption(id, scope);
+        if (command.dryRun !== true && (id === command.id || row.name === command.id) &&
+            Array.isArray(row.adoptedFrom) && row.adoptedFrom.includes(command.fromRootId)) {
+          this.participants.scheduleRefresh();
+          return { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor,
+            adoption: { actorId: id, fromRootId: command.fromRootId, intoRootId: this.config.rootId, scope,
+              sourceActorRoot: "", targetActorRoot: liveRoots[scope], recovered }, completedAt: Date.now() };
+        }
+        break;
+      }
+    }
+    this.#assertAdoptionTarget();
+    const deadConfig = readJson<ResidentHostConfig>(path.join(residentRoot(this.config.meshRoot, command.fromRootId), "config.json"));
+    if (!deadConfig || deadConfig.rootId !== command.fromRootId || typeof deadConfig.meshRoot !== "string" ||
+        path.resolve(deadConfig.meshRoot) !== path.resolve(this.config.meshRoot) || typeof deadConfig.actorRoot !== "string") {
+      throw new Error(`No resident configuration for dead root ${command.fromRootId} in this mesh`);
+    }
+    const evidence = readResidentOperatorEvidence(deadConfig, this.mesh);
+    assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
+    const deadRoots = residentActorRoots(deadConfig);
+    const located = (["project", "session"] as const).flatMap(scope =>
+      new ActorRegistryStore(deadRoots[scope]).records().filter(row => row.rootId === command.fromRootId &&
+        row.residency === "durable" && (row.id === command.id || row.name === command.id)).map(row => ({ scope, row })));
+    if (located.length !== 1) throw new Error(located.length
+      ? `Ambiguous dead-root actor: ${command.id}` : `Unknown Fabric actor of dead root ${command.fromRootId}: ${command.id}`);
+    const { scope, row } = located[0]!;
+    const project = typeof this.config.project === "string" ? this.config.project : projectOf(this.config.cwd);
+    if (typeof row.project === "string" && row.project !== project) {
+      throw new ResidentActorAuthorizationError(`Fabric actor ${row.id} belongs to project ${row.project}, not to ${project}`);
+    }
+    const released = (): void => {
+      const participant = this.participants.get(row.id, Date.now(), { fresh: true });
+      if (participant && participant.ownerHostId !== this.hostId) {
+        throw new Error(`Fabric actor ${row.id} is still published by ${participant.ownerHostId}; release it through the dead root's resident host first`);
+      }
+    };
+    if (command.dryRun !== true) released();
+    const adoption = { actorId: row.id, fromRootId: command.fromRootId, intoRootId: this.config.rootId, scope,
+      sourceActorRoot: deadRoots[scope], targetActorRoot: liveRoots[scope],
+      ...(Object.keys(recovered).length ? { recovered } : {}) };
+    if (command.dryRun === true) {
+      const publishedBy = this.participants.get(row.id, Date.now(), { fresh: true })?.ownerHostId;
+      return { format: RESIDENT_HOST_FORMAT, requestId, ok: true, operatorEvidence: evidence,
+        adoption: { ...adoption, ...(publishedBy ? { publishedBy } : {}) }, completedAt: Date.now() };
+    }
+    await moveActorCustody({ ...adoption, intentFile: actorAdoptionIntentPath(this.config.residencyRoot, row.id),
+      check: () => {
+        this.#assertAdoptionTarget();
+        assertResidentOperatorConfirmed(readResidentOperatorEvidence(deadConfig, this.mesh), command.confirmDeadRoot);
+        released();
+        commit(row.id);
+      },
+      fault: testAdoptionFault });
+    boundaryAdmitted?.();
+    const actor = this.actors.acceptAdoption(row.id, scope);
+    this.participants.scheduleRefresh();
+    return { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, adoption, completedAt: Date.now() };
   }
 
   async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {

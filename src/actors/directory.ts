@@ -105,6 +105,12 @@ export class ActorDirectory extends ActorManager {
     return { ops: [...first.ops, ...second.ops], committed: () => { first.committed(); second.committed(); } };
   }
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
+  override releaseForAdoption(...args: Parameters<ActorManager["releaseForAdoption"]>): ReturnType<ActorManager["releaseForAdoption"]> { return this.#isPrimary(args[0]) ? super.releaseForAdoption(...args) : this.#secondary.releaseForAdoption(...args); }
+  override releasedForAdoption(id: string): boolean { return super.releasedForAdoption(id) || this.#secondary.releasedForAdoption(id); }
+  /** The adopted row's scope selects the registry that now names this root. */
+  override acceptAdoption(id: string, scope: FabricActorStorageScope = this.#defaultScope): FabricActorInfo {
+    return scope === this.#defaultScope ? super.acceptAdoption(id) : this.#secondary.acceptAdoption(id);
+  }
   override reclaim(...args: Parameters<ActorManager["reclaim"]>): ReturnType<ActorManager["reclaim"]> { return this.#isPrimary(args[0]) ? super.reclaim(...args) : this.#secondary.reclaim(...args); }
   override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }
   override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> { try { return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args); } catch { return false; } }

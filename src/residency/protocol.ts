@@ -562,6 +562,31 @@ export interface ResidentOperatorActorCommand {
   createdAt: number;
 }
 
+/** smarty-dev#5919: the dead root's host releases one durable actor for adoption. */
+export interface ResidentReleaseActorCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "releaseActor";
+  id: string;
+  confirmDeadRoot?: string;
+  dryRun?: boolean;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+}
+
+/** smarty-dev#5919: the live root's host adopts a dead root's durable actor. */
+export interface ResidentAdoptActorCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "adoptActor";
+  id: string;
+  fromRootId: string;
+  confirmDeadRoot?: string;
+  dryRun?: boolean;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+}
+
 type LegacyResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
@@ -571,6 +596,8 @@ type LegacyResidentCommand =
   | ResidentActorMutationCommand
   | ResidentActorStatusCommand
   | ResidentOperatorActorCommand
+  | ResidentReleaseActorCommand
+  | ResidentAdoptActorCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
       requestId: string; rootId: string; createdAt: number });
 
@@ -588,6 +615,7 @@ const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
   "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "operatorActor",
+  "releaseActor", "adoptActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -644,6 +672,11 @@ export interface ResidentCommandResponse {
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
   operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
+  /** smarty-dev#5919 adoption: the committed custody move. */
+  adoption?: { actorId: string; fromRootId: string; intoRootId: string; scope: "project" | "session";
+    sourceActorRoot: string; targetActorRoot: string; recovered?: Record<string, string>;
+    /** Dry-run only: the host that still publishes the actor (released by adopt first). */
+    publishedBy?: string };
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;

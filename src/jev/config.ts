@@ -15,6 +15,9 @@ export interface FabricJevConfig {
   maxEvaluations: number;
   maxToolCalls: number;
   maxTokens: number;
+  /** Host-only: the Node's Jev gateway Unix socket (smarty-dev#1470). When set, every
+   * evaluation goes through the gateway's `systemone` op and no Jev credential is read. */
+  gatewaySocket?: string;
 }
 export const DEFAULT_JEV_CONFIG: FabricJevConfig = {
   enabled: true,
@@ -30,6 +33,9 @@ export const DEFAULT_JEV_CONFIG: FabricJevConfig = {
   maxToolCalls: 10_000,
   maxTokens: 1_000_000,
 };
+/** An absolute, bounded, NUL-free path; the transport checks the socket itself before every connect. */
+const isGatewaySocketPath = (value: string): boolean =>
+  value.length > 1 && value.length <= 1024 && !value.includes("\0") && (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value));
 export function normalizeJevConfig(value: unknown): FabricJevConfig {
   const input = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : {};
@@ -58,5 +64,7 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
     maxEvaluations: integer("maxEvaluations", 100_000),
     maxToolCalls: integer("maxToolCalls", 1_000_000),
     maxTokens: integer("maxTokens", 100_000_000),
+    ...(typeof input.gatewaySocket === "string" && isGatewaySocketPath(input.gatewaySocket)
+      ? { gatewaySocket: input.gatewaySocket } : {}),
   };
 }

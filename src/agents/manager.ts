@@ -2698,12 +2698,15 @@ export class AgentManager {
       }
     }
     // Check preserved trees from previous hosts too. Reuse the conservative
-    // retention predicate without removing anything. Unknown external transport
-    // identities have no surviving handle, so are deliberately out of scope.
+    // retention predicate without removing anything: disposeScratch:false keeps
+    // even eligible scratch (contents, fence, lock-free metadata) intact, so any
+    // remaining custody vetoes this receipt instead of being collected before
+    // the handover commits. Unknown external transport identities have no
+    // surviving handle, so are deliberately out of scope.
     const started = performance.now();
     const expired = () => performance.now() - started > 100;
     const inspect = (directory: string, tracked: boolean, depth = 0): void => {
-      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired)) {
+      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired, { disposeScratch: false })) {
         throw new Error(`Agent release quiescence has an unresolved run tree: ${directory}`);
       }
       if (!tracked) {

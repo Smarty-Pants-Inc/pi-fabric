@@ -39,7 +39,7 @@ const fleet = (n: number, now: number): BridgePresence => {
 const perRecord = async (store: MeshStore, presence: BridgePresence, now: number) => {
   const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
   for (const { record, expiresAt } of presence.hosts) {
-    const until = now + Math.min(15_000, expiresAt - record.updatedAt);
+    const until = Math.min(expiresAt, now + 15_000);
     wanted.set(hostKey(record.id), { value: { ...record, updatedAt: now, expiresAt: until, remoteHost: "forge" }, identity: record.identity });
   }
   for (const p of presence.participants) {
@@ -57,7 +57,7 @@ const perRecord = async (store: MeshStore, presence: BridgePresence, now: number
   }
   for (const { record, expiresAt } of presence.hosts) {
     writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id,
-      updatedAt: now, expiresAt: now + Math.min(15_000, expiresAt - record.updatedAt) });
+      updatedAt: Math.min(record.updatedAt, now), expiresAt: Math.min(expiresAt, now + 15_000) });
   }
   for (const entry of old) {
     if (wanted.has(entry.key)) continue;
@@ -136,6 +136,8 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     await side.mirror(presence);
     const before = store.listAll();
     now += 5_000;
+    // The origins renewed; only their lease fields move.
+    presence.hosts = presence.hosts.map(({ record }) => ({ record: { ...record, updatedAt: now, expiresAt: now + 15_000 }, expiresAt: now + 15_000 }));
     const probe = io(store);
     await side.mirror(presence);
     expect(probe.counts()).toEqual({ reads: 1, commits: 0, locks: 1 });

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { hostLeaseExpiry, hostLiveness, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
@@ -56,7 +56,7 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolea
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
   event.topic.startsWith("fleet.work.") ||
-  (event.topic === "ops.owner" && event.kind === "pr.wake");
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
 
 /** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
 export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
@@ -118,6 +118,8 @@ export interface BridgeSide {
   presence(): Promise<BridgePresence>;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  /** Optional capability: returns a durably committed, ordered prefix (1..256 events). */
+  publishBatch?(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
   holds?(id: string): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
@@ -155,9 +157,14 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   return value as unknown as FabricParticipantRecord;
 };
 
+/** A content digest, independent of JSON property order (smarty-dev#5036). */
+const contentDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(value, (_key, item) =>
+  isObject(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item,
+)).digest("hex");
+
 /** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
-  JSON.stringify({ ...value, updatedAt: undefined, expiresAt: undefined });
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
@@ -263,14 +270,10 @@ export class StoreBridgeSide implements BridgeSide {
       }
       reserved.add(host.id).add(host.identity.id).add(host.rootId);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
-      const expiresAt = hostLeaseExpiry(leases, host);
-      // File-only heartbeats leave the state record old. Carry the effective lease's
-      // renewal time too, so the peer measures its TTL rather than the state's age.
-      const lease = leases.get(host.id);
-      const record = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-        lease.expiresAt >= host.expiresAt
-        ? { ...host, updatedAt: lease.updatedAt, expiresAt }
-        : host;
+      const liveness = hostLiveness(leases, host);
+      const expiresAt = liveness.expiresAt;
+      // Carry effective renewal time as well as expiry, with the same incarnation fence.
+      const record = { ...host, ...liveness };
       if (expiresAt > now) hosts.push({ record, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
@@ -304,10 +307,22 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
+    const published = await this.store.publish(this.#publication(event, held));
+    return { sequence: published.sequence };
+  }
+
+  async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
+    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [])));
+    return published.map(({ sequence }) => ({ sequence }));
+  }
+
+  #publication(event: BridgePublish, held: string[]): Parameters<MeshStore["publish"]>[0] {
     const checked = checkBridgePublish(event);
     const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
-    const published = await this.store.publish({
+    return {
       ...checked,
+      // The cursor advances only after the destination confirms its append durably.
+      durable: true,
       from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
@@ -320,8 +335,7 @@ export class StoreBridgeSide implements BridgeSide {
         }
         return data;
       },
-    });
-    return { sequence: published.sequence };
+    };
   }
 
   /**
@@ -400,7 +414,7 @@ export class StoreBridgeSide implements BridgeSide {
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
-      if (expiresAt > now) hosts.push({ record: host, expiresAt });
+      if (expiresAt > now) hosts.push({ record: { ...host, ...hostLiveness(leases, host) }, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];
@@ -470,7 +484,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
           if (
             existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-            JSON.stringify(existing.updatedBy) === JSON.stringify(identity) &&
+            contentDigest(existing.updatedBy) === contentDigest(identity) &&
             (key.startsWith(HOST_PREFIX)
               ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
               : existing.value.updatedAt === value.updatedAt)
@@ -553,7 +567,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "mirror" | "bridgedIds";
+type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishBatch" | "mirror" | "bridgedIds";
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
@@ -644,7 +658,7 @@ const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participant
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
   switch (request.op) {
-    case "hello": return { version: BRIDGE_PROTOCOL_VERSION, tail: true };
+    case "hello": return { version: BRIDGE_PROTOCOL_VERSION, tail: true, publishBatch: true };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
     case "tail": return side.tail(numberArg(request.args, "after"),
@@ -652,6 +666,11 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args));
+    case "publishBatch": {
+      if (!Array.isArray(request.args) || !request.args.length || request.args.length > 256) throw new Error("Invalid bridge publish batch");
+      // Remote wire never accepts held IDs: those are hub-local ownership fences.
+      return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })));
+    }
     case "mirror": return side.mirror(presenceArg(request.args));
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
     default: throw new Error(`Unknown bridge operation: ${String(request.op)}`);
@@ -662,6 +681,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
+  publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
   #closed: Error | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
@@ -728,9 +748,10 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   async hello(): Promise<void> {
-    const reply = await this.#call<{ version?: unknown; tail?: unknown }>("hello");
+    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown }>("hello");
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION) throw new Error(`Bridge agent speaks protocol ${String(reply?.version)}`);
     this.#supportsTail = reply.tail === true;
+    if (reply.publishBatch === true) this.publishBatch = events => this.#call("publishBatch", events.map(({ event }) => event));
   }
 
   latestSequence(): Promise<number> { return this.#call("latestSequence"); }
@@ -900,8 +921,11 @@ export class MeshBridge {
     this.options.log?.(message);
   }
 
-  /** Load the cursor (or start at both heads) and the ids bridged since the last save. */
+  /** Restore event recovery and reconcile live participants on every (re)connect. */
   async start(): Promise<void> {
+    // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
+    // even when this instance's previous presence pass would not yet be due (#5036).
+    this.#presenceAt = Number.NEGATIVE_INFINITY;
     const { local, remote, localName, remoteName } = this.options;
     let saved: CursorFile | undefined;
     try {
@@ -930,11 +954,15 @@ export class MeshBridge {
       allBridgedIds(local, this.#cursor.toLocal.mark),
     ]);
     this.#seen = { toRemote, toLocal };
+    // Read CURRENT natives (including participants/ files), never a saved projection set.
+    // Reconcile against the destination under its lock: unchanged digests skip state writes,
+    // but lost records must be recreated and missing sources must not have their lease renewed.
+    await this.syncPresence();
   }
 
   #save(): void {
     fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
-    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600 });
+    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
   }
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
@@ -1018,8 +1046,62 @@ export class MeshBridge {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
       }
-      for (const event of page.events) {
+      for (let index = 0; index < page.events.length; index++) {
+        const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
+        if (this.#stopped) return { forwarded, dropped };
+        // Batch only a contiguous, already-admitted prefix. Refusals, lapsed authority and
+        // legacy peers retain the single-event refresh/refusal path below.
+        if (target.publishBatch && page.events.length - index > 1 && !seen.has(event.id)) {
+          if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) {
+            await this.syncPresence();
+            rules = await authority(false);
+          }
+          if (this.#stopped) return { forwarded, dropped };
+          const candidates: Array<{ event: BridgePublish; held: string[] }> = [];
+          let bytes = 0;
+          for (const candidate of page.events.slice(index, index + 256)) {
+            if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
+            if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
+            const data = isObject(candidate.data) ? candidate.data : {};
+            const item = {
+              event: {
+                topic: candidate.topic, kind: candidate.kind, from: candidate.from, to: candidate.to!,
+                ...(candidate.verification === "mesh" || candidate.verification === "bridge" ? { principal: candidate.principal } : {}),
+                ...(candidate.text !== undefined ? { text: candidate.text } : {}),
+                data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: candidate.id } },
+              },
+              held: direction === "toLocal" ? [candidate.from.id,
+                ...(candidate.topic === "fabric.control.ack" && typeof data.targetId === "string" ? [data.targetId] : [])] : [],
+            };
+            bytes += Buffer.byteLength(JSON.stringify(item.event), "utf8") + 1;
+            if (bytes > BRIDGE_PAGE_BYTES - 1024) break;
+            candidates.push(item);
+          }
+          if (candidates.length > 1) {
+            let committed: Array<{ sequence: number }> | undefined;
+            try { committed = await target.publishBatch(candidates); }
+            catch (error) {
+              // No admitted prefix: let the original path refresh/drop this one event.
+              if (!(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
+            }
+            if (committed) {
+              if (!Array.isArray(committed) || !committed.length || committed.length > candidates.length ||
+                  committed.some(result => !Number.isSafeInteger(result?.sequence) || result.sequence <= 0)) {
+                throw new Error("Invalid bridge batch receipt");
+              }
+              const ids = page.events.slice(index, index + committed.length).map(item => item.id);
+              for (const id of ids) seen.add(id);
+              cursor.mark = Math.max(cursor.mark, ...committed.map(result => result.sequence));
+              cursor.after = page.events[index + committed.length - 1]!.sequence;
+              forwarded += committed.length;
+              this.#save(); // Advance only after the destination confirms the prefix durably.
+              for (const id of ids) seen.delete(id);
+              index += committed.length - 1;
+              continue;
+            }
+          }
+        }
         let refreshed = false;
         const refresh = async (): Promise<void> => {
           refreshed = true;

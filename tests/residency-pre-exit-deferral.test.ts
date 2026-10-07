@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -120,9 +121,11 @@ fs.rmSync = function(file, options) {
       expect(state()?.phase).toBe("cancelled");
       if (mode === "disposed-Main") await clientB.close();
       process.execPath = exec; vi.unstubAllEnvs();
-      const registryFile = path.join(config.actorRoot, "actors.json");
-      const actorMessages = (): Array<{ direction: string; id: string }> =>
-        JSON.parse(fs.readFileSync(registryFile, "utf8")).actors.find((record: { id: string }) => record.id === actor.id)?.messages ?? [];
+      const actorMessages = (): Array<{ direction: string; id: string }> => {
+        const store = new ActorRegistryStore(config.actorRoot);
+        const record = store.records().find(record => record.id === actor.id);
+        return record ? store.messages(record) as Array<{ direction: string; id: string }> : [];
+      };
       await until(() => actorMessages().filter(message => message.direction === "out").length === 2);
       const messages = actorMessages();
       expect(messages.filter(message => message.direction === "in" && message.id === queued.messageId)).toHaveLength(1);

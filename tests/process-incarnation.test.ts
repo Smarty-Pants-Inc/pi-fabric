@@ -94,6 +94,23 @@ describe("native process incarnation", () => {
     } finally { clearInterval(renewal); }
   });
 
+  it.each(["darwin", "win32"] as const)("uses the remaining %s acquisition budget, aborts its child and discards late output", async platform => {
+    vi.useFakeTimers();
+    let finish!: (value: string) => void;
+    const run = vi.fn<IncarnationCommandRunner>().mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const reader = createProcessIncarnationReader({ platform, systemRoot: "C:\\Windows", run });
+    expect(await reader.read(123, 0)).toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
+    const pending = reader.read(123, 50);
+    expect(run.mock.calls[0]![2].timeout).toBe(50);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await pending).toBeUndefined();
+    expect(run.mock.calls[0]![2].signal.aborted).toBe(true);
+    finish(platform === "win32" ? "639264528000000000" : "Thu Oct  1 12:00:00 2026");
+    await Promise.resolve();
+    expect(await pending).toBeUndefined();
+  });
+
   it("does not compare foreign/malformed identity or run commands for invalid PIDs, missing tools or unsupported platforms", async () => {
     const run = vi.fn<IncarnationCommandRunner>();
     for (const platform of ["linux", "darwin", "win32", "freebsd"] as const) {

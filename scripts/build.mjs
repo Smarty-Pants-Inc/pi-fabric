@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
 
@@ -10,10 +10,12 @@ const primaryEntryPoints = [
   "src/mesh.ts",
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
+  "src/actors-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  "src/agents/worker-protocol.ts",
   "src/jev.ts",
   "src/protocol.ts",
   "src/residency/host.ts",
@@ -36,6 +38,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/residency/launcher-owner.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
@@ -50,6 +53,7 @@ const lazyEntryPoints = [
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
+  "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
@@ -87,10 +91,12 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/worker/context-reseed.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
+  "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
@@ -124,6 +130,10 @@ const result = await build({
   metafile: true,
   logLevel: "info",
 });
+
+// Advertise the exact manager/worker contract without importing candidate code at spawn.
+const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);
 
 // Pi supplies these packages to extensions through its module aliases, so
 // they are peers and must never be bundled into code that Pi loads.

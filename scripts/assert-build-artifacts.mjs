@@ -18,6 +18,7 @@ const stable = [
   "judge-cli.js",
   "core/provider-operations.js",
   "worker.js",
+  "agents/worker-protocol.js",
   "residency/host.js",
   "compaction/hook.js",
   "core/action-registry.js",
@@ -31,6 +32,7 @@ const stable = [
   "providers/memory-provider.js",
 ];
 const lazy = [
+  "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",
@@ -42,6 +44,7 @@ const lazy = [
   "agents/compact-control.js",
   "agents/result.js",
   "agents/veda-cli.js",
+  "agents/transports/placement.js",
   "fabric-runtime-state.js",
   "components/configuration.js",
   "providers/jev-provider.js",
@@ -73,6 +76,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/activation-compaction.js",
   "worker/context-admission.js",
+  "worker/context-reseed.js",
   "worker/reply-tool.js",
   "worker/principal-delivery.js",
   "guards/foreground-wait.js",
@@ -90,6 +94,7 @@ const lazy = [
 const entries = [...stable, ...lazy];
 const declarations = entries.map((file) => file.replace(/\.js$/, ".d.ts"));
 const required = [
+  "worker-protocol.json",
   ...entries,
   ...entries.map((file) => `${file}.map`),
   ...declarations,
@@ -98,6 +103,10 @@ const required = [
 if (process.platform === "linux") required.push("native/fabric-landlock");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
+
+const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+const workerProtocol = JSON.parse(readFileSync(join(dist, "worker-protocol.json"), "utf8"));
+if (workerProtocol.version !== WORKER_PROTOCOL_VERSION) throw new Error("Worker protocol manifest differs from manager contract");
 
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(root, "config/landlock-roles.json"))) {

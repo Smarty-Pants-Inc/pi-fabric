@@ -23,6 +23,78 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
+    const code = `if (false) {
+      await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });
+      await agents.steer({ id: "actor:peer", message: "unchanged", idempotencyKey: "steer-key" });
+    } return "typed";`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    for (const name of ["followUp", "steer"]) {
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 200 });
+      expect(typeCheckFabricCode(`await agents.${name}({ id: "peer", message: "unchanged", idempotencyKey: 7 });`, guestTypeDeclarations(fullCodeMode), true).errors)
+        .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
+    }
+  });
+  it.each([false, true])("types explicit task-auto pins but removes quality reporting (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const run = await agents.run({ task: "exact checks", model: "auto", routeClass: "task:exact-checks", protected: false, pinModel: "test/sol", pinThinking: "max" }); return run.id;`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    for (const method of ["routeOutcome", "reportRouteQuality"]) {
+      const invalid = `return await agents.${method}({ id: "run-1", routeQuality: "fail" });`;
+      expect(typeCheckFabricCode(invalid, guestTypeDeclarations(fullCodeMode), true).errors.map(error => error.message))
+        .toEqual([expect.stringContaining(`Property '${method}' does not exist`)]);
+    }
+  });
+  it("does not register or bridge the removed quality API", async () => {
+    expect(IMPLEMENTED).not.toContain("routeOutcome");
+    expect(GUEST_SETUP).not.toContain('agents.routeOutcome');
+    const calls: string[] = [];
+    const result = await new QuickJsRuntime().execute(`return typeof agents.routeOutcome;`, async ref => {
+      calls.push(ref); return null;
+    }, { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([]);
+  });
+  it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
+    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
+      const actor = await agents.actorStatus({ id: "reviewer" });
+      const count: number = actor.filterSkipped.count;
+      const key: string | null = actor.filterSkipped.lastKey;
+      const topic: string | null = actor.filterSkipped.lastTopic;
+      const at: number | null = actor.filterSkipped.lastAt;
+      const expiry: number | undefined = actor.activationFilterExpiresAt;
+      return { count, key, topic, at, expiry };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
+    expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
+  });
+  it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
+    const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
+    for (const fullCodeMode of [false, true]) {
+      const code = `const result = await agents.${method}(${args});
+        const release: string | undefined = result.fabricRelease;
+        const omitted: Pick<typeof result, "fabricRelease"> = {};
+        return { release, omitted };`;
+      expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+  });
+
+  it.each([false, true])("types Main before/after readback without regressing literal actor targets (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const main = await agents.setThinking({ id: "session:root", thinking: "high" });
+      const actor = await agents.setModel({ id: "actor", model: "probe/b" });
+      const caller: string = main.caller;
+      const previous: string | undefined = main.previous.model;
+      const scope: "session" | "project" = actor.scope;
+      const dynamic = await agents.setThinking({ id: (await agents.main()).id, thinking: "high" });
+      if ("previous" in dynamic) return dynamic.previous.thinking;
+      return { caller, previous, scope };`;
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    const refused = `const model = await agents.setModel({ id: "session:root", model: "probe/b" }); return model.previous;`;
+    expect(typeCheckFabricCode(refused, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("does not exist on type 'never'")]);
+  });
+
   it.each([false, true])("#3819 types inline XOR verified file instructions (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     for (const name of ["create", "createActor", "setInstructions"]) {
@@ -52,13 +124,15 @@ describe("guest agents surface", () => {
        await agents.spawn({ task: "probe", modelReason: "Compatibility probe" });
        await agents.create({ name: "probe", instructions: "Work.", modelReason: "Compatibility probe" });
        await agents.createActor({ name: "alias-probe", instructions: "Work.", modelReason: "Compatibility probe" });
-       const reason: string | undefined = run.modelReason; return reason;`,
+       const actor = await agents.setModel({ id: "actor", model: "cliproxyapi/gpt-6-astra", modelReason: "Named probe" });
+       const actorReason: string | undefined = actor.modelReason;
+       const reason: string | undefined = run.modelReason; return { reason, actorReason };`,
       guestTypeDeclarations(fullCodeMode), true,
     );
     expect(result.errors).toEqual([]);
-    for (const name of ["run", "spawn", "create", "createActor"]) {
+    for (const name of ["run", "spawn", "create", "createActor", "setModel"]) {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
-      expect(schema.properties.modelReason).toMatchObject({ type: "string" });
+      expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
   });
 
@@ -72,6 +146,20 @@ describe("guest agents surface", () => {
       return { markers, selections, effective: actor.model, observed: run.model };`;
     expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
     expect(typeCheckFabricCode(`${code}\nconst invalid: boolean = run.selectedModel;`, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
+  });
+
+  it.each([false, true])("types activation-blocked diagnostics on actor status (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const status = await agents.actorStatus({ id: "actor" });
+      const code: string | undefined = status.activationBlocked?.code;
+      const reason: string | undefined = status.activationBlocked?.reason;
+      const since: number | undefined = status.activationBlocked?.since;
+      const count: number | undefined = status.activationBlocked?.count;
+      const omitted: Pick<FabricActorInfo, "activationBlocked"> = {};
+      return { code, reason, since, count, omitted };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    expect(typeCheckFabricCode(`${code}\nconst invalid: boolean = status.activationBlocked?.code;`, declarations, true).errors.map(error => error.message))
       .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
   });
 

@@ -95,6 +95,54 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker", () => {
+  it("3864 retains an awaited delivery receipt without advancing a cursor after lease loss", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-lease-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    let leased = true;
+    const deliver = vi.fn(async () => { await Promise.resolve(); leased = false; });
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100, canConsumeMesh: () => leased }, deliver);
+    brokers.push(broker);
+    const sub = await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliver.mock.calls.length === 1);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
+    leased = true;
+    await waitFor(() => broker.list()[0]?.afterSequence === mesh.latestSequence());
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])("3864 fences the cursor/once receipt under the commit lock after lease loss (once=%s)", async once => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-commit-lease-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    let leased = true;
+    const deliver = vi.fn();
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100, canConsumeMesh: () => leased }, deliver);
+    brokers.push(broker);
+    const sub = await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once });
+    const write = mesh.writeBatch.bind(mesh);
+    const waiting = vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      // Renewal fails while cursor persistence is waiting for its mesh lock.
+      leased = false;
+      return write(input);
+    });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliver.mock.calls.length === 1);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(broker.list()).toHaveLength(1);
+    expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
+    waiting.mockRestore(); leased = true;
+    await waitFor(() => once ? broker.list().length === 0 : broker.list()[0]?.afterSequence === mesh.latestSequence());
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("blocks release on an unconfirmed delivered cursor/once deletion without replay (once=%s)", async (once) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -420,7 +468,7 @@ describe("LifecycleBroker", () => {
 
   // review/astra on #49: the receiving side skips an event whose source is not the current
   // owner, for good. A cached view where the source's lease had lapsed must not decide that.
-  it("delivers an event from a source whose lease was renewed after the receiver's cached read", async () => {
+  it.each(["files", "legacy state"])("delivers an event from a source whose lease was renewed after the receiver's cached read (%s)", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
@@ -443,6 +491,13 @@ describe("LifecycleBroker", () => {
     const targetDirectory = directory(targetMesh, targetIdentity, 60_000);   // the receiver stays live
     await sourceDirectory.refresh();                           // the source's lease: 1 s
     await targetDirectory.refresh();
+    if (mode === "legacy state") {
+      // Explicitly model a live pre-capability receiver. This must force source state renewal.
+      for (const entry of targetMesh.listAll("topology/hosts/")) {
+        if (entry.updatedBy.id === targetIdentity.id) await targetMesh.put({ key: entry.key, identity: targetIdentity,
+          value: { ...(entry.value as Record<string, unknown>), livenessLeaseFiles: undefined } });
+      }
+    }
     const deliveries: FabricLifecycleEvent[] = [];
     const target = new LifecycleBroker(targetMesh, targetIdentity, targetDirectory,
       { enabled: true, pollMs: 20, maxReadEvents: 100 }, (_subscription, event) => { deliveries.push(event); });
@@ -455,12 +510,18 @@ describe("LifecycleBroker", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 1_100));  // the cached lease has lapsed
     expect(targetDirectory.get(source.id)).toBeUndefined();   // the receiver's cached view
+    const stateBefore = fs.readFileSync(path.join(meshRoot, "state.json"), "utf8");
     await sourceDirectory.refresh();                           // the source renews ...
-    // ... only in the shared state, as a runtime before host lease files does: a file lease is
-    // read fresh, and would already show the renewal (smarty-dev#816).
-    removeHostLease(meshRoot, source.id);
+    if (mode === "legacy state") {
+      // Older writers only renew state; retain coverage of the receiver's fresh-read guard.
+      removeHostLease(meshRoot, source.id);
+      expect(targetDirectory.get(source.id)).toBeUndefined(); // still the stale cached view
+    } else {
+      // New writers renew the file, with no state commit. Cached identity is safe; lease is fresh.
+      expect(fs.readFileSync(path.join(meshRoot, "state.json"), "utf8")).toBe(stateBefore);
+      expect(targetDirectory.get(source.id)?.stale).toBe(false);
+    }
     await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 7 });   // ... and publishes
-    expect(targetDirectory.get(source.id)).toBeUndefined();   // still the stale cached view
     target.start();
     await waitFor(() => deliveries.length === 1);
     expect(deliveries[0]).toMatchObject({ event: "pi.agent_settled", occurredAt: 7 });

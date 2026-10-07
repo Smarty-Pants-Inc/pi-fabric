@@ -4,10 +4,12 @@ import {
   TOOL_CALL_WHITESPACE_MAX_BYTES,
   TOOL_CALL_WHITESPACE_TIMEOUT_MS,
   ToolCallStreamGuard,
+  toolCallWhitespaceTimeoutMs,
 } from "../src/worker/tool-call-stream-guard.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
 });
 describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (field) => {
@@ -40,11 +42,11 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("aborts at 60 seconds despite continuous whitespace progress and unrelated events", () => {
+  it("aborts at 90 seconds despite continuous whitespace progress and unrelated events", () => {
     const { guard, fail, delta } = setup();
-    expect(TOOL_CALL_WHITESPACE_TIMEOUT_MS).toBe(60_000);
+    expect(TOOL_CALL_WHITESPACE_TIMEOUT_MS).toBe(90_000);
     delta(" ");
-    for (let i = 0; i < 59; i++) {
+    for (let i = 0; i < 89; i++) {
       vi.advanceTimersByTime(1000);
       delta("\n");
       guard.observe(update("text_delta", 1, "thinking isn't argument progress"));
@@ -53,14 +55,14 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     expect(fail).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledTimes(1);
-    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 60 });
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 90 });
   });
 
   it("bounds a whitespace stream that goes silent without requiring another delta", () => {
     const { fail, delta } = setup();
     delta("\t");
-    vi.advanceTimersByTime(60_000);
-    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 1 });
+    vi.advanceTimersByTime(90_000);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 1 });
   });
 
   it("re-arms for the remainder when the timer wakes 1 ms before the monotonic deadline", () => {
@@ -69,16 +71,16 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     vi.spyOn(performance, "now").mockImplementation(() => now);
     const timer = vi.spyOn(globalThis, "setTimeout");
     delta(" ");
-    now += 59_999;
+    now += 89_999;
     // The timer clock has reached its deadline, but the elapsed clock is 1 ms behind.
-    vi.advanceTimersByTime(60_000);
+    vi.advanceTimersByTime(90_000);
     expect(fail).not.toHaveBeenCalled();
     expect(timer).toHaveBeenLastCalledWith(expect.any(Function), 1);
     expect(vi.getTimerCount()).toBe(1);
     now += 1;
     vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledTimes(1);
-    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 1 });
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 1 });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -86,12 +88,12 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     const { fail, delta } = setup();
     delta(" ");
     vi.setSystemTime(Date.now() + adjustment);
-    vi.advanceTimersByTime(59_999);
+    vi.advanceTimersByTime(89_999);
     delta("\t");
     expect(fail).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledTimes(1);
-    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 2 });
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 2 });
   });
 
   it("reports monotonic elapsed time for the byte limit too", () => {
@@ -112,13 +114,39 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     expect(fail.mock.calls[0]![0].bytes).toBe(65536);
   });
 
-  it.each(["{", "\u200b", "x"])("permanently exempts a normal long call after non-whitespace %j", meaningful => {
-    const { fail, delta } = setup();
+  it.each(["{", "\u200b", "x"])("resets the interval on every non-whitespace delta %j during a long mixed call", meaningful => {
+    const { guard, fail, delta } = setup();
     delta(" ");
-    vi.advanceTimersByTime(59_999);
-    delta(meaningful);
-    delta(" ".repeat(100_000));
-    vi.advanceTimersByTime(600_000);
+    for (let i = 0; i < 8; i++) {
+      vi.advanceTimersByTime(89_999);
+      delta(meaningful);
+      delta(" ".repeat(100_000));
+    }
+    expect(fail).not.toHaveBeenCalled();
+    guard.observe(update("toolcall_end"));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds a whitespace suffix even after a meaningful JSON prefix", () => {
+    const { fail, delta } = setup();
+    delta('{"code":');
+    delta(" ");
+    vi.advanceTimersByTime(89_999);
+    delta("real content");
+    expect(vi.getTimerCount()).toBe(0);
+    delta("\n");
+    vi.advanceTimersByTime(89_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 1 });
+  });
+
+  it("does not bound whitespace text/thinking deltas", () => {
+    const { guard, fail } = setup();
+    for (const type of ["text_delta", "thinking_delta"]) {
+      guard.observe(update(type, 0, " ".repeat(100_000)));
+      vi.advanceTimersByTime(900_000);
+    }
     expect(fail).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -169,14 +197,14 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
     guard.dispose();
   });
 
-  it("also bounds empty-only argument deltas at 60 seconds", () => {
+  it("also bounds empty-only argument deltas at 90 seconds", () => {
     const { fail, delta } = setup();
     delta("");
-    vi.advanceTimersByTime(59_999);
+    vi.advanceTimersByTime(89_999);
     delta("");
     expect(fail).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 0 });
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 0 });
   });
 
   it.each([
@@ -188,8 +216,9 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
       type: "toolcall_start", contentIndex: 0, partial: { content: [{ type: "toolCall", ...block }] },
     } });
     delta(" ".repeat(100_000));
-    vi.advanceTimersByTime(120_000);
+    vi.advanceTimersByTime(89_999);
     expect(fail).not.toHaveBeenCalled();
+    delta("real argument content");
     guard.dispose();
   });
 
@@ -216,5 +245,30 @@ describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (f
       partial: { content: [{ partialJson: " ".repeat(65536), arguments: {} }] },
     } });
     expect(fail.mock.calls[0]![0].bytes).toBe(65536);
+  });
+});
+
+
+describe("tool-call whitespace timeout configuration", () => {
+  it.each([undefined, "", "invalid", "0", "-1", "1.5", "Infinity", "2147483648"])("uses the 90s default for invalid override %j", value => {
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", value);
+    expect(toolCallWhitespaceTimeoutMs()).toBe(90_000);
+  });
+
+  it("honours a configured interval in both the worker helper and guard", () => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_FABRIC_TOOL_CALL_WHITESPACE_TIMEOUT_MS", "120000");
+    expect(toolCallWhitespaceTimeoutMs()).toBe(120_000);
+    const fail = vi.fn();
+    const guard = new ToolCallStreamGuard(fail, () => ({ model: "fixture/model", effort: "high" }));
+    guard.observe({ type: "message_update", event: { type: "toolcall_delta", contentIndex: 0, delta: " " } });
+    vi.advanceTimersByTime(119_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 120_000, bytes: 1 });
+  });
+
+  it.each([0, -1, NaN, Infinity, 1.5, 2_147_483_648])("rejects an unsafe direct timeout %s", timeoutMs => {
+    expect(() => new ToolCallStreamGuard(vi.fn(), () => ({ model: "fixture/model", effort: "high" }), timeoutMs)).toThrow(RangeError);
   });
 });

@@ -96,7 +96,7 @@ const visiblePiModels = [
 
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
-  const refusal = "named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)";
+  const refusal = `model ${model} requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134`;
   const reason = "  Explicit exception for a bounded compatibility probe  ";
   const argsFor = (action: string): Record<string, unknown> => action === "create" || action === "createActor"
     ? { name: "guard-probe", instructions: "Work." } : { task: "Work.", transport: "process" };
@@ -114,6 +114,60 @@ describe("explicit Astra launch guard (#3134)", () => {
       expect(globalActors.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); }
+  });
+
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s covers all Astra provider prefixes and the reason length boundary", async action => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
+    for (const selection of ["gpt-6-astra", "openai-codex/gpt-6-astra-xhigh", "cliproxyapi/gpt-6-astra-preview"]) {
+      await expect(provider.invoke(action, { ...argsFor(action), model: selection }, context))
+        .rejects.toThrow(`model ${selection} requires modelReason (named exception); omit model to use the role default cliproxyapi/gpt-6.1-sol, see smarty-dev#3134`);
+    }
+    const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
+    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow("role default provider/session, see smarty-dev#3134");
+    await expect(provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(201) }, context))
+      .rejects.toThrow("modelReason must be ≤200 chars");
+    expect(agents.list()).toEqual([]); expect(actors.list()).toEqual([]);
+    const receipt = await provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(200) }, context) as AgentRunRecord;
+    if (action === "spawn") await agents.wait(receipt.id);
+    expect(receipt.modelReason).toBe("x".repeat(200));
+  });
+
+  it.each(["session", "project", "global"] as const)("setModel refuses without a fresh reason and records an accepted %s exception", async scope => {
+    const { provider, actors, agents, globalActors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
+    const actor = await provider.invoke("create", { name: "setter", instructions: "Work.", ...(scope === "global" ? { scope } : {}) }, context) as FabricActorInfo;
+    for (const modelReason of [undefined, "", "  ", false, "x".repeat(201)]) {
+      await expect(provider.invoke("setModel", { id: actor.id, scope, model, modelReason }, context)).rejects.toThrow("requires modelReason (named exception)");
+    }
+    const selected = await provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context) as FabricActorInfo;
+    expect(selected).toMatchObject({ model, modelReason: reason });
+    if (scope === "global") expect(globalActors.toRequest(globalActors.resolve(actor.id)!)).toMatchObject({ model, modelReason: reason });
+    else {
+      const message = await provider.invoke("ask", { id: actor.id, message: "Work." }, context) as { runId: string };
+      expect(agents.status(message.runId)).toMatchObject({ model, modelReason: reason });
+      expect(actors.status(actor.id).modelReason).toBe(reason);
+    }
+    const cleared = await provider.invoke("setModel", { id: actor.id, scope, model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    expect(cleared.modelReason).toBeUndefined();
+  });
+
+  it("keeps existing actors and template imports running without a retroactive reason requirement", async () => {
+    const { provider, actors, agents, globalActors } = setup();
+    const existing = await actors.create({ name: "pre-policy", instructions: "Work.", model });
+    const message = await provider.invoke("ask", { id: existing.id, message: "Work." }, context) as { runId: string };
+    expect(agents.status(message.runId)).toMatchObject({ model, status: "completed" });
+    expect(agents.status(message.runId).modelReason).toBeUndefined();
+    await expect(provider.invoke("setModel", { id: existing.id, model }, context)).rejects.toThrow("requires modelReason");
+    const template = globalActors.create({ name: "pre-policy-template", instructions: "Work.", model });
+    expect(await provider.invoke("import", { id: template.id, as: "legacy-import" }, context)).toMatchObject({ model });
+  });
+
+  it("honors an empty rollback list and a provider-qualified override", async () => {
+    const disabled = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
+    expect(await disabled.provider.invoke("run", { task: "Work.", model, transport: "process" }, context)).toMatchObject({ model });
+    const custom = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: ["cliproxyapi/gpt-6.1-sol"] } } });
+    expect(await custom.provider.invoke("run", { task: "Work.", model, transport: "process" }, context)).toMatchObject({ model });
+    await expect(custom.provider.invoke("spawn", { task: "Work.", model: "cliproxyapi/gpt-6.1-sol" }, context)).rejects.toThrow("requires modelReason");
+    custom.agents.assertExplicitModelReason("other/gpt-6.1-sol", undefined);
   });
 
   it.each(["run", "spawn"] as const)("%s accepts a reason and records it verbatim on the run", async action => {
@@ -160,7 +214,7 @@ describe("explicit Astra launch guard (#3134)", () => {
     let sequence = 0;
     for (const [selection, invocation] of [
       [{}, context], [{}, inherited], [{ model: "cliproxyapi/gpt-6.1-sol" }, context],
-      [{ model: "probe" }, context], [{ model: "gpt-6-astra" }, context],
+      [{ model: "probe" }, context],
     ] as const) {
       const receipt = await provider.invoke(action, { ...argsFor(action), name: `guard-probe-${sequence++}`, ...selection }, invocation) as AgentRunRecord;
       if (action === "spawn") expect((await agents.wait(receipt.id)).status).toBe("completed");
@@ -488,7 +542,7 @@ describe("fleet model policy (#2490)", () => {
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       for (const model of ["veda/cliproxyapi/gpt-6-astra", undefined]) {
-        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model, modelReason: "Exercise independent backend deny policy" } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
       }
       expect(agents.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
@@ -843,14 +897,41 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
       agentsConfig: { modelRouting: { shadowCandidates: [{ model: "provider/model-b", effort: "medium" }] } } });
-    const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
-    expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
+    const modelReason = "  Named routed-task exception  ";
+    const handle = await provider.invoke("spawn", { ...request, cwd: root, modelReason }, context) as AgentHandleInfo & { routeDecision: { model: string } };
+    expect(handle).toMatchObject({ model: "provider/model-a", modelReason, thinking: "high", routeDecision: { model: "provider/model-b", modelReason, effort: "medium", reasonCode: "shadow-choice" } });
     const result = await agents.wait(handle.id);
-    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high",
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", modelReason, thinking: "high",
       routeClass: "bounded-lookup", routeClassSource: "explicit", protected: false });
     const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+    for (const row of rows) expect(row.modelReason).toBe(modelReason);
+    expect(agents.status(handle.id).modelReason).toBe(modelReason);
+    expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
     expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+  it.each(["task:merge-additive", "task:ci-test-fixture", "task:exact-checks"])("routes explicit opt-in %s on spawn and run, never from task text", async routeClass => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    for (const action of ["spawn", "run"]) {
+      const handle = await provider.invoke(action, { ...request, task: "ECHO_MODEL", routeClass }, context) as AgentHandleInfo;
+      expect(await agents.wait(handle.id)).toMatchObject({ model: "provider/model-b", thinking: "high", routeClass, routeClassSource: "explicit" });
+    }
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    const plain = await provider.invoke("spawn", { task: routeClass, name: routeClass, transport: "process", protected: false }, context) as AgentHandleInfo;
+    expect(await agents.wait(plain.id)).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived" });
+    expect(evaluate).toHaveBeenCalledTimes(2);
+  });
+  it("removes the quality reporting action without disabling opted-in LIVE", async () => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [request.routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    const registry = new ActionRegistry(); registry.register(provider);
+    await expect(registry.invoke("agents.routeOutcome", { id: "removed", routeQuality: "fail" }, { ...context, approve: async () => {}, audits: [], maxResultChars: 100000 })).rejects.toThrow();
+    const handle = await provider.invoke("spawn", request, context) as AgentHandleInfo & { routeDecision: { reasonCode: string } };
+    expect(handle.routeDecision.reasonCode).toBe("live-choice");
+    await agents.wait(handle.id);
   });
   it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
     const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
@@ -1908,6 +1989,35 @@ const lifecycleSubscription = (
   });
 
   describe("AgentsProvider lifecycle coalescing", () => {
+    it.each(["main", "session:test"])("delivers exactly one local completion notification to %s during a directory outage", async (to) => {
+      const request = vi.fn();
+      const { provider, participants, mainAgent, mainDeliveries } = setup([], [], { request } as unknown as FabricControlPlane);
+      const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+      Object.assign(participants, {
+        routingUnavailable: () => "heartbeat failed",
+        refreshRoutingView,
+        get: vi.fn(() => { throw new Error("directory read failed"); }),
+      });
+      // Exercise the provider's local-Main grouping path as well as its router.
+      Object.assign(mainAgent, { supportsProvenance: () => true });
+      const errors = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const event = lifecycleEvent({ status: "completed" });
+      try {
+        await provider.deliverLifecycle(lifecycleSubscription({ to }), event);
+        await provider.flushLifecycleDeliveries();
+        await provider.flushLifecycleDeliveries();
+        expect(mainDeliveries).toHaveLength(1);
+        expect(mainDeliveries[0]).toMatchObject({ delivery: "followUp", data: event, triggerTurn: true });
+        expect(errors).not.toHaveBeenCalled();
+        expect(refreshRoutingView).not.toHaveBeenCalled();
+        await expect(provider.routeMessage("session:remote", "do not publish", undefined, "followUp"))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(refreshRoutingView).toHaveBeenCalledOnce();
+        expect(request).not.toHaveBeenCalled();
+        expect(mainDeliveries).toHaveLength(1);
+      } finally { errors.mockRestore(); }
+    });
     it("coalesces a burst of followUp lifecycle events into one wake delivery", async () => {
       const { provider, mainDeliveries } = setup();
       for (let index = 0; index < 5; index += 1) {
@@ -2104,6 +2214,7 @@ describe("AgentsProvider runner support", () => {
         delivery: request.delivery ?? "mailbox",
         responseMode: request.responseMode ?? "text",
         triggerTurn: request.triggerTurn ?? false,
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         coalesce: request.coalesce ?? true,
         residency: "durable",
         queued: 0,
@@ -2213,6 +2324,16 @@ describe("AgentsProvider runner support", () => {
     expect((await provider.describe("peers", context))?.risk).toBe("read");
   });
 
+  it("keeps session: stop targets out of actor classification (#2386)", async () => {
+    const { provider, actors, agents } = setup();
+    const status = vi.spyOn(actors, "status");
+    const failure = new Error("stop dispatch reached");
+    const stop = vi.spyOn(agents, "stop").mockRejectedValue(failure);
+    await expect(provider.invoke("stop", { id: "session:peer" }, context)).rejects.toBe(failure);
+    expect(stop).toHaveBeenCalledWith("session:peer", { consume: false });
+    expect(status).not.toHaveBeenCalled();
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;
@@ -2225,7 +2346,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
     expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
-      { message: "hello", data: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge" });
+      { message: "hello", data: undefined, principal: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge", idempotencyKey: expect.any(String) });
   });
 
   it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
@@ -2237,6 +2358,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it.each([
+    ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2252,7 +2374,11 @@ describe("AgentsProvider runner support", () => {
     const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
-    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
+    if (scenario === "directory-unavailable") {
+      participants.routingUnavailable = () => "Timed out waiting for the Fabric mesh lock";
+      participants.refreshRoutingView = vi.fn().mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+    }
     const registry = new ActionRegistry();
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2271,7 +2397,7 @@ describe("AgentsProvider runner support", () => {
       });
       expect(result.success, result.error).toBe(true);
       expect(result.value).toEqual({ isError: true, name, code,
-        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+        ...(["not-yet-mirrored", "directory-unavailable"].includes(scenario) ? { retryable: true } : {}) });
     } finally {
       await registry.close();
     }
@@ -2353,11 +2479,11 @@ describe("AgentsProvider runner support", () => {
       .resolves.toMatchObject({ id: "session:lead" });
     await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
-    // Resident delivery never elects a replacement. An exact launch binding still uses the
-    // same resolver, so an unrecorded mirror cannot inherit a dead root's messages.
+    // Resident delivery never elects a replacement: even a recorded integrator cannot inherit
+    // a dead root's actor output, and an unrecorded mirror cannot either.
     expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:gone");
     const binding = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: lead.id }) };
-    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:gone");
     expect(deliveryRoot("session:gone", [mirrored], project, binding)).toBe("session:gone");
   });
 
@@ -4363,7 +4489,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 
@@ -4378,8 +4504,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const request = vi.fn().mockResolvedValue({ queued: true, messageId: "m", routed: "mesh", acknowledged: true });
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
-      await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
+      const idempotencyKey = `retry-${kind}`;
+      await expect(provider.invoke(kind, { id: child.id, message: `correct it (${kind})`, data: { key: "k" }, idempotencyKey }, context))
+        .resolves.toMatchObject({ acknowledged: true });
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" }, principal: undefined }, child.ownerIdentityId, { routedRemoteHost: null, idempotencyKey });
     }
     await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
     expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
@@ -4451,7 +4579,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } }),
       "identity:resident",
-      { routedRemoteHost: null },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
   });
 
@@ -5157,6 +5285,12 @@ describe("AgentsProvider steering", () => {
       name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    const expiresAt = Date.now() + 60_000;
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
+      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    for (const invalid of [NaN, Infinity, "tomorrow"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
+    }
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null }, context)).resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"] }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
@@ -5167,6 +5301,7 @@ describe("AgentsProvider steering", () => {
       name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
@@ -5668,7 +5803,7 @@ describe("AgentsProvider switchModel", () => {
       } as unknown as ExtensionContext,
     };
     const results = await Promise.allSettled([
-      provider.invoke("spawn", { task: "Astra", model: "openai-codex/gpt-6-astra" }, invocation),
+      provider.invoke("spawn", { task: "Astra", model: "openai-codex/gpt-6-astra", modelReason: "Named compatibility probe" }, invocation),
       provider.invoke("spawn", { task: "Sol", model: "openai-codex/gpt-6-sol" }, invocation),
       provider.invoke("spawn", { task: "Unrelated", model: "openai-codex/zzzz" }, invocation),
     ]);
@@ -5870,6 +6005,24 @@ describe("own-root resident setters and authoritative status", () => {
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
   });
 
+  it("resident setModel requires a named exception before submission and forwards its metering reason", async () => {
+    const state = await remoteState();
+    const model = "cliproxyapi/gpt-6-astra";
+    const modelReason = "Named resident compatibility probe";
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model }, context)).rejects.toThrow("requires modelReason");
+    }
+    expect(state.setActor).not.toHaveBeenCalled();
+    state.setActor.mockResolvedValue({ ...state.effective, model, modelReason });
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model, modelReason }, context)).resolves.toMatchObject({ model, modelReason });
+      expect(state.setActor).toHaveBeenLastCalledWith(
+        { operation: "setModel", id: state.actor.id, scope, model, modelReason },
+        context.signal, { identity: state.identity, hostId: state.identity.id },
+      );
+    }
+  });
+
   it("returns model and via from resident model setters without activity", async () => {
     const state = await remoteState();
     state.setActor.mockResolvedValue({ ...state.effective, model: "cliproxyapi/gpt-6.1-sol" });
@@ -5936,10 +6089,18 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("forwards resident expiry to the execution owner", async () => {
+    const state = await remoteState();
+    const expiresAt = Date.now() + 60000;
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+  });
+
   it("returns host effective status/list rather than a stale Main overlay", async () => {
     const state = await remoteState();
+    state.effective.filterSkipped = { count: 7, lastKey: "review-key", lastTopic: "github.demo", lastAt: 1234 };
     const roster = vi.spyOn(ResidentActorClient.prototype, "actors").mockResolvedValue([state.effective]);
-    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max" });
+    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max", filterSkipped: state.effective.filterSkipped });
     await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
     expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
     roster.mockRestore();

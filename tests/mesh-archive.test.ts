@@ -1,13 +1,15 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_ARCHIVE_CONFIG, MeshArchive, archiveFileName, currentBoot } from "../src/mesh/archive.js";
+import { MESH_ARCHIVE_CONFIG, MeshArchive, MeshArchiveRecoveryChanged, archiveFileName, currentBoot } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#754 (Paul's decision 2): every mesh event goes into plain append-only files, one per
 // topic and UTC day. An event is archived durably before it goes live, and the live append
-// commits it; a publish that fails or stops before that leaves nothing a reader can see.
+// commits it; positive archived bytes survive ambiguous mixed-version recovery without replay.
 const roots: string[] = [];
 const from: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 
@@ -40,6 +42,133 @@ afterEach(() => {
 });
 
 describe("mesh event archive", () => {
+  it("installs a durable direct sequence address before a live append and returns only its exact line", async () => {
+    const { store, root, dir } = setup();
+    const append = fs.appendFileSync.bind(fs);
+    const spy = vi.spyOn(fs, "appendFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (target === path.join(root, "events.jsonl")) {
+        const event = JSON.parse(String(args[0]));
+        expect(new MeshArchive(dir, root).lookup(event.sequence)).toEqual(event);
+      }
+      return (append as (...args: unknown[]) => void)(target, ...args);
+    }) as typeof fs.appendFileSync);
+    const first = await store.publish({ topic: "indexed.first", from, text: "one", dedupeKey: "indexed" });
+    spy.mockRestore();
+    await store.publish({ topic: "indexed.second", from, text: "two" });
+    const directories = vi.spyOn(fs, "readdirSync");
+    const reads = vi.spyOn(fs, "readSync");
+    expect(new MeshArchive(dir, root).lookup(first.sequence)).toEqual(first);
+    expect(directories).not.toHaveBeenCalled();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(reads.mock.results[0]!.value).toBe(Buffer.byteLength(JSON.stringify(first) + "\n"));
+  });
+
+  it("keeps an explicit negative index after rollback and treats a missing index as unavailable", async () => {
+    const { root, dir } = setup();
+    const archive = new MeshArchive(dir, root);
+    archive.reserveLookup(1);
+    expect(archive.lookup(1)).toBeUndefined();
+    const event: MeshEvent = { id: "indexed-pending", sequence: 1, topic: "indexed.pending", kind: "message", from, createdAt: Date.now() };
+    const pending = archive.begin({ event, line: JSON.stringify(event) });
+    expect(archive.lookup(1)).toEqual(event);
+    archive.rollback(pending);
+    expect(archive.lookup(1)).toBeUndefined();
+    expect(() => archive.lookup(2)).toThrow("sequence index is unavailable");
+  });
+
+  it("hides an aborted reservation even if death interrupts its negative sidecar, including reboot promotion", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.abort", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "archive-only", sequence: 2, dedupeKey: "abort-after-overtake", text: "orphan" };
+    archive.begin({ event, line: JSON.stringify(event) });
+    expect(archive.lookupEntry(2)?.committed).toBe(false);
+    const later = { ...seed, id: "later-live", sequence: 3 };
+    const pending = archive.begin({ event: later, line: JSON.stringify(later) });
+    fs.appendFileSync(path.join(root, "events.jsonl"), JSON.stringify(later) + "\n");
+    archive.commit(pending); // Overwrite/remove PENDING, as a mixed-version writer can do.
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([event, later]);
+    const negative = vi.spyOn(archive, "reserveLookup").mockImplementationOnce(() => { throw new Error("death before negative index"); });
+    expect(() => archive.abort({ event, line: JSON.stringify(event) })).toThrow("death before negative index");
+    negative.mockRestore();
+    const index = path.join(dir, "sequence-index", "0", "2.json");
+    expect(JSON.parse(fs.readFileSync(index, "utf8"))).toMatchObject({ id: event.id, committed: false });
+    expect(archive.lookup(2)).toBeUndefined(); // The durable abort marker takes precedence over the positive address.
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    const recovery = archive.recover(1, archive.prepareRecovery(1));
+    expect(recovery.rebooted).toBe(true);
+    expect(recovery.promote.map(entry => entry.event)).toEqual([later]);
+    archive.recovered(recovery.promote.at(-1), recovery.promote);
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+  });
+
+  it("rejects an abort-marker change after off-lock reboot preflight", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.abort-race", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "abort-after-preflight", sequence: 2 };
+    const pending = archive.begin({ event, line: JSON.stringify(event) });
+    archive.commit(pending);
+    const markers = path.join(dir, path.dirname(pending.file), "ABORTED.json");
+    fs.writeFileSync(markers, "{}");
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    const plan = archive.prepareRecovery(1);
+    expect(plan?.promote.map(entry => entry.event.id)).toEqual([event.id]);
+    // In-place mutation does not change the parent directory identity. The
+    // off-lock plan must also fence the existing positive abort-marker file.
+    fs.writeFileSync(markers, JSON.stringify({ [event.sequence]: event.id }));
+    expect(() => archive.recover(1, plan)).toThrow(MeshArchiveRecoveryChanged);
+    expect(archive.prepareRecovery(1)?.promote).toEqual([]);
+  });
+
+  it.each(["at-offset", "before-offset", "shorter-replacement", "longer-replacement", "torn", "corrupt", "wrong-length"])("directly distinguishes old cutback/replacement from unavailable bytes (%s)", async damage => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.cutback", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "cut-back-reservation", sequence: 2, dedupeKey: "cutback", text: "x".repeat(100) };
+    const pending = archive.begin({ event, line: JSON.stringify(event) });
+    const target = path.join(dir, pending.file);
+    const index = path.join(dir, "sequence-index", "0", "2.json");
+    const indexed = JSON.parse(fs.readFileSync(index, "utf8"));
+    if (damage === "at-offset" || damage === "before-offset") {
+      fs.truncateSync(target, damage === "at-offset" ? pending.size : pending.size - 1);
+    } else if (damage.endsWith("replacement")) {
+      fs.truncateSync(target, pending.size);
+      const later = { ...seed, id: "old-writer-later", sequence: 3, text: damage === "longer-replacement" ? "x".repeat(5000) : "short" };
+      fs.appendFileSync(target, JSON.stringify(later) + "\n");
+    } else if (damage === "torn") {
+      fs.truncateSync(target, pending.size + 10);
+    } else if (damage === "corrupt") {
+      fs.truncateSync(target, pending.size);
+      fs.appendFileSync(target, "not-json\n");
+    } else {
+      fs.writeFileSync(index, JSON.stringify({ ...indexed, length: indexed.length + 1 }));
+    }
+    const directories = vi.spyOn(fs, "readdirSync");
+    const history = vi.spyOn(fs, "readFileSync");
+    if (["torn", "corrupt", "wrong-length"].includes(damage)) expect(() => archive.lookup(2)).toThrow("is unavailable");
+    else expect(archive.lookup(2)).toBeUndefined();
+    expect(directories).not.toHaveBeenCalled();
+    expect(history.mock.calls.some(([file]) => String(file).endsWith(".jsonl"))).toBe(false);
+    // Direct absence does not rewrite old metadata or manufacture an abort.
+    expect(JSON.parse(fs.readFileSync(index, "utf8"))).toEqual(damage === "wrong-length" ? { ...indexed, length: indexed.length + 1 } : indexed);
+  });
+
+  it("marks a keyed reboot promotion live before archive cursor readers can deliver it", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.reboot", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "synced-keyed", sequence: 2, dedupeKey: "reboot-promotion", text: "synced" };
+    archive.begin({ event, line: JSON.stringify(event) });
+    fs.writeFileSync(path.join(root, "sequence"), "2");
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    await store.publish({ topic: seed.topic, from, text: "after reboot" });
+    expect(archive.lookupEntry(2)).toMatchObject({ event, committed: true });
+    expect(store.read({ after: 1 }).filter(item => item.dedupeKey === event.dedupeKey)).toEqual([event]);
+    expect(store.nextEventAfter(1)).toEqual(event);
+  });
+
   it("writes each event to its topic's file for its UTC day, with the live log's bytes", async () => {
     const { store, file, lines, live, dir } = setup();
     vi.useFakeTimers({ now: Date.parse("2026-09-27T23:59:59.500Z"), toFake: ["Date"] });
@@ -163,11 +292,13 @@ describe("mesh event archive", () => {
     const size = fs.statSync(target).size;
     fs.appendFileSync(target, `${JSON.stringify(orphan)}${ending}`);
     fs.writeFileSync(path.join(root, "sequence"), "2");
-    // Before recovery, no reader sees it: it is past the newest live sequence, and it is pending.
+    // Before recovery, no reader sees it: it is past the actual newest live sequence.
+    // PENDING alone cannot hide an event inside that horizon (old recovery may leave it stale).
     const archive = new MeshArchive(dir, root);
     expect(archive.readAfter(0, 1, () => true, 10).map((event) => event.sequence)).toEqual([1]);
     fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: orphan.id, file: path.relative(dir, target), size }));
-    expect(archive.readAfter(0, 2, () => true, 10).map((event) => event.sequence)).toEqual([1]);
+    expect(archive.readAfter(0, 1, () => true, 10).map((event) => event.sequence)).toEqual([1]);
+    expect(store.nextEventAfter(1)).toBeUndefined();
 
     await store.publish({ topic: "ops.owner", from, text: "three" });
     expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 3]);
@@ -247,6 +378,59 @@ describe("mesh event archive", () => {
     expect(live()[1]).toBe(second);
     expect(sequences(target)).toEqual([1, 2, 3]);
     expect(fs.readFileSync(path.join(dir, "BOOT"), "utf8")).toBe(currentBoot());
+  });
+
+  it.each(["retry-first", "unrelated-first"] as const)("promotes the full lost live suffix before keyed intent settlement after reboot (%s)", async ordering => {
+    const { root, dir, store, live } = setup();
+    const seed = await store.publish({ topic: "ops.owner", from, text: "seed" });
+    expect(seed.sequence).toBe(1);
+    const livePath = path.join(root, "events.jsonl");
+    const seedSize = fs.statSync(livePath).size;
+    const recipient: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
+    const inbox = (mesh: MeshStore) => new RootInbox(mesh, recipient, { steerGraceMs: 0, pageSize: 1 });
+    // Persist the real recipient cursor before its ordinary, acknowledged work arrives.
+    await store.put({ key: inbox(store).key, value: { after: 1 }, identity: recipient });
+    const ordinary = await store.publish({ topic: "fleet.work.reboot", from, to: recipient.id, text: "acknowledged ordinary work" });
+    expect(ordinary.sequence).toBe(2);
+    const packet = { topic: ordinary.topic, from, to: recipient.id, text: "keyed work", dedupeKey: "reboot-key-3" };
+    const crash = vi.spyOn(MeshArchive.prototype, "commit").mockImplementationOnce(() => { throw new Error("death before live confirmation/receipt"); });
+    await expect(store.publish(packet)).rejects.toThrow("death before live confirmation/receipt");
+    crash.mockRestore();
+    const archive = new MeshArchive(dir, root);
+    const keyed = archive.lookupEntry(3)!;
+    expect(keyed).toMatchObject({ committed: false, event: { sequence: 3, dedupeKey: packet.dedupeKey } });
+    const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    expect(archive.pending()?.id).toBe(keyed.event.id);
+    expect(archive.readAfter(0, 3, () => true, 100)).toEqual([seed, ordinary, keyed.event]);
+    // A reboot loses unsynced live appends but keeps both synced archive lines and the intent.
+    fs.truncateSync(livePath, seedSize);
+    fs.writeFileSync(path.join(dir, "BOOT"), "previous-boot");
+    expect(live().map(line => JSON.parse(line).sequence)).toEqual([1]);
+    const restarted = new MeshStore(root, store.maxEventBytes, store.maxReadEvents);
+    let unrelated: MeshEvent | undefined;
+    if (ordering === "unrelated-first") unrelated = await restarted.publish({ topic: "ops.owner", from, text: "unrelated" });
+    // In retry-first, publish(key 3) is the first operation on this store after restart.
+    expect(await restarted.publish(packet)).toEqual(keyed.event);
+    const expected = [ordinary, keyed.event, ...(unrelated ? [unrelated] : [])];
+    expect(restarted.read({ after: 1 })).toEqual(expected);
+    expect(live().map(line => JSON.parse(line).sequence)).toEqual([1, ...expected.map(event => event.sequence)]);
+    expect(fs.readFileSync(path.join(dir, "BOOT"), "utf8")).toBe(currentBoot());
+    const beforeRetry = fs.readFileSync(livePath, "utf8");
+    expect(await restarted.publish(packet)).toEqual(keyed.event);
+    expect(fs.readFileSync(livePath, "utf8")).toBe(beforeRetry);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(archive.readAfter(1, restarted.latestSequence(), () => true, 100).filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([keyed.event]);
+    // Exercise RootInbox.#scan's actual paged sequence cursor, not an archive-only reader.
+    const recipientInbox = inbox(restarted);
+    const batch = await recipientInbox.next(rootInboxSession([]));
+    expect(batch.events).toEqual([ordinary, keyed.event]);
+    expect(batch.through).toBe(unrelated?.sequence ?? 3);
+    const delivered = rootInboxSession([{ type: "custom_message", ...rootInboxMessage(batch.events) }]);
+    expect((await recipientInbox.next(delivered)).events).toEqual([]);
+    expect(restarted.get(recipientInbox.key)?.value).toMatchObject({ after: batch.through });
+    expect((await inbox(new MeshStore(root, store.maxEventBytes, store.maxReadEvents)).next(delivered)).events).toEqual([]);
   });
 
   it("cuts a torn pending line after a reboot, and keeps its sequence unused", async () => {

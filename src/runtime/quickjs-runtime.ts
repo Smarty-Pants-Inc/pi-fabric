@@ -29,6 +29,8 @@ type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_DIRECTORY_UNAVAILABLE: "FabricDirectoryUnavailableError",
+  FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
@@ -46,6 +48,12 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const metadata: Record<string, string | boolean> = { name, code };
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
+  if (code === "FABRIC_PARTICIPANT_STALE") {
+    // The public message schema bounds retry keys to 1-200 chars. Read only own
+    // data properties: never invoke a host getter or export unrelated metadata.
+    const key = Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value;
+    if (typeof key === "string" && key.length >= 1 && key.length <= 200) metadata.idempotencyKey = key;
+  }
   return metadata;
 };
 
@@ -539,6 +547,7 @@ globalThis.agents = Object.freeze({
   tell: (target, message) => __call("agents.tell", __messageArgs(target, message)),
   steer: (target, message) => __call("agents.steer", __messageArgs(target, message)),
   followUp: (target, message) => __call("agents.followUp", __messageArgs(target, message)),
+  cancelFollowUp: (args) => __call("agents.cancelFollowUp", args),
   setSteeringMode: (args) => __call("agents.setSteeringMode", args),
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),

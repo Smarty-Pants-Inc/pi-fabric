@@ -3,9 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
-import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 
@@ -34,6 +34,64 @@ afterEach(async () => {
 });
 
 describe("AgentManager close storage", () => {
+  it.each(["before-close", "during-drain"] as const)("joins a child settled %s without foreground consumption, but real wait still consumes", async (timing) => {
+    const fence = vi.fn();
+    const consumed = vi.fn();
+    const settled = vi.fn();
+    const stoppedAtClose = vi.fn();
+    const { manager } = setup(true, {
+      onBeforeResultReturned: fence, onResultConsumed: consumed,
+      onSettled: settled, onStoppedAtClose: stoppedAtClose,
+    });
+    let release!: () => void;
+    const drain = new Promise<void>((resolve) => { release = resolve; });
+    let alive = true;
+    let statusFile = "";
+    const publish = () => {
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      fs.writeFileSync(statusFile, JSON.stringify({ ...record, status: "completed", finishedAt: Date.now(),
+        updatedAt: Date.now(), text: "unread full outcome", value: { private: "structured outcome" } }));
+      alive = false;
+    };
+    const stop = vi.fn(async () => {
+      if (timing === "during-drain") { publish(); await drain; }
+      alive = false;
+    });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request) => {
+      statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      fs.writeFileSync(statusFile, JSON.stringify({ id: request.id, name: request.name, task: "unread", status: "running",
+        runner: "pi", transport: "process", cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(),
+        turns: 1, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+      return { kind: "process", isAlive: async () => alive, stop };
+    });
+    const child = await manager.spawn({ task: "unread", transport: "process", extensions: false });
+    if (timing === "before-close") { publish(); await manager.join(child.id); }
+    const statusReads = vi.spyOn(fs, "readFileSync");
+    const closing = manager.close();
+    try {
+      if (timing === "during-drain") {
+        await vi.waitFor(() => {
+          expect(stop).toHaveBeenCalledOnce();
+          // Both stop's snapshot and the monitor must see the terminal record
+          // before the exact transport receipt releases either continuation.
+          expect(statusReads.mock.calls.filter(([file]) => file === statusFile).length).toBeGreaterThanOrEqual(3);
+        });
+        release();
+      }
+      await closing;
+    } finally { release(); await closing; statusReads.mockRestore(); }
+    expect(stop).toHaveBeenCalledOnce();
+    expect(settled).toHaveBeenCalledOnce();
+    expect(fence).not.toHaveBeenCalled();
+    expect(consumed).not.toHaveBeenCalled();
+    if (timing === "before-close") expect(stoppedAtClose).not.toHaveBeenCalled();
+    await expect(manager.wait(child.id)).resolves.toMatchObject({
+      status: "completed", text: "unread full outcome", value: { private: "structured outcome" },
+    });
+    expect(fence).toHaveBeenCalledExactlyOnceWith(child.id);
+    expect(consumed).toHaveBeenCalledExactlyOnceWith(child.id);
+  });
+
   it("removes empty managed roots immediately, without recreating them on repeated close", async () => {
     const { manager, root } = setup();
     const first = manager.close();
@@ -51,6 +109,58 @@ describe("AgentManager close storage", () => {
     expect(fs.readdirSync(root).length).toBeGreaterThan(1);
     await manager.close();
     expect(fs.existsSync(root)).toBe(false);
+  });
+
+  it.each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root && attempts++ === 0) {
+        expect(fs.readdirSync(root)).toEqual([]);
+        throw Object.assign(new Error("Windows directory handle is still closing"), { code });
+      }
+      return rmdir(directory);
+    });
+    await manager.close();
+    expect(attempts).toBe(2);
+    expect(fs.existsSync(root)).toBe(false);
+  });
+
+  it("bounds retries for a persistently busy owned empty root", async () => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root) {
+        attempts++;
+        throw Object.assign(new Error("directory remains busy"), { code: "EBUSY" });
+      }
+      return rmdir(directory);
+    });
+    const started = Date.now();
+    await manager.close();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(2_000);
+    expect(attempts).toBeGreaterThan(1);
+    expect(attempts).toBeLessThanOrEqual(42);
+    expect(fs.existsSync(root)).toBe(true);
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("preserves unknown contents appearing during an empty-root retry", async () => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root && attempts++ === 0) {
+        fs.writeFileSync(path.join(root, "unrelated"), "not an agent artifact");
+        throw Object.assign(new Error("directory handle is still closing"), { code: "EBUSY" });
+      }
+      return rmdir(directory);
+    });
+    await manager.close();
+    expect(attempts).toBe(2);
+    expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
   });
 
   it("retains closed managed run artifacts by default", async () => {

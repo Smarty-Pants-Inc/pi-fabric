@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
-import { confirmedSessionEntries, type SessionReceiptManager } from "../core/session-receipts.js";
+import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
 /**
@@ -104,7 +104,11 @@ const workReceipts = (fromId: string, data: unknown): string[] => {
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
 const eventReceipts = (event: MeshEvent): string[] => [
-  eventReceipt(event.id), receipt(event.from.id, "id", event.id), ...workReceipts(event.from.id, event.data),
+  eventReceipt(event.id), receipt(event.from.id, "id", event.id),
+  // Host-only publication keys are mesh-wide, even when a different maintenance owner
+  // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
+  ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
+  ...workReceipts(event.from.id, event.data),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
@@ -387,12 +391,36 @@ export class RootInbox {
   }
 }
 
+const matchesInboxReceipt = (line: string): boolean =>
+  line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE);
+
+const matchesMainReceipt = (line: string): boolean => line.includes(AGENT_MESSAGE_CUSTOM_TYPE) || line.includes('\"session\"');
+/** Original native carrier IDs, for a retired/dead Main's inbox rotation. This uses
+ * the same cached canonical receipt/barrier path as the root shadow inbox. */
+export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId: string): Set<string> => {
+  const snapshot = confirmedSessionReceiptSnapshot(manager, matchesMainReceipt);
+  const ids = new Set<string>();
+  if (!snapshot.count) return ids;
+  type Entry = { type?: string; id?: string; customType?: string; details?: { id?: string; chain?: string; items?: Array<{ id?: string; chain?: string }> } };
+  const header = snapshot.entries.get(0) as Entry | undefined;
+  if (header?.type !== "session" || header.id !== sessionId) throw new Error("Main inbox session receipt identity mismatch");
+  for (const value of snapshot.entries.values()) {
+    const entry = value as Entry;
+    if (entry.type !== "custom_message" || entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    for (const item of [entry.details, ...(entry.details?.items ?? [])]) {
+      if (typeof item?.id === "string") ids.add(item.id);
+      if (typeof item?.chain === "string") ids.add(item.chain);
+    }
+  }
+  return ids;
+};
+
 /** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
 export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootInboxSession => {
   try {
-    return rootInboxSession(confirmedSessionEntries(manager, (line) =>
-      line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE)));
+    const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt);
+    return inboxReceiptSession(snapshot.entries, snapshot.count);
   } catch {
     return rootInboxSession([]);
   }
@@ -400,7 +428,10 @@ export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootI
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
  * Batch presence retains its compatibility lookback; delivery identity does not. */
-export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession => {
+export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession =>
+  inboxReceiptSession(Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]), entries.length, lookback);
+
+const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500): RootInboxSession => {
   const batchIds = new Set<string>();
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
@@ -410,14 +441,16 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
     delivered.add(id);
     deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
   };
-  for (let index = entries.length - 1; index >= 0; index--) {
+  // Persisted snapshots contain receipts only, with original history positions. All-history
+  // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
+  for (const [index, value] of [...entries].reverse()) {
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
-    const entry = entries[index] as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    const entry = value as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
     const parsedAt = Date.parse(entry.timestamp ?? "");
     const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
-      if (index >= Math.max(0, entries.length - lookback)) {
+      if (index >= Math.max(0, count - lookback)) {
         hasBatch = true;
         for (const id of entry.details.ids) if (typeof id === "string") batchIds.add(id);
       }

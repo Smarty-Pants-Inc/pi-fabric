@@ -153,8 +153,9 @@ describe("round-1 admission invariance", () => {
       enabled: true, hostId: "owner-host", pollMs: 10, acknowledgementTimeoutMs: 1_000,
     });
     try {
-      // The remote command's UUID is now journalled and counts against the same byte quota.
-      const deliveryIdBytes = Buffer.byteLength(JSON.stringify("00000000-0000-0000-0000-000000000000"));
+      // Stable control IDs are SHA-256 hex (64 chars), not the old 36-char UUID.
+      // Their serialized journal cost remains charged to the same real quota.
+      const deliveryIdBytes = Buffer.byteLength(JSON.stringify("0".repeat(64)));
       const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - deliveryIdBytes - 16), delivery: "followUp" as const };
       before.main.deliverAgent(seed);
       after.main.deliverAgent(seed);
@@ -172,6 +173,7 @@ describe("round-1 admission invariance", () => {
       expect(after.main.queueDepth().pendingFollowUps).toBe(2); // Seed plus one report, not two reports.
       const commands = senderStore.read({ topic: "fabric.control.command" });
       expect(commands).toHaveLength(2);
+      expect(commands.every(event => /^[a-f0-9]{64}$/.test((event.data as { commandId: string }).commandId))).toBe(true);
       expect(commands.map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text]);
       expect(fs.existsSync(journal)).toBe(true);
       after.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });

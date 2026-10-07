@@ -9,6 +9,9 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Agent, type AgentMessage, type QueueMode } from "@earendil-works/pi-agent-core";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import principalDelivery from "../src/worker/principal-delivery.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -79,6 +82,7 @@ const mainLeaseFixture = async (files: boolean) => {
   if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, identity, value: { version: 1, participants: "files" } });
   const directory = new ParticipantDirectory(mesh, {
     enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+    routingLease: { waitMs: 5, pollMs: 1 },
   });
   directories.push(directory);
   await directory.refresh();
@@ -92,7 +96,7 @@ const mainLeaseFixture = async (files: boolean) => {
   };
   await mesh.put({ key: key("topology/hosts/"), identity: target, value: {
     format: 1, id: target.id, rootId: target.id, identity: target, startedAt: 1,
-    updatedAt: Date.now(), expiresAt: Date.now() - 600_000,
+    updatedAt: Date.now(), expiresAt: Date.now() - 2_000,
   } });
   const participantKey = key("topology/participants/");
   if (files) writeParticipantFile(meshRoot, { key: participantKey, value: presence, version: 1, updatedAt: Date.now(), updatedBy: target });
@@ -109,15 +113,277 @@ const mainLeaseFixture = async (files: boolean) => {
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
 
+describe("directory availability for live Mains (#2386)", () => {
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {
+    const f = await mainLeaseFixture(files);
+    if (freshLease) {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+      expect(f.directory.get(f.target.id)?.kind).toBe("root");
+    }
+    const timeout = Object.assign(new Error("Timed out waiting for the Fabric mesh lock (injected)"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const heartbeat = vi.spyOn(f.mesh, "confirmWritable").mockRejectedValueOnce(timeout);
+    await expect(f.directory.refresh()).rejects.toBe(timeout);
+    heartbeat.mockRestore();
+    expect(f.directory.routingUnavailable()).toContain(timeout.message);
+    const request = vi.fn().mockResolvedValue({ queued: true, messageId: "recovered", routed: "mesh", acknowledged: true });
+    const send = router(unknown, [], { request }, f.directory);
+    const probe = vi.spyOn(f.directory, "refreshRoutingView");
+    const lock = path.join(f.meshRoot, ".lock");
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
+    try {
+      const failure = await send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp").catch(error => error);
+      expect(failure).toMatchObject(freshLease
+        ? { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true }
+        : { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+      expect(failure.message).toContain(freshLease ? "Timed out waiting for the Fabric mesh lock" : "lease late by");
+      expect(failure.message).not.toContain("Unknown Fabric actor");
+      expect(probe).toHaveBeenCalledTimes(freshLease ? 1 : 0);
+      expect(request).not.toHaveBeenCalled();
+      expect(send.actors.status).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(lock, { recursive: true, force: true });
+    }
+    // A late target renews before retry; routing still needs its ordinary canonical read.
+    if (!freshLease) {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+    }
+    // No sender heartbeat success is needed for the canonical routing read to recover.
+    await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
+      .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
+    expect(probe).toHaveBeenCalledTimes(freshLease ? 2 : 1);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
+    expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
+  });
+
+  it.each(["", "  ", "{", "{}", "null"])("never confirms damaged canonical bytes %j as absence of a published Main", async (damaged) => {
+    const f = await mainLeaseFixture(false);
+    const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+    await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+    expect(f.directory.get(f.target.id)?.kind).toBe("root");
+    const state = path.join(f.meshRoot, "state.json");
+    const healthy = fs.readFileSync(state, "utf8");
+    fs.writeFileSync(state, damaged);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    try {
+      await expect(f.directory.refresh()).rejects.toThrow();
+      await expect(f.directory.refreshRoutingView()).rejects.toThrow();
+      expect(f.directory.routingUnavailable()).toBeDefined();
+      for (const kind of ["followUp", "steer"] as const) {
+        await expect(send.value.routeMessage(f.target.id, "must not publish", undefined, kind))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+      }
+      expect(request).not.toHaveBeenCalled();
+      expect(fs.readFileSync(state, "utf8")).toBe(damaged);
+    } finally {
+      fs.writeFileSync(state, healthy);
+    }
+  });
+
+  it.each(["cached-root", "fresh-root", "fresh-negative", "retained-list", "name-list", "retained-lastKnown", "lineage", "diagnostic-lastKnown", "diagnostic-peers"] as const)("classifies the late %s read with one bounded probe", async (readPath) => {
+    const target = { ...remote("session:live", "running", "root"), name: "live-name", rootId: "session:live", controlProtocol: "v1" } as FabricParticipantInfo;
+    for (const fails of [false, true]) {
+      let failed = true;
+      let cachedReads = 0;
+      let lists = 0;
+      let retainedReads = 0;
+      const badRead = () => { if (failed) throw new Error(`fresh ${readPath} read failed`); };
+      const get = vi.fn((id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
+        if (id === target.id) {
+          if (options?.fresh && readPath === "fresh-root") badRead();
+          if (!options?.fresh && readPath === "cached-root" && ++cachedReads >= 2) badRead();
+          if (!["retained-list", "retained-lastKnown", "lineage"].includes(readPath)) return target;
+        }
+        if (options?.fresh && readPath === "fresh-negative") badRead();
+        return undefined;
+      });
+      const list = vi.fn(() => {
+        if (readPath === "retained-list" || (readPath === "name-list" && ++lists >= 2)) badRead();
+        return readPath.startsWith("diagnostic") || readPath === "fresh-negative" ? [] : [target];
+      });
+      const lastKnown = vi.fn(() => {
+        if (readPath === "retained-lastKnown" || (readPath === "diagnostic-lastKnown" && ++retainedReads >= 3)) badRead();
+        return readPath === "retained-lastKnown" ? { participant: target, lapsedMs: 1 } : undefined;
+      });
+      const peers = vi.fn(() => { if (readPath === "diagnostic-peers") badRead(); return []; });
+      const lineageAlive = vi.fn(() => { if (readPath === "lineage") badRead(); return true; });
+      const refreshRoutingView = vi.fn(async () => { if (fails) throw new Error("probe failed"); failed = false; });
+      const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+      const source = { get, ...(["retained-lastKnown", "diagnostic-lastKnown"].includes(readPath) ? {} : { list }),
+        lastKnown, peers, lineageAlive, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView };
+      const send = router(unknown, [], { request }, source);
+      const selector = ["name-list", "fresh-negative"].includes(readPath) ? "live-name"
+        : readPath.startsWith("diagnostic") ? "session:absent" : target.id;
+      const delivery = send.value.routeMessage(selector, "one bounded resolution", undefined, "followUp");
+      if (fails) {
+        await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(request).not.toHaveBeenCalled();
+      } else if (readPath.startsWith("diagnostic") || readPath === "fresh-negative") {
+        await expect(delivery).rejects.toThrow("Unknown Fabric participant");
+        expect(request).not.toHaveBeenCalled();
+      } else {
+        await expect(delivery).resolves.toMatchObject({ queued: true });
+        expect(request).toHaveBeenCalledOnce();
+      }
+      expect(refreshRoutingView).toHaveBeenCalledOnce();
+      if (readPath === "fresh-root") expect(get.mock.calls.some(call => call[0] === target.id && !call[2]?.fresh)).toBe(true);
+    }
+  });
+
+  it.each(["no confirmed view", "view overdue", "last refresh failed"])("probes once when the %s, for both delivery modes", async (reason) => {
+    let unavailable: string | undefined = reason;
+    const target = remote("session:live", "running", "root");
+    const get = vi.fn(() => unavailable ? undefined : target);
+    const refreshRoutingView = vi.fn(async () => { unavailable = undefined; });
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => unavailable, refreshRoutingView });
+    for (const kind of ["followUp", "steer"] as const) {
+      unavailable = reason;
+      await expect(send.value.routeMessage(target.id, "recovered", undefined, kind)).resolves.toMatchObject({ queued: true });
+    }
+    expect(refreshRoutingView).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(send.actors.status).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("revalidates actor ownership before lookup, retaining failed probe causes (fails=%s)", async (fails) => {
+    let unavailable: string | undefined = "no confirmed view";
+    const target = remote("actor:resident", "idle", "actor");
+    const get = vi.fn(() => target);
+    const lockError = Object.assign(new Error("ownerless mesh lock"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const refreshRoutingView = vi.fn(async () => {
+      if (fails) throw lockError;
+      unavailable = undefined;
+    });
+    const send = router(unknown, [], undefined, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => unavailable, refreshRoutingView });
+    const lookup = send.value.resolveActorTargetFresh(target.id);
+    if (fails) {
+      await expect(lookup).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", cause: lockError });
+      expect(get).not.toHaveBeenCalled();
+    } else {
+      await expect(lookup).resolves.toMatchObject({ participant: target });
+      expect(get).toHaveBeenCalledOnce();
+    }
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("bounds recovery of a read failure after a healthy preflight (probe fails=%s)", async (fails) => {
+    let failed = true;
+    const target = remote("session:live", "running", "root");
+    const get = vi.fn(() => { if (failed) throw new Error("directory read failed"); return target; });
+    const refreshRoutingView = vi.fn(async () => {
+      if (fails) throw new Error("Timed out waiting for the Fabric mesh lock");
+      failed = false;
+    });
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
+    const delivery = send.value.routeMessage(target.id, "retry resolution", undefined, "followUp");
+    if (fails) {
+      await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+      expect(request).not.toHaveBeenCalled();
+    } else {
+      await expect(delivery).resolves.toMatchObject({ queued: true });
+      expect(request).toHaveBeenCalledOnce();
+    }
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+  });
+
+  it("never retries a repeated fresh-root read failure or a post-publication ACK failure", async () => {
+    const target = remote("session:live", "running", "root");
+    const refreshRoutingView = vi.fn().mockResolvedValue(undefined);
+    const get = vi.fn((_id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
+      if (options?.fresh) throw new Error("persistent fresh read failure");
+      return target;
+    });
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
+    await expect(send.value.routeMessage(target.id, "no publication", undefined, "followUp"))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    get.mockImplementation(() => target);
+    refreshRoutingView.mockClear();
+    const ackFailure = new Error("Control acknowledgement timed out after publication");
+    request.mockRejectedValue(ackFailure);
+    await expect(send.value.routeMessage(target.id, "already published", undefined, "followUp")).rejects.toBe(ackFailure);
+    expect(request).toHaveBeenCalledOnce();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
+  });
+
+  it.each(["followUp", "steer"] as const)("delivers canonical local Main/tasks without probing an unavailable directory (%s)", async (kind) => {
+    const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+    const get = vi.fn(() => { throw new Error("directory read failed"); });
+    const request = vi.fn();
+    const manager = {
+      status: vi.fn((id: string) => {
+        if (id === "child") return { id, name: "Child", runner: "pi" };
+        throw new Error(`Unknown Fabric agent: ${id}`);
+      }),
+      steer: vi.fn(() => ({ messageId: "local-task" })),
+      followUp: vi.fn(() => ({ messageId: "local-task" })),
+    } as unknown as Ports[0];
+    const send = router(manager, [], { request }, {
+      get, scheduleRefresh: vi.fn(), routingUnavailable: () => "heartbeat failed", refreshRoutingView,
+    });
+    await expect(send.value.routeMessage(identity.id, "local Main", undefined, kind)).resolves.toMatchObject({ routed: "main" });
+    await expect(send.value.routeMessage("child", "local task", undefined, kind)).resolves.toMatchObject({ routed: "local" });
+    expect(send.main.deliverAgent).toHaveBeenCalledOnce();
+    expect(kind === "steer" ? manager.steer : manager.followUp).toHaveBeenCalledOnce();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
+    await expect(send.value.routeMessage("session:remote", "no publication", undefined, kind))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    expect(send.main.deliverAgent).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish remotely when a proven-local task disappears during delivery", async () => {
+    const status = vi.fn().mockReturnValueOnce({ id: "child", name: "Child" })
+      .mockImplementation(() => { throw new Error("Unknown Fabric agent: child"); });
+    const get = vi.fn();
+    const request = vi.fn();
+    const send = router({ status } as unknown as Ports[0], [], { request }, { get, scheduleRefresh: vi.fn() });
+    await expect(send.value.routeMessage("child", "no fallback", undefined, "steer")).rejects.toThrow("Unknown Fabric agent: child");
+    expect(get).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("only a fresh view proves an actor id absent, and healthy actor routes are unchanged", async () => {
+    const f = await mainLeaseFixture(false);
+    const send = router(unknown, [], undefined, f.directory);
+    await expect(send.value.resolveActorMessageTarget("actor:missing")).rejects.toThrow("Unknown Fabric actor: actor:missing");
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("actor:running", "existing route", undefined, kind))
+        .resolves.toMatchObject({ queued: true, routed: "local", messageId: "mailbox" });
+    }
+    expect(send.actors.tell).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["followUp", "steer"] as const)("never tries an actor for an absent session: address (%s)", async (kind) => {
+    const send = router(unknown);
+    const failure = await send.value.routeMessage("session:missing", "no actor fallback", undefined, kind).catch(error => error);
+    expect(failure.message).toContain("Unknown Fabric participant: session:missing");
+    expect(failure.message).not.toContain("Unknown Fabric actor");
+    await expect(send.value.resolveActorMessageTarget("session:missing")).rejects.toThrow("Unknown Fabric Main participant");
+    expect(() => send.value.resolveActorTarget("session:missing")).toThrow("is not an actor");
+    expect(send.actors.status).not.toHaveBeenCalled();
+    expect(send.actors.validateDirectMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("Main target lineage delivery (#3686)", () => {
   it.each([
     [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
     [false, "steer", true], [false, "followUp", true], [true, "steer", true], [true, "followUp", true],
     [false, "steer", "name"], [false, "followUp", "name"], [true, "steer", "name"], [true, "followUp", "name"],
-  ] as const)("queues %s file presence / %s / selector=%s despite a ten-minute lease lapse", async (files, kind, selector) => {
+  ] as const)("queues %s file presence / %s / selector=%s during the bounded recent-lease grace", async (files, kind, selector) => {
     const f = await mainLeaseFixture(files);
     expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
-    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(600_000);
+    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(2_000);
     expect(f.directory.lineageAlive(f.target.id)).toBe(true);
     const sender = f.plane(identity);
     sender.start(() => ({ accepted: false }));
@@ -233,7 +499,10 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
     const f = await mainLeaseFixture(files);
     const stalled = new Error("Fabric mesh write stalled");
     if (state === "dead-lineage") vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
-    else vi.spyOn(f.directory, "writeStalled").mockReturnValue(stalled);
+    else {
+      vi.spyOn(f.directory, "routingUnavailable").mockReturnValue(stalled.message);
+      vi.spyOn(f.directory, "refreshRoutingView").mockRejectedValue(stalled);
+    }
     const request = vi.fn();
     const send = router(unknown, [], { request }, f.directory);
     for (const kind of ["followUp", "steer"] as const) {
@@ -259,15 +528,96 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
 });
 
 describe("running-task followUp advisory (#3005)", () => {
-  it("A1 local receipt warns after exactly one unchanged follow_up append", async () => {
+  it("A1 local receipt warns after exactly one tracked follow_up append with unchanged payload", async () => {
     const f = await running();
-    const data = { private: "unchanged" };
+    const data = { private: "unchanged" }, admittedAt = Date.now();
     const receipt = await router(f.manager).value.routeMessage(f.id, "later", data, "followUp");
-    expect(f.entries()).toEqual([{ type: "follow_up", message: "later", data, provenance: expect.any(Object), id: receipt.messageId, ts: expect.any(Number) }]);
+    expect(f.entries()).toEqual([{ type: "follow_up", message: "later", data, provenance: expect.any(Object),
+      followUpId: receipt.messageId, deadlineAt: receipt.deadlineAt, id: receipt.messageId, ts: expect.any(Number) }]);
     expect(f.entries()[0]).not.toHaveProperty("warning");
-    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), routed: "local", warning: warning(f.id) });
+    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), routed: "local", warning: warning(f.id), deadlineAt: expect.any(Number) });
+    expect(receipt.deadlineAt).toBeGreaterThanOrEqual(admittedAt + 600_000);
+    expect(receipt.deadlineAt).toBeLessThanOrEqual(Date.now() + 600_000);
+    expect(f.manager.status(f.id).followUpDeliveries).toEqual([{ messageId: receipt.messageId, deadlineAt: receipt.deadlineAt, state: "queued" }]);
   });
 
+  it.each([
+    { followUpMode: "all", steeringMode: "one-at-a-time", firstBatch: ["FOLLOW_FIRST", "FOLLOW_SECOND"] },
+    { followUpMode: "one-at-a-time", steeringMode: "all", firstBatch: ["FOLLOW_FIRST"] },
+  ] as const)("public tracked follow-ups honour $followUpMode independently of steering $steeringMode", async ({ followUpMode, steeringMode, firstBatch }) => {
+    const f = await running(), r = router(f.manager).value;
+    f.manager.setSteeringMode(f.id, steeringMode);
+    f.manager.setFollowUpMode(f.id, followUpMode);
+    const run = f.manager.runDirectory(f.id)!, directory = path.join(run, "deliveries");
+    fs.mkdirSync(directory, { recursive: true });
+    const previous = process.env.PI_FABRIC_DELIVERY_DIR;
+    const handlers = new Map<string, (...args: any[]) => any>();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const contexts: AgentMessage[][] = [];
+    const faux = createFauxCore({ tokensPerSecond: 100_000 });
+    faux.setResponses(Array.from({ length: 4 }, () => async (_context, _options, state) => {
+      if (state.callCount === 1) await gate;
+      return fauxAssistantMessage("done");
+    }));
+    const modes = f.entries();
+    const receiver = new Agent({
+      initialState: { model: faux.getModel() }, streamFn: faux.streamSimple,
+      steeringMode: modes[0].mode as QueueMode, followUpMode: modes[1].mode as QueueMode,
+      transformContext: async messages => {
+        const result = await handlers.get("context")?.({ messages }, {});
+        const consumed = result?.messages ?? messages;
+        contexts.push(consumed);
+        return consumed;
+      },
+    });
+    const send = vi.fn((text: string, options: { deliverAs: "steer" | "followUp" }) => {
+      const message: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+      if (options.deliverAs === "steer") receiver.steer(message);
+      else receiver.followUp(message);
+    });
+    process.env.PI_FABRIC_DELIVERY_DIR = directory;
+    try {
+      principalDelivery({
+        registerCommand: (_name: string, command: any) => handlers.set("command", command.handler),
+        on: (name: string, handler: any) => handlers.set(name, handler), sendUserMessage: send,
+      } as unknown as ExtensionAPI);
+    } finally {
+      if (previous === undefined) delete process.env.PI_FABRIC_DELIVERY_DIR;
+      else process.env.PI_FABRIC_DELIVERY_DIR = previous;
+    }
+    receiver.subscribe(async event => {
+      if (event.type === "turn_end") await handlers.get("turn_end")?.(event, { isIdle: () => false, signal: receiver.signal });
+    });
+    const processing = receiver.prompt("initial request");
+    try {
+      await vi.waitFor(() => expect(faux.state.callCount).toBe(1));
+      const receipts = [];
+      for (const marker of ["FOLLOW_FIRST", "FOLLOW_SECOND", "FOLLOW_CANCELLED"]) {
+        const receipt = await r.routeMessage(f.id, marker, undefined, "followUp");
+        receipts.push(receipt);
+        const entry = f.entries().at(-1)!;
+        expect(entry).toMatchObject({ followUpId: receipt.messageId, deadlineAt: receipt.deadlineAt });
+        fs.writeFileSync(path.join(directory, receipt.messageId + ".json"), JSON.stringify({
+          message: entry.message, delivery: "followUp", followUpId: entry.followUpId, provenance: entry.provenance,
+        }));
+        await handlers.get("command")!(receipt.messageId, { isIdle: () => false });
+      }
+      expect(send).not.toHaveBeenCalled();
+      expect(f.manager.status(f.id).followUpDeliveries?.map(d => d.state)).toEqual(["queued", "queued", "queued"]);
+      expect(f.manager.cancelFollowUp(f.id, receipts[2]!.messageId).state).toBe("cancelled");
+      release(); await processing;
+      const markers = (messages: AgentMessage[]) => messages.flatMap(m => m.role === "user" && Array.isArray(m.content)
+        ? m.content.flatMap(c => c.type === "text" && c.text.startsWith("FOLLOW_") ? [c.text] : []) : []);
+      expect(markers(contexts[1]!)).toEqual(firstBatch);
+      expect(markers(contexts.at(-1)!)).toEqual(["FOLLOW_FIRST", "FOLLOW_SECOND"]);
+      expect(send.mock.calls.map(call => call[1].deliverAs)).toEqual(["followUp", "followUp"]);
+      expect(f.manager.status(f.id).followUpDeliveries?.map(d => d.state)).toEqual(["delivered", "delivered", "cancelled"]);
+      expect(receipts.every(receipt => Number.isSafeInteger(receipt.deadlineAt))).toBe(true);
+    } finally {
+      release(); receiver.abort(); await processing;
+    }
+  });
   it("A2 ordinary remote owner ACK and replay retain the warning without re-enqueue", async () => {
     const f = await running();
     const meshRoot = path.join(f.root, "mesh");

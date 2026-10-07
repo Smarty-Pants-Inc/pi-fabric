@@ -1,8 +1,9 @@
 // smarty-dev#2014: idle Mains re-parse and re-scan the shared mesh state far more than its
 // changes require. These tests pin the observable contract of two minimal read-path savings:
-//  1. confirmWritable discards the snapshot: unchanged metadata is not proof of unchanged
-//     ownership when a legacy writer copies the canonical UUID (#164 Security S1).
-//  2. non-fresh prefix selections are reused within one parsed snapshot instead of rescanning every entry,
+//  1. confirmWritable revalidates physical identity without discarding unchanged bytes.
+//     Legacy copied-marker changes still invalidate via nanosecond identity; adapters without
+//     that identity retain the conservative fresh-read fallback (#164 Security S1).
+//  2. prefix selections are reused within one parsed snapshot instead of rescanning every entry,
 //     with the same invalidation and copy semantics as today.
 import fs from "node:fs";
 import path from "node:path";
@@ -63,7 +64,7 @@ const seed = async (store: MeshStore, count = 40): Promise<void> => {
 };
 
 describe("MeshStore.confirmWritable revalidates canonical state", () => {
-  it("re-reads even an unchanged file after confirmation, then reuses the new snapshot", async () => {
+  it("revalidates an unchanged file after confirmation and preserves its snapshot", async () => {
     const root = newRoot();
     const writer = storeAt(root);
     const reader = storeAt(root, { readCacheMs: LONG_CACHE_MS });
@@ -74,13 +75,14 @@ describe("MeshStore.confirmWritable revalidates canonical state", () => {
     const reads = spyStateReads();
     expect(reader.get("a/1")?.value).toBe(1);
     expect(reader.listAll("a/").map((entry) => entry.key)).toEqual(["a/1"]);
-    // #164 Security S1: our earlier zero-read spec was a regression, not baseline semantics.
-    // A copied UUID plus repeated stat must not preserve a cached owner after confirmation.
-    expect(reads()).toBe(1);
+    // Confirmation bypasses age, not the physical-generation gate. Unchanged nanosecond
+    // metadata keeps the same canonical payload; copied-marker mutation probes below still
+    // require a new snapshot, including adapters unable to supply high-resolution identity.
+    expect(reads()).toBe(0);
     const revalidated = reader.stateToken();
-    expect(revalidated).not.toBe(token);
+    expect(revalidated).toBe(token);
     expect(reader.stateToken()).toBe(revalidated);
-    expect(reads()).toBe(1);
+    expect(reads()).toBe(0);
   });
 
   it("sees another store's write made after confirmation at once, despite a long readCacheMs", async () => {
@@ -136,12 +138,13 @@ describe("MeshStore prefix selections within one stateToken", () => {
     }
     expect(reader.stateToken()).toBe(token);
     expect(scans.count()).toBe(0);
-    // #164 Security S1: explicit freshness reparses canonical bytes even for a static store;
-    // its new parsed snapshot needs a new selection scan, not reuse of a stale-owner memo.
+    // Explicit freshness revalidates the physical generation. With unchanged bytes the
+    // snapshot and its selection memo remain valid; changed-owner probes below pin invalidation.
     for (let index = 0; index < 2; index++) {
       scans.reset();
       expect(reader.listAll("p/", { fresh: true })).toHaveLength(40);
-      expect(scans.count()).toBeGreaterThan(0);
+      expect(scans.count()).toBe(0);
+      expect(reader.stateToken({ fresh: true })).toBe(token);
       scans.reset();
       expect(reader.listAll("p/")).toHaveLength(40);
       expect(scans.count()).toBe(0);

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
@@ -11,6 +12,8 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { launchLog, same, stopAllOwned } from "./helpers/owned-processes.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, residentResultPath, type ResidentDeliveryRecord, type ResidentHostConfig } from "../src/residency/protocol.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const wait = async (check: () => boolean, timeoutMs = 10_000) => {
@@ -112,7 +115,8 @@ describe("resident producer durable outbox", () => {
       // not relative to our 25 ms polling loop's observation of it.
       await wait(() => ensure.mock.calls.length > 0, 10_000);
       await sleep(250);
-      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json")),
+        ["owner.json", "error.json", "launcher.log", "child-stderr.log"].map(file => { try { return `${file}: ${fs.readFileSync(path.join(f.config.residencyRoot, file), "utf8")}`; } catch { return `${file}: absent`; } }).join("\n")).toBe(false);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       for (const root of [f.config.actorRoot, f.config.sessionActorRoot!]) {
         const registry = path.join(root, "actors.json");
@@ -156,6 +160,8 @@ describe("resident producer durable outbox", () => {
   });
 
   it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
+    // Explicit same-process fixture adapter, never the real subprocess watchdog above.
+    installInProcessResidentFence();
     const f = setup();
     const participants = mainParticipants(f);
     const client = new ResidencyClient({
@@ -209,6 +215,7 @@ describe("resident producer durable outbox", () => {
   });
 
   it.each([false, true])("replays commit-before-unlink without duplicating an envelope (consumed=%s)", async consumed => {
+    installInProcessResidentFence();
     const f = setup();
     const controller = new AbortController();
     const record: ResidentDeliveryRecord = { format: RESIDENT_HOST_FORMAT, id: "stable-id", rootId: f.config.rootId,

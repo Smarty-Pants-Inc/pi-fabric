@@ -33,6 +33,7 @@ import type {
   FabricPeerInfo,
 } from "./topology/types.js";
 import { resolveFabricIdentity } from "./fabric-provenance.js";
+import { ParticipantRoleGrant } from "./topology/project-identity.js";
 import type {
   FabricAgentMessageDelivery,
   FabricAgentMessageResult,
@@ -50,6 +51,7 @@ import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
+import { probeAgentPlacement } from "./agents/placement-config.js";
 
 export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
@@ -70,7 +72,9 @@ export class FabricState {
   #config: FabricConfig | undefined;
   #provisionalConfig: FabricConfig | undefined;
   #kernelReloadRequired = false;
+  #placementProbeLine: string | undefined;
 
+  readonly #roleGrant = new ParticipantRoleGrant();
   #cwd: string | undefined;
   #generation = 0;
   #everActivated = false;
@@ -80,6 +84,8 @@ export class FabricState {
   #shutDown = false;
   #activationHook: ActivationHook | undefined;
   #activationFailureHook: ActivationFailureHook | undefined;
+  // Synchronous: presentation timers must stop before the runtime becomes unavailable.
+  #deactivationHook: (() => void) | undefined;
   readonly #externalProviders = new Map<string, FabricProvider>();
   readonly #externalComponents = new Map<string, FabricComponentDefinition>();
   readonly #options: FabricStateOptions;
@@ -177,15 +183,18 @@ export class FabricState {
   get repairs(): FabricRuntimeState["repairs"] { return this.#required().repairs; }
   get components(): FabricRuntimeState["components"] { return this.#required().components; }
 
-  setActivationHook(hook: ActivationHook, onFailure?: ActivationFailureHook): void {
+  setActivationHook(hook: ActivationHook, onFailure?: ActivationFailureHook, onDeactivate?: () => void): void {
     this.#activationHook = hook;
     this.#activationFailureHook = onFailure;
+    this.#deactivationHook = onDeactivate;
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
+    // Bind at session_start, not first tool use: an idle /new must not consume the launch grant.
+    if (!this.#managedHost) this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd, process.env, true);
     // A failed config load must not leak the previous session's configuration
     // into this one: clear before the read so bootstrapped stays false and
     // presentation falls back to the safe default until a load succeeds.
@@ -196,6 +205,7 @@ export class FabricState {
       projectTrusted: context.isProjectTrusted(),
     });
     this.#config = config;
+    this.#probePlacement(config, context.cwd, true);
     this.#kernelReloadRequired = false;
     this.prewalk.cancel();
     this.prewalkDrift.clear();
@@ -223,6 +233,7 @@ export class FabricState {
       this.#kernelReloadRequired = next.executor.kernel !== this.#config.executor.kernel;
       next.executor.kernel = this.#config.executor.kernel;
       this.#config = next;
+      this.#probePlacement(next, context.cwd);
     }
     await this.#activate(context, true);
   }
@@ -279,7 +290,7 @@ export class FabricState {
   }
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
-  peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
+  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] { return this.#current()?.peerInfos(options) ?? []; }
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle);
   }
@@ -304,6 +315,9 @@ export class FabricState {
   }
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
+  }
+  reportMainProviderError(message: string): Promise<unknown> {
+    return this.#required().reportMainProviderError(message);
   }
   stopParticipant(targetId: string): Promise<unknown> { return this.#required().stopParticipant(targetId); }
   claimHandoff(execution: FabricExecutionResult, sessionId: string, resultFormat: FabricResultFormat, outerToolCallId: string): Promise<PendingFabricHandoff | undefined> {
@@ -383,6 +397,7 @@ export class FabricState {
       }
     }
     this.#config = next;
+    this.#probePlacement(next, context.cwd);
     this.#runtime?.reloadConfig(context, next);
   }
 
@@ -435,12 +450,24 @@ export class FabricState {
     );
   }
 
+  #probePlacement(config: FabricConfig, cwd: string, startup = false): void {
+    const placement = config.agents.placement;
+    if (!placement) { this.#placementProbeLine = undefined; return; }
+    const probe = probeAgentPlacement(placement, cwd);
+    const line = probe.reason
+      ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
+      : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
+    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    this.#placementProbeLine = line;
+  }
+
   #assertOpen(): void {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(reason?: string): Promise<void> {
+  async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
+    this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
     if (activation) await activation.catch(() => undefined);
@@ -449,7 +476,9 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown(reason);
+      // Preserve the existing one-argument shutdown contract unless a native rotation supplies a target.
+      if (targetSessionFile === undefined) await runtime?.shutdown(reason);
+      else await runtime?.shutdown(reason, targetSessionFile);
       await this.#managedHost?.close();
     } finally {
       if (generation === this.#generation) {
@@ -479,6 +508,9 @@ export class FabricState {
     const existing = this.#runtime;
     const reusable = existing?.initialized ? existing : undefined;
     const orphan = existing && !existing.initialized ? existing : undefined;
+    // Reinitialization/session switches reuse this facade. Stop the old UI before
+    // initialize() awaits teardown and state getters start rejecting (smarty-dev#4383).
+    if (existing) this.#deactivationHook?.();
     this.#runtime = undefined;
     let candidate: FabricRuntimeState | undefined;
     const assertCurrent = (): void => {
@@ -556,6 +588,7 @@ export class FabricState {
       this.capturedTools,
       {
         ...(this.#managedHost ? {managedHost: this.#managedHost} : {}),
+        roleGrant: this.#roleGrant,
         activity: this.activity,
         prewalk: this.prewalk,
         prewalkDrift: this.prewalkDrift,

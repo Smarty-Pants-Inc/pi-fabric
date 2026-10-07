@@ -20,6 +20,13 @@ const ctx = {cwd: "/work", signal: undefined, parentToolCallId: "test", nestedTo
 const invocation = () => ({...ctx, approve: async () => undefined, audits: [], maxResultChars: 10000});
 
 describe("explicit managed host", () => {
+  it("does not consult native session identity while bootstrapping a managed host", async () => {
+    const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog(), { managedHost: { providers: [] } });
+    const forbidden = () => { throw new Error("Ambient native session access"); };
+    const context = { cwd: "/hosted", sessionManager: new Proxy({}, { get: forbidden }), ui: { setStatus: vi.fn() } } as unknown as ExtensionContext;
+    try { await state.bootstrap(context); expect(state.bootstrapped).toBe(true); }
+    finally { await state.shutdown(); }
+  });
   it("preserves default reserved-name rejection, even with overwrite", () => {
     const state = new FabricState({} as ExtensionAPI, new CapturedToolCatalog());
     for (const name of ["agents", "memory", "compact", "schema", "state", "mesh", "mcp"]) expect(() => state.registerExternal(provider(name), {overwrite: true})).toThrow(/Reserved/);

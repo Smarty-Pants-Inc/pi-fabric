@@ -349,6 +349,18 @@ export interface ResidentHostConfig {
   agents: FabricAgentConfig;
   mesh: FabricMeshConfig;
   retention: FabricRetentionConfig;
+  /** Launcher-owned recovery for a live child whose file lease stopped renewing. Unsupported (always disabled) on win32. */
+  watchdog?: {
+    enabled?: boolean;
+    /** Lease age that identifies a wedge. Default 180000 ms. */
+    stallMs?: number;
+    /** Do not inspect for a wedge until the first lease write plus this allowance. Default 900000 ms. */
+    coldStartMs?: number;
+    /** Sampling interval. Default 30000 ms. */
+    intervalMs?: number;
+    /** Reserved restart ceiling (default/hard cap 3). Automatic respawn is currently fail-closed without whole-attempt containment. */
+    maxRestartsPerHour?: number;
+  };
   /** Absent in a config an older release wrote: the defaults apply. */
   actors?: FabricActorsConfig;
   /** Host-only shadow gates; old snapshots refuse optional inference. */
@@ -369,8 +381,12 @@ export interface ResidentHostOwner {
   /** Linux /proc start ticks; absent for older hosts and on other platforms. */
   processStartTime?: string | undefined;
   token: string;
+  /** Binds ready custody transfer to the exact client-owned launch attempt. */
+  launchToken?: string;
   startedAt: number;
   readyAt: number;
+  /** With v1, usable readiness additionally requires a same-token post-lease maintenance receipt. */
+  maintenanceReady?: 1;
   /** The immutable entry path this owner actually loaded, not the mutable config selector. */
   fabricExtensionPath?: string;
   /** Commands supported by this running binary; absent on pre-negotiation hosts. */
@@ -513,9 +529,9 @@ export type ResidentActorMutation =
   | { operation: "resetSession"; id: string }
   | { operation: "stop"; id: string }
   | { operation: "setTools"; id: string; tools: string[] }
-  | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
+  | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
-  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;
@@ -534,6 +550,18 @@ interface ResidentActorStatusCommand {
   createdAt: number;
 }
 
+export interface ResidentOperatorActorCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "operatorActor";
+  action: "stop" | "remove";
+  id: string;
+  dryRun?: boolean;
+  confirmDeadRoot?: string;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+}
+
 type LegacyResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
@@ -542,6 +570,7 @@ type LegacyResidentCommand =
   | ResidentCreateActorCommand
   | ResidentActorMutationCommand
   | ResidentActorStatusCommand
+  | ResidentOperatorActorCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
       requestId: string; rootId: string; createdAt: number });
 
@@ -558,7 +587,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "operatorActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -614,6 +643,7 @@ export interface ResidentCommandResponse {
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
+  operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;

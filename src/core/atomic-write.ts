@@ -1,3 +1,4 @@
+import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -36,8 +37,9 @@ export const createProcessIncarnationReader = (options: {
 }) => {
   const { platform, systemRoot, run = runIncarnationCommand, timeoutMs = 2_000 } = options;
   let own: Promise<string | undefined> | undefined;
-  const read = async (pid: number): Promise<string | undefined> => {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const read = async (pid: number, remainingMs = timeoutMs): Promise<string | undefined> => {
+    const budgetMs = Math.max(0, Math.min(timeoutMs, remainingMs));
+    if (!Number.isSafeInteger(pid) || pid <= 0 || budgetMs <= 0) return undefined;
     try {
       if (platform === "linux") {
         const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -59,11 +61,11 @@ export const createProcessIncarnationReader = (options: {
       // Independent deadline also bounds injected/broken runners. Abort kills the native
       // child; late output never becomes evidence. No synchronous spawn on this path.
       const timeout = new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => { abort.abort(); resolve(undefined); }, timeoutMs);
+        timer = setTimeout(() => { abort.abort(); resolve(undefined); }, budgetMs);
       });
       try {
         const start = await Promise.race([run(executable, args, {
-          timeout: timeoutMs, maxBuffer: 4_096, windowsHide: true, signal: abort.signal,
+          timeout: budgetMs, maxBuffer: 4_096, windowsHide: true, signal: abort.signal,
           ...(platform === "darwin" ? { env: { ...process.env, LC_ALL: "C", TZ: "UTC" } } : {}),
         }), timeout]);
         if (start === undefined) return undefined;
@@ -91,8 +93,9 @@ const nativeReader = () => {
   return reader;
 };
 
-/** Fresh holder evidence; macOS second-resolution reuse stays conservative. */
-export const processIncarnation = (pid: number): Promise<string | undefined> => nativeReader().read(pid);
+/** Fresh holder evidence, optionally bounded by remaining acquisition time.
+ * macOS second-resolution reuse stays conservative; timeout aborts the native child. */
+export const processIncarnation = (pid: number, timeoutMs?: number): Promise<string | undefined> => nativeReader().read(pid, timeoutMs);
 /** Memoized lazily, not at import/registration/session start. */
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
 
@@ -180,8 +183,7 @@ const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev
  * A second walk detects replacements, including links retargeted to the SAME inode.
  * Windows skips unsupported directory fsync, but still binds the opened receipt.
  */
-export const syncPathNamespace = (target: string, receipt?: Inode): void => {
-  const walk = () => {
+const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const absolute = path.isAbsolute(target) ? target : `${process.cwd()}${path.sep}${target}`;
     const split = (value: string) => value.split(path.sep === "\\" ? /[\\/]+/ : /\/+/);
     let current = path.parse(absolute).root;
@@ -236,8 +238,10 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
     if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
     return { entries, directories, parents };
-  };
-  const before = walk();
+};
+
+export const syncPathNamespace = (target: string, receipt?: Inode): void => {
+  const before = namespaceSnapshot(target, receipt);
   if (process.platform !== "win32") {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
@@ -256,11 +260,30 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(walk().entries) !== JSON.stringify(before.entries)) {
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
 
+/** Same namespace fence as the synchronous writer, with barriers off the event loop.
+ * Always confirm all parent entries: an unchanged ancestor inode does not prove
+ * that a newly created or replaced child directory is durably linked. */
+export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
+  const before = namespaceSnapshot(target, receipt);
+  if (process.platform !== "win32") {
+    for (const [directory, expected] of [...before.directories].reverse()) {
+      const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
+      try {
+        const opened = await handle.stat();
+        if (!opened.isDirectory() || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
+        await handle.sync();
+      } finally { await handle.close(); }
+    }
+  }
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+    throw new Error("Namespace changed during durability barriers");
+  }
+};
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);
@@ -318,6 +341,170 @@ export const writeFileAtomic = (
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     fs.rmSync(temporary, { force: true });
+  }
+};
+
+/** A single-owner writer (or used under its protocol lock). Equal bytes may skip
+ * only a soft-state replacement; durable writes always establish fresh barriers.
+ */
+export class AtomicFileWriter {
+  constructor(readonly file: string) {}
+
+  #stamp(): string {
+    const stat = fs.statSync(this.file);
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  }
+
+  write(contents: string, options?: AtomicWriteOptions): boolean {
+    let unchanged = false;
+    try {
+      const before = this.#stamp();
+      const current = readFileRetrying(this.file);
+      const after = this.#stamp();
+      unchanged = before === after && current === contents;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    // The retained equal-bytes cache is a soft-state optimization only. Durable
+    // writes are receipts: always replace, fsync, and re-confirm the namespace.
+    if (unchanged && !options?.durable) return false;
+    writeFileAtomic(this.file, contents, options);
+    return true;
+  }
+}
+
+export interface ExclusiveLockOptions {
+  directory: string;
+  lockName: string;
+  /** Error message when acquisition times out. */
+  timeoutMessage: string;
+  staleMs?: number;
+  attempts?: number;
+  delayMs?: number;
+}
+
+/** Synchronous claim locks use no process probe until actual acquisition. */
+const exclusiveLockProcessAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+
+// Stale-lock recovery must be an exclusive claim. Stat-then-delete is
+// TOCTOU: two reapers (or a reaper and a fresh writer that recreated the
+// lock in between) can both pass their checks, and the slower rm then
+// deletes a lock the faster one already replaced. rename() is the claim —
+// only one process can move the directory, and removal targets the claimed
+// path, never the live lock path. A claim that turns out to hold a live
+// lock is renamed back before any destructive step; a live lock is never
+// deleted, even if the rename-back races a fresh writer.
+const reapStaleLock = (lock: string, verify: (claimed: string) => boolean): boolean => {
+  const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
+  try {
+    fs.renameSync(lock, claim);
+  } catch {
+    return false;
+  }
+  if (!verify(claim)) {
+    try {
+      fs.renameSync(claim, lock);
+    } catch {
+      // `lock` was recreated after the claim. Re-verify before any
+      // destructive step so a claimed live lock is only ever abandoned as
+      // garbage, never deleted.
+      if (verify(claim)) fs.rmSync(claim, { recursive: true, force: true });
+    }
+    return false;
+  }
+  fs.rmSync(claim, { recursive: true, force: true });
+  return true;
+};
+
+export const withExclusiveFileLock = <T>(
+  options: ExclusiveLockOptions,
+  operation: () => T,
+): T => {
+  const attempts = options.attempts ?? 50;
+  const delayMs = options.delayMs ?? 5;
+  const staleMs = options.staleMs ?? 30_000;
+  fs.mkdirSync(options.directory, { recursive: true, mode: 0o700 });
+  const lock = path.join(options.directory, options.lockName);
+  const ownerPath = path.join(lock, "owner");
+  const token = randomUUID();
+  let acquired = false;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      try {
+        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
+      } catch (error) {
+        fs.rmSync(lock, { recursive: true, force: true });
+        throw error;
+      }
+      acquired = true;
+      break;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+      try {
+        const firstOwner = fs.readFileSync(ownerPath, "utf8");
+        const [, pidText, createdText] = firstOwner.trim().split("\n");
+        const stale = Date.now() - Number(createdText) > staleMs;
+        if (stale && !exclusiveLockProcessAlive(Number(pidText))) {
+          const secondOwner = fs.readFileSync(ownerPath, "utf8");
+          if (
+            secondOwner === firstOwner &&
+            reapStaleLock(lock, (claimed) => {
+              try {
+                const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
+                const [, pid, created] = owner.trim().split("\n");
+                return Date.now() - Number(created) > staleMs && !exclusiveLockProcessAlive(Number(pid));
+              } catch {
+                return false;
+              }
+            })
+          ) {
+            continue;
+          }
+        }
+      } catch {
+        try {
+          // Ownerless lock (crash between mkdir and the owner write): age is
+          // the only signal, and the claim re-verifies it after the rename.
+          const first = fs.statSync(lock);
+          if (
+            Date.now() - first.mtimeMs > staleMs &&
+            reapStaleLock(lock, (claimed) => {
+              try {
+                return Date.now() - fs.statSync(claimed).mtimeMs > staleMs;
+              } catch {
+                return false;
+              }
+            })
+          ) {
+            continue;
+          }
+        } catch {
+          // Lock creation or stale recovery raced; retry the bounded acquisition.
+        }
+      }
+      if (attempt === attempts - 1) break;
+      syncSleep(delayMs);
+    }
+  }
+  if (!acquired) throw new Error(options.timeoutMessage);
+  try {
+    return operation();
+  } finally {
+    try {
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      if (owner.startsWith(`${token}\n`)) {
+        fs.rmSync(lock, { recursive: true, force: true });
+      }
+    } catch {
+      // A recovering process already removed this lock.
+    }
   }
 };
 
@@ -436,11 +623,14 @@ export class MeshBackgroundRetry {
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
-    this.#retryAt = Date.now() + this.#delay;
+    // Keep the exponential ceiling separate from the randomized draw. Timers
+    // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
+    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
+    this.#retryAt = Date.now() + delayMs;
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${this.#delay} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
     return transient;

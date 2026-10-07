@@ -188,12 +188,15 @@ describe("ActorDirectory", () => {
     const alpha = open(root, "alpha");
     const supervisor = await alpha.directory.create({ scope: "session", name: "session supervisor", instructions: "HANG" });
     expect(alpha.directory.inFlightCount()).toBe(0);
-    alpha.directory.tell(supervisor.id, "check the Main");
+    // The fake worker reads task payloads, not the actor's system instructions.
+    // Keep both runs alive until teardown rather than sampling a brief running state.
+    alpha.directory.tell(supervisor.id, "HANG: check the Main");
     await vi.waitFor(() => expect(alpha.directory.status(supervisor.id).status).toBe("running"), { timeout: 5_000 });
     expect(alpha.directory.inFlightCount()).toBe(1);
     const project = await alpha.directory.create({ scope: "project", name: "project guardian", instructions: "HANG" });
-    alpha.directory.tell(project.id, "check the release");
+    alpha.directory.tell(project.id, "HANG: check the release");
     await vi.waitFor(() => expect(alpha.directory.status(project.id).status).toBe("running"), { timeout: 5_000 });
+    expect(alpha.directory.status(supervisor.id).status).toBe("running");
     expect(alpha.directory.inFlightCount()).toBe(2);
   });
 

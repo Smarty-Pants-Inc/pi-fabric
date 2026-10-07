@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
@@ -107,6 +108,8 @@ import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
+import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
+import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
@@ -420,6 +423,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // The user's Escape stop-the-world, held for the self-reload gate independently of the actor
   // and Jev halts and of any settle outcome; only a non-extension input lifts it (pi-fabric#160).
   let escapeLatched = false;
+  registerMainProviderRecovery(pi, {
+    halted: () => escapeLatched || state.escapeHalted,
+    report: async (message, context) => {
+      await state.ensure(context);
+      await state.reportMainProviderError(message);
+    },
+  });
   pi.on("input", (event) => {
     if ((event as { source?: string }).source !== "extension") escapeLatched = false;
   });
@@ -459,7 +469,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     fabricUi.start(context);
     installHaltOnEscape(context);
     installShellHangKeys(context);
-  }, cleanupActivationSideEffects);
+  }, cleanupActivationSideEffects, cleanupActivationSideEffects);
 
   // Continual entropy reduction runs off the interaction path. Session-tree
   // discovery and JSONL ingestion use async I/O, scoring yields in fixed trace
@@ -563,7 +573,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const task = (async () => {
       try {
         if (request.delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, request.delayMs));
+          await new Promise<void>((resolve) => {
+            const finish = (): void => {
+              clearTimeout(timer);
+              request.signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, request.delayMs);
+            timer.unref();
+            request.signal.addEventListener("abort", finish, { once: true });
+            if (request.signal.aborted) finish();
+          });
         }
         await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
@@ -680,6 +700,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
+    principalView.start(context);
     // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
     state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? () => wakeIdleMain() : undefined);
     if (hostQueuesTriggeredBehindPreflight(pi)) {
@@ -725,6 +746,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       releaseSlot?.();
     }
   });
+
+  // Keep activation/reload startup first; the renderer's session_start hook
+  // only snapshots display history and must not replace that entry point.
+  registerIncomingMessageRenderers(pi, () => principalViewIncomingMode(state.provisionalConfig().ui.principalView));
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
   // must track it exactly. Rewind removes abandoned-branch residue.
@@ -1237,7 +1262,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     directToolApproval.clear();
     toolDisplay.clear();
     try {
-      await state.shutdown(reason);
+      await state.shutdown(reason, event?.targetSessionFile);
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();
@@ -1265,7 +1290,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     suspendToolCapture,
     refreshCodePreviewSettings,
     refreshToolDisplay: () => toolDisplay.refresh(),
+    refreshPrincipalView: context => principalView.apply(context),
   });
+  const principalView = registerPrincipalView(pi, state);
 
   // Registered after Fabric's own agent_settled handler, so the inbox follow-up goes first.
   const selfReload = installSelfReload(pi, {

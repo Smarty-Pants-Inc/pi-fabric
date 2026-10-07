@@ -125,11 +125,11 @@ describe("PiRecoveryWatchdog", () => {
       } };
       guard.observe(delta);
       watchdog.observe(delta);
-      if (bound === "time") vi.advanceTimersByTime(60_000);
+      if (bound === "time") vi.advanceTimersByTime(90_000);
       expect(fail).not.toHaveBeenCalled();
       expect(runaway).toHaveBeenCalledTimes(1);
       expect(runaway.mock.calls[0]![0]).toMatchObject(bound === "time"
-        ? { elapsedMs: 60_000, bytes: 3 } : { elapsedMs: 0, bytes: 65_536 });
+        ? { elapsedMs: 90_000, bytes: 3 } : { elapsedMs: 0, bytes: 65_536 });
       watchdog.dispose();
       expect(vi.getTimerCount()).toBe(0);
     }
@@ -156,8 +156,12 @@ describe("PiRecoveryWatchdog", () => {
     expect(runaway).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledTimes(1);
+    expect(runaway).not.toHaveBeenCalled();
+    // A failed recovery stays bounded at 60s; the independent argument
+    // whitespace deadline remains 90s and cannot be refreshed by deltas.
+    vi.advanceTimersByTime(30_000);
     expect(runaway).toHaveBeenCalledTimes(1);
-    expect(runaway.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 36 });
+    expect(runaway.mock.calls[0]![0]).toMatchObject({ elapsedMs: 90_000, bytes: 36 });
     expect(vi.getTimerCount()).toBe(0);
   });
 

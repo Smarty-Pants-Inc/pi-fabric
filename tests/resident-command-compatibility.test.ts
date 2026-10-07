@@ -1,5 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +20,8 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 // CI can supply a pinned prior release; local rollout probes use installed B70.
 const legacyRelease = process.env.PI_FABRIC_LEGACY_RELEASE ?? path.join(os.homedir(), ".local/share/smarty-dev/fabric/releases/b243bc926beec5da8717135893dd6b578af73f7b");
 const legacyHost = path.join(legacyRelease, "dist/residency/host.js");
+beforeEach(() => installInProcessResidentFence());
+
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-mixed-release-"));
@@ -161,6 +165,36 @@ describe("rollback-safe resident actor command envelopes", () => {
 });
 
 describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/residency/host.js")))("real B70 rollback recovery of unclaimed current-release commands", () => {
+  it("restores an untouched current actor before previous-release read/write without losing settings", async () => {
+    const { root, config, configPath } = fixture();
+    let legacy: ChildProcess | undefined;
+    let output = "";
+    const current = fork(path.resolve("tests/fixtures/untouched-rollback-host.mjs"), [path.resolve("dist/residency/host.js"), configPath], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+    current.stdout?.on("data", data => { output += String(data); });
+    current.stderr?.on("data", data => { output += String(data); });
+    try {
+      const exited = await Promise.race([once(current, "exit"), delay(15_000).then(() => { throw new Error("Current reload timed out: " + output); })]);
+      expect(exited, output).toEqual([0, null]);
+      const registryPath = path.join(config.actorRoot, "actors.json");
+      const before = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+      expect(before.actors).toHaveLength(1);
+      expect(before.actors[0]).not.toHaveProperty("filterSkipped");
+      expect(before.actors[0]).not.toHaveProperty("activationFilterExpiresAt");
+      legacy = fork(path.resolve("tests/fixtures/legacy-resident-host.mjs"), [legacyHost, configPath, "recover"], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+      legacy.stdout?.on("data", data => { output += String(data); });
+      legacy.stderr?.on("data", data => { output += String(data); });
+      const [recovered] = await Promise.race([once(legacy, "message"), delay(15_000).then(() => { throw new Error("Legacy reload timed out: " + output); })]);
+      expect(recovered.actor).toMatchObject({ id: before.actors[0].id, name: "untouched-rollback" });
+      await stop(legacy, () => output);
+      const after = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      expect(after.actors.map(settings)).toEqual(before.actors.map(settings));
+    } finally {
+      if (current.exitCode === null && current.signalCode === null) { current.kill("SIGKILL"); await once(current, "exit"); }
+      if (legacy) await stop(legacy, () => output);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 40_000);
   it.each([...operations, "actors", "setActivationFilter"] as const)("rejects persisted %s after SIGKILL without removing identity, registry or queued mailbox", async operation => {
     const { root, config, configPath } = fixture();
     const launches = launchLog(root);

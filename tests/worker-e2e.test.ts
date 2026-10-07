@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { directiveSchema } from "../src/actors/manager.js";
@@ -24,6 +24,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
 
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((m) => m.close()));
+    vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -39,6 +40,32 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     managers.push(manager);
     return manager.run({ task, transport: "process" });
   };
+
+  it("persists the spawn-selected compatible installed release in the real worker record", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-installed-e2e-"));
+    roots.push(root);
+    const installed = path.join(root, "installed");
+    fs.mkdirSync(installed);
+    fs.cpSync(path.resolve("dist"), path.join(installed, "dist"), { recursive: true });
+    fs.writeFileSync(path.join(installed, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module" }));
+    fs.symlinkSync(path.resolve("node_modules"), path.join(installed, "node_modules"), "junction");
+    const profile = path.join(root, "profile");
+    fs.mkdirSync(profile);
+    fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [installed] }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", profile);
+    vi.stubEnv("FAKE_PI_BEHAVIOR", "success");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000 }, {
+      workerPath, piBinary, fullCodeMode: true, runRoot: path.join(root, "runs"),
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "installed worker evidence", transport: "process" });
+    expect(handle.fabricRelease).toBe(installed);
+    const result = await manager.wait(handle.id);
+    expect(result.status, result.error).toBe("completed");
+    expect(result.fabricRelease).toBe(installed);
+    const record = JSON.parse(fs.readFileSync(path.join(root, "runs", handle.id, "status.json"), "utf8"));
+    expect(record.fabricRelease).toBe(installed); // On disk, not manager-only enrichment.
+  }, 15_000);
 
   it.each(["reject", "error-only-turn", "success", "terminated-recover"])("records actual inference consumption, not startup/error-only turns (%s)", async (behavior) => {
     const previous = process.env.FAKE_PI_BEHAVIOR;
@@ -726,7 +753,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(events.some((event) => event.type === "abort")).toBe(false);
   });
 
-  it("aborts a hanging run as stopped, not exited-without-a-result", async () => {
+  it.each(["abort", "stop"] as const)("%s ends a hanging run as stopped, not exited-without-a-result", async (method) => {
     process.env.FAKE_PI_BEHAVIOR = "hang";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
@@ -740,34 +767,43 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const ac = new AbortController();
     const handle = await manager.spawn({ task: "hang", transport: "process" }, ac.signal);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    ac.abort();
+    if (method === "abort") ac.abort();
+    else expect((await manager.stop(handle.id)).status).toBe("stopped");
     const result = await manager.wait(handle.id);
-    expect(result.status).toBe("stopped");
+    expect(result.status, JSON.stringify(result)).toBe("stopped");
+    expect(manager.status(handle.id).status).toBe("stopped");
   });
+
+  // These fixtures test crash reporting, not the run deadline. The shared 2s
+  // budget can kill a slow-starting child before its first stream event injects
+  // the crash. Allow cold startup and the worker's 5s execution-cleanup grace;
+  // keep the outer test bound above the run budget and transport teardown.
+  const crashRunTimeoutMs = 30_000;
+  const crashTestTimeoutMs = 45_000;
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "stream";
     try {
-      const result = await run();
+      const result = await run("do it", crashRunTimeoutMs);
       expect(result.status).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated stream crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
     }
-  });
+  }, crashTestTimeoutMs);
 
   it("reports a terminal failure when the worker crashes while finalizing", async () => {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "close";
     try {
-      const result = await run();
+      const result = await run("do it", crashRunTimeoutMs);
       expect(result.status).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated close crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
     }
-  });
+  }, crashTestTimeoutMs);
 
   it("emits attributed tokens.usage events live and lands them in the budget ledger", async () => {
     process.env.FAKE_PI_BEHAVIOR = "usage-flow";

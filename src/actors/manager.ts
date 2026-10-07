@@ -367,6 +367,12 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
+export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
+export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+/** At most one owner alarm per actor per hour while its events dead-letter. */
+const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -402,6 +408,11 @@ export class ActorManager {
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
+  // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the oldest dropped
+  // by the bound, and when each actor last raised its dead-letter owner alarm.
+  readonly #deadLetters = new Map<string, number>();
+  readonly #deadLettersDropped = new Map<string, number>();
+  readonly #deadLetterAlarms = new Map<string, number>();
   // Predecessor queue files taken over, deleted after this lineage's own file is next written.
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
@@ -2480,6 +2491,10 @@ export class ActorManager {
       deferDrain?: boolean;
       /** Routed mesh work: acceptance requires the persisted queue to hold it (#816). */
       requirePersisted?: boolean;
+      /** Durable routed work: past the queue and overflow it waits in the actor's dead-letter file. */
+      deadLetter?: boolean;
+      /** A dead-lettered event returning to the queue; it never goes back to the file. */
+      replaying?: boolean;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2553,6 +2568,14 @@ export class ActorManager {
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
     };
+    if (options.deadLetter && !options.replaying && this.#persistent && (this.#deadLetterCount(actor.id) > 0 ||
+      (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
+      // smarty-dev#816: a sick actor's full queue never holds the shared host cursor. Its further
+      // routed events wait in its own dead-letter file, behind any already there, so order holds.
+      this.#appendDeadLetter(actor, source, payload as MeshEvent);
+      this.#replayDeadLetters(actor);
+      return item;
+    }
     if (actor.queue.length >= this.meshConfig.actorQueueLimit) {
       // A full queue must not hold other actors' delivery (smarty-dev#1065): the item waits in this
       // actor's overflow, and past its cap it is recorded as dropped, never lost silently.
@@ -2733,6 +2756,7 @@ export class ActorManager {
         }
         const item = actor.queue.shift();
         this.#refill(actor);
+        this.#replayDeadLetters(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
@@ -3011,7 +3035,11 @@ export class ActorManager {
             // Transfer ownership before cleanup can yield: persistence must never see
             // this activation both in flight and queued (review/astra round 2, #3167).
             this.#inFlight.delete(actor.id);
-            actor.queue.unshift(item);
+            // Rotate, never unshift: a failing item retries behind newer work, so one bad item
+            // cannot block the rest of this actor's queue (smarty-dev#816 round 3).
+            const overflow = this.#overflow.get(actor.id);
+            if (overflow?.length) overflow.push(item);
+            else actor.queue.push(item);
             this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
             // Retain routed work in the actor's durable queue beyond the ask budget, with
@@ -3540,8 +3568,9 @@ export class ActorManager {
     }
   }
 
-  // Returns false when an owned receiver's queue was full; the monitor then offers the event
-  // again while it catches up, and actors that already took it are skipped.
+  // Returns false only when a receiver could not checkpoint the event (or, on a non-persistent
+  // host, a fleet.* receiver's queue was full); the monitor then offers it again and actors that
+  // already took it are skipped. A durable receiver's full queue dead-letters instead (#816).
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
     // Empty polls only observe owners through the idle cache. The matched targets below
     // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
@@ -3592,18 +3621,7 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
-          const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
-          // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
-          // so a joined key could merge two topics' subjects. Keeps the value's type.
-          this.#enqueue(actor, `mesh:${event.topic}`, event, {
-            ...(event.verification === "mesh" || event.verification === "bridge"
-              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
-            ownershipChecked: true,
-            requirePersisted: true,
-            // Work waits for room; the monitor offers it again (smarty-dev#754).
-            ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
-            ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
-          });
+          this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -3617,6 +3635,137 @@ export class ActorManager {
       }
     }
     return full ? false : handedOn ? true : "ignored";
+  }
+
+  #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
+    const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+    return {
+      ...(event.verification === "mesh" || event.verification === "bridge"
+        ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
+      ownershipChecked: true,
+      requirePersisted: true,
+      // A durable host never holds the shared cursor for one actor's full queue: past it, work
+      // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
+      // which has no such file, keeps fleet.* work in the mesh until there is room (#754).
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+      // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
+      // so a joined key could merge two topics' subjects. Keeps the value's type.
+      ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
+    };
+  }
+
+  #deadLetterFile(actorId: string): string {
+    return path.join(this.#actorRoot, actorId, "dead-letter.jsonl");
+  }
+
+  #readDeadLetters(actorId: string): ActorDeadLetter[] {
+    let text: string;
+    try { text = fs.readFileSync(this.#deadLetterFile(actorId), "utf8"); } catch { return []; }
+    return text.split("\n").flatMap((line) => {
+      if (!line) return [];
+      try {
+        const value = JSON.parse(line) as Partial<ActorDeadLetter>;
+        return typeof value.source === "string" && typeof value.event?.id === "string" ? [value as ActorDeadLetter] : [];
+      } catch { return []; }                                  // a torn final line from a crash
+    });
+  }
+
+  #deadLetterCount(actorId: string): number {
+    let count = this.#deadLetters.get(actorId);
+    if (count === undefined) this.#deadLetters.set(actorId, count = this.#readDeadLetters(actorId).length);
+    return count;
+  }
+
+  #writeDeadLetters(actorId: string, entries: readonly ActorDeadLetter[]): void {
+    const file = this.#deadLetterFile(actorId);
+    if (entries.length === 0) fs.rmSync(file, { force: true });
+    else {
+      const temporary = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(temporary, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), { mode: 0o600 });
+      fs.renameSync(temporary, file);
+    }
+    this.#deadLetters.set(actorId, entries.length);
+  }
+
+  // Append-only and bounded: past the bound the oldest entries drop (to 90%, so a flood rewrites
+  // the file once per tenth), each drop counted on the actor. A write failure is a checkpoint
+  // failure, as for the queue file: the event stays in the mesh.
+  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
+    const file = this.#deadLetterFile(actor.id);
+    let count = this.#deadLetterCount(actor.id);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, `${JSON.stringify({ at: Date.now(), source, event })}\n`, { mode: 0o600 });
+      this.#deadLetters.set(actor.id, ++count);
+      if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
+        const entries = this.#readDeadLetters(actor.id);
+        const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
+        let bytes = entries.reduce((total, entry) => total + size(entry), 0);
+        let dropped = 0;
+        while (entries.length > 0 && (entries.length > ACTOR_DEAD_LETTER_MAX_ENTRIES * 0.9 || bytes > ACTOR_DEAD_LETTER_MAX_BYTES * 0.9)) {
+          bytes -= size(entries.shift()!);
+          dropped++;
+        }
+        this.#writeDeadLetters(actor.id, entries);
+        count = entries.length;
+        const total = (this.#deadLettersDropped.get(actor.id) ?? 0) + dropped;
+        this.#deadLettersDropped.set(actor.id, total);
+        this.#recordMessage(actor, {
+          id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+          createdAt: Date.now(),
+          error: `Dropped the ${dropped} oldest dead-lettered events: the dead-letter file is bounded at ${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries and ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes (${total} dropped since start)`,
+          data: { deadLetterDropped: dropped, deadLetterDroppedTotal: total },
+        });
+      }
+    } catch {
+      throw new ActorQueueCheckpointError(actor);
+    }
+    if (this.#closing) return;
+    const now = Date.now();
+    const last = this.#deadLetterAlarms.get(actor.id);
+    if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
+    this.#deadLetterAlarms.set(actor.id, now);
+    const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
+      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter file ${file}. ` +
+      `They re-queue automatically once its queue drains below half; other actors are not held. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count, file },
+    };
+    this.#recordMessage(actor, notice);
+    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count, file } }).catch(() => undefined);
+    try {
+      this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+    } catch { /* best effort: the notice stays in the actor's messages */ }
+  }
+
+  // Re-queues dead letters, oldest first, once the actor's queue has drained below half and its
+  // overflow is empty. The file is rewritten right after the synchronous enqueue, and an event
+  // still held in memory is skipped, so each dead letter runs once.
+  #replayDeadLetters(actor: ManagedActor): void {
+    if (!this.#persistent || this.#closing || actor.status === "stopped" || actor.removal ||
+      !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
+    const limit = this.meshConfig.actorQueueLimit;
+    if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
+    const entries = this.#readDeadLetters(actor.id);
+    const inFlight = this.#inFlight.get(actor.id);
+    const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actor.id) ?? [])]
+      .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
+    let taken = 0;
+    try {
+      while (taken < entries.length && actor.queue.length < limit) {
+        const entry = entries[taken]!;
+        if (!held.has(entry.event.id)) {
+          this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+        }
+        taken++;
+      }
+    } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
+    if (taken === 0) return;
+    try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+    this.#ensureDrain(actor);
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
@@ -4431,6 +4580,10 @@ export class ActorManager {
     this.#schedulePresenceRetry();
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
+    // Dead letters from before a restart re-queue once this host manages an idle actor (#816).
+    if (firstLoads.length && this.#persistent) queueMicrotask(() => {
+      for (const actor of firstLoads) { const live = this.#actors.get(actor.id); if (live) this.#replayDeadLetters(live); }
+    });
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();
   }

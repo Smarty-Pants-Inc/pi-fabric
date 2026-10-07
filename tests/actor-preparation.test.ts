@@ -8,7 +8,7 @@ import * as predicate from "../src/actors/predicate.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -91,7 +91,10 @@ describe("round-three accepted-work regressions (#3167)", () => {
       const items = JSON.parse(snapshot).items as Array<{ id: string; payload: unknown; preparationAttempts: number; attempts: number }>;
       expect(items.filter((item) => item.id === originalId)).toHaveLength(1);
       expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
-      expect(items.find((item) => item.id === originalId)).toMatchObject({ preparationAttempts: attempt, attempts: 0 });
+      // Each held cleanup persisted one more failed preparation. A failed item rotates behind
+      // newer work (smarty-dev#816 round 3), so the failures spread over the queued items.
+      expect(items.find((item) => item.id === originalId)).toMatchObject({ attempts: 0 });
+      expect(items.reduce((total, item) => total + item.preparationAttempts, 0)).toBe(attempt);
       releases[attempt - 1]!.resolve();
       await waitFor(() => before.inFlightCount() === 0);
     }
@@ -462,7 +465,8 @@ describe("actor preparation (#3167)", () => {
     await waitFor(() => retryEvent(actors, actor.id, "presence") !== undefined && actors.inFlightCount() === 0);
     expect(run).not.toHaveBeenCalled();
     expect(actors.status(actor.id)).toMatchObject({ status: "queued", queued: 2 });
-    expect(readQueue(actor.sessionFile!)[0]).toMatchObject({ attempts: 0, preparationAttempts: 1 });
+    // The failed item rotated behind the newer one (smarty-dev#816 round 3).
+    expect(readQueue(actor.sessionFile!)).toMatchObject([{ attempts: 0, preparationAttempts: 0 }, { attempts: 0, preparationAttempts: 1 }]);
     expect(retryEvent(actors, actor.id, "presence")?.data).toMatchObject({ errorType: "ActorPreparationTimeoutError", attempts: 1 });
     await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
     expect(run).toHaveBeenCalledTimes(2);
@@ -696,12 +700,12 @@ describe("#816 per-actor queue acceptance", () => {
     const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
     const cursorPath = path.join(root, "cursor.json");
     let generation = 0;
-    const host = (preparation: Preparation, maxReadEvents = 2) => {
+    const host = (preparation: Preparation, maxReadEvents = 2, actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) => {
       const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, `runs-${generation++}`),
       });
       const actors = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
-        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, maxReadEvents }, agents, () => {}, {
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, maxReadEvents, actorQueueLimit }, agents, () => {}, {
           actorRoot: path.join(root, "actors"), persistent: true, meshCursorPath: cursorPath,
           preparationTimeoutMs: 80, preparationRetryMs: 20,
           acquireCapabilityView: async () => {
@@ -789,6 +793,71 @@ describe("#816 per-actor queue acceptance", () => {
     expect(replies(after.actors, f.healthy.id)).toBe(5);         // nothing processed is re-run
     expect(after.actors.messages(f.healthy.id, 500).filter(message => message.direction === "in")).toHaveLength(5);
     expect(queued(f.failing.sessionFile!)).toEqual([]);
+  });
+
+  // Round 3 of PR #554: a sick actor's full queue must never hold the shared host cursor.
+  it("(4) past a sick actor's queue cap, its events dead-letter, the cursor advances, and recovery runs each once", async () => {
+    const f = fixture();
+    const seed = f.host({ ok: true, failures: 0 }, 2, 2);
+    // fleet.* work is what a full queue used to hold in the shared cursor (holdWhenFull).
+    const ids = await create(seed.actors, "fleet.work.review", "fleet.work.ok");
+    await seed.close();
+    const failing: MeshEvent[] = [];
+    const healthy: MeshEvent[] = [];
+    for (let index = 0; index < 30; index++) {
+      failing.push(await f.mesh.publish({ topic: "fleet.work.review", from, data: { n: index } }));
+      if (index % 3 === 0) healthy.push(await f.mesh.publish({ topic: "fleet.work.ok", from, data: { n: index } }));
+    }
+    const lastSequence = Math.max(failing.at(-1)!.sequence, healthy.at(-1)!.sequence);
+    const preparation = { ok: false, failures: 0 };
+    const { actors, agents } = f.host(preparation, 2, 2);
+    const tail = vi.spyOn(f.mesh, "tail");
+    const run = vi.spyOn(agents, "run");
+    // Queue limit 2: the queue (2) and overflow (16) hold 18, plus one in preparation.
+    await waitFor(() => replies(actors, ids.healthy.id) === healthy.length && (f.cursor().last?.sequence ?? 0) >= lastSequence, 10_000);
+    expect(tail.mock.results.filter(result => (result.value as { events: unknown[] }).events.length === 2).length).toBeGreaterThanOrEqual(10);
+    const deadLetterFile = path.join(path.dirname(ids.failing.sessionFile!), "dead-letter.jsonl");
+    const deadLetters = () => fs.existsSync(deadLetterFile)
+      ? fs.readFileSync(deadLetterFile, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { event: MeshEvent }).event.id) : [];
+    const dead = deadLetters();
+    expect(dead.length).toBeGreaterThanOrEqual(30 - 19);
+    expect(dead).toEqual(failing.slice(30 - dead.length).map(event => event.id));   // the newest, in order
+    expect(actors.status(ids.failing.id).queued + dead.length).toBeGreaterThanOrEqual(29);
+    expect(preparation.failures).toBeGreaterThanOrEqual(1);
+    // One owner alarm for the actor, not one per event.
+    const alarms = () => actors.messages(ids.failing.id, 500).filter(message =>
+      message.source === "fabric-host" && (message.data as { reason?: string } | undefined)?.reason === "dead_letter");
+    expect(alarms()).toHaveLength(1);
+    expect(run).toHaveBeenCalledTimes(healthy.length);
+    preparation.ok = true;
+    const answered = () => actors.messages(ids.failing.id, 500).filter(message =>
+      message.direction === "out" && !message.error && message.source !== "fabric-host").length;
+    await waitFor(() => answered() === 30 && actors.status(ids.failing.id).queued === 0 && !fs.existsSync(deadLetterFile), 20_000);
+    await pause(200);
+    expect(run).toHaveBeenCalledTimes(healthy.length + 30);
+    expect(answered()).toBe(30);
+    expect(replies(actors, ids.healthy.id)).toBe(healthy.length);
+    const accepted = actors.messages(ids.failing.id, 500).filter(message => message.direction === "in" && message.source === "mesh:fleet.work.review")
+      .map(message => (message.data as { id: string }).id);
+    expect([...accepted].sort()).toEqual(failing.map(event => event.id).sort());   // each exactly once
+    expect(alarms()).toHaveLength(1);
+  }, 40_000);
+
+  it("(5) a failed preparation rotates its item behind newer work instead of keeping it first", async () => {
+    const f = fixture();
+    const seed = f.host({ ok: true, failures: 0 });
+    const ids = await create(seed.actors, "github.review", "team.work");
+    await seed.close();
+    const first = await f.mesh.publish({ topic: "github.review", from, data: { n: 1 } });
+    const second = await f.mesh.publish({ topic: "github.review", from, data: { n: 2 } });
+    // Only the first preparation fails.
+    const preparation = { failures: 0, get ok() { return this.failures >= 1; } };
+    const { actors, agents } = f.host(preparation);
+    const run = vi.spyOn(agents, "run");
+    await waitFor(() => run.mock.calls.length === 2 && actors.status(ids.failing.id).queued === 0 && actors.inFlightCount() === 0);
+    expect(preparation.failures).toBe(1);
+    expect(run.mock.calls.map(([request]) => request.task.includes(first.id) ? "first" : request.task.includes(second.id) ? "second" : "?"))
+      .toEqual(["second", "first"]);
   });
 
   it("(2) archive catch-up with one pending work item does not stop live reads", async () => {

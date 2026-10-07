@@ -471,7 +471,10 @@ describe("MeshStore", () => {
     crash.mockRestore();
     const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
     const intent = JSON.parse(fs.readFileSync(base + ".pending.json", "utf8"));
-    expect(intent).toMatchObject({ dedupeKey: packet.dedupeKey, reservedSequence: 1, liveOffset: 0 });
+    // Without an archive the intent is position independent (smarty-dev#4383).
+    expect(intent).toMatchObject(archived ? { dedupeKey: packet.dedupeKey, reservedSequence: 1, liveOffset: 0 }
+      : { version: 2, dedupeKey: packet.dedupeKey, eventId: intent.eventId });
+    if (!archived) expect(intent).not.toHaveProperty("reservedSequence");
     const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
     const event = await restarted.publish(packet);
     expect(event.id).not.toBe(intent.eventId);

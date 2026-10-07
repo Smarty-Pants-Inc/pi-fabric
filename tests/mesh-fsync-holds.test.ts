@@ -439,27 +439,84 @@ const publishLoop = async (root: string) => {
     kill() { if (child.exitCode === null) child.kill("SIGKILL"); fs.rmSync(stop, { force: true }); },
   };
 };
-/** Slow every barrier of THIS process, so the peer loop appends inside each optimistic window. */
-const slowBarriers = (ms: number) => {
-  const wait = new Int32Array(new SharedArrayBuffer(4));
-  const sync = fs.fsyncSync.bind(fs);
-  vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { Atomics.wait(wait, 0, 0, ms); sync(fd); });
-};
 const settled = () => new Promise(resolve => setTimeout(resolve, 50));
+/** Slow every barrier of THIS process and record whether THIS process held the mesh lock
+ * at each one (the owner record's pid line), so a peer's hold is never counted. */
+const slowOwnBarriers = (root: string, ms: number) => {
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  const held: boolean[] = [];
+  const ownsLock = () => {
+    try { return fs.readFileSync(path.join(root, ".lock", "owner"), "utf8").split("\n")[1] === String(process.pid); }
+    catch { return false; }
+  };
+  const originals = [fs.fsyncSync.bind(fs), fs.fdatasyncSync.bind(fs)];
+  ((["fsyncSync", "fdatasyncSync"] as const)).forEach((name, index) => vi.spyOn(fs, name).mockImplementation(fd => {
+    held.push(ownsLock());
+    Atomics.wait(wait, 0, 0, ms);
+    originals[index]!(fd);
+  }));
+  return { held };
+};
 
-describe("bounded locked fallback under constant peer appends (round 3)", () => {
+describe("position-independent keyed intents under constant peer appends (round 4)", () => {
+  it("runs ZERO fsyncs under the lock for keyed publishes while another process runs a tight publish loop", async () => {
+    const mesh = new MeshStore(store().root, 1024, 100, { lockTimeoutMs: 5_000 });
+    const other = new MeshStore(mesh.root, 1024, 100, { lockTimeoutMs: 5_000 });
+    const loop = await publishLoop(mesh.root);
+    try {
+      const barriers = slowOwnBarriers(mesh.root, 20);
+      const retries = meshPublishCounters.keyedRetries;
+      const serial: MeshEvent[] = [];
+      for (let index = 0; index < 3; index++) serial.push(await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: `serial-${index}`, text: "once" }));
+      const concurrent = await Promise.all([0, 1, 2, 3].map(index => (index % 2 ? other : mesh)
+        .publish({ topic: "mesh.fsync", from, dedupeKey: `concurrent-${index}`, text: "once" })));
+      const same = await Promise.all([mesh, other].map(store => store.publish({ topic: "mesh.fsync", from, dedupeKey: "same", text: "once" })));
+      vi.restoreAllMocks();
+      // Every barrier of this process (intent, log, receipt, namespaces) ran outside its holds.
+      expect(barriers.held.length).toBeGreaterThan(20);
+      expect(barriers.held.filter(Boolean)).toEqual([]);
+      // Only the same-key pair may wait on each other; peer appends voided nothing.
+      expect(meshPublishCounters.keyedRetries - retries).toBeLessThanOrEqual(50);
+      expect(same[0]).toEqual(same[1]);
+      await loop.stop();
+      const all = fs.readFileSync(live(mesh.root), "utf8").trim().split("\n").map(line => JSON.parse(line) as MeshEvent);
+      for (const event of [...serial, ...concurrent, same[0]!]) expect(all.filter(entry => entry.dedupeKey === event.dedupeKey)).toEqual([event]);
+      expect(new Set(all.map(entry => entry.id)).size).toBe(all.length);
+      expect(all.every((entry, index) => index === 0 || entry.sequence === all[index - 1]!.sequence + 1)).toBe(true);
+      expect(fs.readdirSync(path.join(mesh.root, "event-receipts")).filter(name => !/^[a-f0-9]{64}\.json$/.test(name))).toEqual([]);
+    } finally { loop.kill(); }
+  }, 90_000);
+
+  it("stages a position-independent intent: no sequence, offset, size or mtime", async () => {
+    const mesh = store();
+    const rename = fs.renameSync.bind(fs);
+    let intent: Record<string, unknown> | undefined;
+    const target = receipt(mesh.root, "shape", ".pending.json");
+    vi.spyOn(fs, "renameSync").mockImplementation((source, to) => {
+      if (to === target) intent = JSON.parse(fs.readFileSync(source, "utf8")) as Record<string, unknown>;
+      rename(source, to);
+    });
+    const event = await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "shape", text: "once" });
+    expect(Object.keys(intent!).sort()).toEqual(["dedupeKey", "eventId", "owner", "payloadHash", "version"]);
+    expect(intent).toMatchObject({ version: 2, dedupeKey: "shape", eventId: event.id, owner: { pid: process.pid } });
+  });
+});
+
+describe("bounded keyed publish and recovery under constant peer appends (round 3)", () => {
   it("completes a keyed publish within a bounded time while another process runs a tight publish loop", async () => {
     const mesh = new MeshStore(store().root, 1024, 100, { lockTimeoutMs: 3_000 });
     const loop = await publishLoop(mesh.root);
     try {
-      slowBarriers(20);
-      const fallbacks = meshPublishCounters.keyedLockedFallbacks;
+      const barriers = slowOwnBarriers(mesh.root, 20);
+      const retries = meshPublishCounters.keyedRetries;
       const started = Date.now();
       const event = await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "under-load", text: "once" });
       const elapsed = Date.now() - started;
       vi.restoreAllMocks();
       expect(elapsed).toBeLessThan(3_000);
-      expect(meshPublishCounters.keyedLockedFallbacks).toBeGreaterThan(fallbacks);
+      expect(meshPublishCounters.keyedRetries).toBe(retries); // Peer appends never void the intent.
+      expect(barriers.held.length).toBeGreaterThan(0);
+      expect(barriers.held).not.toContain(true);
       const before = loop.lines();
       while (loop.lines() < before + 20) await new Promise(resolve => setTimeout(resolve, 5)); // Still appending.
       expect(await loop.stop()).toBeGreaterThan(50);
@@ -479,20 +536,23 @@ describe("bounded locked fallback under constant peer appends (round 3)", () => 
     expect(crashed.map(event => event.dedupeKey)).toEqual(["crashed-publish", "crashed-compact"]);
     const loop = await publishLoop(root);
     try {
-      slowBarriers(20);
+      const barriers = slowOwnBarriers(root, 20);
       const mesh = new MeshStore(root, 1024, 100, { lockTimeoutMs: 3_000 });
       let started = Date.now();
       expect(await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "crashed-publish", text: "once" })).toEqual(crashed[0]);
       expect(Date.now() - started).toBeLessThan(3_000);
       expect(fs.existsSync(receipt(root, "crashed-publish", ".pending.json"))).toBe(false);
-      // Compaction's off-lock settle is voided by every append; its one locked retry settles.
+      const recovery = barriers.held.length;
+      expect(recovery).toBeGreaterThan(0);
+      expect(barriers.held).not.toContain(true); // Keyed recovery: reads and renames only under the lock.
+      // Compaction's off-lock settle matches by key and event id: peer appends cannot void it.
       while (fs.statSync(live(root)).size <= compactOptions.maxEventLogBytes) await new Promise(resolve => setTimeout(resolve, 5));
-      const recoveries = meshPublishCounters.recoveryLockedFallbacks;
       started = Date.now();
       await new MeshStore(root, 1024, 100, { ...compactOptions, lockTimeoutMs: 3_000 }).settleCompaction();
       expect(Date.now() - started).toBeLessThan(6_000);
       vi.restoreAllMocks();
-      expect(meshPublishCounters.recoveryLockedFallbacks).toBeGreaterThan(recoveries);
+      // Only compaction's own final remainder fold under custody (P2-1) may sync while held.
+      expect(barriers.held.slice(recovery).filter(Boolean).length).toBeLessThanOrEqual(1);
       expect(fs.existsSync(receipt(root, "crashed-compact", ".pending.json"))).toBe(false);
       expect(JSON.parse(fs.readFileSync(receipt(root, "crashed-compact"), "utf8"))).toEqual(crashed[1]);
       await loop.stop();
@@ -513,7 +573,7 @@ describe("gated compaction staging (round 3)", () => {
   it("never stages while an intent stays pending, and backs off its settle attempts", async () => {
     const mesh = store(true);
     const intent = plantLiveIntent(mesh.root, "stalled");
-    const stages = meshPublishCounters.compactionStages, recoveries = meshPublishCounters.recoveryLockedFallbacks;
+    const stages = meshPublishCounters.compactionStages;
     for (let index = 0; index < 10; index++) {
       await mesh.publish({ topic: "mesh.fsync", from, text: "x".repeat(500) });
       await settled();
@@ -521,7 +581,6 @@ describe("gated compaction staging (round 3)", () => {
     await mesh.settleCompaction(); // Explicit: ignores the backoff, still never stages.
     expect(fs.statSync(live(mesh.root)).size).toBeGreaterThan(2800);
     expect(meshPublishCounters.compactionStages - stages).toBe(0);
-    expect(meshPublishCounters.recoveryLockedFallbacks - recoveries).toBeLessThanOrEqual(2); // First trigger + settleCompaction.
     expect(fs.existsSync(intent)).toBe(true);
     fs.rmSync(intent);
     await mesh.settleCompaction();

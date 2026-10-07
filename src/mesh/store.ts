@@ -588,13 +588,22 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
+/** A durable dedupe intent. Version 2 (keyed publish without an archive) is position
+ * independent: it names the event by dedupe key, event id and payload hash, never by its
+ * sequence, byte offset or the log's size or mtime, so a peer append cannot void it
+ * (smarty-dev#4383). Version 1 (the one-lock archive/batch protocol and older releases)
+ * records the reserved position. */
 interface MeshDedupeIntent {
+  version?: 2;
   dedupeKey: string;
-  reservedSequence: number;
   eventId: string;
-  /** Byte offset captured before the live append; it makes recovery a direct read. */
-  liveOffset: number;
-  /** Captured before append: removing/changing archive configuration cannot authorize retry. */
+  /** v2: sha256 of the event without its sequence (see eventDigest). */
+  payloadHash?: string;
+  /** v1 only: the reserved sequence. */
+  reservedSequence?: number;
+  /** v1 only: byte offset captured before the live append; it makes recovery a direct read. */
+  liveOffset?: number;
+  /** v1 only. Captured before append: removing/changing archive configuration cannot authorize retry. */
   archiveDir?: string;
   /** Off-lock (two-step) publish attempts only: recovery never removes a live owner's intent. */
   owner?: MeshIntentOwner;
@@ -616,23 +625,20 @@ const COMPACTION_BACKOFF_MAX_MS = 60_000;
 // A cross-process stager claim older than this, or whose pid is gone, is abandoned.
 const COMPACTION_CLAIM_STALE_MS = 5 * 60_000;
 
-/** Process-local diagnostics for the bounded fallbacks and compaction staging (smarty-dev#4383). */
+/** Process-local diagnostics for keyed publication and compaction staging (smarty-dev#4383). */
 export const meshPublishCounters = {
-  /** Keyed publishes that ran their whole protocol under one lock hold after an optimistic conflict. */
-  keyedLockedFallbacks: 0,
-  /** Off-lock intent recoveries (compaction settle) retried once under the lock. */
-  recoveryLockedFallbacks: 0,
+  /** Keyed publish retries after a same-key conflict (a live owner's intent or a racing receipt). */
+  keyedRetries: 0,
   /** Compaction stage files written (each up to the retained tail, fsynced). */
   compactionStages: 0,
 };
 
-interface MeshPublicationDraft {
-  event: MeshEvent;
-  line: string;
-  identity: string;
-  archive?: MeshArchive | undefined;
-  intent: MeshDedupeIntent;
-}
+/** A keyed event's position-independent content: everything except its sequence. */
+const eventDigest = (event: MeshEvent): string =>
+  createHash("sha256").update(JSON.stringify({ ...event, sequence: undefined })).digest("hex");
+
+/** How far an intent's event was searched in one live inode (complete lines only). */
+interface MeshIntentScan { dev: number; ino: number; end: number; rewritten: boolean; event?: MeshEvent }
 
 // Only confirmations queued before this barrier starts share it. A later append
 // must enqueue a new barrier, even while a previous confirmation is settling.
@@ -829,13 +835,15 @@ export class MeshStore {
 
   /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
   #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
+    if (intent.version === 2) return this.#scanIntentEvent(intent).event;
+    const liveOffset = intent.liveOffset ?? 0;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const stat = fs.fstatSync(descriptor);
-      if (intent.liveOffset >= stat.size) return undefined;
-      const bytes = Buffer.allocUnsafe(Math.min(this.maxEventBytes + 1, stat.size - intent.liveOffset));
-      const count = fs.readSync(descriptor, bytes, 0, bytes.length, intent.liveOffset);
+      if (liveOffset >= stat.size) return undefined;
+      const bytes = Buffer.allocUnsafe(Math.min(this.maxEventBytes + 1, stat.size - liveOffset));
+      const count = fs.readSync(descriptor, bytes, 0, bytes.length, liveOffset);
       const newline = bytes.subarray(0, count).indexOf(0x0a);
       if (newline < 0) return undefined; // A partial append never committed.
       const event = JSON.parse(bytes.subarray(0, newline).toString("utf8")) as MeshEvent;
@@ -849,16 +857,66 @@ export class MeshStore {
     }
   }
 
+  /** Find an intent's event among the complete live lines by event id (and payload hash or
+   * reserved sequence), never at a recorded offset. With `after` and the same inode, only
+   * the suffix appended since that scan is read. Reads only: safe under the lock. */
+  #scanIntentEvent(intent: MeshDedupeIntent, after?: MeshIntentScan): MeshIntentScan {
+    let descriptor: number;
+    try { descriptor = fs.openSync(this.#eventsPath, "r"); }
+    catch (error) {
+      if (errorCode(error) === "ENOENT") return { dev: 0, ino: 0, end: 0, rewritten: !!after && after.end > 0 };
+      throw error;
+    }
+    try {
+      const stat = fs.fstatSync(descriptor);
+      const rewritten = !!after && (after.dev !== stat.dev || after.ino !== stat.ino || stat.size < after.end);
+      let position = after && !rewritten ? after.end : 0;
+      const needle = Buffer.from(`{"id":${JSON.stringify(intent.eventId)},`, "utf8");
+      const chunk = Buffer.allocUnsafe(Math.max(0, Math.min(stat.size - position, Math.max(1 << 20, this.maxEventBytes + 1))));
+      let found: MeshEvent | undefined;
+      while (position < stat.size && !found) {
+        const count = fs.readSync(descriptor, chunk, 0, Math.min(chunk.length, stat.size - position), position);
+        if (count <= 0) break;
+        const bytes = chunk.subarray(0, count);
+        const last = bytes.lastIndexOf(0x0a);
+        if (last < 0) {
+          if (count < chunk.length) break; // A partial tail line: not committed (yet).
+          position += count; // An oversized line cannot be this event.
+          continue;
+        }
+        const complete = bytes.subarray(0, last + 1);
+        for (let hit = complete.indexOf(needle); hit >= 0 && !found; hit = complete.indexOf(needle, hit + 1)) {
+          const start = complete.lastIndexOf(0x0a, hit) + 1;
+          try {
+            const event = JSON.parse(complete.subarray(start, complete.indexOf(0x0a, hit)).toString("utf8")) as MeshEvent;
+            if (event.id === intent.eventId && event.dedupeKey === intent.dedupeKey &&
+              (intent.version === 2 ? eventDigest(event) === intent.payloadHash : event.sequence === intent.reservedSequence)) found = event;
+          } catch { /* nested or malformed: not this event's line */ }
+        }
+        position += last + 1;
+      }
+      return { dev: stat.dev, ino: stat.ino, end: position, rewritten, ...(found ? { event: found } : {}) };
+    } finally { fs.closeSync(descriptor); }
+  }
+
   #readDedupeIntent(file: string, dedupeKey?: string): MeshDedupeIntent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    return this.#parseDedupeIntent(file, text, dedupeKey);
+  }
+
+  #parseDedupeIntent(file: string, text: string, dedupeKey?: string): MeshDedupeIntent {
     const intent = JSON.parse(text) as MeshDedupeIntent;
+    const positional = intent.version === undefined;
     if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
         (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
-        !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
         typeof intent.eventId !== "string" || !intent.eventId ||
-        !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 ||
+        (positional
+          ? !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence! < 1 ||
+            !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset! < 0
+          : intent.version !== 2 || typeof intent.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.payloadHash) ||
+            intent.reservedSequence !== undefined || intent.liveOffset !== undefined || intent.archiveDir !== undefined) ||
         (intent.archiveDir !== undefined && (typeof intent.archiveDir !== "string" || !path.isAbsolute(intent.archiveDir))) ||
         file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
       throw new Error("Invalid event publication intent");
@@ -878,7 +936,7 @@ export class MeshStore {
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
     }
-    if (!event && !prior && archive) {
+    if (!event && !prior && archive && intent.reservedSequence !== undefined) {
       let entry: (MeshArchiveEntry & { committed: boolean }) | undefined;
       try { entry = archive.lookupEntry(intent.reservedSequence); }
       catch (error) {
@@ -921,9 +979,12 @@ export class MeshStore {
     if (event && !prior) {
       if (live) {
         this.#confirmEventFile(this.#eventsPath);
-        archive?.confirmLive(live.sequence, live.id);
-        const pending = archive?.pending();
-        if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
+        // A position-independent intent never reserved an archive slot.
+        if (intent.version !== 2) {
+          archive?.confirmLive(live.sequence, live.id);
+          const pending = archive?.pending();
+          if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
+        }
       }
       writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
     }
@@ -942,13 +1003,10 @@ export class MeshStore {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, draft?: { value?: MeshPublicationDraft },
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number },
     confirmReceiptAfterRelease = false): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
-    const principal = input.principal;
-    const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
-    const fixedData = stamp ? undefined : input.data;
     input.signal?.throwIfAborted();
     // Historical reads are prepared off-lock and validated before any mutation.
     // An authoritative receipt needs no archive recovery, even if its mount is gone.
@@ -979,7 +1037,7 @@ export class MeshStore {
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
       if (input.dedupeKey) {
-        const offLock = !!draft || confirmReceiptAfterRelease;
+        const offLock = confirmReceiptAfterRelease;
         const prior = this.#readDedupeReceipt(input.dedupeKey, !offLock);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
@@ -1005,10 +1063,6 @@ export class MeshStore {
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        // A same-key publisher may have installed an intent since off-lock
-        // recovery. Retry that recovery rather than syncing its live anchor here.
-        if (draft && !archive && this.#readDedupeIntent(intentPath!, input.dedupeKey)?.archiveDir === undefined &&
-            fs.existsSync(intentPath!)) throw new MeshArchiveRecoveryChanged();
         const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
         if (prior) return prior;
       }
@@ -1016,46 +1070,42 @@ export class MeshStore {
         this.#recoverArchive(archive, false, prepared);
         if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
       }
-      const createdAt = Date.now();
-      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-      const event: MeshEvent = {
-        id: randomUUID(),
-        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-        sequence,
-        topic: input.topic,
-        kind: input.kind?.trim() || "message",
-        from: jsonClone(input.from),
-        ...(principal ? { principal } : {}),
-        // Old bridges only wrote data.bridge. It can veto a native attestation, but
-        // arbitrary payload data cannot establish bridge verification or any authority.
-        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-          : { verification: "mesh" as const }),
-        ...(input.to ? { to: input.to } : {}),
-        ...(input.text !== undefined ? { text: input.text } : {}),
-        ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt,
-      };
+      const event = this.#buildEvent(input, sequence, Date.now());
       const line = JSON.stringify(event);
       if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
         throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-      }
-      if (draft) {
-        let liveOffset = 0;
-        try { liveOffset = fs.statSync(this.#eventsPath).size; }
-        catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-        draft.value = { event, line, archive, identity: this.#publicationIdentity(archive),
-          intent: { dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
-            ...(archive ? { archiveDir: archive.dir } : {}) } };
-        return event;
       }
       return this.#commitPublication(input, event, line, archive, batch);
     };
   }
 
+  #buildEvent(input: MeshPublishInput, sequence: number, createdAt: number): MeshEvent {
+    const principal = input.principal;
+    const eventData = typeof input.data === "function"
+      ? jsonClone((input.data as (createdAt: number) => unknown)(createdAt)) : input.data;
+    return {
+      id: randomUUID(),
+      ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+      sequence,
+      topic: input.topic,
+      kind: input.kind?.trim() || "message",
+      from: jsonClone(input.from),
+      ...(principal ? { principal } : {}),
+      // Old bridges only wrote data.bridge. It can veto a native attestation, but
+      // arbitrary payload data cannot establish bridge verification or any authority.
+      ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
+        : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
+        : { verification: "mesh" as const }),
+      ...(input.to ? { to: input.to } : {}),
+      ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(eventData !== undefined ? { data: eventData } : {}),
+      createdAt,
+    };
+  }
+
   #commitPublication(input: MeshPublishInput, event: MeshEvent, line: string, archive?: MeshArchive,
-    batch?: { appendStarted: boolean; bytes: number }, intentPrepared = false): MeshEvent {
+    batch?: { appendStarted: boolean; bytes: number }): MeshEvent {
       const sequence = event.sequence;
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
@@ -1072,9 +1122,9 @@ export class MeshStore {
       if (intentPath) {
         // A durable negative lookup exists before the intent. Only begin() can replace it
         // with the synced archive line address, before any live append.
-        if (!intentPrepared) archive?.reserveLookup(sequence);
+        archive?.reserveLookup(sequence);
         // This is the crash fence: the intent is durable before the live append begins.
-        if (!intentPrepared) writeFileAtomic(intentPath, JSON.stringify({
+        writeFileAtomic(intentPath, JSON.stringify({
           dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
           ...(archive ? { archiveDir: archive.dir } : {}),
         } satisfies MeshDedupeIntent), { durable: true });
@@ -1094,28 +1144,13 @@ export class MeshStore {
       if (pending) archive!.commit(pending);
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
-      if (receiptPath && !intentPrepared) {
+      if (receiptPath) {
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
         if (intentPath) this.#removeDedupeIntent(intentPath);
       }
       if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
       return event;
-  }
-
-  #publicationIdentity(archive?: MeshArchive): string {
-    const text = (file: string): string | undefined => {
-      try { return fs.readFileSync(file, "utf8"); }
-      catch (error) { if (errorCode(error) !== "ENOENT") throw error; return undefined; }
-    };
-    let live: unknown;
-    try {
-      const stat = fs.statSync(this.#eventsPath);
-      live = [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
-    } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-    return JSON.stringify([live, text(this.#counterPath), text(this.#generationPath),
-      text(path.join(this.root, "event-archive.json")), archive?.dir,
-      ...(archive ? ["HEAD.json", "PENDING.json", "BOOT"].map(name => text(path.join(archive.dir, name))) : [])]);
   }
 
   #confirmEventsAfterRelease(): Promise<void> {
@@ -1150,27 +1185,25 @@ export class MeshStore {
     return event;
   }
 
-  /** Common same-boot/no-archive recovery is also staged off-lock. Archived
-   * recovery remains on its original reboot/index protocol; do not infer an
-   * absent archive append from a missing live anchor. */
+  /** Off-lock recovery of a no-archive intent, by dedupe key and event id, never by offset:
+   * no peer append can void it (smarty-dev#4383). Under the lock only reads, renames and
+   * unlinks run; every barrier runs outside. An intent is removed only when provably
+   * abandoned. Archived recovery remains on its original reboot/index protocol. */
   async #recoverLiveReceipt(input: Pick<MeshPublishInput, "dedupeKey" | "signal">): Promise<MeshEvent | undefined> {
     const key = input.dedupeKey!;
     const prior = this.#readDedupeReceipt(key, false);
     if (prior) return this.#confirmReceiptAfterRelease(input, prior);
     const intentPath = this.#dedupePath(key, ".pending.json");
-    let text: string;
-    try { text = fs.readFileSync(intentPath, "utf8"); }
-    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
-    // Malformed records retain the existing validated recovery/error path.
-    let intent: MeshDedupeIntent;
-    try { intent = JSON.parse(text) as MeshDedupeIntent; }
-    catch { return undefined; }
-    if (intent.dedupeKey !== key || typeof intent.eventId !== "string" || !intent.eventId ||
-      !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
-      !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 || intent.archiveDir !== undefined ||
-      fs.existsSync(path.join(this.root, "event-archive.json"))) return undefined;
-    const identity = this.#publicationIdentity();
-    const event = this.#readEventAtIntent(intent);
+    const text = this.#readTextFile(intentPath);
+    if (text === undefined) return undefined;
+    const intent = this.#parseDedupeIntent(intentPath, text, key);
+    // An archive appeared (or this is an archive intent): the coupled locked protocol owns it.
+    if (intent.archiveDir !== undefined || fs.existsSync(path.join(this.root, "event-archive.json"))) {
+      throw new MeshArchiveRecoveryChanged();
+    }
+    // A legacy positional intent (older releases) keeps its direct read at the recorded offset.
+    const scan = intent.version === 2 ? this.#scanIntentEvent(intent) : undefined;
+    const event = scan ? scan.event : this.#readEventAtIntent(intent);
     // Never treat a live owner's unappended reservation as abandoned: wait for it.
     if (!event && this.#intentOwnerLive(intent)) throw new MeshArchiveRecoveryChanged();
     const receiptPath = this.#dedupePath(key, ".json");
@@ -1182,13 +1215,12 @@ export class MeshStore {
       }
       const committed = await this.#withLock(() => {
         input.signal?.throwIfAborted();
-        if (this.#publicationIdentity() !== identity || fs.existsSync(receiptPath)) return false;
-        let current: string;
-        try { current = fs.readFileSync(intentPath, "utf8"); }
-        catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
-        if (current !== text) return false;
-        if (event) renameAtomic(temporary, receiptPath);
-        else fs.rmSync(intentPath, { force: true });
+        if (fs.existsSync(receiptPath) || this.#readTextFile(intentPath) !== text) return false;
+        if (event) { renameAtomic(temporary, receiptPath); return true; }
+        // Abandonment must also cover the suffix appended since the off-lock scan. Reads only.
+        const rest = scan ? this.#scanIntentEvent(intent, scan) : { event: this.#readEventAtIntent(intent), rewritten: false };
+        if (rest.event || rest.rewritten || this.#intentOwnerLive(intent)) return false;
+        fs.rmSync(intentPath, { force: true });
         return true;
       });
       if (!committed) throw new MeshArchiveRecoveryChanged();
@@ -1198,8 +1230,8 @@ export class MeshStore {
     } finally { fs.rmSync(temporary, { force: true }); }
   }
 
-  /** Compaction must settle every offset anchor before rewriting, but common
-   * no-archive receipts need not hold custody during their durability barriers. */
+  /** Compaction must settle every intent before rewriting, but common no-archive
+   * receipts need not hold custody during their durability barriers. */
   async #settleDedupeIntentsAfterRelease(): Promise<void> {
     if (MeshArchive.fromRoot(this.root)) {
       // Archive/index/reboot recovery retains its coupled legacy crash protocol.
@@ -1219,17 +1251,10 @@ export class MeshStore {
         await this.#withLock(() => this.#settleDedupeIntent(file, undefined, MeshArchive.fromRoot(this.root)));
         continue;
       }
-      // A live or racing intent stays pending; compaction then skips staging.
+      // Peer appends cannot void this recovery. A live or racing intent stays pending,
+      // and compaction then skips staging and backs off.
       try { await this.#recoverLiveReceipt({ dedupeKey: intent.dedupeKey }); }
-      catch (error) {
-        if (!(error instanceof MeshArchiveRecoveryChanged)) throw error;
-        if (!fs.existsSync(file)) continue;
-        // Bounded fallback: any peer append voids the off-lock identity, so settle once
-        // under ONE lock hold (the original protocol). A live owner's intent still refuses.
-        meshPublishCounters.recoveryLockedFallbacks++;
-        try { await this.#withLock(() => this.#settleDedupeIntent(file, undefined, undefined)); }
-        catch (inner) { if (!(inner instanceof MeshArchiveRecoveryChanged)) throw inner; }
-      }
+      catch (error) { if (!(error instanceof MeshArchiveRecoveryChanged)) throw error; }
     }
   }
 
@@ -1245,96 +1270,109 @@ export class MeshStore {
     catch (error) { return errorCode(error) === "EPERM"; }
   }
 
-  async #publishKeyed(input: MeshPublishInput, locked = false): Promise<MeshEvent> {
+  /** Archive-configured stores, and a pending v1 archive intent, keep the one-lock protocol:
+   * the archive's durable index reservation is a barrier under the lock by design
+   * (smarty-dev#754). A malformed intent also takes it, which reports the error. */
+  #archivedKeyedPublish(intentPath: string): boolean {
+    if (fs.existsSync(path.join(this.root, "event-archive.json"))) return true;
+    try { return (JSON.parse(fs.readFileSync(intentPath, "utf8")) as { archiveDir?: unknown }).archiveDir !== undefined; }
+    catch (error) { return errorCode(error) !== "ENOENT"; }
+  }
+
+  /** Keyed publish without an archive (smarty-dev#4383). The durable intent is position
+   * independent (key, event id, payload hash, owner): it is staged and fsynced ONCE
+   * off-lock, and no peer append can void it. Neither lock hold runs any fsync:
+   * 1. hold: no receipt and no other intent for this key -> rename the synced intent in;
+   *    off-lock: the intent's namespace barrier (the crash fence precedes any append);
+   * 2. hold: still our intent and no receipt -> read sequence and offset from the live log,
+   *    append the line;
+   *    off-lock: the grouped log barrier, then the receipt and its namespace barrier. */
+  async #publishKeyed(input: MeshPublishInput): Promise<MeshEvent> {
     // Receipt recovery can return without acquiring custody. Preserve the
     // validation/admission guards that previously ran before every retry.
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     input.signal?.throwIfAborted();
     this.#writeAbortSignal?.throwIfAborted();
-    if (locked) {
-      // Bounded fallback: the optimistic identity spans two stage fsyncs, a namespace
-      // sync and two lock waits, so a constant stream of peer appends can void it every
-      // time. Like publishBatch's keyed path, settle any intent (locked recovery) and
-      // commit intent, append, barrier and receipt under ONE lock hold: progress is
-      // guaranteed. The optimistic path keeps its full identity check.
-      meshPublishCounters.keyedLockedFallbacks++;
-      const event = await this.#withLock(this.#preparePublish(input, undefined, undefined, true));
-      // A same-key winner's receipt is confirmed (and its intent cleared) outside custody;
-      // for our own commit this is one more off-lock barrier on an already durable receipt.
-      return this.#confirmReceiptAfterRelease(input, event);
-    }
     const key = input.dedupeKey!;
     const intentPath = this.#dedupePath(key, ".pending.json");
     const receiptPath = this.#dedupePath(key, ".json");
+    if (this.#archivedKeyedPublish(intentPath)) {
+      const event = await this.#withLock(this.#preparePublish(input, undefined, true));
+      // A same-key winner's receipt is confirmed (and its intent cleared) outside custody.
+      return this.#confirmReceiptAfterRelease(input, event);
+    }
     const recovered = await this.#recoverLiveReceipt(input);
     if (recovered) return recovered;
-    const holder: { value?: MeshPublicationDraft } = {};
-    const event = await this.#withLock(this.#preparePublish(input, undefined, holder));
-    const draft = holder.value;
-    if (!draft) {
-      // A concurrent receipt rename can be visible before its final barrier.
-      // Confirm independently, OUTSIDE mesh custody, before acknowledging it.
-      return this.#confirmReceiptAfterRelease(input, event);
+    // Everything but the sequence is fixed now; the payload hash covers it.
+    const staged = this.#buildEvent(input, 0, Date.now());
+    if (Buffer.byteLength(JSON.stringify({ ...staged, sequence: this.#readSequence() + 1 }), "utf8") > this.maxEventBytes) {
+      throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
     // The attempt token marks this intent live until the attempt ends (P2-2).
     const owner: MeshIntentOwner = { pid: process.pid, token: randomUUID(), at: Date.now() };
-    const intentText = JSON.stringify({ ...draft.intent, owner } satisfies MeshDedupeIntent);
-    const outcome = { appendStarted: false, bytes: 0 };
+    const intentText = JSON.stringify({ version: 2, dedupeKey: key, eventId: staged.id,
+      payloadHash: eventDigest(staged), owner } satisfies MeshDedupeIntent);
+    let appendStarted = false;
     liveIntentOwners.add(owner.token);
     const intentStage = `${intentPath}.${process.pid}.${randomUUID()}.prepared`;
     const receiptStage = `${receiptPath}.${process.pid}.${randomUUID()}.prepared`;
-    const ownsIntent = (): boolean => {
-      try { return fs.readFileSync(intentPath, "utf8") === intentText; }
-      catch (error) { if (errorCode(error) !== "ENOENT") throw error; return false; }
-    };
+    const ownsIntent = (): boolean => this.#readTextFile(intentPath) === intentText;
     try {
       writePreparedFile(intentStage, intentText);
-      writePreparedFile(receiptStage, draft.line);
       if (process.env.PI_FABRIC_TEST_CRASH_AFTER_INTENT_PREPARE === "1") process.kill(process.pid, "SIGKILL");
-      const installed = await this.#withLock(() => {
+      const installed = await this.#withLock((): MeshEvent | boolean => {
         input.signal?.throwIfAborted();
-        if (this.#publicationIdentity(draft.archive) !== draft.identity ||
-          fs.existsSync(intentPath) || fs.existsSync(receiptPath)) return false;
-        // Preserve the archive's durable negative proof before exposing an intent.
-        draft.archive?.reserveLookup(draft.event.sequence);
+        const prior = this.#readDedupeReceipt(key, false);
+        if (prior) return prior;
+        // Same-key race: any other intent for this key (live or abandoned) settles first.
+        if (fs.existsSync(intentPath)) return false;
         renameAtomic(intentStage, intentPath);
         return true;
       });
+      // A concurrent receipt rename can be visible before its final barrier.
+      if (typeof installed === "object") return await this.#confirmReceiptAfterRelease(input, installed);
       if (!installed) throw new MeshArchiveRecoveryChanged();
-      // Keep the original crash fence: even a failed final intent namespace
-      // barrier must precede ANY live append. Release, confirm, then revalidate.
+      // The original crash fence: the intent's final name is durable before ANY live append.
       try { syncPathNamespace(intentPath); }
       catch (error) {
         if (!ownsIntent()) throw new MeshArchiveRecoveryChanged();
         throw error;
       }
-      const committed = await this.#withLock(() => {
+      const event = await this.#withLock((): MeshEvent | undefined => {
         input.signal?.throwIfAborted();
-        if (this.#publicationIdentity(draft.archive) !== draft.identity || !ownsIntent() || fs.existsSync(receiptPath)) {
-          // Delete only our own still-unappended reservation. Never a successor.
-          if (ownsIntent()) fs.rmSync(intentPath, { force: true });
-          return false;
-        }
-        this.#commitPublication(input, draft.event, draft.line, draft.archive, outcome, true);
-        return true;
+        // Only this key's state is re-checked. The sequence and offset are read from the
+        // live log in THIS hold, so a compaction or replacement before it (new inode or
+        // generation) is already reflected: nothing staged depends on the log position.
+        if (!ownsIntent() || fs.existsSync(receiptPath)) return undefined;
+        this.#repairEventLog();
+        const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+        const event: MeshEvent = { ...staged, sequence };
+        const line = JSON.stringify(event);
+        if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+        // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+        atomicWrite(this.#counterPath, sequence);
+        appendStarted = true;
+        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
+        if (process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
+        return event;
       });
-      if (!committed) {
-        syncPathNamespace(path.dirname(intentPath));
-        throw new MeshArchiveRecoveryChanged();
-      }
+      if (!event) throw new MeshArchiveRecoveryChanged();
+      // No receipt before the grouped data barrier; a failed barrier fails the publish.
       await this.#confirmEventsAfterRelease();
+      writePreparedFile(receiptStage, JSON.stringify(event));
       // This key has committed exactly this identity. A recovery writer may
       // install the same receipt meanwhile; replacing it cannot change identity.
       renameAtomic(receiptStage, receiptPath);
       syncPathNamespace(receiptPath);
       if (ownsIntent()) this.#removeDedupeIntent(intentPath);
-      return draft.event;
+      return event;
     } finally {
       liveIntentOwners.delete(owner.token);
       // A failed attempt that never began its append withdraws its own reservation,
       // so peers need not wait for its age bound. Best effort: recovery covers the rest.
-      if (!outcome.appendStarted) { try { if (ownsIntent()) fs.rmSync(intentPath, { force: true }); } catch { /* recovery */ } }
+      if (!appendStarted) { try { if (ownsIntent()) fs.rmSync(intentPath, { force: true }); } catch { /* recovery */ } }
       fs.rmSync(intentStage, { force: true });
       fs.rmSync(receiptStage, { force: true });
     }
@@ -1343,24 +1381,20 @@ export class MeshStore {
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Freeze ordinary payload/principal bytes once, even if archive validation retries.
     input = this.#capturePublication(input);
-    const started = Date.now();
-    const recoveryDeadline = started + this.#lockTimeoutMs;
+    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
     let event: MeshEvent;
-    // After the first optimistic conflict, or once half the deadline has passed, a keyed
-    // publish takes the single-lock fallback; at least one such attempt always runs.
-    let conflicts = 0, lockedAttempts = 0;
-    for (;;) {
-      const locked = !!input.dedupeKey && (conflicts > 0 || Date.now() - started >= this.#lockTimeoutMs / 2);
+    // A keyed publish retries only on a same-key conflict (a live owner's pending intent,
+    // a racing receipt or recovery): peer appends never void its intent.
+    for (let conflicts = 0; ; conflicts++) {
       try {
-        if (locked) lockedAttempts++;
-        event = input.dedupeKey ? await this.#publishKeyed(input, locked)
+        event = input.dedupeKey ? await this.#publishKeyed(input)
           : await this.#withLock(this.#preparePublish(input));
         break;
       } catch (error) {
-        if (!(error instanceof MeshArchiveRecoveryChanged)) throw error;
-        conflicts++;
-        if (Date.now() >= recoveryDeadline && (!input.dedupeKey || lockedAttempts > 0)) throw error;
-        await delay(0);
+        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        if (input.dedupeKey) meshPublishCounters.keyedRetries++;
+        // Waiting on a live same-key owner: back off (1..16 ms) rather than rescan in a spin.
+        await delay(input.dedupeKey ? Math.min(16, 2 ** Math.min(conflicts, 4)) : 0);
       }
     }
     // Once append has committed, a compaction/barrier failure must NEVER retry

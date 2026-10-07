@@ -2,6 +2,7 @@ import fs, { type FSWatcher } from "node:fs";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { warnWatchFallback } from "../core/watch-fallback.js";
 import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
@@ -94,9 +95,12 @@ export class ActorMeshMonitor {
         this.#scheduleBackground();
       });
       this.#watcher = watcher;
-      watcher.on("error", () => this.#fallback(watcher));
+      watcher.on("error", (error) => this.#fallback(watcher, error));
       this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
-    } catch {
+    } catch (error) {
+      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
+      // and say so once, so nobody hunts for free space and the session never crashes.
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
       this.#startTimer(this.config.actorPollMs);
     }
     this.schedule();
@@ -158,8 +162,9 @@ export class ActorMeshMonitor {
     this.#watchTimer.unref();
   }
 
-  #fallback(watcher: FSWatcher): void {
+  #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     watcher.close();
     this.#watcher = undefined;
     this.#startTimer(this.config.actorPollMs);

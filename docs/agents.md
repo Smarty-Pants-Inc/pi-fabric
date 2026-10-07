@@ -838,9 +838,14 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
-not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
-Each activation allows three preparation requeues; a further retryable preparation failure
-reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
+not the execution/restart `attempts` counter. Callerless work (mesh, host, and tells) retries
+with 5-second, 15-second, then capped 60-second backoff; preparation failure never discards
+its pending activation. After three preparation requeues, further failures report
+`failing-preparation` and raise one owner alarm until a successful activation clears it.
+For durable actors, the mesh cursor stays before an accepted, unlaunched event through preparation retries;
+replay deduplicates the pending item. A confirmed worker launch releases that boundary.
+Caller-owned asks retain three preparation requeues and terminal exhaustion so a waiting
+caller receives a finite failure. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.

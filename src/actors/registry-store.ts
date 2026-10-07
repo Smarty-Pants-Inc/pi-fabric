@@ -96,9 +96,9 @@ export class ActorRegistryStore {
     }
   }
 
-  /** Read/merge/compact/encode and stage before acquisition. Only generation
-   * checks, prepared payload writes, rename and required barriers remain fenced.
-   * Stale preparations never publish heads, and retries re-run source selection. */
+  /** Read/merge/compact/encode and stage outside the optimistic fence. After a
+   * conflict, update also uses this under custody to guarantee forward progress.
+   * Stale preparations never publish heads, and fallback re-runs source selection. */
   prepare(actors: readonly Record<string, unknown>[], options: { durable?: boolean } = {}, snapshot = this.snapshot()) {
     const prior = new Map(snapshot.actors.map(row => [row.id, row]));
     const smallState = (row: Record<string, unknown>): string =>
@@ -175,24 +175,33 @@ export class ActorRegistryStore {
   }
 
   async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
-    const retryUntil = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
-    for (;;) {
-      const snapshot = this.snapshot();
-      const mutation = select(snapshot.actors);
-      if (!mutation) return undefined;
-      const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
+    const snapshot = this.snapshot();
+    const mutation = select(snapshot.actors);
+    if (!mutation) return undefined;
+    const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
+    try {
+      const committed = await this.withLock(() => {
+        if (!prepared.valid() || mutation.validate?.() === false) return false;
+        prepared.commit();
+        return true;
+      });
+      if (committed) return mutation.value;
+    } finally { prepared.dispose(); }
+    // One optimistic attempt keeps the uncontended fence cheap. After any race,
+    // select and prepare under custody: a slow codec must not starve behind even
+    // infrequent writers on a CPU-starved host (smarty-dev#816).
+    return this.withLock(() => {
+      const current = this.snapshot();
+      const selected = select(current.actors);
+      if (!selected) return undefined;
+      const locked = this.prepare(selected.actors, { durable: selected.durable === true }, current);
       try {
-        const committed = await this.withLock(() => {
-          if (!prepared.valid() || mutation.validate?.() === false) return false;
-          prepared.commit();
-          return true;
-        });
-        if (committed) return mutation.value;
-      } finally { prepared.dispose(); }
-      if (Date.now() >= retryUntil) throw new Error("Actor registry changed repeatedly during preparation");
-      // Yield OUTSIDE the fence; contending setters can prepare/commit independently.
-      await delay(0);
-    }
+        // Caller-local cancellation/ownership validation still vetoes publication.
+        if (!locked.valid() || selected.validate?.() === false) return undefined;
+        locked.commit();
+        return selected.value;
+      } finally { locked.dispose(); }
+    });
   }
 
   records(): Array<Record<string, unknown> & { id: string }> {

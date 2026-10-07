@@ -354,7 +354,7 @@ export class ActorRegistryOwnershipError extends Error {
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Windows metadata work yields after each actor; other platforms retain bounded batches. */
 export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
-/** Three preparation requeues, independent of the owner-restoration/drop budget. */
+/** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
 
@@ -643,7 +643,7 @@ export class ActorManager {
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
-    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 1_000);
+    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
@@ -2677,15 +2677,17 @@ export class ActorManager {
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
         ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
-    // A requeued item has not failed its activation yet. Its separate, durable
-    // preparation budget alarms at terminal exhaustion in #drain; counting the
-    // retries here would notify early and persist a consumed alarm across owners.
+    // A requeued item has not consumed an activation. #drain reports prolonged
+    // preparation failure after the initial retries, once per durable streak.
+    // Cleanup of that pending retry must not double-count a failed activation.
     // Failures outside an item retry still need fail-loud host reporting.
-    if (!item) this.#noteFailedActivation(actor, message, undefined, false);
+    if (!item && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
+      (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false);
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
     let retryDrain = false;
+    let retryDelay = this.#preparationRetryMs;
     try {
       while (
         actor.queue.length > 0 &&
@@ -2816,6 +2818,7 @@ export class ActorManager {
               item.launchEvidenceVersion = 1;
               item.executionStarted = true;
               this.#persistQueue(actor.id);
+              this.#meshMonitor.schedule();
               delete actor.preparing;
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2978,7 +2981,8 @@ export class ActorManager {
             error.launchOutcome === "unlaunched";
           const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
             (error instanceof ActorPreparationError && error.phase !== "binding")));
-          if (retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES &&
+          const callerless = !item.resolve && !item.reject;
+          if (retryPreparation && (callerless || (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
@@ -2988,6 +2992,14 @@ export class ActorManager {
             actor.queue.unshift(item);
             this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
+            // Retain routed work beyond the ask budget, with bounded retry pressure.
+            // Tests may shorten the base; production uses 5s, 15s, then 60s.
+            if (callerless) {
+              retryDelay = this.#preparationRetryMs * (item.preparationAttempts === 1 ? 1 : item.preparationAttempts === 2 ? 3 : 12);
+              if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
+                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER, true);
+              }
+            }
             retryDrain = true;
             break;
           }
@@ -3078,7 +3090,7 @@ export class ActorManager {
             this.#drainRetries.delete(live.id);
             const current = this.#actors.get(live.id);
             if (current) this.#ensureDrain(current);
-          }, this.#preparationRetryMs);
+          }, retryDelay);
           timer.unref();
           this.#drainRetries.set(live.id, timer);
         } else if (live !== actor || resetAtExit || rearm) queueMicrotask(() => this.#ensureDrain(live));
@@ -3088,7 +3100,7 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3105,7 +3117,8 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
-    const code = /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
+    const code = preparation ? "failing-preparation"
+      : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
       : /Context exceeds window/i.test(lastError) ? "context-overflow"
       : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
       : "unknown";
@@ -3505,13 +3518,31 @@ export class ActorManager {
 
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
-  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
+  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" | "pending" {
     // Empty polls only observe owners through the idle cache. The matched targets below
     // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
     // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
     this.#ownershipSnapshot = true;
     try {
-      return this.#deliverMeshEvent(event);
+      const delivered = this.#deliverMeshEvent(event);
+      // Enqueue is acceptance, not successful preparation. Hold the mesh boundary
+      // through failed activation retries; replay sees the existing item, not a duplicate.
+      let accepted = false;
+      for (const actor of this.#actors.values()) {
+        if (!this.#delivered.has(`${actor.id}\0${event.id}`)) continue;
+        if (actor.residency !== "durable") continue;
+        accepted = true;
+        if (!this.#canManageCached(actor.id)) continue;
+        const active = this.#inFlight.get(actor.id);
+        const pending = [...(active ? [active] : []), ...actor.queue,
+          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])];
+        if (pending.some(item => !item.executionStarted && item.source === `mesh:${event.topic}` &&
+          typeof item.payload === "object" && item.payload !== null &&
+          (item.payload as { id?: unknown }).id === event.id)) return "pending";
+      }
+      // A replay of an accepted event that has now launched is relevant progress,
+      // not ignored noise: checkpoint its released boundary immediately.
+      return delivered === "ignored" && accepted ? true : delivered;
     } finally {
       this.#ownershipSnapshot = false;
     }
@@ -4728,7 +4759,8 @@ export class ActorManager {
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status: actor.status === "stopped" ? "stopped"
-        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER ? "failed" : actor.preparing
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER
+        ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),

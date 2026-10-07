@@ -56,8 +56,8 @@ export class ActorMeshMonitor {
       beforePoll(): boolean;
       /** Rechecked per event: a page can outlast the resident host lease. */
       canConsumeMesh?: (() => boolean) | undefined;
-      /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
-      onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** false: full; "pending": accepted but unprepared; "ignored": no local delivery. */
+      onEvent(event: MeshEvent): boolean | void | "ignored" | "pending";
     },
   ) {
     const saved = this.#readCursor();
@@ -210,32 +210,41 @@ export class ActorMeshMonitor {
       if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
       const catchingUp = this.#catchingUp;
       let handedOn = false;
+      let pendingBoundary: MonitorCursor | undefined;
       if (!catchingUp) this.#offset = tail.nextOffset;
       for (const [index, event] of tail.events.entries()) {
         if (this.callbacks.canConsumeMesh?.() === false) {
-          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#offset = pendingBoundary?.cursor ?? (index === 0 ? start : tail.cursors?.[index - 1] ?? start);
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           return;
         }
         if (this.#delivered(event)) continue;
         if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
-          if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+          if (!pendingBoundary && typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
-        let accepted: boolean | void | "ignored";
+        let accepted: boolean | void | "ignored" | "pending";
         try {
           accepted = this.callbacks.onEvent(event);
         } catch (error) {
           // Keep only this page's consumed prefix. No second read can move the retry
           // boundary; #last describes that prefix and suppresses duplicates on reread.
-          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#offset = pendingBoundary?.cursor ?? (index === 0 ? start : tail.cursors?.[index - 1] ?? start);
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           throw error;
         }
         if (this.callbacks.canConsumeMesh?.() === false) {
-          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#offset = pendingBoundary?.cursor ?? (index === 0 ? start : tail.cursors?.[index - 1] ?? start);
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           return;
+        }
+        if (accepted === "pending") {
+          // Keep the earliest unprepared boundary, but still offer the rest of this
+          // bounded page: one busy durable actor must not block coalescing or other
+          // receivers. Manager delivery IDs deduplicate the offered suffix on replay.
+          pendingBoundary ??= { cursor: index === 0 ? start : tail.cursors?.[index - 1] ?? start,
+            ...(this.#last ? { last: this.#last } : {}) };
+          continue;
         }
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
@@ -243,12 +252,18 @@ export class ActorMeshMonitor {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
-          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#offset = pendingBoundary?.cursor ?? (index === 0 ? start : tail.cursors?.[index - 1] ?? start);
           this.#writeCursor(handedOn);
           return;
         }
         if (accepted !== false && accepted !== "ignored") handedOn = true;
-        if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+        if (!pendingBoundary && typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+      }
+      if (pendingBoundary) {
+        this.#offset = pendingBoundary.cursor;
+        this.#last = pendingBoundary.last;
+        this.#writeCursor(handedOn);
+        return;
       }
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor(handedOn);
@@ -281,11 +296,13 @@ export class ActorMeshMonitor {
     const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
     const older = page.filter((event) => event.sequence < oldest);
     let handedOn = false;
+    let pending = false;
     for (const event of older) {
       if (this.callbacks.canConsumeMesh?.() === false) return false;
       if (isWork(event) && !this.#delivered(event)) {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
+        if (accepted === "pending") { pending = true; continue; }
         if (accepted === false) {
           this.#writeCursor(handedOn);
           return false;
@@ -294,9 +311,12 @@ export class ActorMeshMonitor {
       }
       // Every event older than the live log counts as passed, work or not, so the live log's
       // first event follows it with no gap. Only a relevant delivery checkpoints immediately.
-      this.#archiveAfter = event.sequence;
-      this.#last = { sequence: event.sequence, id: event.id };
+      if (!pending) {
+        this.#archiveAfter = event.sequence;
+        this.#last = { sequence: event.sequence, id: event.id };
+      }
     }
+    if (pending) { this.#writeCursor(handedOn); return false; }
     if (older.length === page.length && page.length === this.config.maxReadEvents) {
       this.#writeCursor(handedOn);
       setImmediate(() => this.schedule());

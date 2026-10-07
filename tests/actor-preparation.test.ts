@@ -234,7 +234,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(fs.readdirSync(path.join(root, recreate ? "recreated-runs" : "runs"))).toHaveLength(recreate ? 0 : queued ? 2 : 1);
   });
 
-  it.each([false, true])("exhausts the preparation retry budget in one terminal failure and one alarm (queued: %s)", async (queued) => {
+  it.each([false, true])("exhausts a caller-owned ask preparation budget in one terminal failure and one alarm (queued: %s)", async (queued) => {
     const gate = deferred<void>();
     let calls = 0;
     const { actors, agents, notices } = setup({ preparationRetryMs: 30 }, 1, { preparePiModel: async (model) => {
@@ -246,7 +246,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     cleanups.push(async () => { if (blocker) await agents.stop(blocker.id); });
     const actor = await actors.create({ name: "permanent-auth-failure", model: "provider/stalled", instructions: "Reply", responseMode: "directive", coalesce: false });
     const run = vi.spyOn(agents, "run");
-    actors.tell(actor.id, "accepted but permanently stalled auth");
+    void actors.ask(actor.id, "accepted but permanently stalled auth").catch(() => undefined);
     if (blocker) {
       await waitFor(() => actors.status(actor.id).status === "waiting");
       await agents.stop(blocker.id);
@@ -266,59 +266,48 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toEqual([]);
   });
 
-  it("preserves the exhausted preparation budget and alarms once after owner recreation", async () => {
+  it("#816 retains work beyond the preparation budget and alarms once across owner recreation", async () => {
     const gate = deferred<void>();
     let calls = 0;
-    const { actors: before, agents: oldAgents, mesh, root, notices: beforeNotices } = setup({ preparationRetryMs: 80 }, 1, {
-      preparePiModel: async (model) => { calls++; await gate.promise; return model; },
+    const { actors: before, agents: oldAgents, mesh, root, notices: beforeNotices } = setup({ preparationRetryMs: 20 }, 1, {
+      preparePiModel: async model => { calls++; await gate.promise; return model; },
     });
     cleanups.push(async () => { gate.resolve(); });
-    const actor = await before.create({ name: "exhausted-recreation", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
-    before.tell(actor.id, "preserve retry budget across owner recreation");
-    await waitFor(() => calls === 3 && before.inFlightCount() === 0 && readQueue(actor.sessionFile!)[0]?.preparationAttempts === 3);
-    expect(beforeNotices).toEqual([]); // Requeues have not terminally failed the activation.
-    expect(before.status(actor.id).activationBlocked).toBeUndefined();
-    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toEqual([]);
+    const actor = await before.create({ name: "pending-recreation", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
+    const accepted = before.tell(actor.id, "preserve accepted work beyond preparation budget");
+    await waitFor(() => calls >= 4 && before.inFlightCount() === 0);
+    expect(before.status(actor.id)).toMatchObject({ status: "failing-preparation", queued: 1, activationBlocked: { code: "failing-preparation" } });
+    expect(beforeNotices).toHaveLength(1);
     const directory = path.dirname(actor.sessionFile!);
-    const queueFile = path.join(directory, fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
     const snapshot = fs.readFileSync(queueFile, "utf8");
+    expect(JSON.parse(snapshot).items).toEqual([expect.objectContaining({ id: accepted.messageId, preparationAttempts: 4, attempts: 0 })]);
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await before.close(); await oldAgents.close();
     fs.writeFileSync(queueFile, snapshot);
     const notices: string[] = [];
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "recreated-runs"),
-      preparePiModel: async (model) => { calls++; await gate.promise; return model; },
+      preparePiModel: async model => { calls++; await gate.promise; return model; },
     });
     const run = vi.spyOn(agents, "run");
     const after = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
-      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (delivery) => {
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, delivery => {
         if (delivery.message.source === "fabric-host") notices.push(delivery.message.text ?? "");
-      }, { actorRoot: path.join(root, "actors"), persistent: true, preparationTimeoutMs: 80, preparationRetryMs: 30 });
+      }, { actorRoot: path.join(root, "actors"), persistent: true, preparationTimeoutMs: 80, preparationRetryMs: 20 });
     cleanups.push(async () => { await after.close(); await agents.close(); });
-    await waitFor(() => calls === 4 && after.inFlightCount() === 0 && after.status(actor.id).queued === 0);
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(notices).toHaveLength(1);
-    expect(after.status(actor.id)).toMatchObject({
-      status: "failed", queued: 0, activationBlocked: { code: "unknown", count: 1 },
-    });
-    expect(after.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(4);
-    expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
-    gate.resolve(); await pause(200);
-    expect(calls).toBe(4);
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(notices).toHaveLength(1);
-    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-    await after.close();
-    const next = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
-      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (delivery) => {
-        if (delivery.message.source === "fabric-host") notices.push(delivery.message.text ?? "");
-      }, { actorRoot: path.join(root, "actors"), persistent: true });
-    cleanups.push(async () => { await next.close(); });
-    await pause(200);
-    expect(next.status(actor.id)).toMatchObject({ status: "failed", queued: 0, activationBlocked: { code: "unknown", count: 1 } });
-    expect(run).toHaveBeenCalledTimes(1); // Terminal work never returns after another restart.
-    expect(notices).toHaveLength(1);
+    await waitFor(() => calls >= 5 && after.inFlightCount() === 0);
+    expect(after.status(actor.id)).toMatchObject({ status: "failing-preparation", queued: 1 });
+    expect(readQueue(actor.sessionFile!)[0]).toMatchObject({ preparationAttempts: 5, attempts: 0 });
+    expect(notices).toEqual([]);
     expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
+    gate.resolve();
+    await waitFor(() => after.inFlightCount() === 0 && after.status(actor.id).queued === 0);
+    expect(run).toHaveBeenCalledTimes(2); // one timed-out setup, one confirmed worker
+    expect(after.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+    expect(after.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
+    expect(after.status(actor.id).activationBlocked).toBeUndefined();
+    expect(fs.readdirSync(directory).filter(file => file.startsWith("queue-"))).toEqual([]);
   });
 
   it.each([false, true])("never retries an unconfirmed transport launch with a timeout-shaped error (queued: %s)", async (queued) => {
@@ -407,6 +396,44 @@ describe("round-four launch-preparation recovery (#3167)", () => {
 });
 
 describe("actor preparation (#3167)", () => {
+  it.each([1, 4])("#816 holds a durable routed event cursor through %i failed preparations and processes it once", async failures => {
+    const cursorRoot = fs.mkdtempSync(path.join(os.tmpdir(), "preparation-cursor-"));
+    const cursorPath = path.join(cursorRoot, "cursor.json");
+    cleanups.push(async () => { fs.rmSync(cursorRoot, { recursive: true, force: true }); });
+    let failed = 0;
+    let recover = false;
+    const { actors, agents, mesh } = setup({ meshCursorPath: cursorPath, preparationRetryMs: 30,
+      acquireCapabilityView: async () => {
+        if (failed < failures) { failed++; throw new Error("temporary preparation unavailable"); }
+        if (!recover) throw new Error("hold preparation for cursor inspection");
+        return { satisfied: true, missing: [], optionalMissing: [],
+          view: { id: "recovered", digest: "recovered", semanticDigest: "recovered", bindings: {} }, release: async () => {} };
+      },
+    });
+    const actor = await actors.create({ name: "routed-review", instructions: "Reply", topics: ["github.review"],
+      responseMode: "text", coalesce: false, residency: "durable", requires: ["demo.echo"] });
+    const run = vi.spyOn(agents, "run");
+    const event = await mesh.publish({ topic: "github.review", from: { id: "router", name: "router", kind: "main" }, data: { pr: 816 } });
+    await waitFor(() => failed === failures && actors.inFlightCount() === 0);
+    expect(actors.status(actor.id).queued).toBe(1);
+    const directory = path.dirname(actor.sessionFile!);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
+    const items = JSON.parse(fs.readFileSync(queueFile, "utf8")).items;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ payload: { id: event.id }, preparationAttempts: failures, attempts: 0 });
+    expect(run).not.toHaveBeenCalled();
+    const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { last?: { sequence: number; id: string } };
+    expect(cursor().last?.sequence ?? 0).toBeLessThan(event.sequence);
+    if (failures === 4) expect(actors.status(actor.id).status).toBe("failing-preparation");
+    recover = true;
+    await waitFor(() => run.mock.calls.length > 0 && actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
+    await waitFor(() => (cursor().last?.sequence ?? 0) >= event.sequence);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(actors.messages(actor.id).filter(message => message.direction === "in" && message.source === "mesh:github.review")).toHaveLength(1);
+    expect(actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
   it("exposes a typed phase-specific timeout with a conservative production deadline", () => {
     expect(ACTOR_PREPARATION_TIMEOUT_MS).toBe(30_000);
     const error = new ActorPreparationTimeoutError("actor-id", "presence", 80);

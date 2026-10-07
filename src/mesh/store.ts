@@ -608,6 +608,23 @@ const liveIntentOwners = new Set<string>();
 const INTENT_OWNER_STALE_MS = 5 * 60_000;
 // At most one best-effort compaction per live log per process (smarty-dev#4383).
 const compactions = new Map<string, Promise<void>>();
+// Publish-triggered compaction backs off after a deferral (pending intent, refused rename
+// or failure): doubling from 1 s to 60 s, reset by a completed rewrite.
+const compactionBackoff = new Map<string, { delayMs: number; until: number }>();
+const COMPACTION_BACKOFF_MIN_MS = 1_000;
+const COMPACTION_BACKOFF_MAX_MS = 60_000;
+// A cross-process stager claim older than this, or whose pid is gone, is abandoned.
+const COMPACTION_CLAIM_STALE_MS = 5 * 60_000;
+
+/** Process-local diagnostics for the bounded fallbacks and compaction staging (smarty-dev#4383). */
+export const meshPublishCounters = {
+  /** Keyed publishes that ran their whole protocol under one lock hold after an optimistic conflict. */
+  keyedLockedFallbacks: 0,
+  /** Off-lock intent recoveries (compaction settle) retried once under the lock. */
+  recoveryLockedFallbacks: 0,
+  /** Compaction stage files written (each up to the retained tail, fsynced). */
+  compactionStages: 0,
+};
 
 interface MeshPublicationDraft {
   event: MeshEvent;
@@ -925,7 +942,8 @@ export class MeshStore {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, draft?: { value?: MeshPublicationDraft }): () => MeshEvent {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, draft?: { value?: MeshPublicationDraft },
+    confirmReceiptAfterRelease = false): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     const principal = input.principal;
@@ -961,10 +979,11 @@ export class MeshStore {
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
       if (input.dedupeKey) {
-        const prior = this.#readDedupeReceipt(input.dedupeKey, !draft);
+        const offLock = !!draft || confirmReceiptAfterRelease;
+        const prior = this.#readDedupeReceipt(input.dedupeKey, !offLock);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-          if (!draft && fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          if (!offLock && fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
           return prior;
         }
       }
@@ -1200,9 +1219,17 @@ export class MeshStore {
         await this.#withLock(() => this.#settleDedupeIntent(file, undefined, MeshArchive.fromRoot(this.root)));
         continue;
       }
-      // A live or racing intent stays pending; compaction then refuses its rename.
+      // A live or racing intent stays pending; compaction then skips staging.
       try { await this.#recoverLiveReceipt({ dedupeKey: intent.dedupeKey }); }
-      catch (error) { if (!(error instanceof MeshArchiveRecoveryChanged)) throw error; }
+      catch (error) {
+        if (!(error instanceof MeshArchiveRecoveryChanged)) throw error;
+        if (!fs.existsSync(file)) continue;
+        // Bounded fallback: any peer append voids the off-lock identity, so settle once
+        // under ONE lock hold (the original protocol). A live owner's intent still refuses.
+        meshPublishCounters.recoveryLockedFallbacks++;
+        try { await this.#withLock(() => this.#settleDedupeIntent(file, undefined, undefined)); }
+        catch (inner) { if (!(inner instanceof MeshArchiveRecoveryChanged)) throw inner; }
+      }
     }
   }
 
@@ -1218,13 +1245,25 @@ export class MeshStore {
     catch (error) { return errorCode(error) === "EPERM"; }
   }
 
-  async #publishKeyed(input: MeshPublishInput): Promise<MeshEvent> {
+  async #publishKeyed(input: MeshPublishInput, locked = false): Promise<MeshEvent> {
     // Receipt recovery can return without acquiring custody. Preserve the
     // validation/admission guards that previously ran before every retry.
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     input.signal?.throwIfAborted();
     this.#writeAbortSignal?.throwIfAborted();
+    if (locked) {
+      // Bounded fallback: the optimistic identity spans two stage fsyncs, a namespace
+      // sync and two lock waits, so a constant stream of peer appends can void it every
+      // time. Like publishBatch's keyed path, settle any intent (locked recovery) and
+      // commit intent, append, barrier and receipt under ONE lock hold: progress is
+      // guaranteed. The optimistic path keeps its full identity check.
+      meshPublishCounters.keyedLockedFallbacks++;
+      const event = await this.#withLock(this.#preparePublish(input, undefined, undefined, true));
+      // A same-key winner's receipt is confirmed (and its intent cleared) outside custody;
+      // for our own commit this is one more off-lock barrier on an already durable receipt.
+      return this.#confirmReceiptAfterRelease(input, event);
+    }
     const key = input.dedupeKey!;
     const intentPath = this.#dedupePath(key, ".pending.json");
     const receiptPath = this.#dedupePath(key, ".json");
@@ -1304,15 +1343,23 @@ export class MeshStore {
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Freeze ordinary payload/principal bytes once, even if archive validation retries.
     input = this.#capturePublication(input);
-    const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
+    const started = Date.now();
+    const recoveryDeadline = started + this.#lockTimeoutMs;
     let event: MeshEvent;
+    // After the first optimistic conflict, or once half the deadline has passed, a keyed
+    // publish takes the single-lock fallback; at least one such attempt always runs.
+    let conflicts = 0, lockedAttempts = 0;
     for (;;) {
+      const locked = !!input.dedupeKey && (conflicts > 0 || Date.now() - started >= this.#lockTimeoutMs / 2);
       try {
-        event = input.dedupeKey ? await this.#publishKeyed(input)
+        if (locked) lockedAttempts++;
+        event = input.dedupeKey ? await this.#publishKeyed(input, locked)
           : await this.#withLock(this.#preparePublish(input));
         break;
       } catch (error) {
-        if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
+        if (!(error instanceof MeshArchiveRecoveryChanged)) throw error;
+        conflicts++;
+        if (Date.now() >= recoveryDeadline && (!input.dedupeKey || lockedAttempts > 0)) throw error;
         await delay(0);
       }
     }
@@ -2656,17 +2703,64 @@ export class MeshStore {
   #scheduleCompaction(): void {
     try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
     catch { return; }
+    const backoff = compactionBackoff.get(this.#eventsPath);
+    if (backoff && Date.now() < backoff.until) return;
     void this.#startCompaction();
   }
 
-  #startCompaction(): Promise<void> {
+  /** One stager per mesh root: in this process the compactions map, across processes
+   * an O_EXCL claim file. A claim whose pid is gone or that is over-age is replaced. */
+  #claimCompaction(): string | undefined {
+    const file = `${this.#eventsPath}.compacting`;
+    const token = randomUUID();
+    const text = JSON.stringify({ pid: process.pid, token, at: Date.now() });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { fs.writeFileSync(file, text, { flag: "wx", mode: 0o600 }); return token; }
+      catch (error) { if (errorCode(error) !== "EEXIST") return undefined; }
+      const current = this.#readTextFile(file);
+      if (current === undefined) continue;
+      let owner: { pid?: unknown; at?: unknown } = {};
+      try { owner = JSON.parse(current) as typeof owner; } catch { /* malformed: stale */ }
+      let live = typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0 &&
+        typeof owner.at === "number" && Date.now() - owner.at <= COMPACTION_CLAIM_STALE_MS;
+      if (live) {
+        try { process.kill(owner.pid as number, 0); }
+        catch (error) { live = errorCode(error) === "EPERM"; }
+      }
+      // Best effort: re-read so a fresh successor claim is not removed as the stale one.
+      if (live || this.#readTextFile(file) !== current) return undefined;
+      fs.rmSync(file, { force: true });
+    }
+    return undefined;
+  }
+
+  #releaseCompaction(token: string): void {
+    const file = `${this.#eventsPath}.compacting`;
+    try { if ((JSON.parse(this.#readTextFile(file) ?? "{}") as { token?: unknown }).token === token) fs.rmSync(file, { force: true }); }
+    catch { /* best effort; a dead or over-age claim is replaced */ }
+  }
+
+  #startCompaction(force = false): Promise<void> {
     const file = this.#eventsPath;
     const running = compactions.get(file);
     if (running) return running;
+    const defer = (): void => {
+      const delayMs = Math.min(COMPACTION_BACKOFF_MAX_MS, 2 * (compactionBackoff.get(file)?.delayMs ?? COMPACTION_BACKOFF_MIN_MS / 2));
+      compactionBackoff.set(file, { delayMs, until: Date.now() + delayMs });
+    };
     // Never inherit a caller's try-lock budget; errors are only reported.
     const run: Promise<void> = this.#tryLockScope.exit(async () => {
       await delay(0);
-      await this.#compactEventLog();
+      // Another process is staging this root: skip. Explicit maintenance proceeds.
+      const claim = this.#claimCompaction();
+      if (!claim && !force) return;
+      try {
+        if (await this.#compactEventLog() === "deferred") defer();
+        else compactionBackoff.delete(file);
+      } catch (error) {
+        defer();
+        throw error;
+      } finally { if (claim) this.#releaseCompaction(claim); }
     }).catch((error: unknown) => {
       process.emitWarning(`[pi-fabric] Mesh event log compaction deferred: ${error instanceof Error ? error.message : String(error)}`,
         { code: "PI_FABRIC_MESH_COMPACTION" });
@@ -2676,25 +2770,30 @@ export class MeshStore {
   }
 
   /** Await this process's in-flight compaction, then (if still oversized) one more
-   * best-effort attempt. Never rejects. For tests and maintenance tooling. */
+   * best-effort attempt that ignores the backoff and another process's stager claim.
+   * Never rejects. For tests and maintenance tooling. */
   async settleCompaction(): Promise<void> {
     await compactions.get(this.#eventsPath);
     try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
     catch { return; }
-    await this.#startCompaction();
+    await this.#startCompaction(true);
   }
 
-  async #compactEventLog(): Promise<void> {
-    try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return; }
-    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+  async #compactEventLog(): Promise<"done" | "deferred"> {
+    try { if (fs.statSync(this.#eventsPath).size <= this.#maxEventLogBytes) return "done"; }
+    catch (error) { if (errorCode(error) === "ENOENT") return "done"; throw error; }
     // Recovery of legacy durable intents remains conservative. In particular, never
-    // discard the sole live anchor before its authoritative receipt exists. A live
-    // owner's intent stays pending, and the rename below then refuses.
+    // discard the sole live anchor before its authoritative receipt exists.
     try { await this.#settleDedupeIntentsAfterRelease(); }
     catch (error) { if (!(error instanceof MeshArchiveRecoveryChanged)) throw error; }
+    // A live owner's intent stays pending and would refuse the rename: never stage
+    // (up to the retained tail, fsynced) only to discard it. Back off instead.
+    if (this.#hasPendingIntents()) return "deferred";
     // Appends cannot void a prepared snapshot; only a rewrite (dev/ino/generation) can.
     // Then take ONE locked attempt and otherwise wait for the next trigger.
-    if (await this.#compactPrepared() === "overtaken") await this.#compactLocked();
+    const outcome = await this.#compactPrepared();
+    if (outcome === "overtaken") return await this.#compactLocked() ? "done" : "deferred";
+    return outcome === "refused" ? "deferred" : "done";
   }
 
   #readTextFile(file: string): string | undefined {
@@ -2763,6 +2862,7 @@ export class MeshStore {
     try {
       // No mkdir: a removed store root must not be recreated by background work.
       const stage = fs.openSync(temporary, "wx", 0o600);
+      meshPublishCounters.compactionStages++;
       try { fs.writeSync(stage, retained); fs.fsyncSync(stage); }
       finally { fs.closeSync(stage); }
       let staged = snapshot.end;
@@ -2801,7 +2901,7 @@ export class MeshStore {
   }
 
   /** The single fallback after a rewrite overtook the snapshot: prepare under the lock. */
-  async #compactLocked(): Promise<void> {
+  async #compactLocked(): Promise<boolean> {
     const temporary = `${this.#eventsPath}.${process.pid}.${randomUUID()}.retained`;
     try {
       const committed = await this.#withLock(() => {
@@ -2815,6 +2915,7 @@ export class MeshStore {
           retained = this.#retainedTail(descriptor, size).bytes;
         } finally { fs.closeSync(descriptor); }
         const stage = fs.openSync(temporary, "wx", 0o600);
+        meshPublishCounters.compactionStages++;
         try { fs.writeSync(stage, retained); fs.fsyncSync(stage); }
         finally { fs.closeSync(stage); }
         renameAtomic(temporary, this.#eventsPath);
@@ -2822,6 +2923,7 @@ export class MeshStore {
         return true;
       });
       if (committed) syncPathNamespace(this.root);
+      return committed;
     } finally { fs.rmSync(temporary, { force: true }); }
   }
 

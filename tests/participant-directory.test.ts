@@ -2064,3 +2064,111 @@ describe("MeshStore.list", () => {
     expect((store.get("x/a")!.value as { key: string }).key).toBe("a");
   });
 });
+
+// smarty-dev#6477 L6: an idle heartbeat writes nothing, so it must not queue on the mesh lock
+// when another writer's commit already shows the shared state writable.
+describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => {
+  const idleFixture = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-confirm-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:idle", name: "main", kind: "main", sessionId: "idle" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 150 });
+    const other: MeshIdentity = { id: "session:other", name: "other", kind: "main", sessionId: "other" };
+    const writer = new MeshStore(mesh.root, 64 * 1024, 1_000);
+    await writer.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: other });
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "idle")]);
+    directories.push(directory);
+    await directory.refresh();                                 // admission: a real lock receipt
+    await directory.refresh();                                 // settle first-publication migrations
+    const lockPath = path.join(mesh.root, ".lock");
+    // Count real canonical acquisitions: protocol 1 mkdir, protocol 2 rename into place.
+    const mkdir = vi.spyOn(fs, "mkdirSync"), rename = vi.spyOn(fs, "renameSync");
+    const acquisitions = () => mkdir.mock.calls.filter(([target]) => target === lockPath).length +
+      rename.mock.calls.filter(([, target]) => target === lockPath).length;
+    const confirmations = vi.spyOn(mesh, "confirmWritable");
+    const writes = vi.spyOn(mesh, "writeBatch");
+    return { directory, mesh, writer, other, lockPath, acquisitions, confirmations, writes };
+  };
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("takes no mesh lock for an idle confirmation after another writer's commit, and still advances confirmedAt", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    await f.writer.put({ key: "bench/other", value: { at: 1 }, identity: f.other });
+    const committedAt = Date.now();
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.writes).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(committedAt);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(readHostLeases(f.mesh.root).get(f.directory.options.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+    // The next view is canonical, as after confirmWritable: the other writer's commit is visible.
+    expect(f.mesh.get("bench/other")?.value).toEqual({ at: 1 });
+  });
+
+  it("takes the lock exactly once when no unseen commit is evidence, and never confirms behind a stuck holder", async () => {
+    const f = await idleFixture();
+    const baseline = f.acquisitions();
+    await f.directory.refresh();                               // nothing committed since its receipt
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    // Evidence already behind a receipt never confirms twice; a stuck holder commits nothing.
+    const confirmed = f.directory.confirmedAt();
+    fs.mkdirSync(f.lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(f.lockPath, "owner"), "stuck\n" + process.pid + "\n" + Date.now() + "\n");
+    try {
+      await expect(f.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(f.directory.confirmedAt()).toBe(confirmed);
+      expect(f.directory.canConsumeMesh()).toBe(false);
+    } finally { fs.rmSync(f.lockPath, { recursive: true, force: true }); }
+  });
+
+  it("recovers an overdue or failed chain only with a real lock receipt, even after another commit", async () => {
+    const f = await idleFixture();
+    const failure = new Error("shared confirmation blocked");
+    f.confirmations.mockRejectedValueOnce(failure);
+    await expect(f.directory.refresh()).rejects.toBe(failure);
+    await f.writer.put({ key: "bench/other", value: { at: 2 }, identity: f.other });
+    const baseline = f.acquisitions();
+    await f.directory.refresh();                               // a failed refresh needs the lock again
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(f.confirmations).toHaveBeenCalledTimes(2);
+    // Overdue: two heartbeats without a receipt. Fresh evidence does not restart the chain.
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now + 120_000);
+    try {
+      await f.writer.put({ key: "bench/other", value: { at: 3 }, identity: f.other });
+      // That commit is one second old on the advanced clock: only the overdue chain refuses it.
+      const witness = path.join(f.mesh.root, "state.json");
+      fs.utimesSync(witness, fs.statSync(witness).atime, new Date(now + 119_000));
+      await f.directory.refresh();
+      expect(f.confirmations).toHaveBeenCalledTimes(3);
+    } finally { clock.mockRestore(); }
+  });
+
+  it("lets one real confirmation on an idle mesh serve another idle participant without the lock", async () => {
+    const f = await idleFixture();
+    const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
+    const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
+      rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
+    directories.push(second);
+    await second.refresh();
+    await second.refresh();
+    await f.directory.refresh();                               // absorbs the second's first commits
+    const confirmationsBefore = f.confirmations.mock.calls.length;
+    await f.directory.refresh();                               // nothing unseen: a real, witnessed acquisition
+    expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
+    const before = second.confirmedAt(), baseline = f.acquisitions();
+    const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
+    await second.refresh();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(secondConfirms).not.toHaveBeenCalled();
+    expect(second.confirmedAt()).toBeGreaterThan(before);
+  });
+});

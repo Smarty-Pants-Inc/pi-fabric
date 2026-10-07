@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const EXTENSION_FLAGS = new Set(["-e", "--extension"]);
 
@@ -42,15 +43,40 @@ const canonical = (file: string): string => {
 };
 
 // The Fabric package root that a Pi extension argument loads: the package directory, one of
-// its `pi.extensions` entries, or `src/index.ts` (development). Any other file in the
+// its `pi.extensions` entries, either supported compiled entry, or `src/index.ts`
+// (development). Any other file in the
 // package, such as the worker's activation-window hook, loads a hook and not Fabric.
 const requestedFabricRoot = (requested: string): string | undefined => {
   const directoryPackage = fabricPackageIn(requested);
   if (directoryPackage) return directoryPackage.root;
   const fabric = fabricPackageOf(requested);
   if (!fabric) return undefined;
-  const entries = [...fabric.extensions, "src/index.ts"].map((entry) => canonical(path.resolve(fabric.root, entry)));
+  const entries = [...fabric.extensions, "dist/index.js", "dist/extension-bootstrap.js", "src/index.ts"].map((entry) => canonical(path.resolve(fabric.root, entry)));
   return entries.includes(requested) ? fabric.root : undefined;
+};
+
+/**
+ * Suppress registration aliases on this host's event bus, not in a process-global
+ * singleton: SDK hosts and reloads must remain independent. Pi emits bus events
+ * synchronously; the first alias answers subsequent claims until shutdown.
+ */
+export const claimFabricRegistration = (
+  ownEntry: string,
+  pi: Pick<ExtensionAPI, "events" | "on">,
+): boolean => {
+  const entry = canonical(ownEntry);
+  const root = canonical(fabricPackageOf(entry)?.root ?? path.dirname(entry));
+  const channel = "pi-fabric:registration-claim:v1";
+  const claim = { root, claimed: false };
+  pi.events.emit(channel, claim);
+  if (claim.claimed) return false;
+  const release = pi.events.on(channel, (data: unknown) => {
+    if (data && typeof data === "object" && (data as { root?: unknown }).root === root) {
+      (data as { claimed: boolean }).claimed = true;
+    }
+  });
+  pi.on("session_shutdown", () => { release(); });
+  return true;
 };
 
 /**

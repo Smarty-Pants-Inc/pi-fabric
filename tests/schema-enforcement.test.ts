@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, type FabricSchemaMode } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
+import { currentOwnerIdentity } from "../src/core/atomic-write.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
@@ -500,6 +501,141 @@ describe("Schema transactions", () => {
       (item) => item.status === "fulfilled" && item.value.outcome === "committed",
     );
     expect(committed).toHaveLength(1);
+  });
+
+  it.each(["namespace", "host", "malformed"])("security round: refuses recovery of a stale unconfirmed %s owner", kind => {
+    const setup = fixture();
+    const target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "owner applying\n");
+    const journalRoot = path.join(setup.mesh.root, "schema-transactions");
+    const owner = { ...currentOwnerIdentity(), heartbeatAt: Date.now() - 120_000,
+      ...(kind === "namespace" ? { pidNamespace: "pid:[foreign]" } : {}),
+      ...(kind === "host" ? { hostname: "other-host" } : {}) };
+    const lock = `${kind === "malformed" ? 2147483647 : process.pid}\n0\n${kind === "malformed" ? "broken" : JSON.stringify(owner)}\n`;
+    fs.writeFileSync(path.join(journalRoot, ".commit.lock"), lock);
+    const journal = JSON.stringify({ format: 1, id: "live", status: "applying", before: [{
+      path: "a.txt", absolute: target, existed: true, content: Buffer.from("before\n").toString("base64"), mode: 0o644,
+    }], createdAt: 0 });
+    fs.writeFileSync(path.join(journalRoot, "live.json"), journal);
+    new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state);
+    expect(fs.readFileSync(target, "utf8")).toBe("owner applying\n");
+    expect(fs.readFileSync(path.join(journalRoot, ".commit.lock"), "utf8")).toBe(lock);
+    expect(fs.readFileSync(path.join(journalRoot, "live.json"), "utf8")).toBe(journal);
+  });
+
+  it("security round: a superseded transaction neither mutates nor removes the successor lock", async () => {
+    const setup = fixture();
+    const target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "alpha\n");
+    const artifacts = await hypothesisAndCertificate(setup, [{ kind: "file_exists", path: "a.txt" }]);
+    const lockPath = path.join(setup.mesh.root, "schema-transactions", ".commit.lock");
+    const successor = `${process.pid}\n${Date.now()}\n${JSON.stringify({ ...currentOwnerIdentity(), token: "successor" })}\n`;
+    const original = setup.mesh.put.bind(setup.mesh);
+    const put = vi.spyOn(setup.mesh, "put").mockImplementation(async request => {
+      const result = await original(request);
+      if (request.key.startsWith("schema/certificate/")) fs.writeFileSync(lockPath, successor);
+      return result;
+    });
+    try {
+      await expect(setup.controller.commit({ hypothesisId: artifacts.hypothesisId, certificate: artifacts.certificate,
+        operations: [{ kind: "write", path: "a.txt", content: "beta\n", expected: { sha256: sha("alpha\n") } }],
+        postconditions: [{ kind: "file_contains", path: "a.txt", literal: "beta" }],
+      }, artifacts.context)).rejects.toThrow(/ownership lost/);
+      expect(fs.readFileSync(target, "utf8")).toBe("alpha\n");
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(successor);
+      expect(setup.mesh.get("schema/workspace")).toBeUndefined();
+    } finally { put.mockRestore(); }
+  });
+
+  it("security round: recovery holds the same guard used by commit acquisition", () => {
+    const setup = fixture();
+    const target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "mutated\n");
+    const journalRoot = path.join(setup.mesh.root, "schema-transactions");
+    fs.writeFileSync(path.join(journalRoot, "guarded.json"), JSON.stringify({ format: 1, id: "guarded", status: "applying", before: [{
+      path: "a.txt", absolute: target, existed: true, content: Buffer.from("before\n").toString("base64"), mode: 0o644,
+    }], createdAt: 0 }));
+    const original = fs.writeFileSync.bind(fs);
+    let observed = false;
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(((file: any, ...args: any[]) => {
+      if (file === target) {
+        observed = true;
+        expect(fs.existsSync(path.join(journalRoot, ".commit.guard", "owner"))).toBe(true);
+      }
+      return (original as any)(file, ...args);
+    }) as any);
+    try { new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state); }
+    finally { write.mockRestore(); }
+    expect(observed).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("before\n");
+  });
+
+  it("security round: ownership loss during postconditions cannot roll back a successor", async () => {
+    const setup = fixture();
+    const target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "alpha\n");
+    const artifacts = await hypothesisAndCertificate(setup, [{ kind: "file_exists", path: "a.txt" }]);
+    const lockPath = path.join(setup.mesh.root, "schema-transactions", ".commit.lock");
+    const successor = `${process.pid}\n${Date.now()}\n${JSON.stringify({ ...currentOwnerIdentity(), token: "successor" })}\n`;
+    setup.config.trustedCommands.replace_lock = { command: process.execPath, shell: false, timeoutMs: 5000,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor)})`],
+    };
+    await expect(setup.controller.commit({ hypothesisId: artifacts.hypothesisId, certificate: artifacts.certificate,
+      operations: [{ kind: "write", path: "a.txt", content: "beta\n", expected: { sha256: sha("alpha\n") } }],
+      postconditions: [{ kind: "trusted_command", name: "replace_lock" }],
+    }, artifacts.context)).rejects.toThrow(/ownership lost/);
+    expect(fs.readFileSync(target, "utf8")).toBe("beta\n");
+    expect(fs.readFileSync(lockPath, "utf8")).toBe(successor);
+    const journals = fs.readdirSync(path.dirname(lockPath)).filter(file => file.endsWith(".json"));
+    expect(journals).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(lockPath), journals[0]!), "utf8"))).toMatchObject({ status: "applying" });
+  });
+
+  it.each(["gone", "reused", "denied", "unobservable"])("incarnation recovery: %s requires confirmed death", kind => {
+    const setup = fixture();
+    const target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "mutated\n");
+    const journalRoot = path.join(setup.mesh.root, "schema-transactions");
+    const owner = currentOwnerIdentity();
+    const shiftedIncarnation = kind === "reused" || kind === "unobservable";
+    const pid = shiftedIncarnation ? process.pid : 2147483647;
+    const lock = `${pid}\n0\n${JSON.stringify({ ...owner, startedAt: owner.startedAt - (shiftedIncarnation ? 30_000 : 0) })}\n`;
+    fs.writeFileSync(path.join(journalRoot, ".commit.lock"), lock);
+    const journalPath = path.join(journalRoot, "incarnation.json");
+    const journal = JSON.stringify({ format: 1, id: "incarnation", status: "applying", before: [{
+      path: "a.txt", absolute: target, existed: true, content: Buffer.from("before\n").toString("base64"), mode: 0o644,
+    }], createdAt: 0 });
+    fs.writeFileSync(journalPath, journal);
+    const kill = process.kill.bind(process);
+    const probe = vi.spyOn(process, "kill").mockImplementation((candidate, signal) => {
+      if (candidate === 2147483647) throw Object.assign(new Error(kind), { code: kind === "gone" ? "ESRCH" : "EPERM" });
+      return kill(candidate, signal);
+    });
+    // Exercise the real recovery/liveness path with an unavailable native start
+    // reader too: neither Linux procfs failure nor Windows' absent procfs can
+    // turn a stale timestamp plus a live PID into confirmed incarnation death.
+    const read = fs.readFileSync;
+    const nativeStart = vi.spyOn(fs, "readFileSync").mockImplementation(((file: any, ...args: any[]) => {
+      if (kind === "unobservable" && String(file) === `/proc/${process.pid}/stat`) {
+        throw Object.assign(new Error("native start unavailable"), { code: "ENOENT" });
+      }
+      return (read as any)(file, ...args);
+    }) as typeof fs.readFileSync);
+    try { new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state); }
+    finally { nativeStart.mockRestore(); probe.mockRestore(); }
+    // A stale wall-clock timestamp alone is not native incarnation evidence.
+    // Windows (and Linux without procfs identity) must retain the live lock:
+    // there is no comparable boot/start pair for proving this PID was reused.
+    const confirmedDeath = kind === "gone" || (kind === "reused" && owner.bootId !== undefined);
+    expect(fs.readFileSync(target, "utf8")).toBe(confirmedDeath ? "before\n" : "mutated\n");
+    const lockPath = path.join(journalRoot, ".commit.lock");
+    expect(fs.existsSync(lockPath)).toBe(!confirmedDeath);
+    if (confirmedDeath) {
+      expect(JSON.parse(fs.readFileSync(journalPath, "utf8"))).toMatchObject({ status: "rolled_back" });
+    } else {
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(lock);
+      expect(fs.readFileSync(journalPath, "utf8")).toBe(journal);
+    }
   });
 
   it("recovers an applying crash journal before accepting new transactions", () => {

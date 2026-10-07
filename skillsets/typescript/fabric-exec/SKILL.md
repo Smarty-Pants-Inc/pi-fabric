@@ -9,9 +9,9 @@ description: >-
 
 # fabric_exec — core reference
 
-One program in the **TypeScript kernel**. Write TypeScript only in `code`. There is **no per-call kernel selector**, language autodetection, or fallback. Only the `return` value reaches the model; `print()` goes to activity logs. `π` is payload data, not a tool.
+One program in the **TypeScript kernel**. Write TypeScript only in `code`. There is **no per-call kernel selector**, language autodetection, or fallback. Returned values and explicitly emitted `print()`/`console` output reach the model; intermediate values stay in the sandbox. `π` is payload data, not a tool.
 
-QuickJS is isolated by default and receives static type checking; native Node/Bun is an explicit trusted-code escape hatch. Do not switch interpreters through shell commands to perform Fabric orchestration. Only the returned value reaches the model; logs go to activity output.
+QuickJS is isolated by default and receives static type checking; native Node/Bun is an explicit trusted-code escape hatch. Do not switch interpreters through shell commands to perform Fabric orchestration. Prefer one compact return value. Explicit log output is also included in the bounded tool result, so do not print raw intermediate payloads.
 
 ## `pi` core tools (full code mode only)
 `pi.<tool>(arg)` — single arg: bare string (primary field) or options object, or a two-arg `(primary, options)` merge for the string-primary tools (`read`/`bash`/`powershell`/`ls`/`grep`/`find`): `pi.read('index.ts', { limit: 120 })` becomes `{ path: 'index.ts', limit: 120 }`, the positional string winning the primary field on conflict; a non-object second arg on those is still a type error. Positional tuple calls are accepted for `grep`/`find` (`pattern, path, limit`), `write` (`path, content`), and `edit` (`path, oldText, newText`).
@@ -74,7 +74,7 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `state.get()` | `{head,goal,complexity,certification,recentLabels:string[]}` |
 | `state.history(args?)` | `{transitions:unknown[],labels:string[],certifications:unknown[]}` |
 | `state.complexity(args?)` | `{files:ComplexityFile[],netDelta:number}` |
-| `state.verify(args?)` | `{certified,violated,certificationStatus,results,failures,certificate?,reportingError?,evidenceDigest,resultDigest}` |
+| `state.verify(args?)` | `{certified,violated,certificationStatus,results,failures,certificate?,reportingError?,evidenceDigest,resultDigest,binding?,observed?,requestedBy}`; `args.binding` (`{commit?,specDigest?,...}`) binds the certificate, and a commit that differs from git HEAD fails closed |
 | `state.goal(args)` | mesh state entry `{key,value,version,updatedAt,updatedBy}` |
 | `state.checkGoal(args?)` | `{passed:boolean,output:string,exitCode:number\|null,error?}` |
 | `schema.status()` | `{mode,certificateTtlMs,maxFiles,maxBytes,trustedCommands,generation,lastOutcome,hypotheses}` |
@@ -91,11 +91,23 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `components.graph()` | `{components:FabricComponentInfo[],edges:Array<{from,to,ref}>,cycles:string[][]}` |
 | `components.reload({id?}?)` | `{components:FabricComponentInfo[]}`; rolls back activation failure when cleanup succeeds |
 | `compact.request(args?)` | `{requested:true,intent:{reason?,instructions?,preserve?,requestedBy,requestedAt}}` |
-| `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?}}` |
+| `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?},lastAuto?:{at,trigger,committed},owner,outputReserveTokens}` |
+| `compact.pressure()` | `{tokens,contextWindow,fraction,headroomTokens,band:"ok"\|"warn"\|"urgent"\|"unknown",outputReserveTokens,thresholdFraction?,thresholdTokens?,owner}`; read-only |
+| `compact.carry({items?,add?,remove?,clear?}?)` | `{items}`; no args reads; persistent focus rendered in every Fabric summary until cleared (≤16 items) |
 | `compact.cancel()` | `{cancelled:true}` |
 | `cache.status({target?}?)` | Local session cache observations, live leases, capability/cleanup diagnostics; observations do not prove residency |
 | `cache.hold({target?,durationMs,maxRefreshes?,maxCostUsd?})` | `{status:"held",id,scope,sessionId,model,expiresAt}` or an unsupported/unavailable result with a reason; paid native opt-in, no fallback; cost/count bounds currently unsupported |
 | `cache.release({id})` | `{released,cleanupError}`; session-owned holds only; expiry/cleanup is not a refund |
+| `thinking.status()` | `{level,available,bounds:{min,max},baseline,override?:{level,scope,remainingTurns?,reason?,setAt}}` |
+| `thinking.set({level,scope?,turns?,reason?})` | status plus `clamped:true,requested` when clamped; `scope` `"turn"` (default, reverts at agent_end) / `"turns"` (needs `turns` 1–20) / `"session"` |
+| `thinking.reset()` | status after restoring the baseline level |
+| `decisions.raise({title,kind?,body?,options?,input?,holder?,timeoutMs?\|deadline?,onExpire?,defaultOptionId?,escalation?})` | `{id}`; durable pending approval/question/escalation in the mesh; `holder` `"user"` (default, humans only) / `"root"` / `"supervisor:<id>"`; `onExpire:"escalate"` with `escalation:{chain?,hopTimeoutMs?,onFinal?}` moves it up the chain (default supervisor→root→user) per expired hop |
+| `decisions.wait({id,timeoutMs?})` | the record once answered/expired/cancelled (still `open` on timeout): `{status,answer?:{optionId?,text?,answeredBy,via,at},...}` |
+| `decisions.list({status?,holder?,limit?}?)` | records newest first; read-only |
+| `decisions.answer({id,optionId?,text?})` / `decisions.escalate({id,reason?})` / `decisions.cancel({id})` | the updated record; refused for `"user"` holders, other participants' holds, and decisions raised in the same call; `escalate` hands it to the next chain holder now |
+| `programs.save({name,code?,kind?,kernel?,jevProgram?,description?,inputSchema?})` | `{ref:"name@digest12",digest}`; always a candidate; identical content returns the same ref |
+| `programs.list({name?,status?}?)` / `programs.get({ref})` | summaries `{ref,name,digest,kind,kernel?,status,createdAt,...}` / the full record; read-only |
+| `programs.run({ref,input?,requirePromoted?})` | the program's return value; runs nested with this program's capabilities and approvals; `input` is its `input` global |
 | `jev.evaluate(args)` | `{model,answers,usage:{input_tokens,output_tokens}}`; typed Choice/Noul/Score answers, not generated text |
 | `jev.run({program,input})` | terminal `FabricJevRun`: `{id,state,result?,error?,evaluations,toolCalls,usage,events,nextSequence,logs,...}` |
 | `jev.spawn({program,input,observe?})` | `FabricJevRun` initially `running`; session-owned, not restart-durable |
@@ -104,6 +116,12 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `jev.join({id})` | alias for `jev.wait`, with the same arguments, result, and cancellation behavior |
 | `jev.advise({id,eventId,message})` | `{delivered,reason?}`; current observed event only; explicit delivery, agent approvals, freshness and feedback gates apply |
 | `jev.stop({id})` | terminal run envelope after cancellation/cleanup; no rollback of already-issued effects |
+
+`decisions.*` waits on a human or holder without blocking a UI; a person answers with `/fabric decisions` or `pi-fabric decisions answer`. Never try to answer your own approval. See [durable decisions](../../../docs/decisions.md).
+
+`programs.*` stores reusable programs by content digest; a ref is `name` (latest promoted, else latest candidate), `name@<digest prefix ≥12>`, or a full digest. Only the user promotes or retires (`/fabric programs`). See [saved programs](../../../docs/programs.md).
+
+`thinking.set` changes Main's reasoning effort for a bounded scope, clamped into `thinking.bounds` and the model's levels; it never fights a level the user changed meanwhile. See [thinking control](../../../docs/thinking.md).
 
 `cache` targets the local Pi session (`self`); `main` is accepted only in root runtimes. Holds require a compatible native scoped-warming API, are bounded to 1–1800 seconds, and never change native settings. Current stock SDKs return unsupported. Never simulate warming with prompts. See [prompt-cache contracts](../../../docs/prompt-cache.md).
 
@@ -148,7 +166,7 @@ For an explicit implementation handoff, `agents.handoff({ model, task?, when? })
 
 Persistent actors may declare `requires: ["provider.action", { ref: "provider.optional", optional: true }]`. Each run records and verifies a closed-world descriptor commitment; missing required refs fail the activation instead of widening authority.
 
-Agent requests and persistent actors accept `runner: "pi" | "claude"`. Pi is the default and is required for `recursive: true`, `rlm.query()`, and actors that must call Fabric or mesh APIs themselves. Claude invokes the official `claude -p` harness; it supports mapped Claude Code tools and host-managed persistent actors, but not recursive/direct Fabric APIs. Use `agents.models({ runner: "claude" })` for runtime-enumerated `claude/<value>` model keys.
+Agent requests and persistent actors accept `runner: "pi-durable" | "pi" | "claude"`. `pi` remains the fleet default Pi CLI; explicit `pi-durable` selects the isolated durable Pi host. Both support `recursive: true`, `rlm.query()`, and actors that call Fabric or mesh APIs. Durable checkpoints do not restore arbitrary in-flight `fabric_exec` continuations. Claude invokes the official `claude -p` harness; it supports mapped Claude Code tools and host-managed persistent actors, but not recursive/direct Fabric APIs. Use `agents.models({ runner: "claude" })` for runtime-enumerated `claude/<value>` model keys.
 
 For Pi model selection, copy `key` from `agents.models({ runner: "pi" })`, reuse a successful handle's `model`, or use a configured alias. Never infer a model's version from an agent name or another model's version. Exact provider/model matches win; near-miss IDs resolve to the closest available model on that same provider. Check the returned handle's canonical `model`. Unknown providers and unrelated names still fail. For independent launches, await `Promise.allSettled` and inspect every result: an uncaught `Promise.all` rejection ends the program and can abort still-pending siblings. Preserve successful handles when retrying failures.
 

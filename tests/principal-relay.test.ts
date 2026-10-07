@@ -44,7 +44,7 @@ const router = (h: ReturnType<typeof host>, mesh: MeshStore, targets: ReturnType
   const control = new FabricControlPlane(mesh, h.identity, { enabled: true, hostId: h.identity.id, pollMs: 10, acknowledgementTimeoutMs: 2_000 });
   cleanup.push(() => control.close());
   const routes = new AgentMessageRouter({} as any, { identity: h.identity } as any, h.main,
-    { get: (id: string) => { const peer = targets.find(t => t.identity.id === id); return peer && { id, kind: "root", ownerHostId: id, ownerIdentityId: id, rootId: id, capabilities: ["steer", "followUp"], status: "idle", local: false }; }, scheduleRefresh() {} } as any,
+    { get: (id: string) => { const peer = targets.find(t => t.identity.id === id); return peer && { id, kind: "root", ownerHostId: id, ownerIdentityId: id, rootId: id, controlProtocol: "v1", capabilities: ["steer", "followUp"], status: "idle", local: false }; }, scheduleRefresh() {} } as any,
     control, b => b);
   control.start((command, from, signal, verification) => routes.acceptControl(command, from, signal, verification));
   return { routes, control };

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
 import { checkedPrewalkPlan } from "../src/prewalk/plan.js";
 import { captureLoadedFileIdentity } from "../src/build-identity.js";
@@ -27,6 +28,75 @@ const plan = {
 };
 
 describe("prewalk provider", () => {
+  it.each([
+    ["idle", false], ["awaiting", true], ["disabled", false], ["other-session", false],
+    ["recorded", false], ["handing-off", false], ["continuation", false],
+    ["cancelled", false], ["rearmed", true],
+  ] as const)("keeps all discovery surfaces live and session-scoped (%s)", async (phase, available) => {
+    const controller = new PrewalkController();
+    const provider = new PrewalkProvider(controller);
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const context = contextFor();
+    const arm = { model: "anthropic/executor", sessionId: "session-1", requirePlan: true };
+    try {
+      // Discover before every transition to catch stale cached availability.
+      expect((await registry.list({}, context)).map(action => action.ref)).toEqual(["prewalk.status"]);
+      if (phase !== "idle") controller.arm({
+        ...arm,
+        sessionId: phase === "other-session" ? "other" : arm.sessionId,
+        requirePlan: phase !== "disabled",
+      });
+      if (["recorded", "handing-off", "continuation", "rearmed"].includes(phase)) {
+        await provider.invoke("plan", plan, context);
+      }
+      if (phase === "handing-off" || phase === "continuation") {
+        controller.claim([{ ref: "pi.write", nestedToolCallId: "write", startedAt: 1, success: true }], "session-1");
+        if (phase === "continuation") controller.beginContinuation("continuation-1", "anthropic/frontier");
+      }
+      if (phase === "cancelled") controller.cancel();
+      if (phase === "rearmed") controller.arm(arm);
+
+      const expected = available ? ["plan", "status"] : ["status"];
+      expect((await provider.list({}, context)).map(action => action.name)).toEqual(expected);
+      expect((await provider.list({ query: "PLAN" }, context)).some(action => action.name === "plan")).toBe(available);
+      expect(await provider.describe("unknown", context)).toBeUndefined();
+      expect(await provider.describe("status", context)).toMatchObject({ name: "status" });
+      expect((await registry.list({ provider: "prewalk" }, context)).map(action => action.name)).toEqual(expected);
+      expect((await registry.search("prewalk.plan", context)).some(action => action.ref === "prewalk.plan")).toBe(available);
+      const catalog = await registry.catalog(context, { provider: "prewalk" });
+      expect(catalog.providers[0]?.actions.map(action => action.name)).toEqual(expected);
+      if (available) {
+        expect(await provider.describe("plan", context)).toMatchObject({ name: "plan" });
+        const descriptor = await registry.describe("prewalk.plan", context);
+        expect(descriptor.description).toContain("only when this session is awaiting one");
+        expect(descriptor.description).toContain("Not a general task planner, checklist, or acceptance-ledger store");
+        // No status preflight: discovery already supplies eligibility.
+        const result = await registry.invoke("prewalk.plan", plan, {
+          ...context, approve: async () => {}, audits: [], maxResultChars: 10_000,
+        });
+        expect(result).toMatchObject({ recorded: true });
+        expect((await registry.list({}, context)).map(action => action.name)).toEqual(["status"]);
+        await expect(registry.describe("prewalk.plan", context)).rejects.toThrow(/Unknown Fabric action/);
+      } else {
+        expect(await provider.describe("plan", context)).toBeUndefined();
+        await expect(registry.describe("prewalk.plan", context)).rejects.toThrow(/Unknown Fabric action/);
+        await expect(provider.invoke("plan", plan, context)).rejects.toThrow(/not awaiting/);
+      }
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it("still validates a call whose descriptor was discovered before cancellation", async () => {
+    const controller = new PrewalkController();
+    const provider = new PrewalkProvider(controller);
+    controller.arm({ model: "anthropic/executor", sessionId: "session-1", requirePlan: true });
+    expect(await provider.describe("plan", contextFor())).toMatchObject({ name: "plan" });
+    controller.cancel();
+    await expect(provider.invoke("plan", plan, contextFor())).rejects.toThrow(/not awaiting/);
+  });
+
   it("records the plan that closes the readiness gate", async () => {
     const controller = new PrewalkController();
     controller.arm({ model: "anthropic/executor", sessionId: "session-1", requirePlan: true });

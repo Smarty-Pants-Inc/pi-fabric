@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { hostGlobalsGuidance } from "../src/core/system-guidance.js";
+import ts from "typescript";
 import { normalizeFabricConfig } from "../src/config.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import type { FabricState } from "../src/fabric-state.js";
@@ -10,20 +11,27 @@ import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 describe("prewalk prompt isolation", () => {
   it("does not add prewalk state or guidance to before_agent_start", () => {
     const extensionSource = fs.readFileSync(
-      path.join(process.cwd(), "src", "index.ts"),
+      path.join(process.cwd(), "src", "extension.ts"),
       "utf8",
     );
     const toolSource = fs.readFileSync(
       path.join(process.cwd(), "src", "fabric-exec-tool.ts"),
       "utf8",
     );
-    const start = extensionSource.indexOf('pi.on("before_agent_start"');
-    const end = extensionSource.indexOf("registerFabricCommand", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-
-    const handler = extensionSource.slice(start, end);
-    expect(handler.toLowerCase()).not.toContain("prewalk");
+    const source = ts.createSourceFile("extension.ts", extensionSource, ts.ScriptTarget.Latest, true);
+    const handlers: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === "pi.on" &&
+          node.arguments[0] && ts.isStringLiteral(node.arguments[0]) &&
+          node.arguments[0].text === "before_agent_start") {
+        expect(node.arguments[1]).toBeDefined();
+        handlers.push(node.arguments[1]!.getText(source));
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(handlers.length).toBeGreaterThan(0);
+    for (const handler of handlers) expect(handler.toLowerCase()).not.toContain("prewalk");
 
     const guidelinesStart = toolSource.indexOf("promptGuidelines: [");
     const guidelinesEnd = toolSource.indexOf("parameters:", guidelinesStart);
@@ -48,7 +56,7 @@ describe("prewalk prompt isolation", () => {
 
     expect(visibleGuidelines).toHaveLength(6);
     expect(visibleGuidelineChars).toBeLessThanOrEqual(2_200);
-    expect(guidelines).toContain("acceptance ledger");
+    expect(guidelines).toContain("acceptance ledger in reasoning or concise progress notes (no tool call)");
     expect(guidelines).toContain("direct behavioral probes");
     expect(guidelines).toContain("requested public symbols, registrations, and configuration entries");
     expect(guidelines).toContain("smallest checks that cover the ledger");
@@ -89,7 +97,7 @@ describe("prewalk prompt isolation", () => {
 
   it("runs handoff from finalized outer message_end without aborting nested calls", () => {
     const extensionSource = fs.readFileSync(
-      path.join(process.cwd(), "src", "index.ts"),
+      path.join(process.cwd(), "src", "extension.ts"),
       "utf8",
     );
     const toolSource = fs.readFileSync(
@@ -106,7 +114,7 @@ describe("prewalk prompt isolation", () => {
   });
 
   it("disarms the captured task from the agent_settled lifecycle", () => {
-    const source = fs.readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8");
+    const source = fs.readFileSync(path.join(process.cwd(), "src", "extension.ts"), "utf8");
     const start = source.indexOf('pi.on("agent_settled"');
     const end = source.indexOf('pi.on("tool_call"', start);
 
@@ -116,7 +124,7 @@ describe("prewalk prompt isolation", () => {
   });
 
   it("restores the borrowed Main model when a session starts", () => {
-    const source = fs.readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8");
+    const source = fs.readFileSync(path.join(process.cwd(), "src", "extension.ts"), "utf8");
     const start = source.indexOf('pi.on("session_start"');
     const end = source.indexOf('pi.on("session_tree"', start);
 

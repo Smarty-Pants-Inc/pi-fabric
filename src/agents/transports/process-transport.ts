@@ -10,7 +10,7 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
+import { executeFile, findExecutable, spawnDetached, type DetachedProcessHandle } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
@@ -130,11 +130,20 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
     }
     if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+    const transportHandle = (handle: DetachedProcessHandle): AgentTransportHandle => ({
+      kind: this.kind,
+      ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
+      sessionId: String(handle.pid),
+      isAlive: handle.isAlive, lostContact: handle.lostContact,
+      ...(handle.stopDebt ? { stopDebt: handle.stopDebt } : {}),
+      waitForClose: handle.waitForClose, closed: handle.closed, stop: handle.stop,
+      ...(handle.readStderr ? { readStderr: handle.readStderr } : {}),
+    });
     const processHandle = await spawnDetached(
       selected.workerPath,
       workerArguments,
       request.cwd,
-      request,
+      { ...request, onCustody: handle => request.onCustody?.(transportHandle(handle)) },
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
       applyTaskReturnAddress(
@@ -142,20 +151,11 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         workerArguments,
       ),
+      { captureStderr: true },
       executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );
-    return {
-      kind: this.kind,
-      ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
-      sessionId: String(processHandle.pid),
-      isAlive: processHandle.isAlive,
-      lostContact: processHandle.lostContact,
-      ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
-      waitForClose: processHandle.waitForClose,
-      closed: processHandle.closed,
-      stop: processHandle.stop,
-    };
+    return transportHandle(processHandle);
   }
 }

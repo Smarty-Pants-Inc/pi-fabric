@@ -253,14 +253,20 @@ export const createDashboardSnapshot = (
         : agent;
     });
   const localAgentIds = new Set(localAgents.map((agent) => agent.id));
+  // This snapshot describes one session. The project-scoped directory also
+  // carries agents owned by other concurrent sessions of the same project;
+  // they are not this conversation's work and stay out of its agent rows.
   const remoteAgents: FabricUiAgent[] = participants
-    .filter((participant) => participant.kind === "agent" && !localAgentIds.has(participant.id))
+    .filter((participant) =>
+      (participant.kind === "agent" || participant.kind === "provider") &&
+      participant.rootId === main.id &&
+      !localAgentIds.has(participant.id))
     .map((participant) => ({
       id: participant.id,
       name: participant.name,
       status: participant.status,
-      runner: participant.runner,
-      transport: participant.transport,
+      ...(participant.runner ? { runner: participant.runner } : {}),
+      transport: participant.provider ? `provider ${participant.provider}` : participant.transport,
       cwd: participant.cwd ?? "",
       ...(participant.model ? { model: participant.model } : {}),
       ...(participant.thinking ? { thinking: participant.thinking } : {}),

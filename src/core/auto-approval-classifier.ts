@@ -228,47 +228,13 @@ const projectSessionActions = (branch: readonly unknown[]): { actions: FabricSes
   return { actions: kept, truncated };
 };
 
-type CompleteSimpleFn = typeof import("@earendil-works/pi-ai/compat").completeSimple;
-type CompleteSimpleArgs = Parameters<CompleteSimpleFn>;
-
-let completeSimpleLoader: Promise<CompleteSimpleFn> | undefined;
-const loadCompleteSimple = (): Promise<CompleteSimpleFn> => {
-  completeSimpleLoader ??= import("@earendil-works/pi-ai/compat")
-    .then((module) => module.completeSimple);
-  return completeSimpleLoader;
-};
-
-interface NativeClassifierProvider {
-  streamSimple(
-    model: CompleteSimpleArgs[0],
-    context: CompleteSimpleArgs[1],
-    options: CompleteSimpleArgs[2],
-  ): { result(): ReturnType<CompleteSimpleFn> };
-}
-
-// Newer Pi runtimes expose their effective provider directly. Older supported
-// versions register custom stream implementations in pi-ai/compat instead.
-const nativeProvider = (
-  context: ExtensionContext,
-  providerId: string,
-): NativeClassifierProvider | undefined => {
-  const registry = context.modelRegistry as typeof context.modelRegistry & {
-    getProvider?(provider: string): NativeClassifierProvider | undefined;
-  };
-  return registry.getProvider?.(providerId);
-};
-
+// The host registry normalizes Context into TranscriptContext, resolves native
+// providers and request-time auth. Calling Provider.streamSimple directly with
+// legacy systemPrompt/tools fields loses the classifier contract on Pi 0.99.
 const completeWithPiProvider = async (
   context: ExtensionContext,
-  model: CompleteSimpleArgs[0],
-  request: CompleteSimpleArgs[1],
-  options: CompleteSimpleArgs[2],
-) => {
-  const provider = nativeProvider(context, model.provider);
-  if (provider) return provider.streamSimple(model, request, options).result();
-  const completeSimple = await loadCompleteSimple();
-  return completeSimple(model, request, options);
-};
+  ...args: Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>
+) => context.modelRegistry.streamSimple(...args).result();
 
 const configuredModel = (context: ExtensionContext, modelKey?: string) => {
   if (!modelKey) return context.model;

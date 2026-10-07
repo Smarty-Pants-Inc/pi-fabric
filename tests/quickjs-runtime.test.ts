@@ -1152,6 +1152,17 @@ return "done";
     expect(request).toMatchObject({ task: "map", runner: "pi", recursive: true });
   });
 
+  it("keeps explicit legacy Pi selection and rejects non-recursive runners for RLM", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const result = await new QuickJsRuntime().execute(
+      `await rlm.query({ task: "map", runner: "pi" }); try { await rlm.query({ task: "map", runner: "claude" }); } catch (error) { return error.message; }`,
+      async (_ref, args) => { calls.push(args); return { status: "completed", text: "done" }; }, options,
+    );
+    expect(result.value).toContain("requires a Pi runner");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ runner: "pi", recursive: true });
+  });
+
   it("preempts the council synthesizer when roles exhaust the token budget", async () => {
     const calls: string[] = [];
     const result = await new QuickJsRuntime().execute(

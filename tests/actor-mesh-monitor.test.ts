@@ -122,6 +122,28 @@ describe("ActorMeshMonitor", () => {
     expect(s.onEvent).toHaveBeenCalledTimes(2); // owner deduplication handles replay
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
   });
+  it.skipIf(process.platform === "win32")("coalesces filesystem callbacks across microtasks into one leading and one trailing ownership refresh", async () => {
+    const s = setup();
+    let notify!: (event: string, filename: string) => void;
+    vi.mocked(fs.watch).mockImplementation(((_path: unknown, _options: unknown, listener: unknown) => {
+      notify = listener as typeof notify;
+      return s.watcher as unknown as FSWatcher;
+    }) as typeof fs.watch);
+    s.monitor.start(); await flush();
+    s.beforePoll.mockClear();
+    for (let index = 0; index < 8; index++) {
+      notify("change", index % 2 ? "events.jsonl" : "schedules.json");
+      await flush(); // OS watcher callbacks have intervening microtask checkpoints.
+    }
+    expect(s.beforePoll).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(s.beforePoll).toHaveBeenCalledTimes(2);
+    notify("change", "events.jsonl");
+    s.monitor.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.beforePoll).toHaveBeenCalledTimes(2);
+  });
+
   it("does not persist a cursor when disabled or never started", () => {
     const disabled = setup();
     disabled.monitor.config.enabled = false;

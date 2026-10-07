@@ -116,6 +116,16 @@ describe("exclusive kernel tool surface", () => {
     expect(context.invalidate).toHaveBeenCalledOnce();
   });
 
+  it("advertises native models without replacing legacy model listing", () => {
+    const guidance = defaultFabricExecutionGuidance(true, "typescript");
+    expect(guidance).toContain("models === tools.models");
+    expect(guidance).toContain("tools.models()");
+    expect(guidance).toContain("models.getAvailableOfType('classifier')");
+    expect(guidance).toContain("models.classify(model,{state,questions})");
+    expect(guidance).toContain("stopReason");
+    expect(defaultFabricExecutionGuidance(true, "python")).not.toContain("models === tools.models");
+  });
+
   it("uses Python syntax in turn-stable guidance", () => {
     const guidance = defaultFabricExecutionGuidance(true, "python");
     expect(guidance).toContain('r["output"]');

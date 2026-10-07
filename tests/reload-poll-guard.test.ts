@@ -104,7 +104,7 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
       const open = async () => {
         const runner = session!.extensionRunner!;
         const result = await runner.getToolDefinition("fabric_exec")!.execute("activate", { code: "return 1" } as never,
-          undefined, undefined, runner.createContext());
+          undefined, undefined, runner.createToolContext("activate", undefined));
         expect(result.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text" })]));
         modal = runner.getCommand("fabric")!.handler("dashboard", runner.createCommandContext());
         await waitUntil(

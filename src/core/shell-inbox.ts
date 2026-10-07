@@ -30,6 +30,9 @@ export class ShellEventInbox {
     };
     on("context", (event: ContextEvent, ctx) => {
       this.#context = ctx;
+      // First request after a restart reattaches this session's durable tasks
+      // (memoized; a single missing-file check when none were ever started).
+      void jobs.durable?.resume();
       // Request-only projection: survives discarded tool results and compaction,
       // without appending history, requesting a continuation, or waking the owner.
       const messages = event.messages.filter(message => message.role !== "custom" || message.customType !== SHELL_AWARENESS_MESSAGE_TYPE);

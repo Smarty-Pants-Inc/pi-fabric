@@ -29,34 +29,22 @@ export const normalFormEvidenceSummary = (
   return summary;
 };
 
-export const NORMAL_FORM_VERSION = 1 as const;
-export const MAX_NORMAL_FORM_RULES = 128;
-export const MAX_NORMAL_FORM_PLANS = 1_000;
-const RULE_KINDS = ["key-form", "enum-form", "numeric-string", "optional-null"] as const;
-export type NormalFormRuleKind = typeof RULE_KINDS[number];
-export interface NormalFormRule { kind: NormalFormRuleKind; key: string }
-export interface NormalFormPlan {
-  version: typeof NORMAL_FORM_VERSION;
-  ref: string;
-  baseSchemaDigest: string;
-  rules: NormalFormRule[];
-}
-export interface NormalFormWitness {
-  version: typeof NORMAL_FORM_VERSION;
-  baseSchemaDigest: string;
-  beforeShape: string;
-  afterShape: string;
-  rules: NormalFormRule[];
-}
+import {
+  NORMAL_FORM_VERSION, MAX_NORMAL_FORM_RULES,
+  isNormalFormPlan, isNormalFormWitness,
+  normalFormRecord as isRecord, normalFormSafeKey as safeKey,
+  type NormalFormPlan, type NormalFormRule, type NormalFormWitness,
+} from "./normal-form-witness.js";
+export {
+  NORMAL_FORM_VERSION, MAX_NORMAL_FORM_RULES, MAX_NORMAL_FORM_PLANS,
+  isNormalFormPlan, isNormalFormWitness,
+  type NormalFormRuleKind, type NormalFormRule, type NormalFormPlan, type NormalFormWitness,
+} from "./normal-form-witness.js";
 export interface NormalFormResult {
   args: Record<string, unknown>;
   witness?: NormalFormWitness;
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-const safeKey = (key: string): boolean => key.length <= 128 &&
-  !["__proto__", "prototype", "constructor"].includes(key);
 const form = (value: string): string | undefined =>
   /^[a-zA-Z][a-zA-Z0-9 _-]*$/.test(value) ? value.toLowerCase().replace(/[ _-]/g, "") : undefined;
 const accepts = (schema: unknown, args: unknown): boolean => {
@@ -101,19 +89,6 @@ export const deriveNormalFormPlan = (ref: string, schema: unknown): NormalFormPl
   return { version: NORMAL_FORM_VERSION, ref, baseSchemaDigest: stableJsonHash(schema), rules: rules.slice(0, MAX_NORMAL_FORM_RULES) };
 };
 
-const isRule = (value: unknown): value is NormalFormRule => isRecord(value) &&
-  Object.keys(value).length === 2 && typeof value.key === "string" && safeKey(value.key) &&
-  RULE_KINDS.includes(value.kind as NormalFormRuleKind);
-const isDigest = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-export const isNormalFormPlan = (value: unknown): value is NormalFormPlan => isRecord(value) &&
-  Object.keys(value).length === 4 && value.version === NORMAL_FORM_VERSION &&
-  typeof value.ref === "string" && value.ref.length > 0 && value.ref.length <= 1_024 &&
-  isDigest(value.baseSchemaDigest) && Array.isArray(value.rules) &&
-  value.rules.length > 0 && value.rules.length <= MAX_NORMAL_FORM_RULES && value.rules.every(isRule);
-export const isNormalFormWitness = (value: unknown): value is NormalFormWitness => isRecord(value) &&
-  Object.keys(value).length === 5 && value.version === NORMAL_FORM_VERSION &&
-  isDigest(value.baseSchemaDigest) && isDigest(value.beforeShape) && isDigest(value.afterShape) &&
-  Array.isArray(value.rules) && value.rules.length > 0 && value.rules.length <= MAX_NORMAL_FORM_RULES && value.rules.every(isRule);
 
 export const provesNormalFormPlan = (plan: NormalFormPlan, schema: unknown): boolean => {
   if (!isNormalFormPlan(plan)) return false;

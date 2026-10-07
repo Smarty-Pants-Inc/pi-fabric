@@ -713,13 +713,13 @@ describe("Astra round 3 legacy retirement ordering", () => {
     const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
     const claim = await legacyClaim(h, h.result.id); consumeCompletion(h.meshRoot, h.result.id, "B");
     h.setLive([h.participant("B", 200)]);
-    const body = bodyPath(h, h.result.id); const rm = fs.rmSync;
-    const crash = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const body = bodyPath(h, h.result.id); const rm = fs.promises.rm;
+    const crash = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
       if (String(target) === body) {
         expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
         throw new Error("stop after committed delete, before unlink");
       }
-      rm(target, options);
+      await rm(target, options);
     });
     const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
     await expect(b.drain()).rejects.toThrow("stop after committed delete, before unlink");

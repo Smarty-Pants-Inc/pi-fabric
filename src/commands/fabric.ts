@@ -20,38 +20,9 @@ import {
   readFabricPrewalkRequestV1,
   type FabricPrewalkRequestResultV1,
 } from "../protocol.js";
-import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
 import type { RepairStatus } from "../repairs/types.js";
-import { ENTROPY_METRIC_VERSION } from "../entropy/types.js";
-import {
-  entropySurfaceHash,
-  liveSurfaceSnapshot,
-  surfaceFreedomReport,
-} from "../entropy/surface.js";
-import {
-  machineSessionFilesAsync,
-  measureSessionCorpusAsync,
-  projectSessionFilesAsync,
-  sessionWindowEvidenceAsync,
-} from "../entropy/sessions.js";
-import { measureEntropyAsync } from "../entropy/meter.js";
-import { entropyRepairRows } from "../entropy/corpus.js";
-import { entropyReviewSignals, formatEntropyReviewSignal } from "../entropy/compiler.js";
-import { loadObservationPoolAsync } from "../entropy/pool-store.js";
-import { mergeObservationWindowAsync, poolToValueObservations } from "../entropy/pool.js";
-import { applyCompiledSurface } from "../entropy/compiled-surface.js";
-import { normalFormEvidenceSummary } from "../entropy/normal-form.js";
-import {
-  loadCompiledSurfaceAsync,
-  parseCompiledSurfaceArtifact,
-  saveCompiledSurfaceAsync,
-} from "../entropy/compiled-store.js";
-import {
-  formatEntropyCommandHints,
-  formatEntropyMetric,
-} from "../entropy/presentation.js";
-import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
-import { setActiveCompiledSurface } from "../entropy/active.js";
+import { setActiveCompiledSurface } from "../entropy/active-state.js";
+import { formatForeground } from "../core/foreground-tools.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -145,6 +116,28 @@ const resolvePrewalkModel = async (
     );
     return undefined;
   }
+  if (typeof context.ui.custom === "function") {
+    try {
+      const [{ FabricModelSelector }, { buildModelSource }] = await Promise.all([
+        import("../ui/fabric-model-selector.js"), import("../ui/model-picker.js"),
+      ]);
+      // undefined = host can't show the dialog; { model: undefined } = user cancelled.
+      const picked = await context.ui.custom<{ model?: string | undefined } | undefined>(
+        (_tui, theme, _keybindings, done) =>
+          new FabricModelSelector({
+            theme,
+            source: buildModelSource(context.modelRegistry, resolveAgentDir()),
+            currentValue: "",
+            headerText:
+              "Prewalk executor model. Fabric hands off at the next matching mutation boundary; Main continues on the picked model.",
+            inheritRow: false,
+            onSelect: (value) => done({ model: value }),
+            onCancel: () => done({ model: undefined }),
+          }),
+      );
+      if (picked !== undefined) return picked.model;
+    } catch {}
+  }
   return context.ui.select("Prewalk executor model", keys);
 };
 
@@ -225,6 +218,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           request.respond({ ok: false, error: stalled.message });
           return;
         }
+        const { buildPeerCards } = await import("../topology/peer-settle.js");
         request.respond({ ok: true, cards: buildPeerCards(state.peerInfos()) });
       } catch (error) {
         request.respond({
@@ -244,6 +238,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           request.respond({ ok: false, error: "Fabric mesh is disabled; peers cannot be observed" });
           return;
         }
+        const { awaitPeerSettle } = await import("../topology/peer-settle.js");
         request.respond(await awaitPeerSettle({
           poll: () => state.peerInfos(),
           stalled: () => state.writeStalled?.(),
@@ -341,6 +336,9 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "kill",
         "repairs",
         "entropy",
+        "decisions",
+        "programs",
+        "run",
       ];
       const idCommands = new Set([
         "messages",
@@ -598,6 +596,16 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command === "chat") {
         await fabricUi.openConversation(context, argumentsList.join(" ") || undefined);
+        return;
+      }
+      if (command === "decisions") {
+        const { openFabricDecisions } = await import("../decisions/command.js");
+        await openFabricDecisions(state.mesh, context, argumentsList[0]);
+        return;
+      }
+      if (command === "programs" || command === "run") {
+        const { runFabricProgramsCommand } = await import("../programs/host.js");
+        await runFabricProgramsCommand({ state, pi }, context, command, argumentsText.trim().slice(command.length));
         return;
       }
       if (command === "dashboard" || command === "ui") {
@@ -956,6 +964,15 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         return;
       }
       if (command === "entropy") {
+        const {
+          ENTROPY_METRIC_VERSION, entropySurfaceHash, liveSurfaceSnapshot, surfaceFreedomReport,
+          machineSessionFilesAsync, measureSessionCorpusAsync, projectSessionFilesAsync,
+          sessionWindowEvidenceAsync, measureEntropyAsync, entropyRepairRows, entropyReviewSignals,
+          formatEntropyReviewSignal, loadObservationPoolAsync, mergeObservationWindowAsync,
+          poolToValueObservations, applyCompiledSurface, normalFormEvidenceSummary,
+          loadCompiledSurfaceAsync, parseCompiledSurfaceArtifact, saveCompiledSurfaceAsync,
+          formatEntropyCommandHints, formatEntropyMetric, mergeCompiledSurfaces,
+        } = await import("../entropy/index.js");
         const exportArtifactIndex = argumentsList.indexOf("export-artifact");
         if (exportArtifactIndex >= 0) {
           const target = argumentsList[exportArtifactIndex + 1];
@@ -1193,7 +1210,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|chat [id-or-name]|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy]",
+          "Usage: /fabric [status|dashboard|chat [id-or-name]|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy|decisions [id]|programs [promote|retire <ref>]|run <ref> [json]]",
           "warning",
         );
         return;
@@ -1224,6 +1241,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           config.fullCodeMode && config.capture.enabled
             ? `captured tools: ${capturedTools.size} · model visibility: ${config.capture.hideFromModel ? "hidden" : "visible"}`
             : "captured tools: disabled (native registry preserved)",
+          ...(config.foreground.tools.length > 0 ? [`foreground: ${formatForeground(state.foregroundTools())}`] : []),
           `actors: ${state.actors.list().length} · mesh: ${config.mesh.enabled ? state.mesh.root : "disabled"}`,
           `MCP: ${config.mcp.enabled ? "enabled" : "disabled"}`,
           `UI: ${config.ui.enabled ? `${config.ui.widget} widget above chat` : "disabled"}`,

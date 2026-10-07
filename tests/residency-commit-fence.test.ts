@@ -22,7 +22,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { FabricExecutionService } from "../src/execution-service.js";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FabricState } from "../src/fabric-state.js";
 import piFabric from "../src/index.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -851,9 +851,10 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   const tool = registered.get("fabric_exec")!;
   expect(tool.name).toBe("fabric_exec");
   const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
+    tools: [], executeTool: async () => { throw new Error("No nested Pi tool is configured in this receipt harness"); },
     sessionManager: { getSessionId: () => "round4", getSessionFile: () => undefined },
     ...(mainTimeoutMs !== undefined ? { mode: "rpc" } : {}),
-  } as unknown as FabricInvocationContext["extensionContext"];
+  } as unknown as ExtensionToolContext;
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
     const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context!);
@@ -991,6 +992,11 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // The 250 ms create budget above injects uncertainty, not a latency SLO
+      // for the resumed Main's real status/stop requests under CI contention.
+      // Restore a normal reconciliation budget only after the original execution
+      // and held response have settled; its immutable receipt is unchanged.
+      state.client.options.commandTimeoutMs = 8_000;
       // Simulate the resumed wall clock for new reconciliation generations, not
       // the original execution deadline. The expiry watermark never rolls back.
       const realNow = Date.now.bind(Date);
@@ -2026,6 +2032,7 @@ describe("round 1 public cancellation contract", () => {
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+      state.client.options.commandTimeoutMs = 200;
       throw activationFailure;
     });
     let removalError: unknown;

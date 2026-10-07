@@ -123,7 +123,7 @@ export async function processMemoryExpand(
   }
   const ref = access.ref;
   const observedSource = access.observe(branches);
-  let snapshot = cache.cachedExpansionSnapshot(ref.file, branches, observedSource);
+  let snapshot = cache.cachedExpansionSnapshot(ref.file, branches, observedSource, context.fabricScope?.digest);
   if (snapshot) {
     const sourceChanged = expectedSourceHash !== undefined &&
       snapshot.sourceHash !== expectedSourceHash;
@@ -216,6 +216,7 @@ export async function processMemoryExpand(
     snapshot = {
       file: ref.file,
       branches,
+      ...(context.fabricScope ? { scopeDigest: context.fabricScope.digest } : {}),
       sourceHash: finalState.sourceHash,
       lineageFingerprint: finalLineage.fingerprint,
       observation: finalObservation,

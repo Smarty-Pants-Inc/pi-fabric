@@ -4,6 +4,9 @@
 //   default          working tree against HEAD, for local iteration
 //   --base <ref>     <ref> against HEAD, for a CI push range or pull request
 //
+// README/docs Markdown changes also select the documentation style suite, so a
+// docs-only push still checks the writing rules those files are held to.
+//
 // There is deliberately no full-suite fallback. An unusable selection runs
 // nothing and exits, and CI pairs this with the curated platform smoke floor
 // (bun run test:smoke) so a Linux or Windows break still surfaces quickly.
@@ -44,8 +47,8 @@ if (rangeMode) {
       .split("\n")
       .filter(Boolean);
   } catch {
-    console.error(`cannot resolve base ${base}; nothing to select`);
-    process.exit(0);
+    console.error(`cannot resolve base ${base}; refusing an unverifiable test selection`);
+    process.exit(1);
   }
 } else {
   // No flag at all: the local dirty-tree mode.
@@ -71,7 +74,14 @@ if (rangeMode) {
 
 const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
 const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
-const direct = files.filter(isTestFile);
+// Docs carry their own style suite. A docs-only change selects nothing else,
+// so without this mapping a shipped violation stays invisible to CI.
+const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
+const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
+const direct = [...new Set([
+  ...files.filter(isTestFile),
+  ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
+])];
 const related = files.filter(
   (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),
 );

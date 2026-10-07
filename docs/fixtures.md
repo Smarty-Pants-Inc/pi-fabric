@@ -19,8 +19,8 @@ Fabric then registers only read-only restriction hooks. It does not register
 handlers, actor workers or mailbox readers. The active tool set is `read`,
 `grep`, `find`, `ls`, reasserted at session start and each model preflight.
 A `tool_call` guard blocks every other name even if reactivated. User shell
-execution is blocked too. Every model preflight appends a system note that
-inherited roles and mailbox requests are history, not authority, and that the
+execution is blocked too. Every model preflight appends a system reminder:
+inherited roles and mailbox requests are history, not authority, and the
 fixture must never act for the original session.
 
 This is **not an OS sandbox or a credential boundary**. The launcher must load

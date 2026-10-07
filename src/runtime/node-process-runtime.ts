@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { NODE_PROCESS_CHILD_SOURCE } from "./node-process-child-source.js";
@@ -31,7 +33,7 @@ interface ChildResponseAckMessage {
   responseId: number;
 }
 
-type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage;
+type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage | { type: "output"; text?: string; image?: unknown };
 
 const HOST_TASK_SETTLE_GRACE_MS = 250;
 
@@ -98,7 +100,7 @@ export class NodeProcessRuntime {
       : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
     const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
     const guestLineCount = guestBundle.code.split("\n").length;
-    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false);
+    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false, options.nativeStoreEnabled);
     const child = spawn(
       interpreterPath,
       this.#interpreter === "bun"
@@ -116,13 +118,16 @@ export class NodeProcessRuntime {
     );
     const hostAbortController = new AbortController();
     shareCancellationEffects(hostAbortController.signal, options.signal);
-    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options, startedAt);
     let abortHandler: (() => void) | undefined;
     let settled = false;
     let finishing = false;
     const hostTasks = new Set<Promise<void>>();
     let nextResponseId = 0;
     const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
+    const partialLogs: string[] = [];
+    const partialImages: unknown[] = [];
+    let partialChars = 0;
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const finish = (result: FabricSandboxResult, unawaitedHostCalls = false): void => {
@@ -142,14 +147,17 @@ export class NodeProcessRuntime {
         child.removeAllListeners();
         if (child.connected) child.disconnect();
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        resolve(result);
+        resolve(result.terminationReason === "completed" ? result : { ...result, logs: result.logs.length ? result.logs : partialLogs, emitted: result.emitted?.length ? result.emitted : partialImages });
       };
       const expireDeadline = (): void => {
         if (settled) return;
         hostAbortController.abort(executionDeadline.reason);
         finish(executionDeadline.timeoutResult([]));
       };
-      const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const scheduleDeadline = (): void => {
+        if (settled || finishing || humanWait.paused) return;
+        executionDeadline.scheduleDeadline(expireDeadline, true);
+      };
       const send = (message: any, delivered?: () => void): void => {
         if (settled || finishing || !child.connected) return;
         if (executionDeadline.reached) { expireDeadline(); return; }
@@ -174,8 +182,14 @@ export class NodeProcessRuntime {
       };
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
-        if (executionDeadline.extend(requested)) scheduleDeadline();
+        if (humanWait.paused && typeof requested === "number" && Number.isFinite(requested)) humanWait.raise(requested);
+        else if (executionDeadline.extend(requested)) scheduleDeadline();
       };
+
+      const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+        () => executionDeadline, options, scheduleDeadline, expireDeadline,
+      ));
+      options.registerHumanWaitPause?.(humanWait);
 
       abortHandler = () => {
         // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).
@@ -200,6 +214,15 @@ export class NodeProcessRuntime {
           if (!receipt || receipt.id !== message.id) return;
           pendingReceipts.delete(message.responseId);
           receipt.commit();
+          return;
+        }
+        if (message.type === "output") {
+          const chars = typeof message.text === "string" ? message.text.length : JSON.stringify(message.image ?? null).length;
+          partialChars += chars;
+          if (partialChars <= 16_777_216) {
+            if (typeof message.text === "string") partialLogs.push(message.text);
+            else if (message.image !== undefined) partialImages.push(message.image);
+          }
           return;
         }
         if (message.type === "result") {
@@ -252,14 +275,19 @@ export class NodeProcessRuntime {
           });
           return;
         }
-        const task = runAbortable(hostAbortController.signal, () =>
-          hostCall(message.ref, message.args, hostAbortController.signal),
-        ).then(
+        const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
+        if (executionDeadline.reached) { expireDeadline(); return; }
+        if (waitsForHuman) humanWait.enter();
+        const task = runAbortable(hostAbortController.signal, () => {
+          if (executionDeadline.reached) { expireDeadline(); throw executionDeadline.reason; }
+          return hostCall(message.ref, message.args, hostAbortController.signal);
+        }).finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        }).then(
           (value) => {
             if (settled || finishing || !child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }
-            // Serialize before admission: getters/toJSON can spend the remaining
-            // budget, and must not acknowledge an undelivered observation.
+            // A native write is not admission; serialize within the budget, then await the correlated guest ack.
             const response = JSON.parse(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
             if (executionDeadline.reached) { expireDeadline(); return; }
             send(response, () => options.onHostResultDelivered?.(message.args));
@@ -306,6 +334,7 @@ export class NodeProcessRuntime {
         code: guestBundle.code,
         strings: options.strings ?? {},
         tokenBudget: options.tokenBudget,
+        workflowSpentTokens: options.workflowSpentTokens,
         maxLogChars: options.maxLogChars ?? 100_000,
       });
     });

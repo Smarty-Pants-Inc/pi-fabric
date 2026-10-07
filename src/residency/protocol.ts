@@ -14,9 +14,11 @@ import type { FabricModelAliases, FabricModelCandidate } from "../core/model-res
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
-import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
+import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { OwnerHeartbeatFields } from "../core/atomic-write.js";
+import type { FabricScope } from "../protocol.js";
 export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<void> =>
   // Executor form: the configured lib is ES2022, which has no
   // Promise.withResolvers, and an abort listener plus a timer need shared
@@ -374,7 +376,9 @@ export interface ResidentHostConfig {
   modelGuidance?: FabricOwnedModelGuidance[];
 }
 
-export interface ResidentHostOwner {
+// `identity` and `heartbeatAt` are additive (format stays 1): they let a
+// reader in another PID namespace judge the owner by heartbeat.
+export interface ResidentHostOwner extends OwnerHeartbeatFields {
   format: typeof RESIDENT_HOST_FORMAT;
   hostId: string;
   pid: number;
@@ -449,6 +453,8 @@ interface ResidentSpawnCommand {
   request: AgentRunRequest;
   /** Host-captured runtime binding, separate from all task-supplied run settings. */
   caller: ResidentTaskCaller;
+  /** A registered runner's residentModule, imported by the host before launch. */
+  runnerModule?: string;
   createdAt: number;
 }
 
@@ -637,6 +643,8 @@ export interface ResidentCommandResponse {
   errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
+  /** Set when a claimed request was interrupted; the same concept as a run record's outcome. */
+  outcome?: FabricRunOutcome;
   completedAt: number;
 }
 
@@ -669,6 +677,10 @@ export interface ResidentAgentMetadata {
   runDirectory: string;
   handle: AgentHandleInfo;
   worktreeGitRoot?: string;
+  /** Imported again by a restarted host before it re-attaches hosted runs. */
+  runnerModule?: string;
+  /** The scope the durable child launched with (forwarded by the requesting session). */
+  scope?: FabricScope;
   /** Main consumed this terminal result; suppress queued delivery across reconnects. */
   completionConsumedAt?: number;
   createdAt: number;

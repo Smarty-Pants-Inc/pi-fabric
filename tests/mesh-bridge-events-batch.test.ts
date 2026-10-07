@@ -67,7 +67,12 @@ describe("bounded durable bridge event batches", () => {
     // Deterministic count bound independent of this machine's fsync latency.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
-    const sync = vi.spyOn(fs, "fsyncSync");
+    const originalSync = fs.fsyncSync;
+    const syncedFiles: boolean[] = [];
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      syncedFiles.push(fs.fstatSync(fd).isFile());
+      originalSync(fd);
+    });
     const events = Array.from({ length: 256 }, (_, index) => ({ event: event(String(index)) }));
     const first = await side.publishBatch(events);
     expect(first).toHaveLength(256);
@@ -83,6 +88,7 @@ describe("bounded durable bridge event batches", () => {
         if (path.dirname(directory) === directory) break;
       }
     }
+    expect(syncedFiles.filter(Boolean)).toHaveLength(1);
     expect(sync.mock.calls.length).toBe(namespaceBarriers + 1);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");

@@ -319,6 +319,7 @@ export class GlobalActorRegistry {
       coalesce: def.coalesce,
       ...(def.residency ? { residency: def.residency } : {}),
       runner: def.runner,
+      ...(def.kernel ? { kernel: def.kernel } : {}),
       ...(def.model ? { model: def.model } : {}),
       ...(def.modelReason !== undefined ? { modelReason: def.modelReason } : {}),
       ...(def.thinking ? { thinking: def.thinking } : {}),
@@ -366,13 +367,13 @@ export class GlobalActorRegistry {
       throw new Error(`Invalid global actor residency: ${String(def.residency)}`);
     }
     const runner = def.runner ?? "pi";
-    if (runner !== "pi" && runner !== "claude") {
+    if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
       throw new Error(`Invalid global actor runner: ${String(def.runner)}`);
     }
     if (def.kernel !== undefined && def.kernel !== "inherit" && def.kernel !== "typescript" && def.kernel !== "python") {
       throw new Error(`Invalid Fabric actor kernel: ${String(def.kernel)}`);
     }
-    if (def.kernel && def.kernel !== "inherit" && (runner !== "pi" || def.extensions === false)) {
+    if (def.kernel && def.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || def.extensions === false)) {
       throw new Error("An explicit Fabric kernel requires a Pi actor with extensions enabled");
     }
     const model = typeof def.model === "string" && def.model.trim() ? def.model.trim() : undefined;
@@ -517,9 +518,9 @@ export class GlobalActorRegistry {
         (delivery === "steer" || delivery === "followUp") && record.triggerTurn === true;
       const coalesce = record.coalesce !== false;
       const residency = record.residency === "durable" ? "durable" : "session";
-      const runner = record.runner === "claude" ? "claude" : "pi";
+      const runner = record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi";
       if (record.kernel !== undefined && record.kernel !== "inherit" && record.kernel !== "typescript" && record.kernel !== "python") continue;
-      if (record.kernel && record.kernel !== "inherit" && (runner !== "pi" || record.extensions === false)) continue;
+      if (record.kernel && record.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || record.extensions === false)) continue;
       const thinking: FabricThinking | undefined = isFabricThinking(record.thinking)
         ? record.thinking
         : undefined;

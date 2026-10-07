@@ -19,9 +19,9 @@ entry and native CLI entry. The pin is re-applied on startup, restart, project-t
 bootstrap, and resource reload, so changing the selector cannot load a second Fabric
 generation. Other authorized profile/project extensions and package resources retain
 normal discovery and trust rules; the canonical agent/auth directory is unchanged.
-Explicit non-Fabric caller hooks are preserved rather than replaced by the release
-selector. Opaque/custom launchers with no discoverable native SDK fail closed on
-extension auto-discovery (explicit hooks still load), rather than risk mixing releases.
+Explicit non-Fabric caller hooks are preserved; the release selector does not
+replace them. Opaque/custom launchers with no discoverable native SDK fail closed on
+extension auto-discovery (explicit hooks still load) to prevent mixing releases.
 
 Spawn handles, results, and new workers' status records expose the selected canonical
 root as `fabricRelease`. Existing resident hosts themselves retain their loaded
@@ -53,9 +53,9 @@ settings and runtime release records, not prompts, history or authentication fil
 
 JSON lists each Main and its workers and resident hosts, including actor tasks, by loaded
 and active release. Recorded Mains use the actual `session:<sessionId>` lineage carried
-by workers, so detached resident workers join their Main by ID rather than process
+by workers, so detached resident workers join their Main by ID, independent of process
 ancestry. Text groups workers by release on each Main's row and includes resident-host
-and worker rows with lineage/run/actor IDs. Truly remote worker lineages have a null Main
+and worker rows with lineage/run/actor IDs. Remote worker lineages have a null Main
 PID on that host. Synthetic `/proc` fixtures are portable; live census requires Linux,
 and other platforms can aggregate `--snapshot` files.
 

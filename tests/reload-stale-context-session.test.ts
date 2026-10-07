@@ -8,7 +8,7 @@ import {
   ModelRuntime,
   SessionManager,
   type AgentSession,
-  type ExtensionContext,
+  type ExtensionToolContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
@@ -51,6 +51,7 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
       // Loaded after Fabric, so its session_shutdown handler runs after Fabric's and before Pi
       // invalidates the ctx: the window in which a mid-run tool call reached the old Fabric.
       let oldExec: ToolDefinition | undefined;
+      let oldToolContext: ExtensionToolContext | undefined;
       let lateCall: Promise<string> | undefined;
       const faux = fauxProvider({ tokensPerSecond: 1_000 });
       const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
@@ -61,12 +62,12 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
         extensionFactories: [{
           name: "tool-call-during-shutdown",
           factory: (pi) => {
-            pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+            pi.on("session_shutdown", async () => {
               const exec = oldExec;
               oldExec = undefined;
               if (!exec) return;
               lateCall = Promise.resolve()
-                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx))
+                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, oldToolContext!))
                 .then(() => "completed", (error: unknown) => String(error));
               await lateCall;
             });
@@ -84,6 +85,7 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
       await session.prompt("activate");
 
       oldExec = session.extensionRunner!.getToolDefinition("fabric_exec");
+      oldToolContext = session.extensionRunner!.createToolContext("late", undefined);
       expect(oldExec).toBeDefined();
       await session.reload();
       expect(await lateCall).toMatch(/shut down/);

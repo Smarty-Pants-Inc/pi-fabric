@@ -375,6 +375,27 @@ describe("conversation renderer retained-row cache", () => {
     expect(updates).not.toHaveBeenCalled();
   });
 
+  it("borrows stable immutable frames without freezing dynamic output or exposing mutable copies", () => {
+    const output = ["dynamic first"];
+    const dynamicRender = vi.fn(() => output);
+    const { renderer } = setup({ getMessageRenderer: () => () => ({ render: dynamicRender, invalidate() {} }) });
+    const transcript = nativeTranscript([{ role: "custom", customType: "mutable", timestamp: 1, content: "", display: true }]);
+    const first = renderer.render(transcript, 80, options, "borrow");
+    for (let i = 0; i < 20; i++) expect(renderer.render(transcript, 80, options, "borrow")).toBe(first);
+    expect(dynamicRender).toHaveBeenCalledTimes(21);
+    const mutable = renderer.render(transcript, 80, options);
+    mutable.fill("corrupted copy");
+    expect(renderer.render(transcript, 80, options, "borrow")).toBe(first);
+    expect(first.join("\n")).not.toContain("corrupted copy");
+    output[0] = "dynamic second";
+    const second = renderer.render(transcript, 80, options, "borrow");
+    expect(second).not.toBe(first);
+    expect(second.join("\n")).toContain("dynamic second");
+    expect(first.join("\n")).toContain("dynamic first");
+    renderer.invalidate();
+    expect(renderer.render(transcript, 80, options, "borrow")).not.toBe(second);
+  });
+
   it("invalidates live callback rows and guards callbacks/timers on options, target switches, eviction, and disposal", () => {
     let tick = 0;
     const invalidations: Array<() => void> = [];

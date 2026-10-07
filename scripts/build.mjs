@@ -6,6 +6,7 @@ import { buildLandlock } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
+  "src/extension-bootstrap.ts",
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
@@ -14,9 +15,19 @@ const primaryEntryPoints = [
   "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  // Runner adapter registration; never reachable from the extension entry.
+  "src/runners.ts",
+  // Opt-in durable Pi adapter; never reachable from the extension entry.
+  "src/durable.ts",
   "src/agents/worker-protocol.ts",
   "src/jev.ts",
+  "src/assessment.ts",
+  // Public `pi-fabric/scope`; also the extension's first-use scope parser.
+  "src/scope.ts",
   "src/protocol.ts",
+  "src/worker.ts",
+  // Full Pi-compatible durable process host; never in extension registration.
+  "src/durable/worker.ts",
   "src/residency/host.ts",
   "src/residency/launcher.ts",
   "src/residency/pi-entry.ts",
@@ -31,12 +42,22 @@ const primaryEntryPoints = [
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
   "src/records/service-main.ts",
+  // Standalone `pi-fabric` bin; never reachable from the extension entry.
+  "src/cli/index.ts",
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/output-budget.ts",
+  "src/topology/root-inbox.ts",
+  "src/topology/root-inbox-delivery.ts",
+  "src/core/approval-controller.ts",
+  "src/core/auto-approval-classifier.ts",
+  "src/core/file-lock.ts",
+  "src/ui/fabric-model-selector.ts",
+  "src/topology/peer-settle.ts",
   "src/residency/launcher-owner.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
@@ -44,6 +65,16 @@ const lazyEntryPoints = [
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
+  "src/durable/worker-host.ts",
+  "src/native-discovery.ts",
+  "src/memory/extractive-history.ts",
+  "src/cli/mesh.ts",
+  "src/cli/decisions.ts",
+  "src/thinking-control.ts",
+  "src/compaction/owner.ts",
+  "src/compaction/orphan-repair.ts",
+  "src/decisions/command.ts",
+  "src/programs/host.ts",
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
@@ -60,6 +91,11 @@ const lazyEntryPoints = [
   "src/jev/client.ts",
   "src/jev/routes.ts",
   "src/jev/observation.ts",
+  "src/jev-fabric/client.ts",
+  "src/jev-fabric/registry.ts",
+  "src/jev-fabric/operations.ts",
+  "src/jev-fabric/resolve.ts",
+  "src/jev-fabric/serve.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
   "src/runtime/guest-types.ts",
@@ -74,6 +110,7 @@ const lazyEntryPoints = [
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
   "src/ui/shell-tasks.ts",
+  "src/ui/image-overlays.ts",
   "src/ui/languages/bend.ts",
   "src/ui/conversation.ts",
   "src/ui/conversation-host.ts",
@@ -82,6 +119,7 @@ const lazyEntryPoints = [
   "src/ui/conversation-native-reader.ts",
   "src/ui/model-picker.ts",
   "src/ui/settings.ts",
+  "src/worker/tool-call-stream-guard.ts",
   "src/worker/event-projection.ts",
   "src/worker/activation-window.ts",
   "src/worker/activation-compaction.ts",
@@ -90,13 +128,17 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/agents/write-guard.ts",
+  "src/worker/stall-session.ts",
   "src/worker/context-reseed.ts",
   "src/worker/options.ts",
+  "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
+  "src/worker/result.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];
@@ -159,6 +201,11 @@ const standalone = await build({
   plugins: [{
     name: "external-except-host-provided",
     setup(pluginBuild) {
+      // Preserve first-use package-local entries as upstream's split build does.
+      // Inlining them here hoists their external imports into the bootstrap,
+      // before it can publish a missing-dependency startup failure.
+      pluginBuild.onResolve({ filter: /^\.\.?\// }, (args) =>
+        args.kind === "dynamic-import" ? { path: args.path, external: true } : undefined);
       pluginBuild.onResolve({ filter: /^[^./]/ }, (args) =>
         args.kind === "entry-point" || hostProvided.test(args.path)
           ? undefined
@@ -215,6 +262,29 @@ const bundledPackages = [
 ];
 if (bundledPackages.length > 0) {
   throw new Error(`Package code was bundled unexpectedly:\n${bundledPackages.join("\n")}`);
+}
+
+// Only the standalone worker gets a private, stateless TypeBox validator.
+// Pi deliberately omits physical host peers; the extension graph above must
+// continue to use Pi's mapped TypeBox, never this isolated artifact.
+const workerResult = await build({
+  entryPoints: ["src/worker/result.ts"],
+  outfile: "dist/worker/result.js",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  metafile: true,
+  banner: { js: "// Worker-only TypeBox validator. MIT (c) 2017-2026 Haydn Paterson; see THIRD_PARTY_NOTICES.md." },
+});
+for (const input of Object.keys(workerResult.metafile.inputs)) {
+  if (input.includes("node_modules/") && !input.includes("node_modules/typebox/")) {
+    throw new Error(`Unexpected worker validator dependency: ${input}`);
+  }
+}
+if (Object.values(workerResult.metafile.outputs).some(output => output.imports.length > 0)) {
+  throw new Error("Worker validator must be self-contained");
 }
 
 const unstableLazyImports = Object.entries(result.metafile.outputs).flatMap(

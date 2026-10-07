@@ -1,3 +1,4 @@
+import type { FabricSchemaMode } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 
 export type StateTransitionKind = "state" | "representation";
@@ -137,7 +138,28 @@ export interface StateCertificationHead {
   version: number;
 }
 
-export interface StateCertificate {
+/** Caller-supplied claims a certificate is bound to (commit, specDigest, ...). */
+export type StateCertificateBinding = Record<string, string>;
+
+/** Facts the host observed itself in the verification cwd before evidence ran. */
+export interface StateCertificateObserved {
+  commit?: string;
+  dirty?: boolean;
+}
+
+/** "program": through the state provider action surface; "host": direct host code. */
+export type StateCertificateRequester = "program" | "host";
+
+/** Additive bound-certificate fields; older certificates fold without them. */
+export interface StateCertificateBindingFields {
+  binding?: StateCertificateBinding;
+  observed?: StateCertificateObserved;
+  issuer?: "host";
+  requestedBy?: StateCertificateRequester;
+  schemaMode?: FabricSchemaMode;
+}
+
+export interface StateCertificate extends StateCertificateBindingFields {
   certificateId: string;
   sequence: number;
   certificationStatus: "certified";
@@ -155,7 +177,9 @@ export interface VerificationFailure {
     | "missing-evidence"
     | "nonzero-exit"
     | "execution-error"
-    | "reporting-error";
+    | "reporting-error"
+    | "binding-mismatch"
+    | "binding-unobserved";
   message: string;
   transitionId?: string;
   label?: string;
@@ -175,6 +199,9 @@ export interface VerificationReport {
   failures: VerificationFailure[];
   certificate?: StateCertificate;
   reportingError?: string;
+  binding?: StateCertificateBinding;
+  observed?: StateCertificateObserved;
+  requestedBy?: StateCertificateRequester;
 }
 
 export interface AdvanceHeadInput {

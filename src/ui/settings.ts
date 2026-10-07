@@ -29,6 +29,7 @@ import {
 } from "./settings-sections.js";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { openRpcFabricSettings } from "./settings-rpc.js";
+import { imageSafeCustom } from "./image-overlays.js";
 
 const ROOT_ITEM_IDS = [
   "fullCodeMode",
@@ -41,6 +42,7 @@ const ROOT_ITEM_IDS = [
   "capture",
   "ui",
   "compaction",
+  "memory",
   "retention",
   "mesh",
   "codePreview",
@@ -92,6 +94,7 @@ export async function openFabricSettings(
       return;
     }
     deps.state.reloadConfig(context);
+    if (id.startsWith("memory.extractive.")) deps.state.pi.events.emit("pi-fabric:extractive-config-changed", {});
     // Render the persisted layers, not the live config: runtime-only
     // environment and session overrides must not change what this editor saves.
     Object.assign(
@@ -117,6 +120,16 @@ export async function openFabricSettings(
     ...deps.capturedTools.list().map((tool) => tool.name),
   ]);
   const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
+  // Native classifier catalog only; never reuse the chat model picker. No inference.
+  const classifierModels = typeof context.modelRegistry.getModelsOfType === "function"
+    ? context.modelRegistry.getModelsOfType("classifier").map((m) => `${m.provider}/${m.id}`) : [];
+  let availableClassifierModels: string[] = [];
+  try {
+    if (typeof context.modelRegistry.getAvailableOfType === "function") {
+      const available = await context.modelRegistry.getAvailableOfType("classifier", undefined, { signal: AbortSignal.timeout(3000) });
+      availableClassifierModels = available.map((m) => `${m.provider}/${m.id}`);
+    }
+  } catch { /* Catalog remains selectable; missing auth uses explicit deterministic fallback. */ }
   const configuredClaudeModel = deps.state.config.agents.claude.model;
   const claudeModelSource: ModelSource = {
     models: configuredClaudeModel
@@ -142,6 +155,8 @@ export async function openFabricSettings(
       keepVisibleCandidates,
       modelSource,
       claudeModelSource,
+      classifierModels,
+      availableClassifierModels,
       cachedMcpServers: listCachedMcpServerNames(mcpDescriptorCachePath(context.cwd)),
       ...(activeModelKey ? { activeModelKey } : {}),
     });
@@ -161,7 +176,7 @@ export async function openFabricSettings(
     context.ui.notify("Fabric settings require an interactive UI", "warning");
     return;
   } else {
-    await context.ui.custom<void>(
+    await imageSafeCustom<void>(context.ui,
       (tui, theme, _keybindings, done) => {
         const component = new FabricSettingsComponent(
           theme,
@@ -180,6 +195,17 @@ export async function openFabricSettings(
         );
         rootComponent = component;
         return component;
+      },
+      {
+        // Use the same image-safe overlay lifecycle as dashboard and chat.
+        overlay: true,
+        overlayOptions: {
+          width: "94%",
+          minWidth: 40,
+          maxHeight: "90%",
+          anchor: "center",
+          margin: 1,
+        },
       },
     );
   }

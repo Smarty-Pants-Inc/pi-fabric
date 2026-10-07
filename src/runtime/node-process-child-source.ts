@@ -43,17 +43,18 @@ const run = async (message) => {
       });
     });
   };
+  const emitLog = line => { logs.push(line); send({ type: "output", text: line }); };
   const print = (...values) => {
     if (logsTruncated) return;
     const line = values.map(formatValue).join(" ");
     const remaining = message.maxLogChars - logChars;
     if (line.length > remaining) {
-      if (remaining > 0) logs.push(line.slice(0, remaining));
-      logs.push("[Pi Fabric log output truncated]");
+      if (remaining > 0) emitLog(line.slice(0, remaining));
+      emitLog("[Pi Fabric log output truncated]");
       logsTruncated = true;
       return;
     }
-    logs.push(line);
+    emitLog(line);
     logChars += line.length;
   };
 
@@ -64,7 +65,9 @@ const run = async (message) => {
   const __bun = await import("bun").catch(() => undefined);
   const sandbox = {
     __fabricHostCall: hostCall,
+    __fabricEmitImage: image => send({ type: "output", image }),
     __fabricTokenBudget: message.tokenBudget ?? Number.POSITIVE_INFINITY,
+    __fabricWorkflowSpentTokens: message.workflowSpentTokens,
     // Native-module bridge for guests whose vm lacks the dynamic-import
     // callback. Bun >= 1.4 honors importModuleDynamically on runInContext
     // (natural import() works there), so this is mostly a fallback and an
@@ -83,7 +86,7 @@ const run = async (message) => {
 
   try {
     vm.runInContext(message.setup, context, { filename: "pi-fabric-setup.js" });
-    const promise = vm.runInContext(message.code + "\n__piFabricMain()", context, {
+    const promise = vm.runInContext(message.code + "\nglobalThis.__fabricRun(__piFabricMain)", context, {
       filename: "pi-fabric-guest.js",
       // Node requires --experimental-vm-modules (set at spawn). Bun >= 1.4
       // honors this option on runInContext (unlike on createContext), so
@@ -91,12 +94,13 @@ const run = async (message) => {
       importModuleDynamically: (specifier) => import(specifier),
     });
     const value = jsonCompatible(await promise);
-    send({ type: "result", result: { value, logs, terminationReason: "completed" } });
+    send({ type: "result", result: { value, logs, emitted: jsonCompatible(context.__fabricEmitted), terminationReason: "completed" } });
   } catch (error) {
     send({
       type: "result",
       result: {
         logs,
+        emitted: jsonCompatible(context.__fabricEmitted),
         terminationReason: "runtime_error",
         error: error?.stack ?? error?.message ?? String(error),
       },

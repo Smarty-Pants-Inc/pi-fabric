@@ -74,7 +74,8 @@ ActionRegistry.invoke()          serve-or-reexecute at the real call site
    refs that are `risk: "read"` with `effect.kind: "none"`, never prompt for
    approval, and cost nothing when wasted (`pi.read`/`grep`/`find`/`ls`,
    `memory.recall`/`expand`/`sessions`, `state.get`/`history`/`complexity`,
-   `schema.status`, `compact.status`, `components.list`/`status`/`graph`).
+   `mesh.scheduled`, `schema.status`, `compact.status`/`pressure`, `thinking.status`, `decisions.list`,
+   `programs.list`/`get`, `components.list`/`status`/`graph`).
    The gate re-runs against the resolved descriptor at launch, so a provider
    or config change that reclassifies a ref closes speculation off.
 2. **Freshness, not staleness.** A stored promise is served only when both
@@ -133,7 +134,10 @@ tool through config: `speculation.mcpAllowlist: ["exa.*", "github.get_file"]`
 (matched against the ref after the `mcp.` prefix). Cached MCP tool
 annotations, when the runtime surfaces them, override the allowlist in one
 direction only: `destructiveHint: true` or `readOnlyHint: false` refuses even
-an allowlisted tool. Networked results carry no freshness guarantee. The
+an allowlisted tool. The live allowlist and policy gate are checked at both
+launch and replay; removing an entry cannot serve an already-warmed result.
+MCP descriptors keep their conservative network/effect classification rather
+than being relabeled as local reads. Networked results carry no freshness guarantee. The
 epoch still covers in-program effects, yet the world can change behind a
 read; keep the allowlist to stable, idempotent reads.
 

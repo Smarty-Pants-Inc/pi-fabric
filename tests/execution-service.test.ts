@@ -479,19 +479,19 @@ return {
       });
       expect(metadata.success).toBe(true);
       expect(metadata.value).toMatchObject({
-        providers: [],
+        providers: [{ name: "native" }],
         catalog: {
           kind: "pi-fabric.capability-catalog",
           complete: true,
-          totalActions: 0,
-          indexedActions: 0,
-          providers: [],
+          totalActions: 7,
+          indexedActions: 7,
+          providers: [{ name: "native" }],
           root: {
             key: "capability:fabric",
             description: expect.stringContaining("not historical session evidence"),
           },
         },
-        search: [],
+        search: [{ ref: "native.load" }],
       });
 
       const direct = await service.execute({

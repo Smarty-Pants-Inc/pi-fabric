@@ -27,7 +27,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     const scenarioFile = path.join(directory, "scenario");
     fs.writeFileSync(scenarioFile, scenario);
     vi.stubEnv("FAKE_MODEL_SCENARIO", scenarioFile);
-    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 5_000 }, {
+    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 5_000 }, {
       workerPath, piBinary: path.resolve("tests/fixtures/fake-pi-model.mjs"), runRoot: path.join(directory, "runs"),
     });
     managers.push(manager);
@@ -90,7 +90,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     vi.stubEnv("PI_OFFLINE", "1");
     vi.stubEnv("MODEL_PROBE_STARTUP_DELAY_MS", String(startupDelay));
     vi.stubEnv("MODEL_PROBE_SELECTION_DELAY_MS", String(selectionDelay));
-    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: concurrency, timeoutMs: 45_000 }, {
+    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, maxConcurrent: concurrency, timeoutMs: 45_000 }, {
       workerPath,
       piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
       fullCodeMode: false,

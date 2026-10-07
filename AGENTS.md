@@ -82,7 +82,7 @@ change is about dead exports or the lazy startup graph, never as a routine
 gate.
 
 Publishing runs `prepack`, which is `proof:check && typecheck && build`, never the
-suite. `proof:check` requires the pinned Bend 2.0.26 compiler; normal builds verify
+suite. `proof:check` requires the pinned Bend 2.0.35 compiler; normal builds verify
 the checked-in artifact hashes without requiring Bend. After a version bump the artifact is verified through
 `dist-tags` and `time["<version>"]` in the packument.
 

@@ -23,7 +23,13 @@ jobs:
           # The affected-test selection diffs the push range or the pull-request
           # base, so that base commit has to be present in history.
           fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - name: Install runtime prerequisites
         # pi's grep tool downloads rg on first use when it is absent; on shared
         # runners that ad-hoc GitHub Releases download is rate-limited, so
@@ -31,6 +37,9 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
+            # Non-login Git Bash children warn on stderr when its /tmp is absent.
+            # Keep command output deterministic without stripping real warnings.
+            mkdir -p /tmp
             choco install ripgrep -y --no-progress
           else
             sudo apt-get update
@@ -42,8 +51,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.26/bend-2.0.26-linux-x64.tar.gz
-          echo "5edcc8e5c12d525655431ab02659ddf88e362aafbe7c7bb7f783a1ffaeb6165c  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.35/bend-2.0.35-linux-x64.tar.gz
+          echo "63039d1a119f716767ac5a7d8fe0717cfacf219c6c253c35192148e0dade722f  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
       - name: Check proofs, reproduce executable kernels, and reject invalid mutations
@@ -61,6 +70,10 @@ jobs:
       - name: Package install smoke (no peers, as pi install)
         if: runner.os == 'Linux'
         run: bun run smoke:package-install
+      - name: Check CI workflow runtime configuration
+        run: bunx vitest run tests/ci-workflows.test.ts
+      - name: Check Python kernel diagnostics
+        run: bunx vitest run tests/kernel-errors.test.ts
       - name: Test verified-kernel ABI and provider dispatch on both platforms
         run: bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts
       - name: Check bundled verified-kernel behavior

@@ -1,4 +1,5 @@
 import type { FabricKernel } from "../runtime/kernel.js";
+import type { FabricAssessmentTraceV1 } from "./assessment.js";
 import {
   isFabricExecutionTraceV1,
   type FabricExecutionTraceOperationV1,
@@ -11,6 +12,8 @@ export interface FabricPersistedExecutionDetailsV1 {
   success: boolean;
   kernel?: FabricKernel;
   trace: FabricExecutionTraceV1;
+  /** Opt-in (`trace.assessment`) timings and usage, separate from the deterministic trace. */
+  assessment?: FabricAssessmentTraceV1;
   /** Rich render audits persisted verbatim (minus in-memory media) so a resumed transcript re-renders — and expands — exactly like the live one. */
   audits: FabricLegacyRenderAudit[];
   phases: string[];
@@ -101,6 +104,7 @@ export const createFabricPersistedExecutionDetails = (input: {
   success: boolean;
   kernel?: FabricKernel;
   trace: FabricExecutionTraceV1;
+  assessment?: FabricAssessmentTraceV1;
   audits?: readonly FabricPersistableAuditInput[];
   phases?: readonly string[];
   error?: string;
@@ -112,6 +116,10 @@ export const createFabricPersistedExecutionDetails = (input: {
     success: input.success,
     ...(input.kernel ? { kernel: input.kernel } : {}),
     trace: cloneTrace(input.trace),
+    // The execution service builds the projection; it is cloned, not re-guarded.
+    ...(input.assessment
+      ? { assessment: structuredClone(input.assessment) }
+      : {}),
     audits: (input.audits ?? []).map(persistableAudit),
     phases: (input.phases ?? []).filter((phase): phase is string => typeof phase === "string"),
     ...(typeof input.error === "string" && input.error ? { error: input.error } : {}),
@@ -128,6 +136,16 @@ export const createFabricPersistedExecutionDetails = (input: {
     details.audits.length > 0
   ) {
     details.audits.pop();
+  }
+  // Assessment rows are optional observability: they yield before the trace,
+  // and their totals survive.
+  while (
+    serializedBytes(details) > FABRIC_EXECUTION_DETAILS_MAX_BYTES &&
+    details.assessment &&
+    details.assessment.operations.length > 0
+  ) {
+    details.assessment.operations.pop();
+    details.assessment.counts.droppedOperations++;
   }
   while (
     serializedBytes(details) > FABRIC_EXECUTION_DETAILS_MAX_BYTES &&

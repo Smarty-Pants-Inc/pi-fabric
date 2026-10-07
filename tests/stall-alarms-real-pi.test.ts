@@ -45,7 +45,7 @@ it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: native new/resu
     await wait(() => fs.existsSync(path.join(root, "A", "ready")) && fs.existsSync(path.join(root, "B", "ready")));
     identities.A = ready("A"); identities.B = ready("B");
     const old = ready("B");
-    hold = B.prompt("HOLD"); void hold.catch(() => undefined);
+    hold = B.prompt("HOLD").then(() => undefined); void hold.catch(() => undefined);
     await wait(() => fs.existsSync(path.join(root, "B", "holding")));
     const carrierText = "smarty-dev#4313 ORIGINAL-CARRIER from A for rotating B";
     const resultEvents = await A.promptAndWait(`SEND ${JSON.stringify({ id: old.id, message: carrierText })}`, undefined, 30_000);

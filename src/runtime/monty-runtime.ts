@@ -7,6 +7,8 @@ import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { montyBindings } from "./monty-bridge.js";
 import { MONTY_BOOTSTRAP_SOURCE, montyErrorText, prepareMontySource } from "./monty-source.js";
 import { montyInput, normalizeMontyValue } from "./monty-values.js";
@@ -93,11 +95,18 @@ export class MontyRuntime implements FabricKernelRuntime {
       kill();
     };
     const abort = (): void => stop("aborted");
-    const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(() => stop("timed_out"));
+    const scheduleDeadline = (): void => {
+      if (stopped || hostAbort.signal.aborted || humanWait.paused) return;
+      executionDeadline.scheduleDeadline(() => stop("timed_out"));
+    };
     const checkDeadline = (): void => {
       if (executionDeadline.reached) stop("timed_out");
       if (hostAbort.signal.aborted) throw hostAbort.signal.reason;
     };
+    const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+      () => executionDeadline, options, scheduleDeadline, () => stop("timed_out"),
+    ));
+    options.registerHumanWaitPause?.(humanWait);
     scheduleDeadline();
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
@@ -110,7 +119,7 @@ export class MontyRuntime implements FabricKernelRuntime {
           binaryPath, minProcesses: 0, maxProcesses: 1, maxCheckoutsPerWorker: 1,
           // A fixed VM/per-turn limit would defeat a longer host-call floor. In that
           // mode the reschedulable host watchdog hard-kills the captured native PID.
-          ...(options.minimumTimeoutMsForHostCall ? {
+          ...(options.minimumTimeoutMsForHostCall || options.isHumanWaitHostCall ? {
             durationLimitGrace: null, requestTimeout: MAX_EXECUTOR_TIMEOUT_MS / 1000 + 1,
           } : {
             requestTimeout: options.timeoutMs / 1000 + 1, durationLimitGrace: 1,
@@ -125,7 +134,7 @@ export class MontyRuntime implements FabricKernelRuntime {
         const checkedOut = await ownedPool.checkout({
           scriptName: "fabric-exec.py", printFlushInterval: 0,
           limits: { maxMemory: options.memoryLimitBytes, maxRecursionDepth: 500, maxSuspensions: 10_000,
-            ...(!options.minimumTimeoutMsForHostCall ? { maxDurationSecs: options.timeoutMs / 1000 } : {}),
+            ...(!options.minimumTimeoutMsForHostCall && !options.isHumanWaitHostCall ? { maxDurationSecs: options.timeoutMs / 1000 } : {}),
           },
         });
         if (hostAbort.signal.aborted) { await checkedOut.close(); throw hostAbort.signal.reason; }
@@ -147,8 +156,12 @@ export class MontyRuntime implements FabricKernelRuntime {
         const settle = isPiShellRef(ref) && args.settle === true;
         if (isPiShellRef(ref)) delete args.settle;
         const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-        if (executionDeadline.extend(floor)) scheduleDeadline();
+        if (humanWait.paused && typeof floor === "number" && Number.isFinite(floor)) humanWait.raise(floor);
+        else if (executionDeadline.extend(floor)) scheduleDeadline();
         checkDeadline();
+        const waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
+        checkDeadline();
+        if (waitsForHuman) humanWait.enter();
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
         tasks.add(task);
         try {
@@ -169,7 +182,10 @@ export class MontyRuntime implements FabricKernelRuntime {
             return montyInput({ id, responseId: ++nextResponseId, __fabric_response_token: responseToken, value: { ok: false, ...exit, details: null, error: montyErrorText(error) } });
           }
           throw error;
-        } finally { tasks.delete(task); }
+        } finally {
+          tasks.delete(task);
+          if (waitsForHuman) humanWait.leave();
+        }
       };
       class PayloadValues {}
       const attributes = new PayloadValues();

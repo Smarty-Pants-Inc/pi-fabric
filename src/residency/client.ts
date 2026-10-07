@@ -10,11 +10,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeJsonAtomic, recordOwnerLiveness } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
+import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -530,6 +531,12 @@ export class ResidencyClient {
     const resolvedRequest = spawnRequest.cwd === undefined
       ? spawnRequest
       : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
+    // Registration is process-local: the resident host must import the runner too.
+    const runner = request.runner ?? this.options.config.agents.runner;
+    const runnerModule = BUILT_IN_RUNNER_IDS.has(runner) ? undefined : requireAgentRunner(runner).residentModule;
+    if (!BUILT_IN_RUNNER_IDS.has(runner) && !runnerModule) {
+      throw new Error(`Fabric runner ${runner} declares no residentModule; durable residency needs one`);
+    }
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined
@@ -548,6 +555,7 @@ export class ResidencyClient {
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
         caller,
+        ...(runnerModule ? { runnerModule } : {}),
         createdAt: Date.now(),
       },
       signal,
@@ -1000,7 +1008,7 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      !residentProcessAlive(owner.pid, owner.processStartTime)
+      recordOwnerLiveness(owner, { legacyAlive: (pid: number) => residentProcessAlive(pid, owner.processStartTime) }) === "dead"
     ) {
       return undefined;
     }

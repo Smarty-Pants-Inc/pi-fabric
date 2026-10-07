@@ -514,11 +514,17 @@ export class AgentMessageRouter {
       }
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
-      if (!this.control || participant.controlProtocol === "legacy") {
-        return context?.signal || options.principal
-          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
-          : this.actorManager.steerRemote(participant.id, message, kind, data);
+      // Root controls are not actor relays. Only the authenticated v1 owner
+      // path may accept them; legacy/absent channels cannot borrow actor authority.
+      if (!this.control || participant.controlProtocol !== "v1") {
+        throw new Error(`Fabric participant ${participant.id} has no control channel`);
       }
+      // A native Main's inbox belongs to its immutable session, not one extension
+      // generation. The same host/identity and shared command claims carry its
+      // admitted messages across reload. Distinct runtime-owned roots stay pinned,
+      // as do every actor/task control below; physical bridge routing stays bound.
+      const nativeSessionRoot = participant.id === participant.rootId &&
+        participant.ownerHostId === participant.id && participant.ownerIdentityId === participant.id;
       return this.control.request(
         participant.ownerHostId,
         participant.id,
@@ -531,6 +537,7 @@ export class AgentMessageRouter {
           ...(kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
             : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
+          ...(!nativeSessionRoot && participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
         },
         participant.ownerIdentityId,
         {
@@ -570,8 +577,8 @@ export class AgentMessageRouter {
     // into directory-backed publication outside the availability wrapper.
     if (provenLocal) throw new Error(`Unknown Fabric agent: ${id}`);
 
-    // An agent another host owns (a durable child in its spawner's resident host, or a peer's
-    // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
+    // Peer roots were resolved above with Main escalation and bridge fences.
+    // Remote task agents use the same validated execution owner.
     const remoteAgent = this.#get(id);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
       if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
@@ -581,7 +588,7 @@ export class AgentMessageRouter {
         remoteAgent.ownerHostId,
         remoteAgent.id,
         kind,
-        { message, data, principal: options.principal },
+        { message, data, principal: options.principal, ...(remoteAgent.ownerIncarnation ? { ownerIncarnation: remoteAgent.ownerIncarnation } : {}) },
         remoteAgent.ownerIdentityId,
         { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
@@ -648,6 +655,7 @@ export class AgentMessageRouter {
           : {}),
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
         ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+        ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
       },
       participant.ownerIdentityId,
       { idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
@@ -712,7 +720,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
+          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -775,10 +783,9 @@ export class AgentMessageRouter {
         return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
       }
       const options = controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId);
-      // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
-      // Validate without promoting the owner's current defaults into fixed per-call overrides.
+      // Refuse inexact owner-side selections before acknowledging a tell.
       await this.actorManager.resolveActivationBinding(actor.id, options);
-      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
+      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {

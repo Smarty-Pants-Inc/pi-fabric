@@ -6,6 +6,8 @@ interface SettingsSectionOptions {
   keepVisibleCandidates: readonly string[];
   modelSource: ModelSource;
   claudeModelSource?: ModelSource;
+  classifierModels?: readonly string[];
+  availableClassifierModels?: readonly string[];
   activeModelKey?: string;
   cachedMcpServers?: readonly string[];
 }

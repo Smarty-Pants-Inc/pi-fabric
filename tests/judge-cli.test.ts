@@ -11,8 +11,8 @@ let server: http.Server | undefined;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "judge-cli-test-")); });
 afterEach(async () => { if (server) await new Promise<void>(resolve => server!.close(() => resolve())); server = undefined; fs.rmSync(root, { recursive: true, force: true }); });
 const request = () => ({ questionClass: "item-stalled", itemRef: "org/repo#1", evidenceRefs: [{ url: "https://example.test/evidence", revision: "v1", observedAt: "2026-10-01T00:00:00Z" }], evidence: { facts: { fixture: true }, excerpts: [] }, allowedVerdicts: [...VERDICTS], timeboxMs: 5000, budget: { maxEvaluations: 1, maxAgents: 1, maxTokens: 1000 }, requestKey: "cli-proof" });
-const call = (input: string, config?: string) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-  const env = { ...process.env }; delete env.FABRIC_JUDGE_CONFIG;
+const call = (input: string, config?: string, extraEnv: NodeJS.ProcessEnv = {}) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+  const env = { ...process.env, ...extraEnv }; delete env.FABRIC_JUDGE_CONFIG;
   if (config) env.FABRIC_JUDGE_CONFIG = config;
   const child = spawn(process.execPath, [path.resolve("bin/fabric-judge")], { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "";
@@ -29,6 +29,44 @@ describe.skipIf(!fs.existsSync("dist/judge-cli.js"))("built fabric-judge stdin/s
     expect(JSON.parse(result.stdout)).toMatchObject({ verdict: "unknown", status: "unknown", reasonCode: "invalid_input", confidenceProvenance: "unavailable" });
   });
   it("rejects absent trusted configuration rather than selecting binaries from input", async () => { const result = await call(JSON.stringify(request())); expect(result.code).toBe(2); expect(JSON.parse(result.stdout).reasonCode).toBe("invalid_config"); });
+  it("accepts a below-threshold Jev process fallback through the compiled production wrapper without false cleanup debt", async () => {
+    const ledger = path.join(root, "ledger/model-routing.jsonl");
+    let calls = 0;
+    server = http.createServer((req, res) => {
+      req.resume(); req.on("end", () => {
+        calls++;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ model: "fixture", answers: { verdict: { type: "choice", choice: "stalled", confidence: .6,
+          probabilities: { moving: .4, stalled: .6, dependency: 0, agent_decision: 0, human_decision: 0, unknown: 0 } } }, usage: { input_tokens: 3, output_tokens: 2 } }));
+      });
+    });
+    await new Promise<void>(resolve => server!.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const config = path.join(root, "config.json");
+    fs.writeFileSync(config, JSON.stringify({ policy: { version: "test-v1", role: "Sol", pin: { model: "openai-codex/gpt-5.6-sol", effort: "max" } },
+      ledger, piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), fixtureEndpoint: `http://127.0.0.1:${port}/jev` }));
+    const scenario = path.join(root, "scenario"); fs.writeFileSync(scenario, "judge-reply");
+    const launches = path.join(root, "launches.jsonl");
+    const temp = path.join(root, "owned-temp"); fs.mkdirSync(temp);
+    const result = await call(JSON.stringify(request()), config, { FAKE_MODEL_SCENARIO: scenario, FAKE_JUDGE_LAUNCH_FILE: launches, TMPDIR: temp, TMP: temp, TEMP: temp, PI_FABRIC_DEPTH: "0" });
+    expect(result.code).toBe(0); expect(result.stderr).toBe(""); expect(calls).toBe(1);
+    expect(result.stdout.trim().split("\n")).toHaveLength(1);
+    const envelope = JSON.parse(result.stdout);
+    expect(envelope).toMatchObject({ verdict: "dependency", status: "completed", reasonCode: "agent_accepted", confidenceProvenance: "agent-self-report",
+      evidenceLinks: [request().evidenceRefs[0]!.url], cost: { tokens: 10, evaluations: 1, agents: 1, usd: null } });
+    const rows = fs.readFileSync(ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.filter(row => row.type === "decision")).toHaveLength(1);
+    expect(rows.filter(row => row.type === "outcome")).toEqual([expect.objectContaining({ decisionId: envelope.decisionId, status: "completed", tokens: expect.objectContaining({ input: 2, output: 3 }) })]);
+    expect(rows.find(row => row.backend === "pi-process")).toMatchObject({ status: "completed", error: null, usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } });
+    expect(rows.at(-1)).toMatchObject({ type: "judgment-outcome", decisionId: envelope.decisionId, reasonCode: "agent_accepted", cost: { tokens: 10 } });
+    const workers = fs.readFileSync(launches, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(workers).toHaveLength(1);
+    const wrapper = path.dirname(workers[0].cwd);
+    expect(path.dirname(wrapper)).toBe(temp);
+    expect(workers[0].replyFile).toContain(path.join(wrapper, "runs"));
+    expect(fs.existsSync(wrapper)).toBe(false);
+    expect(fs.readdirSync(temp).filter(name => name.startsWith("fabric-judge-"))).toEqual([]);
+  });
   it("records before a local typed Jev request, emits only JSON and does not start Pi", async () => {
     const ledger = path.join(root, "ledger/model-routing.jsonl");
     let calls = 0;

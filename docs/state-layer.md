@@ -42,8 +42,8 @@ The append-only JSONL event log holds:
 - **`transition`**: a versioned proposal with `data: { protocolVersion: 1, phase: "proposed", label, from?, to, summary, evidence?, tags?, kind?, complexity?, certificationStatus?, ts }`.
 - **`transition.committed`**: makes its referenced proposal visible after all ledger and head CAS writes succeed.
 - **`transition.rejected`**: records a failed proposal and its rollback or quarantine status. A proposal never becomes visible merely because this marker exists.
-- **`state.certified`**: emitted only after a successful verification. Its data holds bounded `targets`, the verification-time `head`, `evidenceDigest`, `resultDigest`, `certificationStatus: "certified"`, and `ts`.
-- **`state.violated`**: best-effort reporting for fail-closed verification. Its data holds bounded non-confirmed `results`, blocking `reasons`, selected `targets`, the verification-time `head`, and both digests.
+- **`state.certified`**: emitted only after a successful verification. Its data holds bounded `targets`, the verification-time `head`, `evidenceDigest`, `resultDigest`, `certificationStatus: "certified"`, the [bound certificate](#bound-certificates) fields (`binding?`, `observed?`, `issuer`, `requestedBy`, `schemaMode?`), and `ts`.
+- **`state.violated`**: best-effort reporting for fail-closed verification. Its data holds bounded non-confirmed `results`, blocking `reasons`, selected `targets`, the verification-time `head`, both digests, and the same bound certificate fields.
 - **`state.goal.met`**: emitted when the executable goal predicate passes.
 
 A certificate target carries the transition's stable `transitionId`, `label`, and `to`. When verification has a head, the certificate also records that head's `transitionId`, label, destination, and CAS `version`. The fold applies certification and violation events in sequence for each target. A transition receives a certified overlay only when its latest durable verification outcome is `state.certified`. A later `state.violated` removes that overlay. Certificate currentness also requires the full recorded head identity to equal the committed current head: transition ID, label, destination, and CAS version.
@@ -143,7 +143,7 @@ By default the fold finds the last representation transition and drops earlier t
 
 ### `state.verify`: risk `execute`
 
-`{ labels?, includeArchived?, timeoutMs? }` selects the current head when you omit `labels`. With labels supplied, it selects the active transitions that match. Archived transitions stay out unless you set `includeArchived: true`.
+`{ labels?, includeArchived?, timeoutMs?, binding? }` selects the current head when you omit `labels`. With labels supplied, it selects the active transitions that match. Archived transitions stay out unless you set `includeArchived: true`.
 
 Commands run sequentially with a per-command timeout of 30 seconds by default. The layer streams combined stdout and stderr. It does not accumulate output without limit. Each report keeps at most a 32 KiB UTF-8 prefix per command, plus `outputBytes`, `outputOmittedBytes`, and a digest of the complete byte stream. Results also apply byte bounds to claims, commands, and errors, and each carries digest and omission metadata. Verification events use smaller bounded prefixes, bounded result and reason arrays, and target chunks, so each payload stays comfortably below the default 256 KiB mesh limit. Each result includes `{ claim, command, status, exitCode, output, outputBytes, outputOmittedBytes, outputDigest, error? }`. The `status` field is one of:
 
@@ -151,7 +151,7 @@ Commands run sequentially with a per-command timeout of 30 seconds by default. T
 - `violated` on a non-zero exit;
 - `error` on spawn failure, timeout, or cancellation.
 
-The report adds `{ certified, violated, certificationStatus, evidenceDigest, resultDigest, failures, certificate? }`. The `certified` flag is true if and only if at least one evidence command ran and every result was confirmed. Any other outcome blocks certification and publishes `state.violated`. A successful run publishes `state.certified` and returns its certificate. When the selected targets include the unchanged current head, the layer then CAS-persists that certificate in `state/current` with a binding to the resulting head version. After a failed run that targets the unchanged current head, it CAS-revokes any stored certificate once violation publication succeeds.
+The report adds `{ certified, violated, certificationStatus, evidenceDigest, resultDigest, failures, certificate?, binding?, observed?, requestedBy }`. See [Bound certificates](#bound-certificates) for `binding`. The `certified` flag is true if and only if at least one evidence command ran and every result was confirmed. Any other outcome blocks certification and publishes `state.violated`. A successful run publishes `state.certified` and returns its certificate. When the selected targets include the unchanged current head, the layer then CAS-persists that certificate in `state/current` with a binding to the resulting head version. After a failed run that targets the unchanged current head, it CAS-revokes any stored certificate once violation publication succeeds.
 
 An explicitly empty `labels` array selects nothing and fails closed. A request for an archived, proposed, rejected, or otherwise uncommitted label also fails closed as a missing active target when no committed match is visible.
 
@@ -164,6 +164,28 @@ On POSIX, each command shell leads a detached process group. A timeout or abort 
 ### `state.checkGoal`: risk `execute`
 
 `{ timeoutMs? }` runs the goal predicate and reports `{ passed, output, exitCode, error? }`. The same 32 KiB cap bounds the command output. A passing `state.goal.met` event stores a smaller bounded prefix along with the full-stream digest and omission metadata. Goal checks stay separate from state certification.
+
+## Bound certificates
+
+A certificate says which evidence passed. A verifier that consumes it, such as a pi-work style gate, usually also needs to know *what* that evidence ran against and *who* issued it. `state.verify` accepts an optional `binding`, and every new certificate carries host-recorded provenance:
+
+| Field | Source | Meaning |
+| --- | --- | --- |
+| `binding` | Caller | Up to 16 string claims. Keys match `[a-z][a-zA-Z0-9_.-]{0,63}`, values hold at most 512 characters, and keys are stored sorted. Well-known keys: `commit`, `specDigest`, `nodeAddress`, `criteriaDigest`. |
+| `observed` | Host | `{ commit?, dirty? }` from `git rev-parse --verify HEAD` and `git status --porcelain` in the verification cwd, taken before any evidence runs. Fabric omits it outside a git work tree or before the first commit, and omits only `dirty` when the status probe fails. Probes are time-bounded, output-bounded, and run with `GIT_OPTIONAL_LOCKS=0`. |
+| `issuer` | Host | Always `"host"`: the Fabric host ran the evidence and wrote the certificate. |
+| `requestedBy` | Host | `"program"` when the call came through the `state` provider action surface (a `fabric_exec` program or any other registry caller); `"host"` when host code calls `StateStore.verify` directly. |
+| `schemaMode` | Host | The configured Schema mode (`off`, `audit`, or `enforce`) at verification time, when known. |
+
+Only `binding.commit` is checked. The host compares it, case-insensitively, with the full observed HEAD object name. A different HEAD fails closed with reason `binding-mismatch`. A cwd with no observable HEAD fails closed with reason `binding-unobserved`. In both cases no evidence runs, `state.violated` is published, and a current certificate for the targeted head is revoked as for any other failed verification. Other binding keys are recorded caller claims. Fabric validates their shape but not their meaning. A consumer that requires them must compare them with its own expected values. A malformed `binding` is a usage error: the call throws before any probe, evidence, or event.
+
+These fields appear wherever the certificate does: the `state.certified` event, the durable certificate in `state/current`, `state.get()` (`head.certificate` and `certification.current/recent`), `state.history()`, and the `state.verify` report. All fields are optional on read. Certificates written before this change still fold, and malformed stored values fold as absent while the certificate itself stays valid.
+
+A strict verifier can therefore require, for example, `issuer === "host"`, `requestedBy === "program"`, `observed.commit === expectedCommit`, `observed.dirty === false`, and `binding.specDigest === expectedSpecDigest`. Like the rest of the state layer, these are records in project mesh storage. They are as trustworthy as write access to that storage and not cryptographically signed.
+
+### Relation to the verified state kernel
+
+The bound fields live entirely in the JavaScript host payload. They are not inputs to the generated `headReadable` kernel that decides head visibility, and they do not touch the Schema controller's `assertCertificateFacts`/`consume` transaction-certificate kernels. Certificate currentness still depends only on the recorded head identity. The commit check is a host-side precondition, and it can only add a blocking failure: it can turn a would-be certification into a violation but never the reverse. No `.bend` law, proof, or generated module changed.
 
 ## Complexity rule
 

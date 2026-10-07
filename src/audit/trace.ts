@@ -1,5 +1,5 @@
 import { isPiShellRef } from "../core/pi-tools.js";
-import { isNormalFormWitness, type NormalFormWitness } from "../entropy/normal-form.js";
+import { isNormalFormWitness, type NormalFormWitness } from "../entropy/normal-form-witness.js";
 import { projectFabricAuditArgs, projectFabricAuditResult } from "./projection.js";
 
 export const FABRIC_EXECUTION_TRACE_KIND = "pi-fabric.execution" as const;
@@ -392,10 +392,21 @@ const executionErrorMessage = (outcome: FabricExecutionOutcomeV1): string | unde
   return "Execution failed";
 };
 
+/**
+ * Optional, non-deterministic side channel (the assessment projection). It
+ * observes issue and settle events and never alters the deterministic trace.
+ */
+export interface FabricExecutionTraceObserver {
+  issued(sequence: number, ref: string): void;
+  settled(sequence: number, outcome: FabricExecutionOutcomeV1, result: unknown): void;
+}
+
 export class FabricExecutionTraceOperationHandle {
   constructor(
     private readonly recorder: FabricExecutionTraceRecorder,
     private readonly operation: MutableOperation | undefined,
+    /** Bridge issue order; shared with the trace operation when one is recorded. */
+    readonly sequence = -1,
   ) {}
 
   resolved(provider: string, action: string): void {
@@ -421,6 +432,7 @@ export class FabricExecutionTraceOperationHandle {
   }
 
   succeed(result: unknown, meta?: TraceResultMeta): void {
+    this.recorder.observeSettled(this.sequence, "succeeded", result);
     if (!this.operation || this.recorder.sealed) return;
     const projected = projectFabricAuditResult(this.operation.projectionRef, result);
     if (projected !== undefined) {
@@ -440,6 +452,7 @@ export class FabricExecutionTraceOperationHandle {
     result?: unknown,
     meta?: TraceResultMeta,
   ): void {
+    this.recorder.observeSettled(this.sequence, outcome, result);
     if (!this.operation || this.recorder.sealed) return;
     this.operation.failureStage = stage;
     if (error instanceof FabricTraceSafeError) this.operation.causeSafe = true;
@@ -470,7 +483,22 @@ export class FabricExecutionTraceRecorder {
   #nextSequence = 0;
   #droppedOperations = 0;
   #truncatedIdentifiers = 0;
+  readonly #observer: FabricExecutionTraceObserver | undefined;
   sealed = false;
+
+  constructor(observer?: FabricExecutionTraceObserver) {
+    this.#observer = observer;
+  }
+
+  /** @internal Forwards a settle to the observer; observer faults never reach the program. */
+  observeSettled(sequence: number, outcome: FabricExecutionOutcomeV1, result: unknown): void {
+    if (!this.#observer || this.sealed || sequence < 0) return;
+    try {
+      this.#observer.settled(sequence, outcome, result);
+    } catch {
+      // Observation is best effort.
+    }
+  }
 
   snapshotIdentifier(value: string, maxBytes = MAX_IDENTIFIER_BYTES): string {
     const bounded = boundedIdentifier(value, maxBytes);
@@ -480,9 +508,16 @@ export class FabricExecutionTraceRecorder {
 
   issueCall(ref: string, args: Record<string, unknown>): FabricExecutionTraceOperationHandle {
     const sequence = this.#nextSequence++;
+    if (this.#observer && !this.sealed) {
+      try {
+        this.#observer.issued(sequence, ref);
+      } catch {
+        // Observation is best effort.
+      }
+    }
     if (this.sealed || this.#operations.length >= MAX_RECORDED_OPERATIONS) {
       this.#droppedOperations++;
-      return new FabricExecutionTraceOperationHandle(this, undefined);
+      return new FabricExecutionTraceOperationHandle(this, undefined, this.sealed ? -1 : sequence);
     }
     const identity = lexicalIdentity(ref);
     const operation: MutableOperation = {
@@ -496,7 +531,7 @@ export class FabricExecutionTraceRecorder {
       droppedResultValues: 0,
     };
     this.#operations.push(operation);
-    return new FabricExecutionTraceOperationHandle(this, operation);
+    return new FabricExecutionTraceOperationHandle(this, operation, sequence);
   }
 
   // safeError must contain no guest source text, tool output, or argument

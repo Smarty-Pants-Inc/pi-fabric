@@ -9,10 +9,11 @@ import {
   mergeFabricApprovalUsage,
 } from "../src/core/direct-tool-approval.js";
 
-const tool = (name: string, source = "builtin") => ({
+const tool = (name: string, source = "builtin", extra: Record<string, unknown> = {}) => ({
   name,
   description: "Run " + name,
   parameters: { type: "object", properties: {} },
+  ...extra,
   sourceInfo: {
     path: source === "builtin" ? "<builtin:" + name + ">" : "/extensions/example.ts",
     source,
@@ -69,6 +70,28 @@ describe("direct Pi tool approvals", () => {
       event("deploy", { target: "production" }),
       noUiContext,
     )).rejects.toThrow("extensions.deploy is denied by the Fabric network policy");
+  });
+
+  it("applies an absolute canonical deny to a native Pi MCP tool", async () => {
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.approvals.execute = "allow";
+    config.approvals.network = "allow";
+    config.approvals.actions = { "mcp.github.get_secret": "deny" };
+    const native = tool("mcp__github__get_secret", "builtin", {
+      namespace: { name: "mcp__github" },
+      label: "github/get_secret",
+    });
+    const approval = new FabricDirectToolApproval(
+      { getAllTools: () => [native] } as never,
+      () => config,
+      new FabricSessionApprovals(),
+      undefined,
+      undefined,
+      (toolName) => toolName === native.name ? { server: "github", tool: "get_secret" } : undefined,
+    );
+    await expect(approval.approve(event(native.name), noUiContext)).rejects.toThrow(
+      "mcp.github.get_secret is denied by the Fabric approvals.actions policy",
+    );
   });
 
   it("classifies auto calls with the native action and retains classifier usage", async () => {

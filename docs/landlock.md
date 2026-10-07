@@ -13,7 +13,7 @@ Kernel 6.8 / Landlock ABI 4 has **no audit-only/warn mode**. There is no cheap,
 rootless mechanism that can let arbitrary commands run unchanged while reporting
 all the mutations Landlock would deny. Running a command twice is not a safe
 substitute; text inspection and inotify are not denial evidence. Consequently
-`warn` is rejected at configuration load, rather than accepted with fake data.
+`warn` is rejected at configuration load; it cannot be accepted with fake data.
 The authorized fallback is implemented:
 
 ```json
@@ -124,9 +124,8 @@ its reviewed JSON policy. Build on each target Linux architecture; copying an
 x86 binary to ARM or a non-Linux-built package to Linux does not enable it.
 macOS/Windows builds skip C compilation and keep bash unchanged.
 
-`landrun` was considered as a no-root static Go CLI, but there is no locally
-installed/pinned binary or locally verifiable license/ABI-v4 contract in this
-offline lane. We did not fetch GitHub, dependencies or third-party binaries.
+`landrun` was considered as a rootless static Go CLI. This offline lane has no
+locally installed/pinned binary or locally verifiable license/ABI-v4 contract. We did not fetch GitHub, dependencies or third-party binaries.
 The `ponytail:` comment selects the auditable dependency-free C adapter instead.
 
 The helper replaces the OS-spawned shell executable. It applies `no_new_privs`

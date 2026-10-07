@@ -6,6 +6,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { SHELL_READ_MAX_BYTES } from "../src/core/shell-jobs.js";
 import { TasksProvider } from "../src/providers/tasks-provider.js";
 import { ShellEventInbox } from "../src/core/shell-inbox.js";
 import { ResultConsumption } from "../src/result-consumption.js";
@@ -237,7 +238,9 @@ describe("tasks provider", () => {
       const job = store.begin("bash", "watch", { monitor: { delivery: "ui", match: "READY:", intervalMs: 1000, timeoutMs: 300000 } });
       job.append(Buffer.from("ignored\nREADY: old\n")); await vi.advanceTimersByTimeAsync(1000);
       job.append(Buffer.from(Array.from({ length: 12 }, (_, i) => `READY: ${i}\n`).join(""))); await vi.advanceTimersByTimeAsync(1000);
-      expect(await provider.invoke("watch", { id: job.id }, context)).toMatchObject({ reason: "event", nextCursor: 13, omitted: 5, lines: Array.from({ length: 8 }, (_, i) => `READY: ${i + 4}`) });
+      expect(await provider.invoke("watch", { id: job.id }, context)).toMatchObject({ reason: "event", nextCursor: 13, omitted: 0, losses: [], more: false, lines: ["READY: old", ...Array.from({ length: 12 }, (_, i) => `READY: ${i}`)] });
+      // Agent-facing delivery keeps its eight newest previews; replay keeps every line.
+      expect(job.info().lastEvent).toMatchObject({ omitted: 4, lines: Array.from({ length: 8 }, (_, i) => `READY: ${i + 4}`) });
       expect(await provider.invoke("watch", { id: job.id, after: 11 }, context)).toMatchObject({ omitted: 0, lines: ["READY: 10", "READY: 11"], nextCursor: 13 });
       const next = provider.invoke("watch", { id: job.id, after: 13 }, context);
       job.append(Buffer.from("READY: fresh\n")); await vi.advanceTimersByTimeAsync(1000);
@@ -251,6 +254,140 @@ describe("tasks provider", () => {
       expect(await end).toMatchObject({ reason: "finished", nextCursor: 14, lines: [] });
     } finally { vi.useRealTimers(); }
   });
+  it("pages replay and discloses burst and eviction losses as cursor ranges", async () => {
+    vi.useFakeTimers();
+    try {
+      const { store, provider } = setup();
+      const job = store.begin("bash", "watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });
+      job.append(Buffer.from(Array.from({ length: 300 }, (_, i) => `line ${i}\n`).join(""))); await vi.advanceTimersByTimeAsync(1000);
+      const first = await provider.invoke("watch", { id: job.id }, context);
+      expect(first).toMatchObject({ reason: "event", losses: [{ after: 0, next: 44, reason: "burst" }], omitted: 44, more: true, nextCursor: 108 });
+      expect((first as { lines: string[] }).lines).toEqual(Array.from({ length: 64 }, (_, i) => `line ${i + 44}`));
+      const second = await provider.invoke("watch", { id: job.id, after: 108 }, context) as { lines: string[] };
+      expect(second).toMatchObject({ omitted: 0, losses: [], more: true, nextCursor: 172 });
+      expect(second.lines[0]).toBe("line 108");
+      // The ring keeps the newest 256 positions; a lagging reader sees an eviction record.
+      job.append(Buffer.from(Array.from({ length: 100 }, (_, i) => `more ${i}\n`).join(""))); await vi.advanceTimersByTimeAsync(1000);
+      const lagging = await provider.invoke("watch", { id: job.id, after: 108 }, context) as { lines: string[]; losses: unknown[] };
+      expect(lagging.losses).toEqual([{ after: 108, next: 144, reason: "evicted" }]);
+      expect(lagging.lines[0]).toBe("line 144");
+    } finally { vi.useRealTimers(); }
+  });
+  it("reads combined output by byte offset without splitting UTF-8, and discloses evicted bytes", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "work"); job.spill();
+    const bytes = Buffer.from("héllo\n");
+    job.append(bytes.subarray(0, 2));
+    // The first byte of "é" is held back until its continuation arrives.
+    expect(await provider.invoke("read", { id: job.id }, context)).toMatchObject({ offset: 0, bytes: 1, text: "h", next: 1, eof: false, omittedBytes: 0, stream: "output", state: "spilled" });
+    job.append(bytes.subarray(2));
+    expect(await provider.invoke("read", { id: job.id, offset: 1 }, context)).toMatchObject({ text: "éllo\n", next: 7 });
+    expect(await provider.invoke("read", { id: job.id, offset: 0, encoding: "base64" }, context)).toMatchObject({ data: bytes.toString("base64"), next: 7 });
+    await expect(provider.invoke("read", { id: job.id, offset: 8 }, context)).rejects.toThrow("past the task's output");
+    job.append(Buffer.alloc(1024 * 1024, 97));
+    const lagging = await provider.invoke("read", { id: job.id, offset: 0, max: 4 }, context);
+    expect(lagging).toMatchObject({ offset: 7, omittedBytes: 7, bytes: 4 });
+    await job.finish(0);
+    // After exit a 32 KiB window stays readable at the same offsets.
+    const tail = await provider.invoke("read", { id: job.id, offset: 0 }, context) as { offset: number; omittedBytes: number; next: number; eof: boolean };
+    expect(tail).toMatchObject({ offset: 7 + 1024 * 1024 - 32 * 1024, eof: true, next: 7 + 1024 * 1024 });
+  });
+  it("long-polls a read for new bytes or exit, without stopping the task", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "work"); job.spill();
+    const pending = provider.invoke("read", { id: job.id, offset: 0, waitMs: 5000 }, context);
+    job.append(Buffer.from("ready\n"));
+    expect(await pending).toMatchObject({ text: "ready\n", next: 6 });
+    expect(await provider.invoke("read", { id: job.id, offset: 6, waitMs: 5 }, context)).toMatchObject({ bytes: 0, next: 6, eof: false });
+    const ending = provider.invoke("read", { id: job.id, offset: 6, waitMs: 5000 }, context);
+    await job.finish(0);
+    expect(await ending).toMatchObject({ bytes: 0, eof: true, state: "exited" });
+    expect(job.abort.signal.aborted).toBe(false);
+  });
+  it("watches any task for a literal chosen at watch time, by byte cursor", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "server"); job.spill();
+    job.append(Buffer.from("booting\nlistening on :3000\nGET / 200\npartial READY"));
+    const first = await provider.invoke("watch", { id: job.id, match: "listening" }, context) as { reason: string; lines: string[]; nextCursor: number };
+    expect(first).toMatchObject({ reason: "event", lines: ["listening on :3000"], more: true });
+    // The unterminated line is not consumed until it ends or the task exits.
+    const idle = await provider.invoke("watch", { id: job.id, match: "READY", after: first.nextCursor, timeoutMs: 10 }, context) as { reason: string; nextCursor: number };
+    expect(idle).toMatchObject({ reason: "timeout", lines: [] });
+    const pending = provider.invoke("watch", { id: job.id, match: "READY", after: idle.nextCursor, timeoutMs: 5000 }, context);
+    job.append(Buffer.from("\n"));
+    expect(await pending).toMatchObject({ reason: "event", lines: ["partial READY"], more: false });
+    await job.finish(0);
+    const done = await provider.invoke("watch", { id: job.id, match: "nothing" }, context);
+    expect(done).toMatchObject({ reason: "finished", lines: [], more: false });
+    expect(job.abort.signal.aborted).toBe(false);
+  });
+  it("A21 keeps malformed UTF-8 line cursors in raw bytes and sees appended matches", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "invalid utf8"); job.spill();
+    job.append(Buffer.from([0xff, 0x78, 0x0a]));
+    const first = await provider.invoke("watch", { id: job.id, match: "x" }, context) as { nextCursor: number };
+    expect(first).toMatchObject({ lines: ["�x"], nextCursor: 3, omittedBytes: 0, more: false });
+    await expect(provider.invoke("watch", { id: job.id, match: "x", after: first.nextCursor, timeoutMs: 5 }, context))
+      .resolves.toMatchObject({ lines: [], nextCursor: 3, reason: "timeout" });
+    job.append(Buffer.from("xx\n"));
+    await expect(provider.invoke("watch", { id: job.id, match: "x", after: first.nextCursor }, context))
+      .resolves.toMatchObject({ lines: ["xx"], nextCursor: 6, omittedBytes: 0 });
+  });
+  it("A21 clips malformed UTF-8 pending lines by bytes, not replacement text length", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "invalid clipped utf8"); job.spill();
+    job.append(Buffer.concat([Buffer.from([0xff]), Buffer.alloc(SHELL_READ_MAX_BYTES - 1, 120)]));
+    const first = await provider.invoke("watch", { id: job.id, match: "x" }, context) as { nextCursor: number };
+    expect(first).toMatchObject({ nextCursor: SHELL_READ_MAX_BYTES, more: false });
+    job.append(Buffer.from("NEXT x\n"));
+    await expect(provider.invoke("watch", { id: job.id, match: "NEXT", after: first.nextCursor }, context))
+      .resolves.toMatchObject({ lines: ["NEXT x"], nextCursor: SHELL_READ_MAX_BYTES + 7, omittedBytes: 0 });
+  });
+  it("does not spin on incomplete UTF-8 tails or page-boundary multibyte output", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "utf8"); job.spill();
+    const encoded = Buffer.from("READY: 😀\n");
+    job.append(encoded.subarray(0, encoded.length - 2));
+    await expect(provider.invoke("watch", { id: job.id, match: "READY", timeoutMs: 10 }, context))
+      .resolves.toMatchObject({ reason: "timeout", lines: [] });
+    const pending = provider.invoke("watch", { id: job.id, match: "READY", timeoutMs: 5000 }, context);
+    job.append(encoded.subarray(encoded.length - 2));
+    expect(await pending).toMatchObject({ reason: "event", lines: ["READY: 😀"] });
+
+    const boundary = store.begin("bash", "boundary"); boundary.spill();
+    boundary.append(Buffer.concat([Buffer.alloc(SHELL_READ_MAX_BYTES - 1, 120), Buffer.from("😀NEEDLE")]));
+    const clipped = await provider.invoke("watch", { id: boundary.id, match: "never", timeoutMs: 10 }, context) as { nextCursor: number };
+    expect(clipped).toMatchObject({ reason: "timeout", nextCursor: SHELL_READ_MAX_BYTES - 1 });
+    const resumed = provider.invoke("watch", { id: boundary.id, match: "NEEDLE", after: clipped.nextCursor, timeoutMs: 5000 }, context);
+    boundary.append(Buffer.from([10]));
+    await expect(resumed).resolves.toMatchObject({ reason: "event", lines: ["😀NEEDLE"], nextCursor: boundary.written });
+  });
+
+  it("checks cancellation and deadlines while draining many raw output pages", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "many pages"); job.spill();
+    job.append(Buffer.alloc(SHELL_READ_MAX_BYTES * 4, 120));
+    const abort = new AbortController();
+    const original = job.read.bind(job);
+    const spy = vi.spyOn(job, "read").mockImplementation((...args) => {
+      const page = original(...args);
+      abort.abort(new Error("cancel draining"));
+      return page;
+    });
+    try {
+      await expect(provider.invoke("watch", { id: job.id, match: "never" }, { ...context, signal: abort.signal })).rejects.toThrow("cancel draining");
+      expect(spy).toHaveBeenCalledOnce();
+    } finally { spy.mockRestore(); }
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValueOnce(0).mockReturnValue(100);
+    try {
+      const reader = vi.spyOn(job, "read");
+      await expect(provider.invoke("watch", { id: job.id, match: "never", timeoutMs: 10 }, context)).resolves.toMatchObject({ reason: "timeout" });
+      expect(reader).toHaveBeenCalledOnce();
+      reader.mockRestore();
+    } finally { clock.mockRestore(); }
+  });
+
   it("cancels an in-flight watch without stopping its monitor or consuming an event", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });
@@ -266,7 +403,7 @@ describe("tasks provider", () => {
     const { store, provider } = setup(); const job = store.begin("bash", "work");
     for (const args of [{ timeoutMs: 0 }, { timeoutMs: 300001 }, { timeoutMs: 1.5 }, { extra: true }])
       await expect(provider.invoke("wait", { id: job.id, ...args }, context)).rejects.toThrow("Invalid tasks.wait");
-    await expect(provider.invoke("watch", { id: job.id }, context)).rejects.toThrow("requires a task started with monitor");
+    await expect(provider.invoke("watch", { id: job.id }, context)).rejects.toThrow("needs a match literal");
     const monitor = store.begin("bash", "watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });
     await expect(provider.invoke("watch", { id: monitor.id, after: 1 }, context)).rejects.toThrow("existing event cursor");
     await expect(provider.invoke("wait", { id: "another-session" }, context)).rejects.toThrow("Unknown shell task");
@@ -287,7 +424,7 @@ describe("tasks provider", () => {
   });
   it("registers discoverable list/get/wait/watch/stop contracts", async () => {
     const { provider } = setup();
-    expect((await provider.list({})).map(d => d.name)).toEqual(["list", "get", "wait", "watch", "stop"]);
+    expect((await provider.list({})).map(d => d.name)).toEqual(["list", "get", "wait", "read", "watch", "stop"]);
     expect(await provider.describe("stop")).toMatchObject({ risk: "execute", inputSchema: { additionalProperties: false } });
   });
   it("returns terminal metadata, bounded output, and acknowledges a consumed result", async () => {

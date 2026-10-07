@@ -1,7 +1,9 @@
 import { Type } from "typebox";
 import { validationMessage } from "../core/action-arguments.js";
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
-import { JevClient, JevCredentials, type JevCredentialSource } from "../jev/client.js";
+import { JevClient, JevCredentials, type JevCredentialSource, type JevDispatch } from "../jev/client.js";
+import type { DurableShellBridge } from "../jev-fabric/bridge.js";
+import type { JevFabricServe } from "../jev-fabric/serve.js";
 import { JevProgramManager, type JevManagerOptions } from "../jev/manager.js";
 import { resolveJevModelRoute, type JevRoute } from "../jev/routes.js";
 import type { JevLaunch, JevRequest } from "../jev/types.js";
@@ -62,7 +64,12 @@ export class JevProvider implements FabricProvider {
   readonly manager: JevProgramManager;
   readonly client: JevClient;
   readonly route: JevRoute;
-  constructor(options: JevManagerOptions & { credentialSource?: JevCredentialSource }, client?: JevClient) {
+  /** One jev-fabric `serve` connection per program run: one client, one budget, like a Bend program. */
+  readonly #runs = new Map<string, Promise<JevFabricServe | undefined>>();
+  #transport: "fabric" | "jev-fabric" | undefined;
+  readonly #jevFabric: DurableShellBridge | undefined;
+  constructor(options: JevManagerOptions & { credentialSource?: JevCredentialSource; jevFabric?: DurableShellBridge | undefined }, client?: JevClient) {
+    this.#jevFabric = options.jevFabric;
     this.manager = new JevProgramManager(options);
     this.route = resolveJevModelRoute(options.config.jev.model).route;
     this.client = client ?? new JevClient(options.config.jev, undefined,
@@ -79,11 +86,16 @@ export class JevProvider implements FabricProvider {
     const invalid = validationMessage(descriptor.inputSchema, args);
     if (invalid) throw new Error(`Invalid jev.${name} arguments: ${invalid}`);
     switch (name) {
-      case "evaluate": return this.client.evaluate(args as unknown as JevRequest, context.signal ?? new AbortController().signal);
+      case "evaluate": {
+        const dispatch = await this.#dispatchFor(context.parentToolCallId);
+        this.#transport = dispatch ? "jev-fabric" : "fabric";
+        return this.client.evaluate(args as unknown as JevRequest, context.signal ?? new AbortController().signal, dispatch);
+      }
       case "run": return this.manager.launch(args as unknown as JevLaunch, context, false);
       case "spawn": return this.manager.launch(args as unknown as JevLaunch, context, true);
       case "status": return typeof args.id === "string" ? this.manager.status(args.id, args.after as number | undefined) : {
         credentials: this.client.credentials.status(), model: this.client.config.model, route: this.route.id, runs: this.manager.list(),
+        transport: { configured: this.client.config.transport, ...(this.#transport ? { last: this.#transport } : {}) },
       };
       case "join":
       case "wait": return this.manager.wait(args.id as string, context.signal);
@@ -91,5 +103,60 @@ export class JevProvider implements FabricProvider {
       case "stop": return this.manager.stop(args.id as string);
     }
   }
-  async close(): Promise<void> { await this.manager.close(); await this.client.drainCredentials(); this.client.close(); }
+  /**
+   * Program decisions go through the run's own jev-fabric connection when
+   * configured and available; direct calls stay in-process. `auto` falls back
+   * to in-process only when no suitable binary resolves, never after a request fails.
+   */
+  async #dispatchFor(scope: string | undefined): Promise<JevDispatch | undefined> {
+    const transport = this.client.config.transport;
+    if (transport === "fabric" || !scope?.startsWith("jev:")) return undefined;
+    const bridge = this.#jevFabric;
+    if (!bridge) {
+      if (transport === "jev-fabric") throw new Error("jev.transport jev-fabric needs jev-fabric, which runs on macOS and Linux outside managed hosts");
+      return undefined;
+    }
+    let pending = this.#runs.get(scope);
+    if (!pending) {
+      pending = (async () => {
+        let binary: string;
+        try {
+          binary = (await bridge.resolve("jev")).path;
+        } catch (error) {
+          if (transport === "jev-fabric") throw error;
+          return undefined;
+        }
+        const { JevFabricServe } = await import("../jev-fabric/serve.js");
+        // Host ceilings bound the connection; the manager still enforces each run's own limits first.
+        return JevFabricServe.open(binary, {
+          home: bridge.home, cwd: bridge.options.cwd, timeoutMs: 86_400_000,
+          evaluations: this.client.config.maxEvaluations, tokens: this.client.config.maxTokens,
+        });
+      })();
+      pending.catch(() => this.#runs.delete(scope));
+      this.#runs.set(scope, pending);
+    }
+    const serve = await pending;
+    if (!serve) return undefined;
+    const provider = this.route.id === "vercel-ai-gateway" ? "vercel" : this.route.id;
+    return (request, credential, signal) => serve.request("jev", {
+      request, provider, credential, timeoutMs: this.client.config.requestTimeoutMs,
+    }, signal);
+  }
+
+  async invocationEnded(parentToolCallId: string): Promise<void> {
+    const pending = this.#runs.get(parentToolCallId);
+    if (!pending) return;
+    this.#runs.delete(parentToolCallId);
+    await (await pending.catch(() => undefined))?.close();
+  }
+
+  async close(): Promise<void> {
+    await this.manager.close();
+    await this.client.drainCredentials();
+    this.client.close();
+    const connections = [...this.#runs.values()];
+    this.#runs.clear();
+    await Promise.allSettled(connections.map(async pending => (await pending)?.close()));
+  }
 }

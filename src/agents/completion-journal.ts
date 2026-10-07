@@ -603,7 +603,9 @@ export class CompletionJournal {
         if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
       } else {
         await confirmReceipt(fence, receipt);
-        fs.rmSync(target, { force: true });
+        // Even one metadata unlink can block on a busy filesystem; entry/time
+        // slice caps cannot bound synchronous OS I/O. Keep it off Main's thread.
+        await fs.promises.rm(target, { force: true });
       }
       if (++pruned === 128) break;
     }
@@ -675,7 +677,7 @@ export class CompletionJournal {
       try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); }
       catch { return false; }
     }
-    for (const target of targets) fs.rmSync(target, { force: true });
+    for (const target of targets) await fs.promises.rm(target, { force: true });
     return true;
   }
   #canRead(envelope: CompletionEnvelope): boolean {

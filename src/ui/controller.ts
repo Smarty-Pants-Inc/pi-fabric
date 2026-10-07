@@ -24,6 +24,7 @@ import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapsho
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
+import { FabricWidgetRetention } from "./retention.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
@@ -106,6 +107,7 @@ export class FabricUiController {
   #builtLocal: string | undefined;
   #builtRemote: string | undefined;
   #builtAt = 0;
+  readonly #widgetRetention = new FabricWidgetRetention();
 
   constructor(
     readonly state: FabricState,
@@ -167,6 +169,7 @@ export class FabricUiController {
     this.#events = [];
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
+    this.#widgetRetention.clear();
     this.#lastRefreshErrorAt = 0;
     this.#lastRefreshAt = 0;
     this.#dashboardOpen = false;
@@ -193,23 +196,26 @@ export class FabricUiController {
     if (this.ownsInput) return;
     const jobs = this.state.shellJobs;
     if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
-    const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
-    if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
-    if (context.mode !== "tui") {
-      context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
-      return;
-    }
-    if (!this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
-    if (!this.#context) this.start(context);
+    if (context.mode === "tui" && !this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
+    if (context.mode === "tui" && !this.#context) this.start(context);
+    // Claim input before the first await, including asynchronous reattachment.
     this.#tasksOpen = true;
     const epoch = this.#epoch;
     try {
-      const { ShellTasksView } = await import("./shell-tasks.js");
+      await jobs.durable?.resume();
       if (epoch !== this.#epoch) return;
-      await context.ui.custom<void>((tui, theme, _keys, done) => {
+      const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
+      if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
+      if (context.mode !== "tui") {
+        context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
+        return;
+      }
+      const [{ ShellTasksView }, { imageSafeCustom }] = await Promise.all([import("./shell-tasks.js"), import("./image-overlays.js")]);
+      if (epoch !== this.#epoch) return;
+      await imageSafeCustom<void>(context.ui, (tui, theme, keys, done) => {
         this.#closeTasks = () => done();
         const id = candidates[0]?.id;
-        this.#tasksView = new ShellTasksView({ jobs, theme, done: () => done(), requestRender: () => tui.requestRender(),
+        this.#tasksView = new ShellTasksView({ jobs, theme, keys, done: () => done(), requestRender: () => tui.requestRender(),
           rows: () => tui.terminal?.rows ?? 24, ...(id ? { id } : {}) });
         return this.#tasksView;
       }, { overlay: true, overlayOptions: { width: "94%", maxHeight: "90%", anchor: "center", margin: 1 } });
@@ -247,8 +253,8 @@ export class FabricUiController {
       const { initializeConversationHost } = await import("./conversation-host.js");
       if (epoch !== this.#epoch) return;
       initializeConversationHost(piConversationHost);
-      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }] =
-        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js")]);
+      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }, { imageSafeCustom }] =
+        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
       this.#refresh();
       const initialTarget = query?.trim()
@@ -340,7 +346,7 @@ export class FabricUiController {
         }
       };
       this.#schedulePoll(true);
-      await context.ui.custom<void>((tui, theme, keybindings, done) => {
+      await imageSafeCustom<void>(context.ui, (tui, theme, keybindings, done) => {
         if (epoch !== this.#epoch) {
           done(undefined);
           return { render: () => [], invalidate: () => {} };
@@ -430,8 +436,8 @@ export class FabricUiController {
     // from full activity runs rather than stripped summaries.
     this.#dashboardOpen = true;
     this.#refresh();
-    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }] =
-      await Promise.all([import("./dashboard.js"), import("./model-picker.js")]);
+    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }] =
+      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js")]);
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
     if (this.#snapshot.actors.some((actor) => actor.runner === "claude")) {
@@ -521,6 +527,15 @@ export class FabricUiController {
         context.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
     };
+    const onGlobalEvents = (globalActorId: string, events: FabricActorHostEvent[]): void => {
+      try {
+        this.state.globalActors.update(globalActorId, { events });
+        context.ui.notify("Global actor event subscriptions updated", "info");
+        this.#refresh();
+      } catch (error) {
+        context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    };
     const onActorTools = (actorId: string, tools: string[]): void => {
       reportUpdate("Actor tools updated", this.state.actors.setTools(actorId, tools));
     };
@@ -578,7 +593,7 @@ export class FabricUiController {
     let conversationTarget: string | undefined;
     const epoch = this.#epoch;
     try {
-      await context.ui.custom<void>(
+      await imageSafeCustom<void>(context.ui,
         (tui, theme, keybindings, done) => {
           this.#dashboardTui = tui;
           return new FabricDashboard(tui, theme, () => this.#snapshot, () => done(undefined), {
@@ -609,6 +624,7 @@ export class FabricUiController {
             onActorEvents,
             onActorDeliveryPolicy,
             onGlobalDeliveryPolicy,
+            onGlobalEvents,
             onActorTools,
             actorDefaultTools: this.state.config.agents?.defaultTools ?? [],
             onClearMessages,
@@ -653,8 +669,10 @@ export class FabricUiController {
       this.#timer = undefined;
     }
     if (this.#timer || !this.#context || !this.state.initialized) return;
+    const expiryDelay = this.#widgetRetention.nextExpiryDelay(this.#snapshot, Date.now());
     const localActive =
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
+      expiryDelay !== undefined ||
+      this.#snapshot.shells?.some(job => job.finishedAt === undefined) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(
@@ -681,7 +699,7 @@ export class FabricUiController {
       this.#timer = undefined;
       this.#refresh(false);
       this.#schedulePoll();
-    }), delay);
+    }), Math.min(delay, expiryDelay ?? Infinity));
     this.#timer.unref();
   }
 
@@ -847,6 +865,7 @@ export class FabricUiController {
           participantsRoot ? participantFilesCachedStamp(participantsRoot) : undefined,
         );
       }
+      this.#widgetRetention.sync(this.#snapshot);
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
@@ -874,7 +893,7 @@ export class FabricUiController {
     const config = this.state.config.ui;
     const shouldShow =
       context.mode === "tui" &&
-      shouldShowFabricWidget(this.#snapshot, config.widget);
+      shouldShowFabricWidget(this.#snapshot, config.widget, this.#widgetRetention);
     if (shouldShow) {
       if (this.#widgetMounted) return;
       this.#widgetMounted = true;
@@ -887,6 +906,7 @@ export class FabricUiController {
             () => this.#snapshot,
             config.maxRows,
             () => tui.terminal?.rows ?? process.stdout.rows,
+            this.#widgetRetention,
           );
           return this.#widget;
         },

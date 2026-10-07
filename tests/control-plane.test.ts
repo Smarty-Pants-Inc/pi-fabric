@@ -1500,40 +1500,39 @@ describe("FabricControlPlane", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
-    const sender = plane(meshRoot, "host:sender");
+    // Identity validation is the subject, not filesystem throughput on shared CI runners.
+    const sender = plane(meshRoot, "host:sender", {}, { acknowledgementTimeoutMs: 5_000 });
     const receiver = plane(meshRoot, "host:receiver");
     const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
     sender.start(() => ({ accepted: false }));
     receiver.start(async (command) => {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // Publish the forgery before the owner can emit its authentic acknowledgement.
+      await store.publish({
+        topic: "fabric.control.ack",
+        kind: "accepted",
+        from: identity("host:bystander"),
+        to: "host:sender",
+        data: {
+          version: 1,
+          commandId: command.commandId,
+          targetId: command.targetId,
+          accepted: true,
+          messageId: "forged",
+        },
+      });
       return { accepted: true, messageId: "real:" + command.commandId };
     });
 
-    const request = sender.request("host:receiver", "agent:target", "steer", {
-      message: "focus",
-    });
-    await new Promise((resolve) => setTimeout(resolve, 35));
-    const command = store.read({ topic: "fabric.control.command", limit: 1 })[0];
-    const commandId = (command?.data as { commandId?: string } | undefined)?.commandId;
-    expect(commandId).toBeTypeOf("string");
-    await store.publish({
-      topic: "fabric.control.ack",
-      kind: "accepted",
-      from: identity("host:bystander"),
-      to: "host:sender",
-      data: {
-        version: 1,
-        commandId,
-        targetId: "agent:target",
-        accepted: true,
-        messageId: "forged",
-      },
-    });
-
-    await expect(request).resolves.toMatchObject({
+    await expect(
+      sender.request("host:receiver", "agent:target", "steer", { message: "focus" }),
+    ).resolves.toMatchObject({
       acknowledged: true,
       messageId: expect.stringMatching(/^real:/),
     });
+    expect(store.read({ topic: "fabric.control.ack", after: 0 })).toMatchObject([
+      { from: { id: "host:bystander" }, data: { messageId: "forged" } },
+      { from: { id: "host:receiver" }, data: { messageId: expect.stringMatching(/^real:/) } },
+    ]);
   });
 
   it("recovers an unexpired command published before owner startup", async () => {

@@ -5,7 +5,7 @@ import { MAX_CACHE_LEASES } from "../src/cache/leases.js";
 import { schemaRefAllowedInEnforce } from "../src/schema/policy.js";
 import type { FabricCacheHoldResult, FabricCacheStatus, FabricInvocationContext } from "../src/protocol.js";
 
-function fixture(supported = true, isMain = true) {
+function fixture(supported = true, isMain = true, foreground: string[] = []) {
   const handlers = new Map<string, Set<(event: unknown, context: ExtensionContext) => unknown>>();
   const nativeOwners = new Set<symbol>();
   const releaseNative = vi.fn((key: symbol) => { nativeOwners.delete(key); });
@@ -23,12 +23,12 @@ function fixture(supported = true, isMain = true) {
       return () => { handlers.get(name)!.delete(callback); };
     }),
   };
-  const provider = new CacheProvider(pi as unknown as ExtensionAPI, host, isMain);
+  const provider = new CacheProvider(pi as unknown as ExtensionAPI, host, isMain, () => foreground);
   const ctx: FabricInvocationContext = { cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "inner", extensionContext: host, update() {} };
   const hold = (args: Record<string, unknown> = {}) => provider.invoke("hold", { durationMs: 10_000, ...args }, ctx) as Promise<FabricCacheHoldResult>;
   const status = () => provider.invoke("status", {}, ctx) as Promise<FabricCacheStatus>;
   const emit = async (name: string) => { for (const handler of [...handlers.get(name) ?? []]) await handler({}, host); };
-  return { provider, host, ctx, hold, status, emit, acquire, releaseNative, nativeOwners, pi, handlers };
+  return { provider, host, ctx, hold, status, emit, acquire, releaseNative, nativeOwners, pi, handlers, foreground };
 }
 function held(result: FabricCacheHoldResult) {
   if (result.status !== "held") throw new Error(result.reason);
@@ -90,12 +90,14 @@ describe("CacheProvider", () => {
     await f.provider.close();
     expect([...f.handlers.values()].every(set => set.size === 0)).toBe(true);
   });
-  it.each(["model", "thinking", "prompt", "tools", "support"])("fences changed %s before a native decision without overriding the event", async change => {
+  it.each(["model", "thinking", "prompt", "tools", "foreground", "support"])("fences changed %s before a native decision without overriding the event", async change => {
     const f = fixture(); held(await f.hold());
     if (change === "model") f.host.model!.id = "other";
     if (change === "thinking") (f.host as { thinkingLevel?: string }).thinkingLevel = "high";
     if (change === "prompt") f.host.getSystemPrompt = () => "changed";
     if (change === "tools") f.pi.getActiveTools.mockReturnValue(["read"]);
+    // Full code mode keeps active names stable; the declared foreground set still fences.
+    if (change === "foreground") f.foreground.push("ask_user");
     if (change === "support") delete (f.host as unknown as { acquireCacheWarming?: unknown }).acquireCacheWarming;
     for (const callback of f.handlers.get("cache_warming_decision")!) expect(await callback({}, f.host)).toBeUndefined();
     expect((await f.status()).leases).toEqual([]);

@@ -6,7 +6,7 @@ const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** One immutable rendered-history reference; no history-sized copy on drag. */
 export class ConversationTextSelection {
-  source: string[] | undefined;
+  source: readonly string[] | undefined;
   private anchor: Point | undefined;
   private focus: Point | undefined;
   dragging = false;
@@ -17,7 +17,7 @@ export class ConversationTextSelection {
     this.dragging = false;
   }
 
-  start(source: string[], row: number, col: number): void {
+  start(source: readonly string[], row: number, col: number): void {
     this.source = source;
     this.anchor = this.point(row, col);
     this.focus = this.anchor;

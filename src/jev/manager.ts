@@ -256,8 +256,10 @@ export class JevProgramManager {
           clearTimeout(timer);
           observation?.close();
           context.signal?.removeEventListener("abort", abort);
-          // Bound the unread-result hold from termination, not asynchronous lease cleanup.
+          // Bound the unread-result hold from termination, not asynchronous cleanup.
+          // Providers release run-owned interactive children before releasing authority.
           info.endedAt = Date.now();
+          await registry.endInvocation(`jev:${id}`, info.state === "completed" ? "succeeded" : "failed").catch(() => undefined);
           await runLease.release();
           this.#prune();
         }

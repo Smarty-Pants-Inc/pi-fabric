@@ -5,16 +5,13 @@ import type {
   ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { FabricConfig } from "../config.js";
+
+export interface NativeMcpApprovalIdentity { server: string; tool: string }
+export type ResolveNativeMcpApprovalIdentity = (toolName: string, config: FabricConfig) => NativeMcpApprovalIdentity | undefined;
 import type { ResolvedFabricAction } from "./action-registry.js";
-import {
-  ApprovalController,
-  FabricSessionApprovals,
-  type FabricAutoApprovalAudit,
-} from "./approval-controller.js";
-import {
-  FabricAutoApprovalClassifier,
-  type FabricAutoApprovalDecision,
-} from "./auto-approval-classifier.js";
+import type { FabricAutoApprovalAudit } from "./approval-controller.js";
+import type { FabricSessionApprovals } from "./session-approvals.js";
+import type { FabricAutoApprovalClassifier, FabricAutoApprovalDecision } from "./auto-approval-classifier.js";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -47,26 +44,31 @@ export const mergeFabricApprovalUsage = (
 
 export class FabricDirectToolApproval {
   readonly #pendingUsage = new Map<string, Usage>();
+  #defaultClassifier: FabricAutoApprovalClassifier | undefined;
 
   constructor(
     readonly pi: Pick<ExtensionAPI, "getAllTools">,
     readonly getConfig: () => FabricConfig,
     readonly sessionApprovals: FabricSessionApprovals,
-    readonly classifier = new FabricAutoApprovalClassifier(() => getConfig().jev),
+    readonly classifier?: FabricAutoApprovalClassifier,
     readonly onAutoDecision?: (
       audit: FabricAutoApprovalAudit,
       decision?: FabricAutoApprovalDecision,
     ) => void,
+    readonly resolveNativeMcpIdentity?: ResolveNativeMcpApprovalIdentity,
   ) {}
 
   async approve(event: ToolCallEvent, context: ExtensionContext): Promise<void> {
     const config = this.getConfig();
     const action = this.#resolve(event.toolName, config);
+    const { ApprovalController } = await import("./approval-controller.js");
+    const classifier = this.classifier ?? (this.#defaultClassifier ??=
+      new (await import("./auto-approval-classifier.js")).FabricAutoApprovalClassifier(() => this.getConfig().jev));
     const controller = new ApprovalController(
       config.approvals,
       context,
       this.sessionApprovals,
-      this.classifier,
+      classifier,
       (audit, decision) => {
         this.onAutoDecision?.(audit, decision);
         if (decision) this.#pendingUsage.set(event.toolCallId, decision.usage);
@@ -88,9 +90,11 @@ export class FabricDirectToolApproval {
   #resolve(toolName: string, config: FabricConfig): ResolvedFabricAction {
     const metadata = this.pi.getAllTools().find((tool) => tool.name === toolName);
     const builtin = metadata?.sourceInfo.source === "builtin";
-    const provider = builtin ? "pi" : "extensions";
+    const nativeMcp = this.resolveNativeMcpIdentity?.(toolName, config);
+    const provider = nativeMcp ? "mcp" : (builtin ? "pi" : "extensions");
+    const ref = nativeMcp ? `mcp.${nativeMcp.server}.${nativeMcp.tool}` : provider + "." + toolName;
     return {
-      ref: provider + "." + toolName,
+      ref,
       provider,
       name: toolName,
       description: metadata?.description ?? "Direct Pi tool: " + toolName,

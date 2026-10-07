@@ -94,23 +94,39 @@ function ownRegularWitness(stat: fs.Stats): boolean {
   return stat.isFile() && stat.nlink === 1 && (CURRENT_UID === undefined || stat.uid === CURRENT_UID);
 }
 
+/** The open flags the witness touch uses. Read at call time; a test seam replaces it to simulate a
+ * platform without O_NOFOLLOW (review round 4 on #592). */
+export const confirmWitnessPlatform: { constants: { O_WRONLY: number; O_CREAT: number; O_EXCL: number; O_NOFOLLOW?: number | undefined; O_NONBLOCK?: number | undefined } } =
+  { constants: fs.constants };
+
 /** Runs under the mesh lock only (confirmWritable's callback). Best effort: a failure only
  * withholds evidence from other participants, which then take the lock themselves. Never follows
  * a planted link (lstat first, then O_NOFOLLOW) and touches only this user's own regular witness:
  * anything else under the name is left alone (no truncation of a link target) and gives no proof.
- * The truncation of the empty witness stamps its mtime with the kernel file clock, as before. */
+ * Without an atomic no-follow open (O_NOFOLLOW undefined, e.g. Windows) the witness is never
+ * opened or written: lstat-then-open would race a swap to a symlink, so that platform leaves no
+ * confirmation witness and idle participants take the lock (review round 4 on #592). After the
+ * open, the descriptor must be the very file lstat saw (same dev and ino); a file swapped in
+ * between is refused. A missing witness is created exclusively (O_EXCL), never opened if it
+ * appeared meanwhile. The truncation of the empty witness stamps its mtime with the kernel file
+ * clock, as before. */
 function touchConfirmWitness(meshRoot: string): void {
+  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK = 0 } = confirmWitnessPlatform.constants;
+  if (typeof O_NOFOLLOW !== "number" || O_NOFOLLOW === 0) return;
   const file = path.join(meshRoot, CONFIRM_WITNESS_FILE);
   let fd: number | undefined;
   try {
+    let seen: fs.Stats | undefined;
     try {
-      if (!ownRegularWitness(fs.lstatSync(file))) return;
+      seen = fs.lstatSync(file);
+      if (!ownRegularWitness(seen)) return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
     }
-    const { O_WRONLY, O_CREAT, O_NOFOLLOW = 0, O_NONBLOCK = 0 } = fs.constants;
-    fd = fs.openSync(file, O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
-    if (!ownRegularWitness(fs.fstatSync(fd))) return;
+    fd = fs.openSync(file, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | (seen ? 0 : O_CREAT | O_EXCL), 0o600);
+    const opened = fs.fstatSync(fd);
+    if (!ownRegularWitness(opened)) return;
+    if (seen && (opened.dev !== seen.dev || opened.ino !== seen.ino)) return;
     fs.ftruncateSync(fd, 0);
   } catch { /* no evidence */ } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }

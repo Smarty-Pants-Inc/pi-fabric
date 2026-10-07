@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
@@ -2277,5 +2277,64 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     expect(f.acquisitions() - baseline).toBe(0);
     expect(f.confirmations).not.toHaveBeenCalled();
     expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+  });
+
+  // Review round 4 on #592: without an atomic no-follow open, an lstat-then-open could be raced by a
+  // swap to a symlink. Such a platform never opens or writes the witness: no lock-free proof from
+  // it, so the next idle participant takes the lock too.
+  it("never opens or writes the witness without O_NOFOLLOW, so idle participants take the lock", async () => {
+    const platform = confirmWitnessPlatform.constants;
+    confirmWitnessPlatform.constants = { ...fs.constants, O_NOFOLLOW: undefined };
+    try {
+      const f = await idleFixture();
+      const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
+      const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
+        rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+      second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
+      directories.push(second);
+      await second.refresh();
+      await second.refresh();
+      await f.directory.refresh();                               // absorbs the second's first commits
+      const witness = plantedWitness(f.mesh.root);
+      fs.rmSync(witness, { force: true });
+      const opens = vi.spyOn(fs, "openSync");
+      const confirmationsBefore = f.confirmations.mock.calls.length;
+      fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
+      await f.directory.refresh();                               // a real acquisition, but no witness
+      expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
+      expect(opens.mock.calls.some(([file]) => file === witness)).toBe(false);
+      expect(fs.existsSync(witness)).toBe(false);
+      const baseline = f.acquisitions();
+      const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
+      await second.refresh();
+      expect(secondConfirms).toHaveBeenCalledOnce();
+      expect(f.acquisitions() - baseline).toBe(1);
+      expect(fs.existsSync(witness)).toBe(false);
+    } finally { confirmWitnessPlatform.constants = platform; }
+  });
+
+  // Review round 4 on #592: the descriptor must be the file lstat saw. A regular file of this user
+  // swapped in between lstat and open passes fstat alone; its dev/ino differ, so it is not truncated.
+  it.skipIf(fs.constants.O_NOFOLLOW === undefined)("refuses a witness swapped between lstat and open (dev/ino mismatch)", async () => {
+    const f = await idleFixture();
+    const witness = plantedWitness(f.mesh.root);
+    fs.writeFileSync(witness, "seen");
+    const old = new Date(Date.now() - 3_600_000);
+    fs.utimesSync(witness, old, old);                          // no evidence: the heartbeat takes the lock
+    const swapped = path.join(f.mesh.root, "swapped-in.txt");
+    fs.writeFileSync(swapped, "keep");
+    const realOpen = fs.openSync.bind(fs) as (...args: unknown[]) => number;
+    let raced = 0, witnessFd = -1;
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: unknown[]) => {
+      if (args[0] !== witness) return realOpen(...args);
+      fs.renameSync(swapped, witness); raced++;
+      return (witnessFd = realOpen(...args));
+    }) as typeof fs.openSync);
+    const truncations = vi.spyOn(fs, "ftruncateSync");
+    await f.directory.refresh();                               // nothing unseen: the lock path touches the witness
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(raced).toBe(1);
+    expect(truncations.mock.calls.some(([fd]) => fd === witnessFd)).toBe(false);
+    expect(fs.readFileSync(witness, "utf8")).toBe("keep");    // the swapped-in file was not truncated
   });
 });

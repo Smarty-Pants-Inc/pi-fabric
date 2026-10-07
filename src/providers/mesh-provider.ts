@@ -10,6 +10,7 @@ import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
+import { CALLER_PUBLISH_KEY_MAX_LENGTH, callerPublishKey, publishWithCallerKey } from "../actors/caller-publish-key.js";
 
 const emptySchema = { type: "object", properties: {}, additionalProperties: false };
 const INTERNAL_STATE_PREFIXES = ["topology/", "sessions/", "actors/", "residency/"];
@@ -48,6 +49,12 @@ const descriptors: FabricActionDescriptor[] = [
         to: { type: "string" },
         text: { type: "string" },
         data: {},
+        key: {
+          type: "string",
+          minLength: 1,
+          maxLength: CALLER_PUBLISH_KEY_MAX_LENGTH,
+          description: "Idempotency key, scoped to this publisher: a retry with the same key within 7 days returns the original event and publishes nothing",
+        },
       },
       required: ["topic"],
       additionalProperties: false,
@@ -210,10 +217,11 @@ export class MeshProvider implements FabricProvider {
         ) {
           throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
         }
+        const key = callerPublishKey(args.key);
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
-          return this.store.publish({
+          const input = {
             topic,
             from: this.identity,
             principal: invocationFabricPrincipal(context),
@@ -222,7 +230,10 @@ export class MeshProvider implements FabricProvider {
             ...(typeof args.to === "string" ? { to: args.to } : {}),
             ...(text === undefined ? {} : { text }),
             ...(args.data !== undefined ? { data: args.data } : {}),
-          });
+          };
+          return key === undefined
+            ? this.store.publish(input)
+            : publishWithCallerKey((keyed) => this.store.publish(keyed), input, key);
         };
         const event = checked
           ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")

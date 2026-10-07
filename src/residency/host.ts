@@ -1555,6 +1555,24 @@ export class ResidentHost {
   }
 
   /**
+   * smarty-dev#5919: an actor moves only within its project. The source project is the row's
+   * own `project`, else the dead root's configured `project`; with neither, refuse: an
+   * unknown project must never let an actor, its history and its queued work cross projects.
+   */
+  #assertAdoptionProject(row: { id: string; project?: unknown }, deadConfig: Partial<ResidentHostConfig> | undefined,
+    fromRootId: string): void {
+    const named = (value: unknown): string | undefined => typeof value === "string" && value.trim() ? value : undefined;
+    const source = named(row.project) ?? (deadConfig?.rootId === fromRootId ? named(deadConfig.project) : undefined);
+    const target = typeof this.config.project === "string" ? this.config.project : projectOf(this.config.cwd);
+    if (source === undefined) {
+      throw new ResidentActorAuthorizationError(`Fabric actor ${row.id}: source project unknown; neither its registry row nor dead root ${fromRootId}'s configuration names a project`);
+    }
+    if (source !== target) {
+      throw new ResidentActorAuthorizationError(`Fabric actor ${row.id} belongs to project ${source}, not to ${target}`);
+    }
+  }
+
+  /**
    * smarty-dev#5919: move a dead root's durable actor into this (live) root. The dead root
    * gets the same confirmation and lease veto as stop/remove, re-read under the registry
    * fences right before the commit; its host must have released the actor (or be down, which
@@ -1590,7 +1608,8 @@ export class ResidentHost {
       }
     }
     this.#assertAdoptionTarget();
-    const deadConfig = readJson<ResidentHostConfig>(path.join(residentRoot(this.config.meshRoot, command.fromRootId), "config.json"));
+    const deadConfigPath = path.join(residentRoot(this.config.meshRoot, command.fromRootId), "config.json");
+    const deadConfig = readJson<ResidentHostConfig>(deadConfigPath);
     if (!deadConfig || deadConfig.rootId !== command.fromRootId || typeof deadConfig.meshRoot !== "string" ||
         path.resolve(deadConfig.meshRoot) !== path.resolve(this.config.meshRoot) || typeof deadConfig.actorRoot !== "string") {
       throw new Error(`No resident configuration for dead root ${command.fromRootId} in this mesh`);
@@ -1604,10 +1623,7 @@ export class ResidentHost {
     if (located.length !== 1) throw new Error(located.length
       ? `Ambiguous dead-root actor: ${command.id}` : `Unknown Fabric actor of dead root ${command.fromRootId}: ${command.id}`);
     const { scope, row } = located[0]!;
-    const project = typeof this.config.project === "string" ? this.config.project : projectOf(this.config.cwd);
-    if (typeof row.project === "string" && row.project !== project) {
-      throw new ResidentActorAuthorizationError(`Fabric actor ${row.id} belongs to project ${row.project}, not to ${project}`);
-    }
+    this.#assertAdoptionProject(row, deadConfig, command.fromRootId);
     const released = (): void => {
       const participant = this.participants.get(row.id, Date.now(), { fresh: true });
       if (participant && participant.ownerHostId !== this.hostId) {
@@ -1624,9 +1640,12 @@ export class ResidentHost {
         adoption: { ...adoption, ...(publishedBy ? { publishedBy } : {}) }, completedAt: Date.now() };
     }
     await moveActorCustody({ ...adoption, intentFile: actorAdoptionIntentPath(this.config.residencyRoot, row.id),
-      check: () => {
+      check: (fencedRow) => {
         this.#assertAdoptionTarget();
         assertResidentOperatorConfirmed(readResidentOperatorEvidence(deadConfig, this.mesh), command.confirmDeadRoot);
+        // Reread both the row (under the fence) and the dead root's configuration: a project
+        // that changed or vanished since the precheck refuses the move.
+        this.#assertAdoptionProject(fencedRow, readJson<Partial<ResidentHostConfig>>(deadConfigPath), command.fromRootId);
         released();
         commit(row.id);
       },

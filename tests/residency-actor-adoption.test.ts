@@ -13,6 +13,17 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { actorAdoptionIntentPath, moveActorCustody, recoverActorAdoption, type ActorAdoptionPhase } from "../src/residency/actor-adoption.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { projectOf } from "../src/topology/project-identity.js";
+
+// A seam between the host's precheck and the fenced move: tests change state there.
+const adoptionHooks = vi.hoisted(() => ({ beforeMove: undefined as undefined | (() => void) }));
+vi.mock("../src/residency/actor-adoption.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/residency/actor-adoption.js")>();
+  return { ...actual, moveActorCustody: async (move: Parameters<typeof actual.moveActorCustody>[0]) => {
+    adoptionHooks.beforeMove?.();
+    return actual.moveActorCustody(move);
+  } };
+});
 
 // smarty-dev#5919: adopt a dead root's durable actor into a live root.
 beforeEach(() => installInProcessResidentFence());
@@ -224,6 +235,77 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
       expect(fs.existsSync(actorAdoptionIntentPath(f.liveConfig.residencyRoot, actor.id))).toBe(false);
       await steerFromNewRoot(f, actor.id, "steer after recovery");
     } finally { vi.unstubAllEnvs(); await f.close(); }
+  }, 60_000);
+});
+
+describe("fabric-actors adopt: the source project fails closed (smarty-dev#5919)", () => {
+  const here = projectOf(process.cwd());
+  /** Offline dead root (host down), so only the test edits its registry row and config. */
+  const offline = async () => {
+    const f = await fixture();
+    const actor = await f.create("projected");
+    await f.stopDead();
+    const setRowProject = (project: string | undefined) => {
+      const store = new ActorRegistryStore(f.deadConfig.actorRoot);
+      store.write(store.records().map(row => {
+        if (row.id !== actor.id) return row;
+        const { project: _project, ...rest } = row;
+        return project === undefined ? rest : { ...rest, project };
+      }), { durable: true });
+    };
+    const configFile = path.join(f.deadConfig.residencyRoot, "config.json");
+    const setConfigProject = (project: string | undefined) => {
+      const { project: _project, ...rest } = JSON.parse(fs.readFileSync(configFile, "utf8")) as ResidentHostConfig;
+      fs.writeFileSync(configFile, JSON.stringify(project === undefined ? rest : { ...rest, project }));
+    };
+    const unmoved = () => {
+      expect(f.rows(f.deadConfig.actorRoot).filter(row => row.id === actor.id)).toMatchObject([{ rootId: f.deadConfig.rootId }]);
+      expect(f.rows(f.liveConfig.actorRoot).some(row => row.id === actor.id && row.rootId === f.liveConfig.rootId)).toBe(false);
+      expect(f.live.actors.owns(actor.id)).toBe(false);
+      expect(fs.existsSync(actorAdoptionIntentPath(f.liveConfig.residencyRoot, actor.id))).toBe(false);
+    };
+    return { f, actor, setRowProject, setConfigProject, unmoved };
+  };
+
+  it("a row without a project takes the dead root's configured one: another project or none is refused, the same project adopts", async () => {
+    const { f, actor, setRowProject, setConfigProject, unmoved } = await offline();
+    try {
+      expect(f.rows(f.deadConfig.actorRoot).find(row => row.id === actor.id)?.project).toBe(here);
+      setRowProject(undefined);
+      setConfigProject("/elsewhere/other-project");
+      for (const extra of [["--dry-run"], ["--confirm-dead-root", f.deadConfig.rootId]]) {
+        const foreign = await f.adopt(actor.id, extra);
+        expect(foreign.code).toBe(1);
+        expect(foreign.err).toContain("belongs to project /elsewhere/other-project");
+        unmoved();
+      }
+      setConfigProject(undefined);
+      const unknown = await f.adopt(actor.id);
+      expect(unknown.code).toBe(1); expect(unknown.err).toContain("source project unknown"); unmoved();
+      setConfigProject(here);
+      const same = await f.adopt(actor.id);
+      expect(same).toMatchObject({ code: 0, err: "" });
+      expect(f.rows(f.liveConfig.actorRoot).filter(row => row.id === actor.id)).toMatchObject([{ rootId: f.liveConfig.rootId }]);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each([
+    ["moved to another project", "/elsewhere/other-project", "belongs to project /elsewhere/other-project"],
+    ["dropped", undefined, "source project unknown"],
+  ] as const)("a source project %s between the precheck and the fenced recheck is refused", async (_label, changed, message) => {
+    const { f, actor, setRowProject, setConfigProject, unmoved } = await offline();
+    try {
+      setRowProject(undefined);
+      setConfigProject(here);
+      adoptionHooks.beforeMove = () => { setConfigProject(changed); };
+      const raced = await f.adopt(actor.id);
+      expect(raced.code).toBe(1); expect(raced.err).toContain(message); unmoved();
+      // A row that gains a foreign project under the fence is refused the same way.
+      setConfigProject(here);
+      adoptionHooks.beforeMove = () => { setRowProject("/elsewhere/other-project"); };
+      const rowRaced = await f.adopt(actor.id);
+      expect(rowRaced.code).toBe(1); expect(rowRaced.err).toContain("belongs to project /elsewhere/other-project"); unmoved();
+    } finally { adoptionHooks.beforeMove = undefined; await f.close(); }
   }, 60_000);
 });
 

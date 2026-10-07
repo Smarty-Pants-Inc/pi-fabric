@@ -2216,4 +2216,66 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     expect(secondConfirms).not.toHaveBeenCalled();
     expect(second.confirmedAt()).toBeGreaterThan(before);
   });
+
+  // Security round on #592: only this user's own regular witness file under the mesh root is proof.
+  // A planted symlink (to a recently modified path), a non-regular file or a foreign file is not:
+  // the heartbeat takes the lock, and touching the witness never follows or truncates a link.
+  const plantedWitness = (meshRoot: string) => path.join(meshRoot, "participant-confirm.witness");
+  it.skipIf(process.platform === "win32")("takes the lock when the witness is a symlink to a fresh path, and never writes through it", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const target = path.join(path.dirname(f.mesh.root), "fresh-target.txt");
+    fs.writeFileSync(target, "keep");                         // modified after every receipt
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    fs.symlinkSync(target, witness);
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.lstatSync(witness).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("keep");     // the touch did not follow the link
+  });
+
+  it("takes the lock when the witness is not a regular file", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    fs.mkdirSync(witness);                                     // a fresh directory under the name
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.lstatSync(witness).isDirectory()).toBe(true);
+  });
+
+  it.skipIf(typeof process.getuid !== "function")("takes the lock when the witness belongs to another uid", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const witness = plantedWitness(f.mesh.root);
+    fs.writeFileSync(witness, "");
+    const realLstat = fs.lstatSync.bind(fs) as (...args: unknown[]) => fs.Stats | undefined;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+      const stat = realLstat(...args);
+      if (args[0] === witness && stat) Object.defineProperty(stat, "uid", { value: process.getuid!() + 1 });
+      return stat;
+    }) as typeof fs.lstatSync);
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+  });
+
+  it("still confirms without the lock on this user's own fresh regular witness", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    fs.writeFileSync(plantedWitness(f.mesh.root), "");
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+  });
 });

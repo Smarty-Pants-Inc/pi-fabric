@@ -82,10 +82,39 @@ const CHANGE_REFRESH_MIN_MS = 1_000;
 const CONFIRM_WITNESS_FILE = "participant-confirm.witness";
 const COMMIT_WITNESS_FILES = ["state.read-signal.json", "state.read-journal.jsonl", "state.json", "events.jsonl", CONFIRM_WITNESS_FILE] as const;
 
+/** The current uid, where the platform has one (not on Windows). */
+const CURRENT_UID = typeof process.getuid === "function" ? process.getuid() : undefined;
+
+/** A witness counts only as a regular file of this user under the mesh root (security round on
+ * #592): every name is a fixed basename joined to the root, and its times are read with lstat,
+ * never through a link. A symlink, directory, FIFO or other special file, a hard-linked file, or a
+ * file of another uid is no proof: a process able to write the shared mesh root could otherwise
+ * plant one pointing at a recently modified path and authorize a lock-free confirmation. */
+function ownRegularWitness(stat: fs.Stats): boolean {
+  return stat.isFile() && stat.nlink === 1 && (CURRENT_UID === undefined || stat.uid === CURRENT_UID);
+}
+
 /** Runs under the mesh lock only (confirmWritable's callback). Best effort: a failure only
- * withholds evidence from other participants, which then take the lock themselves. */
+ * withholds evidence from other participants, which then take the lock themselves. Never follows
+ * a planted link (lstat first, then O_NOFOLLOW) and touches only this user's own regular witness:
+ * anything else under the name is left alone (no truncation of a link target) and gives no proof.
+ * The truncation of the empty witness stamps its mtime with the kernel file clock, as before. */
 function touchConfirmWitness(meshRoot: string): void {
-  try { fs.writeFileSync(path.join(meshRoot, CONFIRM_WITNESS_FILE), "", { mode: 0o600 }); } catch { /* no evidence */ }
+  const file = path.join(meshRoot, CONFIRM_WITNESS_FILE);
+  let fd: number | undefined;
+  try {
+    try {
+      if (!ownRegularWitness(fs.lstatSync(file))) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+    const { O_WRONLY, O_CREAT, O_NOFOLLOW = 0, O_NONBLOCK = 0 } = fs.constants;
+    fd = fs.openSync(file, O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
+    if (!ownRegularWitness(fs.fstatSync(fd))) return;
+    fs.ftruncateSync(fd, 0);
+  } catch { /* no evidence */ } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
 }
 
 /** The latest commit witness mtime under the mesh root, or 0 when none can be read. Lock-free.
@@ -96,7 +125,10 @@ function touchConfirmWitness(meshRoot: string): void {
 function latestCommitWitness(meshRoot: string): number {
   let latest = 0;
   for (const name of COMMIT_WITNESS_FILES) {
-    try { latest = Math.max(latest, fs.statSync(path.join(meshRoot, name)).mtimeMs); } catch { /* absent: no evidence */ }
+    try {
+      const stat = fs.lstatSync(path.join(meshRoot, name));
+      if (ownRegularWitness(stat)) latest = Math.max(latest, stat.mtimeMs);
+    } catch { /* absent: no evidence */ }
   }
   return Math.floor(latest);
 }

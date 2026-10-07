@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ResidentActorClient } from "./residency/actor-client.js";
+import { windowsPowerShellPath } from "./residency/windows-acl.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 
@@ -53,8 +54,7 @@ const windowsSidScript = [
 /** Query owner SIDs with a fixed argv; the paths travel in the environment, never the command line. */
 export function windowsOwnerSids(files: string[]): { owners: string[]; user: string } {
   if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
-  const shell = path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const output = execFileSync(shell, ["-NoProfile", "-NonInteractive", "-Command", windowsSidScript], {
+  const output = execFileSync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", windowsSidScript], {
     encoding: "utf8", windowsHide: true, timeout: 30_000, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, FABRIC_ACTORS_OWNER_PATHS: files.join("\n") },
   });

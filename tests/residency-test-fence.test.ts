@@ -7,6 +7,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { FileLockBusy, lockFile } from "../src/residency/file-lock.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -122,6 +123,7 @@ describe("unsupported native residency versus in-process test contract", () => {
     const first = new ResidentHost(config);
     const second = new ResidentHost(config);
     const successor = new ResidentHost(config);
+    installSimulatedWindowsRequestsAcl();
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
     Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });

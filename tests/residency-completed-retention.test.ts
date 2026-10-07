@@ -11,6 +11,7 @@ import { readResidentRequestDecision, residentRoot, residentResultPath, type Res
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 
 // A native session Main owns the caller binding independently of the resident executor.
 const mainParticipants = (config: ResidentHostConfig) => {
@@ -84,7 +85,7 @@ const setup = async () => {
 
 it.each(["native", "win32"])("completed-but-not-cleaned durable agents release acknowledged capacity debt using saved results, not stale running handles (%s)", async platform => {
   const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-  if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
+  if (platform === "win32") { installSimulatedWindowsRequestsAcl(); Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" }); }
   const fixture = await setup();
   try {
     const handles = [];

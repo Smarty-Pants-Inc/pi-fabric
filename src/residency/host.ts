@@ -78,6 +78,7 @@ import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
+import { prepareResidentRequestsDirectory } from "./windows-acl.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
@@ -579,7 +580,9 @@ export class ResidentHost {
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
-      fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
+      // Requests are unauthenticated files: on Windows, refuse to serve unless only
+      // this user, SYSTEM and Administrators own or can write the directory.
+      await prepareResidentRequestsDirectory(this.#requestsPath);
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });

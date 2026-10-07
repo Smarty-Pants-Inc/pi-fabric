@@ -13,6 +13,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
+import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 
 const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const roots: string[] = [], hosts: ResidentHost[] = [];
@@ -60,7 +61,7 @@ describe("#4383 resident host presence batch", () => {
     { hold: 9_000, gap: 1_000, phase: 650, files: false, platform: "native" },
     { hold: 4_900, gap: 100, phase: 50, files: true, platform: "win32" },
   ])("renews and dispatches actor events during periodic mesh holds (%j)", async ({ hold, gap, phase, files, platform }) => {
-    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
+    if (platform === "win32") { installSimulatedWindowsRequestsAcl(); Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" }); }
     const { host, config, records, heartbeatStartedAt } = await fixture(files);
     const actor = records[0]!;
     // A skip filter records real ActorManager delivery without launching a worker.

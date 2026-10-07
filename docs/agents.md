@@ -838,9 +838,16 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
 returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
-not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
-Each activation allows three preparation requeues; a further retryable preparation failure
-reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
+not the execution/restart `attempts` counter. Callerless work (mesh, host, and tells) retries
+with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
+its pending activation. After three preparation requeues, further failures report
+`failing-preparation` and raise one owner alarm until a successful activation clears it.
+A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
+does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
+the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a
+restart restores the pending item without replaying already processed events.
+Caller-owned asks retain three preparation requeues and terminal exhaustion so a waiting
+caller receives a finite failure. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.
@@ -857,7 +864,7 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
-Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
+Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, a routed mesh event on a persistent host goes to the actor's own dead-letter file (`dead-letter.jsonl` in its registry directory, bounded at 10,000 entries or 50 MB with the oldest dropped and counted), the host cursor advances, and the owner gets at most one `actor.alarm` per actor per hour. Dead letters re-queue in order once the actor's queue drains below half, never ahead of work restored after a restart or an ownership change; restored work past the overflow goes back to the head of the dead-letter file instead of being dropped, and an entry leaves the file only once the actor's queue file holds it. A recovered actor catches up and one sick actor never holds the other actors on its host. A failed preparation moves its item behind newer work rather than keeping it first. Elsewhere, past the overflow an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
 
 ```ts
 const reviewers = await agents.actors();

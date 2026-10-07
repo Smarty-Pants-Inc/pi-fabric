@@ -38,7 +38,7 @@ export interface StepFacts {
   toolResultsOnly: boolean;
   /** What follows the last assistant message when it is not tool results only. */
   newInput: "user" | "other" | "none";
-  /** 1 = the previous assistant turn used an edit/write tool; null = none in the window. */
+  /** 1 = the previous assistant turn made a call that could write (see toolCallOps); null = none in the window. */
   authorTurnsAgo: number | null;
   contextTokens: number;
   /** Sorted unique operation labels of the previous assistant turn's tool calls. */
@@ -49,29 +49,35 @@ export interface StepFacts {
   errorResults: number;
 }
 
-const AUTHOR_TOOLS = new Set(["edit", "write", "multiedit", "multi_edit", "apply_patch", "notebook_edit", "notebookedit",
-  "str_replace_editor", "str_replace_based_edit_tool"]);
+/** The ONLY tools that cannot write. Every other tool (bash, edit, write, task, MCP, unknown) is an author signal. */
 const READ_TOOLS = new Set(["read", "grep", "find", "ls", "glob"]);
 const CODE_READ_OPS = new Set(["read", "grep", "find", "ls"]);
-const CODE_AUTHOR_OPS = new Set(["edit", "write"]);
-const CODE_OTHER = /\b(?:agents|mcp|extensions|tools|state|memory|mesh|jev|schema|compact|cache)\.[A-Za-z_$]/;
+/** A direct, literal read call: `pi.read(`, `pi.grep(`, ... Nothing else counts as a read. */
+const CODE_PI_CALL = /(?<![\w$.])pi\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g;
+/** Any remaining `pi` token is an alias, a computed access or an escape (`pi["write"]`, `const { bash } = pi`,
+ * `const p = pi`, `pi?.edit`). `-` and `/` neighbours are path text such as "pi-fabric" or "/pi/", never a call. */
+const CODE_PI_TOKEN = /(?<![\w$.\-/])pi(?![\w$\-])/;
+/** Namespaces and escapes that can reach a write without a literal `pi.<op>(` call. */
+const CODE_OTHER = /(?<![\w$.])(?:agents|mcp|extensions|tools|state|memory|mesh|jev|schema|compact|cache|globalThis|global|self|eval|Function|require|import|process|Reflect)(?![\w$])/;
 
-/** One tool call's operation labels. fabric_exec programs are read for their `pi.*` calls only. */
+/** One tool call's operation labels. Conservative: anything that could write counts as authoring. A plain
+ * tool is read-only only on the allow-list; a fabric_exec program only when every operation is a literal
+ * `pi.read|grep|find|ls(` call and nothing else touches `pi` or another namespace. */
 export function toolCallOps(call: ToolCallLike): { ops: string[]; author: boolean; readOnly: boolean } {
   const name = typeof call.name === "string" ? call.name.toLowerCase() : "unknown";
   if (name === "fabric_exec" || name.endsWith("__fabric_exec") || name.endsWith("_fabric_exec")) {
     const args = call.arguments && typeof call.arguments === "object" ? call.arguments as Record<string, unknown> : {};
     const code = typeof args.code === "string" ? args.code : "";
-    const piOps = [...new Set([...code.matchAll(/\bpi\.([A-Za-z_]+)\s*\(/g)].map(match => match[1]!.toLowerCase()))].sort();
+    const piOps = [...new Set([...code.matchAll(CODE_PI_CALL)].map(match => match[1]!.toLowerCase()))].sort();
+    const rest = code.replace(CODE_PI_CALL, (whole, op: string) => CODE_READ_OPS.has(op.toLowerCase()) ? " " : whole);
+    const alias = CODE_PI_TOKEN.test(rest);
     const other = CODE_OTHER.test(code);
-    const ops = [...piOps.map(op => `pi.${op}`), ...(other ? ["fabric:other"] : [])];
-    return {
-      ops: ops.length ? ops : ["fabric:none"],
-      author: piOps.some(op => CODE_AUTHOR_OPS.has(op)),
-      readOnly: piOps.length > 0 && !other && piOps.every(op => CODE_READ_OPS.has(op)),
-    };
+    const ops = [...piOps.map(op => `pi.${op}`), ...(alias ? ["fabric:alias"] : []), ...(other ? ["fabric:other"] : [])];
+    const author = alias || other || piOps.some(op => !CODE_READ_OPS.has(op));
+    return { ops: ops.length ? ops : ["fabric:none"], author, readOnly: !author && piOps.length > 0 };
   }
-  return { ops: [name], author: AUTHOR_TOOLS.has(name), readOnly: READ_TOOLS.has(name) };
+  const readOnly = READ_TOOLS.has(name);
+  return { ops: [name], author: !readOnly, readOnly };
 }
 
 const toolCalls = (message: MessageLike): ToolCallLike[] =>
@@ -198,7 +204,8 @@ export interface PerCallRecord {
 export interface PerCallContextSnapshot {
   sessionId: string; turnIndex: number; messages: readonly unknown[]; model: string | null; contextTokens: number | null;
 }
-export type PerCallEvaluate = (request: JevRequest, signal: AbortSignal) => Promise<JevResponse>;
+/** `deadline` is the absolute routing deadline (epoch ms): ALL of the evaluation's work, including the gateway's, must end by then. */
+export type PerCallEvaluate = (request: JevRequest, signal: AbortSignal, deadline: number) => Promise<JevResponse>;
 export interface PerCallRouterOptions {
   settings: () => PerCallSettings | undefined;
   /** Ledger path; defaults to <agentDir>/fabric/per-call-routing.jsonl at write time. */
@@ -215,6 +222,8 @@ export class PerCallShadowRouter {
   readonly #tracked = new Set<Promise<void>>();
   readonly #cache = new Map<string, number>();
   readonly #inflight = new Map<string, Promise<number>>();
+  /** The evaluations themselves (not the deadline-raced verdicts); close() joins them. */
+  readonly #evaluations = new Set<Promise<unknown>>();
   readonly #jevCalls = new Map<string, number>();
   readonly #callIndex = new Map<string, number>();
   readonly #abort = new AbortController();
@@ -324,13 +333,28 @@ export class PerCallShadowRouter {
     if (used >= config.jevMaxCallsPerSession) return fallback("ambiguous-jev-budget");
     this.#jevCalls.set(sessionId, used + 1);
     this.jevQuestions++;
-    const deadline = AbortSignal.any([this.#abort.signal, AbortSignal.timeout(ROUTE_DEADLINE_MS)]);
-    const asking = (async () => {
-      const response = await evaluate(perCallJevRequest(facts, settings.jev.model), deadline);
+    // The routing deadline bounds ALL Jev work: the evaluator gets it as an absolute time (the gateway's
+    // expiresAt) and an abort signal; at the deadline the verdict is MAIN even if an evaluator ignores both.
+    const deadlineAt = Date.now() + ROUTE_DEADLINE_MS;
+    const controller = new AbortController();
+    const stop = (): void => controller.abort(new Error("Jev routing deadline"));
+    const timer = setTimeout(stop, ROUTE_DEADLINE_MS);
+    this.#abort.signal.addEventListener("abort", stop, { once: true });
+    if (this.#abort.signal.aborted) stop();
+    const expired = new Promise<never>((_, reject) => {
+      const fail = (): void => reject(new Error("Jev routing deadline timed out"));
+      if (controller.signal.aborted) fail(); else controller.signal.addEventListener("abort", fail, { once: true });
+    });
+    expired.catch(() => undefined);
+    const evaluation = (async () => evaluate(perCallJevRequest(facts, settings.jev.model), controller.signal, deadlineAt))();
+    const joined = evaluation.then(() => undefined, () => undefined);
+    this.#evaluations.add(joined);
+    void joined.then(() => this.#evaluations.delete(joined));
+    const asking = Promise.race([evaluation, expired]).then(response => {
       const answer = response?.answers?.simple;
       if (answer?.type !== "noul" || !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1) throw new Error("malformed");
       return answer.noul;
-    })();
+    });
     this.#inflight.set(key, asking);
     try {
       const noul = await asking;
@@ -338,8 +362,13 @@ export class PerCallShadowRouter {
       while (this.#cache.size > CACHE_LIMIT) this.#cache.delete(this.#cache.keys().next().value!);
       return verdict(noul, false, Math.round(performance.now() - started));
     } catch (error) {
-      return fallback(deadline.aborted || (error instanceof Error && /timed out|timeout/i.test(error.message)) ? "ambiguous-jev-timeout" : "ambiguous-jev-error");
-    } finally { this.#inflight.delete(key); }
+      return fallback(controller.signal.aborted || (error instanceof Error && /timed out|timeout/i.test(error.message)) ? "ambiguous-jev-timeout" : "ambiguous-jev-error");
+    } finally {
+      this.#inflight.delete(key);
+      clearTimeout(timer);
+      this.#abort.signal.removeEventListener("abort", stop);
+      stop(); // A settled ask leaves nothing running: abort any work the evaluator still holds.
+    }
   }
 
   #evaluator(settings: PerCallSettings, config: PerCallRoutingConfig): PerCallEvaluate | undefined {
@@ -348,23 +377,31 @@ export class PerCallShadowRouter {
     // "gateway" never falls back to a direct, key-holding client.
     if (config.jev === "gateway" && !settings.jev.gatewaySocket) return undefined;
     const jev = settings.jev;
-    return async (request, signal) => {
+    return async (request, signal, deadline) => {
       const client = await (this.#client ??= (async () => {
         const [{ JevClient }, { resolveJevModelRoute }] = await Promise.all([import("../jev/client.js"), import("../jev/routes.js")]);
         return new JevClient(jev, undefined, undefined, resolveJevModelRoute(jev.model).route);
       })());
       if (config.jev === "gateway" && !client.viaGateway) throw new Error("Jev gateway not configured");
-      return client.evaluate(request, signal, { use: PER_CALL_GATEWAY_USE });
+      return client.evaluate(request, signal, { use: PER_CALL_GATEWAY_USE, deadline });
     };
   }
 
-  /** Writes every open call (without usage), waits for pending lines, and stops Jev questions. */
+  /** Writes every open call (without usage), waits for pending lines, then aborts and joins every Jev
+   * evaluation: no socket, timer or evaluation outlives the session. */
   async close(): Promise<void> {
     for (const sessionId of [...this.#pending.keys()]) this.#close(sessionId);
-    const bound = new Promise<void>(resolve => { const t = setTimeout(resolve, ROUTE_DEADLINE_MS + 500); t.unref?.(); });
-    await Promise.race([Promise.allSettled([...this.#tracked]).then(() => this.#writes), bound]);
+    const within = async (work: Promise<unknown>, ms: number): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([work, new Promise<void>(resolve => { timer = setTimeout(resolve, ms); })]); } finally { clearTimeout(timer); }
+    };
+    // Verdicts are bounded by the routing deadline, so these lines settle within it.
+    await within(Promise.allSettled([...this.#tracked]).then(() => this.#writes), ROUTE_DEADLINE_MS + 500);
     this.#abort.abort();
+    await within(Promise.allSettled([...this.#evaluations]), 500);
     const client = await this.#client?.catch(() => undefined);
     await client?.drainCredentials();
   }
+  /** Evaluations still running (sockets included); 0 after close() for a cooperative evaluator. */
+  get openEvaluations(): number { return this.#evaluations.size; }
 }

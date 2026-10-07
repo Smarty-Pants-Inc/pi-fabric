@@ -12,7 +12,16 @@ export const JEV_GATEWAY_DEFAULT_USE = "fabric";
 export interface JevEvaluateOptions {
   /** Gateway use (budget, validator, meter) for this request; ignored on the direct HTTPS route. */
   use?: string;
+  /** Absolute deadline (epoch ms) for ALL of this request's work. It caps jev.requestTimeoutMs and is sent
+   * to the gateway as `expiresAt`, so neither side keeps working (or charging) past the caller's decision. */
+  deadline?: number;
 }
+/** The effective absolute deadline: the request timeout, capped by the caller's own deadline. */
+export function jevDeadline(requestTimeoutMs: number, deadline?: number, now = Date.now()): number {
+  const own = now + requestTimeoutMs;
+  return deadline !== undefined && Number.isFinite(deadline) ? Math.min(own, deadline) : own;
+}
+const timeoutUntil = (deadline: number): AbortSignal => AbortSignal.timeout(Math.max(1, Math.ceil(deadline - Date.now())));
 
 export interface JevCredentialSource {
   configured(): boolean;
@@ -156,11 +165,12 @@ export class JevClient {
   get viaGateway(): boolean { return this.#gateway !== undefined; }
   async evaluate(request: JevRequest, signal: AbortSignal, options: JevEvaluateOptions = {}): Promise<JevResponse> {
     checkRequest(request, this.config.maxRequestBytes);
-    if (this.#gateway) return this.#evaluateViaGateway(this.#gateway, request, signal, options.use ?? JEV_GATEWAY_DEFAULT_USE);
+    const deadline = jevDeadline(this.config.requestTimeoutMs, options.deadline);
+    if (this.#gateway) return this.#evaluateViaGateway(this.#gateway, request, signal, options.use ?? JEV_GATEWAY_DEFAULT_USE, deadline);
     const requestedModel = request.model ?? this.config.model;
     const model = resolveJevUpstreamModel(this.route, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available on the ${this.route.label} route`);
-    const timedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]);
+    const timedSignal = AbortSignal.any([signal, timeoutUntil(deadline)]);
     const key = await runAbortable(timedSignal, () => {
       const pending = this.credentials.resolve(timedSignal);
       this.#pendingCredentials.add(pending);
@@ -201,7 +211,7 @@ export class JevClient {
   }
   /** The gateway owns the key, the budget and the meter; Fabric sends the exact typed body and reads
    * the gateway's projection (`{ model, answers: { id: { noul } } }`). Only Noul crosses the socket. */
-  async #evaluateViaGateway(gateway: JevGatewayTransport, request: JevRequest, signal: AbortSignal, use: string): Promise<JevResponse> {
+  async #evaluateViaGateway(gateway: JevGatewayTransport, request: JevRequest, signal: AbortSignal, use: string, deadline: number): Promise<JevResponse> {
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(use)) throw new Error("Invalid Jev gateway use");
     if (Object.values(request.questions).some(question => question.type !== "noul")) {
       throw new Error("The Jev gateway answers Noul questions only");
@@ -209,11 +219,11 @@ export class JevClient {
     const requestedModel = request.model ?? this.config.model;
     const model = resolveJevUpstreamModel(JEV_TYPESAFE_ROUTE, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available through the Jev gateway`);
-    const timedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]);
+    const timedSignal = AbortSignal.any([signal, timeoutUntil(deadline)]);
     const body = jsonText({ model, state: request.state, questions: request.questions }, this.config.maxRequestBytes, "Jev request");
     let reply: { status: number; body: string };
     try {
-      reply = await runAbortable(timedSignal, () => gateway.systemone(use, body, timedSignal, Date.now() + this.config.requestTimeoutMs));
+      reply = await runAbortable(timedSignal, () => gateway.systemone(use, body, timedSignal, deadline));
     } catch (error) {
       if (timedSignal.aborted) throw new Error("Jev gateway request cancelled or timed out");
       throw error instanceof JevGatewayError ? new Error(error.message) : new Error("Jev gateway request failed");

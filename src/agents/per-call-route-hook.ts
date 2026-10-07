@@ -15,7 +15,15 @@ export function registerLazyPerCallRouter(pi: ExtensionAPI, getSettings: () => P
   const withRouter = (use: (router: PerCallShadowRouter) => void): void => {
     const run = (r: PerCallShadowRouter): void => { try { use(r); } catch { /* shadow only */ } };
     if (router) { run(router); return; }
-    loading ??= import("./per-call-route.js").then(module => (router = new module.PerCallShadowRouter({ settings })));
+    if (!loading) {
+      const pending: Promise<PerCallShadowRouter> = import("./per-call-route.js").then(module => {
+        const created = new module.PerCallShadowRouter({ settings });
+        // A session that ended while this loaded keeps its router out of the next session.
+        if (loading === pending) router = created;
+        return created;
+      });
+      loading = pending;
+    }
     void loading.then(run, () => undefined);
   };
   const sessionId = (context: ExtensionContext): string => {
@@ -39,7 +47,11 @@ export function registerLazyPerCallRouter(pi: ExtensionAPI, getSettings: () => P
   });
   pi.on("session_shutdown", async () => {
     if (!loading) return;
-    const loaded = await loading.catch(() => undefined);
+    const current = loading;
+    // A closed router has aborted its Jev work; a later session in this process gets a fresh one.
+    router = undefined;
+    loading = undefined;
+    const loaded = await current.catch(() => undefined);
     await loaded?.close().catch(() => undefined);
   });
 }

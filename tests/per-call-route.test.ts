@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -56,11 +57,34 @@ describe("per-call rule classifier", () => {
     expect(classify([user(), assistant([call("fabric_exec", { code: "return [await pi.read('a'), await pi.grep('x','src')]" })]), result()]))
       .toEqual({ decision: "simple", rule: "read-only-tools" });
   });
-  it("anything else after tool results is ambiguous (the only Jev candidates)", () => {
-    expect(classify([user(), assistant([call("bash", { command: "make" })]), result()]).rule).toBe("ambiguous");
-    expect(classify([user(), assistant([call("fabric_exec", { code: "await pi.bash({cmd:'ls'})" })]), result()]).rule).toBe("ambiguous");
-    expect(classify([user(), assistant([call("fabric_exec", { code: "await pi.read('a'); await agents.run({})" })]), result()]).rule).toBe("ambiguous");
+  it("anything that could write is an author signal: bash, unknown tools, non-read pi ops, aliases and computed access", () => {
+    const after = (c: ReturnType<typeof call>) => classify([user(), assistant([c]), result()]);
+    const fabric = (code: string) => after(call("fabric_exec", { code }));
+    const author = { decision: "main", rule: "author-phase" };
+    expect(after(call("bash", { command: "echo x > f" }))).toEqual(author);
+    expect(after(call("bash", { command: "ls" }))).toEqual(author);
+    for (const name of ["task", "webfetch", "mcp__x__read", "pi", "unknown_tool"]) expect(after(call(name))).toEqual(author);
+    // Aliased and computed pi writes evade a literal `pi.<op>(` scan; they must still count.
+    expect(fabric("const run = pi['bash']; await run({cmd:'echo x > f'})")).toEqual(author);
+    expect(fabric("const { bash } = pi; await bash({cmd:'echo x > f'})")).toEqual(author);
+    expect(fabric("const p = pi; await p.write({path:'f', text:'x'})")).toEqual(author);
+    expect(fabric("await pi[\"write\"]({path:'f', text:'x'})")).toEqual(author);
+    expect(fabric("const op = 'edit'; await pi[op]({path:'f', edits:[]})")).toEqual(author);
+    expect(fabric("await pi?.edit({path:'f', edits:[]})")).toEqual(author);
+    expect(fabric("const r = pi.read; await pi.read('a'); await r.call(pi, 'b')")).toEqual(author);
+    expect(fabric("await pi.bash({cmd:'ls'})")).toEqual(author);
+    expect(fabric("await pi.read('a'); await agents.run({})")).toEqual(author);
+    expect(fabric("await tools.call({ ref: 'pi.write', args: {} })")).toEqual(author);
+    expect(fabric("await globalThis['p'+'i'].write({})")).toEqual(author);
+    expect(fabric("await pi.grep('pi', 'src')")).toEqual(author); // a quoted "pi" is not proven harmless: conservative
+    // Literal reads stay read-only, including paths that merely contain "pi".
+    expect(fabric("return [await pi.read('/lanes/pi-fabric/src/pi/x.ts'), await pi . grep('TODO', 'src')]"))
+      .toEqual({ decision: "simple", rule: "read-only-tools" });
+  });
+  it("only failed reads or operation-free programs are ambiguous (the only Jev candidates)", () => {
     expect(classify([user(), assistant([call("read")]), result(true)]).rule).toBe("ambiguous");
+    expect(classify([user(), assistant([call("fabric_exec", { code: "return await pi.grep('x','src')" })]), result(true)]).rule).toBe("ambiguous");
+    expect(classify([user(), assistant([call("fabric_exec", { code: "return 1 + 1" })]), result()]).rule).toBe("ambiguous");
   });
 });
 
@@ -124,17 +148,17 @@ describe("per-call shadow ledger", () => {
 });
 
 describe("Jev for ambiguous steps only, within budget", () => {
-  const bash = (command: string) => [user(), assistant([call("bash", { command })]), result()];
+  const failed = (name: string, file = "make.txt") => [user(), assistant([call(name, { path: file })]), result(true)];
   it("never asks Jev for rule-decided steps; asks once per step shape and caches it", async () => {
     const ledger = path.join(dir, "fabric", "per-call-routing.jsonl");
     const evaluate = vi.fn(async (_request: JevRequest) => noul(0.95));
     const router = new PerCallShadowRouter({ settings: () => settingsFor(), ledger, evaluate });
     router.onContext(snapshot([user()]));
     router.onContext(snapshot([user(), assistant([call("read")]), result()]));
-    router.onContext(snapshot([user(), assistant([call("edit")]), result(), ...bash("make").slice(1)]));
+    router.onContext(snapshot([user(), assistant([call("edit")]), result(), ...failed("read").slice(1)]));
     expect(evaluate).not.toHaveBeenCalled();
-    router.onContext(snapshot(bash("make")));
-    router.onContext(snapshot(bash("make test"), "s2"));
+    router.onContext(snapshot(failed("read")));
+    router.onContext(snapshot(failed("read", "make test.txt"), "s2"));
     await router.close();
     expect(evaluate).toHaveBeenCalledTimes(1);
     const request = evaluate.mock.calls[0]![0];
@@ -154,7 +178,7 @@ describe("Jev for ambiguous steps only, within budget", () => {
     const ledger = path.join(dir, "fabric", "per-call-routing.jsonl");
     const evaluate = vi.fn(async () => noul(0.2));
     const router = new PerCallShadowRouter({ settings: () => settingsFor({ jevMaxCallsPerSession: 2 }), ledger, evaluate });
-    for (const name of ["bash", "task", "webfetch"]) router.onContext(snapshot([user(), assistant([call(name)]), result()]));
+    for (const name of ["read", "grep", "find"]) router.onContext(snapshot(failed(name)));
     await router.close();
     expect(evaluate).toHaveBeenCalledTimes(2);
     expect(readLedger(ledger).map(row => [row.decidedBy, row.rule, row.decision])).toEqual([
@@ -165,14 +189,76 @@ describe("Jev for ambiguous steps only, within budget", () => {
   it("a Jev failure or gateway-less config leaves the step MAIN, decided by rule", async () => {
     const ledger = path.join(dir, "fabric", "per-call-routing.jsonl");
     const failing = new PerCallShadowRouter({ settings: () => settingsFor(), ledger, evaluate: async () => { throw new Error("Jev gateway refused: cap"); } });
-    failing.onContext(snapshot(bash("x")));
+    failing.onContext(snapshot(failed("read")));
     await failing.close();
     // No gatewaySocket: the default "gateway" mode never falls back to a direct, key-holding client.
     const offline = new PerCallShadowRouter({ settings: () => settingsFor(), ledger });
-    offline.onContext(snapshot(bash("x")));
+    offline.onContext(snapshot(failed("read")));
     await offline.close();
     expect(offline.jevQuestions).toBe(0);
     expect(readLedger(ledger).map(row => row.rule)).toEqual(["ambiguous-jev-error", "ambiguous-jev-off"]);
+  });
+});
+
+describe("the 2.5 s routing deadline bounds all Jev work", () => {
+  const failedRead = () => [user(), assistant([call("read")]), result(true)];
+  it("an evaluator that never answers (and ignores its signal) is cut off at the deadline and logged MAIN", async () => {
+    const ledger = path.join(dir, "fabric", "per-call-routing.jsonl");
+    let seen: { signal: AbortSignal; deadline: number; at: number } | undefined;
+    const router = new PerCallShadowRouter({ settings: () => settingsFor(), ledger,
+      evaluate: (_request, signal, deadline) => { seen = { signal, deadline, at: Date.now() }; return new Promise<JevResponse>(() => undefined); } });
+    const started = Date.now();
+    router.onContext(snapshot(failedRead()));
+    await router.close();
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(2_400);
+    expect(elapsed).toBeLessThan(3_400);
+    expect(seen!.deadline - seen!.at).toBeLessThanOrEqual(2_500);
+    expect(seen!.signal.aborted).toBe(true);
+    expect(readLedger(ledger).map(row => [row.decidedBy, row.rule, row.decision])).toEqual([["rule", "ambiguous-jev-timeout", "main"]]);
+  });
+
+  it.skipIf(process.platform === "win32")("a real gateway socket that never answers: expiresAt is the deadline, the socket is destroyed, nothing is left open", async () => {
+    const sockDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-gw-"));
+    fs.chmodSync(sockDir, 0o700);
+    const socket = path.join(sockDir, "jev-gateway.sock");
+    const lines: Array<{ line: string; at: number }> = [];
+    let opened = 0;
+    let closed = 0;
+    const server = net.createServer(conn => {
+      opened++;
+      conn.setEncoding("utf8");
+      let buffer = "";
+      conn.on("data", chunk => { buffer += chunk; if (buffer.includes("\n")) lines.push({ line: buffer.slice(0, buffer.indexOf("\n")), at: Date.now() }); });
+      conn.on("close", () => { closed++; });
+      // Never answers.
+    });
+    await new Promise<void>(resolve => server.listen(socket, resolve));
+    fs.chmodSync(socket, 0o600);
+    try {
+      const ledger = path.join(dir, "fabric", "per-call-routing.jsonl");
+      const settings = (): PerCallSettings => ({ perCall: config({ jev: "gateway" }),
+        jev: { ...DEFAULT_JEV_CONFIG, enabled: true, model: "jev-1.13.0", gatewaySocket: socket, requestTimeoutMs: 120_000 } });
+      const router = new PerCallShadowRouter({ settings, ledger });
+      const started = Date.now();
+      router.onContext(snapshot(failedRead()));
+      await router.close();
+      expect(Date.now() - started).toBeLessThan(3_400);
+      expect(router.jevQuestions).toBe(1);
+      expect(router.openEvaluations).toBe(0);
+      expect(readLedger(ledger).map(row => [row.decidedBy, row.rule, row.decision])).toEqual([["rule", "ambiguous-jev-timeout", "main"]]);
+      expect(lines).toHaveLength(1);
+      const sent = JSON.parse(lines[0]!.line) as { op: string; use: string; expiresAt: number };
+      expect(sent).toMatchObject({ op: "systemone", use: "percall_route" });
+      // The gateway's own work lifetime is the routing deadline, not jev.requestTimeoutMs (120 s here).
+      expect(sent.expiresAt - started).toBeLessThanOrEqual(2_500 + 50);
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+      expect([opened, closed]).toEqual([1, 1]);
+      expect(await new Promise<number>((resolve, reject) => server.getConnections((error, count) => error ? reject(error) : resolve(count)))).toBe(0);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      fs.rmSync(sockDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -241,6 +327,10 @@ describe("lazy, shadow-only hook", () => {
     expect(rows.map(row => [row.sessionId, row.turnIndex, row.callIndex, row.decision, row.usage?.totalTokens])).toEqual([
       ["lazy-session", 7, 1, "simple", 2], ["lazy-session", 7, 2, "simple", 2],
     ]);
+    // A closed router is not reused: the next session in this process gets a fresh one (call index restarts).
+    await turn(h);
+    await h.emit("session_shutdown", { type: "session_shutdown" });
+    expect(readLedger(path.join(dir, "fabric", "per-call-routing.jsonl")).map(row => row.callIndex)).toEqual([1, 2, 1]);
   });
 
   it("the router and its hook have no model-switch call at all", () => {

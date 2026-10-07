@@ -55,25 +55,34 @@ export function checkGatewaySocket(socket: string): string {
   return resolved;
 }
 
-/** One connection per call; the socket is re-checked before every connect. Nothing is retried. */
+/** One connection per call; the socket is re-checked before every connect. Nothing is retried.
+ * `expiresAt` (epoch ms) bounds ALL of the work, connect, write and read alike: it is sent to the gateway
+ * as the server-side lifetime of the request, and at that instant the socket is destroyed and the call
+ * rejects (unsettled once the line was written). A caller's abort does the same earlier. */
 export function createGatewaySocketTransport(socket: string, connect: (file: string) => net.Socket = file => net.connect(file)): JevGatewayTransport {
   return {
     systemone: (use, body, signal, expiresAt) => new Promise<JevGatewayReply>((resolve, reject) => {
       if (signal.aborted) { reject(new JevGatewayError("Jev gateway request cancelled")); return; }
+      const remaining = Math.floor(expiresAt - Date.now());
+      if (!Number.isFinite(remaining) || remaining <= 0) { reject(new JevGatewayError("Jev gateway request timed out before sending")); return; }
       let checked: string;
       try { checked = checkGatewaySocket(socket); } catch (error) { reject(error); return; }
+      let conn: net.Socket;
+      try { conn = connect(checked); } catch { reject(new JevGatewayError("Jev gateway socket failed")); return; }
       let done = false;
       let sent = false;
       let buffer = "";
-      const conn = connect(checked);
       const finish = (error: Error | undefined, reply?: JevGatewayReply): void => {
         if (done) return;
         done = true;
+        clearTimeout(deadline);
         signal.removeEventListener("abort", onAbort);
         conn.destroy();
         if (error) reject(error); else resolve(reply!);
       };
       const onAbort = (): void => finish(new JevGatewayError("Jev gateway request cancelled or timed out", sent));
+      // One timer for connect, write and read: nothing outlives the caller's deadline.
+      const deadline = setTimeout(() => finish(new JevGatewayError("Jev gateway request timed out", sent)), remaining);
       signal.addEventListener("abort", onAbort, { once: true });
       conn.setEncoding("utf8");
       conn.on("error", () => finish(new JevGatewayError("Jev gateway socket failed", sent)));
@@ -94,8 +103,11 @@ export function createGatewaySocketTransport(socket: string, connect: (file: str
         } else finish(new JevGatewayError("Jev gateway reply misshaped", true));
       });
       conn.on("connect", () => {
+        if (done) return;
         sent = true;
-        conn.write(`${JSON.stringify({ op: "systemone", use, body, expiresAt })}\n`);
+        conn.write(`${JSON.stringify({ op: "systemone", use, body, expiresAt })}\n`, error => {
+          if (error) finish(new JevGatewayError("Jev gateway socket failed", true));
+        });
       });
     }),
   };

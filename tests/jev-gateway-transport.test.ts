@@ -46,6 +46,23 @@ describe("Jev gateway transport (test double)", () => {
     await expect(client.evaluate(request, signal(), { use: "../x" })).rejects.toThrow(/Invalid Jev gateway use/);
   });
 
+  it("a caller deadline caps the gateway's expiresAt and the local timeout; without one, jev.requestTimeoutMs applies", async () => {
+    const expires: number[] = [];
+    const double: JevGatewayTransport = { systemone: async (_use, _body, _signal, expiresAt) => {
+      expires.push(expiresAt);
+      return { status: 200, body: JSON.stringify({ model: "jev-1.13.0", answers: { simple: { noul: 0.5 } } }) };
+    } };
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-1.13.0", requestTimeoutMs: 120_000 }, undefined, noKey(), undefined, double);
+    const before = Date.now();
+    await client.evaluate(request, signal(), { deadline: before + 2_500 });
+    await client.evaluate(request, signal());
+    expect(expires[0]).toBe(before + 2_500);
+    expect(expires[1]! - before).toBeGreaterThanOrEqual(120_000);
+    // A deadline later than the request timeout never extends it.
+    await client.evaluate(request, signal(), { deadline: Date.now() + 10 * 60_000 });
+    expect(expires[2]! - Date.now()).toBeLessThanOrEqual(120_000);
+  });
+
   it("jev.gatewaySocket is an optional absolute path", () => {
     expect(normalizeJevConfig({}).gatewaySocket).toBeUndefined();
     expect(normalizeJevConfig({ gatewaySocket: "/srv/org/state/jev-gateway.sock" }).gatewaySocket).toBe("/srv/org/state/jev-gateway.sock");
@@ -103,6 +120,36 @@ describe.skipIf(process.platform === "win32")("Jev gateway Unix socket (a local 
     const transport = createGatewaySocketTransport(socket);
     await expect(transport.systemone("percall_route", "{}", signal(), Date.now() + 1000)).rejects.toThrow(/refused: use does not allow raw requests/);
     expect(lines).toHaveLength(1);
+  });
+
+  it("a gateway that never answers: the deadline destroys the socket (connect, write and read are all bounded)", async () => {
+    let closed = 0;
+    server.on("connection", conn => conn.on("close", () => { closed++; }));
+    answer = () => "";
+    server.removeAllListeners("connection");
+    server.on("connection", conn => {
+      conn.on("data", chunk => lines.push(String(chunk)));
+      conn.on("close", () => { closed++; });
+    });
+    const started = Date.now();
+    const transport = createGatewaySocketTransport(socket);
+    const error = await transport.systemone("percall_route", "{}", signal(), started + 300).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "JevGatewayError", unsettled: true });
+    expect(String(error)).toMatch(/timed out/);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+    expect(closed).toBe(1);
+    expect(JSON.parse(lines[0]!.trim())).toMatchObject({ op: "systemone", expiresAt: started + 300 });
+    // A connect that never completes is bounded by the same deadline and never writes.
+    let stuck: net.Socket | undefined;
+    const never = createGatewaySocketTransport(socket, () => (stuck = new net.Socket()));
+    const late = await never.systemone("percall_route", "{}", signal(), Date.now() + 200).catch((e: unknown) => e);
+    expect(late).toMatchObject({ name: "JevGatewayError", unsettled: false });
+    expect(stuck!.destroyed).toBe(true);
+    // An expired deadline never connects.
+    const connect = vi.fn(() => new net.Socket());
+    await expect(createGatewaySocketTransport(socket, connect).systemone("percall_route", "{}", signal(), Date.now() - 1)).rejects.toThrow(/timed out before sending/);
+    expect(connect).not.toHaveBeenCalled();
   });
 
   it("checks the socket before connecting: mode, type and symlinks", () => {

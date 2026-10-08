@@ -83,7 +83,11 @@ export interface MeshCommitEffects {
   readonly changed: readonly string[];
   /** The backend change stamp right after this commit (`stateStamp()`), when known. */
   readonly stamp: string | undefined;
-  /** The batch's final view, as committed (a copy, read-only, valid after the transaction). */
+  /**
+   * The committed state, read-only, valid after the transaction. file/shadow: exactly this batch's
+   * commit (a copy). sqlite: captured at first use after COMMIT, so a later writer's commit may show
+   * (iface-changes.md #1); compare `results` versions when exactness matters.
+   */
   readonly view: MeshBatchView;
 }
 

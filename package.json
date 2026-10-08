@@ -71,7 +71,7 @@
     "test:jev:dist": "node scripts/smoke-jev.mjs",
     "test:changed": "node scripts/test-affected.mjs",
     "test:affected": "node scripts/test-affected.mjs --base $PI_TEST_BASE",
-    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/conversation-native-reader-suspension.test.ts",
+    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/conversation-native-reader-suspension.test.ts tests/mesh-backend-windows.test.ts tests/mesh-state-sqlite-powercut.test.ts",
     "test:related": "vitest related --run",
     "check:fast": "bun run typecheck && bun run test:changed",
     "certify:context": "bun run build && node scripts/certify-context.mjs",

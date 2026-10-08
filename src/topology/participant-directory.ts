@@ -2142,13 +2142,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * shared commit stamps its own host record, that record is still the predecessor's; replacing
    * the predecessor's live reload lease file with this incarnation's (new startedAt) dropped the
    * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
-   * Its reloadUntil still bounds the listing if this release never commits. */
+   * Its reloadUntil still bounds the listing if this release never commits.
+   * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
+   * fixed 180 s reload lease never outlasts leaseMs >= 180 s (or heartbeatMs >= 90 s), which made
+   * the guard dead under that config (#663 round 2). Before this incarnation's host record commits,
+   * its own lease file pairs with no host record, so keeping any live predecessor lease of this
+   * root Main loses nothing; only a root Main writes reload leases, so other hosts are unaffected. */
   #keepsPredecessorReloadLease(at: number): boolean {
-    if (this.#leaseConfirmed) return false;
+    if (this.#leaseConfirmed || this.options.identity.kind !== "main" || this.options.hostId !== this.options.rootId) return false;
     const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
     return lease !== undefined && lease.rootId === this.options.rootId &&
       lease.identityId === this.options.identity.id && lease.startedAt !== undefined &&
-      lease.startedAt < this.#startedAt && lease.expiresAt > at && lease.expiresAt - lease.updatedAt > this.#leaseMs;
+      lease.startedAt < this.#startedAt && lease.expiresAt > at;
   }
 
   #renewFileLease(): number {

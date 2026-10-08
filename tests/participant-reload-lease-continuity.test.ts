@@ -77,9 +77,9 @@ const fixture = () => {
 
 /** A Fabric release's directory, built from the given (possibly re-imported) modules. */
 const directoryFrom = (modules: { MeshStore: typeof MeshStore; ParticipantDirectory: typeof ParticipantDirectory },
-  meshRoot: string, options: { lockTimeoutMs: number }) => {
+  meshRoot: string, options: { lockTimeoutMs: number }, timing: { leaseMs?: number; heartbeatMs?: number } = {}) => {
   const directory = new modules.ParticipantDirectory(new modules.MeshStore(meshRoot, 64 * 1024, 1_000, options), {
-    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false, ...timing,
   });
   directory.registerSource(() => [record()]);
   cleanup.push(() => directory.close());
@@ -288,6 +288,37 @@ describe("root Main stays in the directory listing through a reload under lock l
     // The lock never clears for it: the reload lease, not the stalled release, bounds the listing.
     f.advance(MAIN_RELOAD_LEASE_MS + 5_000);
     await fresh.refresh().catch(() => undefined);
+    expect(f.sample()).toMatchObject({ root: false });
+    f.releaseLock();
+  }, 30_000);
+
+  // PR #663 round 2: the kept lease is recognised by its own live expiry, not by outlasting this
+  // release's lease (a 180 s reload lease never outlasts leaseMs >= 180 s, nor heartbeatMs >= 90 s).
+  it.each([
+    { name: "leaseMs = 180 s", timing: { leaseMs: 180_000 } },
+    { name: "heartbeatMs = 90 s", timing: { heartbeatMs: 90_000 } },
+  ])("keeps the predecessor's reload lease with $name until it expires", async ({ timing }) => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options, timing);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    const kept = readHostLeases(f.meshRoot).get(identity.id)!;
+    const next = await reimport();
+    f.advance(1_000);
+    const fresh = directoryFrom(next, f.meshRoot, f.options, timing);
+    expect((await fresh.start().then(() => undefined, (error: unknown) => error) as { code?: string })?.code)
+      .toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toMatchObject({ startedAt: kept.startedAt, expiresAt: kept.expiresAt });
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    f.advance(kept.expiresAt - Date.now() - 5_000);
+    await fresh.refresh().catch(() => undefined);
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    // Expired: no longer kept, and the stalled release no longer lists the Main.
+    f.advance(10_000);
+    await fresh.refresh().catch(() => undefined);
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(kept.startedAt);
     expect(f.sample()).toMatchObject({ root: false });
     f.releaseLock();
   }, 30_000);

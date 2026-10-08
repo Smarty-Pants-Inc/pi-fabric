@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
@@ -2068,5 +2068,326 @@ describe("MeshStore.list", () => {
     expect(page.map((entry) => entry.key)).toEqual(["x/a", "x/b"]);
     (page[0]!.value as { key: string }).key = "mutated";
     expect((store.get("x/a")!.value as { key: string }).key).toBe("a");
+  });
+});
+
+// smarty-dev#6477 L6: an idle heartbeat writes nothing, so it must not queue on the mesh lock
+// when another writer's commit already shows the shared state writable.
+describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => {
+  const idleFixture = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-confirm-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:idle", name: "main", kind: "main", sessionId: "idle" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 150 });
+    const other: MeshIdentity = { id: "session:other", name: "other", kind: "main", sessionId: "other" };
+    const writer = new MeshStore(mesh.root, 64 * 1024, 1_000);
+    await writer.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: other });
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "idle")]);
+    directories.push(directory);
+    await directory.refresh();                                 // admission: a real lock receipt
+    await directory.refresh();                                 // settle first-publication migrations
+    const lockPath = path.join(mesh.root, ".lock");
+    // Count real canonical acquisitions: protocol 1 mkdir, protocol 2 rename into place.
+    const mkdir = vi.spyOn(fs, "mkdirSync"), rename = vi.spyOn(fs, "renameSync");
+    const acquisitions = () => mkdir.mock.calls.filter(([target]) => target === lockPath).length +
+      rename.mock.calls.filter(([, target]) => target === lockPath).length;
+    const confirmations = vi.spyOn(mesh, "confirmWritable");
+    const writes = vi.spyOn(mesh, "writeBatch");
+    return { directory, mesh, writer, other, lockPath, acquisitions, confirmations, writes };
+  };
+  afterEach(() => { vi.restoreAllMocks(); });
+  // Witness times are whole milliseconds of file time (latestCommitWitness floors mtimeMs), so a
+  // commit in the same millisecond as a receipt is, by design, no evidence. Before a commit that
+  // must count as evidence, wait until file time passes every receipt and witness so far.
+  // The latest file time under the mesh root, floored like latestCommitWitness: a superset of its witnesses.
+  const meshFileTime = (meshRoot: string) =>
+    Math.max(0, ...fs.readdirSync(meshRoot).map(name => Math.floor(fs.statSync(path.join(meshRoot, name)).mtimeMs)));
+  const fileClockPast = (meshRoot: string, ...receipts: number[]) => {
+    const latest = Math.max(...receipts, meshFileTime(meshRoot));
+    const probe = path.join(path.dirname(meshRoot), "clock.probe");
+    for (let i = 0; i < 100_000; i++) {
+      fs.writeFileSync(probe, "");
+      if (Math.floor(fs.statSync(probe).mtimeMs) > latest && Date.now() > latest) return;
+    }
+    throw new Error("file clock did not advance");
+  };
+
+  it("takes no mesh lock for an idle confirmation after another writer's commit, and still advances confirmedAt", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    await f.writer.put({ key: "bench/other", value: { at: 1 }, identity: f.other });
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.writes).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+    // The receipt is the commit's file time, clamped to Date.now(). Compare each bound with its own
+    // clock: on Windows file time and Date.now() are separate clocks, and file time can lead by a
+    // millisecond or more, so a Date.now() taken right after the commit is no bound (CI on #634).
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(meshFileTime(f.mesh.root));
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(Date.now());
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(readHostLeases(f.mesh.root).get(f.directory.options.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+    // The next view is canonical, as after confirmWritable: the other writer's commit is visible.
+    expect(f.mesh.get("bench/other")?.value).toEqual({ at: 1 });
+  });
+
+  // smarty-dev#6477 L6 (Windows CI on #634): a commit's file time may lead Date.now(). Such evidence
+  // confirms no later than the real clock, so a confirmation window never starts in the future.
+  it("clamps a lock-free receipt to Date.now() when the commit's file time leads the clock", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    await f.writer.put({ key: "bench/other", value: { at: 5 }, identity: f.other });
+    const witness = path.join(f.mesh.root, "state.json");
+    fs.utimesSync(witness, fs.statSync(witness).atime, new Date(Date.now() + 30_000));
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    const after = Date.now();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(after);
+  });
+
+  // Review round 2 on #592: the fresh read after the witness is synchronous file I/O and can be
+  // slow during a mesh stall. Evidence that ages past one heartbeat during that read must not
+  // confirm: the heartbeat falls back to the lock path.
+  it("falls back to the lock when the fresh read outlasts one heartbeat of witness age", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    await f.writer.put({ key: "bench/other", value: { at: 4 }, identity: f.other });
+    const committedAt = Date.now();
+    const realNow = Date.now.bind(Date);
+    const realToken = f.mesh.stateToken.bind(f.mesh);
+    let stalled = false;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + (stalled ? 60_001 : 0));
+    // Only the confirmation's own read is fresh on this idle path; it completes one heartbeat late.
+    const token = vi.spyOn(f.mesh, "stateToken").mockImplementation(options => {
+      const result = realToken(options);
+      if (options?.fresh === true) stalled = true;
+      return result;
+    });
+    try {
+      const baseline = f.acquisitions();
+      await f.directory.refresh();
+      expect(token.mock.calls.some(([options]) => options?.fresh === true)).toBe(true);
+      expect(f.confirmations).toHaveBeenCalledOnce();
+      expect(f.acquisitions() - baseline).toBe(1);
+      expect(f.writes).not.toHaveBeenCalled();
+      // The receipt is the lock's, taken after the stall, not the aged commit's time.
+      expect(f.directory.confirmedAt()).toBeGreaterThan(committedAt + 60_000);
+    } finally { clock.mockRestore(); token.mockRestore(); }
+  });
+
+  it("takes the lock exactly once when no unseen commit is evidence, and never confirms behind a stuck holder", async () => {
+    const f = await idleFixture();
+    const baseline = f.acquisitions();
+    await f.directory.refresh();                               // nothing committed since its receipt
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    // Evidence already behind a receipt never confirms twice; a stuck holder commits nothing.
+    const confirmed = f.directory.confirmedAt();
+    fs.mkdirSync(f.lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(f.lockPath, "owner"), "stuck\n" + process.pid + "\n" + Date.now() + "\n");
+    try {
+      await expect(f.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(f.directory.confirmedAt()).toBe(confirmed);
+      expect(f.directory.canConsumeMesh()).toBe(false);
+    } finally { fs.rmSync(f.lockPath, { recursive: true, force: true }); }
+  });
+
+  it("recovers an overdue or failed chain only with a real lock receipt, even after another commit", async () => {
+    const f = await idleFixture();
+    const failure = new Error("shared confirmation blocked");
+    f.confirmations.mockRejectedValueOnce(failure);
+    await expect(f.directory.refresh()).rejects.toBe(failure);
+    await f.writer.put({ key: "bench/other", value: { at: 2 }, identity: f.other });
+    const baseline = f.acquisitions();
+    await f.directory.refresh();                               // a failed refresh needs the lock again
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(f.confirmations).toHaveBeenCalledTimes(2);
+    // Overdue: two heartbeats without a receipt. Fresh evidence does not restart the chain.
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now + 120_000);
+    try {
+      await f.writer.put({ key: "bench/other", value: { at: 3 }, identity: f.other });
+      // That commit is one second old on the advanced clock: only the overdue chain refuses it.
+      const witness = path.join(f.mesh.root, "state.json");
+      fs.utimesSync(witness, fs.statSync(witness).atime, new Date(now + 119_000));
+      await f.directory.refresh();
+      expect(f.confirmations).toHaveBeenCalledTimes(3);
+    } finally { clock.mockRestore(); }
+  });
+
+  // Windows CI on #592: Node defines fs.constants.O_NOFOLLOW only on POSIX. Since review round 4 the
+  // product never writes the confirmation witness without an atomic no-follow open, so on Windows a
+  // real confirmation leaves no witness for another idle participant (by design, not a timing race).
+  // There, the native test below asserts that contract instead; this one runs wherever the witness exists.
+  const nativeNoFollow = typeof fs.constants.O_NOFOLLOW === "number" && fs.constants.O_NOFOLLOW !== 0;
+  it.skipIf(!nativeNoFollow)("lets one real confirmation on an idle mesh serve another idle participant without the lock", async () => {
+    const f = await idleFixture();
+    const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
+    const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
+      rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
+    directories.push(second);
+    await second.refresh();
+    await second.refresh();
+    await f.directory.refresh();                               // absorbs the second's first commits
+    const confirmationsBefore = f.confirmations.mock.calls.length;
+    fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
+    await f.directory.refresh();                               // nothing unseen: a real, witnessed acquisition
+    expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
+    const before = second.confirmedAt(), baseline = f.acquisitions();
+    // That real confirmation left its witness, on the file clock, after the second's receipt:
+    // the proof the second may use. Checked here, so a missing proof cannot pass for a lock race.
+    const witnessAt = Math.floor(fs.lstatSync(plantedWitness(f.mesh.root)).mtimeMs);
+    expect(witnessAt).toBeGreaterThan(before);
+    // CI flake on #592: the second's heartbeat read Date.now() several times (evidence age, the
+    // post-read recheck) on a loaded runner. Pin its clock one millisecond after the witness: the
+    // proof is fresh by construction, so the product must confirm without the lock. Age limits
+    // and the fallback to the lock keep their own tests above (real and advanced clocks).
+    const clock = vi.spyOn(Date, "now").mockReturnValue(witnessAt + 1);
+    const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
+    try {
+      await second.refresh();
+    } finally { clock.mockRestore(); }
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(secondConfirms).not.toHaveBeenCalled();
+    expect(second.confirmedAt()).toBeGreaterThan(before);
+    expect(second.confirmedAt()).toBeLessThanOrEqual(witnessAt + 1);
+  });
+
+  // Security round on #592: only this user's own regular witness file under the mesh root is proof.
+  // A planted symlink (to a recently modified path), a non-regular file or a foreign file is not:
+  // the heartbeat takes the lock, and touching the witness never follows or truncates a link.
+  const plantedWitness = (meshRoot: string) => path.join(meshRoot, "participant-confirm.witness");
+  it.skipIf(process.platform === "win32")("takes the lock when the witness is a symlink to a fresh path, and never writes through it", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const target = path.join(path.dirname(f.mesh.root), "fresh-target.txt");
+    fs.writeFileSync(target, "keep");                         // modified after every receipt
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    fs.symlinkSync(target, witness);
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.lstatSync(witness).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("keep");     // the touch did not follow the link
+  });
+
+  it("takes the lock when the witness is not a regular file", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    fs.mkdirSync(witness);                                     // a fresh directory under the name
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.lstatSync(witness).isDirectory()).toBe(true);
+  });
+
+  it.skipIf(typeof process.getuid !== "function")("takes the lock when the witness belongs to another uid", async () => {
+    const f = await idleFixture();
+    fileClockPast(f.mesh.root, f.directory.confirmedAt());
+    const witness = plantedWitness(f.mesh.root);
+    fs.writeFileSync(witness, "");
+    const realLstat = fs.lstatSync.bind(fs) as (...args: unknown[]) => fs.Stats | undefined;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+      const stat = realLstat(...args);
+      if (args[0] === witness && stat) Object.defineProperty(stat, "uid", { value: process.getuid!() + 1 });
+      return stat;
+    }) as typeof fs.lstatSync);
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+  });
+
+  it("still confirms without the lock on this user's own fresh regular witness", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    fs.writeFileSync(plantedWitness(f.mesh.root), "");
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+  });
+
+  // Review round 4 on #592: without an atomic no-follow open, an lstat-then-open could be raced by a
+  // swap to a symlink. Such a platform never opens or writes the witness: no lock-free proof from
+  // it, so the next idle participant takes the lock too.
+  const expectNoWitnessSharing = async () => {
+    const f = await idleFixture();
+    const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
+    const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
+      rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
+    directories.push(second);
+    await second.refresh();
+    await second.refresh();
+    await f.directory.refresh();                               // absorbs the second's first commits
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    const opens = vi.spyOn(fs, "openSync");
+    const confirmationsBefore = f.confirmations.mock.calls.length;
+    fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
+    await f.directory.refresh();                               // a real acquisition, but no witness
+    expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
+    expect(opens.mock.calls.some(([file]) => file === witness)).toBe(false);
+    expect(fs.existsSync(witness)).toBe(false);
+    const baseline = f.acquisitions();
+    const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
+    await second.refresh();
+    expect(secondConfirms).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.existsSync(witness)).toBe(false);
+  };
+  it("never opens or writes the witness without O_NOFOLLOW, so idle participants take the lock", async () => {
+    const platform = confirmWitnessPlatform.constants;
+    confirmWitnessPlatform.constants = { ...fs.constants, O_NOFOLLOW: undefined };
+    try { await expectNoWitnessSharing(); } finally { confirmWitnessPlatform.constants = platform; }
+  });
+  // The same contract with the platform's real constants (Windows): no seam, no witness, the lock.
+  it.runIf(!nativeNoFollow)("on this platform without O_NOFOLLOW, a real confirmation leaves no witness and the next idle participant takes the lock", async () => {
+    expect(confirmWitnessPlatform.constants.O_NOFOLLOW).toBeUndefined();
+    await expectNoWitnessSharing();
+  });
+
+  // Review round 4 on #592: the descriptor must be the file lstat saw. A regular file of this user
+  // swapped in between lstat and open passes fstat alone; its dev/ino differ, so it is not truncated.
+  it.skipIf(fs.constants.O_NOFOLLOW === undefined)("refuses a witness swapped between lstat and open (dev/ino mismatch)", async () => {
+    const f = await idleFixture();
+    const witness = plantedWitness(f.mesh.root);
+    fs.writeFileSync(witness, "seen");
+    const old = new Date(Date.now() - 3_600_000);
+    fs.utimesSync(witness, old, old);                          // no evidence: the heartbeat takes the lock
+    const swapped = path.join(f.mesh.root, "swapped-in.txt");
+    fs.writeFileSync(swapped, "keep");
+    const realOpen = fs.openSync.bind(fs) as (...args: unknown[]) => number;
+    let raced = 0, witnessFd = -1;
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: unknown[]) => {
+      if (args[0] !== witness) return realOpen(...args);
+      fs.renameSync(swapped, witness); raced++;
+      return (witnessFd = realOpen(...args));
+    }) as typeof fs.openSync);
+    const truncations = vi.spyOn(fs, "ftruncateSync");
+    await f.directory.refresh();                               // nothing unseen: the lock path touches the witness
+    expect(f.confirmations).toHaveBeenCalledOnce();
+    expect(raced).toBe(1);
+    expect(truncations.mock.calls.some(([fd]) => fd === witnessFd)).toBe(false);
+    expect(fs.readFileSync(witness, "utf8")).toBe("keep");    // the swapped-in file was not truncated
   });
 });

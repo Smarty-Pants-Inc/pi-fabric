@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**']
 
 permissions:
   contents: read

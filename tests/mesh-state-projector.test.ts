@@ -265,6 +265,73 @@ describe("state projector (shadow)", () => {
     expect(await projector.verify()).toEqual([]);
   });
 
+  it("reports out-of-band byte accounting (row bytes, meta.state_bytes) without a commit and repairs it", async () => {
+    const root = tempRoot("bytes");
+    const file = new MeshStore(root, 64 * 1024, 1_000);
+    await file.put({ key: "k/a", value: "file-a", identity });
+    await file.put({ key: "k/b", value: "file-b", identity });
+    await file.delete({ key: "k/b" });
+    const projector = await openProjector(root);
+    await projector.tick();
+    expect(await projector.verify()).toEqual([]);
+    const database = path.join(projectorDatabaseRoot(root), "state.db");
+    const read = () => {
+      const raw = openNodeSqlite(database);
+      try {
+        return {
+          bytes: Number((raw.prepare("SELECT bytes FROM kv WHERE key = ?").get("k/a") as { bytes: number }).bytes),
+          stateBytes: Number((raw.prepare("SELECT value FROM meta WHERE name = 'state_bytes'").get() as { value: number }).value),
+          commit: Number((raw.prepare("SELECT value FROM meta WHERE name = 'commit_no'").get() as { value: number }).value),
+        };
+      } finally { raw.close(); }
+    };
+    const clean = read();
+    const raw = openNodeSqlite(database);
+    try {
+      raw.prepare("UPDATE kv SET bytes = 1 WHERE key = ?").run("k/a");
+      raw.prepare("UPDATE meta SET value = 7 WHERE name = 'state_bytes'").run();
+    } finally { raw.close(); }
+    expect(read().commit).toBe(clean.commit);
+
+    const found = await projector.verify();
+    expect(found.map(divergence => [divergence.key, divergence.field])).toEqual([["k/a", "bytes"], ["meta:state_bytes", "state-bytes"]]);
+    expect(found[0]).toMatchObject({ fileBytes: clean.bytes, sqliteBytes: 1 });
+    expect(found[1]).toMatchObject({ fileBytes: clean.stateBytes, sqliteBytes: 7 });
+    expect(projector.status()).toMatchObject({ fullResyncs: 2, lastResync: { reason: "divergence" } });
+    // Repaired: the row's bytes and the aggregate are the derived accounting again.
+    expect(read()).toMatchObject({ bytes: clean.bytes, stateBytes: clean.stateBytes });
+    expect(await projector.verify()).toEqual([]);
+    await expectInStep(root);
+  });
+
+  it("reports meta.high_water lowered out of band without a commit and raises it back", async () => {
+    const root = tempRoot("high-water");
+    const file = new MeshStore(root, 64 * 1024, 1_000);
+    await file.put({ key: "k/a", value: 1, identity });
+    await file.put({ key: "k/b", value: 2, identity });
+    const projector = await openProjector(root);
+    await projector.tick();
+    expect(await projector.verify()).toEqual([]);
+    const fileHighWater = fileState(root).highWater;
+    expect(fileHighWater).toBeGreaterThan(1);
+    const database = path.join(projectorDatabaseRoot(root), "state.db");
+    const meta = (name: string): number => {
+      const raw = openNodeSqlite(database);
+      try { return Number((raw.prepare("SELECT value FROM meta WHERE name = ?").get(name) as { value: number }).value); } finally { raw.close(); }
+    };
+    const commit = meta("commit_no");
+    const raw = openNodeSqlite(database);
+    try { raw.prepare("UPDATE meta SET value = 0 WHERE name = 'high_water'").run(); } finally { raw.close(); }
+    expect(meta("commit_no")).toBe(commit);
+
+    const found = await projector.verify();
+    expect(found.map(divergence => [divergence.key, divergence.field])).toEqual([["meta:high_water", "high-water"]]);
+    expect(found[0]).toMatchObject({ fileVersion: fileHighWater, sqliteVersion: 0 });
+    expect(meta("high_water")).toBe(fileHighWater);
+    expect(await projector.verify()).toEqual([]);
+    await expectInStep(root);
+  });
+
   it("publishes a same-version value or metadata repair as a commit that stamp and change-feed readers see", async () => {
     const root = tempRoot("repair-commit");
     const file = new MeshStore(root, 64 * 1024, 1_000);

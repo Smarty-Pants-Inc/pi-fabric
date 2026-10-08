@@ -67,6 +67,14 @@ export const STATE_PROJECTOR_STATUS_FILE = "state-projector.status.json";
 /** Where the projector's state.db lives by default: shadow projects beside the root, sqlite maintains the root's. */
 export const projectorDatabaseRoot = (root: string, mode: StateProjectorMode = "shadow"): string =>
   mode === "sqlite" ? path.resolve(root) : path.join(path.resolve(root), "state-projector");
+
+/** Same directory, through symlinks where both exist. */
+const sameDirectory = (left: string, right: string): boolean => {
+  const real = (directory: string): string => {
+    try { return fs.realpathSync.native(directory); } catch { return path.resolve(directory); }
+  };
+  return path.resolve(left) === path.resolve(right) || real(left) === real(right);
+};
 const LEASE_META = "projector.lease";
 const PROGRESS_META = "projector.progress";
 const STATE_FILE = "state.json";
@@ -89,13 +97,17 @@ export type StateProjectorResyncReason = "initial" | "gap" | "rewrite" | "diverg
 
 /** A divergence with the field that differs and both revisions (undefined: absent on that side). */
 export interface ProjectorDivergence extends StateDivergence {
-  field: "presence" | "version" | "value" | "updatedAt" | "updatedBy" | "tombstone" | "tombstone-order";
+  /** bytes: a row's stored bytes; state-bytes: meta.state_bytes; high-water: meta.high_water below the file's. */
+  field: "presence" | "version" | "value" | "updatedAt" | "updatedBy" | "tombstone" | "tombstone-order" | "bytes" | "state-bytes" | "high-water";
   fileVersion: number | undefined;
   sqliteVersion: number | undefined;
   /** tombstone-order: the key's position in the file's tombstoneOrder and in SQLite (by ord, then key), and its ord. */
   filePosition?: number | undefined;
   sqlitePosition?: number | undefined;
   sqliteOrd?: number | undefined;
+  /** bytes, state-bytes: the accounting derived from the values, and what SQLite stores. */
+  fileBytes?: number | undefined;
+  sqliteBytes?: number | undefined;
 }
 
 export interface StateProjectorLag {
@@ -267,7 +279,7 @@ const encode = (entry: MeshStateEntry): Row => {
 
 const sameRow = (row: SqliteRow | undefined, next: Row): boolean => row !== undefined &&
   String(row.value) === next.value && Number(row.version) === next.version &&
-  Number(row.updated_at) === next.updatedAt && String(row.updated_by) === next.updatedBy;
+  Number(row.updated_at) === next.updatedAt && String(row.updated_by) === next.updatedBy && Number(row.bytes) === next.bytes;
 
 /** The tombstone delta of read-journal.ts: keep the base order minus remove, then append. */
 const applyTombstonePatch = (base: readonly string[], patch: unknown): string[] | undefined => {
@@ -534,6 +546,12 @@ export class StateProjector {
   /** Opens (and, when absent, creates) the database and a projector connection. Does not start the loop. */
   static async open(options: StateProjectorOptions): Promise<StateProjector> {
     const databaseRoot = path.resolve(options.databaseRoot ?? projectorDatabaseRoot(options.root, options.mode));
+    // The shadow database never claims backend authority (pi-fabric#631): it carries backend=sqlite,
+    // and <root>/state.db is exactly what the L4b fence reads as the cutover flag.
+    if ((options.mode ?? "shadow") === "shadow" && sameDirectory(databaseRoot, options.root)) {
+      throw new Error(`Fabric mesh state projector: a shadow database must not live in the mesh root (${databaseRoot}); `
+        + "<root>/state.db is the backend flag, and a shadow copy there would fence every file-mode writer");
+    }
     // The L1 store creates the schema and WAL mode and refuses a non-local filesystem (R16) or a
     // retired database; the projector checkpoints through it (R10) and never writes through it.
     const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, {
@@ -1037,6 +1055,8 @@ export class StateProjector {
     let rows: SqliteRow[];
     let tombs: SqliteRow[];
     let ordMark: number;
+    let stateBytes: number;
+    let highWater: number;
     let progress: Progress;
     this.#db.exec("BEGIN");
     try {
@@ -1044,6 +1064,8 @@ export class StateProjector {
       rows = this.#sql.kvAll.all();
       tombs = this.#sql.tombAll.all();
       ordMark = Number(this.#sql.metaGet.get("tombstone_ord")?.value ?? 0);
+      stateBytes = Number(this.#sql.metaGet.get("state_bytes")?.value ?? 0);
+      highWater = Number(this.#sql.metaGet.get("high_water")?.value ?? 0);
     } finally { try { this.#db.exec("COMMIT"); } catch { try { this.#db.exec("ROLLBACK"); } catch { /* ended */ } } }
     // Only at the projected generation: anything newer is lag, not divergence.
     if (snapshot.identity !== progress.identity) return [];
@@ -1063,8 +1085,10 @@ export class StateProjector {
         : file.version !== stored.version ? "version"
           : JSON.stringify(file.value) !== JSON.stringify(stored.value) ? "value"
             : JSON.stringify(file.updatedBy) !== JSON.stringify(stored.updatedBy) ? "updatedBy"
-              : file.updatedAt !== stored.updatedAt ? "updatedAt" : undefined;
-      if (field) differences.push({ key, field, file: side(file), sqlite: side(stored), fileVersion: file?.version, sqliteVersion: stored?.version });
+              : file.updatedAt !== stored.updatedAt ? "updatedAt"
+                : Number(row!.bytes) !== entryBytes(key, String(row!.value), String(row!.updated_by)) ? "bytes" : undefined;
+      if (field) differences.push({ key, field, file: side(file), sqlite: side(stored), fileVersion: file?.version, sqliteVersion: stored?.version,
+        ...(field === "bytes" ? { fileBytes: entryBytes(key, String(row!.value), String(row!.updated_by)), sqliteBytes: Number(row!.bytes) } : {}) });
     }
     // Tombstones are an ordered list (the eviction order), not a map: compare each key's version,
     // then the order of the keys both sides hold position by position (SQLite by ord, then key),
@@ -1085,6 +1109,18 @@ export class StateProjector {
       differences.push({ key: tomb.key, field: "tombstone-order", file: undefined, sqlite: undefined,
         fileVersion: fileTombs.get(tomb.key), sqliteVersion: tomb.version,
         filePosition: filePositions.get(tomb.key), sqlitePosition: tomb.index, sqliteOrd: tomb.ord });
+    }
+    // The capacity accounting (state-sqlite.ts: rows by entryBytes, tombstones by 2 * key + 32) and
+    // the revision clock, which must never lie below the file's: cutover would reuse versions.
+    const derivedBytes = [...snapshot.entries.values()].reduce((sum, entry) => sum + encode(entry).bytes, 0) +
+      snapshot.tombstones.reduce((sum, [key]) => sum + 2 * utf8(key) + 32, 0);
+    if (stateBytes !== derivedBytes) {
+      differences.push({ key: "meta:state_bytes", field: "state-bytes", file: undefined, sqlite: undefined,
+        fileVersion: undefined, sqliteVersion: undefined, fileBytes: derivedBytes, sqliteBytes: stateBytes });
+    }
+    if (highWater < snapshot.highWater) {
+      differences.push({ key: "meta:high_water", field: "high-water", file: undefined, sqlite: undefined,
+        fileVersion: snapshot.highWater, sqliteVersion: highWater });
     }
     if (differences.length > 0) {
       this.#stats.divergences += differences.length;

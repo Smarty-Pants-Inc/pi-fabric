@@ -267,6 +267,64 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect((await other.publish({ topic: "mesh.fsync", from, text: "next" })).sequence).toBe(10_001);
   });
 
+  // pi-fabric#649 review round 4: `fs.writeSync` may return a short count. The stage gets every
+  // byte, or it is abandoned and the old log is left in place.
+  const stageWrites = (shortWrite: (write: (...args: unknown[]) => number, args: unknown[]) => number) => {
+    const write = fs.writeSync.bind(fs) as (...args: unknown[]) => number;
+    let short = 0;
+    vi.spyOn(fs, "writeSync").mockImplementation(((...args: unknown[]) => {
+      if (!fdPath(args[0] as number).endsWith(".compacting")) return write(...args);
+      short++;
+      return shortWrite(write, args);
+    }) as typeof fs.writeSync);
+    return () => short;
+  };
+
+  it("compaction: a short stage write is completed; every retained event is staged and compacted", async () => {
+    const mesh = compacting();
+    // Each stage write takes at most half the remaining bytes (and at least one).
+    const shortWrites = stageWrites((write, [fd, buffer, offset, length]) =>
+      write(fd, buffer, offset, Math.max(1, Math.floor((length as number) / 2))));
+    const published = [];
+    for (let index = 0; index < 30; index++) published.push(await mesh.publish({ topic: "mesh.fsync", from, text: `event ${index} ${"x".repeat(120)}` }));
+    expect(shortWrites()).toBeGreaterThan(1);
+    expect(generationOf(mesh.root)).not.toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(2800);
+    // Complete JSON lines, a contiguous suffix of what was published, ending at the last publish.
+    const lines = fs.readFileSync(events(mesh.root), "utf8").trimEnd().split("\n");
+    const ids = lines.map(line => (JSON.parse(line) as { id: string }).id);
+    const all = published.map(event => event.id);
+    expect(ids.length).toBeGreaterThan(1);
+    expect(ids).toEqual(all.slice(all.length - ids.length));
+    expect(fs.readdirSync(mesh.root).filter(name => name.endsWith(".compacting"))).toEqual([]);
+  });
+
+  it.each([
+    ["makes no progress", (() => 0) as Parameters<typeof stageWrites>[0], "short write"],
+    ["reports bytes it never wrote", ((write, [fd, buffer, offset, length]) => {
+      write(fd, buffer, offset, Math.max(1, Math.floor((length as number) / 2)));
+      return length as number;
+    }) as Parameters<typeof stageWrites>[0], "compaction stage holds"],
+  ])("compaction: a stage write that %s abandons the stage; the old log keeps every event", async (_, shortWrite, reason) => {
+    const mesh = compacting();
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    const shortWrites = stageWrites(shortWrite);
+    const published = [];
+    for (let index = 0; index < 30; index++) published.push(await mesh.publish({ topic: "mesh.fsync", from, text: `event ${index} ${"x".repeat(120)}` }));
+    expect(shortWrites()).toBeGreaterThan(0);
+    // Never renamed: no generation advance, the live log still holds every publish in order.
+    expect(generationOf(mesh.root)).toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeGreaterThan(2800);
+    expect(mesh.read({ limit: 100 }).map(event => event.id)).toEqual(published.map(event => event.id));
+    expect(fs.readdirSync(mesh.root).filter(name => name.endsWith(".compacting"))).toEqual([]);
+    expect(warn.mock.calls.some(([message]) => String(message).includes("compaction deferred") && String(message).includes(reason))).toBe(true);
+    // Writes whole again: the next trigger compacts.
+    vi.restoreAllMocks();
+    const last = await mesh.publish({ topic: "mesh.fsync", from, text: "next" });
+    expect(generationOf(mesh.root)).not.toBe("0");
+    expect(mesh.read({ limit: 100 }).at(-1)).toEqual(last);
+  });
+
   it("compaction: a concurrent repair truncating a torn tail during staging restarts the snapshot; a later append is not folded mid-line", async () => {
     const mesh = compacting();
     const file = events(mesh.root);

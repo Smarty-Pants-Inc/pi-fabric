@@ -115,6 +115,16 @@ const compactions = new Set<string>();
 const COMPACTION_ROUNDS = 8;
 const COMPACTION_STAGE = /^events\.jsonl\.(\d+)\.[0-9a-f-]{36}\.compacting$/;
 
+/** Write every byte of `bytes` at the descriptor's position: `fs.writeSync` may return a short
+ * count. A write that makes no progress throws, so a caller never commits a short file. */
+function writeAllSync(descriptor: number, bytes: Uint8Array): void {
+  for (let offset = 0; offset < bytes.length;) {
+    const written = fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+    if (!(written > 0)) throw new Error(`Fabric mesh short write: ${offset} of ${bytes.length} bytes`);
+    offset += written;
+  }
+}
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -1138,7 +1148,7 @@ export class EventLog {
     } finally { fs.closeSync(source); }
     bytes = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1);
     if (!bytes.length) return 0;
-    fs.writeSync(stage, bytes);
+    writeAllSync(stage, bytes);
     fs.fsyncSync(stage);
     return bytes.length;
   }
@@ -1234,14 +1244,23 @@ export class EventLog {
       const { dev, ino } = snapshot;
       stagePath = `${file}.${process.pid}.${randomUUID()}.compacting`;
       stage = fs.openSync(stagePath, "wx", 0o600);
-      fs.writeSync(stage, retained);
+      writeAllSync(stage, retained);
       fs.fsyncSync(stage);
+      // Bytes the stage must hold: every write is checked against its file before the rename.
+      let stageLength = retained.length;
       const sameInode = (stat: fs.Stats | undefined): stat is fs.Stats =>
         stat !== undefined && stat.dev === dev && stat.ino === ino && stat.size >= staged;
       for (let round = 0; round < COMPACTION_ROUNDS; round++) {
         const before = this.#liveStat();
         if (!sameInode(before)) return; // Overtaken: another writer rewrote the log.
-        staged += this.#foldIntoStage(stage, ino, staged, before.size);
+        const folded = this.#foldIntoStage(stage, ino, staged, before.size);
+        staged += folded;
+        stageLength += folded;
+        // An incomplete stage is never committed: abandon it and leave the old log (the
+        // finally removes the stage). fstat only, no fsync.
+        if (fs.fstatSync(stage).size !== stageLength) {
+          throw new Error(`compaction stage holds ${fs.fstatSync(stage).size} of ${stageLength} bytes`);
+        }
         const final = round === COMPACTION_ROUNDS - 1;
         const outcome = await this.#lock.withLock((): "done" | "stop" | "behind" => {
           const stat = this.#liveStat();

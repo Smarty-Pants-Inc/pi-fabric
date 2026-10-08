@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
@@ -120,6 +120,36 @@ export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
+
+/**
+ * Removes a host's file lease only when `owned` accepts it (smarty-dev#6477 L2b owner review): a
+ * lease another owner wrote (a replacement that wrote its file before its state record) is kept.
+ * An absent, unreadable or invalid file is never removed. The file is renamed aside before the
+ * final check, so the lease judged is the lease removed; a lease that changed owner in between is
+ * linked back, unless a newer lease already took the name (the newer one wins). Returns whether
+ * a lease was removed.
+ */
+export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (lease: FabricHostLease) => boolean): boolean => {
+  const current = readHostLeaseCurrent(meshRoot, hostId);
+  if (!current || !owned(current)) return false;
+  const file = hostLeasePath(meshRoot, hostId);
+  // Not a .json name: lease scans never read the aside copy.
+  const aside = path.join(path.dirname(file), `.unlease-${randomUUID()}.tmp`);
+  try {
+    fs.renameSync(file, aside);
+  } catch {
+    return false; // Gone already, or busy (Windows): keep; an unremoved mirror lease lapses.
+  }
+  try {
+    let taken: FabricHostLease | undefined;
+    try { taken = leaseOf(fs.readFileSync(aside, "utf8"), fileName(hostId)); } catch { taken = undefined; }
+    if (taken && owned(taken)) return true;
+    try { fs.linkSync(aside, file); } catch { /* EEXIST: a newer lease holds the name */ }
+    return false;
+  } finally {
+    fs.rmSync(aside, { force: true });
+  }
+};
 
 // A file that could not be read gives no answer to cache (`read: false`): the next lookup reads it
 // again. Only a file that was read, valid or not, is cached by its filesystem identity.

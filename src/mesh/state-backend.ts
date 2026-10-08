@@ -207,6 +207,15 @@ export interface StateBackend {
   writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]>;
   /** Acquires and releases the state write lock (no write): evidence the state is writable now. */
   confirmWritable(onAcquired?: (at: number) => void): Promise<void>;
+  /**
+   * The R20 write fence (smarty-dev#6477 L2b): runs `operation` synchronously while no state commit
+   * can happen, and writes nothing. Called with `.lock` held (an event append that must commit on
+   * the ownership it read), so it never waits asynchronously. file and shadow: a passthrough, since
+   * every state.json writer takes `.lock`, which the caller holds. sqlite: one `BEGIN IMMEDIATE`
+   * attempt, `operation` on that snapshot, ROLLBACK; a busy write lock throws `MeshStateBusyError`
+   * before `operation` runs (nothing happened: retry after releasing `.lock`).
+   */
+  withWriteFence<T>(operation: () => T): T;
 
   /** Drops parsed caches (called after a failed operation under the mesh lock). */
   dropCache(): void;
@@ -472,6 +481,18 @@ export class SqliteStateBackend implements StateBackend {
     await this.#write((store) => store.confirmWritable(onAcquired));
   }
 
+  withWriteFence<T>(operation: () => T): T {
+    const store = this.#open();
+    let entered = false;
+    try {
+      return store.fenceSync(() => { entered = true; return operation(); });
+    } catch (error) {
+      if (entered || !(error instanceof MeshLockTimeoutError) || error instanceof MeshStateBusyError) throw error;
+      this.#busyTimeouts += 1;
+      throw new MeshStateBusyError(store.file, 0, error);
+    }
+  }
+
   dropCache(): void {
     this.#snapshot = undefined;
   }
@@ -731,6 +752,10 @@ export class ShadowStateBackend implements StateBackend {
   }
 
   confirmWritable(onAcquired?: (at: number) => void): Promise<void> { return this.#file.confirmWritable(onAcquired); }
+
+  // state.json is the authority and its writers take `.lock`; the shadow database is never read
+  // for a decision, so fencing it would only add busy refusals.
+  withWriteFence<T>(operation: () => T): T { return this.#file.withWriteFence(operation); }
 
   dropCache(): void { this.#file.dropCache(); }
 

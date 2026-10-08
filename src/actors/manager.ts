@@ -61,6 +61,7 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership } from "../topology/publication-generation.js";
+import { withStateFence } from "../mesh/commit-outbox.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -4500,7 +4501,9 @@ export class ActorManager {
       // smarty-dev#6829: observe only the ownership inputs of this manager's actors (their
       // participant records, owner host leases/records, lineage closures) BEFORE deciding,
       // not the fleet-wide directory stamps every heartbeat anywhere on the mesh changes.
-      const ownership = observeActorOwnership(this.mesh.root, [...this.#actors.keys(), ...removedIds], () => {
+      // pi-fabric#640: pass the store, not its root, so the shared-state stamp is the ACTIVE
+      // backend's revision (SQLite commits never touch state.json); reads go through the store.
+      const ownership = observeActorOwnership(this.mesh, [...this.#actors.keys(), ...removedIds], () => {
         const snapshot = this.mesh.stateToken({ fresh: true });
         return key => this.mesh.get(key, { snapshot });
       });
@@ -5406,10 +5409,11 @@ export class ActorManager {
         // #535's order and zero-wait mesh acquisition are unchanged. Generation
         // validation fences the prepared merge; fresh death/owner checks remain
         // under mesh custody and no selected snapshot crosses a retry wait.
-        // Deliberately the mesh lock, not file custody (smarty-dev#6477 L5): the
-        // lineage death proof is shared state, and holding the mesh lock is what
-        // serializes this claim with resumeLineage()'s state delete.
-        adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
+        // Deliberately the state lock, not file custody (smarty-dev#6477 L5): the
+        // lineage death proof is shared state, and holding the state write lock is what
+        // serializes this claim with resumeLineage()'s state delete. A state fence that
+        // writes nothing; the registry commit inside it is the R11 exception (plan, A1 X15).
+        adopted = await ActorRegistryStore.withLocks([this.#registry], () => withStateFence(this.mesh, this.identity, () =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
             if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
             if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;

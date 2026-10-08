@@ -17,6 +17,7 @@ import type {
 
 import { reapDeadHostRecords } from "./host-reaper.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
+import { withStateFence } from "../mesh/commit-outbox.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
@@ -1196,6 +1197,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (expiresAt >= now) return true;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
       participant.status === "stopping" || participant.status === "reloading") return false;
+    // A direct `.lock` observer (smarty-dev#6477 A1 section 4): a heartbeat writer shows there on
+    // the `file` backend only. With state in SQLite this reads the state write-lock signal (L2a).
     const lockWaiting = options.lockWaiting ?? (() => fs.existsSync(path.join(this.mesh.root, ".lock")));
     // A replaced lease file newer than the stored ownership record also explains a cached lapse.
     const advanced = matching && snapshot!.mtimeMs > owner.updatedAt;
@@ -1352,14 +1355,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
       : `participant directory view is overdue (${now - confirmed} ms old)`;
   }
 
-  /** Revalidate once under the ordinary mesh lock, without waiting for a long heartbeat write.
-   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease. */
+  /** Revalidate once under the state write lock, without waiting for a long heartbeat write.
+   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease.
+   * A state operation, not exclusive(): the backend picks the lock (smarty-dev#6477 R3). */
   async refreshRoutingView(): Promise<void> {
     if (this.#closed) throw new Error("participant directory is closed");
     if (!this.options.enabled) return;
     this.#routingReadAt = 0;
     try {
-      await this.mesh.exclusive(() => {
+      await withStateFence(this.mesh, this.options.identity, () => {
         // MeshStore reads are intentionally tolerant for dashboards. Routing absence is
         // stronger: a damaged canonical state must never be confirmed as an empty view.
         assertMeshStateReadable(this.mesh.root);

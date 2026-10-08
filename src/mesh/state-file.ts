@@ -1318,3 +1318,7 @@ export class StateFile {
     }
   }
 }
+
+// smarty-dev#6477 L4b: the backend migration tool (backend-migration.ts) imports and exports
+// state.json through this exact decoder and encoder.
+export { readState as decodeMeshStateFile, encodeState as encodeMeshStateFile, type MeshStateFile };

@@ -1465,83 +1465,80 @@ describe("ParticipantDirectory", () => {
       expect(writes).not.toHaveBeenCalled();
     });
 
-    it("defers change refreshes during a lock outage and preserves backoff until real heartbeat recovery", async () => {
-      vi.useFakeTimers();
-      // Exercise near-ceiling full-jitter draws: the fixed 200 ms tick below
-      // must not consume the second outage's doubled backoff before checking it.
-      vi.spyOn(Math, "random").mockReturnValue(0.999999);
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
-      roots.push(root);
+    it("does not add sub-heartbeat retries to an idle Main with a safe remaining lease", async () => {
+      vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-outage-")); roots.push(root);
+      const identity: MeshIdentity = { id: "session:idle", name: "main", kind: "main", sessionId: "idle" };
+      const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 100, { lockTimeoutMs: 40 });
+      const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id,
+        rootId: identity.id, identity, reapDeadHosts: false });
+      directory.registerSource(() => [rootRecord(identity.id, identity.id, "idle")]); directories.push(directory);
+      const lockPath = path.join(mesh.root, ".lock");
+      try {
+        await directory.start(); const confirmed = directory.confirmedAt();
+        const attempts = vi.spyOn(mesh, "confirmWritable");
+        fs.mkdirSync(lockPath, { mode: 0o700 });
+        fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+        await vi.advanceTimersByTimeAsync(60_100);
+        expect(attempts.mock.calls.length).toBeGreaterThan(0);
+        expect(attempts.mock.calls.length).toBeLessThanOrEqual(12);
+        expect(directory.confirmedAt()).toBe(confirmed); expect(directory.canConsumeMesh()).toBe(false);
+      } finally {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        await directory.close(); vi.restoreAllMocks(); vi.useRealTimers();
+      }
+    });
+
+    it("coalesces changes into one off-heartbeat outage recovery and resets only on a real commit", async () => {
+      vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.999999);
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-")); roots.push(root);
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
       const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
-      const directory = new ParticipantDirectory(mesh, {
-        enabled: true, hostId: identity.id, rootId: identity.id, identity,
-        heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false,
-      });
-      directory.registerSource(source);
-      directories.push(directory);
+      const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+        identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+      directory.registerSource(source); directories.push(directory);
       const intervals = vi.spyOn(globalThis, "setInterval");
       const lockPath = path.join(mesh.root, ".lock");
+      const hold = () => {
+        fs.mkdirSync(lockPath, { mode: 0o700 });
+        fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+      };
       try {
         await directory.start();
-        // Drive the real heartbeat callback without incidental ticks during backoff.
         const heartbeat = intervals.mock.calls[0]![0] as () => void;
         const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
         const confirmations = vi.spyOn(mesh, "confirmWritable");
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-        const tick = async () => {
-          heartbeat();
-          const result = runs.mock.results.at(-1)!.value;
-          await vi.advanceTimersByTimeAsync(200); // acquisition times out after 100 ms
-          return await result;
-        };
-        const hold = () => {
-          fs.mkdirSync(lockPath, { mode: 0o700 });
-          fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
-        };
-        hold();
-        const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
-        expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce();
-        expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
+        hold(); const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
+        heartbeat(); const first = runs.mock.results.at(-1)!.value;
+        await vi.advanceTimersByTimeAsync(200); expect(await first).toBe("retry");
         const retry = runs.mock.contexts.at(-1) as MeshBackgroundRetry;
         const recovered = vi.spyOn(retry, "success");
-        await vi.advanceTimersByTimeAsync(retry.waitMs);
-
-        const readsBefore = source.mock.calls.length, attemptsBefore = runs.mock.calls.length;
-        directory.scheduleRefresh();
+        const readsBefore = source.mock.calls.length, attemptsBefore = confirmations.mock.calls.length;
+        for (let change = 0; change < 40; change++) {
+          directory.scheduleRefresh(); await directory.refreshPresence(); directory.canConsumeMesh();
+        }
         await Promise.resolve();
-        // #4383: even an unchanged change refresh must not re-read the fleet or
-        // become an extra retry. Pending changes ride the next heartbeat.
-        expect(runs.mock.calls.length).toBe(attemptsBefore);
         expect(source.mock.calls.length).toBe(readsBefore);
-        expect(confirmations).toHaveBeenCalledOnce();
-        expect(recovered).not.toHaveBeenCalled();
-        expect(directory.writeStalled()).toBeDefined();
+        expect(confirmations.mock.calls.length).toBe(attemptsBefore);
+        expect(recovered).not.toHaveBeenCalled(); expect(directory.writeStalled()).toBeDefined();
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(confirmations.mock.calls.length).toBeGreaterThan(attemptsBefore);
+        expect(warn).toHaveBeenCalledOnce(); expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
-
-        expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
-        expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
-        heartbeat();
-        expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(confirmations).toHaveBeenCalledTimes(2);
-
+        // A 60 s heartbeat must recover within the retry cap, not after lease lapse.
         fs.rmSync(lockPath, { recursive: true, force: true });
-        await vi.advanceTimersByTimeAsync(retry.waitMs);
-        expect(await tick()).toBe("done"); // a real lock acquisition confirms recovery
-        expect(directory.writeStalled()).toBeUndefined();
-        expect(recovered).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(7_100);
+        expect(directory.writeStalled()).toBeUndefined(); expect(recovered).toHaveBeenCalledOnce();
         expect(retry.waitMs).toBe(0);
-        hold();
-        expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+        hold(); heartbeat(); const later = runs.mock.results.at(-1)!.value;
+        await vi.advanceTimersByTimeAsync(200); expect(await later).toBe("retry");
+        expect(warn).toHaveBeenCalledTimes(2);
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
-        await directory.close();
-        vi.restoreAllMocks();
-        vi.useRealTimers();
+        await directory.close(); vi.restoreAllMocks(); vi.useRealTimers();
       }
     });
 

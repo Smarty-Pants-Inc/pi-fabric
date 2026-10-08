@@ -603,16 +603,30 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
+/** Nominal initial full-jitter window for background lock outages (smarty-dev#7176). */
+export const MESH_BACKGROUND_RETRY_BASE_MS = 250;
+/** A cap is not a lease budget: renewal callers must also supply their actual expiry. */
+export const MESH_BACKGROUND_RETRY_CAP_MS = 7_000;
+
+export interface MeshBackgroundLease {
+  /** Last successful renewal's absolute expiry; undefined before admission. */
+  expiresAt: () => number | undefined;
+  /** Include the caller's polling quantum when it does not schedule an exact retry timer. */
+  marginMs?: number;
+}
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
-  #delay = 0;
+  #failures = 0;
   #retryAt = 0;
   #reported = false;
   #running = false;
-  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000) {}
+  #leaseMarginRetry: number | undefined;
+  constructor(readonly label: string, readonly minMs = MESH_BACKGROUND_RETRY_BASE_MS,
+    readonly maxMs = MESH_BACKGROUND_RETRY_CAP_MS, readonly lease?: MeshBackgroundLease) {}
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
+  success(): void { this.#failures = 0; this.#retryAt = 0; this.#reported = false; this.#leaseMarginRetry = undefined; }
   failure(error: unknown): boolean {
     const transient = isMeshLockTimeout(error);
     if (!transient) {
@@ -622,11 +636,29 @@ export class MeshBackgroundRetry {
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
-    // Keep the exponential ceiling separate from the randomized draw. Timers
-    // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
-    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
-    this.#retryAt = Date.now() + delayMs;
+    // Keep the exponential window separate from the draw: full jitter samples the entire
+    // [0, min(cap, base * 2^n)) range. A 1 ms timer floor prevents a zero-draw spin.
+    const cap = Math.max(1, Math.min(this.maxMs, MESH_BACKGROUND_RETRY_CAP_MS));
+    const base = Math.max(1, Math.min(this.minMs, cap));
+    const now = Date.now();
+    this.#failures = Math.min(31, this.#failures + 1);
+    let delayMs = Math.max(1, retryDelayMs(this.#failures - 1, base, cap));
+    const expiresAt = this.lease?.expiresAt();
+    if (expiresAt !== undefined && Number.isFinite(expiresAt) && expiresAt > now) {
+      const remaining = expiresAt - now - Math.max(0, this.lease?.marginMs ?? MESH_BACKGROUND_RETRY_BASE_MS);
+      // One deadline attempt per unchanged lease. If even that acquisition fails, the
+      // renewal budget is exhausted: do not turn the safety margin into a 1 ms hot loop.
+      if (remaining > 0) {
+        if (delayMs >= remaining) this.#leaseMarginRetry = expiresAt;
+        delayMs = Math.min(delayMs, remaining);
+      } else if (this.#leaseMarginRetry !== expiresAt) {
+        this.#leaseMarginRetry = expiresAt;
+        delayMs = 1;
+      }
+    }
+    // An already lapsed lease cannot be saved by zero-delay retries. Keep ordinary backoff
+    // until a fresh acquisition restores it; this never manufactures a renewal receipt.
+    this.#retryAt = now + delayMs;
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
@@ -663,7 +695,7 @@ export class MeshBackgroundQueue {
   #draining: Promise<void> | undefined;
   #closed = false;
   #failed = false;
-  constructor(label: string, minMs = 100, maxMs = 5_000) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
+  constructor(label: string, minMs = MESH_BACKGROUND_RETRY_BASE_MS, maxMs = MESH_BACKGROUND_RETRY_CAP_MS) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
 
   enqueue(operation: () => unknown | Promise<unknown>): Promise<void> {
     if (this.#closed) return Promise.resolve();

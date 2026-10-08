@@ -13,7 +13,7 @@ describe("background mesh retry boundary", () => {
     const retry = new MeshBackgroundRetry("poll", 100, 400);
     const operation = vi.fn(async () => { throw busy(); });
     expect(await retry.run(operation)).toBe("retry");
-    expect(retry.waitMs).toBe(50);
+    expect(retry.waitMs).toBe(50);                           // first full-jitter window: [0, 100)
     expect(await retry.run(operation)).toBe("skipped");
     expect(operation).toHaveBeenCalledTimes(1);
     for (const wait of [50, 100, 200, 200]) {
@@ -31,13 +31,14 @@ describe("background mesh retry boundary", () => {
     expect(warn).toHaveBeenCalledTimes(2);
   });
 
-  it("randomizes within each ceiling independently and yields even on a zero draw", async () => {
+  it("samples the whole exponential window with a 1 ms timer floor on zero", async () => {
     vi.useFakeTimers(); vi.spyOn(console, "warn").mockImplementation(() => {});
     const random = vi.spyOn(Math, "random");
     const retry = new MeshBackgroundRetry("poll", 100, 400);
     for (const [draw, ceiling, expected] of [[0, 100, 1], [0.75, 200, 150], [0.25, 400, 100], [0.999, 400, 399]]) {
       random.mockReturnValue(draw!); retry.failure(busy());
       expect(retry.waitMs).toBe(expected); expect(retry.waitMs).toBeLessThan(ceiling!);
+      expect(retry.waitMs).toBeGreaterThanOrEqual(1);
       await vi.advanceTimersByTimeAsync(expected!);
     }
     retry.success(); random.mockReturnValue(0.75); retry.failure(busy()); expect(retry.waitMs).toBe(75);
@@ -63,10 +64,10 @@ describe("background mesh retry boundary", () => {
     await queue.enqueue(first); // first failed attempt, not an infinite lock wait
     await queue.enqueue(() => written.push(2)); // admitted during outage without waiting
     expect(written).toEqual([]);
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(250);
     expect(first).toHaveBeenCalledTimes(2);
     locked = false;
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(500);
     expect(written).toEqual([1, 2]);
     await queue.close();
     expect(vi.getTimerCount()).toBe(0);
@@ -91,7 +92,7 @@ describe("background mesh retry boundary", () => {
     await queue.enqueue(publish);
     await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
     locked = false;
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(250);
     await expect(queue.checkpointForRelease()).resolves.toBeUndefined();
     expect(publish).toHaveBeenCalledTimes(2);
     await queue.close();

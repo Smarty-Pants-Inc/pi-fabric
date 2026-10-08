@@ -85,6 +85,46 @@ complete load minutes. It also counts `FABRIC_MESH_LOCK_TIMEOUT` rejections of f
 `MeshStore` entry points (bounded tries separately, as L8 does), and wraps the reload target's
 `MeshStore` too. The `.lock` presence sampler is reported as a cross-check.
 
+## Release gate (relative to a reference run)
+
+At fleet load the baseline fails the absolute checks against itself (see Calibration), so the
+release gate judges a candidate against a **reference report**: the baseline release against
+itself, same harness SHA, same host, same profile. Pass it with `--reference`:
+
+```sh
+scripts/shadow-load/run.sh <candidate-release> <baseline-release> 15 --out <dir> --reference <reference-report.json>
+node scripts/shadow-load/gate.mjs --report <dir>/report.json --reference <reference-report.json> [--out DIR] [--json]   # re-judge a finished run
+```
+
+With `--reference` the exit code and the report's headline follow the gate below (the absolute
+checks stay in the report as information). Every report embeds the figures the gate needs under
+`metrics`, so a lone report.json is a valid reference. Lock figures come from the instrument
+(every process, both releases) so a candidate with L8 lock stats and a baseline without them are
+measured the same way; L8's own figures are shown next to them. `--lock-stats 0|1` sets
+`PI_FABRIC_LOCK_STATS` for every child (default 1, as before); only releases with L8 read it.
+
+| gate | absolute | relative (candidate vs reference) |
+|---|---|---|
+| (a) leases and directory | no unexpected exit; before the pin change no lease over 15 s and no directory miss | reload window (pin change to end): max lease age <= ref x 1.25 + 60 s, lapsed participants <= ref x 1.25 + 5; after the bridge restart: participants missed <= ref + 3 |
+| (b) mesh lock | - | busy <= ref + 5 points; timeouts/min <= ref x 1.25 + 5 |
+| (c) canary | check 3 passes every round | checks 4 and 5: pass rate >= (ref passes - 3) / ref rounds |
+| (d) participant count | - | max drift <= ref + 10 points; before the pin, drift <= ref + 10 points |
+| (e) lock wait p99 | <= 10 s (the lock budget) | at most one histogram bucket above ref |
+| (f) self-reloads, memory | every autoReload Main reloaded without error; PSS <= budget | - |
+
+Each gate prints PASS/FAIL with its parts and numbers, then OVERALL. Margins are flags
+(`--gate-busy-points`, `--gate-timeouts-slack`, ...; gate.mjs also takes them without `gate-`).
+
+**Margins come from measured noise.** Two runs of 04930dfd against itself (c3, R0; fleet profile,
+15 min, epyc1) differed by: busy 0.2 points (21.0 / 20.8%), timeouts 0.5/min (30.6 / 31.1),
+wait p99 0 buckets (<= 10 s both), max drift 0 points (63.7%), reload-window lapsed participants
+2 (27 / 29), max lease age 47 s (130 / 177 s), canary check 4 0 rounds (7/9 both), check 5 3
+rounds (4/9 / 1/9). Each margin covers at least twice that difference and is never tighter than
+the fs-shcal proposal. Check 5 is lock-bound and noisy (it fails in most baseline rounds), so it
+barely gates; the absolute 2% pre-pin count bound was dropped because the baseline already swings
+45% before the pin (spoke mirrors 124 to 248). Two runs are a small sample: widen a margin if a
+re-run of the baseline fails it.
+
 ## Calibration
 
 Target (smarty-dev#6477 stage 1): release 04930dfd against itself over 15 min should show Ryzen 1's
@@ -136,6 +176,7 @@ The fleet profile (`run.sh` default; `--profile legacy` restores the built-in de
 
 ## Files
 
-`run.sh` starts the burner and `orchestrate.mjs`, which runs the whole soak. The other scripts are
+`run.sh` starts the burner and `orchestrate.mjs`, which runs the whole soak. `gate.mjs` holds the
+release gate (used by orchestrate.mjs with `--reference`, and runnable on finished reports). The other scripts are
 its child processes: `seed.mjs`, `mains.mjs`, `host.mjs`, `driver.mjs`, `observer.mjs`,
 `canary.mjs`, `burner.mjs` and `instrument.mjs`. `candidate.mjs` loads code from a release.

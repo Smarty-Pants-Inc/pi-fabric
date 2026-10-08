@@ -433,7 +433,7 @@ try {
   // With PI_FABRIC_LOCK_STATS=0 the stats CLI finds no records: the instrument is the source then.
   const hasL8 = Boolean(l8 && !l8.error && l8.n > 0);
   const lock = {
-    source: hasL8 ? 'L8 lock-stats (candidate)' : 'instrument (candidate predates L8 lock stats): owner-record wait, hold sum',
+    source: hasL8 ? 'L8 lock-stats (candidate)' : `instrument (${l8 && !l8.error ? 'candidate L8 lock stats off or empty' : 'candidate predates L8 lock stats'}): owner-record wait, hold sum`,
     busyPct: hasL8 ? Math.round(l8.busyPct * 10) / 10 : instrumented.busyPct ?? observed.lock?.busyPct ?? null,
     peakMinuteBusyPct: hasL8 ? Math.round(l8.peakMinuteBusyPct * 10) / 10 : instrumented.peakMinuteBusyPct ?? observed.lock?.peakMinuteBusyPct ?? null,
     timeouts: hasL8 ? l8.timeouts : instrumentTimeouts,

@@ -85,8 +85,9 @@ branch on ryzen5 (32 CPUs, shared and loaded, `nice -n 19`) with the default loa
 
 ## CI
 
-The `mesh-lock-bench` job of `.github/workflows/test.yml` (ubuntu-latest, Node 24, on every
-pull request and push to `main`) builds and runs the default load against the committed baseline:
+The `mesh-lock-bench` job of `.github/workflows/test.yml` (ubuntu-latest, Node 24; on pushes to `main`
+and on pull requests whose base matches the workflow's `pull_request.branches`: `main` and the
+`refactor/sd-6477-**` / `feat/sd-6477-**` stack branches) builds and runs the default load against the committed baseline:
 
 ```sh
 bun run build

@@ -109,7 +109,8 @@ change and the bridge restart to 90/95% of the run, so the window measures stead
 | r11 | state 10, actors 20 per host, late pin | 14.1 GB | 96% | 34% | 30.5% | <=3 s | 19 | a b c d |
 | r12 | actors 10, churn-s 40, pin 40% | 16.1 GB | 96% | 39% | 19.8% | <=7.5 s | 118.6 | a b c d e |
 | c1 | fleet profile with churn-s 120, 15 min | 16.7 GB | 96% | 42% | 20.2% (peak 28.3) | <=5 s | 45.3 | a b c d e |
-| c2 | fleet profile (churn-s 300), 15 min | __C2__ |
+| c2 | churn-s 300, 15 min | 16.4 GB | 95% | 38% | 27.7% (peak 39.1) | <=5 s | 18.0 | a b c d e |
+| c3 | fleet profile (churn-s 200), 15 min | 15.8 GB | 96% | 38% | 21.0% (peak 23.1) | <=10 s | 30.6 | a b c d e |
 
 What the runs show:
 
@@ -121,8 +122,9 @@ What the runs show:
   churn at 15 to 40 s per Main drops busy to about 20% while timeouts jump to 120 to 170/min. The
   lock's FIFO admission then idles the lock while CPU-starved queue heads (nice 19) come back,
   and most timeouts are queued waiters that never got an attempt ("after 0 attempts").
-- So 55 to 65% busy and 20 to 30 timeouts/min cannot be reached together here: the timeout rate
-  is the knob that can be matched (turn churn), lock busy stays near 20 to 30%. The fleet's busy
+- So 55 to 65% busy and 20 to 30 timeouts/min cannot be reached together here. Turn churn sets
+  the timeout rate: 300 s gives 18/min, 200 s gives 30.6/min (the profile), 120 s gives 45/min.
+  Lock busy stays near 20 to 30%. The fleet's busy
   figure needs re-checking against the instrument's definition (hold from owner record to
   release; the `.lock` presence sampler agrees within a few points) before it is used as a gate.
 - PSI: the fixed-duty burner (0.5 x 32 CPUs at nice 0) gives 34 to 48% PSI; the controller
@@ -130,7 +132,7 @@ What the runs show:
 
 The fleet profile (`run.sh` default; `--profile legacy` restores the built-in defaults):
 `--mains-per-process 4 --heap-mb 640 --mem-budget-mb 32768 --state-mb 10 --actor-save-s 10
---saves-in-flight 4 --churn-s 300 --burn-duty 0.5`.
+--saves-in-flight 4 --churn-s 200 --burn-duty 0.5`.
 
 ## Files
 

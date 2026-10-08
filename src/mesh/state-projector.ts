@@ -75,7 +75,8 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 export type StateProjectorMode = "shadow" | "sqlite";
 export type StateProjectorRole = "starting" | "active" | "standby" | "stopped";
 export type StateProjectorHaltReason = "foreign-write" | "foreign-database" | "retired";
-export type StateProjectorResyncReason = "initial" | "gap" | "rewrite" | "no-generation" | "divergence" | "manual";
+/** initial: first projection; gap: no verified journal chain; rewrite: same generation, new file. */
+export type StateProjectorResyncReason = "initial" | "gap" | "rewrite" | "divergence" | "manual";
 
 /** A divergence with the field that differs and both revisions (undefined: absent on that side). */
 export interface ProjectorDivergence extends StateDivergence {
@@ -801,7 +802,7 @@ export class StateProjector {
       const head = readHead(this.root);
       if (head.identity === progress.identity) return;
       if (!progress.generation || !head.generation || !head.hash) {
-        await this.#resync(progress.identity === null ? "initial" : "no-generation");
+        await this.#resync(progress.identity === null ? "initial" : "gap");
         return;
       }
       if (head.generation === progress.generation) {

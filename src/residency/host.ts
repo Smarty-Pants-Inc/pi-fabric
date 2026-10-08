@@ -806,6 +806,9 @@ export class ResidentHost {
           await this.#flushingDeliveries;
           await this.participants?.close().catch(() => undefined);
           await projectorStopped;
+          // The host owns its MeshStore: release the state database handle before the host fence,
+          // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
+          try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }
         }
       } finally { this.#releaseLock(); }
     }

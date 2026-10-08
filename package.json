@@ -41,7 +41,8 @@
     "mesh-bridge": "./bin/mesh-bridge",
     "fabric-releases": "./bin/fabric-releases",
     "fabric-actors": "./bin/fabric-actors",
-    "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats"
+    "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats",
+    "fabric-mesh-backend": "./bin/fabric-mesh-backend"
   },
   "files": [
     "bin/",

@@ -7,6 +7,7 @@ import path from "node:path";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, type MeshStateMovedMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
@@ -161,13 +162,15 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
+  let moved: MeshStateMovedMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    throw new Error("invalid state format");
+    if (!isMeshStateMovedMarker(parsed)) throw new Error("invalid state format");
+    moved = parsed;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
     // startup can tolerate damage, but mutations require a repaired snapshot.
@@ -177,6 +180,10 @@ const readState = (
     // Preserve the original bytes at this path as a barrier to clock reset.
     return emptyState();
   }
+  // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
+  // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
+  // refused before it stages anything; a reader does not report false absence).
+  throw meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit
@@ -886,11 +893,22 @@ export class StateFile implements StateBackend {
       serializedText: encoded.serialized.toString("utf8") };
   }
 
+  // The fence's fallback when state.json's bounded header does not carry backendEpoch: this store's decoder.
+  readonly #decodeFileEpoch = (file: string): number => {
+    const epoch = (readState(file, this.#maxStateBytes, false) as MeshStateFile & { backendEpoch?: unknown }).backendEpoch;
+    return epoch === undefined ? 0 : storageRevision(epoch);
+  };
+
   #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
     // this payload's hash. ctime is read after the rename (rename updates it).
+    // smarty-dev#6477 L4b (R1): under .lock and before the rename, for every write (put, delete,
+    // batch, tombstone compaction). After a cutover set backend=sqlite (or during a rollback export)
+    // state.json is not the authority: refuse with MeshBackendFenceError and leave it untouched.
+    // One stat of state.db when absent; nothing is cached across lock holds.
+    assertFileStateWritable(this.root, { maxStateBytes: this.#maxStateBytes, decodeFileEpoch: this.#decodeFileEpoch });
     let staged: number | undefined;
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;
@@ -1396,3 +1414,7 @@ export class StateFile implements StateBackend {
     }
   }
 }
+
+// smarty-dev#6477 L4b: the backend migration tool (backend-migration.ts) imports and exports
+// state.json through this exact decoder and encoder.
+export { readState as decodeMeshStateFile, encodeState as encodeMeshStateFile, type MeshStateFile };

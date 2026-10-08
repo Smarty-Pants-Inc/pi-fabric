@@ -174,8 +174,23 @@ export class MeshLock {
   // here or wrap resident async controls in this second/innermost lock.
   // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
-  async withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
+  withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
     bounded = false): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false);
+  }
+
+  /**
+   * Holds `.lock` until the asynchronous operation settles. Only for a dedicated migration process
+   * (the backend cutover holds it across its writer census, smarty-dev#6477 R1); never in a session,
+   * whose mesh critical sections stay synchronous.
+   */
+  withLockAcrossAwait<T>(operation: () => Promise<T>, lockTimeoutMs = this.#lockTimeoutMs,
+    lockClass: MeshLockClass = "other"): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true);
+  }
+
+  async #withLock<T>(operation: () => T | Promise<T>, lockTimeoutMs: number, lockClass: MeshLockClass,
+    bounded: boolean, acrossAwait: boolean): Promise<T> {
     const lockWaitStart = lockStats ? performance.now() : 0;
     let lockHeldAt = -1;
     let holdMs = -1;
@@ -299,7 +314,7 @@ export class MeshLock {
       if (lockStats) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();
-        return operation();
+        return acrossAwait ? await operation() : operation();
       } catch (error) {
         // A failed write (a version conflict above all) means this store's view is behind: the
         // next read parses the file again instead of reusing a recent parse.

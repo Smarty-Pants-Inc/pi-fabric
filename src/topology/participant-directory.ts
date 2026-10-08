@@ -59,8 +59,15 @@ const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
-/** Addressable across a live reload, but a failed reload stops accepting after this lease. */
-export const MAIN_RELOAD_LEASE_MS = 30_000;
+/**
+ * Addressable across a live reload, but a failed reload stops accepting after this lease.
+ * quiesce("reload") writes it once, at the start of teardown; nothing renews it until the new
+ * release's first heartbeat replaces it, because the old heartbeat stops at teardown and a
+ * synchronous release import blocks the event loop anyway. A reload on a loaded host takes a
+ * minute or more (smarty-dev#6729: p50 56 s, max 102 s), so 30 s let Mains lapse mid-reload.
+ * Bounded so that a Main that dies mid-reload still drops out of the directory within 3 min.
+ */
+export const MAIN_RELOAD_LEASE_MS = 180_000;
 /**
  * Change-driven refreshes (agent UI updates, actor changes) run at most once per this
  * interval, and write only when a published record changed (smarty-dev#367: each write

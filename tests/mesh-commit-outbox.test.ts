@@ -164,6 +164,47 @@ describe("CommitOutbox", () => {
     }
   });
 
+  it.each(["file", "sqlite"] as const)("a late older afterCommit leaves a newer same-key row pending; a crash before its effect replays it once (%s, smarty-dev#7023)", async (backend) => {
+    const root = meshRoot();
+    const mesh = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
+    const log: string[] = [];
+    const outbox = new CommitOutbox(mesh, "scope-late", identity, effects(log));
+    const commit = (n: number, key: string, plan = outbox.plan()) => mesh.writeBatch({ identity, ops: [],
+      prepare: () => plan.stage([{ kind: "put", key: `subject/${n}`, value: n }], [{ kind: "touch", key, payload: { n } }]),
+      // Deferred: this commit's afterCommit has not run yet.
+      afterCommit: () => {} }).then(() => plan);
+    try {
+      const older = await commit(1, "same");
+      // The newer same-key commit lands; its afterCommit never runs (the process dies before it).
+      await commit(2, "same");
+      const newer = mesh.get(outbox.rowKey("same"), { fresh: true });
+      expect((newer?.value as { payload: { n: number } }).payload.n).toBe(2);
+      // The older afterCommit runs late, on a view that already holds the newer row.
+      await mesh.writeBatch({ identity, ops: [], afterCommit: (view) => { expect(older.run(view)).toBe(1); } });
+      expect(log).toEqual(["1"]);
+      expect(outbox.retiring).toBe(0);
+      // A later batch commits and retires what ran: the newer row must survive it.
+      const later = outbox.plan();
+      await mesh.writeBatch({ identity, ops: [], prepare: () => later.stage([{ kind: "put", key: "subject/3", value: 3 }], [{ kind: "touch", key: "other", payload: { n: 3 } }]),
+        afterCommit: (view) => { later.run(view); } });
+      await outbox.retire();
+      expect(mesh.get(outbox.rowKey("same"), { fresh: true })?.version).toBe(newer?.version);
+    } finally {
+      mesh.closeState();
+    }
+    // Restart: the newer effect is pending and runs exactly once.
+    const reopened = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
+    try {
+      const restarted = new CommitOutbox(reopened, "scope-late", identity, effects(log));
+      expect(await restarted.recover()).toBe(1);
+      expect(await restarted.recover()).toBe(0);
+      expect(log).toEqual(["1", "3", "2:replay"]);
+      expect(reopened.listAll(restarted.prefix, { fresh: true })).toEqual([]);
+    } finally {
+      reopened.closeState();
+    }
+  });
+
   it("does not take the lock to recover when nothing is pending", async () => {
     const mesh = store();
     const outbox = new CommitOutbox(mesh, "scope-d", identity, effects([]));

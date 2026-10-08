@@ -2,13 +2,13 @@
 
 `scripts/benchmark-mesh-lock.mjs` runs a fixed, seeded, reproducible load against a synthetic mesh
 root and reports what the mesh lock costs per operation. It is the acceptance number of the
-mesh-lock redesign (smarty-dev#6477, lane L9a; smarty-dev#6676) and, after the SQLite cutover, a
-CI ratchet. It never opens a live mesh: it seeds its own root under `$TMPDIR` and removes it.
+mesh-lock redesign (smarty-dev#6477, lane L9a) and its CI ratchet (smarty-dev#6676, see [CI](#ci)).
+It never opens a live mesh: it seeds its own root under `$TMPDIR` and removes it.
 
 ```sh
 bun run bench:mesh-lock                                   # build, then run with the defaults
 nice -n 19 node scripts/benchmark-mesh-lock.mjs --out result.json   # dist/ already built
-node scripts/benchmark-mesh-lock.mjs --baseline bench/mesh-lock-baseline.json --max-regress 10
+bun run bench:mesh-lock:check                             # the CI ratchet: dist/ built, default load vs the baseline
 node scripts/benchmark-mesh-lock.mjs --from result.json --baseline bench/mesh-lock-baseline.json  # compare only
 ```
 
@@ -83,15 +83,37 @@ baseline from a valid run.
 branch on ryzen5 (32 CPUs, shared and loaded, `nice -n 19`) with the default load; its `note`,
 `host` and `load` fields say so. The SQLite store replaces it at the cutover.
 
-## CI (not wired yet)
+## CI
 
-The benchmark is not in the required CI workflow; that is a later step, after the SQLite cutover.
-CI will then run, on a shared runner:
+The `mesh-lock-bench` job of `.github/workflows/test.yml` (ubuntu-latest, Node 24, on every
+pull request and push to `main`) builds and runs the default load against the committed baseline:
 
 ```sh
-bun run bench:mesh-lock -- --baseline bench/mesh-lock-baseline.json --max-regress 10 --out mesh-lock.json
+bun run build
+bun run bench:mesh-lock:check --out mesh-lock.json   # = --baseline bench/mesh-lock-baseline.json --max-regress 10
 ```
 
-and upload `mesh-lock.json`. A dedicated runner adds `--gate-timing` against its own baseline. An
-intended improvement lowers the numbers: re-record the baseline in the same pull request
-(`--write-baseline bench/mesh-lock-baseline.json --note ...`) so the ratchet tightens.
+and uploads `mesh-lock.json`. It fails (exit 1) when a load-insensitive metric is more than 10%
+above the baseline (all of them are lower-is-better; `timeoutsPer10kOps` has a zero baseline, so one
+timeout fails), and exit 2 when the run is invalid. Timing metrics are printed in the table on
+stderr (class `timing`, with their delta) but never gate there: a shared runner moves them by tens
+of percent (one local pass shows them at +27-33% while the ratchet metrics stay within 0.05%). The
+default load takes about 2.5 minutes (seeding, 15 s warm-up, 120 s window, drain); the job about
+4. It is not a required check; making it one is a separate decision in `.mergify.yml`. A dedicated
+runner can add `--gate-timing` against a baseline recorded on that runner.
+
+**Updating the baseline intentionally.** A change that is meant to move the numbers (an
+improvement that should tighten the ratchet, a load or default change, the SQLite cutover)
+re-records the baseline in the same pull request, so the review sees the old and new numbers in the
+diff of `bench/mesh-lock-baseline.json`:
+
+```sh
+bun run build
+nice -n 19 node scripts/benchmark-mesh-lock.mjs --write-baseline bench/mesh-lock-baseline.json \
+  --note "what changed, the commit, the host and its load" > /dev/null
+git diff bench/mesh-lock-baseline.json
+```
+
+`--write-baseline` refuses an invalid run. Run it two or three times and keep a representative run;
+the ratchet metrics should agree within a fraction of a percent. A pull request that only loosens
+the baseline (higher numbers, same load) needs the reason in its description.

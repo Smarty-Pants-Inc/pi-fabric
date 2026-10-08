@@ -24,6 +24,8 @@ export interface CensusWriter {
   name?: string;
   /** Owner receipt/ticket names that corroborate this process. */
   evidence?: string[];
+  /** Why the census could not read or trust this evidence ("path: errno", "path: invalid"). */
+  reason?: string;
 }
 
 export interface WriterCensus {
@@ -35,6 +37,8 @@ export interface WriterCensus {
 const backendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
 
 const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined);
+
+const errno = (error: unknown): string => (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
 
 /**
  * Writer metadata with every invalid or unsupported field left absent. Leases are validated on
@@ -88,6 +92,9 @@ const writerKey = (writer: CensusWriter): string => writer.pid === undefined
  * unexpired host lease names that writer: same host, pid and start time (a lease of a later process
  * that reused the pid does not vouch for the record). A record without a valid host, pid or start time, or
  * with unsupported metadata, is retained and counted unknown (fail closed).
+ * Only an absent file or directory (ENOENT) is no evidence: any other read failure of the census
+ * directory, a record, a host lease, the lock owner or the lock queue, and an owner record without
+ * a valid pid, is counted unknown with its path and errno, so the census is never clean on it.
  */
 export async function census(root: string): Promise<WriterCensus> {
   const writers: CensusWriter[] = [];
@@ -95,7 +102,8 @@ export async function census(root: string): Promise<WriterCensus> {
   const seen = new Set<string>();
   const host = os.hostname();
   const now = Date.now();
-  const leases = [...readHostLeases(root).values()];
+  const leaseProblems: string[] = [];
+  const leases = [...readHostLeases(root, leaseProblems).values()];
   const leased = (writer: CensusWriter): boolean => validWriterStartedAt(writer.startedAt) &&
     leases.some(lease => lease.expiresAt > now && lease.writer?.host === writer.host &&
       lease.writer?.pid === writer.pid && lease.writer?.startedAt === writer.startedAt);
@@ -130,49 +138,72 @@ export async function census(root: string): Promise<WriterCensus> {
     // dead (fail closed).
     for (const record of metadata.filter(record => !local(record))) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
   };
-  try {
-    const directory = path.join(root, ".writer-census");
-    for (const name of fs.readdirSync(directory)) {
-      if (!name.endsWith(".json")) continue;
-      let text: string;
-      try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
-      catch (error) {
-        // Removed since the listing (its writer exited): gone. Any other read failure is unknown.
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") add({ source: "process-record", name });
-        continue;
+  const directory = path.join(root, ".writer-census");
+  let names: string[] = [];
+  try { names = fs.readdirSync(directory); }
+  catch (error) {
+    // Absent: an old release, before census records. Unreadable: its records are unknown.
+    if (errno(error) !== "ENOENT") add({ source: "process-record", name: directory, reason: `${directory}: ${errno(error)}` });
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    let text: string;
+    try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
+    catch (error) {
+      // Removed since the listing (its writer exited): gone. Any other read failure is unknown.
+      if (errno(error) !== "ENOENT") {
+        add({ source: "process-record", name, reason: `${path.join(directory, name)}: ${errno(error)}` });
       }
-      let value: unknown;
-      try { value = JSON.parse(text); } catch { value = undefined; }
-      const fields = typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
-      // Records are renamed into place whole: an unparsable, foreign-format or pid-less one is
-      // not trusted, and not dropped either.
-      if (!fields || fields.format !== 1 || !validWriterPid(fields.pid)) {
-        add({ source: "process-record", name });
-        continue;
-      }
-      if (censusRecordPrunable(fields, host)) {
-        try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
-        continue;
-      }
-      const record = fields as unknown as MeshWriterRecord;
-      remember(record);
-      add({ ...leaseWriter(record), source: "process-record", name });
+      continue;
     }
-  } catch { /* old release, before census records */ }
+    let value: unknown;
+    try { value = JSON.parse(text); } catch { value = undefined; }
+    const fields = typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+    // Records are renamed into place whole: an unparsable, foreign-format or pid-less one is
+    // not trusted, and not dropped either.
+    if (!fields || fields.format !== 1 || !validWriterPid(fields.pid)) {
+      add({ source: "process-record", name, reason: `${path.join(directory, name)}: invalid` });
+      continue;
+    }
+    if (censusRecordPrunable(fields, host)) {
+      try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      continue;
+    }
+    const record = fields as unknown as MeshWriterRecord;
+    remember(record);
+    add({ ...leaseWriter(record), source: "process-record", name });
+  }
 
+  for (const problem of leaseProblems) add({ source: "host-lease", name: problem, reason: problem });
   for (const lease of leases) if (lease.expiresAt > now) add(fromLease(lease));
 
-  try {
-    const owner = fs.readFileSync(path.join(root, ".lock", "owner"), "utf8").split(/\r?\n/);
-    addLockEvidence(Number(owner[1]), "lock-owner", owner[0] || undefined);
-  } catch { /* absent owner record */ }
+  const ownerPath = path.join(root, ".lock", "owner");
+  let owner: string[] | undefined;
+  try { owner = fs.readFileSync(ownerPath, "utf8").split(/\r?\n/); }
+  catch (error) {
+    // Absent: no lock holder. Unreadable: an unknown holder.
+    if (errno(error) !== "ENOENT") add({ source: "lock-owner", name: ownerPath, reason: `${ownerPath}: ${errno(error)}` });
+  }
+  if (owner) {
+    // The owner record is renamed into place whole: one without a valid pid names an unknown holder.
+    const pid = Number(owner[1]);
+    if (validWriterPid(pid)) addLockEvidence(pid, "lock-owner", owner[0] || undefined);
+    else add({ source: "lock-owner", name: ownerPath, reason: `${ownerPath}: invalid` });
+  }
 
+  let queue: string | undefined;
   try {
-    const queue = meshLockQueueDirectory(root);
+    queue = meshLockQueueDirectory(root);
     for (const name of fs.readdirSync(queue).filter(item => /^\d{24}-\d+-[a-f0-9-]+$/.test(item))) {
       addLockEvidence(Number(name.split("-")[1]), "lock-ticket", name);
     }
-  } catch { /* no queue or queue is not readable */ }
+  } catch (error) {
+    // Absent root or queue: no tickets. Any other failure hides tickets: unknown.
+    if (errno(error) !== "ENOENT") {
+      const where = queue ?? root;
+      add({ source: "lock-ticket", name: where, reason: `${where}: ${errno(error)}` });
+    }
+  }
 
   return { writers, unknown, clean: unknown.length === 0 };
 }

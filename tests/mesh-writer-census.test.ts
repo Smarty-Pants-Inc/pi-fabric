@@ -66,8 +66,35 @@ const root = (): string => {
   return value;
 };
 
+// Makes a file or directory unreadable: chmod 000 on POSIX (unless root, who reads anyway), else
+// an EACCES from the fs calls the census makes on that exact path.
+const denied: string[] = [];
+const deniedPaths = new Set<string>();
+const denyRead = (target: string): void => {
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    fs.chmodSync(target, 0o000);
+    denied.push(target);
+    return;
+  }
+  deniedPaths.add(path.resolve(target));
+  if (vi.isMockFunction(fs.readdirSync)) return;
+  const eacces = (file: unknown): Error => Object.assign(new Error(`EACCES: permission denied, '${String(file)}'`), { code: "EACCES" });
+  const blocked = (file: unknown): boolean => deniedPaths.has(path.resolve(String(file)));
+  const readdir = fs.readdirSync, readFile = fs.readFileSync;
+  vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    if (blocked(file)) throw eacces(file);
+    return (readdir as (...args: unknown[]) => unknown)(file, ...rest);
+  }) as typeof fs.readdirSync);
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    if (blocked(file)) throw eacces(file);
+    return (readFile as (...args: unknown[]) => unknown)(file, ...rest);
+  }) as typeof fs.readFileSync);
+};
+
 afterEach(() => {
   vi.restoreAllMocks();
+  deniedPaths.clear();
+  for (const target of denied.splice(0)) fs.chmodSync(target, 0o700);
   for (const value of roots.splice(0)) fs.rmSync(value, { recursive: true, force: true });
 });
 
@@ -283,8 +310,9 @@ describe("mesh writer census", () => {
     fs.writeFileSync(path.join(directory, "torn.json"), "{");
     fs.writeFileSync(path.join(directory, "pidless.json"), JSON.stringify({ format: 1, host: os.hostname(), startedAt: ownStartedAt() }));
     const result = await census(mesh);
-    expect(result.unknown).toEqual(expect.arrayContaining([{ source: "process-record", name: "torn.json" },
-      { source: "process-record", name: "pidless.json" }]));
+    expect(result.unknown).toEqual(expect.arrayContaining([
+      { source: "process-record", name: "torn.json", reason: `${path.join(directory, "torn.json")}: invalid` },
+      { source: "process-record", name: "pidless.json", reason: `${path.join(directory, "pidless.json")}: invalid` }]));
     expect(fs.readdirSync(directory).sort()).toEqual(["pidless.json", "torn.json"]);
   });
 
@@ -505,5 +533,80 @@ describe("mesh writer census", () => {
     expect(result.clean).toBe(false);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid, host: "other-host.example",
       evidence: [`lock-ticket:${ticket}`] }));
+  });
+
+  it("treats a missing census directory as an old release with no records, and is clean", async () => {
+    const result = await census(root());
+    expect(result).toEqual({ writers: [], unknown: [], clean: true });
+  });
+
+  it("is not clean when the census directory exists but cannot be listed", async () => {
+    const mesh = root();
+    const directory = path.join(mesh, ".writer-census");
+    writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() });
+    denyRead(directory);
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "process-record", name: directory,
+      reason: `${directory}: EACCES` }));
+  });
+
+  it("is not clean when a census record exists but cannot be read", async () => {
+    const mesh = root();
+    const file = writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() });
+    denyRead(file);
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "process-record", name: path.basename(file),
+      reason: `${file}: EACCES` }));
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it("is not clean when the host-lease directory or a lease cannot be read, or a lease is invalid", async () => {
+    const mesh = root();
+    const now = Date.now();
+    writeHostLease(mesh, { id: "host:denied", rootId: "session:denied", identityId: "identity:denied",
+      updatedAt: now, expiresAt: now + 60_000 });
+    const leases = path.join(mesh, "host-leases");
+    const [leaseFile] = fs.readdirSync(leases).map(name => path.join(leases, name));
+    denyRead(leaseFile!);
+    fs.writeFileSync(path.join(leases, "torn.json"), "{");
+    let result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: "host-lease", reason: `${leaseFile}: EACCES` }),
+      expect.objectContaining({ source: "host-lease", reason: `${path.join(leases, "torn.json")}: invalid` })]));
+    const other = root();
+    fs.mkdirSync(path.join(other, "host-leases"));
+    denyRead(path.join(other, "host-leases"));
+    result = await census(other);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "host-lease",
+      reason: `${path.join(other, "host-leases")}: EACCES` }));
+  });
+
+  it("is not clean when the lock owner is unreadable or names no valid pid", async () => {
+    const mesh = root();
+    const owner = path.join(mesh, ".lock", "owner");
+    fs.mkdirSync(path.dirname(owner));
+    fs.writeFileSync(owner, "token\nnot-a-pid\n");
+    let result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-owner", reason: `${owner}: invalid` }));
+    fs.writeFileSync(owner, `token\n${deadPid()}\n${Date.now()}\n`);
+    denyRead(owner);
+    result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-owner", reason: `${owner}: EACCES` }));
+  });
+
+  it("is not clean when the lock queue exists but cannot be listed", async () => {
+    const mesh = root();
+    const queue = meshLockQueueDirectory(mesh);
+    fs.mkdirSync(queue, { recursive: true });
+    denyRead(queue);
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-ticket", reason: `${queue}: EACCES` }));
   });
 });

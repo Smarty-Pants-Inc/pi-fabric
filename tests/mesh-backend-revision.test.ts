@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshBatchConflictError, MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshStateUnsupportedError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import type { StateBackend } from "../src/mesh/state-backend.js";
 
 const identity: MeshIdentity = { id: "mesh-backend-test", name: "mesh-backend-test", kind: "agent" };
 const roots: string[] = [];
@@ -14,7 +15,8 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 // L2a implementations can be added without changing these cross-lane probes. File is mandatory;
 // SQLite is included only when this runtime supports node:sqlite. Shadow is explicitly reported as
 // unavailable on this interface-only base (it will be picked up when a factory is introduced).
-type RevisionBackend = { kind: string; get(key: string): { value: unknown; version: number } | undefined; put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<unknown>; close(): void };
+type RevisionApi = Pick<StateBackend, "get" | "put">;
+type RevisionBackend = RevisionApi & { kind: string; close(): void };
 async function openBackends(): Promise<Array<{ kind: string; open: (root: string) => Promise<RevisionBackend> }>> {
   const kinds: Array<{ kind: string; open: (root: string) => Promise<RevisionBackend> }> = [{ kind: "file", open: async root => { const store = new MeshStore(root, 64 * 1024, 100); return { kind: "file", get: key => store.get(key), put: input => store.put(input), close: () => undefined }; } }];
   try {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { MeshStateEntry } from "../mesh/store.js";
-import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "./host-leases.js";
+import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "./host-leases.js";
 import { readParticipantFile } from "./participant-files.js";
 
 /** Cheap invalidation of a prepared ownership observation. Atomic replacements
@@ -70,12 +70,28 @@ const leaseFacts = (lease: FabricHostLease | undefined): string => lease
   : "absent";
 const closureFacts = (entry: MeshStateEntry | undefined): string => entry ? JSON.stringify([entry.updatedBy?.id ?? null, entry.value ?? null]) : "absent";
 
+/** pi-fabric#637: the clock-dependent inputs of ParticipantDirectory.get(). A participant is
+ * live while a "reloading" record's reloadUntil >= now and its owner's effective expiry (the
+ * later of the shared host record and a MATCHING file lease, hostLiveness) >= now. */
+const reloadDeadline = (entry: MeshStateEntry | undefined): number | undefined => {
+  const value = entry?.value;
+  return isRecord(value) && value.status === "reloading" ? (typeof value.reloadUntil === "number" ? value.reloadUntil : 0) : undefined;
+};
+const hostDeadline = (id: string, entry: MeshStateEntry | undefined, lease: FabricHostLease | undefined): number | undefined => {
+  if (entry) return hostEntryLiveness(entry, lease ? new Map([[id, lease]]) : new Map()).expiresAt;
+  // No shared record (get() then has no live owner): the file lease is the only clock input.
+  return lease?.expiresAt;
+};
+
 /** One prepared observation of the ownership inputs of specific actors. */
 export interface ActorOwnershipObservation {
   /** Narrow validation to the actors the save will actually write (call before unchanged()). */
   scope(ids: Iterable<string>): void;
-  /** False once any ownership fact of a scoped actor changed since the observation. */
+  /** False once any ownership fact of a scoped actor changed since the observation, or once
+   * the clock reached the earliest lease/reload deadline that was still live when observed. */
   unchanged(): boolean;
+  /** Earliest observed live deadline of the scoped actors (Infinity when none). */
+  deadline(): number;
 }
 
 /**
@@ -95,13 +111,19 @@ export const observeActorOwnership = (
   meshRoot: string,
   actorIds: Iterable<string>,
   openState?: () => (key: string) => MeshStateEntry | undefined,
+  options: { now?: () => number } = {},
 ): ActorOwnershipObservation => {
+  const clock = options.now ?? Date.now;
+  // pi-fabric#637: read the clock BEFORE the inputs, as get() does after them; a deadline is
+  // kept only while still live at this instant (an already-lapsed lease was not relied on).
+  const observedAt = clock();
+  const live = (deadline: number | undefined): number => deadline !== undefined && deadline >= observedAt ? deadline : Number.POSITIVE_INFINITY;
   const statePath = path.join(meshRoot, "state.json");
   // Leaf stamp first, then content: a write between them changes the stamp and is compared.
   const stateStamp = stampOf(statePath);
   const state = openState?.();
-  const participants = new Map<string, { key: string; file: string; stamp: string; facts: string; shared: string; owners: string[]; roots: string[] }>();
-  const hosts = new Map<string, { file: string; stamp: string; facts: string; shared: string }>();
+  const participants = new Map<string, { key: string; file: string; stamp: string; facts: string; shared: string; owners: string[]; roots: string[]; deadline: number }>();
+  const hosts = new Map<string, { file: string; stamp: string; facts: string; shared: string; deadline: number }>();
   const closures = new Map<string, string>();
   const ownerOf = (entry: MeshStateEntry | undefined): { owner?: string; root?: string } => {
     const value = entry?.value;
@@ -114,7 +136,9 @@ export const observeActorOwnership = (
     if (hosts.has(id)) return;
     const file = hostLeasePath(meshRoot, id);
     const stamp = stampOf(file);
-    hosts.set(id, { file, stamp, facts: leaseFacts(readHostLeaseCurrent(meshRoot, id)), shared: hostFacts(state?.(HOST_PREFIX + digest(id))) });
+    const lease = readHostLeaseCurrent(meshRoot, id);
+    const entry = state?.(HOST_PREFIX + digest(id));
+    hosts.set(id, { file, stamp, facts: leaseFacts(lease), shared: hostFacts(entry), deadline: live(hostDeadline(id, entry, lease)) });
   };
   for (const id of actorIds) {
     if (participants.has(id)) continue;
@@ -126,18 +150,29 @@ export const observeActorOwnership = (
     const sharedEntry = state?.(key);
     const owners = [...new Set([ownerOf(fileEntry).owner, ownerOf(sharedEntry).owner].filter((owner): owner is string => owner !== undefined))];
     const roots = [...new Set([ownerOf(fileEntry).root, ownerOf(sharedEntry).root].filter((root): root is string => root !== undefined))];
-    participants.set(id, { key, file, stamp, facts: participantFacts(fileEntry), shared: participantFacts(sharedEntry), owners, roots });
+    participants.set(id, { key, file, stamp, facts: participantFacts(fileEntry), shared: participantFacts(sharedEntry), owners, roots,
+      deadline: Math.min(live(reloadDeadline(fileEntry)), live(reloadDeadline(sharedEntry))) });
     for (const owner of owners) observeHost(owner);
     for (const root of roots) if (!closures.has(root)) closures.set(root, closureFacts(state?.(LINEAGE_CLOSURE_PREFIX + digest(root))));
   }
   let scoped = [...participants.keys()];
+  const scopedDeadline = (records: ReadonlyArray<{ owners: string[]; deadline: number }>): number =>
+    Math.min(Number.POSITIVE_INFINITY, ...records.map(record => record.deadline),
+      ...records.flatMap(record => record.owners).map(id => hosts.get(id)?.deadline ?? Number.POSITIVE_INFINITY));
   return {
     scope(ids) { scoped = [...new Set(ids)]; },
+    deadline() {
+      return scopedDeadline(scoped.flatMap(id => participants.get(id) ?? []));
+    },
     unchanged() {
       const selected = scoped.map(id => participants.get(id));
       // An actor outside the observation was never observed: fail closed.
       if (selected.some(entry => entry === undefined)) return false;
       const records = selected as Array<NonNullable<typeof selected[number]>>;
+      // pi-fabric#637: lease expiry and reloadUntil change the decision without any write, so
+      // no stamp can see them. Once the clock reaches the earliest deadline that was live when
+      // observed, the observed decision may be stale: veto, and the retry decides afresh.
+      if (clock() >= scopedDeadline(records)) return false;
       const owners = new Set(records.flatMap(record => record.owners));
       const roots = new Set(records.flatMap(record => record.roots));
       for (const record of records) {

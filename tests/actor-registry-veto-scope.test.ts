@@ -10,7 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { formatResidentOutcomePriority } from "../src/output-budget.js";
 import { ResidentOutcomeUnknownError, type ResidentCommand } from "../src/residency/protocol.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { observeActorOwnership, publicationGeneration } from "../src/topology/publication-generation.js";
 
@@ -38,9 +38,9 @@ const participant = (meshRoot: string, id: string, owner: { hostId: string; iden
       name: id, status: "idle", runner: "pi", transport: "host", capabilities: [], startedAt: 1, updatedAt: now, ...extra },
   });
 };
-const lease = (meshRoot: string, owner: { hostId: string; identityId: string; rootId: string }, startedAt = 1): void => {
+const lease = (meshRoot: string, owner: { hostId: string; identityId: string; rootId: string }, startedAt = 1, expiresAt?: number): void => {
   const now = Date.now() + ++tick;
-  writeHostLease(meshRoot, { id: owner.hostId, rootId: owner.rootId, identityId: owner.identityId, startedAt, updatedAt: now, expiresAt: now + 60_000 });
+  writeHostLease(meshRoot, { id: owner.hostId, rootId: owner.rootId, identityId: owner.identityId, startedAt, updatedAt: now, expiresAt: expiresAt ?? now + 60_000 });
 };
 const OTHER = { hostId: "host:other", identityId: "session:other", rootId: "session:other" };
 const SELF = { hostId: "host:self", identityId: "session:self", rootId: "session:self" };
@@ -120,6 +120,44 @@ describe("smarty-dev#6829 registry save validation is scoped to this root's owne
     replace.spy.mockRestore();
   }, 20_000);
 
+  it("pi-fabric#637: vetoes the attempt during which THIS actor's owner lease expires, with no file write", async () => {
+    const dir = tempRoot();
+    const { actors, meshRoot } = manager(dir);
+    const actor = await actors.create({ name: "lease-expires", instructions: "Reply" });
+    const expiresAt = Date.now() + 60_000;
+    participant(meshRoot, actor.id, SELF);
+    lease(meshRoot, SELF, 1, expiresAt);
+    const ownFiles = () => [path.join(meshRoot, "participants", `${digest(actor.id)}.json`), hostLeasePath(meshRoot, SELF.hostId)]
+      .map(file => { const stat = fs.statSync(file, { bigint: true }); return `${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`; }).join("|");
+    const files = ownFiles();
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+    // The clock crosses the observed owner lease expiry inside the first prepare window only.
+    const expire = duringPrepare(() => { if (offset === 0) offset = expiresAt - realNow() + 1_000; });
+    await expect(actors.setNice(actor.id, 8)).resolves.toBeDefined();
+    expect(ownFiles()).toBe(files); // no participant or lease file write
+    // Attempt 1 vetoed (its observed lease lapsed before validate); the retry re-decided.
+    expect(expire.windows()).toBe(2);
+    expect(committedRow(dir, actor.id)?.nice).toBe(8);
+  }, 20_000);
+
+  it("pi-fabric#637: vetoes the attempt during which THIS actor's reloadUntil passes, with no file write", async () => {
+    const dir = tempRoot();
+    const { actors, meshRoot } = manager(dir);
+    const actor = await actors.create({ name: "reload-boundary", instructions: "Reply" });
+    const reloadUntil = Date.now() + 30_000;
+    participant(meshRoot, actor.id, SELF, { status: "reloading", reloadUntil });
+    lease(meshRoot, SELF);
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+    const cross = duringPrepare(() => { if (offset === 0) offset = reloadUntil - realNow() + 1_000; });
+    await expect(actors.setNice(actor.id, 9)).resolves.toBeDefined();
+    expect(cross.windows()).toBe(2);
+    expect(committedRow(dir, actor.id)?.nice).toBe(9);
+  }, 20_000);
+
   it("still vetoes when THIS actor is ceded to another owner during prepare", async () => {
     const dir = tempRoot();
     const { actors, meshRoot } = manager(dir);
@@ -174,6 +212,71 @@ describe("observeActorOwnership", () => {
     const unobserved = observeActorOwnership(meshRoot, ["actor:mine"]);
     unobserved.scope(["actor:mine", "actor:never-observed"]);
     expect(unobserved.unchanged()).toBe(false);
+  });
+
+  it("pi-fabric#637: vetoes once the clock reaches the observed owner lease expiry, without any write", () => {
+    const meshRoot = setup();
+    const expiresAt = Date.now() + 60_000;
+    lease(meshRoot, SELF, 1, expiresAt);
+    let now = expiresAt - 10;
+    const observed = observeActorOwnership(meshRoot, ["actor:mine"], undefined, { now: () => now });
+    expect(observed.unchanged()).toBe(true);
+    now = expiresAt;
+    expect(observed.unchanged()).toBe(false);
+    // A renewal written after the observation does not revive the observed decision.
+    lease(meshRoot, SELF, 1, expiresAt + 60_000);
+    expect(observed.unchanged()).toBe(false);
+    expect(observed.deadline()).toBe(expiresAt);
+  });
+
+  it("pi-fabric#637: vetoes once a reloading participant's reloadUntil passes, without any write", () => {
+    const meshRoot = setup();
+    const reloadUntil = Date.now() + 30_000;
+    participant(meshRoot, "actor:mine", SELF, { status: "reloading", reloadUntil });
+    let now = reloadUntil - 1;
+    const observed = observeActorOwnership(meshRoot, ["actor:mine"], undefined, { now: () => now });
+    expect(observed.unchanged()).toBe(true);
+    now = reloadUntil + 1;
+    expect(observed.unchanged()).toBe(false);
+    expect(observed.deadline()).toBe(reloadUntil);
+  });
+
+  it("pi-fabric#637: uses the shared host record's effective expiry (later of record and matching lease)", () => {
+    const meshRoot = setup();
+    const key = `topology/hosts/${digest(SELF.hostId)}`;
+    const leaseExpiry = Date.now() + 60_000;
+    lease(meshRoot, SELF, 1, leaseExpiry);
+    const host = (expiresAt: number, identityId = SELF.identityId) => ({ key, version: 1, updatedAt: 1, updatedBy: { id: identityId, name: "s", kind: "main" },
+      value: { format: 1, id: SELF.hostId, rootId: SELF.rootId, identity: { id: identityId, name: "s", kind: "main" }, startedAt: 1, updatedAt: 1, expiresAt } });
+    let entry = host(leaseExpiry + 30_000);
+    const openState = () => (k: string) => (k === key ? entry : undefined) as never;
+    let now = leaseExpiry - 1;
+    const shared = observeActorOwnership(meshRoot, ["actor:mine"], openState, { now: () => now });
+    now = leaseExpiry + 30_000; // the file lease lapsed, the shared record has not: still live
+    expect(shared.unchanged()).toBe(false);
+    now = leaseExpiry + 1;
+    expect(shared.unchanged()).toBe(true);
+    now = leaseExpiry - 1;
+    expect(observeActorOwnership(meshRoot, ["actor:mine"], openState, { now: () => now }).deadline()).toBe(leaseExpiry + 30_000);
+    entry = host(leaseExpiry - 30_000);
+    expect(observeActorOwnership(meshRoot, ["actor:mine"], openState, { now: () => now }).deadline()).toBe(leaseExpiry);
+    // A non-matching (other identity) lease does not extend the shared record.
+    entry = host(leaseExpiry - 30_000, "session:someone-else");
+    now = leaseExpiry - 60_000;
+    expect(observeActorOwnership(meshRoot, ["actor:mine"], openState, { now: () => now }).deadline()).toBe(leaseExpiry - 30_000);
+  });
+
+  it("pi-fabric#637: keeps the cheap path for deadlines already lapsed when observed and for other roots' deadlines", () => {
+    const meshRoot = setup();
+    const lapsed = Date.now() - 1_000;
+    lease(meshRoot, SELF, 1, lapsed);
+    lease(meshRoot, OTHER, 1, Date.now() + 5_000);
+    let now = lapsed + 10;
+    const observed = observeActorOwnership(meshRoot, ["actor:mine", "actor:theirs"], undefined, { now: () => now });
+    observed.scope(["actor:mine"]);
+    // The decision never relied on an already-lapsed lease; another root's expiry is out of scope.
+    now += 60_000;
+    expect(observed.unchanged()).toBe(true);
   });
 
   it("scope() narrows validation to the actors the save writes", () => {

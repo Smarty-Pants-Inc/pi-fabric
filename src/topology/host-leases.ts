@@ -81,7 +81,7 @@ export const waitForHostLeaseRenewal = async (
 export interface MeshWriterRecord {
   pid: number;
   host: string;
-  /** Build/release commit SHA; "unknown" deliberately fails the cutover census. */
+  /** Build/release commit SHA; the advisory census reports "unknown" as an unknown writer. */
   releaseSha: string;
   lockProtocol: number;
   stateBackend: "file" | "shadow" | "sqlite" | string;
@@ -164,8 +164,8 @@ const cache = new Map<string, LeaseSlots>();
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
 /**
  * `problems`, when given, collects every lease file or directory that exists but could not be
- * read, or a lease file that is not a valid lease, as "path: errno|invalid" (the writer census fails closed on
- * them, smarty-dev#6477). A file or directory that is absent (ENOENT) is no problem.
+ * read, or a lease file that is not a valid lease, as "path: errno|invalid" (the advisory writer census
+ * reports them as unknown, smarty-dev#6477). A file or directory that is absent (ENOENT) is no problem.
  */
 export const readHostLeases = (meshRoot: string, problems?: string[]): Map<string, FabricHostLease> => {
   const dir = path.join(meshRoot, LEASE_DIR);
@@ -293,11 +293,11 @@ export const validWriterLockProtocol = (value: unknown): value is 1 | 2 => value
 export const validWriterStateBackend = (value: unknown): value is "file" | "shadow" | "sqlite" =>
   value === "file" || value === "shadow" || value === "sqlite";
 
-/** A build commit; "unknown" (no build SHA in the environment) deliberately fails the cutover census. */
+/** A build commit; "unknown" (no build SHA in the environment) is reported unknown by the census. */
 export const validWriterReleaseSha = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value !== "unknown";
 
-/** Invalid writer metadata is dropped from the lease, so census counts that writer unknown (fail closed). */
+/** Invalid writer metadata is dropped from the lease, so the census reports that writer unknown. */
 const validWriter = (value: unknown): value is MeshWriterRecord => {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;

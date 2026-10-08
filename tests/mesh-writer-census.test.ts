@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as writerCensus from "../src/mesh/writer-census.js";
 import { census } from "../src/mesh/writer-census.js";
 import { MeshStore, censusRecordFileName, meshProcessStartedAt, pruneDeadCensusRecords } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
@@ -124,7 +125,7 @@ describe("mesh writer census", () => {
       stateBackend: "sqlite", startedAt: ownStartedAt() };
     fs.writeFileSync(path.join(directory, `${process.pid}.json`), JSON.stringify({ format: 1, ...writer }));
     const result = await census(mesh);
-    expect(result.clean).toBe(true);
+    expect(result.unknown).toEqual([]);
     expect(result.unknown).toEqual([]);
     expect(result.writers).toContainEqual(expect.objectContaining({ ...writer, source: "process-record" }));
   });
@@ -137,7 +138,7 @@ describe("mesh writer census", () => {
     writeHostLease(mesh, { id: "host:lease", rootId: "session:lease", identityId: "identity:lease",
       updatedAt: now, expiresAt: now + 60_000, writer });
     const result = await census(mesh);
-    expect(result.clean).toBe(true);
+    expect(result.unknown).toEqual([]);
     expect(result.writers).toContainEqual(expect.objectContaining({ ...writer, source: "host-lease", name: "host:lease" }));
   });
 
@@ -150,7 +151,7 @@ describe("mesh writer census", () => {
     const ticket = `${"2".repeat(24)}-${process.pid}-01234567-89ab-cdef-0123-456789abcdef`;
     fs.writeFileSync(path.join(queue, ticket), "");
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-owner", name: "old-token",
       evidence: expect.arrayContaining(["lock-owner:old-token", `lock-ticket:${ticket}`]) }));
   });
@@ -162,7 +163,7 @@ describe("mesh writer census", () => {
     const name = `${"1".repeat(24)}-${process.pid}-01234567-89ab-cdef-0123-456789abcdef`;
     fs.writeFileSync(path.join(queue, name), "");
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-ticket", name }));
   });
   it("deletes this host's record of a dead process", async () => {
@@ -171,7 +172,7 @@ describe("mesh writer census", () => {
     const file = writeRecord(mesh, { pid, host: os.hostname(), startedAt: ownStartedAt() });
     const result = await census(mesh);
     expect(result.writers.find(writer => writer.pid === pid)).toBeUndefined();
-    expect(result.clean).toBe(true);
+    expect(result.unknown).toEqual([]);
     expect(fs.existsSync(file)).toBe(false);
   });
 
@@ -234,7 +235,7 @@ describe("mesh writer census", () => {
     pruneDeadCensusRecords(mesh);
     const result = await census(mesh);
     expect(fs.existsSync(file)).toBe(true);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     const record = result.unknown.find(writer => writer.source === "process-record");
     expect(record).toEqual(expect.objectContaining({ pid: process.pid, host: os.hostname(), name: path.basename(file) }));
     expect(record).not.toHaveProperty("startedAt");
@@ -258,7 +259,7 @@ describe("mesh writer census", () => {
     fs.writeFileSync(path.join(queue, ticket), "");
     const result = await census(mesh);
     expect(fs.existsSync(file)).toBe(true);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     const record = result.unknown.find(writer => writer.source === "process-record");
     expect(record).toEqual(expect.objectContaining({ pid, name: path.basename(file) }));
     expect(record).not.toHaveProperty("host");
@@ -283,7 +284,7 @@ describe("mesh writer census", () => {
     const file = writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), ...fields });
     const result = await census(mesh);
     expect(fs.existsSync(file)).toBe(true);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     const record = result.unknown.find(writer => writer.source === "process-record");
     expect(record).toEqual(expect.objectContaining({ pid: process.pid, host: os.hostname() }));
     if (absent) expect(record).not.toHaveProperty(absent);
@@ -300,7 +301,7 @@ describe("mesh writer census", () => {
         stateBackend: "sqlite", startedAt: now - 1000, ...fields } as never });
     expect(readHostLeases(mesh).get("host:unsupported")?.writer).toBeUndefined();
     const result = await census(mesh);
-    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:unsupported" });
+    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:unsupported", reason: "incomplete or unsupported writer metadata" });
   });
 
   it("counts an unparsable or pid-less record unknown and keeps it", async () => {
@@ -323,7 +324,7 @@ describe("mesh writer census", () => {
     const record = { pid, host: "other-host.example", startedAt: Date.now() - 1000 };
     const file = writeRecord(mesh, record);
     const first = await census(mesh);
-    expect(first.clean).toBe(false);
+    expect(first.unknown).not.toEqual([]);
     expect(first.writers).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
     expect(first.unknown).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
     expect(fs.existsSync(file)).toBe(true);
@@ -333,13 +334,13 @@ describe("mesh writer census", () => {
     writeHostLease(mesh, { id: "host:other", rootId: "session:other", identityId: "identity:other",
       updatedAt: now, expiresAt: now + 60_000, writer });
     const leased = await census(mesh);
-    expect(leased.clean).toBe(true);
+    expect(leased.unknown).toEqual([]);
     expect(leased.writers).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
 
     writeHostLease(mesh, { id: "host:other", rootId: "session:other", identityId: "identity:other",
       updatedAt: now - 120_000, expiresAt: now - 60_000, writer });
     const expired = await census(mesh);
-    expect(expired.clean).toBe(false);
+    expect(expired.unknown).not.toEqual([]);
     expect(expired.unknown).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
   });
 
@@ -348,7 +349,7 @@ describe("mesh writer census", () => {
     { label: "an empty host", host: "", startedAt: Date.now() - 1000 },
     { label: "start time 0", host: "lease-host", startedAt: 0 },
     { label: "a negative start time", host: "lease-host", startedAt: -1 },
-  ])("drops lease writer metadata with $label, so census is not clean", async ({ host, startedAt }) => {
+  ])("drops lease writer metadata with $label, and reports the lease unknown", async ({ host, startedAt }) => {
     const mesh = root();
     const now = Date.now();
     const writer = { pid: process.pid, host, releaseSha: "release-456", lockProtocol: 2, stateBackend: "sqlite", startedAt };
@@ -356,8 +357,8 @@ describe("mesh writer census", () => {
       updatedAt: now, expiresAt: now + 60_000, writer });
     expect(readHostLeases(mesh).get("host:bad")?.writer).toBeUndefined();
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
-    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:bad" });
+    expect(result.unknown).not.toEqual([]);
+    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:bad", reason: "incomplete or unsupported writer metadata" });
   });
 
   it("counts a process record with an empty host or non-positive start time as unknown", async () => {
@@ -372,7 +373,7 @@ describe("mesh writer census", () => {
       updatedAt: now, expiresAt: now + 60_000, writer: { pid: zero, host: "other-host.example", releaseSha: "abc123",
         lockProtocol: 2, stateBackend: "sqlite", startedAt: now - 1000 } });
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     const unknown = result.unknown.filter(writer => writer.source === "process-record");
     expect(unknown).toHaveLength(2);
     const bad = unknown.find(writer => writer.pid === empty)!;
@@ -392,7 +393,7 @@ describe("mesh writer census", () => {
     writeHostLease(mesh, { id: "host:reused", rootId: "session:reused", identityId: "identity:reused",
       updatedAt: now, expiresAt: now + 60_000, writer });
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toEqual([expect.objectContaining({ ...stale, source: "process-record" })]);
     // The new process is listed in its own right, not merged into the stale record.
     expect(result.writers).toContainEqual(expect.objectContaining({ ...writer, source: "host-lease", name: "host:reused" }));
@@ -410,19 +411,22 @@ describe("mesh writer census", () => {
       expect.objectContaining({ host: os.hostname(), startedAt: meshProcessStartedAt, source: "process-record" })]);
   });
 
-  it("refuses a sqlite or shadow backend when the census record cannot be written, after one retry", () => {
+  it("opens a sqlite or shadow backend when the census record cannot be written (advisory, smarty-dev#6982)", async () => {
     const mesh = root();
     // A regular file where the record directory belongs: every attempt fails.
     fs.writeFileSync(path.join(mesh, ".writer-census"), "");
     const mkdir = vi.spyOn(fs, "mkdirSync");
     for (const stateBackend of ["sqlite", "shadow"] as const) {
       mkdir.mockClear();
-      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
-        .toThrow(new RegExp(`cannot record this process in the writer census.*refusing to open the ${stateBackend} state backend`));
-      expect(mkdir.mock.calls.filter(([dir]) => String(dir).endsWith(".writer-census"))).toHaveLength(2);
+      const store = new MeshStore(mesh, 4096, 100, { stateBackend });
+      try {
+        expect(store.stateBackend).toBe(stateBackend);
+        expect(mkdir.mock.calls.filter(([dir]) => String(dir).endsWith(".writer-census"))).toHaveLength(2);
+        await store.put({ key: "census/advisory", value: stateBackend, identity: { id: "t", name: "t", kind: "agent" } });
+        // The unrecorded writer shows up in the report instead.
+        expect((await census(mesh)).unknown).not.toEqual([]);
+      } finally { store.closeState(); }
     }
-    // File mode stays available: its writes take .lock, which the census counts.
-    expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
   });
 
   it("retries a failed census record write once and opens the sqlite backend", async () => {
@@ -500,15 +504,16 @@ describe("mesh writer census", () => {
       lockProtocol: 2, stateBackend: "file", startedAt: meshProcessStartedAt + 1 }) },
     { label: "an unsupported backend", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
       lockProtocol: 2, stateBackend: "redis", startedAt: meshProcessStartedAt }) },
-  ])("fails closed on an existing $label record instead of trusting or overwriting it", ({ text }) => {
+  ])("neither trusts nor overwrites an existing $label record, and still opens the store", ({ text }) => {
     const mesh = root();
     const directory = path.join(mesh, ".writer-census");
     fs.mkdirSync(directory);
     const file = path.join(directory, censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
     fs.writeFileSync(file, text);
     for (const stateBackend of ["sqlite", "shadow"] as const) {
-      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
-        .toThrow(new RegExp(`cannot record this process in the writer census.*not this process's valid record.*refusing to open the ${stateBackend}`));
+      const store = new MeshStore(mesh, 4096, 100, { stateBackend });
+      expect(store.stateBackend).toBe(stateBackend);
+      store.closeState();
     }
     expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
     expect(fs.readFileSync(file, "utf8")).toBe(text);
@@ -523,18 +528,18 @@ describe("mesh writer census", () => {
     const ticket = `${"3".repeat(24)}-${pid}-01234567-89ab-cdef-0123-456789abcdef`;
     fs.writeFileSync(path.join(queue, ticket), "");
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid, host: "other-host.example",
       evidence: [`lock-ticket:${ticket}`] }));
   });
 
-  it("treats a missing census directory on a root without SQLite state as an old release, and is clean", async () => {
+  it("treats a missing census directory on a root without SQLite state as an old release, and reports nothing", async () => {
     const result = await census(root());
-    expect(result).toEqual({ writers: [], unknown: [], clean: true });
+    expect(result).toEqual({ writers: [], unknown: [] });
   });
 
-  // smarty-dev#6982: census() is clean only on positive proof. Every row is one way a review round
-  // (pi-fabric#638 rounds 3-6, and the #6982 audit) found or could find clean:true without proof.
+  // smarty-dev#6982: the census is advisory. Every row is one way a review round (pi-fabric#638
+  // rounds 3-9, and the #6982 audit) found hidden evidence; the report must list it as unknown.
   const identity = { id: "census-test", name: "census-test", kind: "agent" } as const;
   const sqliteStore = async (mesh: string, backend: "sqlite" | "shadow" = "sqlite"): Promise<MeshStore> => {
     const store = new MeshStore(mesh, 4096, 100, { stateBackend: backend });
@@ -554,14 +559,14 @@ describe("mesh writer census", () => {
   };
   const ownWriter = (result: Awaited<ReturnType<typeof census>>) =>
     result.writers.filter(writer => writer.pid === process.pid && writer.source === "process-record");
-  const proofCases: { label: string; clean: boolean; linux?: boolean;
+  const proofCases: { label: string; reportsUnknown: boolean; linux?: boolean;
     setup: (mesh: string, close: Array<() => void>) => Promise<void> | void;
     check?: (result: Awaited<ReturnType<typeof census>>, mesh: string) => void }[] = [
-    { label: "legacy root: no census, no SQLite state", clean: true, setup: () => {} },
-    { label: "a live sqlite writer with its record (the proof)", clean: true,
+    { label: "legacy root: no census, no SQLite state", reportsUnknown: false, setup: () => {} },
+    { label: "a live sqlite writer with its record (the proof)", reportsUnknown: false,
       setup: async (mesh, close) => { const store = await sqliteStore(mesh); close.push(() => store.closeState()); },
       check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite" })]) },
-    { label: "round 3: a file writer that later opened sqlite reports sqlite", clean: true,
+    { label: "round 3: a file writer that later opened sqlite reports sqlite", reportsUnknown: false,
       setup: async (mesh, close) => {
         const plain = new MeshStore(mesh, 4096, 100, { stateBackend: "file" });
         const store = await sqliteStore(mesh);
@@ -569,7 +574,7 @@ describe("mesh writer census", () => {
       },
       check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite",
         stateBackends: ["file", "sqlite"] })]) },
-    { label: "round 4: a sqlite writer through a symlink alias outlives the root's store", clean: true,
+    { label: "round 4: a sqlite writer through a symlink alias outlives the root's store", reportsUnknown: false,
       setup: async (mesh, close) => {
         const alias = path.join(root(), "alias");
         fs.symlinkSync(mesh, alias, process.platform === "win32" ? "junction" : "dir");
@@ -579,11 +584,11 @@ describe("mesh writer census", () => {
         close.push(() => aliased.closeState());
       },
       check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite" })]) },
-    { label: "round 5: an unreadable census directory", clean: false,
+    { label: "round 5: an unreadable census directory", reportsUnknown: true,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() }); denyRead(path.join(mesh, ".writer-census")); } },
-    { label: "round 5: an unreadable record", clean: false,
+    { label: "round 5: an unreadable record", reportsUnknown: true,
       setup: mesh => denyRead(writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() })) },
-    { label: "round 6: a live sqlite writer's census directory removed", clean: false,
+    { label: "round 6: a live sqlite writer's census directory removed", reportsUnknown: true,
       setup: async (mesh, close) => {
         const store = await sqliteStore(mesh);
         close.push(() => store.closeState());
@@ -592,57 +597,57 @@ describe("mesh writer census", () => {
       check: (result, mesh) => expect(result.unknown).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: "process-record", reason: expect.stringMatching(/ENOENT on a root with state\.db/) }),
         expect.objectContaining({ source: "state-database", name: path.join(mesh, "state.db-wal") })])) },
-    { label: "a live shadow writer's census directory removed", clean: false,
+    { label: "a live shadow writer's census directory removed", reportsUnknown: true,
       setup: async (mesh, close) => {
         const store = await sqliteStore(mesh, "shadow");
         close.push(() => store.closeState());
         fs.rmSync(path.join(mesh, ".writer-census"), { recursive: true });
       } },
-    { label: "a root with state.db but no census at all", clean: false, setup: mesh => { fs.writeFileSync(path.join(mesh, "state.db"), ""); } },
-    { label: "a root with a shadow database but no census at all", clean: false, setup: mesh => { fs.mkdirSync(path.join(mesh, "state-shadow")); } },
-    { label: "a live sqlite writer's record deleted", clean: false,
+    { label: "a root with state.db but no census at all", reportsUnknown: true, setup: mesh => { fs.writeFileSync(path.join(mesh, "state.db"), ""); } },
+    { label: "a root with a shadow database but no census at all", reportsUnknown: true, setup: mesh => { fs.mkdirSync(path.join(mesh, "state-shadow")); } },
+    { label: "a live sqlite writer's record deleted", reportsUnknown: true,
       setup: async (mesh, close) => {
         const store = await sqliteStore(mesh);
         close.push(() => store.closeState());
         fs.rmSync(ownRecord(mesh));
       } },
-    { label: "a live sqlite writer's record renamed out of the .json namespace", clean: false,
+    { label: "a live sqlite writer's record renamed out of the .json namespace", reportsUnknown: true,
       setup: async (mesh, close) => {
         const store = await sqliteStore(mesh);
         close.push(() => store.closeState());
         fs.renameSync(ownRecord(mesh), `${ownRecord(mesh)}.bak`);
       } },
-    { label: "a partial (torn) record", clean: false,
+    { label: "a partial (torn) record", reportsUnknown: true,
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{\"format\":1,\"pid\""); } },
-    { label: "a live writer's record write still in flight", clean: false,
+    { label: "a live writer's record write still in flight", reportsUnknown: true,
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(`${ownRecord(mesh)}.0123456789abcdef.tmp`, "{"); } },
-    { label: "a dead writer's torn temporary (removed)", clean: true,
+    { label: "a dead writer's torn temporary (removed)", reportsUnknown: false,
       setup: mesh => {
         fs.mkdirSync(path.join(mesh, ".writer-census"));
         fs.writeFileSync(path.join(mesh, ".writer-census", `${censusRecordFileName(os.hostname(), deadPid(), 1)}.0123456789abcdef.tmp`), "{");
       },
       check: (_, mesh) => expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]) },
-    { label: "clock skew: a live writer's wall-clock start an hour off is not proof of death", clean: true,
+    { label: "clock skew: a live writer's wall-clock start an hour off is not proof of death", reportsUnknown: false,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() - 3_600_000,
         ...(process.platform === "linux" ? incarnation() : {}) }); },
       check: result => expect(ownWriter(result)).toHaveLength(1) },
-    { label: "pid reuse: same boot, another start tick, is a dead record", clean: true, linux: true,
+    { label: "pid reuse: same boot, another start tick, is a dead record", reportsUnknown: false, linux: true,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(),
         ...incarnation(), startTicks: incarnation().startTicks + 1 }); },
       check: (result, mesh) => {
         expect(ownWriter(result)).toEqual([]);
         expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]);
       } },
-    { label: "pid reuse: another boot is a dead record", clean: true, linux: true,
+    { label: "pid reuse: another boot is a dead record", reportsUnknown: false, linux: true,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(),
         ...incarnation(), bootId: "00000000-0000-0000-0000-000000000000" }); },
       check: result => expect(ownWriter(result)).toEqual([]) },
-    { label: "SQLite connection files left by a crashed or unrecorded writer", clean: false, setup: mesh => sqliteResidue(mesh) },
-    { label: "shadow connection files without a shadow writer", clean: false,
+    { label: "SQLite connection files left by a crashed or unrecorded writer", reportsUnknown: true, setup: mesh => sqliteResidue(mesh) },
+    { label: "shadow connection files without a shadow writer", reportsUnknown: true,
       setup: mesh => sqliteResidue(mesh, path.join("state-shadow", "state.db")) },
-    { label: "mixed: a legacy sqlite writer's open database beside a recorded file writer", clean: false,
+    { label: "mixed: a legacy sqlite writer's open database beside a recorded file writer", reportsUnknown: true,
       setup: mesh => { sqliteResidue(mesh); writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), stateBackend: "file" }); } },
-    { label: "round 8: a pre-census remote writer's lock owner and ticket, pid not live here, no metadata", clean: false,
+    { label: "round 8: a pre-census remote writer's lock owner and ticket, pid not live here, no metadata", reportsUnknown: true,
       setup: mesh => {
         const pid = deadPid();
         const token = "01234567-89ab-cdef-0123-456789abcdef";
@@ -660,7 +665,19 @@ describe("mesh writer census", () => {
         expect(writer?.evidence).toEqual(["lock-owner:01234567-89ab-cdef-0123-456789abcdef",
           `lock-ticket:${"5".repeat(24)}-${writer?.pid}-01234567-89ab-cdef-0123-456789abcdef`]);
       } },
-    { label: "mixed: a legacy live lock owner beside a recorded new writer", clean: false,
+    { label: "round 9: a lock owner whose pid matches a live recorded local writer is ambiguous", reportsUnknown: true,
+      setup: mesh => {
+        writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), stateBackend: "file" });
+        fs.mkdirSync(path.join(mesh, ".lock"));
+        fs.writeFileSync(path.join(mesh, ".lock", "owner"), `maybe-remote\n${process.pid}\n${Date.now()}\n`);
+      },
+      check: result => {
+        // Reported against the local writer as a guess, and as unknown, never silently attributed.
+        expect(ownWriter(result)).toEqual([expect.objectContaining({ evidence: ["lock-owner:maybe-remote"] })]);
+        expect(result.unknown).toEqual([{ pid: process.pid, source: "lock-owner", name: "maybe-remote",
+          reason: expect.stringMatching(/attributed by pid only; pid-only lock evidence cannot be attributed safely/) }]);
+      } },
+    { label: "mixed: a legacy live lock owner beside a recorded new writer", reportsUnknown: true,
       setup: mesh => {
         writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), stateBackend: "file" });
         fs.mkdirSync(path.join(mesh, ".lock"));
@@ -668,7 +685,7 @@ describe("mesh writer census", () => {
       } },
   ];
 
-  it.each(proofCases)("positive proof: $label -> clean $clean", async ({ clean, linux, setup, check }) => {
+  it.each(proofCases)("report: $label -> unknown evidence $reportsUnknown", async ({ reportsUnknown, linux, setup, check }) => {
     if (linux && process.platform !== "linux") return;
     const mesh = root();
     const close: Array<() => void> = [];
@@ -677,8 +694,9 @@ describe("mesh writer census", () => {
     try {
       await setup(mesh, close);
       const result = await census(mesh);
-      expect(result.clean, JSON.stringify(result.unknown)).toBe(clean);
-      expect(result.clean).toBe(result.unknown.length === 0);
+      expect(result.unknown.length > 0, JSON.stringify(result.unknown)).toBe(reportsUnknown);
+      for (const item of result.unknown) expect(item.reason, JSON.stringify(item)).toEqual(expect.any(String));
+      expect(Object.keys(result).sort()).toEqual(["unknown", "writers"]);
       check?.(result, mesh);
     } finally {
       for (const done of close) done();
@@ -686,29 +704,29 @@ describe("mesh writer census", () => {
     }
   });
 
-  it("is not clean when the census directory exists but cannot be listed", async () => {
+  it("reports unknown evidence when the census directory exists but cannot be listed", async () => {
     const mesh = root();
     const directory = path.join(mesh, ".writer-census");
     writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() });
     denyRead(directory);
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "process-record", name: directory,
       reason: `${directory}: EACCES` }));
   });
 
-  it("is not clean when a census record exists but cannot be read", async () => {
+  it("reports unknown evidence when a census record exists but cannot be read", async () => {
     const mesh = root();
     const file = writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() });
     denyRead(file);
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "process-record", name: path.basename(file),
       reason: `${file}: EACCES` }));
     expect(fs.existsSync(file)).toBe(true);
   });
 
-  it("is not clean when the host-lease directory or a lease cannot be read, or a lease is invalid", async () => {
+  it("reports unknown evidence when the host-lease directory or a lease cannot be read, or a lease is invalid", async () => {
     const mesh = root();
     const now = Date.now();
     writeHostLease(mesh, { id: "host:denied", rootId: "session:denied", identityId: "identity:denied",
@@ -718,7 +736,7 @@ describe("mesh writer census", () => {
     denyRead(leaseFile!);
     fs.writeFileSync(path.join(leases, "torn.json"), "{");
     let result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toEqual(expect.arrayContaining([
       expect.objectContaining({ source: "host-lease", reason: `${leaseFile}: EACCES` }),
       expect.objectContaining({ source: "host-lease", reason: `${path.join(leases, "torn.json")}: invalid` })]));
@@ -726,33 +744,69 @@ describe("mesh writer census", () => {
     fs.mkdirSync(path.join(other, "host-leases"));
     denyRead(path.join(other, "host-leases"));
     result = await census(other);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "host-lease",
       reason: `${path.join(other, "host-leases")}: EACCES` }));
   });
 
-  it("is not clean when the lock owner is unreadable or names no valid pid", async () => {
+  it("reports unknown evidence when the lock owner is unreadable or names no valid pid", async () => {
     const mesh = root();
     const owner = path.join(mesh, ".lock", "owner");
     fs.mkdirSync(path.dirname(owner));
     fs.writeFileSync(owner, "token\nnot-a-pid\n");
     let result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-owner", reason: `${owner}: invalid` }));
     fs.writeFileSync(owner, `token\n${deadPid()}\n${Date.now()}\n`);
     denyRead(owner);
     result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-owner", reason: `${owner}: EACCES` }));
   });
 
-  it("is not clean when the lock queue exists but cannot be listed", async () => {
+  it("reports unknown evidence when the lock queue exists but cannot be listed", async () => {
     const mesh = root();
     const queue = meshLockQueueDirectory(mesh);
     fs.mkdirSync(queue, { recursive: true });
     denyRead(queue);
     const result = await census(mesh);
-    expect(result.clean).toBe(false);
+    expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ source: "lock-ticket", reason: `${queue}: EACCES` }));
+  });
+
+  it("is advisory: no exported gate and no verdict in the report (smarty-dev#6982)", async () => {
+    expect(Object.keys(writerCensus).sort()).toEqual(["census"]);
+    const mesh = root();
+    fs.mkdirSync(path.join(mesh, ".lock"));
+    fs.writeFileSync(path.join(mesh, ".lock", "owner"), `token\n${process.pid}\n${Date.now()}\n`);
+    writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
+    for (const result of [await census(root()), await census(mesh)]) {
+      expect(Object.keys(result).sort()).toEqual(["unknown", "writers"]);
+      for (const key of ["clean", "safe", "ok", "isClean", "safeToCutover"]) expect(result).not.toHaveProperty(key);
+      for (const value of Object.values(result)) expect(typeof value).not.toBe("boolean");
+    }
+  });
+
+  it("changes no store behaviour on unknown evidence, and nothing in src consumes the census", async () => {
+    const mesh = root();
+    fs.mkdirSync(path.join(mesh, ".writer-census"));
+    fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
+    writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
+    expect((await census(mesh)).unknown.length).toBeGreaterThan(0);
+    for (const stateBackend of ["file", "sqlite", "shadow"] as const) {
+      const store = new MeshStore(mesh, 4096, 100, { stateBackend });
+      try {
+        await store.put({ key: `census/${stateBackend}`, value: 1, identity });
+        expect(store.get(`census/${stateBackend}`)?.value).toBe(1);
+      } finally { store.closeState(); }
+    }
+    // No startup, CLI or migration path imports the census: it can only be called for a report.
+    const importers = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) return importers(file);
+      return /\.[cm]?ts$/.test(entry.name) && file !== path.join("src", "mesh", "writer-census.ts") &&
+        /writer-census\.js["']/.test(fs.readFileSync(file, "utf8")) ? [file] : [];
+    });
+    expect(importers("src")).toEqual([]);
   });
 });

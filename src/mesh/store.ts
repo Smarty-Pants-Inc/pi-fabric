@@ -207,8 +207,8 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
 
 /**
  * Records this process in the census (one retry); returns the record's directory identity (the
- * key closeState() releases), or the failure. The caller fails closed for a backend whose writes
- * the census could not otherwise see.
+ * key closeState() releases), or the failure. The writer census is advisory (smarty-dev#6982), so
+ * a failed record never stops the store: the census then reports its evidence as unknown.
  */
 const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): { identity: string } | { error: unknown } => {
   const directory = path.join(root, ".writer-census");
@@ -276,20 +276,10 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    // Best effort: the writer census is advisory, never a gate (smarty-dev#6982), so a failed
+    // record changes nothing here; the census reports the writer's evidence as unknown instead.
     const recorded = recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
-    const unrecorded = "error" in recorded ? recorded.error : undefined;
     if ("identity" in recorded) this.#censusRecord = recorded.identity;
-    // A process the census cannot see must not write where only the census would see it (pi-fabric#638).
-    // A sqlite or shadow writer takes no .lock for state, so without its record the census may
-    // report clean while it writes: refuse that backend (fail closed). A file-mode writer may go
-    // on: every state write takes .lock, whose owner record and queue ticket census() counts as an
-    // unknown writer while it waits or writes, and cutover fences writers on .lock in any case.
-    if (unrecorded !== undefined && this.#state.kind !== "file") {
-      this.#state.close();
-      const reason = unrecorded instanceof Error ? unrecorded.message : String(unrecorded);
-      throw new Error(`Fabric mesh: cannot record this process in the writer census (${path.join(root, ".writer-census")}): ` +
-        `${reason}; refusing to open the ${this.#state.kind} state backend`, { cause: unrecorded });
-    }
   }
 
   get lockProtocol(): MeshLockProtocol {

@@ -1,3 +1,13 @@
+/**
+ * Mesh writer census (smarty-dev#6477 L4a, pi-fabric#638).
+ *
+ * Advisory only (smarty-dev#6982): never a cutover gate; pid-only lock evidence cannot be attributed safely.
+ * It reports what it sees, for logs and operators: the writers it found (release, lock protocol,
+ * state backends) and every piece of evidence it could not attribute or trust, each with a reason.
+ * There is deliberately no clean/safe verdict: a lock owner or queue ticket names only a pid, so a
+ * remote writer whose pid matches a live local writer is indistinguishable from it (review round 9).
+ * Nothing may block, permit or change behaviour on this report.
+ */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,14 +34,17 @@ export interface CensusWriter {
   name?: string;
   /** Owner receipt/ticket names that corroborate this process. */
   evidence?: string[];
-  /** Why the census could not read or trust this evidence ("path: errno", "path: invalid"). */
+  /** Why the census could not read, trust or attribute this evidence ("path: errno", "path: invalid"). */
   reason?: string;
 }
 
-export interface WriterCensus {
+/** Evidence the census could not read, trust or attribute, with the reason. */
+export type CensusUnknown = CensusWriter & { reason: string };
+
+/** A descriptive report, not a verdict: an empty `unknown` proves nothing (smarty-dev#6982). */
+export interface WriterCensusReport {
   writers: CensusWriter[];
-  unknown: CensusWriter[];
-  clean: boolean;
+  unknown: CensusUnknown[];
 }
 
 const backendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
@@ -93,22 +106,23 @@ const writerKey = (writer: CensusWriter): string => writer.pid === undefined
   : `pid:${writer.host ?? "?"}:${writer.pid}:${writer.startedAt ?? "?"}`;
 
 /**
- * Snapshot current writer leases plus live legacy lock evidence for the L4b cutover tool.
+ * Advisory snapshot of current writer leases plus live legacy lock evidence, for logs and operators.
  * Liveness (pid alive, same /proc incarnation) is judged only for exactly this host's records with
  * valid metadata, and only those are deleted when dead (best effort, `censusRecordPrunable`).
  * Another host's pid proves nothing here: its record is never dropped, and is unknown unless an
  * unexpired host lease names that writer: same host, pid and start time (a lease of a later process
  * that reused the pid does not vouch for the record). A record without a valid host, pid or start time, or
- * with unsupported metadata, is retained and counted unknown (fail closed).
+ * with unsupported metadata, is retained and reported unknown.
  * A lock owner or queue ticket names only a pid: it is attributed to a writer by that pid (live here, or
  * another host's record or lease), and evidence no writer names is unknown, never dropped as dead.
  * Only an absent file or directory (ENOENT) is no evidence: any other read failure of the census
  * directory, a record, a host lease, the lock owner or the lock queue, and an owner record without
- * a valid pid, is counted unknown with its path and errno, so the census is never clean on it.
+ * a valid pid, is reported unknown with its path and errno. Lock evidence attributed to a writer
+ * record by pid alone is also reported unknown: the pid may be another host's writer.
  */
-export async function census(root: string): Promise<WriterCensus> {
+export async function census(root: string): Promise<WriterCensusReport> {
   const writers: CensusWriter[] = [];
-  const unknown: CensusWriter[] = [];
+  const unknown: CensusUnknown[] = [];
   const seen = new Set<string>();
   const host = os.hostname();
   const now = Date.now();
@@ -138,7 +152,9 @@ export async function census(root: string): Promise<WriterCensus> {
       writer.evidence = [`${writer.source}:${writer.name ?? "unknown"}`];
     }
     writers.push(writer);
-    if (!isKnown(writer) || (foreign(writer) && !leased(writer))) unknown.push(writer);
+    const reason = writer.reason ?? (!isKnown(writer) ? "incomplete or unsupported writer metadata"
+      : foreign(writer) && !leased(writer) ? `writer on ${writer.host} without a matching unexpired host lease` : undefined);
+    if (reason !== undefined) unknown.push(Object.assign(writer, { reason }));
   };
   const addLockEvidence = (pid: number, source: "lock-owner" | "lock-ticket", name: string | undefined): void => {
     const metadata = byPid.get(pid) ?? [];
@@ -147,8 +163,14 @@ export async function census(root: string): Promise<WriterCensus> {
     const alive = processAlive(pid);
     if (alive) add({ ...(mine ? leaseWriter(mine) : { pid }), source, ...(name ? { name } : {}) });
     // A same-pid writer on another (or an unnamed) host may own this evidence: never treat it as
-    // dead (fail closed).
+    // dead.
     for (const record of others) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
+    // pi-fabric#638 round 9: attribution by pid alone is a guess. A remote writer whose pid matches a
+    // live local writer (or another recorded writer) leaves the same owner and ticket: report it.
+    if ((alive && mine) || others.length > 0) {
+      unknown.push({ pid, source, ...(name ? { name } : {}),
+        reason: `${source} ${name ?? "unknown"}: pid ${pid} is attributed by pid only; pid-only lock evidence cannot be attributed safely` });
+    }
     // pi-fabric#638 round 8: lock owners and tickets name a pid but no host or boot, so a pid not
     // live here never proves the evidence is this host's dead process: a pre-census remote writer
     // leaves exactly this. Evidence no writer record or lease names is unknown, never dropped.
@@ -244,13 +266,13 @@ export async function census(root: string): Promise<WriterCensus> {
     }
   }
 
-  // An open SQLite connection must be some known writer's: without one, it is an unrecorded
-  // writer (a deleted record, a legacy release, a crash that left the files; fail closed).
-  const sqliteWriter = writers.some(writer => !unknown.includes(writer) &&
+  // An open SQLite connection should be some known writer's: without one, report it as an
+  // unrecorded writer (a deleted record, a legacy release, a crash that left the files).
+  const sqliteWriter = writers.some(writer => !(unknown as CensusWriter[]).includes(writer) &&
     (writer.stateBackends ?? [writer.stateBackend]).some(backend => backend === "sqlite" || backend === "shadow"));
   for (const file of initialized.filter(item => /-(wal|shm)$/.test(item))) {
     if (!sqliteWriter) add({ source: "state-database", name: file, reason: `${file}: open without a known sqlite or shadow writer` });
   }
 
-  return { writers, unknown, clean: unknown.length === 0 };
+  return { writers, unknown };
 }

@@ -682,6 +682,7 @@ export class FabricRuntimeState {
         readActive: () => live.read(ctx => !ctx.isIdle() || ctx.hasPendingMessages()) === true ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
+        stateBackend: this.#config.mesh.stateBackend,
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );

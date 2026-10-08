@@ -77,8 +77,10 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { MeshLockTicket } from "./lock-queue.js";
-import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView, type MeshIdentity,
-  type MeshReadOptions, type MeshStateEntry } from "./store.js";
+// From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
+import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
+  type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
+import type { MeshIdentity } from "./event-log.js";
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -351,6 +353,8 @@ type Statements = ReturnType<typeof prepareStatements>;
 
 const prepareStatements = (db: SqliteConnection) => ({
   metaAll: db.prepare("SELECT name, value FROM meta"),
+  // One statement (one snapshot) of the rows a change stamp and a liveness check need (PK lookups).
+  metaStamp: db.prepare("SELECT name, value FROM meta WHERE name IN ('commit_no', 'epoch', 'backend')"),
   metaGet: db.prepare("SELECT value FROM meta WHERE name = ?"),
   metaSet: db.prepare("UPDATE meta SET value = ? WHERE name = ?"),
   kvGet: db.prepare("SELECT key, value, version, updated_at, updated_by, bytes FROM kv WHERE key = ?"),
@@ -445,9 +449,13 @@ export class SqliteStateStore {
     }
   }
 
-  /** Opens (creating when absent) `<root>/state.db`. Initialisation retries asynchronously while busy. */
+  /**
+   * Opens (creating when absent) `<root>/state.db`. Initialisation (WAL setup, schema, seed) retries
+   * asynchronously while busy, for `initTimeoutMs` (default `lockTimeoutMs`); then the driver's busy
+   * error is thrown. `initTimeoutMs` bounds only this open, never the store's later writes.
+   */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
-    options: SqliteStateStoreOptions = {}): Promise<SqliteStateStore> {
+    options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -457,7 +465,7 @@ export class SqliteStateStore {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = (options.open ?? openNodeSqlite)(file);
-    const deadline = Date.now() + Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
+    const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
       for (;;) {
@@ -473,6 +481,28 @@ export class SqliteStateStore {
         }
       }
     } catch (error) {
+      try { db.close(); } catch { /* best effort */ }
+      throw error;
+    }
+  }
+
+  /**
+   * One synchronous open attempt (lane L2a: the first synchronous read of a sqlite-backed MeshStore).
+   * Throws the driver's busy error unchanged; the caller decides whether and how to retry.
+   */
+  static openSync(root: string, maxEventBytes: number, maxReadEvents: number,
+    options: SqliteStateStoreOptions = {}): SqliteStateStore {
+    const refusal = filesystemRefusal(root);
+    if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const file = path.join(root, "state.db");
+    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const db = (options.open ?? openNodeSqlite)(file);
+    try {
+      return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, initialise(db, options), options);
+    } catch (error) {
+      if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
       try { db.close(); } catch { /* best effort */ }
       throw error;
     }
@@ -499,10 +529,27 @@ export class SqliteStateStore {
     return this.#scan(prefix);
   }
 
-  /** Changes whenever any connection commits a state change: `<store>:<epoch>:<commit>` (review-opus P1-6). */
+  /**
+   * Changes whenever any connection commits a state change (review-opus P1-6) OR retires or
+   * re-epochs the database: `<store>:<epoch>:<commit>` with the CURRENT epoch read from state.db,
+   * plus `:<backend>:<opened epoch>` once this store no longer reads a live database. Retirement
+   * leaves commit_no unchanged, so a stamp built from the epoch this store opened would let a cache
+   * keyed on it outlive the retirement (pi-fabric#626 review round 3). One statement: the
+   * backend, epoch and commit come from one snapshot.
+   */
   stateStamp(): string {
     this.#assertOpen();
-    return `${this.#storeId}:${this.#epoch}:${Number(this.#sql.metaGet.get("commit_no")?.value ?? 0)}`;
+    const meta = this.#stampMeta();
+    const live = meta.backend === "sqlite" && meta.epoch === this.#epoch;
+    return `${this.#storeId}:${meta.epoch}:${meta.commit}${live ? "" : `:${meta.backend}:${this.#epoch}`}`;
+  }
+
+  /**
+   * Throws MeshStateRetiredError when state.db was retired or re-epoched since this store opened it
+   * (cheap: a full check only after another connection committed). For readers that serve a copy.
+   */
+  assertLive(): void {
+    this.#assertReadable();
   }
 
   /** Cheap per-connection "did another connection commit?" counter (PRAGMA data_version). */
@@ -515,7 +562,8 @@ export class SqliteStateStore {
   changesSince(after: number): SqliteStateChanges {
     this.#assertReadable();
     return this.#readTransaction(() => {
-      const commit = Number(this.#sql.metaGet.get("commit_no")?.value ?? 0);
+      // Retirement re-checked in the feed's own read transaction (pi-fabric#626 review round 3).
+      const { commit } = this.#assertLiveMeta(this.#stampMeta());
       const oldest = this.#sql.changesOldest.get()?.oldest;
       const complete = after >= commit || (oldest !== null && oldest !== undefined && Number(oldest) <= after + 1);
       const changes = complete ? this.#sql.changesSince.all(after).map(row => ({
@@ -525,11 +573,17 @@ export class SqliteStateStore {
     });
   }
 
-  /** One consistent snapshot in the file store's envelope shape; also works on a retired database. */
-  exportState(): SqliteStateExport {
+  /**
+   * One consistent snapshot in the file store's envelope shape. Maintenance (rollback, projection)
+   * exports a retired database too; `live: true` (every read path, e.g. a backend snapshot rebuild)
+   * checks retirement and epoch in the SAME read transaction as the rows and throws
+   * MeshStateRetiredError instead of exporting retired state (pi-fabric#626 review round 3).
+   */
+  exportState(options: { live?: boolean } = {}): SqliteStateExport {
     this.#assertOpen();
     return this.#readTransaction(() => {
       const meta = this.#meta();
+      if (options.live) this.#assertLiveMeta(meta);
       const entries: Record<string, MeshStateEntry> = {};
       const versions: Record<string, number> = {};
       for (const row of this.#sql.kvAll.all()) {
@@ -829,9 +883,23 @@ export class SqliteStateStore {
     if (this.#inTransaction) return;
     const version = Number(this.#sql.dataVersion.get()?.data_version ?? 0);
     if (version === this.#dataVersion) return;
-    const meta = this.#meta();
-    if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
+    this.#assertLiveMeta(this.#stampMeta());
     this.#dataVersion = version;
+  }
+
+  #assertLiveMeta<M extends { backend: string; epoch: number }>(meta: M): M {
+    if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
+    return meta;
+  }
+
+  #stampMeta(): { backend: string; epoch: number; commit: number } {
+    const values = new Map<string, unknown>();
+    for (const row of this.#sql.metaStamp.all()) values.set(String(row.name), row.value);
+    return {
+      backend: String(values.get("backend") ?? "missing"),
+      epoch: Number(values.get("epoch") ?? 0),
+      commit: Number(values.get("commit_no") ?? 0),
+    };
   }
 
   #meta(): { highWater: number; commit: number; stateBytes: number; tombstoneOrd: number; backend: string; epoch: number } {

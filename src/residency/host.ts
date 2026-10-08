@@ -308,7 +308,8 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
+        stateBackend: config.mesh.stateBackend });
     // Global order remains registry -> mesh, with the #535 50 ms mesh try.
     // Prepare actor/presence observations BEFORE acquisition, then validate exact
     // atomic registry generations under custody and retain custody through publication.

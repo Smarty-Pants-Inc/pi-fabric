@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MESH_BACKGROUND_RETRY_BASE_MS, MESH_BACKGROUND_RETRY_CAP_MS, MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { retryDelayMs } from "../core/retry-backoff.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
@@ -534,7 +535,8 @@ export interface ParticipantDirectoryOptions {
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
-  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #backgroundRefresh: MeshBackgroundRetry;
+  #leaseExpiresAt: number | undefined;
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
@@ -564,7 +566,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetrying: Promise<void> | undefined;
-  #publicationRetryDelay = 750;
+  #publicationRetryDelay = MESH_BACKGROUND_RETRY_BASE_MS;
+  #publicationRetryMarginLease: number | undefined;
+  #publicationRetryOffHeartbeat = false;
   /** When the last change-driven refresh started (the throttle's reference). */
   #changeRefreshAt = 0;
   /** Whether the refresh in flight renews the lease (a heartbeat) or only publishes changes. */
@@ -600,6 +604,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       : Promise.resolve(undefined);
     this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
+    this.#backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh",
+      MESH_BACKGROUND_RETRY_BASE_MS, MESH_BACKGROUND_RETRY_CAP_MS, {
+        expiresAt: () => this.#leaseExpiresAt,
+        // Lock failures own an exact retry timer, independent of the heartbeat phase.
+        marginMs: MESH_BACKGROUND_RETRY_BASE_MS,
+      });
   }
 
   /** A retired owner lifecycle skips background work; a throwing token is retired too. */
@@ -622,7 +632,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
     this.#refreshError = undefined;
-    this.#publicationRetryDelay = 750;
+    this.#publicationRetryDelay = MESH_BACKGROUND_RETRY_BASE_MS;
+    this.#publicationRetryMarginLease = undefined;
+    this.#publicationRetryOffHeartbeat = false;
+    this.#leaseExpiresAt = undefined;
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
@@ -767,7 +780,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
       this.#cancelPublicationRetry();
-      this.#publicationRetryDelay = 750;
+      this.#publicationRetryDelay = MESH_BACKGROUND_RETRY_BASE_MS;
+      this.#publicationRetryMarginLease = undefined;
+      this.#publicationRetryOffHeartbeat = false;
       this.#routingError = undefined;
       if (full) {
         this.#sweepDeadHosts();
@@ -790,6 +805,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
       lockTimedOut = isMeshLockTimeout(error);
       if (lockTimedOut) {
+        this.#publicationRetryOffHeartbeat ||= !full;
         // A change timer may predate this heartbeat and still be waiting to run.
         // Cancel it too: pending state rides one host-level recovery, not actor retries.
         if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
@@ -815,11 +831,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #schedulePublicationRetry(): void {
-    if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+    if (!this.#timer || this.#closed || this.#quiescing ||
       !isMeshLockTimeout(this.#refreshError) || this.#publicationRetryTimer || this.#publicationRetrying) return;
-    // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
-    const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
-    this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
+    // Not tied to the heartbeat phase: one full-jitter retry for the whole host, bounded
+    // by the last actual renewal rather than an assumed fresh 15 s lease (#7176).
+    const now = Date.now();
+    const expiry = this.#leaseExpiresAt;
+    // Ordinary idle heartbeats already have a coalesced retry cadence. Keep it when
+    // even a full capped cooldown plus the next tick fits inside the actual lease;
+    // an unconditional extra timer increases idle lock attempts (#7176). Pending
+    // changes, FIFO recovery and a short remaining lease need the precise timer.
+    if (!this.options.waitForPublicationRetry && !this.#publicationRetryOffHeartbeat && expiry !== undefined &&
+      expiry - now >= this.#heartbeatMs + MESH_BACKGROUND_RETRY_CAP_MS + MESH_BACKGROUND_RETRY_BASE_MS) return;
+    const remaining = expiry !== undefined && expiry > now
+      ? expiry - now - MESH_BACKGROUND_RETRY_BASE_MS : Number.POSITIVE_INFINITY;
+    let wait = Math.max(1, retryDelayMs(0, this.#publicationRetryDelay, MESH_BACKGROUND_RETRY_CAP_MS));
+    if (remaining > 0) {
+      if (wait >= remaining) this.#publicationRetryMarginLease = expiry;
+      wait = Math.min(wait, remaining);
+    } else if (this.#publicationRetryMarginLease !== expiry) {
+      // Spend the last margin once, not once per millisecond until the lease lapses.
+      this.#publicationRetryMarginLease = expiry;
+      wait = 1;
+    }
+    this.#publicationRetryDelay = Math.min(MESH_BACKGROUND_RETRY_CAP_MS, this.#publicationRetryDelay * 2);
     this.#publicationRetryTimer = setTimeout(() => {
       this.#publicationRetryTimer = undefined;
       if (!this.#live()) return;
@@ -837,7 +872,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       // The failed fence has fully unwound. A FIFO mesh ticket can now wait without
       // occupying either actor registry; admission is not itself a heartbeat receipt.
-      await this.options.waitForPublicationRetry!();
+      await this.options.waitForPublicationRetry?.();
       if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
       // Release mesh BEFORE taking registries. Re-select every actor under fresh
       // registry custody, preserving #504/#531 and the registry -> mesh lock order.
@@ -2152,6 +2187,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: leaseAt,
       expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
     });
+    // Only a successful file write advances the retry budget; a failed publication or
+    // a merely cached local root is not renewal evidence. Main sessions retain their
+    // independent 15 s TTL even when the host has a longer configured lease.
+    this.#leaseExpiresAt = this.#reloadUntil ?? leaseAt + Math.min(this.#leaseMs,
+      this.options.identity.kind === "main" && root?.sessionId ? PARTICIPANT_LEASE_MS : this.#leaseMs);
     return leaseAt;
   }
 

@@ -81,7 +81,8 @@ describe("bridge mirror commit outbox", () => {
     const peer = remote("beta", now);
     // What a bridge that died between COMMIT and its effect leaves: the mirror and its row, no lease.
     const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
-    const lease = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, updatedAt: now, expiresAt: now + 30_000 };
+    const lease = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, startedAt: peer.host.startedAt,
+      updatedAt: now, expiresAt: now + 30_000 };
     await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([{
       kind: "put", key: hostKey(peer.identity.id), identity: peer.identity,
       value: { ...peer.host, updatedAt: now, expiresAt: now + 30_000, remoteHost: "ryzen2" },
@@ -244,6 +245,49 @@ describe("stale lease effect after a replacement mirror (pi-fabric#640 review ro
     expect(liveness.expiresAt).toBe(Math.max(held.expiresAt, replacementLease!.expiresAt));
     expect(liveness.expiresAt).toBeGreaterThan(Date.now());
     expect(readHostLeases(hub.root).get(peer.identity.id)?.startedAt).toBe(held.startedAt);
+  });
+});
+
+describe("legacy outbox rows without an incarnation (pi-fabric#640 review round 3)", () => {
+  it("a legacy lease row replayed after a restarted mirror writes nothing; a legacy unlease row removes nothing", async () => {
+    const hub = store();
+    const now = Date.now();
+    const peer = remote("mu", now);
+    const gone = remote("nu", now);
+    // The same id, root and identity, restarted: the held mirror is the new incarnation.
+    const restarted = { ...peer.host, startedAt: now + 5_000, updatedAt: now + 5_000, remoteHost: "ryzen2" };
+    // Rows of an earlier release: no startedAt. The lease row expires later than the replacement's.
+    const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([{
+      kind: "put", key: hostKey(peer.identity.id), identity: peer.identity, value: restarted,
+    }], [
+      { kind: "lease", key: `lease:${peer.identity.id}`, payload: {
+        id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, updatedAt: now, expiresAt: now + 50_000 } },
+      { kind: "unlease", key: `lease:${gone.identity.id}`, payload: {
+        key: hostKey(gone.identity.id), id: gone.identity.id, rootId: gone.identity.id, identityId: gone.identity.id } },
+    ]) });
+    const replacement = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id,
+      startedAt: restarted.startedAt, updatedAt: now + 5_000, expiresAt: now + 20_000 };
+    writeHostLease(hub.root, replacement);
+    // A lease file without an incarnation, whose state record is absent.
+    const unstamped = { id: gone.identity.id, rootId: gone.identity.id, identityId: gone.identity.id, updatedAt: now, expiresAt: now + 60_000 };
+    writeHostLease(hub.root, unstamped);
+    // Only the replay runs effects: this pass's own afterCommit is dropped.
+    const writeBatch = hub.writeBatch.bind(hub);
+    vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
+      const { afterCommit: _dropped, ...rest } = input;
+      return writeBatch(rest);
+    });
+    const writes = vi.spyOn(fs, "renameSync");
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
+    expect(writes.mock.calls.filter(([, to]) => leaseWrite(String(to)))).toEqual([]);
+    // The replacement's lease and expiry stay as they were; the unstamped lease is not removed.
+    expect(readHostLease(hub.root, peer.identity.id)).toEqual(replacement);
+    expect(readHostLease(hub.root, gone.identity.id)).toEqual(unstamped);
+    // Both legacy rows are retired all the same.
+    expect(hub.get(dead.rowKey(`lease:${gone.identity.id}`), { fresh: true })).toBeUndefined();
+    expect(hub.listAll(dead.prefix, { fresh: true }).map((entry) => (entry.value as { payload: { startedAt?: number } }).payload))
+      .toEqual([expect.objectContaining({ startedAt: restarted.startedAt })]);
   });
 });
 

@@ -195,7 +195,7 @@ const settled = (value: Record<string, unknown>): string =>
 interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number }
 /**
  * A removed mirror's lease identity, as its lease file carries it (root, identity, incarnation).
- * Rows of an older release carry only `key` and `id`: they prove no owner, so they remove nothing.
+ * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
  */
 interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number }
 
@@ -220,7 +220,8 @@ export class StoreBridgeSide implements BridgeSide {
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
       // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
       unlease: (gone: BridgeUnlease, view) => {
-        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string") return;
+        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
+          typeof gone.startedAt !== "number") return;
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
         removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
@@ -634,8 +635,9 @@ export class StoreBridgeSide implements BridgeSide {
     // Only the incarnation the lease was planned for: an overlapping writer may have installed a
     // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
     // and a stale effect must not overwrite its lease (pi-fabric#640 review round 2). A row of an
-    // earlier release carries no incarnation: root and identity decide it, as before.
-    if (lease.startedAt !== undefined && lease.startedAt !== held.startedAt) return;
+    // earlier release carries no incarnation and proves none: it is discarded, and a later pass
+    // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
+    if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt) return;
     // A replayed row never shortens a lease that a later pass already renewed.
     if (replay && (readHostLease(this.store.root, lease.id)?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
     writeHostLease(this.store.root, lease);

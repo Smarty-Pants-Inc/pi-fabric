@@ -48,29 +48,38 @@ export const censusRecordFileName = (host: string, pid: number, startedAt: numbe
 /** This process's census start time (epoch ms), fixed at module load. */
 export const meshProcessStartedAt = Math.floor(Date.now() - process.uptime() * 1000);
 
-let bootTimeMs: number | undefined;
-/** Linux only: the pid's start time in epoch ms from /proc (USER_HZ is 100); else undefined. */
-const procStartedAt = (pid: number): number | undefined => {
+/**
+ * Linux only: a pid's clock-independent incarnation, the kernel boot id and the pid's start time in
+ * clock ticks since boot (/proc/<pid>/stat field 22); else undefined. The wall clock never decides
+ * liveness: it steps (NTP, VM resume), so a start time in epoch ms cannot prove a pid was reused
+ * (smarty-dev#6982).
+ */
+const procIncarnation = (pid: number): { bootId: string; startTicks: number } | undefined => {
   if (process.platform !== "linux") return undefined;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
-    bootTimeMs ??= Number(/^btime\s+(\d+)\s*$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]) * 1000;
-    return Number.isFinite(ticks) && Number.isFinite(bootTimeMs) ? bootTimeMs + ticks * 10 : undefined;
+    const startTicks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return Number.isSafeInteger(startTicks) && bootId.length > 0 ? { bootId, startTicks } : undefined;
   } catch { return undefined; }
 };
+let ownIncarnation: { bootId: string; startTicks: number } | null | undefined;
 
 /**
- * Same-host census liveness (smarty-dev#6477 L4a): the pid is alive and, where /proc tells, is the
- * same incarnation (start within 2 s of the record). A record without startedAt cannot be refuted
- * and stays live (fail closed). Meaningless for another host's pid.
+ * Same-host census liveness (smarty-dev#6477 L4a, smarty-dev#6982): a record's process is dead only
+ * on positive proof: its pid is gone (ESRCH), or the record names its incarnation (bootId,
+ * startTicks) and the live pid is another one (another boot, or the same boot and another start
+ * tick: the pid was reused). Without that proof (no incarnation, no /proc, EPERM) it stays live
+ * (fail closed). Meaningless for another host's pid.
  */
-export const censusRecordAlive = (pid: number, startedAt: unknown): boolean => {
+export const censusRecordAlive = (pid: number, record?: unknown): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
-  const started = procStartedAt(pid);
-  return started === undefined || typeof startedAt !== "number" || Math.abs(started - startedAt) <= 2000;
+  const fields = typeof record === "object" && record !== null ? record as Record<string, unknown> : {};
+  if (typeof fields.bootId !== "string" || fields.bootId.length === 0 || !Number.isSafeInteger(fields.startTicks)) return true;
+  const current = procIncarnation(pid);
+  return current === undefined || (current.bootId === fields.bootId && current.startTicks === fields.startTicks);
 };
 
 /**
@@ -83,7 +92,7 @@ export const censusRecordPrunable = (value: unknown, host = os.hostname()): bool
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return record.format === 1 && validWriterPid(record.pid) && validWriterHost(record.host) && record.host === host &&
-    validWriterStartedAt(record.startedAt) && !censusRecordAlive(record.pid, record.startedAt);
+    validWriterStartedAt(record.startedAt) && !censusRecordAlive(record.pid, record);
 };
 
 /** Best effort: removes this host's census records whose process is gone; never throws. */
@@ -94,11 +103,10 @@ export const pruneDeadCensusRecords = (root: string): void => {
   const host = os.hostname();
   const prefix = `${censusHostSlug(host)}-`;
   for (const name of names) {
-    // This host's records are <hostSlug>-<pid>-<startedAt>.json: another host's are never opened,
-    // and only a name that already looks dead is.
+    // This host's records are <hostSlug>-<pid>-<startedAt>.json: another host's are never opened.
+    // The name carries no incarnation, so only the content can prove a live pid was reused.
     if (!name.startsWith(prefix)) continue;
-    const match = /^(\d+)-(\d+)\.json$/.exec(name.slice(prefix.length));
-    if (!match || censusRecordAlive(Number(match[1]), Number(match[2]))) continue;
+    if (!/^\d+-\d+\.json$/.test(name.slice(prefix.length))) continue;
     const file = path.join(directory, name);
     try {
       if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
@@ -176,8 +184,9 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
       releaseSha = prior.releaseSha;
     }
     const strongest = backends.reduce((a, b) => writerBackendRank[b]! > writerBackendRank[a]! ? b : a);
+    if (ownIncarnation === undefined) ownIncarnation = procIncarnation(process.pid) ?? null;
     const writer = { format: 1, pid: process.pid, host, releaseSha, lockProtocol: Math.min(...protocols),
-      stateBackend: strongest, startedAt: meshProcessStartedAt,
+      stateBackend: strongest, startedAt: meshProcessStartedAt, ...(ownIncarnation ?? {}),
       ...(backends.length > 1 ? { stateBackends: backends } : {}), ...(protocols.length > 1 ? { lockProtocols: protocols } : {}) };
     const serialized = JSON.stringify(writer);
     if (serialized !== text) {

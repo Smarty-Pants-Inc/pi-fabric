@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
-import { censusRecordAlive, censusRecordPrunable } from "./store.js";
+import { censusHostSlug, censusRecordAlive, censusRecordPrunable } from "./store.js";
 import {
   validWriterHost, validWriterLockProtocol, validWriterPid, validWriterReleaseSha, validWriterStartedAt,
   validWriterStateBackend,
@@ -20,7 +20,7 @@ export interface CensusWriter {
   /** Every lock protocol the process opened, when more than one; lockProtocol is the oldest. */
   lockProtocols?: number[];
   startedAt?: number;
-  source: "process-record" | "host-lease" | "lock-owner" | "lock-ticket";
+  source: "process-record" | "host-lease" | "lock-owner" | "lock-ticket" | "state-database";
   name?: string;
   /** Owner receipt/ticket names that corroborate this process. */
   evidence?: string[];
@@ -36,7 +36,15 @@ export interface WriterCensus {
 
 const backendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
 
-const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined);
+const processAlive = (pid: number): boolean => censusRecordAlive(pid);
+
+/**
+ * SQLite state files, durable evidence independent of the census (smarty-dev#6982): any of them
+ * proves the root was initialized for a sqlite or shadow writer, and a -wal or -shm proves a
+ * connection may be open (SQLite removes both when the last connection closes).
+ */
+const DATABASE_FILES = ["state-shadow", ...["state.db", path.join("state-shadow", "state.db")]
+  .flatMap(database => [database, `${database}-wal`, `${database}-shm`])];
 
 const errno = (error: unknown): string => (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
 
@@ -132,21 +140,41 @@ export async function census(root: string): Promise<WriterCensus> {
   };
   const addLockEvidence = (pid: number, source: "lock-owner" | "lock-ticket", name: string | undefined): void => {
     const metadata = byPid.get(pid) ?? [];
-    const mine = metadata.find(record => local(record) && censusRecordAlive(record.pid, record.startedAt));
+    const mine = metadata.find(record => local(record) && censusRecordAlive(record.pid, record));
     if (processAlive(pid)) add({ ...(mine ? leaseWriter(mine) : { pid }), source, ...(name ? { name } : {}) });
     // A same-pid writer on another (or an unnamed) host may own this evidence: never treat it as
     // dead (fail closed).
     for (const record of metadata.filter(record => !local(record))) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
   };
+  const initialized: string[] = [];
+  for (const name of DATABASE_FILES) {
+    const file = path.join(root, name);
+    try { fs.lstatSync(file); initialized.push(file); }
+    catch (error) { if (errno(error) !== "ENOENT") add({ source: "state-database", name: file, reason: `${file}: ${errno(error)}` }); }
+  }
   const directory = path.join(root, ".writer-census");
   let names: string[] = [];
   try { names = fs.readdirSync(directory); }
   catch (error) {
-    // Absent: an old release, before census records. Unreadable: its records are unknown.
+    // Absent on a root without SQLite state: an old release, before census records. Absent on an
+    // initialized root (its records were removed), or unreadable: its records are unknown.
     if (errno(error) !== "ENOENT") add({ source: "process-record", name: directory, reason: `${directory}: ${errno(error)}` });
+    else if (initialized.length > 0) {
+      add({ source: "process-record", name: directory,
+        reason: `${directory}: ENOENT on a root with ${initialized.map(file => path.relative(root, file)).join(", ")}` });
+    }
   }
+  const ownPrefix = `${censusHostSlug(host)}-`;
   for (const name of names) {
-    if (!name.endsWith(".json")) continue;
+    if (!name.endsWith(".json")) {
+      // A record is renamed into place whole: a temporary of this host's dead pid is a torn write.
+      // Anything else (a live writer's write in flight, a renamed record) hides a writer: unknown.
+      const temporary = name.startsWith(ownPrefix) ? /^(\d+)-\d+\.json\.[0-9a-f]+\.tmp$/.exec(name.slice(ownPrefix.length)) : null;
+      if (temporary && !processAlive(Number(temporary[1]))) {
+        try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      } else add({ source: "process-record", name, reason: `${path.join(directory, name)}: not a census record` });
+      continue;
+    }
     let text: string;
     try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
     catch (error) {
@@ -203,6 +231,14 @@ export async function census(root: string): Promise<WriterCensus> {
       const where = queue ?? root;
       add({ source: "lock-ticket", name: where, reason: `${where}: ${errno(error)}` });
     }
+  }
+
+  // An open SQLite connection must be some known writer's: without one, it is an unrecorded
+  // writer (a deleted record, a legacy release, a crash that left the files; fail closed).
+  const sqliteWriter = writers.some(writer => !unknown.includes(writer) &&
+    (writer.stateBackends ?? [writer.stateBackend]).some(backend => backend === "sqlite" || backend === "shadow"));
+  for (const file of initialized.filter(item => /-(wal|shm)$/.test(item))) {
+    if (!sqliteWriter) add({ source: "state-database", name: file, reason: `${file}: open without a known sqlite or shadow writer` });
   }
 
   return { writers, unknown, clean: unknown.length === 0 };

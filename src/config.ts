@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
@@ -1191,6 +1192,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
                 }
                 return { ...routing.revertReset as Record<string, string> };
               })(),
+              ...(routing.perCall !== undefined ? { perCall: parsePerCallRouting(routing.perCall) } : {}),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1758,6 +1760,12 @@ const resolveFabricConfig = (
       delete landlock.disabled; // Host-only fleet kill switch wins over lane config.
       executor.landlock = landlock;
       document.executor = executor;
+      if (Object.hasOwn(document, "jev")) {
+        // Host-only: a lane cannot redirect Jev questions to another socket.
+        const jev = { ...objectValue(document.jev) };
+        delete jev.gatewaySocket;
+        document.jev = jev;
+      }
     }
     merged = mergeObjects(merged, document);
   }

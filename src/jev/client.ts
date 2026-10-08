@@ -5,6 +5,33 @@ import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
 import { JEV_TYPESAFE_ROUTE, resolveJevUpstreamModel, type JevRoute } from "./routes.js";
 import { checkRequest, checkResponse, jsonText } from "./validation.js";
+import { createGatewaySocketTransport, JevGatewayError, type JevGatewayTransport } from "./gateway-transport.js";
+
+/** The only gateway uses Fabric may spend over jev.gatewaySocket. Every other Jev client (provider, programs,
+ * approvals classifier, model-route owner, judge CLI) keeps its direct route even when the socket is configured;
+ * a client is put on the socket only by naming one of these uses (opt-in, per use). */
+export const JEV_GATEWAY_USES = ["percall_route"] as const;
+export type JevGatewayUse = typeof JEV_GATEWAY_USES[number];
+/** Opt-in gateway binding: the use is fixed per client; the transport defaults to jev.gatewaySocket. */
+export interface JevGatewayBinding {
+  use: JevGatewayUse;
+  /** Test seam; defaults to the Unix-socket transport over config.gatewaySocket. */
+  transport?: JevGatewayTransport;
+}
+export interface JevEvaluateOptions {
+  /** Gateway use for this request; on a gateway-bound client it must equal the bound use (or be omitted).
+   * Ignored on the direct HTTPS route. */
+  use?: string;
+  /** Absolute deadline (epoch ms) for ALL of this request's work. It caps jev.requestTimeoutMs and is sent
+   * to the gateway as `expiresAt`, so neither side keeps working (or charging) past the caller's decision. */
+  deadline?: number;
+}
+/** The effective absolute deadline: the request timeout, capped by the caller's own deadline. */
+export function jevDeadline(requestTimeoutMs: number, deadline?: number, now = Date.now()): number {
+  const own = now + requestTimeoutMs;
+  return deadline !== undefined && Number.isFinite(deadline) ? Math.min(own, deadline) : own;
+}
+const timeoutUntil = (deadline: number): AbortSignal => AbortSignal.timeout(Math.max(1, Math.ceil(deadline - Date.now())));
 
 export interface JevCredentialSource {
   configured(): boolean;
@@ -133,20 +160,40 @@ export class JevClient {
   readonly credentials: JevCredentials;
   /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
   readonly #pendingCredentials = new Set<Promise<string>>();
+  readonly #gateway: { use: JevGatewayUse; transport: JevGatewayTransport } | undefined;
   constructor(
     readonly config: FabricJevConfig,
     private readonly fetcher: typeof fetch = fetch,
     credentials?: JevCredentials,
     readonly route: JevRoute = JEV_TYPESAFE_ROUTE,
+    gateway?: JevGatewayBinding,
   ) {
     this.credentials = credentials ?? new JevCredentials(config.credentialCommand, process.env, undefined, route.envKeys);
+    // jev.gatewaySocket alone never reroutes a client: only an explicit binding to a registered use does.
+    if (gateway) {
+      if (!(JEV_GATEWAY_USES as readonly string[]).includes(gateway.use)) {
+        throw new Error(`Jev gateway use "${String(gateway.use).slice(0, 64)}" is refused: jev.gatewaySocket serves only ${JEV_GATEWAY_USES.join(", ")}`);
+      }
+      const transport = gateway.transport ?? (config.gatewaySocket ? createGatewaySocketTransport(config.gatewaySocket) : undefined);
+      if (!transport) throw new Error("Jev gateway not configured: jev.gatewaySocket is unset");
+      this.#gateway = { use: gateway.use, transport };
+    }
   }
-  async evaluate(request: JevRequest, signal: AbortSignal): Promise<JevResponse> {
+  /** True when evaluations go through the Node's Jev gateway and no credential is read. */
+  get viaGateway(): boolean { return this.#gateway !== undefined; }
+  async evaluate(request: JevRequest, signal: AbortSignal, options: JevEvaluateOptions = {}): Promise<JevResponse> {
     checkRequest(request, this.config.maxRequestBytes);
+    const deadline = jevDeadline(this.config.requestTimeoutMs, options.deadline);
+    if (this.#gateway) {
+      if (options.use !== undefined && options.use !== this.#gateway.use) {
+        throw new Error(`Jev gateway use mismatch: this client is bound to ${this.#gateway.use}`);
+      }
+      return this.#evaluateViaGateway(this.#gateway.transport, request, signal, this.#gateway.use, deadline);
+    }
     const requestedModel = request.model ?? this.config.model;
     const model = resolveJevUpstreamModel(this.route, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available on the ${this.route.label} route`);
-    const timedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]);
+    const timedSignal = AbortSignal.any([signal, timeoutUntil(deadline)]);
     const key = await runAbortable(timedSignal, () => {
       const pending = this.credentials.resolve(timedSignal);
       this.#pendingCredentials.add(pending);
@@ -184,6 +231,43 @@ export class JevClient {
     } catch {
       throw new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
     } finally { await reader.cancel().catch(() => undefined); }
+  }
+  /** The gateway owns the key, the budget and the meter; Fabric sends the exact typed body and reads
+   * the gateway's projection (`{ model, answers: { id: { noul } } }`). Only Noul crosses the socket. */
+  async #evaluateViaGateway(gateway: JevGatewayTransport, request: JevRequest, signal: AbortSignal, use: string, deadline: number): Promise<JevResponse> {
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(use)) throw new Error("Invalid Jev gateway use");
+    if (Object.values(request.questions).some(question => question.type !== "noul")) {
+      throw new Error("The Jev gateway answers Noul questions only");
+    }
+    const requestedModel = request.model ?? this.config.model;
+    const model = resolveJevUpstreamModel(JEV_TYPESAFE_ROUTE, requestedModel);
+    if (!model) throw new Error(`Jev model "${requestedModel}" is not available through the Jev gateway`);
+    const timedSignal = AbortSignal.any([signal, timeoutUntil(deadline)]);
+    const body = jsonText({ model, state: request.state, questions: request.questions }, this.config.maxRequestBytes, "Jev request");
+    let reply: { status: number; body: string };
+    try {
+      reply = await runAbortable(timedSignal, () => gateway.systemone(use, body, timedSignal, deadline));
+    } catch (error) {
+      if (timedSignal.aborted) throw new Error("Jev gateway request cancelled or timed out");
+      throw error instanceof JevGatewayError ? new Error(error.message) : new Error("Jev gateway request failed");
+    }
+    if (reply.status !== 200) {
+      throw new Error(`Jev gateway HTTP ${reply.status}${[429, 529].includes(reply.status) ? ": rate limited; back off before retrying" : ""}`);
+    }
+    const invalid = (): never => { throw new Error("Jev gateway returned an invalid typed response"); };
+    let parsed: unknown;
+    try { parsed = JSON.parse(reply.body); } catch { return invalid(); }
+    const value = parsed as { model?: unknown; answers?: Record<string, { noul?: unknown }> } | null;
+    if (!value || typeof value.model !== "string" || !value.answers || typeof value.answers !== "object") return invalid();
+    if (value.model === "other") throw new Error("Jev gateway: an unpinned model answered");
+    const answers: JevResponse["answers"] = {};
+    for (const id of Object.keys(request.questions)) {
+      const noul = Object.hasOwn(value.answers, id) ? value.answers[id]?.noul : undefined;
+      if (typeof noul !== "number" || !Number.isFinite(noul) || noul < 0 || noul > 1) return invalid();
+      answers[id] = { type: "noul", noul };
+    }
+    // The gateway meters tokens and cost on its side; none cross the socket.
+    return { model: value.model, answers, usage: { input_tokens: 0, output_tokens: 0 } };
   }
   async drainCredentials(): Promise<void> {
     while (this.#pendingCredentials.size) await Promise.allSettled([...this.#pendingCredentials]);

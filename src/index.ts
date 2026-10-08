@@ -52,6 +52,7 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
+import { registerLazyPerCallRouter } from "./agents/per-call-route-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
 import {
@@ -1069,6 +1070,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       state.cwd
         ? state.config.compaction.tokenThresholds[modelKey]
         : DEFAULT_FABRIC_CONFIG.compaction.tokenThresholds[modelKey],
+  });
+
+  // Per-call model routing, shadow only (smarty-dev#2890): inert and unloaded unless
+  // agents.modelRouting.perCall.mode is "shadow"; never changes the model or the context.
+  registerLazyPerCallRouter(pi, () => {
+    const config = state.cwd ? state.config : state.provisionalConfig();
+    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev };
   });
 
   pi.on("context", (event, context) => {

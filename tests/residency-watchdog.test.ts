@@ -209,6 +209,26 @@ describe("resident watchdog", () => {
     } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("never rearms an intentional dead-root idle exit from retained actor/outbox work", async () => {
+    const { root, config, client } = fixture();
+    fs.mkdirSync(config.actorRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.actorRoot, "actors.json"), JSON.stringify({ actors: [
+      { id: "stale", rootId: config.rootId, residency: "durable", status: "idle" },
+    ] }));
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "idle-exit.json"), JSON.stringify({ format: 1,
+      reason: "root-dead-idle", rootId: config.rootId, pid: 123, token: "retired-token", at: Date.now(), idleMs: 600_000 }));
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      await client.close(); vi.useRealTimers(); start.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not launch for another root's actors or terminal agents", async () => {
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });

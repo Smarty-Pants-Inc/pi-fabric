@@ -302,6 +302,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
     "actorPollMs": 250,
+    "residentIdleExitMs": 600000,
     "idleReadCoalesceMs": 5000,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
@@ -767,6 +768,8 @@ to canonical reads. The added UUID/hash fields and sidecar remain backward-compa
 writer cadence and CAS revisions are unchanged. See [mesh state read gates](mesh-state-reads.md).
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
+
+A resident host exits cleanly when its root Main is no longer live (including the existing 180-second reload lease), it owns no actors (including idle or stopped actors), and it has no queued/processing requests or active agents continuously for `mesh.residentIdleExitMs` (default `600000`, 10 minutes; range 0–7 days). `0` disables this exit policy. Actor/request activity or a renewed root lease resets the window. The host logs `resident exiting: root dead, no actors, idle N min`, withdraws its lease, and leaves an intentional-exit marker so its launcher does not restart it. A later explicit spawn or actor-create request clears the marker and starts a new host normally. Accepted same-release configuration updates apply the setting during resident maintenance; rollback is a revert or setting `mesh.residentIdleExitMs` to `0`.
 
 Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
 

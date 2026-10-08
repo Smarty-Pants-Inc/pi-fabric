@@ -89,6 +89,7 @@
     "prepack": "bun run proof:check && bun run typecheck && bun run build",
     "smoke:package-install": "node scripts/smoke-package-install.mjs",
     "benchmark:lock-stats": "bun run build && node scripts/benchmark-lock-stats.mjs",
+    "bench:mesh-lock": "bun run build && node scripts/benchmark-mesh-lock.mjs",
     "load:mesh": "bun scripts/mesh-load.ts"
   },
   "keywords": [

@@ -4,7 +4,7 @@ import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -34,6 +34,7 @@ import {
   removeHostLease,
   STATE_LEASE_RENEW_MS,
   writeHostLease,
+  meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
@@ -2138,6 +2139,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       startedAt: this.#startedAt,
+      // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).
+      writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend, meshProcessStartedAt),
       ...(this.options.identity.kind === "main" && root?.sessionId ? {
         session: {
           id: root.sessionId,

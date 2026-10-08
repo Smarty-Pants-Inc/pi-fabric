@@ -773,10 +773,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("agent_start", async (event) => {
+    fabricUi.setHostStreaming(true);
     if (state.initialized) await state.publishHostLifecycle("pi.agent_start", event);
   });
 
   pi.on("agent_end", async (event) => {
+    fabricUi.setHostStreaming(false);
     if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
   });
 

@@ -75,6 +75,14 @@ const CHANGE_REFRESH_MIN_MS = 1_000;
  * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
  */
 const ACTIVITY_REFRESH_MS = 60_000;
+/**
+ * A stopped actor refuses every message and advertises no routing capability, so a
+ * lease-unaware router gains nothing from a fresh envelope; current readers take its
+ * liveness from the owner's host lease. Its envelope is written when it changes (the
+ * stop) and otherwise renewed only this rarely, far inside the 6 h dead-host window,
+ * instead of once per heartbeat inside the locked shared write (smarty-dev#6729).
+ */
+export const STOPPED_ACTOR_RENEW_MS = 60 * 60 * 1_000;
 /** Ignore noisy model activity, not actor queue/mailbox state needed for live reads (#2726). */
 const QUIET_FIELDS = {
   updatedAt: undefined,
@@ -456,6 +464,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #closed = false;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
+  /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
+  readonly #stoppedRenewedAt = new Map<string, number>();
   /** A successful sequence claim survives discarded preparations for this root. */
   #claimedPeerLabel: string | undefined;
   #refreshScheduled = false;
@@ -1660,9 +1670,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // in the value, and do not turn change-only refreshes into heartbeats (#5128).
       // Shared compatibility readers still need their heartbeat envelopes;
       // files-only actors use the independent lane instead of duplicate writes.
+      // A stopped actor is renewed only when its envelope is old (STOPPED_ACTOR_RENEW_MS);
+      // its stop and any later change still publish through the change check below.
+      const renewedAt = (filesOnly ? filesByKey.get(key) : current?.entry)?.updatedAt;
       const renewActor = full && this.options.renewActorParticipants === true &&
         (!filesOnly || !this.options.actorRenewalAllowed) && !this.#quiescing &&
-        record.kind === "actor" && record.rootId === this.options.rootId;
+        record.kind === "actor" && record.rootId === this.options.rootId &&
+        (record.status !== "stopped" || renewedAt === undefined || now - renewedAt >= STOPPED_ACTOR_RENEW_MS);
       if (!renewActor && (filesOnly
         ? !current && currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
         : current && JSON.stringify(current.participant) === JSON.stringify(record))) continue;
@@ -1940,12 +1954,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#actorRenewing) return this.#actorRenewing;
     if (!this.options.enabled || !this.options.renewActorParticipants || !this.options.actorRenewalAllowed ||
       !this.#leaseConfirmed || this.#closed || this.#quiescing) return Promise.resolve();
-    const records = [...this.#localRecords.values()].filter(record => record.kind === "actor" &&
+    const startedAt = Date.now();
+    const owned = [...this.#localRecords.values()].filter(record => record.kind === "actor" &&
       record.rootId === this.options.rootId && record.actorOwnershipToken !== undefined);
+    for (const id of this.#stoppedRenewedAt.keys()) {
+      if (this.#localRecords.get(id)?.status !== "stopped") this.#stoppedRenewedAt.delete(id);
+    }
+    // Stopped actors: once per instance, then every STOPPED_ACTOR_RENEW_MS (smarty-dev#6729).
+    const records = owned.filter(record => record.status !== "stopped" ||
+      startedAt - (this.#stoppedRenewedAt.get(record.id) ?? -Infinity) >= STOPPED_ACTOR_RENEW_MS);
     const work = (async () => {
       this.#renewFileLease();
       for (const record of records) {
         if (this.#closed || this.#quiescing) return;
+        if (record.status === "stopped") this.#stoppedRenewedAt.set(record.id, startedAt);
         const key = keyFor(PARTICIPANT_PREFIX, record.id);
         try {
           await this.mesh.withTryLock(() => writeParticipantFileIf(this.mesh, key, current => {

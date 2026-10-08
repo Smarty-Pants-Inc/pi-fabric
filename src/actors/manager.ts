@@ -242,6 +242,10 @@ const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
+/** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
+ * rewrites an unchanged entry only this rarely: far inside the 24 h dead-session
+ * presence window, and never once per beat per (often stopped) actor (smarty-dev#6729). */
+export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
 const warnedActivationFilters = new Set<string>();
@@ -503,6 +507,9 @@ export class ActorManager {
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
   readonly #presenceRevisions = new Map<string, object>();
+  /** Serialized presence this instance committed through the host heartbeat. A new
+   * instance (restart) starts empty, so its first full heartbeat republishes all once. */
+  readonly #publishedPresence = new Map<string, string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -939,21 +946,45 @@ export class ActorManager {
       const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
       const ids = new Set(pending.keys());
       if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
+      // A full heartbeat renews every live actor's presence (#4383), but only verifies and
+      // repairs a STOPPED actor's: each put is re-versioned and re-encoded in the locked
+      // shared commit, and a host can own hundreds of stopped actors (smarty-dev#6729).
+      // An unchanged stopped entry this instance committed, still in the shared state as
+      // written, is skipped until PRESENCE_REFRESH_MS. The shared read is lazy, so a
+      // host without stopped actors does exactly what it did before.
+      let shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, sharedRead = false;
+      const sharedPresence = () => {
+        if (!sharedRead) { sharedRead = true; shared = this.#sharedPresence(); }
+        return shared;
+      };
+      const now = Date.now();
+      const written = new Map<string, string | undefined>();
       const ops: MeshBatchOperation[] = [];
       for (const id of ids) {
         const actor = this.#actors.get(id);
         if (actor) {
           if (this.#ownershipDecision(id)) {
             const value = this.#presenceValue(actor);
-            if (value) ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+            if (!value) continue;
+            const serialized = actor.status === "stopped" ? JSON.stringify(value) : undefined;
+            if (full && serialized !== undefined && !pending.has(id) &&
+              this.#presenceUnchanged(id, serialized, sharedPresence(), now)) continue;
+            ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+            // Only stopped presence is remembered; a live put or delete forgets it.
+            written.set(id, serialized);
           }
         } else {
           const fence = this.#orphanPresence.get(id);
           ops.push({ kind: "delete", key: this.#presenceKey(id),
             ...(fence !== undefined ? { ifVersion: fence, onConflict: "skip" as const } : {}) });
+          written.set(id, undefined);
         }
       }
       return { ops, committed: () => {
+        for (const [id, serialized] of written) {
+          if (serialized === undefined) this.#publishedPresence.delete(id);
+          else this.#publishedPresence.set(id, serialized);
+        }
         for (const [id, revision] of pending) {
           // A mutation while the shared write waited belongs to the next refresh.
           if (this.#presenceRevisions.get(id) !== revision) continue;
@@ -963,6 +994,24 @@ export class ActorManager {
         }
       } };
     });
+  }
+
+  /** This session's presence entries from the current (exact-on-change) shared read;
+   * undefined when unreadable, which publishes every owned actor as before. */
+  #sharedPresence(): ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined {
+    try {
+      return new Map(this.mesh.listAllShared(`actors/${this.sessionId}/`).map(entry => [entry.key, entry] as const));
+    } catch {
+      return undefined;
+    }
+  }
+
+  #presenceUnchanged(id: string, serialized: string,
+    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, now: number): boolean {
+    if (!shared || this.#publishedPresence.get(id) !== serialized) return false;
+    const entry = shared.get(this.#presenceKey(id));
+    return entry !== undefined && entry.updatedBy.id === this.identity.id &&
+      now - entry.updatedAt < PRESENCE_REFRESH_MS && JSON.stringify(entry.value) === serialized;
   }
 
   async cede(id: string): Promise<FabricActorInfo> {

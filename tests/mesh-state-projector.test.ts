@@ -264,6 +264,90 @@ describe("state projector (shadow)", () => {
     expect(await projector.verify()).toEqual([]);
   });
 
+  it("publishes a same-version value or metadata repair as a commit that stamp and change-feed readers see", async () => {
+    const root = tempRoot("repair-commit");
+    const file = new MeshStore(root, 64 * 1024, 1_000);
+    await file.put({ key: "k/a", value: "file-a", identity });
+    await file.put({ key: "k/b", value: "file-b", identity });
+    const projector = await openProjector(root);
+    await projector.tick();
+    const reader = await openStore(root);
+    const base = projector.status().commit;
+    // A clean verify commits nothing.
+    expect(await projector.verify()).toEqual([]);
+    expect(projector.status().commit).toBe(base);
+    expect(reader.stateStamp()).toMatch(new RegExp(`:${base}$`));
+
+    // Same versions, different value (k/a) and metadata (k/b): no commit counter moves.
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    try {
+      raw.prepare("UPDATE kv SET value = ? WHERE key = ?").run(JSON.stringify("tampered"), "k/a");
+      raw.prepare("UPDATE kv SET updated_by = ? WHERE key = ?").run(JSON.stringify({ id: "other", name: "other", kind: "agent" }), "k/b");
+    } finally { raw.close(); }
+    // A stamp reader caches what it reads under the stamp it read it at.
+    const stamp = reader.stateStamp();
+    expect(reader.get("k/a")?.value).toBe("tampered");
+
+    const found = await projector.verify();
+    expect(found.map(divergence => [divergence.key, divergence.field]).sort()).toEqual([["k/a", "value"], ["k/b", "updatedBy"]]);
+    expect(projector.status().commit).toBe(base + 1);
+    // The stamp moved, so the cached "tampered" is invalid; a re-read serves the repaired row.
+    expect(reader.stateStamp()).not.toBe(stamp);
+    expect(reader.stateStamp()).toMatch(new RegExp(`:${base + 1}$`));
+    expect(reader.get("k/a")).toEqual(file.get("k/a"));
+    expect(reader.get("k/b")).toEqual(file.get("k/b"));
+    const feed = reader.changesSince(base);
+    expect(feed).toMatchObject({ commit: base + 1, complete: true });
+    expect(feed.changes.map(change => [change.commit, change.key, change.version, change.deleted]).sort()).toEqual([
+      [base + 1, "k/a", file.get("k/a")!.version, false],
+      [base + 1, "k/b", file.get("k/b")!.version, false],
+    ]);
+    // Repaired: the next verify is clean and commits nothing.
+    expect(await projector.verify()).toEqual([]);
+    expect(projector.status().commit).toBe(base + 1);
+    await expectInStep(root);
+  });
+
+  it("publishes a tombstone-order-only repair as a commit; a clean verify leaves commit_no", async () => {
+    const root = tempRoot("repair-order-commit");
+    const file = new MeshStore(root, 64 * 1024, 1_000, { maxStateTombstones: 5 });
+    for (const key of ["t/a", "t/b", "t/c"]) await file.put({ key, value: key, identity });
+    for (const key of ["t/a", "t/b", "t/c"]) await file.delete({ key });
+    const projector = await openProjector(root);
+    await projector.tick();
+    const reader = await openStore(root);
+    const base = projector.status().commit;
+    expect(await projector.verify()).toEqual([]);
+    expect(projector.status().commit).toBe(base);
+
+    // Swap the ords of t/a and t/c: same keys, same versions, only the order differs.
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    try {
+      const rows = raw.prepare("SELECT key, ord FROM tombstones").all() as Array<{ key: string; ord: number }>;
+      const ordOf = (key: string) => rows.find(row => row.key === key)!.ord;
+      const [a, c] = [ordOf("t/a"), ordOf("t/c")];
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(-1, "t/a");
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(a, "t/c");
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(c, "t/a");
+    } finally { raw.close(); }
+    const stamp = reader.stateStamp();
+    expect(reader.exportState().tombstoneOrder).toEqual(["t/c", "t/b", "t/a"]);
+
+    expect((await projector.verify()).map(divergence => divergence.field)).toEqual(["tombstone-order", "tombstone-order"]);
+    expect(projector.status().commit).toBe(base + 1);
+    expect(reader.stateStamp()).not.toBe(stamp);
+    expect(reader.exportState().tombstoneOrder).toEqual(["t/a", "t/b", "t/c"]);
+    const feed = reader.changesSince(base);
+    expect(feed.complete).toBe(true);
+    expect(new Set(feed.changes.map(change => change.commit))).toEqual(new Set([base + 1]));
+    expect(feed.changes.every(change => change.deleted)).toBe(true);
+    expect(feed.changes.map(change => change.key)).toEqual(expect.arrayContaining(["t/a", "t/c"]));
+
+    expect(await projector.verify()).toEqual([]);
+    expect(projector.status().commit).toBe(base + 1);
+    await expectInStep(root);
+  });
+
   it("keeps reporting a divergence when repair is off", async () => {
     const root = tempRoot("no-repair");
     const file = new MeshStore(root, 64 * 1024, 1_000);

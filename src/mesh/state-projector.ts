@@ -31,7 +31,9 @@
  *    diffed against SQLite in one transaction.
  *
  * Idempotent by revision: a row is written only when its (version, value, updatedAt, updatedBy) or
- * its tombstone version differs; a re-applied generation commits nothing and leaves commit_no.
+ * its tombstone version or order differs; a re-applied generation commits nothing and leaves commit_no.
+ * Every write is published: a repair that rewrites a row at the same version (value, metadata,
+ * tombstone order) is a commit with that key in the changes feed, like any other.
  * Each changing generation is ONE SQLite commit: commit_no + 1, its keys in the changes feed, the
  * high-water clock (never lowered), state_bytes and the tombstone order as state-sqlite.ts keeps
  * them, so SqliteStateStore readers (get/list/stateStamp/changesSince) see ordinary commits.
@@ -440,11 +442,9 @@ const statements = (db: SqliteConnection) => ({
   tombAll: db.prepare("SELECT key, version, ord FROM tombstones ORDER BY ord, key"),
   tombGet: db.prepare("SELECT version FROM tombstones WHERE key = ?"),
   tombCount: db.prepare("SELECT count(*) AS n FROM tombstones"),
-  tombMaxOrd: db.prepare("SELECT coalesce(max(ord), 0) AS m FROM tombstones"),
   tombInsert: db.prepare("INSERT INTO tombstones(key, version, ord) VALUES (?, ?, ?)"),
   tombVersion: db.prepare("UPDATE tombstones SET version = ? WHERE key = ?"),
   tombDelete: db.prepare("DELETE FROM tombstones WHERE key = ?"),
-  tombClear: db.prepare("DELETE FROM tombstones"),
   changeInsert: db.prepare("INSERT INTO changes(commit_no, key, version, deleted) VALUES (?, ?, ?, ?)"),
   // Whole commits only, as state-sqlite.ts: a reader never sees half of one.
   changeTrim: db.prepare("DELETE FROM changes WHERE commit_no <= (SELECT commit_no FROM changes WHERE seq <= ? ORDER BY seq DESC LIMIT 1)"),
@@ -916,12 +916,16 @@ export class StateProjector {
     } else order = currentKeys;
     const candidates = new Set([...Object.keys(record.entries), ...Object.keys(record.versions), ...currentKeys, ...order]);
     const before = new Map([...candidates].map(key => [key, this.#slot(key)] as const));
+    const touched = new Set<string>();
     for (const [key, value] of Object.entries(record.entries)) {
-      if (value === null) { this.#sql.kvDelete.run(key); continue; }
+      if (value === null) { if (Number(this.#sql.kvDelete.run(key).changes) > 0) touched.add(key); continue; }
       const entry = toEntry(key, value);
       if (!entry) throw new ProjectorGap(`invalid journal entry ${JSON.stringify(key)}`);
       const row = encode(entry);
-      if (!sameRow(this.#sql.kvGet.get(key), row)) this.#sql.kvUpsert.run(key, row.value, row.version, row.updatedAt, row.updatedBy, row.bytes);
+      if (!sameRow(this.#sql.kvGet.get(key), row)) {
+        this.#sql.kvUpsert.run(key, row.value, row.version, row.updatedAt, row.updatedBy, row.bytes);
+        touched.add(key);
+      }
     }
     const desired = order.map((key): [string, number] => {
       const stated = record.versions[key];
@@ -929,8 +933,8 @@ export class StateProjector {
       if (version === undefined || this.#sql.kvGet.get(key)) throw new ProjectorGap(`inconsistent tombstone ${JSON.stringify(key)}`);
       return [key, version];
     });
-    this.#syncTombstones(desired, current);
-    this.#finish(candidates, before, record.highWater, next);
+    this.#syncTombstones(desired, touched);
+    this.#finish(candidates, before, touched, record.highWater, next);
   }
 
   #applySnapshot(snapshot: FileSnapshot, next: Progress): void {
@@ -939,46 +943,60 @@ export class StateProjector {
     const candidates = new Set([...existing.keys(), ...snapshot.entries.keys(), ...current.map(([key]) => key),
       ...snapshot.tombstones.map(([key]) => key)]);
     const before = new Map([...candidates].map(key => [key, this.#slot(key)] as const));
+    const touched = new Set<string>();
     for (const [key, entry] of snapshot.entries) {
       const row = encode(entry);
-      if (!sameRow(existing.get(key), row)) this.#sql.kvUpsert.run(key, row.value, row.version, row.updatedAt, row.updatedBy, row.bytes);
+      if (!sameRow(existing.get(key), row)) {
+        this.#sql.kvUpsert.run(key, row.value, row.version, row.updatedAt, row.updatedBy, row.bytes);
+        touched.add(key);
+      }
     }
-    for (const key of existing.keys()) if (!snapshot.entries.has(key)) this.#sql.kvDelete.run(key);
-    this.#syncTombstones(snapshot.tombstones, current);
-    this.#finish(candidates, before, snapshot.highWater, next);
+    for (const key of existing.keys()) {
+      if (!snapshot.entries.has(key)) { this.#sql.kvDelete.run(key); touched.add(key); }
+    }
+    this.#syncTombstones(snapshot.tombstones, touched);
+    this.#finish(candidates, before, touched, snapshot.highWater, next);
   }
 
-  // Makes the tombstone table equal `desired`, in order: in place when the change is "drop some,
-  // append some" (the file store's only shapes) and every ord lies at or below the tombstone_ord
-  // mark, else a rewrite with fresh ordinals.
-  #syncTombstones(desired: ReadonlyArray<[string, number]>, current: ReadonlyArray<[string, number]>): void {
+  // Makes the tombstone table equal `desired`, in order, and adds every tombstone row it writes
+  // (insert, delete, version or ord) to `touched`. The longest prefix of the kept rows that is
+  // already in the desired order with every ord at or below the tombstone_ord mark keeps its ords;
+  // the rest is renumbered after the mark. For the file store's shapes ("drop some, append some")
+  // that is the whole kept list, so only the dropped and appended rows are written.
+  #syncTombstones(desired: ReadonlyArray<[string, number]>, touched: Set<string>): void {
+    const current = this.#sql.tombAll.all().map(row => ({ key: String(row.key), version: Number(row.version), ord: Number(row.ord) }));
     const desiredKeys = new Set(desired.map(([key]) => key));
-    const currentKeys = new Set(current.map(([key]) => key));
-    const kept = current.filter(([key]) => desiredKeys.has(key));
+    const kept = current.filter(tomb => desiredKeys.has(tomb.key));
     let ordinal = Number(this.#sql.metaGet.get("tombstone_ord")?.value ?? 0);
-    const inPlace = kept.every(([key], index) => desired[index]?.[0] === key) &&
-      desired.slice(kept.length).every(([key]) => !currentKeys.has(key)) &&
-      Number(this.#sql.tombMaxOrd.get()?.m ?? 0) <= ordinal;
-    if (inPlace) {
-      for (const [key] of current) if (!desiredKeys.has(key)) this.#sql.tombDelete.run(key);
-      for (const [index, [key, version]] of kept.entries()) {
-        const target = desired[index]![1];
-        if (target !== version) this.#sql.tombVersion.run(target, key);
-      }
-      for (const [key, version] of desired.slice(kept.length)) this.#sql.tombInsert.run(key, version, ++ordinal);
-    } else {
-      this.#sql.tombClear.run();
-      for (const [key, version] of desired) this.#sql.tombInsert.run(key, version, ++ordinal);
+    let prefix = 0;
+    while (prefix < kept.length && desired[prefix]?.[0] === kept[prefix]!.key && kept[prefix]!.ord <= ordinal) prefix += 1;
+    for (const tomb of current) {
+      if (!desiredKeys.has(tomb.key)) { this.#sql.tombDelete.run(tomb.key); touched.add(tomb.key); }
+    }
+    const moved = new Map(kept.slice(prefix).map(tomb => [tomb.key, tomb] as const));
+    for (const key of moved.keys()) this.#sql.tombDelete.run(key);
+    for (const [index, tomb] of kept.slice(0, prefix).entries()) {
+      const target = desired[index]![1];
+      if (target !== tomb.version) { this.#sql.tombVersion.run(target, tomb.key); touched.add(tomb.key); }
+    }
+    for (const [key, version] of desired.slice(prefix)) {
+      const ord = ++ordinal;
+      this.#sql.tombInsert.run(key, version, ord);
+      const old = moved.get(key);
+      if (!old || old.version !== version || old.ord !== ord) touched.add(key);
     }
     this.#sql.metaSet.run(ordinal, "tombstone_ord");
   }
 
   // One SQLite commit per changing generation: changes rows, commit_no, clock, bytes, progress.
-  #finish(candidates: Iterable<string>, before: ReadonlyMap<string, string>, highWater: number, next: Progress): void {
+  // A key is published when its slot moved or any of its rows was written (a same-version value or
+  // metadata repair, a tombstone re-ordered): stamp and change-feed readers must see every write.
+  #finish(candidates: Iterable<string>, before: ReadonlyMap<string, string>, touched: ReadonlySet<string>, highWater: number,
+    next: Progress): void {
     const changes: Array<{ key: string; version: number; deleted: boolean }> = [];
-    for (const key of candidates) {
+    for (const key of new Set([...candidates, ...touched])) {
       const after = this.#slot(key);
-      if (after === before.get(key)) continue;
+      if (after === before.get(key) && !touched.has(key)) continue;
       const [kind, version] = after.split(":");
       changes.push({ key, version: Number(version ?? 0), deleted: kind !== "live" });
     }

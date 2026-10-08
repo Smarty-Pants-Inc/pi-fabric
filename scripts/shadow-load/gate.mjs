@@ -9,11 +9,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Defaults: README.md, "Relative gates" (noise: 04930dfd vs itself, runs c3 and R0, epyc1).
+// Defaults: README.md, "Relative gates". Set from run-to-run noise of 04930dfd against itself
+// (runs c3 and R0, fleet profile, 15 min, epyc1): each margin covers at least twice the difference
+// seen between the two runs, and is never tighter than the fs-shcal proposal.
 export const DEFAULT_MARGINS = {
-  leaseFactor: 1.25, leaseSlackS: 30, lapsedFactor: 1.25, lapsedSlack: 10,
-  busyPoints: 10, timeoutsFactor: 1.25, timeoutsSlack: 10,
-  canaryRounds: 2, driftPoints: 15, maxPrePinDriftPct: 2,
+  leaseFactor: 1.25, leaseSlackS: 60, lapsedFactor: 1.25, lapsedSlack: 5, restartMissingSlack: 3,
+  busyPoints: 5, timeoutsFactor: 1.25, timeoutsSlack: 5,
+  canaryRounds: 3, driftPoints: 10,
   maxWaitP99S: 10, waitBuckets: 1,
 };
 export const WAIT_BOUNDS = [5, 10, 25, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, null];
@@ -98,8 +100,13 @@ export const judge = (c, ref, margins = DEFAULT_MARGINS) => {
   a.push(has(c.exits) ? part('no unexpected exits', c.exits === 0, 'exits ' + c.exits) : no('no unexpected exits', 'exits'));
   a.push(c.prePin ? part('before the pin: no lapse over 15 s, no directory miss', c.prePin.lapsed === 0 && c.prePin.misses === 0,
     'lapsed ' + c.prePin.lapsed + ', misses ' + c.prePin.misses + ', lease max ' + c.prePin.leaseMaxMs + ' ms') : no('before the pin: no lapse, no miss', 'timeline (old report)'));
-  a.push(c.afterRestart ? part('after the bridge restart: no directory miss', c.afterRestart.misses === 0, 'misses ' + c.afterRestart.misses + ' (' + c.afterRestart.missing + ' participants)')
-    : no('after the bridge restart: no miss', 'timeline or restart marker'));
+  // After the bridge restart: the baseline itself misses a reloaded Main whose lease lapse runs past
+  // the restart (R0: 1 participant), so this part is relative too.
+  const refRestartMissing = ref.afterRestart ? ref.afterRestart.missing ?? (ref.afterRestart.misses === 0 ? 0 : null) : null;
+  const restartLimit = has(refRestartMissing) ? refRestartMissing + m.restartMissingSlack : null;
+  a.push(c.afterRestart && has(c.afterRestart.missing) ? part('after the bridge restart: participants missed <= ref + ' + m.restartMissingSlack, restartLimit !== null && c.afterRestart.missing <= restartLimit,
+    c.afterRestart.missing + ' (' + c.afterRestart.misses + ' misses) vs limit ' + restartLimit + ' (ref ' + refRestartMissing + ')')
+    : no('after the bridge restart: participants missed', 'timeline or restart marker'));
   if (c.reload && ref.reload) {
     const leaseLimit = lim(ref.reload.leaseMaxMs, m.leaseFactor, m.leaseSlackS * 1_000);
     const lapsedLimit = lim(ref.reload.lapsed, m.lapsedFactor, m.lapsedSlack);
@@ -134,9 +141,11 @@ export const judge = (c, ref, margins = DEFAULT_MARGINS) => {
 
   // (d) participant count.
   const driftLimit = has(ref.count?.maxDriftPct) ? r1(ref.count.maxDriftPct + m.driftPoints) : null;
+  // Relative only: the baseline's count swings 45% before the pin already (spoke mirrors 124-248).
+  const preLimit = has(ref.count?.prePinDriftPct) ? r1(ref.count.prePinDriftPct + m.driftPoints) : null;
   gates.d = { name: 'participant count drift', parts: [
-    has(c.count?.prePinDriftPct) ? part('before the pin: drift <= ' + m.maxPrePinDriftPct + '%', c.count.prePinDriftPct <= m.maxPrePinDriftPct, c.count.prePinDriftPct + '% over ' + c.count.prePinSamples + ' samples')
-      : no('before the pin: drift', 'observer counts'),
+    ...(preLimit === null ? [] : [part('before the pin: drift <= ref + ' + m.driftPoints + ' points', has(c.count?.prePinDriftPct) && c.count.prePinDriftPct <= preLimit,
+      c.count?.prePinDriftPct + '% vs limit ' + preLimit + '% (ref ' + ref.count.prePinDriftPct + '%)')]),
     part('max drift <= ref + ' + m.driftPoints + ' points', has(c.count?.maxDriftPct) && driftLimit !== null && c.count.maxDriftPct <= driftLimit,
       c.count?.maxDriftPct + '% vs limit ' + driftLimit + '% (ref ' + ref.count?.maxDriftPct + '%)'),
   ] };
@@ -181,8 +190,8 @@ const argMap = argv => {
   return out;
 };
 const MARGIN_FLAGS = { 'lease-factor': 'leaseFactor', 'lease-slack-s': 'leaseSlackS', 'lapsed-factor': 'lapsedFactor', 'lapsed-slack': 'lapsedSlack',
-  'busy-points': 'busyPoints', 'timeouts-factor': 'timeoutsFactor', 'timeouts-slack': 'timeoutsSlack', 'canary-rounds': 'canaryRounds',
-  'drift-points': 'driftPoints', 'max-pre-pin-drift-pct': 'maxPrePinDriftPct', 'max-wait-p99-s': 'maxWaitP99S', 'wait-buckets': 'waitBuckets' };
+  'restart-missing-slack': 'restartMissingSlack', 'busy-points': 'busyPoints', 'timeouts-factor': 'timeoutsFactor', 'timeouts-slack': 'timeoutsSlack', 'canary-rounds': 'canaryRounds',
+  'drift-points': 'driftPoints', 'max-wait-p99-s': 'maxWaitP99S', 'wait-buckets': 'waitBuckets' };
 // The harness takes only the --gate-<margin> spelling (some plain names are its absolute-gate flags).
 export const marginsFrom = (args, prefixedOnly = false) => {
   const margins = {};

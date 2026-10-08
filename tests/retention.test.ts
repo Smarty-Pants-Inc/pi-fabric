@@ -356,10 +356,12 @@ describe("shared run-tree exit veto", () => {
       expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
       birth.mockReturnValue(undefined);
       expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
-      // A read, differing birth identity is a reused PID: it no longer vetoes forever.
+      // A read, differing birth identity is a reused PID: by default retention keeps the strict
+      // live veto; only the mesh-wide sweep's opt-in accepts the reuse proof.
       birth.mockReturnValue("456");
       expect(runTreeExitVeto(run)).toBeUndefined();
-      expect(runTreeExitVeto(run, 0, undefined, true)).toBeUndefined();
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
+      expect(runTreeExitVeto(run, 0, undefined, true, true)).toBeUndefined();
     } finally { probe.mockRestore(); birth.mockRestore(); }
   });
 
@@ -420,11 +422,16 @@ describe("safe run roots", () => {
       expect(canRemoveTerminalRun(run)).toBe(false);
       expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
       expect(fs.existsSync(writer)).toBe(true);
-      // A read, differing birth identity proves PID reuse: the PID no longer vetoes forever.
+      // A read, differing birth identity proves PID reuse, but only the mesh-wide sweep accepts that
+      // proof; the temp-root sweep and every default caller keep the live veto (pi-fabric#645 CI).
       birth.mockReturnValue("456");
       expect(runTreeExitVeto(run)).toBeUndefined();
-      expect(canRemoveTerminalRun(run)).toBe(true);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true })).toEqual([run]);
+      expect(canRemoveTerminalRun(run)).toBe(false);
+      if (kind === "closed") expect(canRemoveManagedRunRoot(root)).toBe(false);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true })).toEqual([]);
+      expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(canRemoveTerminalRun(run, undefined, true)).toBe(true);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual([run]);
       expect(fs.existsSync(writer)).toBe(true);
     } finally { birth.mockRestore(); }
   });

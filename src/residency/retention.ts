@@ -24,6 +24,8 @@ export const sweepResidentRuns = (
   runsRoot: string, now = Date.now(), budgetMs = 100,
   options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean;
     dryRun?: boolean; measure?: (run: string) => number; isRetained?: (runId: string) => boolean;
+    /** Mesh-wide sweep only (smarty-dev#3252): accept a checked PID-reuse proof; default keeps the strict live-PID veto. */
+    acceptPidReuse?: boolean;
     onRemove?: (run: string, bytes: number) => void;
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
@@ -46,7 +48,8 @@ export const sweepResidentRuns = (
       const stat = ownedStat(run);
       if (!stat?.isDirectory()) continue;
       if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
-          !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
+          !runTreeExitVeto(run, 0, expired, true, options.acceptPidReuse === true) &&
+          canRemoveTerminalRun(run, expired, options.acceptPidReuse === true) &&
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
         // A referenced candidate is kept as is; compaction would veto it on the same reference.
         const name = entry.name, bytes = options.measure?.(run) ?? 0;

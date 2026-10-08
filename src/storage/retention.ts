@@ -48,12 +48,16 @@ const validOwner = (owner: RunRootOwner | undefined): owner is RunRootOwner => !
   (owner.orphanedAt === undefined || time(owner.orphanedAt)) &&
   (owner.childrenStopped === undefined || typeof owner.childrenStopped === "boolean");
 /**
- * A live PID is the run's saved worker unless its checked start identity proves PID reuse
- * (smarty-dev#3252): the saved start time was read and differs from the live process's. A
- * missing saved identity or an unreadable current one still counts as live.
+ * Automatic retention's live-writer fence. By default any live PID vetoes, whatever its saved
+ * birth identity: routed workers, temp run roots and every pre-existing caller keep the strict
+ * live veto (pi-fabric#645 CI: a routed run naming a live process was swept). Only the mesh-wide
+ * sweep opts into `acceptPidReuse` (smarty-dev#3252): there a live PID is the run's saved worker
+ * unless its checked start identity proves reuse (the saved start time was read and differs from
+ * the live process's). A missing saved identity or an unreadable current one still counts as live.
  */
-const savedWriterAlive = (pid: number, record: RunRecordSummary | undefined): boolean => {
+const savedWriterAlive = (pid: number, record: RunRecordSummary | undefined, acceptPidReuse = false): boolean => {
   if (!processAlive(pid)) return false;
+  if (!acceptPidReuse) return true;
   const saved = typeof record?.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
     ? record.processStartTime : undefined;
   if (saved === undefined) return true;
@@ -115,8 +119,8 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
  * External transports currently have no durable native exit-receipt contract: skip
  * them even when a surviving host once observed a terminal result. */
 export const runTreeExitVeto = (
-  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
-): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit);
+  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false, acceptPidReuse = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit, acceptPidReuse);
 /** Native resource safety is independent of full-result archival. This only
  * authorizes pre-launch worktree rollback or isolation of shutdown obligations;
  * its tracked root has native transport custody, but descendants need saved exit
@@ -126,6 +130,7 @@ export const runTreeResourceVeto = (
 ): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit);
 const runTreeVeto = (
   directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
+  acceptPidReuse = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -167,7 +172,7 @@ const runTreeVeto = (
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return `worker exit is unconfirmed: unknown ${worker} identity`;
-      if (savedWriterAlive(pid, record)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
+      if (savedWriterAlive(pid, record, acceptPidReuse)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -189,7 +194,8 @@ const runTreeVeto = (
           }
         }
       }
-      if (!validPid || (alive && savedWriterAlive(pid, record))) {
+      // Explicit cleanup's own PID-reuse proof (pre-existing); the persisted-exit fence above stays strict.
+      if (!validPid || (alive && savedWriterAlive(pid, record, true))) {
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
@@ -198,7 +204,7 @@ const runTreeVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit);
+      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, acceptPidReuse);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -241,20 +247,20 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
   // authorize recordless pre-launch rollback through the non-retention mode.
-  if (runTreeExitVeto(root, 0, expired, true)) return false;
+  if (runTreeExitVeto(root, 0, expired, true, acceptPidReuse)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence at every level,
-  // including descendants, alongside the recursive exit proof. A live PID vetoes
-  // unless its checked start identity proves reuse (smarty-dev#3252): a reused
-  // PID used to veto removal forever. Unknown identity still vetoes.
+  // including descendants, alongside the recursive exit proof. A live PID vetoes;
+  // only the mesh-wide sweep's opt-in accepts checked PID reuse (smarty-dev#3252).
+  // Unknown identity always vetoes.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
-  if (pid !== undefined && savedWriterAlive(pid, record)) return false;
+  if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
@@ -292,7 +298,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
         continue;
       }
       return false;
@@ -302,9 +308,9 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
 };
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
-export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
@@ -672,6 +678,9 @@ export const pruneActorRunArchives = (options: {
   /** Called after a run directory is removed (or, in a dry run, would be), with its `measure` bytes. */
   onRemove?: (directory: string, bytes: number) => void;
   onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
+  /** Mesh-wide sweep only (smarty-dev#3252): a live PID whose checked birth identity differs is reuse,
+   * not the run's writer. Every other caller keeps the strict live-PID veto. */
+  acceptPidReuse?: boolean;
 }): string[] => {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
@@ -682,7 +691,7 @@ export const pruneActorRunArchives = (options: {
     if (!entry.isDirectory() || entry.name === options.latestRunId || options.isRetained?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) continue;
     if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, {
         ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),

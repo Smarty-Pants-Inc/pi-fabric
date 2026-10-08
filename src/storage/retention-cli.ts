@@ -124,7 +124,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
         // re-discovers the registry roots, and the check and delete run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, retainRuns: false, requireRegistries: true, dryRun,
+          actorRoots: registries, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
           isRetained: registryRootsChanged, measure: treeBytes,
           onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
@@ -187,7 +187,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
             if (!/^[A-Za-z0-9_-]+$/.test(id) || row?.removal !== undefined || !absent(path.join(registryRoot, `removal-${id}.json`))) continue;
             const inFlight = typeof row?.inFlightRun?.id === "string" ? row.inFlightRun.id : undefined;
             pruneActorRunArchives({
-              runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun,
+              runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun, acceptPidReuse: true,
               ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
               isRetained: (run, final) => run === inFlight || (final ? referencedNow(run) : referenced(run)),
               // Sized before the final check; check and delete back to back (review round 4).

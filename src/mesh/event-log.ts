@@ -269,7 +269,18 @@ export class EventLog {
       throw new Error("Invalid event publication intent");
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
-    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
+    if (prior && after) {
+      // The original publisher installed the receipt after our first lookup missed (it writes
+      // it after release). Confirm it and unlink the intent after release too: no fsync and
+      // no namespace barrier under the lock, as on the no-archive off-lock path.
+      const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
+      after.finish = () => {
+        this.#confirmEventFile(receiptPath);
+        if (fs.existsSync(file)) this.#removeDedupeIntent(file);
+      };
+      return prior;
+    }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
@@ -1141,36 +1152,50 @@ export class EventLog {
         // Never rewrite away an event named by a durable intent (byte offsets).
         await this.#lock.withLock(() => this.#settleDedupeIntents(MeshArchive.fromRoot(this.root)), undefined, "publish");
       }
-      const generation = this.#readGeneration();
-      const source = fs.openSync(file, "r");
-      let snapshot: { dev: number; ino: number };
-      let retained: Buffer;
-      let staged: number;
-      try {
-        const stat = fs.fstatSync(source);
-        if (stat.size <= this.#maxEventLogBytes) return;
-        const readBytes = Math.min(stat.size, this.#retainedEventLogBytes + this.maxEventBytes + 1);
-        const buffer = Buffer.allocUnsafe(readBytes);
-        const captured = buffer.subarray(0, fs.readSync(source, buffer, 0, readBytes, stat.size - readBytes));
-        const boundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
-        const newline = boundary === 0 ? -1 : captured.indexOf(0x0a, boundary);
-        const begin = boundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
-        const last = captured.lastIndexOf(0x0a);
-        const stop = last >= begin ? last + 1 : begin;
-        retained = captured.subarray(begin, stop);
-        staged = stat.size - captured.length + stop;
-        snapshot = { dev: stat.dev, ino: stat.ino };
-      } finally { fs.closeSync(source); }
+      // Snapshot the retained tail. A concurrent repair (under the lock) may truncate a torn
+      // tail, and appends may follow, between the stat and the read: a short or shifted read
+      // would misplace the staged offset, so the round restarts on any change of the snapshot
+      // (size, inode, generation). The offset is the requested read start plus the bytes kept.
+      let generation = -1;
+      let snapshot: { dev: number; ino: number } | undefined;
+      let retained = Buffer.alloc(0);
+      let staged = 0;
+      for (let attempt = 0; !snapshot; attempt++) {
+        if (attempt === COMPACTION_ROUNDS) return; // Contended: the next trigger retries.
+        generation = this.#readGeneration();
+        const source = fs.openSync(file, "r");
+        try {
+          const stat = fs.fstatSync(source);
+          if (stat.size <= this.#maxEventLogBytes) return;
+          const readBytes = Math.min(stat.size, this.#retainedEventLogBytes + this.maxEventBytes + 1);
+          const start = stat.size - readBytes;
+          const buffer = Buffer.allocUnsafe(readBytes);
+          const count = fs.readSync(source, buffer, 0, readBytes, start);
+          const now = this.#liveStat();
+          if (count !== readBytes || fs.fstatSync(source).size !== stat.size || now?.dev !== stat.dev ||
+              now.ino !== stat.ino || this.#readGeneration() !== generation) continue;
+          const captured = buffer.subarray(0, count);
+          const boundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
+          const newline = boundary === 0 ? -1 : captured.indexOf(0x0a, boundary);
+          const begin = boundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
+          const last = captured.lastIndexOf(0x0a);
+          const stop = last >= begin ? last + 1 : begin;
+          retained = captured.subarray(begin, stop);
+          staged = start + stop;
+          snapshot = { dev: stat.dev, ino: stat.ino };
+        } finally { fs.closeSync(source); }
+      }
+      const { dev, ino } = snapshot;
       stagePath = `${file}.${process.pid}.${randomUUID()}.compacting`;
       stage = fs.openSync(stagePath, "wx", 0o600);
       fs.writeSync(stage, retained);
       fs.fsyncSync(stage);
       const sameInode = (stat: fs.Stats | undefined): stat is fs.Stats =>
-        stat !== undefined && stat.dev === snapshot.dev && stat.ino === snapshot.ino && stat.size >= staged;
+        stat !== undefined && stat.dev === dev && stat.ino === ino && stat.size >= staged;
       for (let round = 0; round < COMPACTION_ROUNDS; round++) {
         const before = this.#liveStat();
         if (!sameInode(before)) return; // Overtaken: another writer rewrote the log.
-        staged += this.#foldIntoStage(stage, snapshot.ino, staged, before.size);
+        staged += this.#foldIntoStage(stage, ino, staged, before.size);
         const final = round === COMPACTION_ROUNDS - 1;
         const outcome = await this.#lock.withLock((): "done" | "stop" | "behind" => {
           const stat = this.#liveStat();
@@ -1179,7 +1204,7 @@ export class EventLog {
             // A torn tail of a dead writer is never folded: it is a partial line.
             if (!final) return "behind";
             if (stat.size <= 2 * this.#maxEventLogBytes) return "stop"; // Next trigger retries.
-            staged += this.#foldIntoStage(stage!, snapshot.ino, staged, stat.size);
+            staged += this.#foldIntoStage(stage!, ino, staged, stat.size);
           }
           renameAtomic(stagePath!, file);
           stagePath = undefined;

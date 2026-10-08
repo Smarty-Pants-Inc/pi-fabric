@@ -236,4 +236,89 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(fs.readFileSync(events(mesh.root), "utf8").trimEnd().split("\n").at(-1)).toBe(injected);
     expect((await other.publish({ topic: "mesh.fsync", from, text: "next" })).sequence).toBe(10_001);
   });
+
+  it("compaction: a concurrent repair truncating a torn tail during staging restarts the snapshot; a later append is not folded mid-line", async () => {
+    const mesh = compacting();
+    const file = events(mesh.root);
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    for (let index = 0; index < 15; index++) await mesh.publish({ topic: "mesh.fsync", from, text: `seed ${index} ${"x".repeat(120)}` });
+    const generation = fs.readFileSync(path.join(mesh.root, "generation"), "utf8");
+    const torn = '{"sequence":9999,"id":"torn","topic":"mesh.fs';
+    let phase: "armed" | "torn" | "done" = "armed";
+    let injected: string | undefined;
+    const stat = fs.statSync.bind(fs) as (...args: unknown[]) => fs.Stats;
+    const read = fs.readSync.bind(fs) as (...args: unknown[]) => number;
+    vi.spyOn(fs, "statSync").mockImplementation(((...args: unknown[]) => {
+      // A dead writer's torn tail is on the log when the off-lock compaction trigger looks.
+      if (phase === "armed" && args[0] === file && !held() && stat(file).size > 2800) {
+        fs.appendFileSync(file, torn);
+        phase = "torn";
+      }
+      return stat(...args);
+    }) as typeof fs.statSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      if (phase !== "torn" || held() || !sameFile(args[0] as number, file)) return read(...args);
+      phase = "done";
+      // Between the snapshot stat and its read, another process's repair truncates the torn
+      // tail (the read returns short) ...
+      fs.truncateSync(file, stat(file).size - torn.length);
+      const count = read(...args);
+      // ... and another writer's committed append then lands at the truncated end.
+      injected = JSON.stringify({ id: "after-repair", sequence: 10_000, topic: "mesh.fsync", kind: "message", from, verification: "mesh", createdAt: Date.now() });
+      fs.appendFileSync(file, `${injected}\n`);
+      return count;
+    }) as typeof fs.readSync);
+    for (let index = 0; phase !== "done" && index < 30; index++) await mesh.publish({ topic: "mesh.fsync", from, text: `more ${index} ${"x".repeat(120)}` });
+    vi.restoreAllMocks();
+    expect(phase).toBe("done");
+    expect(fs.readFileSync(path.join(mesh.root, "generation"), "utf8")).not.toBe(generation);
+    const lines = fs.readFileSync(file, "utf8").trimEnd().split("\n");
+    // No mid-line fold: every committed line is a whole event, the torn bytes are gone and
+    // the append after the repair survives intact.
+    expect(lines.map(line => () => JSON.parse(line)).every(parse => { try { parse(); return true; } catch { return false; } })).toBe(true);
+    expect(lines.some(line => line.includes('"id":"torn"'))).toBe(false);
+    expect(lines.at(-1)).toBe(injected);
+    expect(mesh.read({ limit: 100 }).at(-1)?.id).toBe("after-repair");
+    expect((await mesh.publish({ topic: "mesh.fsync", from, text: "next" })).sequence).toBe(10_001);
+  });
+
+  it("recovery: a receipt the original publisher installs after the first lookup is confirmed and its intent unlinked after release", async () => {
+    const mesh = store();
+    const packet = { topic: "mesh.fsync", from, dedupeKey: "late-receipt", text: "once" };
+    const sync = fs.fsyncSync.bind(fs);
+    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (sameFile(fd, events(mesh.root))) throw new Error("live barrier failed");
+      sync(fd);
+    });
+    await expect(mesh.publish(packet)).rejects.toThrow("live barrier failed");
+    fail.mockRestore();
+    const intentPath = receipt(mesh.root, packet.dedupeKey, ".pending.json");
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    expect(fs.existsSync(receiptPath)).toBe(false);
+    expect(fs.existsSync(intentPath)).toBe(true);
+    const committed = mesh.read()[0]!;
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    const readFile = fs.readFileSync.bind(fs) as (...args: unknown[]) => string | Buffer;
+    let installed = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      // The retry's first receipt lookup (under the lock) has missed. Now the original
+      // publisher, which holds no lock for this step, installs its receipt.
+      if (!installed && args[0] === intentPath && held()) {
+        fs.writeFileSync(receiptPath, JSON.stringify(committed));
+        installed = true;
+      }
+      return readFile(...args);
+    }) as typeof fs.readFileSync);
+    let receiptSynced = false;
+    const watcher = watchBarriers(mesh.root, fd => { if (sameFile(fd, receiptPath) && !held()) receiptSynced = true; });
+    expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
+    expect(installed).toBe(true);
+    // No fsync (receipt, live log or namespace directory) while `.lock` is held ...
+    expect(watcher.held()).toEqual([]);
+    // ... yet the receipt is confirmed and the intent removed before the retry resolves.
+    expect(receiptSynced).toBe(true);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+  });
 });

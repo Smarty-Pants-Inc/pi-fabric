@@ -40,7 +40,8 @@ import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
@@ -223,6 +224,10 @@ export class ResidentHost {
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  // A delivery whose root is chosen on shared state is written after the commit that chose it
+  // (smarty-dev#6477 R11); a crash in between leaves its row for the next flush to replay.
+  #deliveryCommits!: CommitOutbox;
+  #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
@@ -291,6 +296,9 @@ export class ResidentHost {
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
         stateBackend: config.mesh.stateBackend });
+    this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
+      delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),
+    });
     // Global order remains registry -> mesh, with the #535 50 ms mesh try.
     // Prepare actor/presence observations BEFORE acquisition, then validate exact
     // atomic registry generations under custody and retain custody through publication.
@@ -326,8 +334,9 @@ export class ResidentHost {
       listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
       // Acquire/release only: never carry a selected snapshot or mesh custody into
-      // registry acquisition. FIFO waiting gets us into periodic free windows.
-      waitForPublicationRetry: () => this.mesh.exclusive(() => undefined),
+      // registry acquisition. FIFO waiting gets us into periodic free windows. A state
+      // fence, so it waits on whichever lock the state backend commits under (R3).
+      waitForPublicationRetry: () => withStateFence(this.mesh, this.identity, () => undefined),
       publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
@@ -926,8 +935,7 @@ export class ResidentHost {
     source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
-    const persist = (target: string): void => {
-      const record: ResidentDeliveryRecord = {
+    const record = (target: string): ResidentDeliveryRecord => ({
         format: RESIDENT_HOST_FORMAT,
         id,
         rootId: target,
@@ -940,18 +948,28 @@ export class ResidentHost {
         ...(data === undefined ? {} : { data }),
         ...(agentCompletionId ? { agentCompletionId } : {}),
         createdAt: Date.now(),
-      };
-      // Persist before handing off: idle exit/queue pressure must not drop custody.
-      // Agent completions use the fixed creating root and still persist before yielding.
-      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
-    };
+      });
+    // Persist before handing off: idle exit/queue pressure must not drop custody.
+    // Agent completions use the fixed creating root and still persist before yielding.
+    const persist = (target: string): void =>
+      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record(target), { durable: true });
     if (typeof rootId === "function") {
-      // Serialize proof+absence, target selection and the irreversible outbox
-      // write with resumed-root proof invalidation. Never persist a stale choice.
-      // This stays on the mesh lock, not file custody (smarty-dev#6477 L5):
-      // resumeLineage() invalidates the proof with a shared-state delete.
-      try { await this.mesh.exclusive(() => persist(rootId())); }
-      catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
+      // Serialize proof+absence and target selection with resumed-root proof
+      // invalidation: resumeLineage() invalidates the proof with a shared-state delete,
+      // so the choice is a state commit (smarty-dev#6477 L5, R11). The irreversible
+      // outbox write is that commit's effect: recorded in it, written after it, and
+      // replayed after a crash. Never persist a stale choice.
+      // The plan is this call's own: concurrent deliveries never run each other's effect or
+      // read each other's result (on SQLite another batch can commit before this afterCommit).
+      let chosen = false;
+      const plan = this.#deliveryCommits.plan();
+      try {
+        await this.mesh.writeBatch({ identity: this.identity, ops: [],
+          prepare: () => plan.stage([], [{ kind: "delivery", key: id, payload: record(rootId()) }], { durable: true }),
+          afterCommit: view => { chosen = plan.run(view) === 1; } });
+        await this.#deliveryCommits.retire().catch(() => undefined);
+      } catch { /* no commit: the original mailbox below */ }
+      if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.
     } else persist(rootId);
     await this.#retryDeliveries();
   }
@@ -967,7 +985,22 @@ export class ResidentHost {
     return flushing;
   }
 
+  // The commit effect of a state-chosen delivery (see #queueDelivery). A replay never
+  // recreates a delivery that a flush already handed to the mesh under either root.
+  #writeDelivery(record: ResidentDeliveryRecord, view: MeshBatchView, replay: boolean): void {
+    const file = path.join(this.#deliveryOutboxPath, `${record.id}.json`);
+    if (replay && (fs.existsSync(file) || [record.rootId, this.config.rootId].some(root =>
+      view.version(`${residentDeliveryPrefix(root)}${record.id}`) > 0))) return;
+    writeJsonAtomic(file, record, { durable: true });
+  }
+
   async #flushDeliveries(): Promise<void> {
+    if (!this.#deliveryCommitsRecovered) {
+      try {
+        await this.#deliveryCommits.recover();
+        this.#deliveryCommitsRecovered = true;
+      } catch { /* retried on the next flush; the files below still flush */ }
+    }
     if (!fs.existsSync(this.#deliveryOutboxPath)) return;
     for (const entry of fs.readdirSync(this.#deliveryOutboxPath).filter(entry => entry.endsWith(".json")).slice(0, 32)) {
       const file = path.join(this.#deliveryOutboxPath, entry);

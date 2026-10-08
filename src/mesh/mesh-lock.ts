@@ -12,9 +12,12 @@ import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, Mes
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
 // (event-log.ts) take this lock; neither owns it.
 // Lock order, one direction only (smarty-dev#6477 R20): actor registries (sorted path) first, then
-// the state transaction. Today the state transaction is this mesh `.lock`: the second and innermost
-// lock, whose critical sections are synchronous. Once state has its own transaction, `.lock` may be
-// taken inside it only by migration tools.
+// the state transaction. On the file backend the state transaction is this mesh `.lock`: the second
+// and innermost lock, whose critical sections are synchronous. On SQLite, state has its own
+// transaction: `.lock` may then be held around it (the bridge's R20 write fence, a single
+// synchronous `BEGIN IMMEDIATE` attempt inside an event append), never taken inside it, except by
+// migration tools. A SQLite transaction is one synchronous segment and `.lock` is only acquired
+// asynchronously, so the reverse order cannot occur in this process.
 
 // Mesh-lock wait/hold by caller class under <root>/lock-stats (smarty-dev#6477 L8). On unless
 // PI_FABRIC_LOCK_STATS=0; no extra lock, no fsync, and no timer or file before an acquisition.

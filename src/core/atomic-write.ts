@@ -603,16 +603,21 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
+/** Background lock-outage backoff cap (smarty-dev#6477). Under half of the 15 s participant
+ * and bridge leases and under two 5 s heartbeat ticks: a backed-off heartbeat skips at most
+ * one tick, so a live host still renews well inside its lease. */
+export const MESH_BACKGROUND_RETRY_CAP_MS = 7_000;
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
-  #delay = 0;
+  #failures = 0;
   #retryAt = 0;
   #reported = false;
   #running = false;
-  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000) {}
+  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = MESH_BACKGROUND_RETRY_CAP_MS) {}
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
+  success(): void { this.#failures = 0; this.#retryAt = 0; this.#reported = false; }
   failure(error: unknown): boolean {
     const transient = isMeshLockTimeout(error);
     if (!transient) {
@@ -622,10 +627,12 @@ export class MeshBackgroundRetry {
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
-    // Keep the exponential ceiling separate from the randomized draw. Timers
-    // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
-    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
+    // Full jitter ABOVE the normal interval: the window [base, min(cap, base * 2^n)) doubles
+    // per consecutive timeout. A draw from zero let a timeout retry 1-200 ms later, faster
+    // than the path's own cadence, adding to the very contention it waited on (#6477).
+    const base = Math.max(1, this.minMs);
+    this.#failures = Math.min(31, this.#failures + 1);
+    const delayMs = base + retryDelayMs(0, Math.max(0, Math.min(this.maxMs, base * 2 ** this.#failures) - base), Number.POSITIVE_INFINITY);
     this.#retryAt = Date.now() + delayMs;
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
@@ -663,7 +670,7 @@ export class MeshBackgroundQueue {
   #draining: Promise<void> | undefined;
   #closed = false;
   #failed = false;
-  constructor(label: string, minMs = 100, maxMs = 5_000) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
+  constructor(label: string, minMs = 100, maxMs = MESH_BACKGROUND_RETRY_CAP_MS) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
 
   enqueue(operation: () => unknown | Promise<unknown>): Promise<void> {
     if (this.#closed) return Promise.resolve();

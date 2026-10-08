@@ -382,6 +382,21 @@ describe("shadow backend", () => {
     expect(await shadowOf(store).verify()).toEqual([]);
   });
 
+  it("verify() before any write runs the initial reconcile first (smarty-dev#6900)", async () => {
+    const root = tempRoot("shadow-verify-first");
+    const before = open(root, { stateBackend: "file" });
+    await before.put({ key: "a", value: 1, identity });
+    await before.put({ key: "b", value: { nested: true }, identity });
+    const store = open(root, { stateBackend: "shadow" });
+    const shadow = shadowOf(store);
+    // No write, no repair, no flush: verify() is the first use.
+    expect(await shadow.verify()).toEqual([]);
+    expect(shadow.shadow.listAll("").map(entry => entry.key)).toEqual(["a", "b"]);
+    // Repeated (timer) checks stay clean and never count a divergence.
+    expect(await shadow.verify()).toEqual([]);
+    expect(store.stateDiagnostics()).toMatchObject({ kind: "shadow", divergences: 0, divergentKeys: [], shadowFailures: 0 });
+  });
+
   it("a SQLite failure never fails or changes the caller's write", async () => {
     const root = tempRoot("shadow-fail");
     fs.writeFileSync(path.join(root, "state-shadow"), "not a directory");

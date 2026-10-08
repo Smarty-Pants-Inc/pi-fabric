@@ -667,6 +667,8 @@ export class ShadowStateBackend implements StateBackend {
   readonly #budgetMs: number;
   readonly #pending = new Set<string>();
   #full = true;
+  /** Set once a full reconcile has succeeded; until then the shadow cannot be compared. */
+  #reconciled = false;
   #running: Promise<void> | undefined;
   #timer: ReturnType<typeof setInterval> | undefined;
   #disabled: string | undefined;
@@ -775,9 +777,15 @@ export class ShadowStateBackend implements StateBackend {
   /**
    * Compares the whole file state with the shadow and returns the current differences. A key is
    * COUNTED (diagnostics().divergences) when the previous check saw the same difference for the same
-   * file revision. Waits for this process's own queued mirrors first.
+   * file revision. Waits for this process's own queued mirrors first. Before the first successful
+   * full reconcile (a fresh shadow over an existing state.json, verified before any write or
+   * repair), it starts that reconcile and waits for it, so clean keys never read as missing.
    */
   async verify(): Promise<StateDivergence[]> {
+    if (!this.#reconciled && !this.#disabled) {
+      this.#full = true;
+      this.#kick();
+    }
     await this.flush();
     if (this.#disabled) return [];
     const files = new Map(this.#file.listAll("", { fresh: true }).map((entry) => [entry.key, entry] as const));
@@ -827,6 +835,7 @@ export class ShadowStateBackend implements StateBackend {
         this.#pending.clear();
         try {
           await this.#mirror(full ? undefined : keys);
+          if (full) this.#reconciled = true;
           this.#applied += 1;
         } catch (error) {
           this.#failures += 1;

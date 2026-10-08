@@ -1021,6 +1021,11 @@ export class StateFile implements StateBackend {
    * read without discarding an unchanged parsed snapshot. Explicit confirmation starts one
    * new fixed idle window; ordinary cache hits never slide that deadline.
    */
+  /** R20 write fence: every state.json writer takes `.lock`, which the caller holds. */
+  withWriteFence<T>(operation: () => T): T {
+    return operation();
+  }
+
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
     await this.#lock.withLock(() => {
       // Invalidate observation age, not the payload. Metadata + generation still guard reuse.

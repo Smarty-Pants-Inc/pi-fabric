@@ -2515,12 +2515,18 @@ describe("ActorManager", () => {
     const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
     let successor: ActorManager | undefined;
     const registry = new ActorRegistryStore(path.join(state.root, "actors"));
-    const exclusive = state.mesh.exclusive.bind(state.mesh);
-    const attempts = vi.spyOn(state.mesh, "exclusive").mockImplementation((operation, timeout) => {
-      expect(fs.existsSync(path.join(state.root, "actors", "actors.json.lock", "owner"))).toBe(true);
-      expect(timeout).toBe(0);
-      return exclusive(operation, timeout);
+    // Adoption is a zero-wait state fence (a no-op writeBatch), not exclusive() (smarty-dev#6477 L2b).
+    const writeBatch = state.mesh.writeBatch.bind(state.mesh);
+    const fences: number[] = [];
+    const batches = vi.spyOn(state.mesh, "writeBatch").mockImplementation((input) => {
+      if (input.ops.length === 0 && input.prepare && !input.afterCommit) {
+        expect(fs.existsSync(path.join(state.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+        expect(state.mesh.tryLockBudgetMs).toBe(0);
+        fences.push(fences.length);
+      }
+      return writeBatch(input);
     });
+    const exclusive = vi.spyOn(state.mesh, "exclusive");
     try {
       await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
       const identity: MeshIdentity = { id: "session:contended-successor", name: "main", kind: "main", sessionId: "contended-successor" };
@@ -2529,18 +2535,19 @@ describe("ActorManager", () => {
         canManageActor: () => undefined, lineageAlive: () => false,
       });
       actorManagers.push(successor);
-      await waitFor(() => attempts.mock.calls.length > 0);
+      await waitFor(() => fences.length > 0);
       const started = performance.now();
       await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent mutation" }))));
       expect(performance.now() - started).toBeLessThan(1000);
       await new Promise(resolve => setTimeout(resolve, 200));
-      expect(attempts).toHaveBeenCalledOnce(); // not an immediate retry storm
+      expect(fences).toHaveLength(1); // not an immediate retry storm
+      expect(exclusive).not.toHaveBeenCalled();
       expect(registry.records()[0]!.rootId).toBe(state.identity.id);
       expect(await exited).toBe(0);
       await waitFor(() => successor!.owns(actor.id), 5000);
       expect(registry.records()[0]!.rootId).toBe(identity.id);
     } finally {
-      await exited; attempts.mockRestore(); await successor?.close();
+      await exited; batches.mockRestore(); await successor?.close();
     }
   }, 10000);
 

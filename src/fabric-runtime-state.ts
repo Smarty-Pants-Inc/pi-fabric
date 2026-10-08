@@ -1818,6 +1818,9 @@ export class FabricRuntimeState {
       if (reason === "exit") await this.#participants?.closeLineage();
       else await this.#participants?.close();
     }
+    // Last mesh user gone: release the state database handle (sqlite, shadow). A leaked handle keeps
+    // state.db open on Windows past reload and blocks mesh cleanup and migration (pi-fabric#640).
+    try { this.#mesh?.closeState(); } catch { /* best effort at teardown */ }
     this.#registry = undefined;
     this.#config = undefined;
     this.#execution = undefined;

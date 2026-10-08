@@ -106,9 +106,15 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     const directory = fixture();
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
-    const read = vi.spyOn(directory.mesh, "exclusive");
+    // A state operation bounded to 250 ms, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
+    const read = vi.spyOn(directory.mesh, "withTryLock");
+    const exclusive = vi.spyOn(directory.mesh, "exclusive");
+    const fence = vi.spyOn(directory.mesh, "writeBatch");
     await directory.refreshRoutingView();
-    expect(read).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(250);
+    expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
+    expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
     expect(directory.canConsumeMesh()).toBe(false);
     await directory.refresh();

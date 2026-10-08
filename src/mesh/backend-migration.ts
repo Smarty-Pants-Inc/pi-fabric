@@ -2,14 +2,14 @@
  * Mesh state backend migration: import, cutover and rollback with the R1 fence (smarty-dev#6477, lane L4b).
  *
  * Plan section 5 (docs/mesh-lock-plan.md) is the contract. `meta.backend` in `<mesh>/state.db` is
- * `sqlite`, `exporting` or `file`; `meta.epoch` only grows; `state.json` records the epoch of
+ * `sqlite`, `importing`, `exporting` or `file`; `meta.epoch` only grows; `state.json` records the epoch of
  * its export in `backendEpoch` (and the export's snapshot digest in `backendDigest`), right after
  * `readGeneration`, so older readers and writers keep and ignore both fields.
  *
- * Invariant (pi-fabric#627 review round 4): while state.json is the moved marker (backend-fence.ts),
- * legacy writers fail closed; import and cutover write it as their LAST step under `.lock`, abort
- * restores it before its flag moves, and rollback removes it only by its very last step, after
- * backend=file is committed.
+ * Invariants (pi-fabric#627 review rounds 4 and 5; legacy writers fail closed on the moved marker, readers follow it to SQLite):
+ *   roll-forward (import, cutover; marker BEFORE flag): fill SQLite at backend=importing E+1 (state.json stays the authority), verify, install the marker, THEN commit backend=sqlite.
+ *   roll-back (flag BEFORE marker removal): exporting E+1, export and verify, commit backend=file, THEN replace the marker; abort restores the marker before exporting -> sqlite.
+ *   Hence, at every crash point, backend=sqlite implies the marker, and a missing marker implies state.json is the authority (each sequence runs under ONE `.lock` hold).
  *
  * Rollback commit order, all under ONE `.lock` hold after the census (each step is a crash point;
  * a rerun converges from the stored flag and the marker):
@@ -41,23 +41,26 @@
  * `assumeNoWriters`, `.lock` held throughout, the marker last). Its core: under the mesh `.lock` (no file-mode writer can
  * commit), state.json is read through the normal decoder and cross-checked against the store's own
  * read path (which follows the read journal), then written into state.db in ONE transaction that
- * replaces kv, tombstones and the change feed, sets backend=sqlite and epoch=E+1 and verifies the
+ * replaces kv, tombstones and the change feed, sets backend=importing and epoch=E+1 (not authoritative:
+ * readers and file-mode writers keep using state.json, sqlite-mode writers fail closed) and verifies the
  * digest both ways (database read-back, and the database snapshot through the encoder and decoder)
- * before COMMIT, and once more after it. Right before COMMIT it re-reads state.json: a changed
+ * before COMMIT, and once more after it. backend=sqlite is committed only after the marker landed.
+ * Rerun: importing without the marker redoes the import from state.json (a legacy writer that took the
+ * dead tool's `.lock` committed to the authority); importing with the marker only commits sqlite. Right before COMMIT it re-reads state.json: a changed
  * readGeneration or digest (a writer that ignored `.lock`) rolls the transaction back, so the flag
  * never moves on a state the import did not see. A fresh state.db is created by this tool at
  * backend=file, epoch 0 (the legacy file authority), never at an authoritative empty sqlite.
  *
  * Cutover holds the mesh `.lock` for the WHOLE critical section (file-mode writers serialize on it, so
  * none commits inside): census (no writer outside the cutover modes) -> read state.json (generation
- * and digest G0) -> import, flag sqlite at E+1 (BEGIN IMMEDIATE, FULL), digest verification -> second
- * census -> state.json re-read against G0. Only then is `.lock` released. A file-mode writer seen by
+ * and digest G0) -> import at backend=importing E+1 (BEGIN IMMEDIATE, FULL), digest verification -> second
+ * census -> state.json re-read against G0 -> copy, marker -> backend=sqlite. Only then is `.lock` released. A file-mode writer seen by
  * the second census (or a failed census, or a state.json that moved) fails the cutover: the rollback
  * fence runs under the same `.lock` back to backend=file at E+2 and the error is thrown
- * (MeshCutoverFailedError); a cutover never succeeds "with an alarm". On success, as the LAST step
- * before `.lock` is released (pi-fabric#627 review round 3), cutover copies state.json to
- * `state.json.cutover-<E+1>` (fsync) and atomically replaces state.json with the moved marker
- * (backend-fence.ts; temp, fsync, rename, directory fsync). Every deployed write path reads
+ * (MeshCutoverFailedError); a cutover never succeeds "with an alarm". On success, before `.lock` is
+ * released, cutover copies state.json to `state.json.cutover-<E+1>` (fsync), atomically replaces
+ * state.json with the moved marker (backend-fence.ts; temp, fsync, rename, directory fsync) and only
+ * then commits backend=sqlite at E+1 (review round 5). Every deployed write path reads
  * state.json strictly and throws "invalid state format" on it, so a LEGACY file-mode writer that
  * waited on `.lock` (or starts later) fails closed and writes nothing; rollback step 5 replaces the
  * marker with the export. New writers are also fenced by `assertFileStateWritable` (backend-fence.ts,
@@ -88,13 +91,13 @@ import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateM
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
 export { assertFileStateWritable, MeshBackendFenceError, readMeshStateMovedMarker, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource };
 
-export type MeshBackendFlag = "sqlite" | "exporting" | "file";
+export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file";
 
 /** Crash points, in commit order. `onStep` runs synchronously right after each one. */
 export type MeshBackendStep =
   | "import-read" | "import-commit" | "import-verify"
   | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
-  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker";
+  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
 /** Provided by the census lane (writer-census.ts): every live process that may write the root. */
@@ -602,10 +605,11 @@ export const resolveMeshStateSource = (root: string, options: MeshBackendOptions
 
 // ------------------------------------------------------------------ import and cutover
 
-const verifyImported = (fence: FenceDb, expected: { epoch: number; digest: string }, root: string, options: MeshBackendOptions): void => {
+const verifyImported = (fence: FenceDb, expected: { epoch: number; digest: string }, root: string, options: MeshBackendOptions,
+  flag: "sqlite" | "importing" = "sqlite"): void => {
   const { meta, state } = fence.snapshot();
-  if (meta.backend !== "sqlite" || meta.epoch !== expected.epoch) {
-    throw alarm(options, root, `Fabric mesh import verification found backend=${meta.backend} epoch ${meta.epoch} (expected sqlite at ${expected.epoch})`,
+  if (meta.backend !== flag || meta.epoch !== expected.epoch) {
+    throw alarm(options, root, `Fabric mesh import verification found backend=${meta.backend} epoch ${meta.epoch} (expected ${flag} at ${expected.epoch})`,
       { backend: meta.backend, epoch: meta.epoch });
   }
   const readBack = meshSnapshotDigest(state);
@@ -635,11 +639,15 @@ const assertFileUnchanged = (root: string, options: MeshBackendOptions, g0: File
   }
 };
 
-/** A rerun after cutover committed its marker: converge on the database, which that cutover verified. */
+/**
+ * A rerun after the marker landed: converge on the database, which the import verified. Writers were
+ * fenced since the marker (sqlite-mode ones by `importing`), so SQLite is current; with backend=importing
+ * the caller redoes only the flag commit (`commitRollForward`).
+ */
 const importConvergedOnMarker = (root: string, options: MeshBackendOptions, fence: FenceDb, marker: MeshStateMovedMarker): MeshImportResult => {
   const meta = fence.meta();
   const digest = String(meta.values.get("import_digest") ?? "");
-  if (meta.backend !== "sqlite" || meta.epoch !== marker.epoch || !digest) {
+  if ((meta.backend !== "sqlite" && meta.backend !== "importing") || meta.epoch !== marker.epoch || !digest) {
     throw alarm(options, root, `Fabric mesh state.json is the moved marker (epoch ${marker.epoch}) but state.db has backend=${meta.backend} `
       + `at epoch ${meta.epoch}: import refused`, { backend: meta.backend, epoch: meta.epoch, fileEpoch: marker.epoch });
   }
@@ -647,7 +655,7 @@ const importConvergedOnMarker = (root: string, options: MeshBackendOptions, fenc
   if (digestNormalized(normalized) !== digest) {
     throw new MeshBackendRefusedError(`Fabric mesh state.db is authoritative (backend=sqlite epoch ${meta.epoch} commit ${meta.commit}) since the cutover; nothing to import`);
   }
-  verifyImported(fence, { epoch: meta.epoch, digest }, root, options);
+  verifyImported(fence, { epoch: meta.epoch, digest }, root, options, meta.backend as "sqlite" | "importing");
   options.onStep?.("import-verify");
   return { root, backend: "sqlite", epoch: meta.epoch, previousEpoch: Number(meta.values.get("import_previous_epoch") ?? meta.epoch - 1),
     entries: normalized.entries.length, tombstones: normalized.tombstones.length, highWater: normalized.highWater, digest,
@@ -687,26 +695,30 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
     const counts = fence.counts();
     const fresh = meta.backend === "sqlite" && meta.commit === 0 && counts.kv === 0 && counts.tombstones === 0;
     const rollForward = meta.backend === "file" && fileEpoch === meta.epoch;
-    if (!Number.isSafeInteger(meta.epoch) || meta.epoch < 0 || fileEpoch > meta.epoch || (!fresh && !rollForward)) {
+    // Killed before the marker (review round 5): state.json is still the authority, redo from the import.
+    const redo = meta.backend === "importing" && fileEpoch < meta.epoch;
+    if (!Number.isSafeInteger(meta.epoch) || meta.epoch < 0 || fileEpoch > meta.epoch || (!fresh && !rollForward && !redo)) {
       throw alarm(options, root, `Fabric mesh import refused: state.db backend=${meta.backend} epoch ${meta.epoch} commit ${meta.commit}, state.json epoch ${fileEpoch}`,
         { backend: meta.backend, epoch: meta.epoch, fileEpoch });
     }
-    const next = meta.epoch + 1;
+    const next = redo ? meta.epoch : meta.epoch + 1;
+    const previous = redo ? Number(meta.values.get("import_previous_epoch") ?? fileEpoch) : meta.epoch;
     fence.replaceState(normalized, meta.commit + 1, maxBytesOf(options));
-    fence.setMeta("backend", "sqlite");
+    // Not authoritative yet: backend=sqlite is committed only after the moved marker (commitRollForward).
+    fence.setMeta("backend", "importing");
     fence.setMeta("epoch", next);
     fence.setMeta("import_digest", digest);
     fence.setMeta("import_generation", generation);
-    fence.setMeta("import_previous_epoch", meta.epoch);
+    fence.setMeta("import_previous_epoch", previous);
     fence.setMeta("imported_at", Date.now());
     // Verify inside the transaction: a mismatch rolls the whole import back.
-    verifyImported(fence, { epoch: next, digest }, root, options);
+    verifyImported(fence, { epoch: next, digest }, root, options, "importing");
     // Reconcile right before COMMIT: a state.json that moved since G0 keeps the flag where it was.
     assertFileUnchanged(root, options, { generation, digest }, "before the flag commit", "import aborted, the backend flag is unchanged");
-    return { epoch: next, previousEpoch: meta.epoch };
+    return { epoch: next, previousEpoch: previous };
   });
   options.onStep?.("import-commit");
-  verifyImported(fence, { epoch, digest }, root, options);
+  verifyImported(fence, { epoch, digest }, root, options, "importing");
   options.onStep?.("import-verify");
   return result(epoch, previousEpoch, false);
 };
@@ -714,17 +726,18 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
 /**
  * Import (file -> sqlite, also the roll forward) and cutover are ONE fenced section (pi-fabric#627
  * review round 4): an import commits backend=sqlite, so it needs the census (or the operator's
- * `assumeNoWriters`) exactly like cutover, holds `.lock` throughout, and leaves the moved marker as
- * its last step, so a legacy file-mode writer can never commit to the retired state.json.
+ * `assumeNoWriters`) exactly like cutover, holds `.lock` throughout, and installs the moved marker
+ * BEFORE it commits backend=sqlite (review round 5), so a legacy file-mode writer can never commit
+ * to a state.json that readers ignore, even after a crash.
  */
 export const importMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
   fencedCutover(root, options, "import");
 
 /**
  * Cutover: one critical section under the mesh `.lock` (file-mode writers serialize on it):
- * census -> G0 -> import and flag at E+1 -> verify -> second census -> state.json against G0 -> the
- * moved marker. A file-mode writer (or a moved state.json) found after the flag fails the cutover and
- * runs the rollback fence back to backend=file at E+2 before `.lock` is released.
+ * census -> G0 -> import at backend=importing E+1 -> verify -> second census -> state.json against G0 ->
+ * the moved marker -> backend=sqlite. A file-mode writer (or a moved state.json) found after the import
+ * fails the cutover and runs the rollback fence back to backend=file at E+2 before `.lock` is released.
  */
 export const cutoverMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
   fencedCutover(root, options, "cutover");
@@ -765,6 +778,7 @@ const fencedCutover = async (root: string, options: MeshBackendOptions, operatio
         options.onStep?.("cutover-reconcile");
         const stateCopy = path.join(root, `${STATE_JSON}.cutover-${imported.epoch}`);
         if (!moved) retireStateFile(root, options, imported.epoch, stateCopy);
+        commitRollForward(root, options, fence, imported);
         return { ...imported, writers, stateCopy };
       }
       const reason = failures.join("; ");
@@ -785,8 +799,8 @@ const fencedCutover = async (root: string, options: MeshBackendOptions, operatio
 };
 
 /**
- * Cutover's last step, still under its `.lock` hold and after the flag commit and both checks:
- * keep state.json at `stateCopy` (fsync), then replace it with the moved marker (temp, fsync,
+ * Roll-forward step 3, still under the `.lock` hold, after the import at backend=importing and both
+ * checks: keep state.json at `stateCopy` (fsync), then replace it with the moved marker (temp, fsync,
  * rename, directory fsync). A legacy writer that gets `.lock` afterwards reads it strictly and
  * fails with "invalid state format" before it commits (pi-fabric#627 review round 3).
  */
@@ -801,6 +815,28 @@ const retireStateFile = (root: string, options: MeshBackendOptions, epoch: numbe
   options.onStep?.("cutover-copy");
   writeMovedMarker(root, epoch);
   options.onStep?.("cutover-marker");
+};
+
+/**
+ * Roll-forward step 4, the LAST (pi-fabric#627 review round 5): backend importing -> sqlite at E+1, only
+ * with the moved marker in place, so a crash anywhere before leaves state.json the authority (no marker)
+ * or the marker fencing every legacy writer. A rerun at backend=sqlite verifies only.
+ */
+const commitRollForward = (root: string, options: MeshBackendOptions, fence: FenceDb, imported: { epoch: number; digest: string }): void => {
+  const marker = readMeshStateMovedMarker(root);
+  if (marker?.epoch !== imported.epoch) {
+    throw alarm(options, root, `Fabric mesh roll-forward refused: backend=sqlite at epoch ${imported.epoch} needs the moved marker first `
+      + `(state.json ${marker ? `is the marker at epoch ${marker.epoch}` : "is not the marker"})`, { epoch: imported.epoch });
+  }
+  const committed = fence.transaction(() => {
+    const current = fence.meta();
+    if (current.backend === "sqlite" && current.epoch === imported.epoch) return false;
+    verifyImported(fence, imported, root, options, "importing");
+    fence.setMeta("backend", "sqlite");
+    return true;
+  });
+  if (committed) options.onStep?.("cutover-flag");
+  verifyImported(fence, imported, root, options);
 };
 
 const writeMovedMarker = (root: string, epoch: number): void => {
@@ -925,11 +961,11 @@ const ensureMovedMarker = (root: string, epoch: number): void => {
   if (!readMeshStateMovedMarker(root)) writeMovedMarker(root, epoch);
 };
 
-/** Step 2: BEGIN IMMEDIATE at FULL checks backend=sqlite at E, sets exporting at E+1. */
-const rollbackFlag = (root: string, options: MeshBackendOptions, fence: FenceDb, from: number): number => {
+/** Step 2: BEGIN IMMEDIATE at FULL checks backend=sqlite (importing: a failed cutover) at E, sets exporting at E+1. */
+const rollbackFlag = (root: string, options: MeshBackendOptions, fence: FenceDb, from: number, flag = "sqlite"): number => {
   fence.transaction(() => {
     const current = fence.meta();
-    if (current.backend !== "sqlite" || current.epoch !== from) {
+    if (current.backend !== flag || current.epoch !== from) {
       throw new MeshBackendRefusedError(`Fabric mesh rollback raced: backend=${current.backend} epoch ${current.epoch}`);
     }
     fence.setMeta("backend", "exporting");
@@ -991,11 +1027,15 @@ const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceD
     verifyExport(root, options, fence, lock, recorded);
     return done(recorded, false);
   }
-  if (meta.backend === "sqlite") {
+  if (meta.backend === "importing" && !censused) {
+    throw new MeshBackendRefusedError(`Fabric mesh backend=importing at epoch ${meta.epoch}: an import or cutover was interrupted; rerun it (or roll it back by rerunning after it completes)`);
+  }
+  if (meta.backend === "sqlite" || meta.backend === "importing") {
     if (!censused) throw new MeshBackendRefusedError(`Fabric mesh rollback raced: backend=sqlite at epoch ${meta.epoch} without a census`);
-    // A state.json that is not the marker (an older tool, a failed cutover) is not authority under sqlite.
+    // A state.json that is not the marker (an older tool, a failed cutover) is not authority under sqlite;
+    // a failed cutover at importing exports the state it imported (a conflicting state.json is kept aside).
     ensureMovedMarker(root, meta.epoch);
-    rollbackFlag(root, options, fence, meta.epoch);
+    rollbackFlag(root, options, fence, meta.epoch, meta.backend);
     steps.push(2);
     meta = fence.meta();
   }
@@ -1017,8 +1057,8 @@ const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceD
 /** A failed cutover's way back to file, under its held `.lock` (its census was step 1). */
 const rollbackUnderLock = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock): MeshRollbackResult => {
   const meta = fence.meta();
-  if (meta.backend !== "sqlite") {
-    throw alarm(options, root, `Fabric mesh cutover rollback expected backend=sqlite, found ${meta.backend} at epoch ${meta.epoch}`,
+  if (meta.backend !== "sqlite" && meta.backend !== "importing") {
+    throw alarm(options, root, `Fabric mesh cutover rollback expected backend=importing or sqlite, found ${meta.backend} at epoch ${meta.epoch}`,
       { backend: meta.backend, epoch: meta.epoch });
   }
   return rollbackLocked(root, options, fence, lock, [], true);
@@ -1104,7 +1144,7 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
     status.fileDigest = meshSnapshotDigest(file);
   } catch (error) { status.fileError = (error as Error).message; }
   status.fenceHolds = status.fileEpoch === undefined ? status.backend !== "file"
-    : status.fileEpoch <= status.epoch && (status.fileMoved ? status.backend === "sqlite" || status.backend === "exporting" || status.backend === "file"
+    : status.fileEpoch <= status.epoch && (status.fileMoved ? ["sqlite", "importing", "exporting", "file"].includes(status.backend)
       : status.backend !== "file" || status.fileEpoch === status.epoch);
   const { onAlarm: _quiet, ...quiet } = options;
   try { status.reader = { source: resolveMeshStateSource(root, quiet).source }; }

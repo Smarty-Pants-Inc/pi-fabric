@@ -166,7 +166,8 @@ export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceO
 /**
  * The reader rule (plan section 5) for a known database flag (`none`: state.db absent or
  * uninitialised): use state.json only when backend=file and it is a real state file whose epoch
- * equals meta.epoch; with sqlite or exporting read SQLite; anything else fails closed with
+ * equals meta.epoch, or backend=importing (an import not yet authoritative, pi-fabric#627 review
+ * round 5) and a real state file below meta.epoch; with sqlite or exporting read SQLite; anything else fails closed with
  * MeshBackendFenceError and an alarm. While state.json is the moved marker SQLite is read whatever
  * the (valid) flag (pi-fabric#627 review round 4): it is the last committed state, because the flag
  * fences sqlite-mode writers once it is exporting or file, and rollback removes the marker only as
@@ -194,12 +195,17 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
       : `Fabric mesh state.json epoch ${fileEpoch} exceeds the database epoch ${epoch} (backend=${backend})`, detail);
   }
   if (backend === "none") return { source: "file", ...detail };
-  if (backend === "sqlite" || backend === "exporting" || (moved && backend === "file")) return { source: "sqlite", ...detail };
+  if (backend === "sqlite" || backend === "exporting" || (moved && (backend === "file" || backend === "importing"))) return { source: "sqlite", ...detail };
+  // Importing without the marker: SQLite is being filled and is not authoritative; state.json still is.
+  if (backend === "importing") {
+    if (fileEpoch < epoch) return { source: "file", ...detail };
+    throw meshFenceAlarm(options, root, `Fabric mesh backend=importing at epoch ${epoch} but state.json carries epoch ${fileEpoch}`, detail);
+  }
   if (backend === "file") {
     if (fileEpoch === epoch) return { source: "file", ...detail };
     throw meshFenceAlarm(options, root, `Fabric mesh backend=file at epoch ${epoch} but state.json carries epoch ${fileEpoch}`, detail);
   }
-  throw meshFenceAlarm(options, root, `Fabric mesh state.db backend flag ${JSON.stringify(backend)} is not sqlite, exporting or file`, detail);
+  throw meshFenceAlarm(options, root, `Fabric mesh state.db backend flag ${JSON.stringify(backend)} is not sqlite, importing, exporting or file`, detail);
 };
 
 /** node:sqlite at first use (AGENTS.md startup budget); the subset the guard needs. */

@@ -13,8 +13,8 @@ const USAGE = `Usage: fabric-mesh-backend <import|status|cutover|rollback|abort-
 
   status          backend flag, epochs, digests, the reader decision and the census writers.
   import          the cutover section (also the roll forward): state.json -> state.db under the
-                  mesh .lock, digest verified both ways, backend=sqlite at E+1, state.json replaced
-                  by the moved marker. Refuses a diverged sqlite root.
+                  mesh .lock at backend=importing E+1, digest verified both ways, state.json replaced
+                  by the moved marker, then backend=sqlite. Refuses a diverged sqlite root.
   cutover         import, refused unless the writer census shows no file-mode writer.
   rollback        the R1 fence: flag exporting (E+1), export to a verified temp, switch to file,
                   then replace the marker (last). A rerun converges from the stored flag.

@@ -286,13 +286,19 @@ describe("mesh backend reader rule", () => {
     expect(() => resolveMeshStateSource(root, { onAlarm })).toThrow(MeshBackendFenceError);
     setRawMeta(root, "backend", "exporting"); // exporting: readers stay on SQLite
     expect(resolveMeshStateSource(root, { onAlarm })).toMatchObject({ source: "sqlite", backend: "exporting" });
+    // importing (review round 5): SQLite is not authoritative before the marker; state.json below the epoch is.
+    setRawMeta(root, "backend", "importing");
+    expect(resolveMeshStateSource(root, { onAlarm })).toMatchObject({ source: "file", backend: "importing", epoch: 3, fileEpoch: 2 });
+    expect(() => assertFileStateWritable(root)).not.toThrow();
+    setRawMeta(root, "epoch", 2);
+    expect(() => resolveMeshStateSource(root, { onAlarm })).toThrow(/backend=importing at epoch 2 but state.json carries epoch 2/);
     setRawMeta(root, "backend", "sqlite");
     setRawMeta(root, "epoch", 1); // file epoch above the database epoch
     expect(() => resolveMeshStateSource(root, { onAlarm })).toThrow(/exceeds the database epoch/);
     setRawMeta(root, "epoch", 2);
     setRawMeta(root, "backend", "retired");
-    expect(() => resolveMeshStateSource(root, { onAlarm })).toThrow(/not sqlite, exporting or file/);
-    expect(alarms.map(alarm => alarm.code)).toEqual(["FABRIC_MESH_BACKEND_FENCE", "FABRIC_MESH_BACKEND_FENCE", "FABRIC_MESH_BACKEND_FENCE"]);
+    expect(() => resolveMeshStateSource(root, { onAlarm })).toThrow(/not sqlite, importing, exporting or file/);
+    expect(alarms.map(alarm => alarm.code)).toEqual(Array(4).fill("FABRIC_MESH_BACKEND_FENCE"));
     const status = await meshBackendStatus(root);
     expect(status.reader).toHaveProperty("error");
 

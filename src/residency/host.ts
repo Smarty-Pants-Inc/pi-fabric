@@ -119,6 +119,12 @@ export const sweepResidentRuns = (
 
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
+// The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
+// fleet-wide actor ownership view that often: that view lists every project participant and
+// stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
+// Requests, admissions and agents are still checked on every tick; the actor check is
+// reused for at most this long, and an exit is always confirmed by a current actor check.
+const IDLE_ACTOR_CHECK_MS = 1_000;
 const COMPLETION_MAX_CHARS = 8_000;
 const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
 
@@ -240,6 +246,9 @@ export class ResidentHost {
   #started = false;
   #ready = false;
   #idleSince = Date.now();
+  #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
+  // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
+  #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
   #handover: ResidentHandoverPlan | undefined;
@@ -1050,7 +1059,7 @@ export class ResidentHost {
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
-    Object.assign(this.#retention, this.#effectiveConfig?.().retention ?? this.config.retention);
+    Object.assign(this.#retention, this.#currentRetention());
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
     if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
@@ -1067,9 +1076,31 @@ export class ResidentHost {
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
   }
 
+  /** The accepted retention overlay, re-read only when config.json was replaced or changed:
+   * this runs on every 100 ms maintenance tick, and Main rewrites the file atomically. */
+  #currentRetention(): ResidentHostConfig["retention"] {
+    let stamp: string | undefined;
+    try {
+      const stat = fs.statSync(path.join(this.config.residencyRoot, "config.json"), { bigint: true });
+      stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch { /* Absent or unreadable: re-evaluate on every tick, as before. */ }
+    if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) return this.#retentionOverlay.retention;
+    const retention = this.#effectiveConfig?.().retention ?? this.config.retention;
+    this.#retentionOverlay = stamp === undefined ? undefined : { stamp, retention };
+    return retention;
+  }
+
+  #hasActiveActor(now: number, current = false): boolean {
+    if (current || now - this.#activeActor.at >= IDLE_ACTOR_CHECK_MS) {
+      this.#activeActor = { at: now, active: this.actors.hasActiveDurableActor() };
+    }
+    return this.#activeActor.active;
+  }
+
   #checkIdle(): void {
     if (this.#closed || this.#staged || this.#handover) return;
-    const activeActor = this.actors.hasActiveDurableActor();
+    const now = Date.now();
+    const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
@@ -1078,10 +1109,16 @@ export class ResidentHost {
       catch { return false; }
     });
     if (activeActor || activeAgent || pendingRequest || this.#admissions) {
-      this.#idleSince = Date.now();
+      this.#idleSince = now;
       return;
     }
-    if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
+    if (now - this.#idleSince < IDLE_EXIT_MS) return;
+    // Never exit on a reused actor observation: confirm with a current one.
+    if (this.#hasActiveActor(now, true)) {
+      this.#idleSince = now;
+      return;
+    }
+    this.onIdle();
   }
 
   #trackPublication(promise: Promise<unknown>): void {

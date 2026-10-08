@@ -1135,14 +1135,18 @@ export class EventLog {
    * 3. Off-lock: the directory barrier that makes the rename durable.
    * Only if appends outrun every round AND the log has reached twice its cap does the last
    * fold (a few lines) fsync under the lock, so the log stays bounded under sustained load.
-   * Pending dedupe intents (keyed publishers in flight, or a dead one) are settled first
-   * through the locked legacy protocol; an intent that appears later refuses the rename.
+   * A pending no-archive dedupe intent (a keyed publisher in flight, or a dead one) defers
+   * compaction: it settles only on its off-lock path, and the next publish after that compacts.
+   * Archive-coupled intents, and any intent once the log reaches twice its cap, are settled
+   * first through the locked legacy protocol; an intent that appears later refuses the rename.
    */
   async #compactAfterUnlock(): Promise<void> {
     const file = this.#eventsPath;
     if (compactions.has(file)) return;
-    try { if ((this.#liveStat()?.size ?? 0) <= this.#maxEventLogBytes) return; }
+    let size = 0;
+    try { size = this.#liveStat()?.size ?? 0; }
     catch { return; }
+    if (size <= this.#maxEventLogBytes) return;
     compactions.add(file);
     let stagePath: string | undefined;
     let stage: number | undefined;
@@ -1150,7 +1154,13 @@ export class EventLog {
       this.#sweepCompactionStages();
       if (this.#hasPendingIntents()) {
         // Never rewrite away an event named by a durable intent (byte offsets).
-        await this.#lock.withLock(() => this.#settleDedupeIntents(MeshArchive.fromRoot(this.root)), undefined, "publish");
+        const archive = MeshArchive.fromRoot(this.root);
+        // No-archive: defer rather than fsync the log, receipt and namespace under `.lock`.
+        // The intent settles off-lock (its publisher, or a same-key retry); the next trigger compacts.
+        // ponytail: past twice the cap (a dead publisher's intent nobody retries) the locked
+        // legacy settlement below still runs, so the log stays bounded; its fsyncs hold `.lock`.
+        if (!archive && size <= 2 * this.#maxEventLogBytes) return;
+        await this.#lock.withLock(() => this.#settleDedupeIntents(archive), undefined, "publish");
       }
       // Snapshot the retained tail. A concurrent repair (under the lock) may truncate a torn
       // tail, and appends may follow, between the stat and the read: a short or shifted read

@@ -244,7 +244,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     for (let index = 0; index < 15; index++) await mesh.publish({ topic: "mesh.fsync", from, text: `seed ${index} ${"x".repeat(120)}` });
     const generation = fs.readFileSync(path.join(mesh.root, "generation"), "utf8");
     const torn = '{"sequence":9999,"id":"torn","topic":"mesh.fs';
-    let phase: "armed" | "torn" | "done" = "armed";
+    let phase = "armed" as "armed" | "torn" | "done";
     let injected: string | undefined;
     const stat = fs.statSync.bind(fs) as (...args: unknown[]) => fs.Stats;
     const read = fs.readSync.bind(fs) as (...args: unknown[]) => number;
@@ -280,6 +280,62 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(lines.at(-1)).toBe(injected);
     expect(mesh.read({ limit: 100 }).at(-1)?.id).toBe("after-repair");
     expect((await mesh.publish({ topic: "mesh.fsync", from, text: "next" })).sequence).toBe(10_001);
+  });
+
+  it("compaction: a pending no-archive intent defers compaction (no barrier under the lock); the publish that settles it compacts", async () => {
+    const mesh = compacting();
+    const packet = { topic: "mesh.fsync", from, dedupeKey: "pending-over-cap", text: "once" };
+    const sync = fs.fsyncSync.bind(fs);
+    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (sameFile(fd, events(mesh.root))) throw new Error("live barrier failed");
+      sync(fd);
+    });
+    await expect(mesh.publish(packet)).rejects.toThrow("live barrier failed");
+    fail.mockRestore();
+    const intentPath = receipt(mesh.root, packet.dedupeKey, ".pending.json");
+    expect(fs.existsSync(intentPath)).toBe(true);
+    const committed = mesh.read()[0]!;
+    const generation = () => fs.existsSync(path.join(mesh.root, "generation")) ? fs.readFileSync(path.join(mesh.root, "generation"), "utf8") : "0";
+    const watcher = watchBarriers(mesh.root);
+    // Over the cap (2800) but under the hard bound (5600): every trigger defers.
+    for (let index = 0; fs.statSync(events(mesh.root)).size <= 2800 + 300 && index < 40; index++) {
+      await mesh.publish({ topic: "mesh.fsync", from, text: `fill ${index} ${"x".repeat(120)}` });
+    }
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(5600);
+    expect(watcher.held()).toEqual([]);
+    expect(generation()).toBe("0");
+    expect(fs.existsSync(intentPath)).toBe(true);
+    expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey))).toBe(false);
+    // The same-key retry settles the intent off-lock; its own compaction trigger then compacts.
+    expect(await new MeshStore(mesh.root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 }).publish(packet)).toEqual(committed);
+    expect(watcher.held()).toEqual([]);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
+    expect(generation()).not.toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(2800);
+    expect(await mesh.publish(packet)).toEqual(committed);
+  });
+
+  it("compaction: past twice the cap a pending no-archive intent is settled under the lock so the log stays bounded", async () => {
+    const mesh = compacting();
+    const packet = { topic: "mesh.fsync", from, dedupeKey: "pending-hard-bound", text: "once" };
+    const sync = fs.fsyncSync.bind(fs);
+    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (sameFile(fd, events(mesh.root))) throw new Error("live barrier failed");
+      sync(fd);
+    });
+    await expect(mesh.publish(packet)).rejects.toThrow("live barrier failed");
+    fail.mockRestore();
+    const intentPath = receipt(mesh.root, packet.dedupeKey, ".pending.json");
+    const committed = mesh.read()[0]!;
+    for (let index = 0; fs.existsSync(intentPath) && index < 60; index++) {
+      await mesh.publish({ topic: "mesh.fsync", from, text: `fill ${index} ${"x".repeat(120)}` });
+    }
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
+    expect(fs.readFileSync(path.join(mesh.root, "generation"), "utf8")).not.toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(5600);
+    expect(await mesh.publish(packet)).toEqual(committed);
   });
 
   it("recovery: a receipt the original publisher installs after the first lookup is confirmed and its intent unlinked after release", async () => {

@@ -541,7 +541,8 @@ describe("MeshStore", () => {
     await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
     crash.mockRestore();
     const event = JSON.parse(fs.readFileSync(path.join(root, "events.jsonl"), "utf8"));
-    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    // No archive: a pending intent defers compaction until the log passes twice its cap (pi-fabric#649).
+    for (let index = 0; index < 12; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
     expect(store.oldestSequence()).toBeGreaterThan(event.sequence);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
@@ -628,7 +629,8 @@ describe("MeshStore", () => {
     await expect(store.publish(packet)).rejects.toThrow("before append");
     crash.mockRestore();
     const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
-    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    // A pending no-archive intent defers compaction until the log passes twice its cap (pi-fabric#649).
+    for (let index = 0; index < 12; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(fs.existsSync(base + ".json")).toBe(false);
     const event = await store.publish(packet);
@@ -647,7 +649,10 @@ describe("MeshStore", () => {
     });
     try {
       await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
-      await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
+      // Under twice the cap a pending no-archive intent defers compaction (pi-fabric#649);
+      // past it the locked settlement runs and fails here.
+      for (let index = 0; index < 3; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
+      expect(fs.existsSync(base + ".pending.json")).toBe(true);
       const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
       // Compaction is best effort after commit (smarty-dev#6477 E1): the committed unkeyed
       // publish resolves (a rejection would invite a duplicate retry); the failure is reported.

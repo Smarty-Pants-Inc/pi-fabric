@@ -2,11 +2,11 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { census } from "../src/mesh/writer-census.js";
 import { MeshStore, censusRecordFileName, meshProcessStartedAt, pruneDeadCensusRecords } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { meshWriterLeaseRecord, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 
 const ownStartedAt = (): number => Math.floor(Date.now() - process.uptime() * 1000);
 const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
@@ -67,6 +67,7 @@ const root = (): string => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const value of roots.splice(0)) fs.rmSync(value, { recursive: true, force: true });
 });
 
@@ -244,6 +245,10 @@ describe("mesh writer census", () => {
     { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
     { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
     { label: "an empty backend", fields: { stateBackend: "" }, absent: "stateBackend" },
+    { label: "a backend weaker than one it lists", fields: { stateBackend: "file", stateBackends: ["file", "sqlite"] }, absent: "stateBackend" },
+    { label: "a backend list without its backend", fields: { stateBackend: "sqlite", stateBackends: ["file"] }, absent: "stateBackend" },
+    { label: "a non-list of backends", fields: { stateBackends: "sqlite" }, absent: "stateBackend" },
+    { label: "a protocol newer than one it lists", fields: { lockProtocol: 2, lockProtocols: [1, 2] }, absent: "lockProtocol" },
     { label: "an unknown release", fields: { releaseSha: "unknown" }, absent: undefined },
     { label: "an empty release", fields: { releaseSha: "" }, absent: "releaseSha" },
   ])("counts a live writer with $label unknown", async ({ fields, absent }) => {
@@ -354,6 +359,113 @@ describe("mesh writer census", () => {
     expect(bad).not.toHaveProperty("startedAt");
     expect(unknown.find(writer => writer.pid === zero)).not.toHaveProperty("startedAt");
     expect(fs.existsSync(emptyFile)).toBe(true);
+  });
+
+  it("does not let a later process's lease (same host and pid, other start time) vouch for a stale record", async () => {
+    const mesh = root();
+    const now = Date.now();
+    const pid = deadPid();
+    const stale = { pid, host: "other-host.example", startedAt: now - 3_600_000 };
+    writeRecord(mesh, stale);
+    const writer = { ...stale, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite", startedAt: now - 1000 };
+    writeHostLease(mesh, { id: "host:reused", rootId: "session:reused", identityId: "identity:reused",
+      updatedAt: now, expiresAt: now + 60_000, writer });
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toEqual([expect.objectContaining({ ...stale, source: "process-record" })]);
+    // The new process is listed in its own right, not merged into the stale record.
+    expect(result.writers).toContainEqual(expect.objectContaining({ ...writer, source: "host-lease", name: "host:reused" }));
+    expect(result.writers.filter(item => item.pid === pid)).toHaveLength(2);
+  });
+
+  it("merges this process's lease and record when both carry its exact start time", async () => {
+    const mesh = root();
+    new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    const now = Date.now();
+    writeHostLease(mesh, { id: "host:self", rootId: "session:self", identityId: "identity:self",
+      updatedAt: now, expiresAt: now + 60_000, writer: meshWriterLeaseRecord(2, "file", meshProcessStartedAt) });
+    const result = await census(mesh);
+    expect(result.writers.filter(item => item.pid === process.pid)).toEqual([
+      expect.objectContaining({ host: os.hostname(), startedAt: meshProcessStartedAt, source: "process-record" })]);
+  });
+
+  it("refuses a sqlite or shadow backend when the census record cannot be written, after one retry", () => {
+    const mesh = root();
+    // A regular file where the record directory belongs: every attempt fails.
+    fs.writeFileSync(path.join(mesh, ".writer-census"), "");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    for (const stateBackend of ["sqlite", "shadow"] as const) {
+      mkdir.mockClear();
+      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
+        .toThrow(new RegExp(`cannot record this process in the writer census.*refusing to open the ${stateBackend} state backend`));
+      expect(mkdir.mock.calls.filter(([dir]) => String(dir).endsWith(".writer-census"))).toHaveLength(2);
+    }
+    // File mode stays available: its writes take .lock, which the census counts.
+    expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
+  });
+
+  it("retries a failed census record write once and opens the sqlite backend", async () => {
+    const mesh = root();
+    const real = fs.renameSync;
+    let failures = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to).includes(".writer-census") && failures++ === 0) throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+      return real(from, to);
+    });
+    const store = new MeshStore(mesh, 4096, 100, { stateBackend: "sqlite" });
+    try {
+      expect(store.stateBackend).toBe("sqlite");
+      expect(failures).toBe(2);
+      const result = await census(mesh);
+      expect(result.writers).toContainEqual(expect.objectContaining({ pid: process.pid, stateBackend: "sqlite",
+        source: "process-record" }));
+      expect(fs.readdirSync(path.join(mesh, ".writer-census")).filter(name => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      store.closeState();
+    }
+  });
+
+  it("widens this process's record to every backend it opened, and keeps it until the last store closes", async () => {
+    const mesh = root();
+    const file = path.join(mesh, ".writer-census", censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
+    const plain = new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ lockProtocol: 2, stateBackend: "file" }));
+    const sqlite = new MeshStore(mesh, 4096, 100, { lockProtocol: 1, stateBackend: "sqlite" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ pid: process.pid,
+      stateBackend: "sqlite", stateBackends: ["file", "sqlite"], lockProtocol: 1, lockProtocols: [1, 2] }));
+    const own = (await census(mesh)).writers.filter(writer => writer.pid === process.pid);
+    // The cutover sees a sqlite writer (which takes no .lock), not the earlier file store.
+    expect(own).toEqual([expect.objectContaining({ source: "process-record", stateBackend: "sqlite",
+      stateBackends: ["file", "sqlite"], lockProtocol: 1 })]);
+    // A third store of a weaker backend never narrows the record.
+    const third = new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ stateBackend: "sqlite", lockProtocol: 1 }));
+    sqlite.closeState();
+    sqlite.closeState();
+    third.closeState();
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ stateBackend: "sqlite" }));
+    plain.closeState();
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it.each([
+    { label: "corrupt", text: "{not json" },
+    { label: "another start time", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "file", startedAt: meshProcessStartedAt + 1 }) },
+    { label: "an unsupported backend", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "redis", startedAt: meshProcessStartedAt }) },
+  ])("fails closed on an existing $label record instead of trusting or overwriting it", ({ text }) => {
+    const mesh = root();
+    const directory = path.join(mesh, ".writer-census");
+    fs.mkdirSync(directory);
+    const file = path.join(directory, censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
+    fs.writeFileSync(file, text);
+    for (const stateBackend of ["sqlite", "shadow"] as const) {
+      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
+        .toThrow(new RegExp(`cannot record this process in the writer census.*not this process's valid record.*refusing to open the ${stateBackend}`));
+    }
+    expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
   });
 
   it("keeps a lock ticket whose pid belongs to another host's writer", async () => {

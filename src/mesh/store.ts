@@ -29,6 +29,10 @@ export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateB
 const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+const validWriterLockProtocol = (value: unknown): value is number => value === 1 || value === 2;
+/** Backends by danger to a cutover: sqlite and shadow write state without .lock (pi-fabric#638). */
+const writerBackendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
+const validWriterStateBackend = (value: unknown): value is string => typeof value === "string" && Object.hasOwn(writerBackendRank, value);
 
 /**
  * Filesystem-safe host identity for census file names: the sanitized hostname (bounded) plus a
@@ -103,12 +107,80 @@ export const pruneDeadCensusRecords = (root: string): void => {
 };
 
 const prunedCensusRoots = new Set<string>();
-const ownCensusRecords = new Set<string>();
+/** This process's census record files, each with the number of its stores still open. */
+const ownCensusRecords = new Map<string, number>();
 const removeOwnCensusRecords = (): void => {
-  for (const file of ownCensusRecords) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+  for (const file of ownCensusRecords.keys()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };
 
-const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): void => {
+/** One store of this process closed: the record goes with the last one (else at exit). */
+const releaseMeshWriterRecord = (file: string): void => {
+  const stores = (ownCensusRecords.get(file) ?? 0) - 1;
+  if (stores > 0) { ownCensusRecords.set(file, stores); return; }
+  ownCensusRecords.delete(file);
+  try { fs.rmSync(file, { force: true }); } catch { /* best effort; pruned once this process is gone */ }
+};
+
+const unique = <T>(values: T[]): T[] => [...new Set(values)].sort();
+
+/**
+ * Writes or widens this process's census record. One record per (root, host, pid, startedAt)
+ * lists every backend and lock protocol any store of this process opened there; its top-level
+ * stateBackend is the most dangerous of them (sqlite > shadow > file) and its lockProtocol the
+ * oldest, so a census reader without the lists still sees the strongest writer. An existing
+ * record that is not this process's valid record is never trusted or overwritten: the
+ * registration fails (pi-fabric#638). Returns the failure, or undefined once recorded.
+ */
+const writeMeshWriterRecord = (directory: string, file: string, host: string, lockProtocol: number,
+  stateBackend: string): unknown => {
+  try {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    let text: string | undefined;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    let backends = [stateBackend], protocols = [lockProtocol];
+    let releaseSha = process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown";
+    if (text !== undefined) {
+      let value: unknown;
+      try { value = JSON.parse(text); } catch { value = undefined; }
+      const prior = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+      const priorBackends = prior.stateBackends ?? [prior.stateBackend];
+      const priorProtocols = prior.lockProtocols ?? [prior.lockProtocol];
+      if (prior.format !== 1 || prior.pid !== process.pid || prior.host !== host || prior.startedAt !== meshProcessStartedAt ||
+        typeof prior.releaseSha !== "string" || prior.releaseSha.length === 0 ||
+        !validWriterStateBackend(prior.stateBackend) || !validWriterLockProtocol(prior.lockProtocol) ||
+        !Array.isArray(priorBackends) || !priorBackends.includes(prior.stateBackend) || !priorBackends.every(validWriterStateBackend) ||
+        !Array.isArray(priorProtocols) || !priorProtocols.includes(prior.lockProtocol) || !priorProtocols.every(validWriterLockProtocol)) {
+        throw new Error(`existing census record ${file} is not this process's valid record`);
+      }
+      backends = unique([...priorBackends as string[], stateBackend]);
+      protocols = unique([...priorProtocols as number[], lockProtocol]);
+      releaseSha = prior.releaseSha;
+    }
+    const strongest = backends.reduce((a, b) => writerBackendRank[b]! > writerBackendRank[a]! ? b : a);
+    const writer = { format: 1, pid: process.pid, host, releaseSha, lockProtocol: Math.min(...protocols),
+      stateBackend: strongest, startedAt: meshProcessStartedAt,
+      ...(backends.length > 1 ? { stateBackends: backends } : {}), ...(protocols.length > 1 ? { lockProtocols: protocols } : {}) };
+    const serialized = JSON.stringify(writer);
+    if (serialized !== text) {
+      const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
+      fs.writeFileSync(temporary, serialized, { flag: "w", mode: 0o600 });
+      try { fs.renameSync(temporary, file); }
+      catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+    }
+    if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
+    ownCensusRecords.set(file, (ownCensusRecords.get(file) ?? 0) + 1);
+    return undefined;
+  } catch (error) {
+    return error ?? new Error("census record write failed");
+  }
+};
+
+/**
+ * Records this process in the census (one retry); returns the record file, or the failure.
+ * The caller fails closed for a backend whose writes the census could not otherwise see.
+ */
+const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): { file: string } | { error: unknown } => {
   const directory = path.join(root, ".writer-census");
   if (!prunedCensusRoots.has(directory)) {
     prunedCensusRoots.add(directory);
@@ -118,25 +190,9 @@ const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: stri
   // skips its record nor removes the other's on exit. Only an earlier store in this process matches.
   const host = os.hostname();
   const file = path.join(directory, censusRecordFileName(host, process.pid, meshProcessStartedAt));
-  try {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if (fs.existsSync(file)) return;
-    const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
-    const writer = { format: 1, pid: process.pid, host,
-      releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
-      lockProtocol, stateBackend, startedAt: meshProcessStartedAt };
-    fs.writeFileSync(temporary, JSON.stringify(writer), { flag: "w", mode: 0o600 });
-    try { fs.renameSync(temporary, file); }
-    catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
-    if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
-    ownCensusRecords.add(file);
-  } catch {
-    // ponytail: a read-only or full disk must not fail MeshStore construction, so this process
-    // writes no census record and no new mechanism records the failure. While it queues for or
-    // holds the mesh lock its ticket/owner has no census metadata, so census() lists it unknown
-    // (clean:false). Otherwise only its host lease shows it: a sqlite writer between custody
-    // operations takes no .lock, and without a lease the census cannot see it.
-  }
+  const first = writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
+  const error = first === undefined ? undefined : writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
+  return error === undefined ? { file } : { error };
 };
 
 export interface MeshStoreOptions {
@@ -176,6 +232,8 @@ export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
   readonly #events: EventLog;
+  /** This store's census registration, released once by closeState(). */
+  #censusRecord: string | undefined;
 
   constructor(
     readonly root: string,
@@ -189,7 +247,20 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
+    const recorded = recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
+    const unrecorded = "error" in recorded ? recorded.error : undefined;
+    if ("file" in recorded) this.#censusRecord = recorded.file;
+    // A process the census cannot see must not write where only the census would see it (pi-fabric#638).
+    // A sqlite or shadow writer takes no .lock for state, so without its record the census may
+    // report clean while it writes: refuse that backend (fail closed). A file-mode writer may go
+    // on: every state write takes .lock, whose owner record and queue ticket census() counts as an
+    // unknown writer while it waits or writes, and cutover fences writers on .lock in any case.
+    if (unrecorded !== undefined && this.#state.kind !== "file") {
+      this.#state.close();
+      const reason = unrecorded instanceof Error ? unrecorded.message : String(unrecorded);
+      throw new Error(`Fabric mesh: cannot record this process in the writer census (${path.join(root, ".writer-census")}): ` +
+        `${reason}; refusing to open the ${this.#state.kind} state backend`, { cause: unrecorded });
+    }
   }
 
   get lockProtocol(): MeshLockProtocol {
@@ -213,6 +284,11 @@ export class MeshStore {
   /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
   closeState(): void {
     this.#state.close();
+    // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
+    // store no longer needs the record. Another open store of this process keeps it.
+    const record = this.#censusRecord;
+    this.#censusRecord = undefined;
+    if (record !== undefined) releaseMeshWriterRecord(record);
   }
 
   get readCacheMs(): number {

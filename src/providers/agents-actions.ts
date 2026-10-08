@@ -533,7 +533,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     description: "Queue a message through a persistent actor's live owner without waiting. Optional model/thinking values apply only to this activation.",
     inputSchema: {
       type: "object",
-      properties: actorInvocationProperties,
+      properties: { ...actorInvocationProperties,
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on an outcome-unknown or FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },

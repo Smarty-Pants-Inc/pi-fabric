@@ -412,11 +412,12 @@ describe("mesh writer census", () => {
   });
 
   it("opens a sqlite or shadow backend when the census record cannot be written (advisory, smarty-dev#6982)", async () => {
-    const mesh = root();
-    // A regular file where the record directory belongs: every attempt fails.
-    fs.writeFileSync(path.join(mesh, ".writer-census"), "");
     const mkdir = vi.spyOn(fs, "mkdirSync");
     for (const stateBackend of ["sqlite", "shadow"] as const) {
+      // A fresh root per backend: the rollback fence (L2a) refuses shadow file writes once a root is sqlite.
+      const mesh = root();
+      // A regular file where the record directory belongs: every attempt fails.
+      fs.writeFileSync(path.join(mesh, ".writer-census"), "");
       mkdir.mockClear();
       const store = new MeshStore(mesh, 4096, 100, { stateBackend });
       try {
@@ -788,12 +789,13 @@ describe("mesh writer census", () => {
   });
 
   it("changes no store behaviour on unknown evidence, and nothing in src consumes the census", async () => {
-    const mesh = root();
-    fs.mkdirSync(path.join(mesh, ".writer-census"));
-    fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
-    writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
-    expect((await census(mesh)).unknown.length).toBeGreaterThan(0);
     for (const stateBackend of ["file", "sqlite", "shadow"] as const) {
+      // A fresh root per backend: the rollback fence (L2a) refuses shadow file writes once a root is sqlite.
+      const mesh = root();
+      fs.mkdirSync(path.join(mesh, ".writer-census"));
+      fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
+      writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
+      expect((await census(mesh)).unknown.length).toBeGreaterThan(0);
       const store = new MeshStore(mesh, 4096, 100, { stateBackend });
       try {
         await store.put({ key: `census/${stateBackend}`, value: 1, identity });

@@ -183,9 +183,10 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
         expect(stateReads).toHaveLength(0); // The post-lock recheck gates unchanged metadata, not another payload parse.
         const hostKey = "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex");
         const hostReads = get.mock.calls.filter(([key]) => key === hostKey);
-        expect(hostReads).toHaveLength(2);
+        expect(hostReads).toHaveLength(3); // recovery check + idle decision share preparation
         expect(hostReads[0]![1]?.snapshot).toBeDefined();
-        expect(hostReads[1]![1]?.snapshot).toBeUndefined();
+        expect(hostReads[1]![1]?.snapshot).toBe(hostReads[0]![1]?.snapshot);
+        expect(hostReads[2]![1]?.snapshot).toBeUndefined();
       } finally { get.mockRestore(); reads.mockRestore(); }
     } finally { clock.mockRestore(); }
   });
@@ -782,14 +783,14 @@ describe("ParticipantDirectory host leases", () => {
     } finally { clock.mockRestore(); }
   });
 
-  it("all-new peers need no periodic shared record renewal, even under the old policy", async () => {
+  it("a Main suspended past the old policy interval re-publishes its lapsed presence", async () => {
     const { hostEntry, alpha, meshRoot } = await setup(true);
     const shared = hostEntry()!;
     const now = Date.now;
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
     try {
       await alpha.refresh();
-      expect(hostEntry()).toEqual(shared);
+      expect(hostEntry()!.version).toBeGreaterThan(shared.version);
       expect(readHostLeases(meshRoot).get("session:alpha")?.updatedAt).toBeGreaterThan(shared.updatedAt);
       expect(alpha.get("session:alpha")?.stale).toBe(false);
     } finally { clock.mockRestore(); }

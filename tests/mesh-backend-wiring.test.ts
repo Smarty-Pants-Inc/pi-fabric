@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -77,6 +77,51 @@ const run = async (...argv: string[]): Promise<{ code: number; out: string; err:
   const code = await main(argv, { stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
   return { code, out, err };
 };
+
+// The operator runs the BUILT command (package.json bin -> bin/fabric-mesh-backend -> dist), not
+// main() in-process. CI runs `bun run build` before the tests; locally, without dist, this skips.
+const BIN = path.resolve("bin/fabric-mesh-backend");
+const BUILT_CLI = path.resolve("dist/mesh/mesh-backend-cli.js");
+const hasBuiltCli = fs.existsSync(BUILT_CLI);
+if (!hasBuiltCli) console.warn(`skipping the built fabric-mesh-backend test: ${BUILT_CLI} is absent (run bun run build)`);
+
+describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fabric#671)", () => {
+  const cli = (...argv: string[]): { code: number | null; out: string; err: string } => {
+    const child = spawnSync(process.execPath, [BIN, ...argv], {
+      encoding: "utf8", timeout: 30_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" },
+    });
+    return { code: child.status, out: child.stdout, err: child.stderr };
+  };
+
+  it("status, cutover and rollback as a subprocess: exit 0, the advisory census line, the result", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-bin-"));
+    roots.push(root);
+    const seed = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+    await seed.put({ key: "keep/seed", value: 1, identity });
+    seed.closeState();
+
+    const before = cli("status", "--root", root);
+    expect(before, before.err).toMatchObject({ code: 0 });
+    expect(before.out).toContain("census        advisory: 0 writers, 0 unknown");
+    const cutover = cli("cutover", "--root", root);
+    expect(cutover, cutover.err).toMatchObject({ code: 0 });
+    expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
+    expect(cutover.out).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\), 1 entries/);
+    const after = cli("status", "--root", root, "--json");
+    expect(after.code).toBe(0);
+    expect(JSON.parse(after.out)).toMatchObject({ backend: "sqlite", epoch: 1, reader: { source: "sqlite" }, fenceHolds: true });
+    const rollback = cli("rollback", "--root", root);
+    expect(rollback, rollback.err).toMatchObject({ code: 0 });
+    // Advisory only: on a SQLite root the census may list unattributed state.db-wal/-shm evidence as unknown.
+    expect(rollback.err).toMatch(/^fabric-mesh-backend: advisory: 0 writers, \d+ unknown$/m);
+    expect(rollback.out).toMatch(/^rollback done: backend=file epoch 2/);
+    // A usage error is the built command's exit 2, not a crash.
+    expect(cli("cutover", "--root", root, "--assume-no-writers").code).toBe(2);
+    const file = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+    expect(file.get("keep/seed", { fresh: true })?.value).toBe(1);
+    file.closeState();
+  }, 60_000);
+});
 
 describe("fabric-mesh-backend with the writer census (W1)", () => {
   it("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {

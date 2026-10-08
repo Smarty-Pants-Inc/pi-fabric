@@ -648,6 +648,20 @@ export class SqliteStateBackend implements StateBackend {
 
 const SHADOW_IDENTITY: MeshIdentity = { id: "fabric-state-shadow", name: "fabric-state-shadow", kind: "agent" };
 const MAX_DIVERGENT_KEYS = 32;
+/** verify() retries a failed initial full reconcile this many times before it reports "not reconciled". */
+const VERIFY_RECONCILE_ATTEMPTS = 3;
+
+/**
+ * verify() could not compare: the initial full reconcile of the shadow keeps failing (for example
+ * SQLite busy). The unreconciled shadow is never compared, so no key is counted as divergent.
+ */
+export class MeshShadowNotReconciledError extends Error {
+  readonly code = "FABRIC_MESH_SHADOW_NOT_RECONCILED";
+  constructor(attempts: number) {
+    super(`Fabric mesh shadow not reconciled: the initial full reconcile failed ${String(attempts)} times; nothing compared`);
+    this.name = "MeshShadowNotReconciledError";
+  }
+}
 const sameEntry = (left: MeshStateEntry | undefined, right: MeshStateEntry | undefined): boolean =>
   left === undefined || right === undefined ? left === right
     : JSON.stringify(left.value) === JSON.stringify(right.value) && JSON.stringify(left.updatedBy) === JSON.stringify(right.updatedBy);
@@ -701,7 +715,10 @@ export class ShadowStateBackend implements StateBackend {
     });
     const verifyMs = Math.max(0, Math.floor(options.shadowVerifyMs ?? 60_000));
     if (verifyMs > 0) {
-      this.#timer = setInterval(() => { void this.verify().catch(() => { this.#failures += 1; }); }, verifyMs);
+      // A failed reconcile is already counted by the mirror; only other verify failures count here.
+      this.#timer = setInterval(() => {
+        void this.verify().catch((error: unknown) => { if (!(error instanceof MeshShadowNotReconciledError)) this.#failures += 1; });
+      }, verifyMs);
       this.#timer.unref?.();
     }
   }
@@ -787,15 +804,19 @@ export class ShadowStateBackend implements StateBackend {
    * COUNTED (diagnostics().divergences) when the previous check saw the same difference for the same
    * file revision. Waits for this process's own queued mirrors first. Before the first successful
    * full reconcile (a fresh shadow over an existing state.json, verified before any write or
-   * repair), it starts that reconcile and waits for it, so clean keys never read as missing.
+   * repair), it starts that reconcile and waits for it, so clean keys never read as missing. A
+   * failed reconcile (SQLite busy) is retried, bounded; if it still fails, verify() rejects with
+   * MeshShadowNotReconciledError and compares nothing, so an unreconciled shadow never counts.
    */
   async verify(): Promise<StateDivergence[]> {
-    if (!this.#reconciled && !this.#disabled) {
+    for (let attempt = 0; attempt < VERIFY_RECONCILE_ATTEMPTS && !this.#reconciled && !this.#disabled; attempt += 1) {
       this.#full = true;
       this.#kick();
+      await this.flush();
     }
     await this.flush();
     if (this.#disabled) return [];
+    if (!this.#reconciled) throw new MeshShadowNotReconciledError(VERIFY_RECONCILE_ATTEMPTS);
     const files = new Map(this.#file.listAll("", { fresh: true }).map((entry) => [entry.key, entry] as const));
     const shadows = new Map(this.#shadow.listAll("").map((entry) => [entry.key, entry] as const));
     const differences: StateDivergence[] = [];

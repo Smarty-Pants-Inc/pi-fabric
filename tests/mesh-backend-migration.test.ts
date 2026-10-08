@@ -212,8 +212,24 @@ describe("mesh backend rollback fence (R1)", () => {
     expect(resolveMeshStateSource(root)).toMatchObject({ source: "sqlite", backend: "exporting", epoch: 2 });
     await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(MeshStateRetiredError);
 
-    expect(await abortMeshRollback(root)).toMatchObject({ backend: "sqlite", epoch: 2, converged: false });
-    expect(await abortMeshRollback(root)).toMatchObject({ backend: "sqlite", epoch: 2, converged: true });
+    // Like the other mutating commands, abort-rollback runs the advisory census inside its fence
+    // (custody.lock held) and returns the report; a reported writer never gates it.
+    const advised: MeshCensusAdvisory[] = [];
+    let custodyHeld = false;
+    const aborted = await abortMeshRollback(root, {
+      census: async () => {
+        custodyHeld = fs.existsSync(path.join(root, "custody.lock"));
+        return { writers: [{ pid: 4242, release: "3.2.0", mode: "sqlite" }] };
+      },
+      onAdvisory: advisory => { advised.push(advisory); },
+    });
+    expect(aborted).toMatchObject({ backend: "sqlite", epoch: 2, converged: false });
+    expect(custodyHeld).toBe(true);
+    expect(advised).toEqual([{ writers: [{ pid: 4242, release: "3.2.0", mode: "sqlite" }], unknown: [] }]);
+    expect(aborted.census).toEqual(advised[0]);
+    expect(await abortMeshRollback(root, { census: async () => ({ writers: [] }) }))
+      .toMatchObject({ backend: "sqlite", epoch: 2, converged: true, census: { writers: [], unknown: [] } });
+    expect(await abortMeshRollback(root)).not.toHaveProperty("census");
     const reopened = await openSqlite(root);
     await reopened.put({ key: "after/abort", value: 1, identity });
     expect(resolveMeshStateSource(root)).toMatchObject({ source: "sqlite", epoch: 2 });

@@ -211,7 +211,14 @@ export interface MeshRollbackResult {
   census?: MeshCensusAdvisory;
 }
 
-export interface MeshAbortRollbackResult { root: string; backend: "sqlite"; epoch: number; converged: boolean }
+export interface MeshAbortRollbackResult {
+  root: string;
+  backend: "sqlite";
+  epoch: number;
+  converged: boolean;
+  /** The advisory census report, when a provider ran. */
+  census?: MeshCensusAdvisory;
+}
 
 export interface MeshBackendStatus {
   root: string;
@@ -1095,13 +1102,17 @@ export const rollbackMeshState = async (root: string, options: MeshBackendOption
  * `exporting` back to `sqlite`, keeping epoch E+1 (stores opened at E reopen). The fence
  * (`custody.lock`, `.lock`) is taken FIRST; the marker is ensured (restored if anything replaced it) before the flag moves, so no
  * legacy writer queued on `.lock` ever sees a real state.json while SQLite is the authority.
+ * Like the other mutating commands, it runs the advisory census inside the fence and returns its
+ * report (also passed to `onAdvisory`); the census never gates it.
  */
 export const abortMeshRollback = async (root: string, options: MeshBackendOptions = {}): Promise<MeshAbortRollbackResult> => {
   root = path.resolve(root);
   const fence = FenceDb.open(root, options, "write");
   if (!fence) throw new MeshBackendRefusedError(`No state.db at ${root}`);
   try {
-    return await holdFence(root, options, () => {
+    return await holdFence(root, options, async () => {
+      const census = await adviseCensus(options);
+      const advisory = census ? { census } : {};
       const meta = fence.meta();
       const converged = meta.backend === "sqlite" && Number(meta.values.get("aborted_rollback_epoch")) === meta.epoch;
       if (!converged && meta.backend !== "exporting") {
@@ -1110,7 +1121,7 @@ export const abortMeshRollback = async (root: string, options: MeshBackendOption
       ensureMovedMarker(root, meta.epoch);
       removeRollbackTemps(root);
       removeStaleTemps(root);
-      if (converged) return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: true };
+      if (converged) return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: true, ...advisory };
       fence.transaction(() => {
         const current = fence.meta();
         if (current.backend !== "exporting" || current.epoch !== meta.epoch) {
@@ -1120,7 +1131,7 @@ export const abortMeshRollback = async (root: string, options: MeshBackendOption
         fence.setMeta("aborted_rollback_epoch", meta.epoch);
       });
       options.onStep?.("abort-rollback");
-      return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: false };
+      return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: false, ...advisory };
     });
   } finally { fence.close(); }
 };

@@ -904,6 +904,124 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it("retains the widget through a running host reply and zero-child gaps, then releases it at idle", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: "auto", refreshMs: 100, maxRows: 6 });
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
+    const activity = new FabricActivityStore();
+    Object.assign(state, { activity });
+    let widget: FabricWidget | undefined;
+    const tui = { requestRender: vi.fn(), terminal: { rows: 24 } } as unknown as TUI;
+    const setWidget = vi.fn((_key: string, content: unknown) => {
+      if (typeof content === "function") widget = (content as (t: TUI, theme: Theme) => FabricWidget)(tui, theme);
+    });
+    const context = { mode: "tui", ui: { notify: vi.fn(), setWidget } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    activity.start("first");
+    try {
+      controller.start(context);
+      const mounted = widget!;
+      expect(mounted.render(80)).toHaveLength(6);
+      activity.finish("first", true);
+      state.widgetDismissedAt = Date.now() + 1;
+      await vi.advanceTimersByTimeAsync(110);
+      expect(controller.snapshot().main.status).toBe("running");
+      expect(mounted.render(80)).toHaveLength(6);
+      expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(0);
+      activity.start("second");
+      await vi.advanceTimersByTimeAsync(110);
+      expect(widget).toBe(mounted);
+      expect(mounted.render(80)).toHaveLength(6);
+      activity.finish("second", true);
+      state.widgetDismissedAt = Date.now() + 1;
+      await vi.advanceTimersByTimeAsync(110);
+      expect(mounted.render(80)).toHaveLength(6);
+      vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
+      // No child event follows: the host alone keeps polling until idle.
+      await vi.advanceTimersByTimeAsync(110);
+      expect(mounted.render(80).length).toBeLessThan(6);
+      expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(1);
+      // Explicit agent_end releases immediately even before Pi's isIdle flips.
+      vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
+      controller.setHostStreaming(true);
+      expect(widget!.render(80)).toHaveLength(6);
+      controller.setHostStreaming(false);
+      expect(controller.snapshot().main.status).toBe("idle");
+      expect(widget!.render(80).length).toBeLessThan(6);
+      expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(2);
+      // A child may outlive Main; it must not extend the host's reservation.
+      activity.start("outlives-host");
+      controller.setHostStreaming(true);
+      expect(widget!.render(80)).toHaveLength(6);
+      controller.setHostStreaming(false);
+      expect(controller.snapshot().runs[0]!.status).toBe("running");
+      expect(widget!.render(80).length).toBeLessThan(6);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("never mounts or reserves rows in explicit hidden mode despite active host and Fabric work", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: "hidden", refreshMs: 100, maxRows: 6 });
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
+    vi.mocked(state.actors.list).mockReturnValue([{ ...state.actors.list()[0]!, status: "running" }]);
+    const activity = new FabricActivityStore();
+    activity.start("live");
+    Object.assign(state, { activity });
+    const setWidget = vi.fn();
+    const context = { mode: "tui", ui: { notify: vi.fn(), setWidget } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      activity.beginCall("live", { callId: "c", ref: "agents.run", args: {} });
+      await vi.advanceTimersByTimeAsync(210);
+      expect(setWidget.mock.calls.filter(([, content]) => content !== undefined)).toHaveLength(0);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("immediately shrinks a controller-owned streaming reservation on terminal resize", () => {
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: "always", maxRows: 6 });
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
+    vi.mocked(state.actors.list).mockReturnValue([{ ...state.actors.list()[0]!, status: "running" }]);
+    let widget: FabricWidget | undefined;
+    const terminal = { rows: 24 };
+    const tui = { terminal, requestRender: vi.fn() } as unknown as TUI;
+    const context = { mode: "tui", ui: {
+      notify: vi.fn(),
+      setWidget: vi.fn((_key: string, content: unknown) => {
+        if (typeof content === "function") widget = (content as (t: TUI, theme: Theme) => FabricWidget)(tui, theme);
+      }),
+    } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      expect(widget!.render(80)).toHaveLength(6);
+      terminal.rows = 8;
+      expect(widget!.hasChanged()).toBe(true);
+      expect(widget!.render(80)).toHaveLength(4);
+      terminal.rows = 4;
+      // Resize can directly render without an intervening poll/hasChanged.
+      expect(widget!.render(80)).toHaveLength(2);
+      terminal.rows = 1;
+      expect(widget!.hasChanged()).toBe(true);
+      expect(widget!.render(80)).toHaveLength(1);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+    }
+  });
+
   it("rebuilds topology on lease-only re-acquisition without a state or participant record change", async () => {
     vi.useFakeTimers();
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-leases-"));
@@ -949,6 +1067,7 @@ describe("FabricUiController dashboard wiring", () => {
     state.config.ui.widget = "auto";
     state.config.ui.refreshMs = 500;
     state.config.ui.maxRows = 6;
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
     vi.mocked(state.actors.list).mockReturnValue([]);
     const activity = new FabricActivityStore();
     Object.assign(state, { activity });
@@ -970,6 +1089,10 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       activity.start("live", { name: "T06 slice A" });
+      await vi.advanceTimersByTimeAsync(110);
+      expect(widget).toBeDefined();
+      const reserved = widget!.render(80);
+      expect(reserved).toHaveLength(6);
       for (let index = 0; index < 6; index++) {
         const callId = `c${index}`;
         activity.beginCall("live", { callId, ref: "pi.read", args: { path: `${index}.ts` } });
@@ -980,6 +1103,7 @@ describe("FabricUiController dashboard wiring", () => {
       const first = widget!.render(80).join("\n");
       expect(first).toContain("T06 slice A");
       expect(first).toContain("6/6 calls");
+      expect(first.split("\n")).toHaveLength(reserved.length);
       // Sub-second elapsed stays hidden, so the clock shows its first real tick.
       expect(first).toMatch(/1s/);
       expect(controller.snapshot().runs[0]?.status).toBe("running");
@@ -991,6 +1115,10 @@ describe("FabricUiController dashboard wiring", () => {
       expect(elapsedMs).toBeGreaterThanOrEqual(5_000);
       expect(second).toMatch(/6s/);
       expect(requestRender).toHaveBeenCalled();
+      activity.finish("live", true);
+      vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
+      await vi.advanceTimersByTimeAsync(110);
+      expect(widget!.render(80).length).toBeLessThan(reserved.length);
     } finally {
       controller.stop();
       vi.useRealTimers();

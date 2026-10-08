@@ -137,21 +137,31 @@ it.each([1, 2] as const)("busy participant-key native recovery prepares outside 
   let nativeUnderCustody = false;
   let began!: () => void;
   const preparing = new Promise<void>(resolve => { began = resolve; });
+  // The native read stays pending until the test has taken both registry fences,
+  // so "prepares outside the fences" is an ordering fact, not a wall-clock race.
+  // The 5 s fallback only bounds a regression that holds a fence across the read.
+  let finishRead!: () => void, nativeFinished = false;
+  const nativeRead = new Promise<void>(resolve => { finishRead = resolve; }).then(() => { nativeFinished = true; });
   const read = vi.spyOn(atomic, "processIncarnation").mockImplementation(() => {
     nativeUnderCustody ||= s.custody(); began();
-    const work = pause(1200).then(() => undefined); reads.push(work); return work;
+    const hangGuard = setTimeout(finishRead, 5_000);
+    const work = nativeRead.then(() => { clearTimeout(hangGuard); return undefined; }); reads.push(work); return work;
   });
   try {
     const begin = performance.now();
     await expect(host.participants.refreshPresence()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    expect(performance.now() - begin).toBeLessThan(150);
+    // The fenced caller fails fast: no native read (asserted directly) and no
+    // 5 s LOCK_WAIT_MS key wait. The bound is a hang guard, not a latency budget.
     expect(read).not.toHaveBeenCalled();
+    expect(performance.now() - begin).toBeLessThan(2_500);
     const retry = host.participants.refresh().catch(error => error);
     await preparing;
     const setterBegin = performance.now();
     await Promise.all(s.actorRoots.map(root => new ActorRegistryStore(root).withLock(() => undefined)));
     const registryBlockedMs = performance.now() - setterBegin;
-    expect(registryBlockedMs).toBeLessThan(150);
+    // Both registry fences were acquired while native preparation was still in flight.
+    expect(nativeFinished).toBe(false);
+    finishRead();
     expect(await retry).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     expect(nativeUnderCustody).toBe(false); expect(read).toHaveBeenCalledOnce();
     expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(receipt);
@@ -159,8 +169,8 @@ it.each([1, 2] as const)("busy participant-key native recovery prepares outside 
     fs.rmSync(keyLock, { recursive: true });
     await host.participants.refresh();
     expect(host.participants.canConsumeMesh()).toBe(true);
-    console.log(JSON.stringify({ entrypoint: "busy participant-key retry", protocol, simulatedNativeMs: 1200, registryBlockedMs, nativeUnderCustody, unknownStayedLive: true }));
-  } finally { fs.rmSync(keyLock, { recursive: true, force: true }); releaseRetry(); }
+    console.log(JSON.stringify({ entrypoint: "busy participant-key retry", protocol, registryBlockedMs, nativeUnderCustody, unknownStayedLive: true }));
+  } finally { finishRead(); fs.rmSync(keyLock, { recursive: true, force: true }); releaseRetry(); }
 }, 10000);
 
 it("a fenced caller missing its prepared own receipt fails closed instead of reading native identity", async () => {

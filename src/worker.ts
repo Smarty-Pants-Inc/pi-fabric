@@ -19,6 +19,7 @@ import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
+import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
@@ -268,24 +269,16 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-let crashPending = false;
-const finishCrash = async (error: unknown): Promise<void> => {
-  if (crashPending) return;
-  crashPending = true;
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-  try {
-    // A crash result is not an exit receipt. Do not publish it (or exit this
-    // custodian) until every admitted execution obligation has been drained.
-    await executionCleanup();
-    await executionSettled();
-    writeCrashStatus(error);
-    process.exit(1);
-  } catch (cleanupError) {
-    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
-    // Keep the custodian available to its parent even if no native pipes remain.
-    setInterval(() => {}, 1000);
-  }
-};
+const crash = createCrashFinisher({
+  cleanup: () => executionCleanup(),
+  settled: () => executionSettled(),
+  report: writeCrashStatus,
+  exit: code => process.exit(code),
+  log: text => console.error(text),
+  // Keep the custodian available to its parent even if no native pipes remain.
+  retain: () => { setInterval(() => {}, 1000); },
+});
+const finishCrash = crash.finish;
 process.on("uncaughtException", (error) => { void finishCrash(error); });
 process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
@@ -2078,7 +2071,7 @@ const main = async (): Promise<void> => {
   }
   await executionSettled();
 
-  if (crashPending) return; // finishCrash owns result publication after the drain.
+  if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);

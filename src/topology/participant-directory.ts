@@ -1514,9 +1514,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
       this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
     }
-    await this.#actorRenewing;
-    await this.#refreshing?.catch(() => undefined);
-    await this.refresh();
+    try {
+      await this.#actorRenewing;
+      await this.#refreshing?.catch(() => undefined);
+      await this.refresh();
+    } catch (error) {
+      // A reload's shared write can time out under lock load (smarty-dev#6729). The reload
+      // goes on regardless (shutdown swallows this), so keep the Main addressable: renew its
+      // own lease file, which needs no mesh lock, and let close() keep the root and lease.
+      if (this.#reloadUntil !== undefined && this.options.enabled) {
+        try { this.#renewFileLease(); } catch { /* close() still keeps the last lease */ }
+        this.#reloadPublished = true;
+      }
+      throw error;
+    }
     this.#reloadPublished = this.#reloadUntil !== undefined;
   }
 

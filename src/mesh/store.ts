@@ -78,6 +78,11 @@ export class MeshStore {
     return this.#state.kind;
   }
 
+  /** The backend itself, for maintenance tools (shadow verify/repair, the L3 projector, L4 census). */
+  get stateBackendHandle(): StateBackend {
+    return this.#state;
+  }
+
   stateDiagnostics(): StateBackendDiagnostics {
     return this.#state.diagnostics();
   }

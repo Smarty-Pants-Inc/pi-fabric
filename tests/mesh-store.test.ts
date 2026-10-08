@@ -636,7 +636,7 @@ describe("MeshStore", () => {
     expect(store.read().filter(e => e.dedupeKey === packet.dedupeKey)).toEqual([event]);
   });
 
-  it("does not compact if settlement cannot durably write its receipt", async () => {
+  it("does not compact if settlement cannot durably write its receipt, and never fails the publish", async () => {
     const store = createStore({ maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
     const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "blocked-settlement", text: "first" };
     const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
@@ -648,7 +648,13 @@ describe("MeshStore", () => {
     try {
       await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
       await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
-      await expect(store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) })).rejects.toThrow("receipt unavailable");
+      const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+      // Compaction is best effort after commit (smarty-dev#6477 E1): the committed unkeyed
+      // publish resolves (a rejection would invite a duplicate retry); the failure is reported.
+      const committed = await store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) });
+      expect(String(warn.mock.calls.at(-1)?.[0])).toContain("receipt unavailable");
+      warn.mockRestore();
+      expect(store.read().at(-1)).toEqual(committed);
       expect(store.oldestSequence()).toBe(1);
       expect(fs.existsSync(base + ".pending.json")).toBe(true);
     } finally { crash.mockRestore(); }

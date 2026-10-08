@@ -214,6 +214,56 @@ describe("state projector (shadow)", () => {
     await expectInStep(root);
   });
 
+  it("detects tombstones with the file's keys and versions in a different ord order and repairs it", async () => {
+    const root = tempRoot("tombstone-order");
+    const file = new MeshStore(root, 64 * 1024, 1_000, { maxStateTombstones: 5 });
+    for (const key of ["t/a", "t/b", "t/c"]) await file.put({ key, value: key, identity });
+    for (const key of ["t/a", "t/b", "t/c"]) await file.delete({ key });
+    expect(fileState(root).tombstoneOrder).toEqual(["t/a", "t/b", "t/c"]);
+    const projector = await openProjector(root);
+    await projector.tick();
+    expect(await projector.verify()).toEqual([]);
+
+    // Same keys, same versions; only the ords of t/a and t/c are swapped (ord is UNIQUE: via a free slot).
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    let before: Array<{ key: string; version: number; ord: number }>;
+    try {
+      before = raw.prepare("SELECT key, version, ord FROM tombstones ORDER BY ord").all() as typeof before;
+      const ordOf = (key: string) => before.find(row => row.key === key)!.ord;
+      const [a, c] = [ordOf("t/a"), ordOf("t/c")];
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(-1, "t/a");
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(a, "t/c");
+      raw.prepare("UPDATE tombstones SET ord = ? WHERE key = ?").run(c, "t/a");
+      const swapped = raw.prepare("SELECT key, version FROM tombstones ORDER BY ord").all() as Array<{ key: string; version: number }>;
+      expect(swapped.map(row => row.key)).toEqual(["t/c", "t/b", "t/a"]);
+      // An unordered comparison would see no difference.
+      expect(new Map(swapped.map(row => [row.key, row.version]))).toEqual(new Map(before.map(row => [row.key, row.version])));
+    } finally { raw.close(); }
+
+    const found = await projector.verify();
+    expect(found.map(divergence => [divergence.key, divergence.field])).toEqual([["t/c", "tombstone-order"], ["t/a", "tombstone-order"]]);
+    expect(found[0]).toMatchObject({ fileVersion: found[0]!.sqliteVersion, filePosition: 2, sqlitePosition: 0 });
+    expect(found[1]).toMatchObject({ fileVersion: found[1]!.sqliteVersion, filePosition: 0, sqlitePosition: 2 });
+    expect(projector.status()).toMatchObject({ divergences: 2, fullResyncs: 2, lastResync: { reason: "divergence" } });
+    // Repaired by the resync: a second verify is clean and SQLite has the file's order again.
+    expect(await projector.verify()).toEqual([]);
+    await expectInStep(root);
+  });
+
+  it("reports a tombstone ord above the tombstone_ord mark as a tombstone-order divergence", async () => {
+    const root = tempRoot("tombstone-ord-mark");
+    const file = new MeshStore(root, 64 * 1024, 1_000);
+    await file.put({ key: "t/a", value: 1, identity });
+    await file.delete({ key: "t/a" });
+    const projector = await openProjector(root);
+    await projector.tick();
+    expect(await projector.verify()).toEqual([]);
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    try { raw.prepare("UPDATE tombstones SET ord = ord + 1000 WHERE key = ?").run("t/a"); } finally { raw.close(); }
+    expect((await projector.verify()).map(divergence => [divergence.key, divergence.field])).toEqual([["t/a", "tombstone-order"]]);
+    expect(await projector.verify()).toEqual([]);
+  });
+
   it("keeps reporting a divergence when repair is off", async () => {
     const root = tempRoot("no-repair");
     const file = new MeshStore(root, 64 * 1024, 1_000);

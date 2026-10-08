@@ -80,9 +80,13 @@ export type StateProjectorResyncReason = "initial" | "gap" | "rewrite" | "diverg
 
 /** A divergence with the field that differs and both revisions (undefined: absent on that side). */
 export interface ProjectorDivergence extends StateDivergence {
-  field: "presence" | "version" | "value" | "updatedAt" | "updatedBy" | "tombstone";
+  field: "presence" | "version" | "value" | "updatedAt" | "updatedBy" | "tombstone" | "tombstone-order";
   fileVersion: number | undefined;
   sqliteVersion: number | undefined;
+  /** tombstone-order: the key's position in the file's tombstoneOrder and in SQLite (by ord, then key), and its ord. */
+  filePosition?: number | undefined;
+  sqlitePosition?: number | undefined;
+  sqliteOrd?: number | undefined;
 }
 
 export interface StateProjectorLag {
@@ -433,9 +437,10 @@ const statements = (db: SqliteConnection) => ({
     updated_by = excluded.updated_by, bytes = excluded.bytes`),
   kvDelete: db.prepare("DELETE FROM kv WHERE key = ?"),
   kvCount: db.prepare("SELECT count(*) AS n FROM kv"),
-  tombAll: db.prepare("SELECT key, version FROM tombstones ORDER BY ord"),
+  tombAll: db.prepare("SELECT key, version, ord FROM tombstones ORDER BY ord, key"),
   tombGet: db.prepare("SELECT version FROM tombstones WHERE key = ?"),
   tombCount: db.prepare("SELECT count(*) AS n FROM tombstones"),
+  tombMaxOrd: db.prepare("SELECT coalesce(max(ord), 0) AS m FROM tombstones"),
   tombInsert: db.prepare("INSERT INTO tombstones(key, version, ord) VALUES (?, ?, ?)"),
   tombVersion: db.prepare("UPDATE tombstones SET version = ? WHERE key = ?"),
   tombDelete: db.prepare("DELETE FROM tombstones WHERE key = ?"),
@@ -944,14 +949,16 @@ export class StateProjector {
   }
 
   // Makes the tombstone table equal `desired`, in order: in place when the change is "drop some,
-  // append some" (the file store's only shapes), else a rewrite with fresh ordinals.
+  // append some" (the file store's only shapes) and every ord lies at or below the tombstone_ord
+  // mark, else a rewrite with fresh ordinals.
   #syncTombstones(desired: ReadonlyArray<[string, number]>, current: ReadonlyArray<[string, number]>): void {
     const desiredKeys = new Set(desired.map(([key]) => key));
     const currentKeys = new Set(current.map(([key]) => key));
     const kept = current.filter(([key]) => desiredKeys.has(key));
     let ordinal = Number(this.#sql.metaGet.get("tombstone_ord")?.value ?? 0);
     const inPlace = kept.every(([key], index) => desired[index]?.[0] === key) &&
-      desired.slice(kept.length).every(([key]) => !currentKeys.has(key));
+      desired.slice(kept.length).every(([key]) => !currentKeys.has(key)) &&
+      Number(this.#sql.tombMaxOrd.get()?.m ?? 0) <= ordinal;
     if (inPlace) {
       for (const [key] of current) if (!desiredKeys.has(key)) this.#sql.tombDelete.run(key);
       for (const [index, [key, version]] of kept.entries()) {
@@ -1004,12 +1011,14 @@ export class StateProjector {
     // One read transaction: the rows and the fence come from one SQLite snapshot.
     let rows: SqliteRow[];
     let tombs: SqliteRow[];
+    let ordMark: number;
     let progress: Progress;
     this.#db.exec("BEGIN");
     try {
       progress = this.#fence(false);
       rows = this.#sql.kvAll.all();
       tombs = this.#sql.tombAll.all();
+      ordMark = Number(this.#sql.metaGet.get("tombstone_ord")?.value ?? 0);
     } finally { try { this.#db.exec("COMMIT"); } catch { try { this.#db.exec("ROLLBACK"); } catch { /* ended */ } } }
     // Only at the projected generation: anything newer is lag, not divergence.
     if (snapshot.identity !== progress.identity) return [];
@@ -1032,11 +1041,25 @@ export class StateProjector {
               : file.updatedAt !== stored.updatedAt ? "updatedAt" : undefined;
       if (field) differences.push({ key, field, file: side(file), sqlite: side(stored), fileVersion: file?.version, sqliteVersion: stored?.version });
     }
+    // Tombstones are an ordered list (the eviction order), not a map: compare each key's version,
+    // then the order of the keys both sides hold position by position (SQLite by ord, then key),
+    // and that every ord lies at or below the tombstone_ord mark the next tombstone is numbered from.
+    const reported = (key: string): boolean => differences.some(divergence => divergence.key === key);
     const fileTombs = new Map(snapshot.tombstones);
-    const sqliteTombs = new Map(tombs.map(row => [String(row.key), Number(row.version)] as const));
+    const filePositions = new Map(snapshot.tombstones.map(([key], index) => [key, index] as const));
+    const sqliteList = tombs.map((row, index) => ({ key: String(row.key), version: Number(row.version), ord: Number(row.ord), index }));
+    const sqliteTombs = new Map(sqliteList.map(tomb => [tomb.key, tomb] as const));
     for (const key of new Set([...fileTombs.keys(), ...sqliteTombs.keys()])) {
-      if (fileTombs.get(key) === sqliteTombs.get(key) || differences.some(divergence => divergence.key === key)) continue;
-      differences.push({ key, field: "tombstone", file: undefined, sqlite: undefined, fileVersion: fileTombs.get(key), sqliteVersion: sqliteTombs.get(key) });
+      if (fileTombs.get(key) === sqliteTombs.get(key)?.version || reported(key)) continue;
+      differences.push({ key, field: "tombstone", file: undefined, sqlite: undefined, fileVersion: fileTombs.get(key), sqliteVersion: sqliteTombs.get(key)?.version });
+    }
+    const fileOrder = snapshot.tombstones.map(([key]) => key).filter(key => sqliteTombs.has(key));
+    const sqliteOrder = sqliteList.filter(tomb => fileTombs.has(tomb.key));
+    for (const [index, tomb] of sqliteOrder.entries()) {
+      if ((fileOrder[index] === tomb.key && tomb.ord <= ordMark) || reported(tomb.key)) continue;
+      differences.push({ key: tomb.key, field: "tombstone-order", file: undefined, sqlite: undefined,
+        fileVersion: fileTombs.get(tomb.key), sqliteVersion: tomb.version,
+        filePosition: filePositions.get(tomb.key), sqlitePosition: tomb.index, sqliteOrd: tomb.ord });
     }
     if (differences.length > 0) {
       this.#stats.divergences += differences.length;

@@ -448,6 +448,31 @@ describe("mesh writer census", () => {
     expect(fs.existsSync(file)).toBe(false);
   });
 
+  it("keeps the record while a store opened through a symlink/junction alias of the root is still open", async () => {
+    const mesh = root();
+    const alias = path.join(root(), "alias");
+    fs.symlinkSync(mesh, alias, process.platform === "win32" ? "junction" : "dir");
+    const file = path.join(mesh, ".writer-census", censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
+    const direct = new MeshStore(mesh, 4096, 100, { stateBackend: "file" });
+    const aliased = new MeshStore(alias, 4096, 100, { stateBackend: "sqlite" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ stateBackend: "sqlite" }));
+    direct.closeState();
+    expect(fs.existsSync(file)).toBe(true);
+    for (const view of [mesh, alias]) {
+      expect((await census(view)).writers).toContainEqual(expect.objectContaining({ pid: process.pid,
+        source: "process-record", stateBackend: "sqlite" }));
+    }
+    aliased.closeState();
+    expect(fs.existsSync(file)).toBe(false);
+    // And in the other order: the alias store closes first, the root store keeps the record.
+    const viaAlias = new MeshStore(alias, 4096, 100, { stateBackend: "sqlite" });
+    const viaRoot = new MeshStore(mesh, 4096, 100, { stateBackend: "file" });
+    viaAlias.closeState();
+    expect(fs.existsSync(file)).toBe(true);
+    viaRoot.closeState();
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
   it.each([
     { label: "corrupt", text: "{not json" },
     { label: "another start time", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",

@@ -2095,8 +2095,11 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
   // Witness times are whole milliseconds of file time (latestCommitWitness floors mtimeMs), so a
   // commit in the same millisecond as a receipt is, by design, no evidence. Before a commit that
   // must count as evidence, wait until file time passes every receipt and witness so far.
+  // The latest file time under the mesh root, floored like latestCommitWitness: a superset of its witnesses.
+  const meshFileTime = (meshRoot: string) =>
+    Math.max(0, ...fs.readdirSync(meshRoot).map(name => Math.floor(fs.statSync(path.join(meshRoot, name)).mtimeMs)));
   const fileClockPast = (meshRoot: string, ...receipts: number[]) => {
-    const latest = Math.max(...receipts, ...fs.readdirSync(meshRoot).map(name => Math.floor(fs.statSync(path.join(meshRoot, name)).mtimeMs)));
+    const latest = Math.max(...receipts, meshFileTime(meshRoot));
     const probe = path.join(path.dirname(meshRoot), "clock.probe");
     for (let i = 0; i < 100_000; i++) {
       fs.writeFileSync(probe, "");
@@ -2110,18 +2113,39 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     const before = f.directory.confirmedAt();
     fileClockPast(f.mesh.root, before);
     await f.writer.put({ key: "bench/other", value: { at: 1 }, identity: f.other });
-    const committedAt = Date.now();
     const baseline = f.acquisitions();
     await f.directory.refresh();
     expect(f.acquisitions() - baseline).toBe(0);
     expect(f.confirmations).not.toHaveBeenCalled();
     expect(f.writes).not.toHaveBeenCalled();
     expect(f.directory.confirmedAt()).toBeGreaterThan(before);
-    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(committedAt);
+    // The receipt is the commit's file time, clamped to Date.now(). Compare each bound with its own
+    // clock: on Windows file time and Date.now() are separate clocks, and file time can lead by a
+    // millisecond or more, so a Date.now() taken right after the commit is no bound (CI on #634).
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(meshFileTime(f.mesh.root));
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(Date.now());
     expect(f.directory.canConsumeMesh()).toBe(true);
     expect(readHostLeases(f.mesh.root).get(f.directory.options.hostId)?.expiresAt).toBeGreaterThan(Date.now());
     // The next view is canonical, as after confirmWritable: the other writer's commit is visible.
     expect(f.mesh.get("bench/other")?.value).toEqual({ at: 1 });
+  });
+
+  // smarty-dev#6477 L6 (Windows CI on #634): a commit's file time may lead Date.now(). Such evidence
+  // confirms no later than the real clock, so a confirmation window never starts in the future.
+  it("clamps a lock-free receipt to Date.now() when the commit's file time leads the clock", async () => {
+    const f = await idleFixture();
+    const before = f.directory.confirmedAt();
+    fileClockPast(f.mesh.root, before);
+    await f.writer.put({ key: "bench/other", value: { at: 5 }, identity: f.other });
+    const witness = path.join(f.mesh.root, "state.json");
+    fs.utimesSync(witness, fs.statSync(witness).atime, new Date(Date.now() + 30_000));
+    const baseline = f.acquisitions();
+    await f.directory.refresh();
+    const after = Date.now();
+    expect(f.acquisitions() - baseline).toBe(0);
+    expect(f.confirmations).not.toHaveBeenCalled();
+    expect(f.directory.confirmedAt()).toBeGreaterThan(before);
+    expect(f.directory.confirmedAt()).toBeLessThanOrEqual(after);
   });
 
   // Review round 2 on #592: the fresh read after the witness is synchronous file I/O and can be

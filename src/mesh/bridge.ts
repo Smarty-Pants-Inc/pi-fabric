@@ -638,8 +638,14 @@ export class StoreBridgeSide implements BridgeSide {
     // earlier release carries no incarnation and proves none: it is discarded, and a later pass
     // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
     if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt) return;
+    const onDisk = readHostLease(this.store.root, lease.id);
     // A replayed row never shortens a lease that a later pass already renewed.
-    if (replay && (readHostLease(this.store.root, lease.id)?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
+    if (replay && (onDisk?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
+    // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
+    // and incarnation can run their effects out of order, and the older one still matches startedAt
+    // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
+    if (onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.expiresAt > lease.expiresAt) return;
     writeHostLease(this.store.root, lease);
   }
 

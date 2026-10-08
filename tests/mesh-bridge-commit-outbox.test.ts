@@ -248,6 +248,57 @@ describe("stale lease effect after a replacement mirror (pi-fabric#640 review ro
   });
 });
 
+describe("out-of-order live lease effects of one incarnation (smarty-dev#6939)", () => {
+  it("concurrent SQLite mirror batches: the older effect, run last, never shortens the newer lease", async () => {
+    const hub = store("sqlite");
+    expect(hub.stateBackend).toBe("sqlite");
+    const other = new MeshStore(hub.root, 64 * 1024, 100, { stateBackend: "sqlite" });
+    opened.push(other);
+    const now = Date.now();
+    const peer = remote("xi", now);
+    // Two writers for the same peer, host and incarnation, through two connections to one database.
+    const older = new StoreBridgeSide(hub, "ryzen2", () => now);
+    const newer = new StoreBridgeSide(other, "ryzen2", () => now);
+    // The newer writer has nothing to recover: only live effects run below.
+    await newer.mirror({ hosts: [], participants: [] });
+    let newerLease: ReturnType<typeof readHostLease>;
+    let olderEffects = 0;
+    const writeBatch = hub.writeBatch.bind(hub);
+    vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
+      if (input.lockClass !== "bridge" || !input.afterCommit) return writeBatch(input);
+      const { afterCommit, ...rest } = input;
+      // The older batch commits; before its effect runs, the newer batch commits and writes its lease.
+      const results = await writeBatch(rest);
+      await newer.mirror({ hosts: [{ record: peer.host, expiresAt: now + 14_000 }], participants: [peer.participant] });
+      newerLease = readHostLease(hub.root, peer.identity.id);
+      expect(newerLease).toMatchObject({ startedAt: peer.host.startedAt, expiresAt: now + 14_000 });
+      // The older effect runs last, on a state that still holds the same incarnation.
+      await writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: (view) => { olderEffects += 1; afterCommit(view); } });
+      return results;
+    });
+    const writes = vi.spyOn(fs, "renameSync");
+    await older.mirror({ hosts: [{ record: peer.host, expiresAt: now + 8_000 }], participants: [peer.participant] });
+    expect(olderEffects).toBe(1);
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })?.value).toMatchObject({ startedAt: peer.host.startedAt, remoteHost: "ryzen2" });
+    // The newer lease and its expiry survive; the older effect wrote no lease file.
+    expect(readHostLease(hub.root, peer.identity.id)).toEqual(newerLease);
+    expect(writes.mock.calls.filter(([, to]) => leaseWrite(String(to)))).toHaveLength(1);
+  });
+
+  it("a live effect still replaces a later-expiring lease of another incarnation", async () => {
+    const hub = store("sqlite");
+    const now = Date.now();
+    const peer = remote("omicron", now);
+    const restarted = { ...peer.host, startedAt: now + 1_000, updatedAt: now + 1_000 } as FabricHostRecord;
+    // The previous incarnation's lease, expiring later than the restarted mirror's.
+    writeHostLease(hub.root, { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id,
+      startedAt: peer.host.startedAt, updatedAt: now, expiresAt: now + 60_000 });
+    await new StoreBridgeSide(hub, "ryzen2", () => now + 1_000)
+      .mirror({ hosts: [{ record: restarted, expiresAt: now + 9_000 }], participants: [peer.participant] });
+    expect(readHostLease(hub.root, peer.identity.id)).toMatchObject({ startedAt: restarted.startedAt, expiresAt: now + 9_000 });
+  });
+});
+
 describe("legacy outbox rows without an incarnation (pi-fabric#640 review round 3)", () => {
   it("a legacy lease row replayed after a restarted mirror writes nothing; a legacy unlease row removes nothing", async () => {
     const hub = store();

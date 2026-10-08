@@ -1947,6 +1947,10 @@ export class FabricRuntimeState {
     } finally {
       await this.#participants?.close();
     }
+    // smarty-dev#6997: the users are drained; release the state backend before dropping the store.
+    // A reload builds a new MeshStore, so the old SQLite/shadow handle would otherwise leak (and
+    // keep state.db open on Windows), exactly as shutdown already releases it (pi-fabric#640).
+    try { this.#mesh?.closeState(); } catch { /* best effort at teardown */ }
     this.#registry = undefined;
     this.#execution = undefined;
     this.#agents = undefined;

@@ -4,7 +4,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
-import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./router-config.js";
+import type { FabricAgentRouterConfig } from "./router-config.js";
 
 export interface SpawnRouterBinding { model?: string; thinking: FabricThinking }
 export interface SpawnRouterPick extends SpawnRouterBinding { model: string; reason?: string; policyVersion?: string }
@@ -92,8 +92,13 @@ export const routeAgentCreation = async (options: {
   validateModel: (model: string) => string;
   signal?: AbortSignal;
 }): Promise<SpawnRouterBinding | undefined> => {
-  const config = normalizeAgentRouterConfig(options.config)!;
-  if (config.mode === "off") return undefined;
+  const config = options.config;
+  const mode = config.mode ?? "off";
+  if (mode !== "shadow" && mode !== "enforce") return undefined;
+  // Keep the config normalizer out of this lazy entry: sharing a tiny runtime
+  // helper creates another chunk in every host's eager static closure.
+  const timeoutMs = typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs)
+    ? Math.max(200, Math.min(5000, Math.round(config.timeoutMs))) : 1500;
   const request: SpawnRouterRequest = {
     kind: options.kind, role: options.role, name: options.name ?? null,
     cwd: options.cwd, project: options.project,
@@ -114,7 +119,7 @@ export const routeAgentCreation = async (options: {
   let selected: SpawnRouterBinding | undefined;
   if (!options.explicit) {
     try {
-      const output = await runRouter(config.command, request, config.timeoutMs!, options.signal);
+      const output = await runRouter(config.command, request, timeoutMs, options.signal);
       let parsed: unknown;
       try { parsed = JSON.parse(output); } catch { throw new Error("invalid-json"); }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid-output");
@@ -129,7 +134,7 @@ export const routeAgentCreation = async (options: {
       pick = { model, thinking: value.thinking,
         ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
         ...(typeof value.policyVersion === "string" ? { policyVersion: value.policyVersion } : {}) };
-      if (config.mode === "enforce") {
+      if (mode === "enforce") {
         selected = { model: pick.model, thinking: pick.thinking };
         actual = { model: pick.model, thinking: pick.thinking };
       }
@@ -139,7 +144,7 @@ export const routeAgentCreation = async (options: {
     }
   }
   const decision = {
-    ts: new Date().toISOString(), requestDigest, kind: request.kind, mode: config.mode,
+    ts: new Date().toISOString(), requestDigest, kind: request.kind, mode,
     decision: options.explicit ? "explicit" : selected ? "enforce" : "default",
     pick, actual, latencyMs: Math.round((performance.now() - started) * 1000) / 1000, error,
   };

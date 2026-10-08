@@ -929,6 +929,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
   const wakeText = normalizeWakeTextConfig(agents.wakeText);
+  const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
@@ -1156,7 +1157,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
       ...(placement ? { placement } : {}),
-      ...(normalizeAgentRouterConfig(agents.router) ? { router: normalizeAgentRouterConfig(agents.router)! } : {}),
+      ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {

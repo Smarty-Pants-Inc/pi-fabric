@@ -23,6 +23,15 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types and registers spawn complexity hints (fullCodeMode=%s)", fullCodeMode => {
+    for (const complexity of ["simple", "normal", "complex"]) {
+      expect(typeCheckFabricCode(`return await agents.spawn({ task: "work", complexity: "${complexity}" });`, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+    expect(typeCheckFabricCode('return await agents.spawn({ task: "work", complexity: "unknown" });', guestTypeDeclarations(fullCodeMode), true).errors).not.toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "spawn")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.complexity).toMatchObject({ type: "string", enum: ["simple", "normal", "complex"] });
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });

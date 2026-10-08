@@ -55,7 +55,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
+import type { AgentRunRecord, AgentRunRequest } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -6185,3 +6185,105 @@ describe("own-root resident setters and authoritative status", () => {
   });
 });
 
+describe("external spawn router hook (#2890)", () => {
+  const pick = { model: "provider/model-b", thinking: "high", reason: "normal task", policyVersion: "v1" };
+  const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {}) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-spawn-router-")); roots.push(dir);
+    const inputPath = path.join(dir, "requests.jsonl");
+    const command = [process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
+      require('node:fs').appendFileSync(process.argv[1], input); ${body ?? `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`}
+    });`, inputPath];
+    const state = setup([], [], undefined, { agentsConfig: { model: "provider/model-a", thinking: "medium", ...agentsConfig,
+      router: { command, mode, timeoutMs: 400 } } });
+    const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    return { ...state, dir, inputPath, logs, requests };
+  };
+  it.each(["off", "shadow", "enforce"] as const)("%s selects the expected actual worker model/thinking", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "implementation", name: "normal child", complexity: "normal", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual);
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    if (mode === "off") {
+      expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+    } else {
+      expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+      expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", name: "normal child", requestedComplexity: "normal", parentId: state.identity.id,
+        defaults: { model: "provider/model-a", thinking: "medium" } })]);
+      expect(state.requests()[0]).not.toHaveProperty("task");
+    }
+  });
+  it.each([
+    [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
+    [{ thinking: "xhigh" }, { model: "provider/model-a", thinking: "xhigh" }],
+  ])("caller override %j bypasses router and is logged explicit", async (overrides, actual) => {
+    const state = routerSetup("enforce");
+    const child = await state.provider.invoke("spawn", { task: "explicit", ...overrides }, context) as AgentHandleInfo;
+    expect(child).toMatchObject(actual); await state.agents.wait(child.id);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual, error: null })]);
+  });
+  it.each([
+    ["process.stdout.write('garbage');", "invalid-json"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/unknown', thinking: 'high' }));", "unknown-or-denied-model"],
+    ["setInterval(() => {}, 1000);", "timeout"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'invalid' }));", "invalid-output"],
+  ])("router error %s keeps worker defaults and records %s", async (body, error) => {
+    const state = routerSetup("enforce", body);
+    const child = await state.provider.invoke("spawn", { task: "fallback" }, context) as AgentHandleInfo;
+    const actual = { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual); expect(await state.agents.wait(child.id)).toMatchObject({ status: "completed", ...actual });
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, error })]);
+  });
+  it("does not fuzzy-match or bypass host deny policy for a router pick", async () => {
+    for (const model of ["provider/modle-b", "provider/model-b"]) {
+      const state = routerSetup("enforce", `process.stdout.write(JSON.stringify({ model: ${JSON.stringify(model)}, thinking: 'high' }));`, { deniedModels: ["provider/model-b"] });
+      const child = await state.provider.invoke("spawn", { task: "protected fallback" }, context) as AgentHandleInfo;
+      expect(child.model).toBe("provider/model-a"); await state.agents.wait(child.id);
+      expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
+    }
+  });
+  it("uses inherited model/thinking as the static default but does not mistake inheritance for explicit", async () => {
+    const state = routerSetup("shadow");
+    const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, undefined, state.lifecycle,
+      undefined, undefined, true, undefined, () => "max");
+    const child = await provider.invoke("spawn", { task: "inherited" }, inherited) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: "provider/session", thinking: "max" }); await state.agents.wait(child.id);
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()[0]).toMatchObject({ pick, actual: { model: "provider/session", thinking: "max" } });
+  });
+  it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
+    const state = routerSetup("enforce");
+    const actor = await state.provider.invoke(action, { name: "router actor", instructions: "private actor instructions" }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.actors.definition(actor.id)).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
+    expect(state.logs()).toHaveLength(1);
+  });
+  it("forwards the selected model and complexity to a durable spawn without a second router call", async () => {
+    const state = routerSetup("enforce");
+    const spawnAgent = vi.fn(async (request: AgentRunRequest) => ({ id: "durable-test", name: "durable", runner: "pi", transport: "process", cwd: process.cwd(), status: "running", model: request.model, thinking: request.thinking }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const child = await state.provider.invoke("spawn", { task: "durable", complexity: "complex", residency: "durable" }, context) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity: "complex" }), undefined);
+    expect(state.requests()).toHaveLength(1); expect(state.logs()).toHaveLength(1);
+  });
+  it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
+    const state = routerSetup("enforce");
+    await state.provider.invoke("create", { name: "template", instructions: "later", scope: "global" }, context);
+    await state.provider.invoke("run", { task: "one-off" }, context);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+  });
+  it("validates complexity before command or launch", async () => {
+    const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "bad hint", complexity: "extreme" }, context)).rejects.toThrow("Invalid agent complexity");
+      expect(launch).not.toHaveBeenCalled(); expect(fs.existsSync(state.inputPath)).toBe(false);
+    } finally { launch.mockRestore(); }
+  });
+});

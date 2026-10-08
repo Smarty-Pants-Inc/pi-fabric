@@ -1,14 +1,14 @@
 // fabric-mesh-lock-stats: fleet view of a mesh root's lock (smarty-dev#6477 L8). Read-only; it
 // sums every process's <mesh>/lock-stats/<host>-<pid>.json, see docs/mesh-lock-stats.md.
 import path from "node:path";
-import { readLockStats, summarizeLockStats, type LockStatsSummary } from "./mesh/commit-stats.js";
+import { LOCK_STATS_RETAIN_MINUTES, readLockStats, summarizeLockStats, type LockStatsSummary } from "./mesh/commit-stats.js";
 import { resolveMeshRoot } from "./participants-cli.js";
 
 const USAGE = `Usage: fabric-mesh-lock-stats [--mesh DIR] [--minutes N] [--top K] [--json]
                               [--max-busy PCT] [--max-timeouts N]
 
 Prints the mesh lock's busy %, timeouts, top caller classes by hold time and top pids over
-the last N complete minutes (default 10, at most 60), summed over every process on the root.
+the last N complete minutes (default 10, at most ${LOCK_STATS_RETAIN_MINUTES}), summed over every process on the root.
 --max-busy and --max-timeouts exit 3 when the window exceeds them (a stage gate).`;
 
 interface Options { mesh?: string; minutes: number; top: number; json: boolean; maxBusy?: number; maxTimeouts?: number }
@@ -24,7 +24,7 @@ const parseArgs = (argv: string[]): Options | "help" => {
     if (flag === "--mesh") { options.mesh = value; continue; }
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0) throw new Error(`Bad ${flag} ${value}\n${USAGE}`);
-    if (flag === "--minutes") options.minutes = Math.max(1, Math.min(60, Math.floor(number)));
+    if (flag === "--minutes") options.minutes = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(number)));
     else if (flag === "--top") options.top = Math.max(1, Math.floor(number));
     else if (flag === "--max-busy") options.maxBusy = number;
     else if (flag === "--max-timeouts") options.maxTimeouts = Math.floor(number);

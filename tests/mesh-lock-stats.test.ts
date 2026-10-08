@@ -108,10 +108,46 @@ describe("mesh lock stats recorder", () => {
     for (const root of roots) stats.acquired(root, "other", 1, 1);
     registry[lockKey]!.flush();
     const minutes = read(roots[0]!).minutes;
-    expect(minutes.length).toBeLessThanOrEqual(LOCK_STATS_RETAIN_MINUTES);
+    expect(minutes.length).toBeLessThanOrEqual(LOCK_STATS_RETAIN_MINUTES + 1);
     expect(minutes.at(-1)!.minute).toBe(MINUTE0 + 90);
     expect(roots.filter(root => fs.existsSync(ownFile(root)))).toHaveLength(32);
     expect(fs.statSync(ownFile(roots[0]!)).size).toBeLessThan(32 * 1024);
+  });
+
+  it("retains the oldest minute of a 60-minute query: M-60 counts during minute M, M-61 never does", () => {
+    vi.useFakeTimers();
+    const root = temp();
+    const stats = createLockStats("1")!;
+    const M = MINUTE0 + 61;
+    vi.setSystemTime((M - 61) * 60_000 + 1_000);
+    stats.acquired(root, "custody", 1, 7); // M-61: outside every window queried during M
+    stats.failed(root, "custody", 9, false);
+    vi.setSystemTime((M - 60) * 60_000 + 1_000);
+    stats.acquired(root, "publish", 2, 300); // M-60: the oldest minute of --minutes 60
+    stats.failed(root, "publish", 10_000, false);
+    vi.setSystemTime((M - 1) * 60_000 + 59_000);
+    stats.acquired(root, "writeBatch", 1, 20); // M-1: the newest complete minute
+    vi.setSystemTime(M * 60_000 + 30_000);
+    stats.acquired(root, "put/delete", 1, 50); // M: current, incomplete, never counted
+    registry[lockKey]!.flush();
+    const minutes = read(root).minutes.map(minute => minute.minute);
+    expect(minutes).toEqual([M - 60, M - 1, M]);
+    const now = M * 60_000 + 45_000;
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 60, now });
+    expect(summary).toMatchObject({ fromMinute: M - 60, toMinute: M - 1, minutes: 60, n: 2, holdMs: 320, timeouts: 1 });
+    // The CLI's longest window is exactly the retention: --minutes 61 clamps to the same 60.
+    for (const span of ["60", "61", "1000"]) {
+      let out = "";
+      expect(main(["--mesh", root, "--minutes", span, "--json", "--max-timeouts", "0"], { stdout: text => { out += text; }, now })).toBe(3);
+      expect(JSON.parse(out)).toMatchObject({ fromMinute: M - 60, minutes: LOCK_STATS_RETAIN_MINUTES, n: 2, timeouts: 1 });
+    }
+    // At the next minute M-60 is out of the window and trimmed by the next write; M-59.. remain.
+    vi.setSystemTime((M + 1) * 60_000 + 1_000);
+    stats.acquired(root, "other", 1, 1);
+    registry[lockKey]!.flush();
+    expect(read(root).minutes.map(minute => minute.minute)).toEqual([M - 1, M, M + 1]);
+    expect(summarizeLockStats(root, readLockStats(root), { minutes: 60, now: (M + 1) * 60_000 + 5_000 }))
+      .toMatchObject({ fromMinute: M - 59, n: 2, holdMs: 70, timeouts: 0 });
   });
 
   it("never recreates a removed root or throws, and prunes stale files of dead processes", () => {

@@ -71,7 +71,8 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 // Every acquisition of a mesh root's `.lock` records who took it (the store entry point), how
 // long it waited and how long it held the lock. Wall-clock minutes are aggregated in memory and
 // written just after each minute (and at exit) to `<root>/lock-stats/<host>-<pid>.json`: one
-// small file per process, rewritten by an atomic rename, holding at most the last hour. No extra
+// small file per process, rewritten by an atomic rename, holding at most the last 60 complete
+// minutes plus the current one (the longest query window, see LOCK_STATS_RETAIN_MINUTES). No extra
 // lock, no fsync, and nothing at all before the first acquisition. `fabric-mesh-lock-stats`
 // sums every process's file into fleet busy %, timeouts and the classes and pids that hold it.
 // On by default; PI_FABRIC_LOCK_STATS=0 (or off/false/no) disables it for the process.
@@ -90,6 +91,7 @@ export interface LockStats {
 /** Histogram upper bounds in ms; one more bucket counts everything above the last bound. */
 export const LOCK_STATS_BOUNDS_MS: readonly number[] = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
 export const LOCK_STATS_DIR = "lock-stats";
+/** Complete minutes retained besides the current one; also the longest query window (--minutes). */
 export const LOCK_STATS_RETAIN_MINUTES = 60;
 const LOCK_STATS_MAX_ROOTS = 32;
 const LOCK_STATS_STALE_FILE_MS = 24 * 60 * 60_000;
@@ -147,7 +149,8 @@ const errorCodeOf = (error: unknown): unknown => (error as { code?: unknown } | 
 const roundMs = (_key: string, value: unknown): unknown =>
   typeof value === "number" && !Number.isInteger(value) ? Math.round(value * 1000) / 1000 : value;
 const trimMinutes = (minutes: Map<number, unknown>, current: number): void => {
-  for (const minute of minutes.keys()) if (minute <= current - LOCK_STATS_RETAIN_MINUTES) minutes.delete(minute);
+  // Keep current-60..current: the 60 complete minutes a query during `current` covers, plus current.
+  for (const minute of minutes.keys()) if (minute < current - LOCK_STATS_RETAIN_MINUTES) minutes.delete(minute);
 };
 const lockStatsDisabled = (setting: string | undefined): boolean =>
   setting !== undefined && /^(?:0|off|false|no)$/i.test(setting.trim());

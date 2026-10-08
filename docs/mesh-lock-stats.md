@@ -23,7 +23,8 @@ For each class and wall-clock minute: acquisitions, wait time (request to custod
 or zero-wait callers, which fail by design while the lock is busy).
 
 Each process writes `<mesh>/lock-stats/<host>-<pid>.json` just after every minute in which it took
-the lock, and at exit. The file holds at most the last 60 minutes and is replaced by an atomic
+the lock, and at exit. The file holds at most the last 60 complete minutes (the longest
+`--minutes` window) plus the current one and is replaced by an atomic
 rename, without fsync and without any lock. Files untouched for 24 hours are pruned. Nothing runs
 before a process's first acquisition. Set `PI_FABRIC_LOCK_STATS=0` to turn recording off for a
 process; test runs set it, and the lock-stats suites opt back in.

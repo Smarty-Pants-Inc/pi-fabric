@@ -5,10 +5,10 @@
 //    interleaved processes with PI_FABRIC_LOCK_STATS=0 versus the default (on).
 // 2. The hook's direct cost in an "on" process: one acquired() record plus the three
 //    performance.now() stamps, against the cheapest uncontended lock cycle measured in (1).
-// 3. A small multi-process demo on one root, printed through fabric-mesh-lock-stats.
+// 3. A small multi-process demo on one root, printed by the shipped bin/fabric-mesh-lock-stats.
 //
 //   node scripts/benchmark-lock-stats.mjs [--rounds=9] [--ops=3000] [--puts=400] [--demo=8]
-import { fork } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -106,10 +106,16 @@ if (args.worker === "ab") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "lock-stats-demo-"));
     try {
       await Promise.all(Array.from({ length: demo }, () => run("demo", { PI_FABRIC_LOCK_STATS: "1" }, [`--root=${root}`])));
-      const { main } = await import(pathToFileURL(path.join(repo, "dist/mesh-lock-stats-cli.js")).href);
-      // Show the current minute as if it were complete.
-      console.log(`\n$ fabric-mesh-lock-stats --mesh <demo root> --minutes 2   # ${demo} processes x 25 x (put, writeBatch, publish, confirm, exclusive)`);
-      main(["--mesh", root, "--minutes", "2", "--top", "3"], { now: Date.now() + 60_000 });
+      // The CLI reports complete minutes only: wait for the demo's last minute to complete.
+      await new Promise(resolve => setTimeout(resolve, 60_000 - Date.now() % 60_000 + 200));
+      console.log(`\n$ fabric-mesh-lock-stats --mesh <demo root> --minutes 2 --top 3   # ${demo} processes x 25 x (put, writeBatch, publish, confirm, exclusive)`);
+      const cli = spawnSync(process.execPath, [path.join(repo, "bin/fabric-mesh-lock-stats"), "--mesh", root, "--minutes", "2", "--top", "3"],
+        { encoding: "utf8" });
+      process.stdout.write(cli.stdout ?? "");
+      process.stderr.write(cli.stderr ?? "");
+      console.log(`[fabric-mesh-lock-stats exit status ${cli.status}${cli.signal ? ` signal ${cli.signal}` : ""}]`);
+      if (cli.error) throw cli.error;
+      if (cli.status !== 0) throw new Error(`fabric-mesh-lock-stats exited ${cli.status ?? cli.signal}`);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }
 }

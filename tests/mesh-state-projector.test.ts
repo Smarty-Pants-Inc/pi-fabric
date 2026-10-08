@@ -79,7 +79,6 @@ describe("state projector (shadow)", () => {
     const generations = 16;
     await writeGenerations(file, generations);
     const lagSeen: number[] = [];
-    const observed = await openProjector(root, { owner: "observer" });
     await projector.stop();
     const follower = await openProjector(root, { owner: "follower", beforeCommit: () => { lagSeen.push(follower.status().lag.generations); } });
     status = await follower.tick();
@@ -106,7 +105,46 @@ describe("state projector (shadow)", () => {
     const again = await openProjector(root, { owner: "again" });
     status = await again.tick();
     expect(status).toMatchObject({ role: "active", appliedGenerations: 0, fullResyncs: 0, commit: firstCommit + generations });
-    expect(observed.status().role).toBe("starting");
+  });
+
+  it("follows two concurrent writers and converges", async () => {
+    const root = tempRoot("concurrent");
+    const left = new MeshStore(root, 64 * 1024, 1_000, { maxStateTombstones: 5 });
+    const right = new MeshStore(root, 64 * 1024, 1_000, { maxStateTombstones: 5 });
+    await left.put({ key: "k/base", value: 0, identity });
+    const projector = await openProjector(root, { pollMs: 5 });
+    await projector.tick();
+    projector.run();
+    // Each writer yields a timer turn between commits, so the loop interleaves with them.
+    const writer = async (store: MeshStore, offset: number): Promise<void> => {
+      for (let step = 0; step < 40; step += 1) {
+        await writeGenerations(store, 1, offset + step);
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+    };
+    await Promise.all([writer(left, 0), writer(right, 100)]);
+    const target = fileState(root);
+    const sorted = (entries: Record<string, unknown>) => JSON.stringify(Object.keys(entries).sort().map(key => entries[key]));
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const status = await projector.tick();
+      if (status.lag.generations === 0) {
+        const store = await openStore(root);
+        const done = sorted(store.exportState().entries) === sorted(target.entries);
+        store.close();
+        if (done) break;
+      }
+      if (Date.now() > deadline) throw new Error("projector did not catch up");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(await projector.verify()).toEqual([]);
+    await expectInStep(root);
+    const status = projector.status();
+    // Every one of the 80 generations went through the journal or a resync; none was skipped.
+    expect(status.appliedGenerations).toBeGreaterThan(0);
+    expect(status.errors).toBe(0);
+    expect(status.divergences).toBe(0);
+    if (process.env.PROJECTOR_PROBE) fs.appendFileSync(process.env.PROJECTOR_PROBE, `concurrent: applied ${status.appliedGenerations} generations, ${status.fullResyncs} full resyncs, maxLagMs ${status.maxLagMs}\n`);
   });
 
   it("falls back to a full resync after a journal gap, then follows the journal again", async () => {

@@ -796,35 +796,45 @@ export class StateProjector {
       if (this.#verifyMs > 0 && Date.now() - this.#lastVerifyAt >= this.#verifyMs) await this.#verify();
       return;
     }
-    // Follow the journal. A writer renames state.json BEFORE it appends the record, so one short
-    // retry absorbs that window before a gap costs a full resync.
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const head = readHead(this.root);
-      if (head.identity === progress.identity) return;
-      if (!progress.generation || !head.generation || !head.hash) {
-        await this.#resync(progress.identity === null ? "initial" : "gap");
-        return;
-      }
-      if (head.generation === progress.generation) {
-        await this.#resync("rewrite");
-        return;
-      }
-      if (await this.#follow(progress, head)) return;
-      if (attempt === 0) await delay(25);
+    const head = readHead(this.root);
+    if (head.identity === progress.identity) return;
+    if (!progress.generation || !head.generation || !head.hash) {
+      await this.#resync(progress.identity === null ? "initial" : "gap");
+      return;
+    }
+    if (head.generation === progress.generation) {
+      await this.#resync("rewrite");
+      return;
+    }
+    // Follow the journal to the generation this head names. A writer renames state.json BEFORE it
+    // appends that generation's record, so a missing record is retried briefly (same head) before
+    // a gap costs a full resync. Later generations are left for the next pass.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await this.#follow(progress, head);
+      if (result === "applied") return;
+      if (result === "broken") break;
+      await delay(10 * (attempt + 1));
     }
     await this.#resync("gap");
   }
 
-  // Applies the verified chain from the projected generation to the file's, one transaction each.
-  // False: no verified chain (or it broke mid-way); the caller resyncs.
-  async #follow(progress: Progress, head: FileHead): Promise<boolean> {
+  // Applies the verified chain from the projected generation to the head's, one transaction each.
+  // "missing": no chain reaches the head yet; "broken": the chain is not bound to the file, or it
+  // broke mid-way; the caller resyncs.
+  async #follow(progress: Progress, head: FileHead): Promise<"applied" | "missing" | "broken"> {
     const records = readJournal(this.root, progress.cursor);
     const chain = records && chainOf(records, progress, head);
     const terminal = chain?.at(-1);
-    if (!chain || !terminal || terminal.identity !== head.identity ||
-      !verifyStateJournalEndpoint(this.root, { generation: terminal.generation, chainHash: terminal.hash, identity: terminal.identity, payloadHash: terminal.payloadHash })) {
-      return false;
-    }
+    if (!chain || !terminal) return "missing";
+    if (terminal.identity !== head.identity) return "broken";
+    // The chain hash was read from the header of the very file whose identity the terminal record
+    // names, so it binds every record body. The payload check additionally binds the bytes
+    // (copied-marker replacement). Under load the file has often moved on by now; then the bytes
+    // are gone and the header binding stands (a copied marker would surface in verify()).
+    const bound = verifyStateJournalEndpoint(this.root,
+      { generation: terminal.generation, chainHash: terminal.hash, identity: terminal.identity, payloadHash: terminal.payloadHash }) ||
+      stateIdentity(this.root) !== head.identity;
+    if (!bound) return "broken";
     const highWater = Number(this.#sql.metaGet.get("high_water")?.value ?? 0);
     this.#observeLag({ revisions: Math.max(0, terminal.highWater - highWater), generations: chain.length,
       ms: Date.now() - commitTime(chain[0]!, head.mtimeMs) });
@@ -839,7 +849,7 @@ export class StateProjector {
           this.#options.beforeCommit?.({ kind: "record", generation: record.generation, index });
         });
       } catch (error) {
-        if (error instanceof ProjectorGap) return false;
+        if (error instanceof ProjectorGap) return "broken";
         throw error;
       }
       this.#stats.appliedGenerations += 1;
@@ -851,7 +861,7 @@ export class StateProjector {
           ms: Math.max(0, Date.now() - commitTime(next, head.mtimeMs)) }
         : { revisions: 0, generations: 0, ms: 0 };
     }
-    return true;
+    return "applied";
   }
 
   #observeLag(lag: StateProjectorLag): void {

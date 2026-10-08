@@ -46,7 +46,7 @@ describe("shadow projector and the backend fence (pi-fabric#631)", () => {
     await projector.stop();
 
     // The real cutover commits backend=sqlite in <root>/state.db: file-mode writers are refused.
-    await cutoverMeshState(root, { assumeNoWriters: true });
+    await cutoverMeshState(root); // W1: the writer census is advisory, there is no assumeNoWriters
     expect(resolveMeshStateSource(root)).toMatchObject({ source: "sqlite", backend: "sqlite" });
     expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
     await expect(new MeshStore(root, 64 * 1024, 1_000).put({ key: "k/late", value: 1, identity })).rejects.toThrow(MeshBackendFenceError);

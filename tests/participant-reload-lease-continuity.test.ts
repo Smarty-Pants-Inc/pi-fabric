@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#6729 gate 1 (pi-fabric#646): a root Main reloads while the shared mesh lock is busy,
@@ -258,6 +258,88 @@ describe("root Main stays in the directory listing through a reload under lock l
     expect(f.samples.at(-1)).toMatchObject({ lease: true, root: true, leaseExpired: false });
     expect(f.samples.at(-1)!.leaseAgeMs).toBeLessThanOrEqual(MAX_LEASE_AGE_MS);
   }, 60_000);
+
+  it.each(["ordinary heartbeat", "unpaired reload"] as const)("does not keep a predecessor's %s lease during first commit", async (kind) => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    const ordinary = readHostLeases(f.meshRoot).get(identity.id)!;
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    const reload = readHostLeases(f.meshRoot).get(identity.id)!;
+    const predecessor = kind === "ordinary heartbeat" ? ordinary : { ...reload, startedAt: reload.startedAt! + 1 };
+    writeHostLease(f.meshRoot, predecessor);
+    f.advance(1_000);
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    expect((await fresh.start().then(() => undefined, (error: unknown) => error) as { code?: string })?.code)
+      .toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    // Ordinary/unpaired evidence cannot withhold the new incarnation's liveness file.
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(predecessor.startedAt);
+    f.releaseLock();
+    await fresh.refresh();
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+  }, 30_000);
+
+  it("takes over the reload lease as soon as its own host record commits, before post-commit file work", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    f.advance(1_000);
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    await fresh.start().catch(() => undefined);
+    const predecessor = readHostLeases(f.meshRoot).get(identity.id)!;
+    // Force a root update so the first successful host commit has a post-commit file copy.
+    vi.spyOn(fresh, "scheduleRefresh").mockImplementation(() => {});
+    fresh.registerSource(() => [{ ...record(), status: "running" }]);
+    f.releaseLock();
+    const files = await import("../src/topology/participant-files.js");
+    const write = files.writeParticipantFileIf;
+    const keyHash = createHash("sha256").update(identity.id).digest("hex");
+    let observed: { hostStartedAt: number; leaseStartedAt: number | undefined } | undefined;
+    vi.spyOn(files, "writeParticipantFileIf").mockImplementation(async (mesh, key, decide, options) => {
+      if (!observed && key === "topology/participants/" + keyHash) {
+        const host = fresh.mesh.get("topology/hosts/" + keyHash, { fresh: true })!.value as { startedAt: number };
+        observed = { hostStartedAt: host.startedAt, leaseStartedAt: readHostLeases(f.meshRoot).get(identity.id)!.startedAt };
+      }
+      return write(mesh, key, decide, options);
+    });
+    await fresh.refresh();
+    expect(observed).toBeDefined();
+    expect(observed!.hostStartedAt).not.toBe(predecessor.startedAt);
+    expect(observed!.leaseStartedAt).toBe(observed!.hostStartedAt);
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+  }, 30_000);
+
+  it.each([false, true])("keeps a live reload lease through its final seconds (legacy writer=%s)", async (legacy) => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    const kept = readHostLeases(f.meshRoot).get(identity.id)!;
+    expect(kept.reloadUntil).toBe(kept.expiresAt);
+    if (legacy) {
+      const { reloadUntil: _reloadUntil, ...oldLease } = kept;
+      writeHostLease(f.meshRoot, oldLease);
+    }
+    f.advance(kept.expiresAt - Date.now() - (legacy ? 5_000 : 15_000));
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    expect((await fresh.start().then(() => undefined, (error: unknown) => error) as { code?: string })?.code)
+      .toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).toBe(kept.startedAt);
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    f.releaseLock();
+    await fresh.refresh();
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.reloadUntil).toBeUndefined();
+  }, 30_000);
 
   it("drops a Main whose process is gone once its reload lease expires", async () => {
     const f = fixture();

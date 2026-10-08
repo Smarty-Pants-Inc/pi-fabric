@@ -236,10 +236,11 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
       const via = /settleDedupeIntent|removeDedupeIntent|finishLiveReceipt|confirmEventFile|syncPathNamespace|writeFileAtomic/.exec(
         stack.split("\n").filter(line => !line.includes("atomic-write")).join("\n"))?.[0] ?? "other";
       // The fresh intent's write is the only writeFileAtomic called directly from the publish
-      // closure (an anonymous event-log frame) before the append; settlement frames are named.
+      // commit step before the append: the anonymous publish closure, or its `append` step that
+      // main's R20 bridge fence (input.fence) runs (smarty-dev#6477 L2b). Settlement frames are named.
       const frames = stack.split("\n").map(line => line.trim());
       const writer = frames.findIndex(line => line.startsWith("at writeFileAtomic "));
-      const fence = !appendedInHold && writer >= 0 && /^at \S*src\/mesh\/event-log\.ts:\d+:\d+$/.test(frames[writer + 1] ?? "") &&
+      const fence = !appendedInHold && writer >= 0 && /^at (?:\S*src\/mesh\/event-log\.ts:\d+:\d+|append \(\S*src\/mesh\/event-log\.ts:\d+:\d+\))$/.test(frames[writer + 1] ?? "") &&
         !/settleDedupeIntent|removeDedupeIntent|finishLiveReceipt/.test(stack);
       held.push({ path: fdPath(fd), fence, via });
     };

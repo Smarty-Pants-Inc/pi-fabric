@@ -14,10 +14,15 @@ export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
  * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
  * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
- * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry. */
+ * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry.
+ * `dryRun`: the same selection and fences, with no removal or compaction; the returned runs are the
+ * ones an apply would delete (pi-fabric#645 review round 3). `onRemove` is called before a run is
+ * removed (or, in a dry run, would be). */
 export const sweepResidentRuns = (
   runsRoot: string, now = Date.now(), budgetMs = 100,
-  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean } = {},
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean;
+    dryRun?: boolean; onRemove?: (run: string) => void;
+    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
   const removed: string[] = [];
   if (!ownedStat(runsRoot)?.isDirectory()) return removed;
@@ -40,11 +45,14 @@ export const sweepResidentRuns = (
       if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
           !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
           hasPreservedResidentResult(runsRoot, entry.name) && !expired() && !referencedNow(entry.name)) {
-        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+        options.onRemove?.(run);
+        if (options.dryRun) removed.push(run);
+        else try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
           ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+          ...(options.dryRun ? { dryRun: true } : {}), ...(options.onCompact ? { onCompact: options.onCompact } : {}),
           now, expired, isRetained: () => referencedNow(path.basename(run)) });
       }
     }

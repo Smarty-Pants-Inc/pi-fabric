@@ -100,11 +100,15 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
     for (const root of residents.values()) {
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
-      if (options.runRetentionMs !== undefined && !dryRun) {
+      if (options.runRetentionMs !== undefined) {
         // Same final pre-delete check as the actor-run pass below: every discovered registry is
         // re-read uncached before each delete; a vanished or unreadable one vetoes (review round 2).
+        // A dry run takes the same selection and fences without mutating, so its preview lists
+        // the runs --apply deletes (review round 3).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, retainRuns: false, requireRegistries: true,
+          actorRoots: registries, retainRuns: false, requireRegistries: true, dryRun,
+          onRemove: run => changes.push({ path: run, beforeBytes: treeBytes(run), afterBytes: 0 }),
+          onCompact: change => changes.push(change),
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
         }));
       } else compactRuns(path.join(root, "runs"));

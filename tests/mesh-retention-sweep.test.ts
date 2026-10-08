@@ -203,6 +203,40 @@ describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-del
     expect(fs.existsSync(resident)).toBe(false);
   });
 
+  // pi-fabric#645 review round 3: the default CLI mode (--runs-older-than, dry run) previews the
+  // dead-resident runs --apply deletes, through the same selection and fences, without mutating.
+  const snapshot = (root: string): unknown[] => fs.readdirSync(root).sort().map(name => {
+    const file = path.join(root, name); const stat = fs.lstatSync(file);
+    return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.isDirectory() ? snapshot(file) : fs.readFileSync(file, "utf8")];
+  });
+
+  it("dry run lists the dead-resident runs --apply then deletes, and leaves the disk unchanged", async () => {
+    const { mesh, resident } = deadResident();
+    const host = path.join(mesh.root, "residency", "host");
+    const young = run(path.join(host, "runs", "young-resident"), { status: "completed", finishedAt: NOW - 1_000 });
+    const before = snapshot(mesh.root);
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(snapshot(mesh.root)).toEqual(before);
+    expect(plan.skipped).toEqual([]);
+    expect(plan.removedRuns).toContain(resident);
+    expect(plan.removedRuns).not.toContain(young);
+    expect(plan.changes.find(change => change.path === resident)).toMatchObject({ afterBytes: 0 });
+    expect(plan.changes.find(change => change.path === resident)!.beforeBytes).toBeGreaterThan(0);
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
+    expect(applied.removedRuns.sort()).toEqual(plan.removedRuns.sort());
+    expect(fs.existsSync(resident)).toBe(false);
+    expect(fs.existsSync(young)).toBe(true);
+  });
+
+  it("dry run fails closed like --apply when a registry becomes unreadable after the snapshot", async () => {
+    const { mesh, resident, other } = deadResident();
+    const injected = afterSnapshot(resident, () => write(path.join(other, "actors.json"), "{not json"));
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(plan.removedRuns).not.toContain(resident);
+    expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
+  });
+
   for (const [name, row] of [
     ["latest", { status: "idle", lastRunId: "old-resident" }],
     ["in-flight", { status: "running", inFlightRun: { id: "old-resident", startedAt: NOW, ageS: 0 } }],

@@ -80,7 +80,7 @@ export const describeLockHolder = (ownerPath: string): string => {
   return ` held by pid ${pid} (alive${state})${held}`;
 };
 
-export const processAlive = (pid: number): boolean => {
+const processAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);

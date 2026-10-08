@@ -541,8 +541,7 @@ describe("MeshStore", () => {
     await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
     crash.mockRestore();
     const event = JSON.parse(fs.readFileSync(path.join(root, "events.jsonl"), "utf8"));
-    // No archive: a pending intent defers compaction until the log passes twice its cap (pi-fabric#649).
-    for (let index = 0; index < 12; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
     expect(store.oldestSequence()).toBeGreaterThan(event.sequence);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
@@ -629,8 +628,7 @@ describe("MeshStore", () => {
     await expect(store.publish(packet)).rejects.toThrow("before append");
     crash.mockRestore();
     const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
-    // A pending no-archive intent defers compaction until the log passes twice its cap (pi-fabric#649).
-    for (let index = 0; index < 12; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(fs.existsSync(base + ".json")).toBe(false);
     const event = await store.publish(packet);
@@ -638,7 +636,7 @@ describe("MeshStore", () => {
     expect(store.read().filter(e => e.dedupeKey === packet.dedupeKey)).toEqual([event]);
   });
 
-  it("does not compact if settlement cannot durably write its receipt, and never fails the publish", async () => {
+  it("does not compact if settlement cannot durably write its receipt", async () => {
     const store = createStore({ maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
     const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "blocked-settlement", text: "first" };
     const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
@@ -649,17 +647,8 @@ describe("MeshStore", () => {
     });
     try {
       await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
-      // Under twice the cap a pending no-archive intent defers compaction (pi-fabric#649);
-      // past it the locked settlement runs and fails here.
-      for (let index = 0; index < 3; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
-      expect(fs.existsSync(base + ".pending.json")).toBe(true);
-      const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
-      // Compaction is best effort after commit (smarty-dev#6477 E1): the committed unkeyed
-      // publish resolves (a rejection would invite a duplicate retry); the failure is reported.
-      const committed = await store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) });
-      expect(String(warn.mock.calls.at(-1)?.[0])).toContain("receipt unavailable");
-      warn.mockRestore();
-      expect(store.read().at(-1)).toEqual(committed);
+      await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
+      await expect(store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) })).rejects.toThrow("receipt unavailable");
       expect(store.oldestSequence()).toBe(1);
       expect(fs.existsSync(base + ".pending.json")).toBe(true);
     } finally { crash.mockRestore(); }

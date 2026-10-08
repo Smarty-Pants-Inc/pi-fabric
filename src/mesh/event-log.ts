@@ -2,10 +2,10 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, renameAtomic, syncPathNamespace } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
-import { delay, errorCode, processAlive, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
@@ -110,20 +110,6 @@ interface AfterUnlock { finish?: (() => Promise<void> | void) | undefined }
 // One live-log barrier per root, shared by every confirmation queued before it STARTS. A
 // later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
 const eventBarriers = new Map<string, Promise<void>>();
-// At most one after-unlock compaction per live log per process; another is skipped.
-const compactions = new Set<string>();
-const COMPACTION_ROUNDS = 8;
-const COMPACTION_STAGE = /^events\.jsonl\.(\d+)\.[0-9a-f-]{36}\.compacting$/;
-
-/** Write every byte of `bytes` at the descriptor's position: `fs.writeSync` may return a short
- * count. A write that makes no progress throws, so a caller never commits a short file. */
-function writeAllSync(descriptor: number, bytes: Uint8Array): void {
-  for (let offset = 0; offset < bytes.length;) {
-    const written = fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
-    if (!(written > 0)) throw new Error(`Fabric mesh short write: ${offset} of ${bytes.length} bytes`);
-    offset += written;
-  }
-}
 
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
@@ -375,29 +361,6 @@ export class EventLog {
     }
   }
 
-  /**
-   * No-archive intents with nothing durable written under `.lock` (pi-fabric#649 review round 3).
-   * Under the lock only reads and the ordered unlink of a never-committed intent; after release,
-   * for each committed one: the live barrier, the durable receipt, then the unlink and its
-   * namespace barrier (`#finishLiveReceipt`). Until its receipt is durable each intent stays
-   * the recovery anchor, so a crash here leaves exactly the "died after the live append" state.
-   */
-  async #settleDedupeIntentsAfterUnlock(): Promise<void> {
-    const directory = path.join(this.root, "event-receipts");
-    const finishes: Array<() => Promise<void> | void> = [];
-    await this.#lock.withLock(() => {
-      let names: string[];
-      try { names = fs.readdirSync(directory); }
-      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-      for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
-        const after: AfterUnlock = {};
-        this.#settleDedupeIntent(path.join(directory, name), undefined, undefined, after);
-        if (after.finish) finishes.push(after.finish);
-      }
-    }, undefined, "publish");
-    for (const finish of finishes) await finish();
-  }
-
   #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
@@ -552,10 +515,14 @@ export class EventLog {
         if (intentPath) this.#removeDedupeIntent(intentPath);
       }
       if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
-      else if (input.durable && !receiptPath) {
-        // Unkeyed durable publish: the live-log barrier runs after release (group commit).
-        if (after) after.finish = () => this.#confirmEventsAfterRelease();
-        else this.#confirmEventFile(this.#eventsPath);
+      else {
+        // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
+        this.#compactEventLog();
+        if (input.durable && !receiptPath) {
+          // Unkeyed durable publish: the live-log barrier runs after release (group commit).
+          if (after) after.finish = () => this.#confirmEventsAfterRelease();
+          else this.#confirmEventFile(this.#eventsPath);
+        }
       }
       return event;
     };
@@ -577,7 +544,6 @@ export class EventLog {
     // Committed. Never retry from here: a failed barrier must not append the event twice.
     // The publish resolves only after its bytes (and any receipt) are durable.
     await after.finish?.();
-    await this.#compactAfterUnlock();
     return event;
   }
 
@@ -598,7 +564,7 @@ export class EventLog {
           try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome), outcome }); }
           catch (error) { if (!prepared.length) throw error; break; }
         }
-        const committed = await this.#lock.withLock(() => {
+        return await this.#lock.withLock(() => {
           const started = performance.now();
           const events: MeshEvent[] = [];
           let bytes = 0;
@@ -615,12 +581,10 @@ export class EventLog {
               break;
             }
           }
-          // Legacy keyed batch receipts and this final barrier stay under the lock (smarty-dev#6000).
+          this.#compactEventLog();
           this.#confirmEventFile(this.#eventsPath);
           return events;
         }, undefined, "bridge");
-        await this.#compactAfterUnlock();
-        return committed;
       } catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
@@ -1122,169 +1086,34 @@ export class EventLog {
     };
   }
 
-  #hasPendingIntents(): boolean {
-    let names: string[] = [];
-    try { names = fs.readdirSync(path.join(this.root, "event-receipts")); }
-    catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-    return names.some(name => /^[a-f0-9]{64}\.pending\.json$/.test(name));
-  }
-
-  /** Live log stat by path, undefined when absent. */
-  #liveStat(): fs.Stats | undefined {
-    try { return fs.statSync(this.#eventsPath); }
-    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
-  }
-
-  /** Append the complete lines of live bytes [from, to) of inode `ino` to the stage and fsync
-   * it. Returns the bytes copied (0 if the inode changed). */
-  #foldIntoStage(stage: number, ino: number, from: number, to: number): number {
-    if (to <= from) return 0;
-    const source = fs.openSync(this.#eventsPath, "r");
-    let bytes: Buffer;
+  #compactEventLog(): void {
+    // Never rewrite away an event named by a durable intent. Resolve every intent while
+    // the publish lock is held, before taking the retained tail snapshot.
+    let descriptor: number | undefined;
     try {
-      if (fs.fstatSync(source).ino !== ino) return 0;
-      const buffer = Buffer.allocUnsafe(to - from);
-      bytes = buffer.subarray(0, fs.readSync(source, buffer, 0, buffer.length, from));
-    } finally { fs.closeSync(source); }
-    bytes = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1);
-    if (!bytes.length) return 0;
-    writeAllSync(stage, bytes);
-    fs.fsyncSync(stage);
-    return bytes.length;
-  }
-
-  /** Remove compaction stages of dead processes (a SIGKILL during staging). */
-  #sweepCompactionStages(): void {
-    let names: string[];
-    try { names = fs.readdirSync(this.root); } catch { return; }
-    for (const name of names) {
-      const pid = Number(COMPACTION_STAGE.exec(name)?.[1]);
-      if (!pid || pid === process.pid || processAlive(pid)) continue;
-      fs.rmSync(path.join(this.root, name), { force: true });
-    }
-  }
-
-  /**
-   * Live compaction with no fsync under `.lock` (smarty-dev#6477 E1). Best effort, after the
-   * triggering publish committed: a failure never fails or retries that publish.
-   *
-   * 1. Off-lock: copy the retained tail (complete lines) of the live inode into a stage and
-   *    fsync it. Appends since the snapshot are folded in off-lock, fsynced, in rounds.
-   * 2. Under the lock, no fsync: same inode and generation, no pending intent, nothing
-   *    unfolded: rename the stage over the live log and advance the generation, as before.
-   *    Every byte of the new inode was fsynced before the rename, so a returned publish's
-   *    bytes survive whether or not the rename does.
-   * 3. Off-lock: the directory barrier that makes the rename durable.
-   * Nothing is fsynced under the lock: if appends outrun every round, this pass defers and the
-   * next publish over the cap (each one triggers) retries.
-   * A pending no-archive dedupe intent (a keyed publisher in flight, or a dead one) always
-   * defers compaction in this pass. Below twice the cap it settles on its own off-lock path
-   * (the publisher, or a same-key retry). Past twice the cap (a dead publisher nobody retries)
-   * this pass settles it with `#settleDedupeIntentsAfterUnlock` (no fsync under the lock), and
-   * the next publish compacts. Archive-coupled intents are settled first through the locked
-   * legacy protocol (smarty-dev#6000); an intent that appears later refuses the rename.
-   */
-  async #compactAfterUnlock(): Promise<void> {
-    const file = this.#eventsPath;
-    if (compactions.has(file)) return;
-    let size = 0;
-    try { size = this.#liveStat()?.size ?? 0; }
-    catch { return; }
-    if (size <= this.#maxEventLogBytes) return;
-    compactions.add(file);
-    let stagePath: string | undefined;
-    let stage: number | undefined;
-    try {
-      this.#sweepCompactionStages();
-      if (this.#hasPendingIntents()) {
-        // Never rewrite away an event named by a durable intent (byte offsets).
-        const archive = MeshArchive.fromRoot(this.root);
-        // No-archive: never settle with an fsync under `.lock`, and never compact in this pass.
-        // Past twice the cap, settle off-lock so a dead publisher's intent cannot pin the log;
-        // the next trigger compacts once the intent is gone.
-        if (!archive) {
-          if (size > 2 * this.#maxEventLogBytes) await this.#settleDedupeIntentsAfterUnlock();
-          return;
-        }
-        await this.#lock.withLock(() => this.#settleDedupeIntents(archive), undefined, "publish");
-      }
-      // Snapshot the retained tail. A concurrent repair (under the lock) may truncate a torn
-      // tail, and appends may follow, between the stat and the read: a short or shifted read
-      // would misplace the staged offset, so the round restarts on any change of the snapshot
-      // (size, inode, generation). The offset is the requested read start plus the bytes kept.
-      let generation = -1;
-      let snapshot: { dev: number; ino: number } | undefined;
-      let retained = Buffer.alloc(0);
-      let staged = 0;
-      for (let attempt = 0; !snapshot; attempt++) {
-        if (attempt === COMPACTION_ROUNDS) return; // Contended: the next trigger retries.
-        generation = this.#readGeneration();
-        const source = fs.openSync(file, "r");
-        try {
-          const stat = fs.fstatSync(source);
-          if (stat.size <= this.#maxEventLogBytes) return;
-          const readBytes = Math.min(stat.size, this.#retainedEventLogBytes + this.maxEventBytes + 1);
-          const start = stat.size - readBytes;
-          const buffer = Buffer.allocUnsafe(readBytes);
-          const count = fs.readSync(source, buffer, 0, readBytes, start);
-          const now = this.#liveStat();
-          if (count !== readBytes || fs.fstatSync(source).size !== stat.size || now?.dev !== stat.dev ||
-              now.ino !== stat.ino || this.#readGeneration() !== generation) continue;
-          const captured = buffer.subarray(0, count);
-          const boundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
-          const newline = boundary === 0 ? -1 : captured.indexOf(0x0a, boundary);
-          const begin = boundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
-          const last = captured.lastIndexOf(0x0a);
-          const stop = last >= begin ? last + 1 : begin;
-          retained = captured.subarray(begin, stop);
-          staged = start + stop;
-          snapshot = { dev: stat.dev, ino: stat.ino };
-        } finally { fs.closeSync(source); }
-      }
-      const { dev, ino } = snapshot;
-      stagePath = `${file}.${process.pid}.${randomUUID()}.compacting`;
-      stage = fs.openSync(stagePath, "wx", 0o600);
-      writeAllSync(stage, retained);
-      fs.fsyncSync(stage);
-      // Bytes the stage must hold: every write is checked against its file before the rename.
-      let stageLength = retained.length;
-      const sameInode = (stat: fs.Stats | undefined): stat is fs.Stats =>
-        stat !== undefined && stat.dev === dev && stat.ino === ino && stat.size >= staged;
-      for (let round = 0; round < COMPACTION_ROUNDS; round++) {
-        const before = this.#liveStat();
-        if (!sameInode(before)) return; // Overtaken: another writer rewrote the log.
-        const folded = this.#foldIntoStage(stage, ino, staged, before.size);
-        staged += folded;
-        stageLength += folded;
-        // An incomplete stage is never committed: abandon it and leave the old log (the
-        // finally removes the stage). fstat only, no fsync.
-        if (fs.fstatSync(stage).size !== stageLength) {
-          throw new Error(`compaction stage holds ${fs.fstatSync(stage).size} of ${stageLength} bytes`);
-        }
-        const final = round === COMPACTION_ROUNDS - 1;
-        const outcome = await this.#lock.withLock((): "done" | "stop" | "behind" => {
-          const stat = this.#liveStat();
-          if (!sameInode(stat) || this.#readGeneration() !== generation || this.#hasPendingIntents()) return "stop";
-          // Unfolded appends: fold them off-lock and retry; after the last round the next trigger
-          // retries. Never fold (fsync) under the lock. A torn tail of a dead writer is never
-          // folded: it is a partial line.
-          if (stat.size > staged) return final ? "stop" : "behind";
-          renameAtomic(stagePath!, file);
-          stagePath = undefined;
-          atomicWrite(this.#generationPath, this.#readGeneration() + 1);
-          return "done";
-        }, undefined, "publish");
-        if (outcome === "behind") continue;
-        if (outcome === "done") syncPathNamespace(file, fs.fstatSync(stage));
-        return;
-      }
-    } catch (error) {
-      process.emitWarning(`[pi-fabric] Mesh event log compaction deferred: ${error instanceof Error ? error.message : String(error)}`,
-        { code: "PI_FABRIC_MESH_COMPACTION" });
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const size = fs.fstatSync(descriptor).size;
+      if (size <= this.#maxEventLogBytes) return;
+      this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
+      const readBytes = Math.min(
+        size,
+        this.#retainedEventLogBytes + this.maxEventBytes + 1,
+      );
+      const buffer = Buffer.allocUnsafe(readBytes);
+      const bytesRead = fs.readSync(descriptor, buffer, 0, readBytes, size - readBytes);
+      const captured = buffer.subarray(0, bytesRead);
+      const retentionBoundary = Math.max(0, captured.length - this.#retainedEventLogBytes);
+      const newline = retentionBoundary === 0 ? -1 : captured.indexOf(0x0a, retentionBoundary);
+      const retainedStart = retentionBoundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
+      const retained = captured.subarray(retainedStart);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      // Persist both the retained bytes and the rename. Later intents may name offsets in
+      // this generation; a reboot must not resurrect its unsynced predecessor or lose bytes.
+      writeFileAtomic(this.#eventsPath, retained, { durable: true });
+      atomicWrite(this.#generationPath, this.#readGeneration() + 1);
     } finally {
-      if (stage !== undefined) fs.closeSync(stage);
-      if (stagePath) fs.rmSync(stagePath, { force: true });
-      compactions.delete(file);
+      if (descriptor !== undefined) fs.closeSync(descriptor);
     }
   }
 

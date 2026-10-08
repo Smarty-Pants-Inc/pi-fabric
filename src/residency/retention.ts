@@ -9,6 +9,45 @@ import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
 
+export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
+ * host is proven dead and flock-fenced. Every existing run is then untracked. */
+export const sweepResidentRuns = (
+  runsRoot: string, now = Date.now(), budgetMs = 100,
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number } = {},
+): string[] => {
+  const removed: string[] = [];
+  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  const started = performance.now();
+  const expired = () => performance.now() - started >= budgetMs;
+  const retained = retainedActorRunIds(options.actorRoots ?? []);
+  if (retained.has("*")) return removed;
+  let directory: fs.Dir;
+  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
+  try {
+    let entry: fs.Dirent | null;
+    while (!expired() && (entry = directory.readSync())) {
+      if (!entry.isDirectory() || retained.has(entry.name)) continue;
+      const run = path.join(runsRoot, entry.name);
+      const stat = ownedStat(run);
+      if (!stat?.isDirectory()) continue;
+      if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
+          !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+      } else {
+        compactTerminalRunEvents(run, {
+          ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
+          ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+          now, expired });
+      }
+    }
+  } finally { directory.closeSync(); }
+  return removed;
+};
+
+
 const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
 const time = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;

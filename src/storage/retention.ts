@@ -47,6 +47,19 @@ const validOwner = (owner: RunRootOwner | undefined): owner is RunRootOwner => !
   (owner.closedAt === undefined || time(owner.closedAt)) &&
   (owner.orphanedAt === undefined || time(owner.orphanedAt)) &&
   (owner.childrenStopped === undefined || typeof owner.childrenStopped === "boolean");
+/**
+ * A live PID is the run's saved worker unless its checked start identity proves PID reuse
+ * (smarty-dev#3252): the saved start time was read and differs from the live process's. A
+ * missing saved identity or an unreadable current one still counts as live.
+ */
+const savedWriterAlive = (pid: number, record: RunRecordSummary | undefined): boolean => {
+  if (!processAlive(pid)) return false;
+  const saved = typeof record?.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
+    ? record.processStartTime : undefined;
+  if (saved === undefined) return true;
+  const current = processStartTime(pid);
+  return current === undefined || current === saved;
+};
 const writeOwner = (root: string, owner: RunRootOwner): void => {
   if (fs.existsSync(root) && !ownedStat(root)?.isDirectory()) throw new Error("Unsafe Fabric run root");
   const file = ownerPath(root);
@@ -154,7 +167,7 @@ const runTreeVeto = (
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return `worker exit is unconfirmed: unknown ${worker} identity`;
-      if (processAlive(pid)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
+      if (savedWriterAlive(pid, record)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -176,10 +189,7 @@ const runTreeVeto = (
           }
         }
       }
-      const savedStart = typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
-        ? record.processStartTime : undefined;
-      const currentStart = alive && savedStart ? processStartTime(pid) : undefined;
-      if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
+      if (!validPid || (alive && savedWriterAlive(pid, record))) {
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
@@ -238,13 +248,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   // authorize recordless pre-launch rollback through the non-retention mode.
   if (runTreeExitVeto(root, 0, expired, true)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
-  // Automatic retention keeps its independent live-writer fence. A mismatched
-  // birth identity can clear explicit cleanup's exit veto, but never authorizes
-  // a sweep to remove a run with a live or unknown saved PID. Apply this at
-  // every level, including descendants, alongside the recursive exit proof.
+  // Automatic retention keeps its independent live-writer fence at every level,
+  // including descendants, alongside the recursive exit proof. A live PID vetoes
+  // unless its checked start identity proves reuse (smarty-dev#3252): a reused
+  // PID used to veto removal forever. Unknown identity still vetoes.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
-  if (pid !== undefined && processAlive(pid)) return false;
+  if (pid !== undefined && savedWriterAlive(pid, record)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
@@ -340,6 +350,29 @@ const pruneClosedRunRoot = (
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
+};
+/** Per-interval claim files of the mesh-wide retention sweep (smarty-dev#3252). */
+export const MESH_RETENTION_SWEEP_PREFIX = ".mesh-retention-sweep-";
+/**
+ * Claim this interval's mesh-wide sweep. Exactly one process per mesh wins a slot: the claim
+ * is an exclusive create of the slot's file, so two owners never both start a sweep in the
+ * same interval. Older slot files are dropped once a newer slot is claimed.
+ */
+export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, now = Date.now()): boolean => {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
+  const slot = Math.floor(now / intervalMs);
+  const name = `${MESH_RETENTION_SWEEP_PREFIX}${slot}.json`;
+  try {
+    const fd = fs.openSync(path.join(meshRoot, name), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, claimedAt: now })); } finally { fs.closeSync(fd); }
+  } catch { return false; }
+  try {
+    for (const other of fs.readdirSync(meshRoot)) {
+      const match = other.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(other.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
+      if (match && Number(match[1]) < slot - 1) fs.rmSync(path.join(meshRoot, other), { force: true });
+    }
+  } catch { /* stale slot files are tiny; the next claim retries */ }
+  return true;
 };
 /** Host-wide marker of the last temp-root sweep; a dotfile, so the root pattern never matches it. */
 export const RUN_ROOT_SWEEP_MARKER = ".pi-fabric-runs-sweep.json";
@@ -599,6 +632,12 @@ export const pruneActorRunArchives = (options: {
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
   now?: number;
+  /** Further live references (registry latest/in-flight runs), checked again just before removal. */
+  isRetained?: (runId: string) => boolean;
+  dryRun?: boolean;
+  /** Called before a run directory is removed (or, in a dry run, would be). */
+  onRemove?: (directory: string) => void;
+  onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
 }): string[] => {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
@@ -606,14 +645,23 @@ export const pruneActorRunArchives = (options: {
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === options.latestRunId) continue;
+    if (!entry.isDirectory() || entry.name === options.latestRunId || options.isRetained?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
     if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
-      compactTerminalRunEvents(directory, { ...options, now });
+      compactTerminalRunEvents(directory, {
+        ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
+        ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+        now, isRetained: () => !!options.isRetained?.(entry.name),
+        ...(options.dryRun !== undefined ? { dryRun: options.dryRun } : {}),
+        ...(options.onCompact ? { onCompact: options.onCompact } : {}),
+      });
       continue;
     }
+    if (options.isRetained?.(entry.name)) continue;
+    options.onRemove?.(directory);
+    if (options.dryRun) { removed.push(directory); continue; }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;

@@ -208,12 +208,34 @@ function stopAttempt(attempt: Attempt): Promise<void> {
   })();
 }
 
+/** Size cap of launcher.log and each child-*.log: one rotated generation (.1) is kept (smarty-dev#3252). */
+export const RESIDENT_LOG_MAX_BYTES = 8 * 1024 * 1024;
+/** Per-transaction child logs older than this are removed when a new child starts. */
+const RESIDENT_CHILD_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+/** Append, rotating the file to `<file>.1` (replacing the previous generation) once it exceeds the cap. */
+export const appendResidentLog = (file: string, data: string | Buffer, maxBytes = RESIDENT_LOG_MAX_BYTES): void => {
+  try { if (fs.statSync(file).size >= maxBytes) fs.renameSync(file, `${file}.1`); }
+  catch { /* absent, or rotation failed: append to the current file */ }
+  fs.appendFileSync(file, data);
+};
+const pruneResidentChildLogs = (root: string, keep: string, now = Date.now()): void => {
+  try {
+    for (const name of fs.readdirSync(root)) {
+      if (!/^child-.+\.log(\.1)?$/.test(name)) continue;
+      const file = path.join(root, name);
+      if (file === keep || file === `${keep}.1`) continue;
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && now - stat.mtimeMs > RESIDENT_CHILD_LOG_RETENTION_MS) fs.rmSync(file, { force: true });
+    }
+  } catch { /* diagnostics only; the next launch retries */ }
+};
+
 /** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
 export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number } = {}): Promise<void> {
   const root = path.dirname(configPath);
   const ownerPath = path.join(root, "owner.json");
   const trace = (event: string, extra: Record<string, unknown> = {}): void => {
-    try { fs.appendFileSync(path.join(root, "launcher.log"), `${JSON.stringify({ event, at: Date.now(), ...extra })}\n`); }
+    try { appendResidentLog(path.join(root, "launcher.log"), `${JSON.stringify({ event, at: Date.now(), ...extra })}\n`); }
     catch { /* Audit failure is never permission to abandon recovery. */ }
   };
   const readOwner = (): ResidentHostOwner | undefined => readHandoverJson<ResidentHostOwner>(ownerPath);
@@ -277,6 +299,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
           ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" },
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
+    pruneResidentChildLogs(root, logFile);
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
@@ -291,7 +314,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     });
     for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: Buffer) => {
       attempt.stderr = `${attempt.stderr}${chunk}`.slice(-4_000);
-      try { fs.appendFileSync(logFile, chunk); } catch { /* best effort */ }
+      try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
     });
     trace("child-spawned", { pid: child.pid, entry: launchEntry, configPath: snapshot, digest: spec?.digest, transaction: plan?.id, kind });
     current = attempt;

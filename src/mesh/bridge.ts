@@ -631,6 +631,11 @@ export class StoreBridgeSide implements BridgeSide {
     const entry = view.get(keyFor(HOST_PREFIX, lease.id));
     const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
     if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
+    // Only the incarnation the lease was planned for: an overlapping writer may have installed a
+    // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
+    // and a stale effect must not overwrite its lease (pi-fabric#640 review round 2). A row of an
+    // earlier release carries no incarnation: root and identity decide it, as before.
+    if (lease.startedAt !== undefined && lease.startedAt !== held.startedAt) return;
     // A replayed row never shortens a lease that a later pass already renewed.
     if (replay && (readHostLease(this.store.root, lease.id)?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
     writeHostLease(this.store.root, lease);

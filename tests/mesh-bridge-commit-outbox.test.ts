@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BridgeOwnershipError, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLiveness, readHostLease, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -200,6 +200,50 @@ describe("owner-matched unlease (smarty-dev#6477 L2b owner review, P2)", () => {
     await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
     expect(hub.get(rows.rowKey(`lease:${peer.identity.id}`), { fresh: true })).toBeUndefined();
     expect(readHostLease(hub.root, peer.identity.id)).toEqual(replacement);
+  });
+});
+
+describe("stale lease effect after a replacement mirror (pi-fabric#640 review round 2)", () => {
+  it("overlapping SQLite bridge writers: the stale afterCommit keeps the replacement's lease and liveness", async () => {
+    const hub = store("sqlite");
+    expect(hub.stateBackend).toBe("sqlite");
+    // A second writer for the same peer, through another connection to the same database.
+    const other = new MeshStore(hub.root, 64 * 1024, 100, { stateBackend: "sqlite" });
+    opened.push(other);
+    const now = Date.now();
+    const peer = remote("lambda", now);
+    // The same id, root and identity, restarted: a new incarnation (startedAt).
+    const restarted = { ...peer.host, startedAt: now + 5_000, updatedAt: now + 5_000 } as FabricHostRecord;
+    const stale = new StoreBridgeSide(hub, "ryzen2");
+    const replacing = new StoreBridgeSide(other, "ryzen2");
+    let replacementLease: ReturnType<typeof readHostLease>;
+    let staleEffects = 0;
+    const writeBatch = hub.writeBatch.bind(hub);
+    vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
+      if (input.lockClass !== "bridge" || !input.afterCommit) return writeBatch(input);
+      const { afterCommit, ...rest } = input;
+      // The first writer commits its mirror; before its effect reacquires the store, the second
+      // writer installs the replacement mirror and writes its lease.
+      const results = await writeBatch(rest);
+      await replacing.mirror({ hosts: [{ record: restarted, expiresAt: now + 60_000 }], participants: [peer.participant] });
+      replacementLease = readHostLease(hub.root, peer.identity.id);
+      expect(replacementLease?.startedAt).toBe(restarted.startedAt);
+      // The stale effect then runs on the committed state, which now holds the replacement.
+      await writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: (view) => { staleEffects += 1; afterCommit(view); } });
+      return results;
+    });
+    await stale.mirror(peer.presence);
+    expect(staleEffects).toBe(1);
+    const entry = hub.get(hostKey(peer.identity.id), { fresh: true });
+    expect(entry?.value).toMatchObject({ startedAt: restarted.startedAt, remoteHost: "ryzen2" });
+    // The replacement's lease survives the stale effect...
+    expect(readHostLease(hub.root, peer.identity.id)).toEqual(replacementLease);
+    // ...and liveness matches it: the live mirror never looks expired.
+    const held = entry!.value as FabricHostRecord;
+    const liveness = hostLiveness(readHostLeases(hub.root), held);
+    expect(liveness.expiresAt).toBe(Math.max(held.expiresAt, replacementLease!.expiresAt));
+    expect(liveness.expiresAt).toBeGreaterThan(Date.now());
+    expect(readHostLeases(hub.root).get(peer.identity.id)?.startedAt).toBe(held.startedAt);
   });
 });
 

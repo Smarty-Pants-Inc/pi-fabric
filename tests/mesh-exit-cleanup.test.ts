@@ -310,6 +310,45 @@ describe("directory withdrawal on exit (smarty-dev#6622)", () => {
       .not.toContain("agent:child");
   }, 15_000);
 
+  // A resident's idle exit under a held mesh lock must end within its shutdown window
+  // (residency-outbox F6): one batch, at most two lock waits (smarty-dev#6622, round 3).
+  it("a full close withdraws records and host entry in one batch and waits at most two lock timeouts", async () => {
+    const meshRoot = tempRoot();
+    const identity: MeshIdentity = { id: "session:idle", name: "main", kind: "main", sessionId: "idle" };
+    const open = async () => {
+      const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 300 });
+      const warnings: string[] = [];
+      const directory = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000, reapDeadHosts: false,
+        onWithdrawalFailure: (message) => warnings.push(message),
+      });
+      directory.registerSource(() => [record(identity.id, "root", identity.id), record("agent:child", "agent", identity.id)]);
+      directories.push(directory);
+      await directory.start();
+      return { mesh, directory, warnings, batches: vi.spyOn(mesh, "writeBatch") };
+    };
+    const ownKeys = (mesh: MeshStore) => [...mesh.listAll("topology/participants/", { fresh: true }), ...mesh.listAll("topology/hosts/", { fresh: true })]
+      .filter((entry) => entry.updatedBy.id === identity.id);
+
+    const free = await open();
+    expect(ownKeys(free.mesh).some((entry) => entry.key.startsWith("topology/hosts/"))).toBe(true);
+    expect(ownKeys(free.mesh).some((entry) => entry.key.startsWith("topology/participants/"))).toBe(true);
+    await free.directory.close();
+    expect(free.batches).toHaveBeenCalledOnce();
+    expect(ownKeys(free.mesh)).toEqual([]);
+    expect(free.warnings).toEqual([]);
+
+    const busy = await open();
+    const release = holdLock(meshRoot);
+    const started = Date.now();
+    try { await busy.directory.close(); } finally { release(); }
+    const elapsed = Date.now() - started;
+    expect(busy.batches).toHaveBeenCalledTimes(2);
+    expect(elapsed).toBeLessThan(3 * 300 + 400);
+    expect(busy.warnings).toHaveLength(1);
+    expect(readHostLeases(meshRoot).has(identity.id)).toBe(false);
+  }, 20_000);
+
   it("an exit while close() waits for the busy lock does not leave the host lease fresh", async () => {
     const meshRoot = tempRoot();
     const run = runChild("directory", meshRoot);

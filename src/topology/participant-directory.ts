@@ -54,6 +54,10 @@ const PARTICIPANT_PREFIX = "topology/participants/";
 /** A clean close retries its withdrawal batch this often when the mesh lock is busy
  * (smarty-dev#6622): a swallowed lock timeout used to leave the entry fresh. */
 const CLOSE_WITHDRAW_ATTEMPTS = 3;
+/** Of those attempts, at most this many may wait a full mesh lock timeout: a resident's
+ * idle exit under a held lock must still end within its shutdown window, and a failed
+ * withdrawal lapses with the unrenewed lease anyway (smarty-dev#6622, round 3). */
+const CLOSE_WITHDRAW_LOCK_WAITS = 2;
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
 const PEER_SEQ_KEY = "topology/peer-seq";
 const HOST_PREFIX = "topology/hosts/";
@@ -600,6 +604,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async #withdraw(select: () => MeshBatchOperation[]): Promise<{ ok: true } | { ok: false; reason: string }> {
     const text = (error: unknown): string => error instanceof Error ? error.message : String(error);
     let reason = "no attempt";
+    let lockWaits = 0;
     for (let attempt = 1; attempt <= CLOSE_WITHDRAW_ATTEMPTS; attempt++) {
       try {
         const ops = select();
@@ -610,7 +615,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         reason = `delete skipped on a version conflict: ${skipped.join(", ")}`;
       } catch (error) {
         reason = text(error);
-        if (!isMeshLockTimeout(error)) return { ok: false, reason };
+        if (!isMeshLockTimeout(error) || ++lockWaits >= CLOSE_WITHDRAW_LOCK_WAITS) return { ok: false, reason };
       }
     }
     try {
@@ -1547,13 +1552,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // ONE batch (one lock acquisition) for every shared record, reread fresh and retried
     // while the lock is busy: under mesh-lock load, per-entry deletes each timed out and
     // were swallowed, which left this host's entries fresh after a clean exit (#6622).
+    // A full close folds its host entry into that batch: a second batch waited its own lock
+    // timeouts and pushed a resident's idle exit past its shutdown window (round 3).
     const legacySessionKey = this.#legacySessionKey();
+    const withdrawHost = !this.#reloadPublished;
     const records = await this.#withdraw(() => {
       const ops: MeshBatchOperation[] = this.mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }).filter(own)
         .map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const }));
       const legacy = legacySessionKey ? this.mesh.get(legacySessionKey, { fresh: true }) : undefined;
       if (legacy?.updatedBy.id === this.options.identity.id) {
         ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
+      }
+      const hostEntry = withdrawHost ? this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true }) : undefined;
+      if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
+        ops.push({ kind: "delete", key: hostEntry.key, ifVersion: hostEntry.version, onConflict: "skip" });
       }
       return ops;
     });
@@ -1567,14 +1579,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return;
     }
     removeHostLease(this.mesh.root, this.options.hostId);
-    const host = await this.#withdraw(() => {
-      const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true });
-      return hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined
-        ? [{ kind: "delete" as const, key: hostEntry.key, ifVersion: hostEntry.version, onConflict: "skip" as const }] : [];
-    });
-    const failed = !records.ok ? records : !host.ok ? host : undefined;
     // The lease file is gone either way; only a committed withdrawal retires the exit hook.
-    if (failed) { this.#withdrawalFailure(failed.reason); return; }
+    if (!records.ok) { this.#withdrawalFailure(records.reason); return; }
     this.#withdrawn = true;
     this.#removeExitHook();
   }

@@ -87,6 +87,14 @@ export interface CommitOutboxPlan {
    * A retried prepare replaces what an earlier attempt staged.
    */
   stage(ops: MeshBatchOperation[], effects: CommitOutboxEffect[], options?: { durable?: boolean }): MeshBatchOperation[];
+  /**
+   * For the batch's `prepare`, before stage(): runs every pending row of this scope (a crashed
+   * predecessor's) on `view`, the committed state under the write lock, as recover() does, but on
+   * the batch's own snapshot: no read or transaction of its own (one read per presence pass,
+   * smarty-dev#3752). stage() then commits the deletes of the rows that ran in this batch. Returns
+   * how many effects ran.
+   */
+  replay(view: MeshBatchView): number;
   /** For the same batch's `afterCommit`: runs this plan's effects, then retries failed rows.
    * Returns how many of this plan's effects ran. */
   run(view: MeshBatchView, halted?: () => boolean): number;
@@ -125,9 +133,21 @@ export class CommitOutbox {
   plan(): CommitOutboxPlan {
     let staged: readonly StagedEffect[] = [];
     let ran = false;
+    let replayed = false;
     return {
+      replay: (view) => {
+        let count = 0;
+        for (const entry of view.listAll(this.prefix)) {
+          const stored = rowOf(entry.value);
+          if (!stored || stored.scope !== this.scope) continue;
+          if (this.#execute(entry.key, stored.kind, stored.payload, view, true)) count += 1;
+        }
+        replayed ||= count > 0;
+        return count;
+      },
       stage: (ops, effects, options = {}) => {
-        const result = this.#stage(ops, effects, options);
+        // Replayed rows are deleted in this batch even when it has nothing else to commit.
+        const result = this.#stage(ops, effects, replayed ? { ...options, durable: true } : options);
         staged = result.staged;
         return result.ops;
       },

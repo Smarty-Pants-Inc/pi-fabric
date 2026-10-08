@@ -26,13 +26,14 @@ export const meshDirectoryStamp = (meshRoot: string, name: string): string => {
   return files.map(stamp).join("|");
 };
 
-/** A mesh whose state backend can name its committed revision (smarty-dev#6477 R7). The `file`
- * backend has no such counter, so the stat of `state.json` stands in; a backend that commits
- * elsewhere (SQLite) supplies `stateRevision` from its `meta` counter, comparable across time
- * and connections. */
+/** A mesh whose ACTIVE state backend names its committed revision (smarty-dev#6477 R7, MeshStore).
+ * `stateRevision()` is undefined when state.json is the authority (file, shadow): its stat stands
+ * in. A backend that commits elsewhere (SQLite) returns its commit stamp, comparable across time
+ * and connections. Required, not optional: a source without it would silently stamp a state.json
+ * that SQLite commits never update (pi-fabric#640 review round 1, P1). */
 export interface PublicationGenerationSource {
   readonly root: string;
-  stateRevision?(): string | undefined;
+  stateRevision(): string | undefined;
 }
 
 /** Cheap invalidation of a prepared ownership observation. Atomic replacements
@@ -40,7 +41,8 @@ export interface PublicationGenerationSource {
  * This is validation, never authority; callers still prepare a fresh directory read. */
 export const publicationGeneration = (mesh: string | PublicationGenerationSource): string => {
   const meshRoot = typeof mesh === "string" ? mesh : mesh.root;
-  const revision = typeof mesh === "string" || typeof mesh.stateRevision !== "function" ? undefined : mesh.stateRevision();
+  // A bare root names a file-backed mesh (tests, tools without a store); a store names its backend.
+  const revision = typeof mesh === "string" ? undefined : mesh.stateRevision();
   const state = revision === undefined ? stamp(path.join(meshRoot, "state.json")) : `revision:${revision}`;
   return [state, meshDirectoryStamp(meshRoot, "participants"), meshDirectoryStamp(meshRoot, "host-leases")].join("|");
 };

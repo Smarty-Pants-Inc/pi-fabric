@@ -128,6 +128,13 @@ const IDLE_EXIT_MS = 30_000;
 // window and drops the reused observation, so a run that starts and ends between two samples
 // still counts: the window always runs from the last real actor activity.
 const IDLE_ACTOR_CHECK_MS = 1_000;
+// A stat stamp of config.json proves it unchanged only once the file is older than the
+// coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
+// replacement inside one timestamp tick can keep size and times, and its file id too where
+// the volume reports ino 0 or reuses the freed inode; such a file is re-read on every tick.
+// Any later replacement is then written after the cached mtime plus a tick, so its mtime
+// differs (the racily-clean rule of git's index).
+const CONFIG_STAMP_SETTLE_MS = 3_000;
 const COMPLETION_MAX_CHARS = 8_000;
 const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
 
@@ -1063,7 +1070,7 @@ export class ResidentHost {
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
-    Object.assign(this.#retention, this.#currentRetention());
+    Object.assign(this.#retention, this.#currentRetention(now));
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
     if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
@@ -1082,15 +1089,18 @@ export class ResidentHost {
 
   /** The accepted retention overlay, re-read only when config.json was replaced or changed:
    * this runs on every 100 ms maintenance tick, and Main rewrites the file atomically. */
-  #currentRetention(): ResidentHostConfig["retention"] {
+  #currentRetention(now = Date.now()): ResidentHostConfig["retention"] {
     let stamp: string | undefined;
+    let settled = false;
     try {
       const stat = fs.statSync(path.join(this.config.residencyRoot, "config.json"), { bigint: true });
       stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      settled = BigInt(Math.floor(now)) * 1_000_000n - stat.mtimeNs >= BigInt(CONFIG_STAMP_SETTLE_MS) * 1_000_000n;
     } catch { /* Absent or unreadable: re-evaluate on every tick, as before. */ }
     if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) return this.#retentionOverlay.retention;
     const retention = this.#effectiveConfig?.().retention ?? this.config.retention;
-    this.#retentionOverlay = stamp === undefined ? undefined : { stamp, retention };
+    // Cache only a settled stamp: a file younger than the settle window is read on every tick.
+    this.#retentionOverlay = stamp !== undefined && settled ? { stamp, retention } : undefined;
     return retention;
   }
 

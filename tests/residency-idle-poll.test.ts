@@ -5,6 +5,15 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { ResidentRequestRetention } from "../src/residency/retention.js";
+
+// Windows runs the legacy retention path (retentionV2Enabled() is false on win32). Both paths
+// run here on every platform, so a Windows-only difference shows up on Linux too.
+const platform = vi.hoisted(() => ({ retentionV2: process.platform !== "win32" }));
+vi.mock("../src/storage/retention-platform.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/storage/retention-platform.js")>()),
+  retentionV2Enabled: () => platform.retentionV2,
+}));
 
 // smarty-dev#6729: an idle resident host's 50 ms request poll rebuilt the fleet-wide actor
 // ownership view (every project participant, every host lease) on every tick for its idle check.
@@ -19,56 +28,143 @@ const fixture = (onIdle: () => void = () => {}) => {
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
-  fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
-  return { root, config, host: new ResidentHost(config, onIdle) };
+  const file = path.join(config.residencyRoot, "config.json");
+  fs.writeFileSync(file, JSON.stringify(config));
+  // A running host's config.json was usually written long ago; a fresh one is re-read until it settles.
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(file, old, old);
+  return { root, config, file, host: new ResidentHost(config, onIdle) };
 };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const waitUntil = async (done: () => boolean, ms = 5_000) => {
+  for (let waited = 0; waited < ms && !done(); waited += 20) await sleep(20);
+  return done();
+};
+// Main publishes config.json by an atomic replace.
+const replace = (file: string, value: unknown) => {
+  fs.writeFileSync(file + ".tmp", JSON.stringify(value));
+  fs.renameSync(file + ".tmp", file);
+};
+const withRetention = (config: ResidentHostConfig, completedRequestMs: number) =>
+  ({ ...config, retention: { ...config.retention, completedRequestMs } });
 
 describe("idle resident host polling (smarty-dev#6729)", () => {
-  it("rebuilds the actor ownership view about once a second, not on every 50 ms request tick", async () => {
-    const { root, host } = fixture();
+  it("rebuilds the actor ownership view once per second of clock time, not on every 50 ms request tick", async () => {
+    const { root, file, host } = fixture();
+    let now = Date.now();
+    // The host's own clock drives the one-second reuse; real 50 ms ticks keep running.
+    // Measuring against wall time made the bound depend on how fast the runner was.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const reads = vi.spyOn(fs, "readFileSync");
+    const configReads = () => reads.mock.calls.filter(([read]) => String(read) === file).length;
     try {
       await host.start();
+      // The first maintenance pass reads the overlay once; from then on its stamp is cached.
+      expect(await waitUntil(() => configReads() > 0)).toBe(true);
       await host.actors.create({ name: "idle-poll", instructions: "wait", residency: "durable" });
       await host.participants.refresh();
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor");
-      const lists = vi.spyOn(host.participants, "list");
-      const reads = vi.spyOn(fs, "readFileSync");
-      const started = Date.now();
-      await sleep(2_000);
-      const seconds = (Date.now() - started) / 1_000;
-      const configReads = reads.mock.calls.filter(([file]) => String(file) === path.join(host.config.residencyRoot, "config.json")).length;
-      // Before: one check (and one fleet-wide participant listing) per 50 ms tick, about 40 here.
-      expect(checks.mock.calls.length).toBeLessThanOrEqual(Math.ceil(seconds) + 1);
-      expect(lists.mock.calls.length).toBeLessThanOrEqual(Math.ceil(seconds) * 3 + 2);
-      // Before: the 100 ms maintenance tick re-read and parsed config.json each time, about 20 here.
-      expect(configReads).toBeLessThanOrEqual(1);
+      // Count the fleet-wide listings the idle check itself makes. The actor mesh monitor also
+      // lists participants before each of its polls; that cadence is its own and differs by
+      // platform (a 250 ms timer on Windows, file-watch wakes plus a 2 s reconcile elsewhere).
+      let inCheck = 0;
+      let checkListings = 0;
+      const list = host.participants.list.bind(host.participants);
+      vi.spyOn(host.participants, "list").mockImplementation((...args: Parameters<typeof list>) => {
+        if (inCheck > 0) checkListings++;
+        return list(...args);
+      });
+      const active = host.actors.hasActiveDurableActor.bind(host.actors);
+      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => {
+        inCheck++;
+        try { return active(); } finally { inCheck--; }
+      });
+      reads.mockClear();
+      // About 20 request ticks with the clock still: at most the one current observation the
+      // reused one needs. Before: one check (and one fleet-wide listing) on every tick.
+      await sleep(1_000);
+      const first = checks.mock.calls.length;
+      expect(first).toBeLessThanOrEqual(1);
+      for (let second = 1; second <= 2; second++) {
+        now += 1_000;
+        expect(await waitUntil(() => checks.mock.calls.length >= first + second)).toBe(true);
+        await sleep(500);
+        expect(checks.mock.calls.length).toBe(first + second);
+      }
+      expect(checkListings).toBe(checks.mock.calls.length);
+      // Before: the 100 ms maintenance tick re-read and parsed the unchanged config.json each time.
+      expect(configReads()).toBe(0);
     } finally {
+      clock.mockRestore();
+      reads.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("applies a replaced config.json retention overlay at the next maintenance tick", async () => {
-    const { root, config, host } = fixture();
-    try {
+  describe.each([
+    { retentionV2: true, name: "retention v2 (Linux, macOS)" },
+    { retentionV2: false, name: "legacy retention (Windows)" },
+  ])("$name", ({ retentionV2 }) => {
+    const start = async (host: ResidentHost) => {
+      platform.retentionV2 = retentionV2;
+      // The legacy path applies the overlay at its next sweep: make every request tick one.
+      if (!retentionV2) vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       await host.start();
-      await sleep(300);
-      const file = path.join(config.residencyRoot, "config.json");
-      const retention = { ...config.retention, completedRequestMs: (config.retention as { completedRequestMs?: number }).completedRequestMs ?? 1 };
-      const replaced = { ...config, retention: { ...retention, probeMarker: 7 } };
-      fs.writeFileSync(file + ".tmp", JSON.stringify(replaced));
-      fs.renameSync(file + ".tmp", file);
-      const reads = vi.spyOn(fs, "readFileSync");
-      await sleep(400);
-      const configReads = reads.mock.calls.filter(([read]) => String(read) === file).length;
-      expect(configReads).toBeGreaterThanOrEqual(1);
-      expect(configReads).toBeLessThanOrEqual(2);
-    } finally {
+    };
+    const finish = async (host: ResidentHost, root: string) => {
+      platform.retentionV2 = process.platform !== "win32";
+      vi.restoreAllMocks();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
-    }
+    };
+
+    it("applies a replaced config.json retention overlay at the next maintenance pass, then caches it", async () => {
+      const { root, config, file, host } = fixture();
+      try {
+        await start(host);
+        const reads = vi.spyOn(fs, "readFileSync");
+        const configReads = () => reads.mock.calls.flatMap(([read], index) =>
+          String(read) === file ? [String(reads.mock.results[index]?.value)] : []);
+        replace(file, withRetention(config, 222_222));
+        expect(await waitUntil(() => configReads().some(text => text.includes("222222")))).toBe(true);
+        // Once the replacement is older than the settle window its stamp is trusted again.
+        const old = new Date(Date.now() - 3_600_000);
+        fs.utimesSync(file, old, old);
+        reads.mockClear();
+        expect(await waitUntil(() => configReads().length > 0)).toBe(true);
+        reads.mockClear();
+        await sleep(500);
+        expect(configReads()).toHaveLength(0);
+      } finally {
+        await finish(host, root);
+      }
+    });
+
+    it("re-reads a same-size replacement whose stat stamp did not change (file id 0, one timestamp tick)", async () => {
+      const { root, config, file, host } = fixture();
+      try {
+        await start(host);
+        const reads = vi.spyOn(fs, "readFileSync");
+        const configReads = () => reads.mock.calls.flatMap(([read], index) =>
+          String(read) === file ? [String(reads.mock.results[index]?.value)] : []);
+        replace(file, withRetention(config, 111_111));
+        // A volume that reports file id 0 and a coarse timestamp: the same-size replacement
+        // below, within the same tick, stats identically to this one.
+        const stamp = Object.assign(Object.create(Object.getPrototypeOf(fs.statSync(file, { bigint: true })) as object),
+          fs.statSync(file, { bigint: true }), { ino: 0n }) as fs.BigIntStats;
+        const stat = fs.statSync;
+        vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) =>
+          String(target) === file ? stamp : stat(target, options)) as typeof fs.statSync);
+        expect(await waitUntil(() => configReads().some(text => text.includes("111111")))).toBe(true);
+        replace(file, withRetention(config, 222_222));
+        expect(fs.statSync(file, { bigint: true })).toBe(stamp);
+        // Before: the identical stamp kept the old overlay for good.
+        expect(await waitUntil(() => configReads().some(text => text.includes("222222")), 3_000)).toBe(true);
+      } finally {
+        await finish(host, root);
+      }
+    });
   });
 
   it("never exits on a reused actor observation: an idle exit is confirmed by a current check", async () => {

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { abortMeshRollback, importMeshState, meshSnapshotDigest, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
+import { abortMeshRollback, cutoverMeshState, importMeshState, meshSnapshotDigest, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
   type MeshBackendStep, type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
 import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
@@ -36,7 +36,8 @@ const options = { assumeNoWriters: true, onStep: (step) => {
   process.kill(process.pid, "SIGKILL");
   for (;;) { /* never return into the next step */ }
 } };
-const run = operation === "import" ? migration.importMeshState : operation === "rollback" ? migration.rollbackMeshState : migration.abortMeshRollback;
+const run = operation === "import" ? migration.importMeshState : operation === "cutover" ? migration.cutoverMeshState
+  : operation === "rollback" ? migration.rollbackMeshState : migration.abortMeshRollback;
 await run(root, options);
 process.stdout.write("completed\\n");
 `;
@@ -127,6 +128,24 @@ describe("mesh backend tool killed after each step", () => {
     expect(await dbDigest(root)).toBe(original);
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   }, 120_000);
+
+  it.each(["import-read", "import-commit", "import-verify", "cutover-reconcile"] as const)(
+    "cutover killed after %s (inside its .lock section) converges on rerun", async (step) => {
+      const root = tempRoot(`cutover-${step}`);
+      await seed(root);
+      const original = meshSnapshotDigest(fileState(root));
+      const killed = await runChild("cutover", root, step);
+      expect(killed.signal, killed.stderr).toBe("SIGKILL");
+      // It died holding .lock: no file-mode writer could have committed meanwhile.
+      expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
+      assertFence(root);
+      expect(meta(root).backend).toBe(step === "import-read" ? "file" : "sqlite");
+      const rerun = await cutoverMeshState(root, { assumeNoWriters: true, lockTimeoutMs: 20_000 });
+      expect(rerun).toMatchObject({ backend: "sqlite", epoch: 1, digest: original, converged: step !== "import-read" });
+      assertFence(root);
+      expect(await dbDigest(root)).toBe(original);
+      expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    }, 120_000);
 
   it.each(["rollback-flag", "rollback-export-temp", "rollback-export", "rollback-verify", "rollback-switch"] as const)(
     "rollback killed after %s converges on rerun", async (step) => {

@@ -1,12 +1,14 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { abortMeshRollback, cutoverMeshState, importMeshState, meshBackendStatus, MeshBackendFenceError, MeshBackendRefusedError,
-  meshSnapshotDigest, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState, type MeshBackendAlarm,
+import { abortMeshRollback, assertFileStateWritable, cutoverMeshState, importMeshState, meshBackendStatus, MeshBackendFenceError,
+  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState, type MeshBackendAlarm,
   type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
-import { decodeMeshStateFile } from "../src/mesh/state-file.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
+import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -251,25 +253,142 @@ describe("mesh backend reader rule", () => {
 });
 
 describe("mesh backend cutover census", () => {
-  it("refuses unless the census shows no file-mode writer, and alarms on a late one", async () => {
+  const sqliteWriter = { pid: 101, release: "3.2.0", mode: "sqlite" };
+  const fileWriter = { pid: 103, release: "3.1.57", mode: "file" };
+
+  it("refuses unless the census shows no file-mode writer", async () => {
     const root = tempRoot("cutover");
     await seedFileRoot(root);
     await expect(cutoverMeshState(root)).rejects.toThrow(/needs the writer census/);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     await expect(cutoverMeshState(root, { census: async () => ({ writers: [
-      { pid: 101, release: "3.2.0", mode: "sqlite" }, { pid: 102, release: "3.1.57", mode: "file" },
+      sqliteWriter, { pid: 102, release: "3.1.57", mode: "file" },
     ] }) })).rejects.toThrow(/pid 102 \(file, 3\.1\.57\)/);
     expect(resolveMeshStateSource(root).source).toBe("file");
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
 
+    const result = await cutoverMeshState(root, { census: async () => ({ writers: [sqliteWriter] }) });
+    expect(result).toMatchObject({ backend: "sqlite", epoch: 1, writers: [{ pid: 101 }], generation: decodeFile(root).readGeneration });
+    expect(result).not.toHaveProperty("lateWriters");
+    const status = await meshBackendStatus(root, { census: async () => ({ writers: [sqliteWriter] }) });
+    expect(status).toMatchObject({ backend: "sqlite", writers: [{ pid: 101, mode: "sqlite" }] });
+  });
+
+  it("holds .lock across the section: a writer that starts during the import waits, then is refused", async () => {
+    const root = tempRoot("blocked");
+    await seedFileRoot(root);
+    let censusCalls = 0;
+    let writer: Promise<string> | undefined;
+    const result = await cutoverMeshState(root, {
+      census: async () => { censusCalls += 1; await new Promise(resolve => setTimeout(resolve, 150)); return { writers: [] }; },
+      onStep: (step) => {
+        if (step !== "import-read") return;
+        // A new-release file-mode writer: it takes .lock and checks the flag before it writes.
+        writer = new MeshLock(root, { lockTimeoutMs: 20_000 }, () => undefined).withLock(() => {
+          const seen = `census ${censusCalls}, backend ${String(rawMeta(root).backend)}`;
+          try { assertFileStateWritable(root); return `${seen}: wrote`; }
+          catch (error) { return `${seen}: ${(error as Error).name}`; }
+        });
+      },
+    });
+    expect(result).toMatchObject({ backend: "sqlite", epoch: 1 });
+    // It got .lock only after the second census, and the flag refused its write.
+    expect(await writer).toBe("census 2, backend sqlite: MeshBackendFenceError");
+  });
+
+  it("fails on a late file-mode writer seen by the second census and rolls back to file at E+2", async () => {
+    const root = tempRoot("late");
+    await seedFileRoot(root);
+    const original = meshSnapshotDigest(decodeFile(root));
     let calls = 0;
     const alarms: MeshBackendAlarm[] = [];
-    const result = await cutoverMeshState(root, {
-      census: async () => ({ writers: calls++ === 0 ? [{ pid: 101, release: "3.2.0", mode: "sqlite" }] : [{ pid: 103, release: "3.1.57", mode: "file" }] }),
-      onAlarm: (alarm) => { alarms.push(alarm); },
+    const steps: string[] = [];
+    const failure = await cutoverMeshState(root, {
+      census: async () => ({ writers: calls++ === 0 ? [sqliteWriter] : [fileWriter] }),
+      onAlarm: (alarm) => { alarms.push(alarm); }, onStep: (step) => { steps.push(step); },
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(MeshCutoverFailedError);
+    expect((failure as Error).message).toMatch(/second census shows pid 103 \(file, 3\.1\.57\).*rolled back to backend=file at epoch 2/);
+    expect(failure).toMatchObject({ lateWriters: [{ pid: 103 }], rollback: { backend: "file", epoch: 2, digest: original } });
+    expect(steps).toEqual(["import-read", "import-commit", "import-verify",
+      "rollback-flag", "rollback-export-temp", "rollback-export", "rollback-verify", "rollback-switch"]);
+    expect(alarms.map(alarm => alarm.code)).toEqual(["FABRIC_MESH_BACKEND_LATE_WRITER"]);
+    expect(rawMeta(root)).toMatchObject({ backend: "file", epoch: 2 });
+    expect(resolveMeshStateSource(root)).toEqual({ source: "file", backend: "file", epoch: 2, fileEpoch: 2 });
+    expect(meshSnapshotDigest(decodeFile(root))).toBe(original);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    // The late writer now commits to the authority.
+    expect(() => assertFileStateWritable(root)).not.toThrow();
+    await fileStore(root).put({ key: "late/writer", value: 1, identity });
+
+    // A census that fails after the flag fails the cutover too (roll forward to 3, back to file at 4).
+    let second = 0;
+    await expect(cutoverMeshState(root, { census: async () => {
+      if (second++ > 0) throw new Error("census down");
+      return { writers: [] };
+    } })).rejects.toThrow(/second census failed \(census down\).*rolled back to backend=file at epoch 4/);
+    expect(rawMeta(root)).toMatchObject({ backend: "file", epoch: 4 });
+    expect(fileStore(root).get("late/writer", { fresh: true })?.value).toBe(1);
+
+    // The CLI exits non-zero.
+    let cliCalls = 0;
+    let err = "";
+    const code = await main(["cutover", "--root", root], {
+      census: async () => ({ writers: cliCalls++ === 0 ? [] : [fileWriter] }), stdout: () => undefined, stderr: (text) => { err += text; },
     });
-    expect(result).toMatchObject({ backend: "sqlite", epoch: 1, writers: [{ pid: 101 }], lateWriters: [{ pid: 103 }] });
-    expect(alarms).toMatchObject([{ code: "FABRIC_MESH_BACKEND_LATE_WRITER" }]);
-    const status = await meshBackendStatus(root, { census: async () => ({ writers: [{ pid: 101, release: "3.2.0", mode: "sqlite" }] }) });
-    expect(status).toMatchObject({ backend: "sqlite", writers: [{ pid: 101, mode: "sqlite" }] });
+    expect(code).toBe(3);
+    expect(err).toMatch(/cutover refused: Fabric mesh cutover failed: .*epoch 6/);
+    expect(rawMeta(root)).toMatchObject({ backend: "file", epoch: 6 });
+  });
+
+  it("aborts with the flag unchanged when state.json moves before the flag commit, and rolls back after it", async () => {
+    // A writer that ignored .lock (another lock protocol) commits state.json at the given step.
+    const rogueWrite = (root: string): void => {
+      const file = decodeFile(root) as MeshStateFile & { highWater: number };
+      const version = file.highWater + 1;
+      const rogue = { ...file, readGeneration: randomUUID(), highWater: version,
+        entries: { ...file.entries, "rogue/key": { key: "rogue/key", value: 1, version, updatedAt: Date.now(), updatedBy: identity } } };
+      fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateFile(rogue).serialized);
+    };
+    const before = tempRoot("moved-before");
+    await seedFileRoot(before);
+    const aborted = await cutoverMeshState(before, { assumeNoWriters: true, onStep: (step) => { if (step === "import-read") rogueWrite(before); } })
+      .catch((error: unknown) => error);
+    expect(aborted).toBeInstanceOf(MeshBackendFenceError);
+    expect((aborted as Error).message).toMatch(/changed before the flag commit .*import aborted, the backend flag is unchanged/);
+    expect(rawMeta(before)).toMatchObject({ backend: "file", epoch: 0, commit_no: 0 });
+    expect(resolveMeshStateSource(before).source).toBe("file");
+    expect(decodeFile(before).entries["rogue/key"]?.value).toBe(1);
+
+    const after = tempRoot("moved-after");
+    await seedFileRoot(after);
+    const imported = meshSnapshotDigest(decodeFile(after));
+    const failed = await cutoverMeshState(after, { assumeNoWriters: true, onStep: (step) => { if (step === "import-verify") rogueWrite(after); } })
+      .catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(MeshCutoverFailedError);
+    expect((failed as Error).message).toMatch(/changed after the flag commit.*rolled back to backend=file at epoch 2; the conflicting state.json is kept at /);
+    expect(rawMeta(after)).toMatchObject({ backend: "file", epoch: 2 });
+    expect(meshSnapshotDigest(decodeFile(after))).toBe(imported);
+    const conflict = (failed as MeshCutoverFailedError).conflictFile!;
+    expect((decodeMeshStateFile(conflict, 64 * 1024 * 1024, false) as MeshStateFile).entries["rogue/key"]?.value).toBe(1);
+  });
+});
+
+describe("file-mode writer fence (assertFileStateWritable)", () => {
+  it("passes only where the reader rule reads state.json", async () => {
+    const root = tempRoot("writable");
+    await seedFileRoot(root);
+    expect(() => assertFileStateWritable(root)).not.toThrow(); // legacy root, no state.db
+    await importMeshState(root);
+    expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
+    expect(() => assertFileStateWritable(root)).toThrow(/backend=sqlite at epoch 1/);
+    const stop = new Error("stop after the flag");
+    await expect(rollbackMeshState(root, { assumeNoWriters: true, onStep: (step) => { if (step === "rollback-flag") throw stop; } })).rejects.toBe(stop);
+    expect(() => assertFileStateWritable(root)).toThrow(/backend=exporting at epoch 2/);
+    await rollbackMeshState(root);
+    expect(() => assertFileStateWritable(root)).not.toThrow();
+    setRawMeta(root, "epoch", 5); // backend=file at another epoch: fail closed
+    expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
   });
 });
 

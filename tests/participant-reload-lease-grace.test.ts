@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
@@ -91,6 +92,48 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
     const lease = readHostLeases(f.meshRoot).get(identity.id)!;
     expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
     expect(lease.session?.expiresAt ?? 0).toBeLessThanOrEqual(Date.now() + 30_000);
+  }, 60_000);
+
+  // smarty-dev#6729 re-soak of 61dc81be: hub Mains' host lease FILE was missing for 80-116 s.
+  // Under fleet lock load quiesce("reload")'s shared write timed out; the shutdown swallows that
+  // and closes, and close() then took the non-reload path and deleted the host lease and root.
+  it.each([false, true])("a reload whose quiesce write times out keeps the lease file and root (files-only policy: %s)", async (filesOnly) => {
+    const f = await fixture(filesOnly);
+    const old = f.release();
+    await old.start();
+    expect(f.seen()).toMatchObject({ stale: false });
+
+    // The shared mesh lock stays busy through the old release's teardown.
+    let lockBusy = true;
+    const writeBatch = MeshStore.prototype.writeBatch;
+    vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(function (this: MeshStore, ...args: Parameters<MeshStore["writeBatch"]>) {
+      if (lockBusy) return Promise.reject(new MeshLockTimeoutError("", 40, 1_000));
+      return writeBatch.apply(this, args);
+    });
+    const confirmWritable = MeshStore.prototype.confirmWritable;
+    vi.spyOn(MeshStore.prototype, "confirmWritable").mockImplementation(function (this: MeshStore, ...args: Parameters<MeshStore["confirmWritable"]>) {
+      if (lockBusy) return Promise.reject(new MeshLockTimeoutError("", 40, 1_000));
+      return confirmWritable.apply(this, args);
+    });
+    // FabricRuntimeState.shutdown("reload") swallows this and closes anyway.
+    const quiesceError = await old.quiesce("reload").then(() => undefined, (error: unknown) => error);
+    if (!filesOnly) expect(quiesceError).toBeInstanceOf(MeshLockTimeoutError);
+    await old.close();
+    lockBusy = false;
+
+    for (let elapsed = 0; elapsed <= 90_000; elapsed += 5_000) {
+      const lease = readHostLeases(f.meshRoot).get(identity.id);
+      expect(lease, `host lease file missing ${elapsed} ms into the reload`).toBeDefined();
+      expect(lease!.expiresAt, `host lease expired ${elapsed} ms into the reload`).toBeGreaterThan(Date.now());
+      expect(f.seen(), `lapsed ${elapsed} ms into the reload`).toMatchObject({ stale: false });
+      expect(f.listed(), `missing from the directory ${elapsed} ms into the reload`).toContain(identity.id);
+      if (elapsed < 90_000) f.advance(5_000);
+    }
+
+    const fresh = f.release();
+    await fresh.start();
+    expect(f.seen()).toMatchObject({ status: "idle", stale: false });
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
   }, 60_000);
 
   it.each([false, true])("a Main that dies mid-reload lapses once the bounded grace ends (files-only policy: %s)", async (filesOnly) => {

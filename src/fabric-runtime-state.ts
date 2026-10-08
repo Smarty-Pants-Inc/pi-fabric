@@ -707,6 +707,13 @@ export class FabricRuntimeState {
         live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
       },
       live: live.current,
+      // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
+      // ops topic instead of vanishing from the directory in silence. The UI ctx is retired too.
+      onLifecycleLost: ticks => {
+        void this.publishOpsEvent("ops.fabric.presence", "fabric.presence.degraded", {
+          participantId: mainAgentId, hostId, ticks, reason: "no live session ctx (session replaced or reloaded)",
+        }).catch(() => undefined);
+      },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),

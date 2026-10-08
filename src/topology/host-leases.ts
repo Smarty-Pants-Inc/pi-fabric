@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
@@ -77,6 +78,22 @@ export const waitForHostLeaseRenewal = async (
   }
 };
 
+export interface MeshWriterRecord {
+  pid: number;
+  host: string;
+  /** Build/release commit SHA; "unknown" deliberately fails the cutover census. */
+  releaseSha: string;
+  lockProtocol: number;
+  stateBackend: "file" | "shadow" | "sqlite" | string;
+  startedAt: number;
+}
+
+export const meshWriterLeaseRecord = (lockProtocol: number, stateBackend: string, startedAt = Math.floor(Date.now() - process.uptime() * 1000)): MeshWriterRecord => ({
+  pid: process.pid, host: os.hostname(),
+  releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+  lockProtocol, stateBackend, startedAt,
+});
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -87,6 +104,8 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
+  /** Writer census metadata, absent on leases from pre-census releases. */
+  writer?: MeshWriterRecord;
 }
 
 const fileName = (hostId: string): string =>
@@ -162,6 +181,7 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
+      ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };
   } catch {
     return undefined;
@@ -265,6 +285,38 @@ const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.BigI
     lease: parsed.lease,
   });
   return parsed.lease;
+};
+
+// Census writer metadata validation (smarty-dev#6477 L4a), shared by host leases, MeshStore
+// process records and the census. Here, in the eager host-lease module, so it adds no startup chunk.
+
+/** A positive safe-integer process id. */
+export const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
+/** A census writer must name its host; "" cannot be matched to a machine, so it is no evidence. */
+export const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+
+/** A census start time is a positive epoch-ms integer; 0 or a fraction is not a real incarnation. */
+export const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
+/** The mesh lock protocols this release understands. */
+export const validWriterLockProtocol = (value: unknown): value is 1 | 2 => value === 1 || value === 2;
+
+/** The keyed-state backends this release understands. */
+export const validWriterStateBackend = (value: unknown): value is "file" | "shadow" | "sqlite" =>
+  value === "file" || value === "shadow" || value === "sqlite";
+
+/** A build commit; "unknown" (no build SHA in the environment) deliberately fails the cutover census. */
+export const validWriterReleaseSha = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value !== "unknown";
+
+/** Invalid writer metadata is dropped from the lease, so census counts that writer unknown (fail closed). */
+const validWriter = (value: unknown): value is MeshWriterRecord => {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return validWriterPid(record.pid) && validWriterHost(record.host) && typeof record.releaseSha === "string" &&
+    validWriterLockProtocol(record.lockProtocol) && validWriterStateBackend(record.stateBackend) &&
+    validWriterStartedAt(record.startedAt);
 };
 
 const validSession = (value: unknown): value is NonNullable<FabricHostLease["session"]> => {

@@ -1,5 +1,8 @@
 import type { MeshLockProtocol } from "../config.js";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
@@ -19,6 +22,122 @@ export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateB
 //   state-file.ts  keyed state on state.json; state-backend.ts selects it, sqlite or shadow (L2a).
 //   event-log.ts   events, receipts, the live log, compaction and the archive.
 // Each domain keeps its own private fields; they share only the context (root, bounds, lock).
+
+// Census record validation (smarty-dev#6477 L4a). host-leases.ts holds the same predicates for
+// leases and the census; they are repeated here on purpose, because either module importing the
+// other's values splits a new chunk into the startup graph (assert:build-artifacts budget).
+const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
+/**
+ * Filesystem-safe host identity for census file names: the sanitized hostname (bounded) plus a
+ * hash of the exact hostname, so hosts that sanitize or case-fold alike still get distinct names.
+ */
+export const censusHostSlug = (host: string): string =>
+  `${host.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "_"}-${createHash("sha256").update(host).digest("hex").slice(0, 12)}`;
+
+/** `<hostSlug>-<pid>-<startedAt>.json`: unique per host incarnation, so hosts never share a record. */
+export const censusRecordFileName = (host: string, pid: number, startedAt: number): string =>
+  `${censusHostSlug(host)}-${pid}-${startedAt}.json`;
+
+/** This process's census start time (epoch ms), fixed at module load. */
+export const meshProcessStartedAt = Math.floor(Date.now() - process.uptime() * 1000);
+
+let bootTimeMs: number | undefined;
+/** Linux only: the pid's start time in epoch ms from /proc (USER_HZ is 100); else undefined. */
+const procStartedAt = (pid: number): number | undefined => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
+    bootTimeMs ??= Number(/^btime\s+(\d+)\s*$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]) * 1000;
+    return Number.isFinite(ticks) && Number.isFinite(bootTimeMs) ? bootTimeMs + ticks * 10 : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * Same-host census liveness (smarty-dev#6477 L4a): the pid is alive and, where /proc tells, is the
+ * same incarnation (start within 2 s of the record). A record without startedAt cannot be refuted
+ * and stays live (fail closed). Meaningless for another host's pid.
+ */
+export const censusRecordAlive = (pid: number, startedAt: unknown): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
+  const started = procStartedAt(pid);
+  return started === undefined || typeof startedAt !== "number" || Math.abs(started - startedAt) <= 2000;
+};
+
+/**
+ * The only census record that may be deleted: a format-1 record of exactly this host (host ===
+ * os.hostname(), byte for byte) with a valid pid and positive start time whose process is gone
+ * or whose pid now belongs to another incarnation. Another host, a missing or empty host, or an
+ * invalid start time proves nothing here, so such a record is retained (fail closed).
+ */
+export const censusRecordPrunable = (value: unknown, host = os.hostname()): boolean => {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return record.format === 1 && validWriterPid(record.pid) && validWriterHost(record.host) && record.host === host &&
+    validWriterStartedAt(record.startedAt) && !censusRecordAlive(record.pid, record.startedAt);
+};
+
+/** Best effort: removes this host's census records whose process is gone; never throws. */
+export const pruneDeadCensusRecords = (root: string): void => {
+  const directory = path.join(root, ".writer-census");
+  let names: string[];
+  try { names = fs.readdirSync(directory); } catch { return; }
+  const host = os.hostname();
+  const prefix = `${censusHostSlug(host)}-`;
+  for (const name of names) {
+    // This host's records are <hostSlug>-<pid>-<startedAt>.json: another host's are never opened,
+    // and only a name that already looks dead is.
+    if (!name.startsWith(prefix)) continue;
+    const match = /^(\d+)-(\d+)\.json$/.exec(name.slice(prefix.length));
+    if (!match || censusRecordAlive(Number(match[1]), Number(match[2]))) continue;
+    const file = path.join(directory, name);
+    try {
+      if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
+    } catch { /* unreadable or already gone: left to the next prune */ }
+  }
+};
+
+const prunedCensusRoots = new Set<string>();
+const ownCensusRecords = new Set<string>();
+const removeOwnCensusRecords = (): void => {
+  for (const file of ownCensusRecords) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+};
+
+const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): void => {
+  const directory = path.join(root, ".writer-census");
+  if (!prunedCensusRoots.has(directory)) {
+    prunedCensusRoots.add(directory);
+    pruneDeadCensusRecords(root);
+  }
+  // Host-scoped: two hosts' writers with the same pid and start time never share a file, so neither
+  // skips its record nor removes the other's on exit. Only an earlier store in this process matches.
+  const host = os.hostname();
+  const file = path.join(directory, censusRecordFileName(host, process.pid, meshProcessStartedAt));
+  try {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (fs.existsSync(file)) return;
+    const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
+    const writer = { format: 1, pid: process.pid, host,
+      releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+      lockProtocol, stateBackend, startedAt: meshProcessStartedAt };
+    fs.writeFileSync(temporary, JSON.stringify(writer), { flag: "w", mode: 0o600 });
+    try { fs.renameSync(temporary, file); }
+    catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+    if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
+    ownCensusRecords.add(file);
+  } catch {
+    // ponytail: a read-only or full disk must not fail MeshStore construction, so this process
+    // writes no census record and no new mechanism records the failure. While it queues for or
+    // holds the mesh lock its ticket/owner has no census metadata, so census() lists it unknown
+    // (clean:false). Otherwise only its host lease shows it: a sqlite writer between custody
+    // operations takes no .lock, and without a lease the census cannot see it.
+  }
+};
 
 export interface MeshStoreOptions {
   /** Captured at construction, never reloaded. Defaults to B68-compatible protocol 1. */
@@ -67,6 +186,7 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
   }
 
   get lockProtocol(): MeshLockProtocol {

@@ -91,6 +91,7 @@
     "smoke:package-install": "node scripts/smoke-package-install.mjs",
     "benchmark:lock-stats": "bun run build && node scripts/benchmark-lock-stats.mjs",
     "bench:mesh-lock": "bun run build && node scripts/benchmark-mesh-lock.mjs",
+    "bench:mesh-lock:check": "node scripts/benchmark-mesh-lock.mjs --baseline bench/mesh-lock-baseline.json --max-regress 10",
     "load:mesh": "bun scripts/mesh-load.ts"
   },
   "keywords": [

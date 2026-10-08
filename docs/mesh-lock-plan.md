@@ -87,6 +87,29 @@ E2 trigger (owner fabric-v2): event-path holds on `.lock` (publish, archive barr
 
 Commswatch reads the L8 metrics of each lock (`.lock`, `custody.lock`, SQLite write lock) on each cut-over host (Ryzen 1, ryzen3, ryzen4, ryzen5) in 10-minute windows. Full load on host H: live Pi processes and mesh writes per minute on H are both at or above H's own p95 of the 7 days before its cutover. Where natural load falls short, `mesh-load` (L9a) adds Pi workers with keyed publishes, presence heartbeats and registry writes until H reaches that level. A window counts only at full load. We accept when each host has 144 counted windows (576 in total) and each one shows: busy (holder-timed holds / 600 s) below 30% for each lock; 0 `FABRIC_MESH_LOCK_TIMEOUT`; 0 `SQLITE_BUSY` failures; 0 actor preparation timeouts. A window below full load neither counts nor fails; that host's run extends. A failed window restarts that host's 144 windows after the fix.
 
+### mesh-load hub profile
+
+Measured on ryzen5 on 2026-10-08 (load average about 50 on 32 CPUs, from other lanes). Each run used a scratch mesh under `/srv/scratch/paul/tmp-fs-hold`, seeded to 4.8 MB (`--seed-state-mb 4.8`, the shadow soak's hub-sized state), with `nice -n 10 taskset -c 4-11`, `--max-in-flight 1` (the default) and about 200-290 s per run. Lock figures come from L8 `lock-stats` over complete minutes, excluding the first. Wait p99 is a histogram bucket upper bound. Generator CPU is (user + sys) / wall from `/usr/bin/time`, covering the controller and every worker.
+
+The fleet hub runs at 55-65% busy with 25-40 timeouts/min. On a fresh mesh, holds last about 0.6 ms and handoff stops at about 150 acquisitions/s, so busy topped out near 23% with heavy timeouts. A keyed put rewrites the whole state under the lock, about 5 ms per MB, so a seeded state lengthens each hold. Puts alone stall near 40%, though. Every commit invalidates the snapshots the other writers prepared, so the lock sits idle while they parse the state again. Custody ops (`--custody-share`) read and parse the state under the lock without writing, and they fill that gap.
+
+| setting | writes/min achieved | lock acq/min | hold mean | busy % (per minute) | wait p99 | timeouts/min | generator CPU |
+|---|---|---|---|---|---|---|---|
+| put 0.5, target 2400, 8 procs (→11) | 595 | 1052 | 20.9 ms (put 27.7) | 36.7 (37.5/35.8) | ≤1 s | 1.5 | 1.65 |
+| put 0.5, target 2400, 18 procs (→21) | 410 | 1006 | 23.7 ms | 39.6 (36.8/42.5) | ≤1 s | 42.5 | 1.98 |
+| put 0.4, custody 0.4, target 480, 10 procs (→14) | 322 | 578 | 47.7 ms (custody 100) | 46.0 (46.3/44.5/47.1) | ≤2.5 s | 1.7 | 0.79 |
+| put 0.4, custody 0.4, target 2400, 10 procs (→13) | 483 | 1044 | 35.3 ms (custody 95) | 61.4 (1 full minute) | ≤2.5 s | 17 | 1.45 |
+| **hub profile**: put 0.4, custody 0.4, target 2400, 12 procs fixed | 373 | 904 | 40.4 ms (custody 126, put 25.7) | **60.9 (64.1/57.7)** | ≤1 s | 19.5 | 1.15 |
+
+Hub profile, about 60% busy at about 20 timeouts/min. Add processes or raise `--custody-share` to push the timeouts toward the hub's 25-40/min:
+
+```sh
+nice -n 10 taskset -c 4-11 bun scripts/mesh-load.ts --root <scratch-mesh> --seed-state-mb 4.8 \
+  --put-share 0.4 --custody-share 0.4 --target-writes-per-min 2400 --target-processes 12 --max-workers 12 --duration 600
+```
+
+The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy, instead of queueing them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
+
 ## 5. Rollback
 
 | Stage | Rollback |

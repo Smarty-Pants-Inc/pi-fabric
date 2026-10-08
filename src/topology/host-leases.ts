@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
@@ -77,6 +78,22 @@ export const waitForHostLeaseRenewal = async (
   }
 };
 
+export interface MeshWriterRecord {
+  pid: number;
+  host: string;
+  /** Build/release commit SHA; the advisory census reports "unknown" as an unknown writer. */
+  releaseSha: string;
+  lockProtocol: number;
+  stateBackend: "file" | "shadow" | "sqlite" | string;
+  startedAt: number;
+}
+
+export const meshWriterLeaseRecord = (lockProtocol: number, stateBackend: string, startedAt = Math.floor(Date.now() - process.uptime() * 1000)): MeshWriterRecord => ({
+  pid: process.pid, host: os.hostname(),
+  releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+  lockProtocol, stateBackend, startedAt,
+});
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -87,6 +104,8 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
+  /** Writer census metadata, absent on leases from pre-census releases. */
+  writer?: MeshWriterRecord;
 }
 
 const fileName = (hostId: string): string =>
@@ -134,12 +153,12 @@ export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (leas
 
 // A file that could not be read gives no answer to cache (`read: false`): the next lookup reads it
 // again. Only a file that was read, valid or not, is cached by its filesystem identity.
-const parseLease = (file: string, name: string): { read: boolean; lease?: FabricHostLease | undefined } => {
+const parseLease = (file: string, name: string): { read: boolean; lease?: FabricHostLease | undefined; code?: string } => {
   let text: string;
   try {
     text = readFileRetrying(file);
-  } catch {
-    return { read: false };
+  } catch (error) {
+    return { read: false, code: (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN" };
   }
   return { read: true, lease: leaseOf(text, name) };
 };
@@ -162,6 +181,7 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
+      ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };
   } catch {
     return undefined;
@@ -172,12 +192,22 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
 const cache = new Map<string, LeaseSlots>();
 
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
-export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> => {
+/**
+ * `problems`, when given, collects every lease file or directory that exists but could not be
+ * read, or a lease file that is not a valid lease, as "path: errno|invalid" (the advisory writer census
+ * reports them as unknown, smarty-dev#6477). A file or directory that is absent (ENOENT) is no problem.
+ */
+export const readHostLeases = (meshRoot: string, problems?: string[]): Map<string, FabricHostLease> => {
   const dir = path.join(meshRoot, LEASE_DIR);
+  const failed = (file: string, error: unknown): void => {
+    const code = (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
+    if (code !== "ENOENT") problems?.push(`${file}: ${code}`);
+  };
   let names: string[];
   try {
     names = fs.readdirSync(dir);
-  } catch {
+  } catch (error) {
+    failed(dir, error);
     return new Map();
   }
   const known = cache.get(dir) ?? new Map();
@@ -190,10 +220,11 @@ export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> =
     let stat: fs.BigIntStats;
     try {
       stat = fs.statSync(path.join(dir, name), { bigint: true });
-    } catch {
+    } catch (error) {
+      failed(path.join(dir, name), error);
       continue;
     }
-    const lease = cachedLease(known, dir, name, stat);
+    const lease = cachedLease(known, dir, name, stat, problems);
     if (lease) leases.set(lease.id, lease);
   }
   for (const name of known.keys()) if (!present.has(name)) known.delete(name);
@@ -250,21 +281,59 @@ type LeaseSlots = Map<string, Pick<fs.BigIntStats, "dev" | "ino" | "size" | "mti
   lease: FabricHostLease | undefined;
 }>;
 
-const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.BigIntStats): FabricHostLease | undefined => {
+const cachedLease = (
+  known: LeaseSlots, dir: string, name: string, stat: fs.BigIntStats, problems?: string[],
+): FabricHostLease | undefined => {
   const slot = known.get(name);
+  const invalid = (): undefined => { problems?.push(`${path.join(dir, name)}: invalid`); return undefined; };
   // Atomic replacement can preserve size and timestamps. Keep the exact file identity:
   // NTFS IDs can exceed Number.MAX_SAFE_INTEGER, so distinct replacements can have the
   // same numeric ino. Nanosecond timestamps also avoid rounding away a change when a
   // filesystem lacks useful dev/ino values.
   if (slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
-    slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs) return slot.lease;
+    slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs) return slot.lease ?? invalid();
   const parsed = parseLease(path.join(dir, name), name);
-  if (!parsed.read) return slot?.lease;                     // unreadable for now: keep the last answer
+  if (!parsed.read) {                                       // unreadable for now: keep the last answer
+    if (parsed.code !== "ENOENT") problems?.push(`${path.join(dir, name)}: ${parsed.code}`);
+    return slot?.lease;
+  }
   known.set(name, {
     dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs,
     lease: parsed.lease,
   });
-  return parsed.lease;
+  return parsed.lease ?? invalid();
+};
+
+// Census writer metadata validation (smarty-dev#6477 L4a), shared by host leases, MeshStore
+// process records and the census. Here, in the eager host-lease module, so it adds no startup chunk.
+
+/** A positive safe-integer process id. */
+export const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
+/** A census writer must name its host; "" cannot be matched to a machine, so it is no evidence. */
+export const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+
+/** A census start time is a positive epoch-ms integer; 0 or a fraction is not a real incarnation. */
+export const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
+/** The mesh lock protocols this release understands. */
+export const validWriterLockProtocol = (value: unknown): value is 1 | 2 => value === 1 || value === 2;
+
+/** The keyed-state backends this release understands. */
+export const validWriterStateBackend = (value: unknown): value is "file" | "shadow" | "sqlite" =>
+  value === "file" || value === "shadow" || value === "sqlite";
+
+/** A build commit; "unknown" (no build SHA in the environment) is reported unknown by the census. */
+export const validWriterReleaseSha = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value !== "unknown";
+
+/** Invalid writer metadata is dropped from the lease, so the census reports that writer unknown. */
+const validWriter = (value: unknown): value is MeshWriterRecord => {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return validWriterPid(record.pid) && validWriterHost(record.host) && typeof record.releaseSha === "string" &&
+    validWriterLockProtocol(record.lockProtocol) && validWriterStateBackend(record.stateBackend) &&
+    validWriterStartedAt(record.startedAt);
 };
 
 const validSession = (value: unknown): value is NonNullable<FabricHostLease["session"]> => {

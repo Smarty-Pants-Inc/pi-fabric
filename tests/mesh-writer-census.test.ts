@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { census } from "../src/mesh/writer-census.js";
-import { MeshStore } from "../src/mesh/store.js";
+import { MeshStore, censusRecordFileName, meshProcessStartedAt, pruneDeadCensusRecords } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 
@@ -13,7 +13,9 @@ const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
 const writeRecord = (mesh: string, record: Record<string, unknown>): string => {
   const directory = path.join(mesh, ".writer-census");
   fs.mkdirSync(directory, { recursive: true });
-  const file = path.join(directory, `${String(record.pid)}-${String(record.startedAt)}.json`);
+  const file = path.join(directory, typeof record.host === "string" && Number.isSafeInteger(record.startedAt)
+    ? censusRecordFileName(record.host, Number(record.pid), Number(record.startedAt))
+    : `${String(record.pid)}-${String(record.startedAt)}-${String(record.lockProtocol ?? "")}${String(record.stateBackend ?? "")}.json`);
   fs.writeFileSync(file, JSON.stringify({ format: 1, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite", ...record }));
   return file;
 };
@@ -29,6 +31,33 @@ const { MeshStore } = await jiti.import("./src/mesh/store.ts");
 new MeshStore(root, 4096, 100, { stateBackend: "file" });
 process.stdout.write(JSON.stringify(fs.readdirSync(path.join(root, ".writer-census"))) + "\\n");
 `;
+
+// Another host's writer with this child's pid and start time is already recorded in the shared mesh.
+const COLLIDING_CHILD = `
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+const [root, other] = process.argv.slice(1);
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { MeshStore, meshProcessStartedAt, censusRecordFileName } = await jiti.import("./src/mesh/store.ts");
+const directory = path.join(root, ".writer-census");
+fs.mkdirSync(directory, { recursive: true });
+fs.writeFileSync(path.join(directory, censusRecordFileName(other, process.pid, meshProcessStartedAt)), JSON.stringify({ format: 1,
+  pid: process.pid, host: other, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite", startedAt: meshProcessStartedAt }));
+new MeshStore(root, 4096, 100, { stateBackend: "file" });
+process.stdout.write(JSON.stringify({ pid: process.pid, startedAt: meshProcessStartedAt, names: fs.readdirSync(directory).sort() }) + "\\n");
+`;
+
+const runChild = async (script: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string; pid: number }> => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, ...args],
+    { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+  return { code, stdout, stderr, pid: child.pid! };
+};
 
 const roots: string[] = [];
 const root = (): string => {
@@ -120,16 +149,139 @@ describe("mesh writer census", () => {
 
   it("removes its own record when the process exits", async () => {
     const mesh = root();
-    const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD, mesh],
-      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", chunk => { stdout += chunk; });
-    child.stderr.on("data", chunk => { stderr += chunk; });
-    const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    const { code, stdout, stderr, pid } = await runChild(CHILD, [mesh]);
     expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
-    expect(JSON.parse(stdout)).toEqual([expect.stringMatching(new RegExp(`^${child.pid}-\\d+\\.json$`))]);
+    const prefix = censusRecordFileName(os.hostname(), pid, 0).replace(/0\.json$/, "");
+    expect(JSON.parse(stdout)).toEqual([expect.stringMatching(/^.+-\d+-\d+\.json$/)]);
+    expect(JSON.parse(stdout)[0].startsWith(prefix)).toBe(true);
     expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]);
   }, 30_000);
+
+  it("keeps two hosts' writers with the same pid and start time apart; each exit removes only its own", async () => {
+    const mesh = root();
+    const other = "other-host.example";
+    const { code, stdout, stderr, pid } = await runChild(COLLIDING_CHILD, [mesh, other]);
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+    const reported = JSON.parse(stdout) as { pid: number; startedAt: number; names: string[] };
+    const mine = censusRecordFileName(os.hostname(), pid, reported.startedAt);
+    const theirs = censusRecordFileName(other, pid, reported.startedAt);
+    expect(mine).not.toBe(theirs);
+    // The later writer still records itself (no shared file to skip on) ...
+    expect(reported.names).toEqual([mine, theirs].sort());
+    // ... and its exit removes only its own record, never the other host's.
+    expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([theirs]);
+  }, 30_000);
+
+  it("prunes only this host's record files, even when another host's looks dead here", async () => {
+    const mesh = root();
+    const startedAt = meshProcessStartedAt - 3_600_000;
+    // Same pid as this live process with a mismatching start time, but another host's: kept.
+    const theirs = writeRecord(mesh, { pid: process.pid, host: "other-host.example", startedAt });
+    const dead = deadPid();
+    // A name in this host's namespace whose content names another host: kept.
+    const directory = path.join(mesh, ".writer-census");
+    const mislabelled = path.join(directory, censusRecordFileName(os.hostname(), dead, startedAt));
+    fs.writeFileSync(mislabelled, JSON.stringify({ format: 1, pid: dead, host: "other-host.example", releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "sqlite", startedAt }));
+    const mineDead = writeRecord(mesh, { pid: deadPid(), host: os.hostname(), startedAt });
+    pruneDeadCensusRecords(mesh);
+    expect(fs.existsSync(theirs)).toBe(true);
+    expect(fs.existsSync(mislabelled)).toBe(true);
+    expect(fs.existsSync(mineDead)).toBe(false);
+  });
+
+  it.each([
+    { label: "start time 0", startedAt: 0 },
+    { label: "a negative start time", startedAt: -5 },
+    { label: "a fractional start time", startedAt: 1.5 },
+    { label: "a string start time", startedAt: "yesterday" },
+    { label: "no start time", startedAt: undefined },
+  ])("retains this host's live-pid record with $label and counts it unknown", async ({ startedAt }) => {
+    const mesh = root();
+    const directory = path.join(mesh, ".writer-census");
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, `invalid-start-${process.pid}.json`);
+    fs.writeFileSync(file, JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "sqlite", ...(startedAt === undefined ? {} : { startedAt }) }));
+    pruneDeadCensusRecords(mesh);
+    const result = await census(mesh);
+    expect(fs.existsSync(file)).toBe(true);
+    expect(result.clean).toBe(false);
+    const record = result.unknown.find(writer => writer.source === "process-record");
+    expect(record).toEqual(expect.objectContaining({ pid: process.pid, host: os.hostname(), name: path.basename(file) }));
+    expect(record).not.toHaveProperty("startedAt");
+  });
+
+  it.each([
+    { label: "no host", host: undefined },
+    { label: "an empty host", host: "" },
+    { label: "a numeric host", host: 7 },
+  ])("retains a dead pid's record with $label and counts it unknown", async ({ host }) => {
+    const mesh = root();
+    const pid = deadPid();
+    const directory = path.join(mesh, ".writer-census");
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, `hostless-${pid}.json`);
+    fs.writeFileSync(file, JSON.stringify({ format: 1, pid, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite",
+      startedAt: Date.now() - 1000, ...(host === undefined ? {} : { host }) }));
+    const queue = meshLockQueueDirectory(mesh);
+    fs.mkdirSync(queue, { recursive: true });
+    const ticket = `${"4".repeat(24)}-${pid}-01234567-89ab-cdef-0123-456789abcdef`;
+    fs.writeFileSync(path.join(queue, ticket), "");
+    const result = await census(mesh);
+    expect(fs.existsSync(file)).toBe(true);
+    expect(result.clean).toBe(false);
+    const record = result.unknown.find(writer => writer.source === "process-record");
+    expect(record).toEqual(expect.objectContaining({ pid, name: path.basename(file) }));
+    expect(record).not.toHaveProperty("host");
+    // Its lock ticket is not dismissed as this host's dead pid either.
+    expect(record?.evidence).toContain(`lock-ticket:${ticket}`);
+  });
+
+  it.each([
+    { label: "lock protocol 3", fields: { lockProtocol: 3 }, absent: "lockProtocol" },
+    { label: "lock protocol 0", fields: { lockProtocol: 0 }, absent: "lockProtocol" },
+    { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
+    { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
+    { label: "an empty backend", fields: { stateBackend: "" }, absent: "stateBackend" },
+    { label: "an unknown release", fields: { releaseSha: "unknown" }, absent: undefined },
+    { label: "an empty release", fields: { releaseSha: "" }, absent: "releaseSha" },
+  ])("counts a live writer with $label unknown", async ({ fields, absent }) => {
+    const mesh = root();
+    const file = writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), ...fields });
+    const result = await census(mesh);
+    expect(fs.existsSync(file)).toBe(true);
+    expect(result.clean).toBe(false);
+    const record = result.unknown.find(writer => writer.source === "process-record");
+    expect(record).toEqual(expect.objectContaining({ pid: process.pid, host: os.hostname() }));
+    if (absent) expect(record).not.toHaveProperty(absent);
+  });
+
+  it.each([
+    { label: "lock protocol 3", fields: { lockProtocol: 3 } },
+    { label: "an unsupported backend", fields: { stateBackend: "redis" } },
+  ])("drops lease writer metadata with $label", async ({ fields }) => {
+    const mesh = root();
+    const now = Date.now();
+    writeHostLease(mesh, { id: "host:unsupported", rootId: "session:u", identityId: "identity:u", updatedAt: now,
+      expiresAt: now + 60_000, writer: { pid: process.pid, host: "lease-host", releaseSha: "abc123", lockProtocol: 2,
+        stateBackend: "sqlite", startedAt: now - 1000, ...fields } as never });
+    expect(readHostLeases(mesh).get("host:unsupported")?.writer).toBeUndefined();
+    const result = await census(mesh);
+    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:unsupported" });
+  });
+
+  it("counts an unparsable or pid-less record unknown and keeps it", async () => {
+    const mesh = root();
+    const directory = path.join(mesh, ".writer-census");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "torn.json"), "{");
+    fs.writeFileSync(path.join(directory, "pidless.json"), JSON.stringify({ format: 1, host: os.hostname(), startedAt: ownStartedAt() }));
+    const result = await census(mesh);
+    expect(result.unknown).toEqual(expect.arrayContaining([{ source: "process-record", name: "torn.json" },
+      { source: "process-record", name: "pidless.json" }]));
+    expect(fs.readdirSync(directory).sort()).toEqual(["pidless.json", "torn.json"]);
+  });
 
   it.runIf(process.platform === "linux")("treats a live pid with another start time as a reused, dead record", async () => {
     const mesh = root();

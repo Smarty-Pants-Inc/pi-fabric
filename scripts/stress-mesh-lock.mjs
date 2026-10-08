@@ -100,7 +100,12 @@ if (args.worker === 'load') {
     if (!/^(?:0|off|false|no)$/i.test(process.env.PI_FABRIC_LOCK_STATS ?? '') && (lockStats.files !== current.length ||
       lockStats.acquisitions !== current.reduce((sum, r) => sum + r.waits.length, 0) ||
       lockStats.timeouts !== current.reduce((sum, r) => sum + r.timeouts, 0))) throw new Error(`Lock stats disagree: ${JSON.stringify(lockStats)}`);
-    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock')) || fs.readdirSync(root).some(name => name !== 'lock-stats')) throw new Error('Leaked lock/tickets or mesh-root sidecars');
+    // .writer-census/ is the writer census (smarty-dev#6477 L4a): each contender removes its own
+    // record on exit, so once all have exited it must be empty.
+    const censusDir = path.join(root, '.writer-census');
+    const leakedCensus = fs.existsSync(censusDir) ? fs.readdirSync(censusDir) : [];
+    if (leakedCensus.length) throw new Error(`Leaked writer census records ${leakedCensus.join(', ')}`);
+    if (remainingTickets !== 0 || fs.existsSync(path.join(root, '.lock')) || fs.readdirSync(root).some(name => name !== 'lock-stats' && name !== '.writer-census')) throw new Error('Leaked lock/tickets or mesh-root sidecars');
     console.log(JSON.stringify({ n, rounds, load, cpuMs, legacyN, budgetMs: 7000, acquisitions: reports.reduce((sum, r) => sum + r.waits.length, 0), timeouts: reports.reduce((sum, r) => sum + r.timeouts, 0), waitMs: summarize(reports.flatMap(r => r.waits)), timeoutWaitMs: summarize(reports.flatMap(r => r.timeoutWaits)), holdMs: summarize(reports.flatMap(r => r.holds)), elapsedMs: Math.round(performance.now() - started), mutualExclusion: true, remainingTickets, lockStats }, null, 2));
   } finally {
     clearTimeout(timer);

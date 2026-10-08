@@ -257,19 +257,36 @@ const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.BigI
   return parsed.lease;
 };
 
+// Census writer metadata validation (smarty-dev#6477 L4a), shared by host leases, MeshStore
+// process records and the census. Here, in the eager host-lease module, so it adds no startup chunk.
+
+/** A positive safe-integer process id. */
+export const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+
 /** A census writer must name its host; "" cannot be matched to a machine, so it is no evidence. */
 export const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 
 /** A census start time is a positive epoch-ms integer; 0 or a fraction is not a real incarnation. */
 export const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 
+/** The mesh lock protocols this release understands. */
+export const validWriterLockProtocol = (value: unknown): value is 1 | 2 => value === 1 || value === 2;
+
+/** The keyed-state backends this release understands. */
+export const validWriterStateBackend = (value: unknown): value is "file" | "shadow" | "sqlite" =>
+  value === "file" || value === "shadow" || value === "sqlite";
+
+/** A build commit; "unknown" (no build SHA in the environment) deliberately fails the cutover census. */
+export const validWriterReleaseSha = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value !== "unknown";
+
 /** Invalid writer metadata is dropped from the lease, so census counts that writer unknown (fail closed). */
 const validWriter = (value: unknown): value is MeshWriterRecord => {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
-  return Number.isSafeInteger(record.pid) && (record.pid as number) > 0 && validWriterHost(record.host) &&
-    typeof record.releaseSha === "string" && (record.lockProtocol === 1 || record.lockProtocol === 2) &&
-    ["file", "shadow", "sqlite"].includes(String(record.stateBackend)) && validWriterStartedAt(record.startedAt);
+  return validWriterPid(record.pid) && validWriterHost(record.host) && typeof record.releaseSha === "string" &&
+    validWriterLockProtocol(record.lockProtocol) && validWriterStateBackend(record.stateBackend) &&
+    validWriterStartedAt(record.startedAt);
 };
 
 const validSession = (value: unknown): value is NonNullable<FabricHostLease["session"]> => {

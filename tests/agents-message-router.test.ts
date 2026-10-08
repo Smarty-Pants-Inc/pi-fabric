@@ -122,6 +122,9 @@ describe("directory availability for live Mains (#2386)", () => {
       expect(f.directory.get(f.target.id)?.kind).toBe("root");
     }
     const timeout = Object.assign(new Error("Timed out waiting for the Fabric mesh lock (injected)"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    // smarty-dev#6477 L6: a peer commit since the last receipt confirms an idle heartbeat without
+    // the lock. Absorb the fixture's commits so the injected lock timeout below is reached.
+    await f.directory.refresh();
     const heartbeat = vi.spyOn(f.mesh, "confirmWritable").mockRejectedValueOnce(timeout);
     await expect(f.directory.refresh()).rejects.toBe(timeout);
     heartbeat.mockRestore();

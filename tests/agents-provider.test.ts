@@ -4581,6 +4581,20 @@ describe("AgentsProvider shared actor definitions", () => {
       "identity:resident",
       { routedRemoteHost: null, idempotencyKey: expect.any(String) },
     );
+
+    // smarty-dev#6729: the outcome-unknown error names an idempotencyKey retry; tell must accept it.
+    const tell = await provider.describe("tell", context);
+    const tellProperties = (tell?.inputSchema as { properties: Record<string, unknown>; additionalProperties: boolean }).properties;
+    expect(tellProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 200 });
+    await provider.invoke("tell", { id: participant.id, message: "queue", idempotencyKey: "tell-retry" }, context);
+    expect(request).toHaveBeenLastCalledWith(
+      "host:resident",
+      participant.id,
+      "followUp",
+      expect.objectContaining({ message: "queue" }),
+      "identity:resident",
+      { routedRemoteHost: null, idempotencyKey: "tell-retry" },
+    );
   });
 
   it("executes one shared actor with each caller's session binding", async () => {

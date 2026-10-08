@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import fs from "node:fs";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { readLockStats, summarizeLockStats } from "../src/mesh/commit-stats.js";
 
@@ -25,12 +26,60 @@ const workerKeys = (id: string): { presenceKey: string; actorKey: string } => ({
   presenceKey: `topology/participants/${hash(workerName(id))}`,
   actorKey: `actors/${workerName(id)}/actor`,
 });
+/**
+ * Each process flushes L8 lock stats 0.5-2.5 s after a wall-clock minute; reading "the last complete minute"
+ * right at the boundary saw almost nothing, so the busy shed never fired. Read as of 5 s ago instead.
+ */
+const STATS_SETTLE_MS = 5_000;
+/** A worker's keyed puts rotate over this many keys, so state does not grow with the run. */
+const PUT_KEYS = 8;
+const putKey = (id: string, seq: number): string => `fleet/work/${workerName(id)}/k${seq % PUT_KEYS}`;
+const pad = (value: number, width: number): string => String(value).padStart(width, "0");
+/** Hub-shaped bulk (an actor registry), the same record shape as benchmark-mesh-lock's --state-mb seed. */
+const SEED_PREFIX = "fleet/actors/load-seed-a";
+const seedValue = (i: number) => ({ id: `a${pad(i, 6)}`, kind: "actor", status: i % 3 ? "idle" : "done", host: `h${pad(i % 32, 2)}`,
+  model: "load-seed-model", summary: "s".repeat(820) });
+/**
+ * Grow state.json to at least `mb` decimal MB with seed records. Idempotent: a root already at that size is
+ * left as is, and seed keys are not run keys, so they stay for later runs like a hub's standing state.
+ */
+const seedState = async (root: string, mb: number): Promise<{ stateBytes: number; seeded: number }> => {
+  const store = new MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 120_000 });
+  // The seeder identity must not carry the run namespace: seed entries are not synthetic run keys.
+  const identity: MeshIdentity = { id: "load-seeder", name: "load-seeder", kind: "agent" };
+  const statePath = path.join(root, "state.json");
+  const sizeOf = () => { try { return fs.statSync(statePath).size; } catch { return 0; } };
+  const target = mb * 1e6;
+  let next = store.listAll().filter(entry => entry.key.startsWith(SEED_PREFIX)).length;
+  let seeded = 0;
+  for (let size = sizeOf(); size < target; size = sizeOf()) {
+    const count = Math.max(1, Math.min(1000, Math.ceil((target - size) / 1000)));
+    await store.writeBatch({ identity, ops: Array.from({ length: count }, () => {
+      const i = next++;
+      return { kind: "put" as const, key: `${SEED_PREFIX}${pad(i, 6)}`, value: seedValue(i) };
+    }) });
+    seeded += count;
+  }
+  return { stateBytes: sizeOf(), seeded };
+};
 const USAGE = `Usage: bun scripts/mesh-load.ts --root <dir> --target-writes-per-min <n> --target-processes <n> [options]
   --root <dir>                 mesh root (required; never inferred)
   --target-writes-per-min <n>  mesh writes/min to sustain; at least ${HEARTBEAT_WRITES_PER_MIN} x --target-processes,
                                because each worker heartbeats every 5 s (${HEARTBEAT_WRITES_PER_MIN} writes/min)
   --target-processes <n>       minimum worker processes (positive integer)
   --max-workers <n>            worker cap (default 64)
+  --seed-state-mb <n>          before the run, grow the root's state.json to n decimal MB (0-30, default 0) with
+                               hub-shaped actor records (kept after the run). A keyed put rewrites the whole state
+                               under the lock, so this sets the hold: about 5 ms per MB on ryzen5
+  --put-share <f>              fraction (0-1, default 0) of the paced writes that are keyed puts (writeBatch,
+                               state-size hold) instead of publishes (event append, about 0.5 ms hold)
+  --custody-share <f>          fraction (0-1, default 0; with --put-share at most 1) of the paced writes that are
+                               custody ops: read and parse state.json under the mesh lock, as registry and inbox
+                               custody does, without writing. The hold scales with the state size, and unlike a
+                               put it does not invalidate the other writers' prepared snapshots
+  --max-in-flight <n>          writes in flight per worker (default 1); a paced write due while the worker is
+                               at the cap is skipped and counted, never queued
+  --control-interval <s>       controller period in seconds (default 30)
   --duration <seconds>         stop after this many seconds; 0 (default) is explicit unbounded mode,
                                running until "stop" on stdin, SIGINT or SIGTERM
   --profile <name>             publish profile tag (default fleet)
@@ -38,6 +87,10 @@ const USAGE = `Usage: bun scripts/mesh-load.ts --root <dir> --target-writes-per-
   --allow-epyc1                allow running on epyc1
 Each run takes a random 8-hex run id; worker identities and keys are mesh-load-<run>-<n>,
 and a run deletes only its own keys. Stop a run on any platform by writing "stop" to its stdin.
+The controller starts --target-processes workers, adds one only when the last full control window fell
+below 90% of the target, sheds one above 110% or when lock busy exceeds 65%, and ignores the window
+right after each resize (worker start-up).
+Hub profile (ryzen5 scratch mesh, about 60% lock busy): see docs/mesh-lock-plan.md, "mesh-load hub profile".
 `;
 const usageError = (message: string): never => {
   process.stderr.write(`mesh-load: ${message}\n${USAGE}`);
@@ -48,26 +101,50 @@ if (args.has("--worker")) {
   const root = String(args.get("--root"));
   const id = String(args.get("--id"));
   const rate = Math.max(0, number("--rate", 1));
+  const putShare = Math.min(1, Math.max(0, number("--put-share", 0)));
+  const custodyShare = Math.min(1 - putShare, Math.max(0, number("--custody-share", 0)));
+  const statePath = path.join(root, "state.json");
+  const maxInFlight = Math.max(1, Math.floor(number("--max-in-flight", 1)));
+  const profile = String(args.get("--profile") ?? "fleet");
   const identity: MeshIdentity = { id, name: workerName(id), kind: "agent" };
   const store = new MeshStore(root, 64 * 1024, 100);
   let seq = 0;
+  let putCredit = 0;
+  let custodyCredit = 0;
   let stopped = false;
   const tasks = new Set<Promise<unknown>>();
-  const report = () => process.stdout.write('{"type":"write"}\n');
+  const putKeys = new Set<string>();
   const start = (fn: () => Promise<unknown>) => {
     if (stopped) return;
-    const task = fn().then(report).catch(error => process.stderr.write(`mesh-load worker ${id}: ${error instanceof Error ? error.message : String(error)}\n`));
+    // In-flight cap: a write due at the cap is skipped, so overload shows as a shortfall, not a queue of waiters.
+    if (tasks.size >= maxInFlight) { process.stdout.write('{"type":"skip"}\n'); return; }
+    const inFlight = tasks.size + 1;
+    const task = fn().then(() => process.stdout.write(`{"type":"write","inFlight":${inFlight}}\n`))
+      .catch(error => process.stderr.write(`mesh-load worker ${id}: ${error instanceof Error ? error.message : String(error)}\n`));
     tasks.add(task);
     void task.finally(() => tasks.delete(task));
+  };
+  const pacedWrite = () => {
+    const data = { worker: id, seq: ++seq, at: Date.now(), profile };
+    putCredit += putShare;
+    custodyCredit += custodyShare;
+    if (custodyCredit >= 1) {
+      custodyCredit -= 1;
+      return store.exclusive(() => JSON.parse(fs.readFileSync(statePath, "utf8")) as unknown);
+    }
+    if (putCredit >= 1) {
+      putCredit -= 1;
+      const key = putKey(id, seq);
+      putKeys.add(key);
+      return store.writeBatch({ identity, ops: [{ kind: "put", key, value: data }] });
+    }
+    return store.publish({ topic: "fleet.work.mesh-load", from: identity, data });
   };
   let pubTimer: ReturnType<typeof setInterval> | undefined;
   const setRate = (writesPerMin: number) => {
     if (pubTimer) clearInterval(pubTimer);
     const interval = writesPerMin > 0 ? Math.max(1, Math.round(60_000 / writesPerMin)) : 0;
-    pubTimer = interval ? setInterval(() => start(() => store.publish({
-      topic: "fleet.work.mesh-load", from: identity,
-      data: { worker: id, seq: ++seq, at: Date.now(), profile: String(args.get("--profile") ?? "fleet") },
-    })), interval) : undefined;
+    pubTimer = interval ? setInterval(() => start(pacedWrite), interval) : undefined;
   };
   setRate(rate);
   const control = createInterface({ input: process.stdin });
@@ -91,7 +168,7 @@ if (args.has("--worker")) {
     if (pubTimer) clearInterval(pubTimer);
     clearInterval(heartbeatTimer);
     await Promise.allSettled([...tasks]);
-    await store.writeBatch({ identity, ops: [{ kind: "delete", key: presenceKey }, { kind: "delete", key: actorKey }] });
+    await store.writeBatch({ identity, ops: [presenceKey, actorKey, ...putKeys].map(key => ({ kind: "delete" as const, key })) });
   })();
   // "stop"/EOF on stdin works on every platform; signals remain for POSIX use.
   function stopAndExit(): void {
@@ -120,6 +197,16 @@ if (args.has("--worker")) {
   if (!Number.isFinite(target) || target < HEARTBEAT_WRITES_PER_MIN * requested) {
     usageError(`--target-writes-per-min must be at least ${HEARTBEAT_WRITES_PER_MIN} x --target-processes (${HEARTBEAT_WRITES_PER_MIN * requested}): each worker heartbeats every 5 s, which alone is ${HEARTBEAT_WRITES_PER_MIN} writes/min`);
   }
+  const seedMb = number("--seed-state-mb", 0);
+  const putShare = number("--put-share", 0);
+  const custodyShare = number("--custody-share", 0);
+  const maxInFlight = number("--max-in-flight", 1);
+  const controlIntervalS = number("--control-interval", 30);
+  if (!Number.isFinite(seedMb) || seedMb < 0 || seedMb > 30) usageError("--seed-state-mb must be a number of MB from 0 to 30 (the state cap is 32 MiB)");
+  if (!Number.isFinite(putShare) || putShare < 0 || putShare > 1) usageError("--put-share must be a fraction from 0 to 1");
+  if (!Number.isFinite(custodyShare) || custodyShare < 0 || putShare + custodyShare > 1) usageError("--custody-share must be a fraction from 0 to 1, and --put-share + --custody-share at most 1");
+  if (!Number.isInteger(maxInFlight) || maxInFlight < 1) usageError("--max-in-flight must be a positive integer");
+  if (!Number.isFinite(controlIntervalS) || controlIntervalS < 1) usageError("--control-interval must be at least 1 second");
   // Heartbeat floor: more than floor(target / 12) workers overshoot the target on heartbeats alone.
   const workerCap = Math.min(maxWorkers, Math.floor(target / HEARTBEAT_WRITES_PER_MIN));
   const runId = randomBytes(4).toString("hex");
@@ -127,6 +214,8 @@ if (args.has("--worker")) {
   const live = new Set<ChildProcess>();
   const children = new Map<number, ChildProcess>();
   let writes = 0;
+  let skipped = 0;
+  let maxSeenInFlight = 0;
   let stopped = false;
   let nextId = 0;
   let peakWorkers = 0;
@@ -134,7 +223,8 @@ if (args.has("--worker")) {
     const id = `${runId}-${++nextId}`;
     spawnedIds.push(id);
     const rate = Math.max(0, target / requested - HEARTBEAT_WRITES_PER_MIN);
-    const child = spawn(process.execPath, [process.argv[1]!, "--worker", "--root", root, "--id", id, "--rate", String(rate), "--profile", String(args.get("--profile") ?? "fleet")], { stdio: ["pipe", "pipe", "inherit"], env: process.env });
+    const child = spawn(process.execPath, [process.argv[1]!, "--worker", "--root", root, "--id", id, "--rate", String(rate), "--profile", String(args.get("--profile") ?? "fleet"),
+      "--put-share", String(putShare), "--custody-share", String(custodyShare), "--max-in-flight", String(maxInFlight)], { stdio: ["pipe", "pipe", "inherit"], env: process.env });
     child.stdin?.on("error", () => { /* The worker already exited. */ });
     const key = child.pid ?? nextId;
     children.set(key, child);
@@ -144,9 +234,17 @@ if (args.has("--worker")) {
     child.stdout?.on("data", chunk => {
       buffer += String(chunk);
       const lines = buffer.split("\n"); buffer = lines.pop() ?? "";
-      for (const line of lines) try { if (JSON.parse(line).type === "write") writes++; } catch { /* Ignore diagnostics. */ }
+      for (const line of lines) try {
+        const message = JSON.parse(line) as { type?: unknown; inFlight?: unknown };
+        if (message.type === "write") {
+          writes++;
+          if (typeof message.inFlight === "number") maxSeenInFlight = Math.max(maxSeenInFlight, message.inFlight);
+        } else if (message.type === "skip") skipped++;
+      } catch { /* Ignore diagnostics. */ }
     });
     child.on("exit", () => { children.delete(key); live.delete(child); });
+    // "close" follows the last stdout data, so a stopping worker's final writes are counted.
+    child.on("close", () => closed.add(child));
   };
   // Cross-platform stop: SIGTERM on Windows kills without running handlers, so ask on stdin instead.
   const stopWorker = (child: ChildProcess) => {
@@ -154,9 +252,10 @@ if (args.has("--worker")) {
     child.stdin.write("stop\n");
     child.stdin.end();
   };
-  const waitExit = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>(resolve => {
+  const closed = new Set<ChildProcess>();
+  const waitExit = (child: ChildProcess) => closed.has(child) ? Promise.resolve() : new Promise<void>(resolve => {
     const timer = setTimeout(() => child.kill(), 30_000);
-    child.once("exit", () => { clearTimeout(timer); resolve(); });
+    child.once("close", () => { clearTimeout(timer); resolve(); });
   });
   const resize = (count: number) => {
     const desired = Math.max(1, Math.min(workerCap, count));
@@ -166,15 +265,19 @@ if (args.has("--worker")) {
     for (const child of children.values()) child.stdin?.write(JSON.stringify({ rate }) + "\n");
   };
   if (args.has("--dry-run")) {
-    process.stdout.write(JSON.stringify({ dryRun: true, root, runId, targetWritesPerMin: target, targetProcesses: requested, maxWorkers, workerCap, durationSec: duration }) + "\n");
+    process.stdout.write(JSON.stringify({ dryRun: true, root, runId, targetWritesPerMin: target, targetProcesses: requested, maxWorkers, workerCap, durationSec: duration,
+      seedStateMb: seedMb, putShare, custodyShare, maxInFlight, controlIntervalSec: controlIntervalS }) + "\n");
     process.exit(0);
+  }
+  if (seedMb > 0) {
+    const seeded = await seedState(root, seedMb);
+    process.stderr.write(`mesh-load: seeded ${seeded.seeded} records; state.json is ${seeded.stateBytes} bytes\n`);
   }
   process.stderr.write(`mesh-load: run ${runId} root ${root}\n`);
   resize(requested);
   const started = Date.now();
   let lastMinute = started;
   let lastWrites = 0;
-  let hasReported = false;
   const shutdown = async () => {
     if (stopped) return;
     stopped = true; clearInterval(tick); clearInterval(control);
@@ -193,28 +296,39 @@ if (args.has("--worker")) {
       exitCode = 1;
     }
     const elapsedMin = Math.max(1 / 60, (Date.now() - started) / 60_000);
-    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1 });
-    if (!hasReported) {
-      process.stdout.write(JSON.stringify({ at: new Date().toISOString(), workers: peakWorkers, writesPerMin: Math.round(writes / elapsedMin), busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
-    }
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: Date.now() - STATS_SETTLE_MS });
+    // The final line covers the whole run: peak workers, mean writes/min, skips and the in-flight peak.
+    process.stdout.write(JSON.stringify({ at: new Date().toISOString(), final: true, workers: peakWorkers, writesPerMin: Math.round(writes / elapsedMin),
+      skipped, maxInFlight: maxSeenInFlight, busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
     process.exit(exitCode);
   };
+  // The controller keeps its own window, independent of the minute report: reading the report's freshly reset
+  // minute as a full window made it add a worker every 30 s even at target. The window after a resize
+  // includes worker start-up, so it is discarded rather than judged.
+  let controlWrites = 0;
+  let controlAt = Date.now();
+  let settling = true;
   const control = setInterval(() => {
-    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1 });
-    const elapsedMin = Math.max(1 / 120, (Date.now() - lastMinute) / 60_000);
-    const achieved = Math.round((writes - lastWrites) / elapsedMin);
-    if (achieved < target * 0.9 && children.size < workerCap) resize(children.size + 1);
+    const now = Date.now();
+    const achieved = Math.round((writes - controlWrites) / Math.max(1 / 120, (now - controlAt) / 60_000));
+    controlWrites = writes; controlAt = now;
+    if (settling) { settling = false; return; }
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: Date.now() - STATS_SETTLE_MS });
+    const before = children.size;
+    if (summary.busyPct > 65 && children.size > 1) resize(children.size - 1);
     else if (achieved > target * 1.1 && children.size > requested) resize(children.size - 1);
-    else if (summary.busyPct > 65 && children.size > 1) resize(children.size - 1);
-  }, 30_000);
+    else if (achieved < target * 0.9 && children.size < workerCap) resize(children.size + 1);
+    if (children.size !== before) settling = true;
+  }, controlIntervalS * 1000);
   const tick = setInterval(() => {
     const now = Date.now();
     const elapsedMin = (now - lastMinute) / 60_000;
     const achieved = elapsedMin > 0 ? Math.round((writes - lastWrites) / elapsedMin) : 0;
     lastWrites = writes; lastMinute = now;
-    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1 });
-    process.stdout.write(JSON.stringify({ at: new Date(now).toISOString(), workers: children.size, writesPerMin: achieved, busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
-    hasReported = true;
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: Date.now() - STATS_SETTLE_MS });
+    process.stdout.write(JSON.stringify({ at: new Date(now).toISOString(), workers: children.size, writesPerMin: achieved, skipped,
+      acqPerMin: summary.n, holdMeanMs: Math.round(summary.holdMeanMs * 100) / 100, waitP99Ms: summary.waitP99Ms,
+      busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
     if (duration > 0 && now - started >= duration * 1000) void shutdown();
   }, 60_000);
   createInterface({ input: process.stdin }).on("line", line => { if (line.trim() === "stop") void shutdown(); });

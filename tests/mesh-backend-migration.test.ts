@@ -1,3 +1,4 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -24,7 +25,10 @@ const tempRoot = (label: string): string => {
   return root;
 };
 
+const children: ChildProcessWithoutNullStreams[] = [];
+
 afterEach(() => {
+  for (const child of children.splice(0)) if (child.exitCode === null) child.kill("SIGKILL");
   for (const store of stores.splice(0)) try { store.close(); } catch { /* closed by the test */ }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -389,6 +393,128 @@ describe("file-mode writer fence (assertFileStateWritable)", () => {
     expect(() => assertFileStateWritable(root)).not.toThrow();
     setRawMeta(root, "epoch", 5); // backend=file at another epoch: fail closed
     expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
+  });
+});
+
+// A real file-mode writer in a second process: MeshStore -> StateFile, the release's own commit path.
+const WRITER = `
+import { createJiti } from "jiti";
+import readline from "node:readline";
+import { pathToFileURL } from "node:url";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+const root = process.argv.at(-1);
+const store = new MeshStore(root, 64 * 1024, 1000);
+const identity = { id: "writer", name: "writer", kind: "agent" };
+process.stdout.write("ready\\n");
+for await (const line of readline.createInterface({ input: process.stdin })) {
+  const [op, key] = JSON.parse(line);
+  try {
+    if (op === "put") await store.put({ key, value: { pid: process.pid }, identity });
+    else if (op === "delete") await store.delete({ key });
+    else await store.writeBatch({ identity, ops: [{ kind: "put", key, value: 1 }, { kind: "put", key: key + "/2", value: 2 }] });
+    process.stdout.write(JSON.stringify({ ok: true }) + "\\n");
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, name: error.name, code: error.code, message: error.message }) + "\\n");
+  }
+}
+`;
+
+interface WriterReply { ok: boolean; name?: string; code?: string; message?: string }
+
+const startWriter = async (root: string): Promise<{ pid: number; send: (op: "put" | "delete" | "batch", key: string) => Promise<WriterReply>; stop: () => Promise<void> }> => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", WRITER, root], { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
+  children.push(child);
+  let buffer = "";
+  let stderr = "";
+  const lines: string[] = [];
+  const waiters: Array<{ resolve: (line: string) => void; reject: (error: Error) => void }> = [];
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    for (let index = buffer.indexOf("\n"); index >= 0; index = buffer.indexOf("\n")) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve(line); else lines.push(line);
+    }
+  });
+  child.once("exit", (code) => { for (const waiter of waiters.splice(0)) waiter.reject(new Error(`writer exited ${String(code)}: ${stderr}`)); });
+  const next = (): Promise<string> => {
+    const line = lines.shift();
+    return line !== undefined ? Promise.resolve(line) : new Promise((resolve, reject) => { waiters.push({ resolve, reject }); });
+  };
+  expect(await next()).toBe("ready");
+  return {
+    pid: child.pid!,
+    send: async (op, key) => {
+      const reply = next();
+      child.stdin.write(`${JSON.stringify([op, key])}\n`);
+      return JSON.parse(await reply) as WriterReply;
+    },
+    stop: () => new Promise((resolve) => { child.once("exit", () => resolve()); child.stdin.end(); }),
+  };
+};
+
+describe("file-mode writer fence on the real StateFile commit path (pi-fabric#627 review round 2)", () => {
+  it("refuses a live file-mode writer in another process after cutover, leaves state.json byte-identical, admits it after rollback at E+2", async () => {
+    const root = tempRoot("real-writer");
+    await seedFileRoot(root);
+    const statePath = path.join(root, "state.json");
+    const writer = await startWriter(root);
+    expect(await writer.send("put", "writer/before")).toEqual({ ok: true });
+    expect(fileStore(root).get("writer/before", { fresh: true })?.value).toEqual({ pid: writer.pid });
+
+    // The census lane does not see this writer (it started without registering): only the fence stops it.
+    const cut = await cutoverMeshState(root, { census: async () => ({ writers: [] }) });
+    expect(cut).toMatchObject({ backend: "sqlite", epoch: 1 });
+    const frozen = fs.readFileSync(statePath);
+    const frozenInode = fs.statSync(statePath).ino;
+
+    // The same writer (warm caches from its first commit): every write path is refused under .lock.
+    for (const [op, key] of [["put", "writer/after"], ["delete", "writer/before"], ["batch", "writer/batch"]] as const) {
+      const reply = await writer.send(op, key);
+      expect(reply).toMatchObject({ ok: false, name: "MeshBackendFenceError", code: "FABRIC_MESH_BACKEND_FENCE" });
+      expect(reply.message).toMatch(/file-mode write refused: backend=sqlite at epoch 1/);
+    }
+    expect(fs.readFileSync(statePath).equals(frozen)).toBe(true);
+    expect(fs.statSync(statePath).ino).toBe(frozenInode);
+    expect(fs.readdirSync(root).filter((name) => name.endsWith(".prepared.tmp"))).toEqual([]);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    const sqlite = await openSqlite(root);
+    expect(sqlite.get("writer/before")?.value).toEqual({ pid: writer.pid });
+    expect(sqlite.get("writer/after")).toBeUndefined();
+    sqlite.close();
+
+    const rolled = await rollbackMeshState(root, { assumeNoWriters: true });
+    expect(rolled).toMatchObject({ backend: "file", epoch: 2 });
+    expect(await writer.send("put", "writer/after-rollback")).toEqual({ ok: true });
+    expect(await writer.send("batch", "writer/batch-after-rollback")).toEqual({ ok: true });
+    expect(resolveMeshStateSource(root)).toEqual({ source: "file", backend: "file", epoch: 2, fileEpoch: 2 });
+    expect(readStateFileEpoch(root)).toBe(2);
+    expect(fileStore(root).get("writer/after-rollback", { fresh: true })?.value).toEqual({ pid: writer.pid });
+    expect(fileStore(root).get("writer/after", { fresh: true })).toBeUndefined();
+    await writer.stop();
+  }, 60_000);
+
+  it("costs one stat on a root without state.db (SQLite never opened)", async () => {
+    const root = tempRoot("fence-cost");
+    await fileStore(root).put({ key: "cost/seed", value: 1, identity });
+    const open = (): never => { throw new Error("the guard must not open SQLite without state.db"); };
+    expect(() => assertFileStateWritable(root, { open })).not.toThrow();
+    const measure = (rounds: number, options: Parameters<typeof assertFileStateWritable>[1]): number => {
+      for (let index = 0; index < Math.min(200, rounds); index++) assertFileStateWritable(root, options);
+      const started = process.hrtime.bigint();
+      for (let index = 0; index < rounds; index++) assertFileStateWritable(root, options);
+      return Number(process.hrtime.bigint() - started) / 1e6 / rounds;
+    };
+    const absent = measure(5_000, { open });
+    // Reported in the review comment; with state.db the guard opens SQLite (informational only).
+    await importMeshState(root);
+    await rollbackMeshState(root, { assumeNoWriters: true });
+    const present = measure(200, {});
+    console.log(`[fence-cost] no state.db: ${(absent * 1000).toFixed(2)} us per write guard (5000 calls); state.db backend=file: ${(present * 1000).toFixed(1)} us per call (200 calls)`);
+    expect(absent).toBeLessThan(0.2);
   });
 });
 

@@ -7,6 +7,7 @@ import path from "node:path";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { assertFileStateWritable } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
@@ -847,11 +848,22 @@ export class StateFile {
       serializedText: encoded.serialized.toString("utf8") };
   }
 
+  // The fence's fallback when state.json's bounded header does not carry backendEpoch: this store's decoder.
+  readonly #decodeFileEpoch = (file: string): number => {
+    const epoch = (readState(file, this.#maxStateBytes, false) as MeshStateFile & { backendEpoch?: unknown }).backendEpoch;
+    return epoch === undefined ? 0 : storageRevision(epoch);
+  };
+
   #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
     // this payload's hash. ctime is read after the rename (rename updates it).
+    // smarty-dev#6477 L4b (R1): under .lock and before the rename, for every write (put, delete,
+    // batch, tombstone compaction). After a cutover set backend=sqlite (or during a rollback export)
+    // state.json is not the authority: refuse with MeshBackendFenceError and leave it untouched.
+    // One stat of state.db when absent; nothing is cached across lock holds.
+    assertFileStateWritable(this.root, { maxStateBytes: this.#maxStateBytes, decodeFileEpoch: this.#decodeFileEpoch });
     let staged: number | undefined;
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;

@@ -47,7 +47,8 @@
  * fence runs under the same `.lock` back to backend=file at E+2 and the error is thrown
  * (MeshCutoverFailedError); a cutover never succeeds "with an alarm". Cutover writes nothing to
  * state.json except through that rollback export. Writers that start after the flag are fenced by
- * `assertFileStateWritable`: every file-mode writer calls it under `.lock` before its write.
+ * `assertFileStateWritable` (backend-fence.ts, re-exported here): StateFile calls it on every commit
+ * under `.lock`, right before the state.json rename, so a refused write leaves state.json untouched.
  *
  * Lock order: this tool is the one place where `.lock` is held around a state transaction
  * (R20). Its own connection uses a synchronous busy handler (default 5 s): it is a dedicated
@@ -60,11 +61,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
 import { storageRevision } from "../verified/storage.js";
+import { assertFileStateWritable, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf, readStateFileEpoch as readEpochHeader,
+  type MeshBackendAlarm, type MeshStateSource } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
+
+// The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
+export { assertFileStateWritable, MeshBackendFenceError, type MeshBackendAlarm, type MeshStateSource };
 
 export type MeshBackendFlag = "sqlite" | "exporting" | "file";
 
@@ -77,15 +83,6 @@ export type MeshBackendStep =
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
 /** Provided by the census lane (writer-census.ts): every live process that may write the root. */
 export type MeshWriterCensus = () => Promise<{ writers: MeshCensusWriter[] }>;
-
-export interface MeshBackendAlarm {
-  code: "FABRIC_MESH_BACKEND_FENCE" | "FABRIC_MESH_BACKEND_LATE_WRITER";
-  root: string;
-  message: string;
-  backend?: string;
-  epoch?: number;
-  fileEpoch?: number;
-}
 
 export interface MeshBackendOptions {
   /** The writer census. Cutover and rollback refuse without it unless `assumeNoWriters`. */
@@ -108,15 +105,6 @@ export interface MeshBackendOptions {
   onStep?: (step: MeshBackendStep) => void;
   /** Fence violations and late writers. The error is thrown as well. */
   onAlarm?: (alarm: MeshBackendAlarm) => void;
-}
-
-/** The fence does not hold: readers and the tool fail closed. */
-export class MeshBackendFenceError extends Error {
-  readonly code = "FABRIC_MESH_BACKEND_FENCE";
-  constructor(message: string) {
-    super(message);
-    this.name = "MeshBackendFenceError";
-  }
 }
 
 /**
@@ -148,13 +136,6 @@ export interface MeshStateSnapshot {
   highWater?: number;
   format?: number;
   revisionFormat?: number;
-}
-
-export interface MeshStateSource {
-  source: "sqlite" | "file";
-  backend: string;
-  epoch: number;
-  fileEpoch: number;
 }
 
 export interface MeshImportResult {
@@ -220,10 +201,7 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_BUSY_MS = 5_000;
 const DEFAULT_LOCK_MS = 60_000;
 const ENVELOPE_BYTES = 256;
-const HEADER_BYTES = 512;
 const DEFAULT_CUTOVER_MODES = ["sqlite", "auto"];
-const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const EPOCH_HEADER = new RegExp(String.raw`^\{"readGeneration":"${UUID}"(?:,"readJournalHash":"[0-9a-f]{64}")?,"backendEpoch":(\d+)[,}]`);
 // Mirrors state-sqlite.ts (schema 1). The tests compare it with a store-created database.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta(name TEXT PRIMARY KEY NOT NULL, value) WITHOUT ROWID;
@@ -534,25 +512,11 @@ const storeReadDigest = (root: string, lock: MeshLock, options: MeshBackendOptio
 };
 
 /** The epoch recorded in state.json: a bounded header read, else the full normal decoder. */
-export const readStateFileEpoch = (root: string, options: Pick<MeshBackendOptions, "maxStateBytes"> = {}): number => {
-  const file = path.join(path.resolve(root), STATE_JSON);
-  let descriptor: number;
-  try { descriptor = fs.openSync(file, "r"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
-  let header = "";
-  try {
-    const buffer = Buffer.alloc(HEADER_BYTES);
-    header = buffer.subarray(0, fs.readSync(descriptor, buffer, 0, HEADER_BYTES, 0)).toString("utf8");
-  } finally { fs.closeSync(descriptor); }
-  const match = EPOCH_HEADER.exec(header);
-  if (match) return storageRevision(Number(match[1]));
-  return fileEpochOf(decodeMeshStateFile(file, maxBytesOf(options), false) as FencedFile);
-};
+export const readStateFileEpoch = (root: string, options: Pick<MeshBackendOptions, "maxStateBytes"> = {}): number =>
+  readEpochHeader(root, { decodeFileEpoch: (file) => fileEpochOf(decodeMeshStateFile(file, maxBytesOf(options), false) as FencedFile) });
 
-const alarm = (options: MeshBackendOptions, root: string, message: string, detail: Partial<MeshBackendAlarm> = {}): MeshBackendFenceError => {
-  try { options.onAlarm?.({ code: "FABRIC_MESH_BACKEND_FENCE", root, message, ...detail }); } catch { /* an alarm sink never masks the fence */ }
-  return new MeshBackendFenceError(message);
-};
+const alarm = (options: MeshBackendOptions, root: string, message: string, detail: Partial<MeshBackendAlarm> = {}): MeshBackendFenceError =>
+  meshFenceAlarm(options, root, message, detail);
 
 const censusWriters = async (options: MeshBackendOptions): Promise<MeshCensusWriter[] | undefined> => {
   if (!options.census) return undefined;
@@ -594,8 +558,9 @@ const removeStaleTemps = (root: string): void => {
 // ------------------------------------------------------------------ the reader rule
 
 /**
- * Which representation a reader may use (plan section 5). Throws MeshBackendFenceError (and raises
- * the alarm) on any mismatch. A root without state.db is a legacy file root.
+ * Which representation a reader may use (plan section 5; the rule itself is `meshStateSourceOf` in
+ * backend-fence.ts). Throws MeshBackendFenceError (and raises the alarm) on any mismatch. A root
+ * without state.db is a legacy file root.
  */
 export const resolveMeshStateSource = (root: string, options: MeshBackendOptions = {}): MeshStateSource => {
   root = path.resolve(root);
@@ -609,51 +574,10 @@ export const resolveMeshStateSource = (root: string, options: MeshBackendOptions
       epoch = meta.epoch;
     } finally { fence.close(); }
   }
-  let fileEpoch: number;
-  try { fileEpoch = readStateFileEpoch(root, options); }
-  catch (error) {
-    // A damaged state.json is not authority under sqlite/exporting; the legacy store tolerates it.
-    if (backend === "sqlite" || backend === "exporting") return { source: "sqlite", backend, epoch, fileEpoch: Number.NaN };
-    if (backend === "none") return { source: "file", backend, epoch, fileEpoch: Number.NaN };
-    throw alarm(options, root, `Fabric mesh state.json is unreadable under backend=${backend} epoch ${epoch}: ${(error as Error).message}`, { backend, epoch });
-  }
-  const detail = { backend, epoch, fileEpoch };
-  if (!Number.isSafeInteger(epoch) || epoch < 0) throw alarm(options, root, `Fabric mesh state.db has an invalid epoch (${String(epoch)})`, detail);
-  if (fileEpoch > epoch) {
-    throw alarm(options, root, backend === "none"
-      ? `Fabric mesh state.json carries epoch ${fileEpoch} but state.db is missing`
-      : `Fabric mesh state.json epoch ${fileEpoch} exceeds the database epoch ${epoch} (backend=${backend})`, detail);
-  }
-  if (backend === "none") return { source: "file", ...detail };
-  if (backend === "sqlite" || backend === "exporting") return { source: "sqlite", ...detail };
-  if (backend === "file") {
-    if (fileEpoch === epoch) return { source: "file", ...detail };
-    throw alarm(options, root, `Fabric mesh backend=file at epoch ${epoch} but state.json carries epoch ${fileEpoch}`, detail);
-  }
-  throw alarm(options, root, `Fabric mesh state.db backend flag ${JSON.stringify(backend)} is not sqlite, exporting or file`, detail);
-};
-
-/**
- * The file-mode writer fence (R1, late writers): every process that writes state.json in file mode
- * calls this under the mesh `.lock`, right before its write. It passes only where the reader rule
- * reads state.json (a legacy root without state.db, or backend=file at the file's epoch) and
- * otherwise fails closed with MeshBackendFenceError: after a cutover committed backend=sqlite, a
- * writer blocked on `.lock` (or started later) must not commit to a retired state.json.
- */
-export const assertFileStateWritable = (root: string,
-  options: Pick<MeshBackendOptions, "maxStateBytes" | "open" | "busyTimeoutMs" | "onAlarm"> = {}): void => {
-  root = path.resolve(root);
-  let source: MeshStateSource;
-  try { source = resolveMeshStateSource(root, options); }
-  catch (error) {
-    if (error instanceof MeshBackendFenceError) throw error;
-    throw alarm(options, root, `Fabric mesh file-mode write refused: the backend flag is unreadable (${(error as Error).message})`);
-  }
-  if (source.source !== "file") {
-    throw alarm(options, root, `Fabric mesh file-mode write refused: backend=${source.backend} at epoch ${source.epoch}; `
-      + "state.json is not the authority (this release must run in sqlite mode)",
-    { backend: source.backend, epoch: source.epoch, fileEpoch: source.fileEpoch });
-  }
+  return meshStateSourceOf(root, backend, epoch, {
+    ...(options.onAlarm ? { onAlarm: options.onAlarm } : {}),
+    decodeFileEpoch: (file) => fileEpochOf(decodeMeshStateFile(file, maxBytesOf(options), false) as FencedFile),
+  });
 };
 
 // ------------------------------------------------------------------ import and cutover

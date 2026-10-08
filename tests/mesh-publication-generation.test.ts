@@ -6,6 +6,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { SqliteStateBackend } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshStoreOptions } from "../src/mesh/store.js";
 import { publicationGeneration } from "../src/topology/publication-generation.js";
 
@@ -30,6 +31,8 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
 
   it("MeshStore names its backend's revision, and an ownership commit moves the generation", async () => {
     const mesh = new MeshStore(path.join(tempRoot(), "mesh"), 64 * 1024, 100, options);
+    // pi-fabric#640 (Windows CI): an open state.db handle makes the root's removal fail with EBUSY.
+    closers.push(async () => mesh.closeState());
     expect(mesh.stateBackend).toBe(stateBackend);
     const stateJson = path.join(mesh.root, "state.json");
     const before = { generation: publicationGeneration(mesh), revision: mesh.stateRevision(), file: stat(stateJson),
@@ -46,13 +49,39 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
     }
   });
 
+  it("closing the store releases the state files, so the root can be renamed or removed (Windows EBUSY, pi-fabric#640)", async () => {
+    const mesh = new MeshStore(path.join(tempRoot(), "mesh"), 64 * 1024, 100, options);
+    closers.push(async () => mesh.closeState());
+    await ownershipChange(mesh);
+    const backend = mesh.stateBackendHandle;
+    if (stateBackend === "sqlite") expect(fs.existsSync(path.join(mesh.root, "state.db"))).toBe(true);
+    mesh.closeState();
+    if (backend instanceof SqliteStateBackend) {
+      // The backend reports closed: no handle remains and none is reopened behind the caller.
+      expect(() => backend.store).toThrow(/closed/);
+      expect(backend.stateStamp()).toBeUndefined();
+    } else {
+      expect(stateBackend).toBe("file");
+    }
+    // Windows refuses to rename a file with an open handle (EBUSY/EPERM); Linux checks the report above.
+    for (const name of fs.readdirSync(mesh.root).filter((entry) => entry.startsWith("state"))) {
+      const file = path.join(mesh.root, name);
+      fs.renameSync(file, `${file}.moved`);
+      fs.renameSync(`${file}.moved`, file);
+    }
+    fs.rmSync(mesh.root, { recursive: true, force: true });
+    expect(fs.existsSync(mesh.root)).toBe(false);
+  });
+
   it.each([false, true])("ActorManager's registry save validation fails iff ownership changed after its snapshot (changed=%s)", async (changed) => {
     const dir = tempRoot();
     const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100, options);
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(dir, "runs") });
     const actors = new ActorManager("gen", { id: "session:gen", name: "main", kind: "main" }, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, agents, () => {}, { actorRoot: path.join(dir, "actors"), persistent: true });
-    closers.push(() => agents.close(), () => actors.close());
+    // Closed in reverse: actors, agents, then the store's state handle (MeshStore is not owned by
+    // ActorManager; leaving it open fails the root's removal on Windows with EBUSY, pi-fabric#640).
+    closers.push(async () => mesh.closeState(), () => agents.close(), () => actors.close());
     const actor = await actors.create({ name: "gen", instructions: "Reply" });
     // The next registry save: ActorManager selects from its ownership snapshot; before the update
     // acquires the registry fence (where it validates), another session commits an ownership change.

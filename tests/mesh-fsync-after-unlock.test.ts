@@ -63,6 +63,36 @@ const durableImage = (root: string) => {
   };
 };
 
+/** The file an fd names (Linux /proc), for classifying a barrier. */
+const fdPath = (fd: number): string => { try { return fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { return ""; } };
+
+/** A no-archive keyed publish whose live barrier fails: the "died after the live append" state
+ * (intent + live line, no receipt). Returns the committed event and the intent path. */
+const strandIntent = async (mesh: MeshStore, dedupeKey: string) => {
+  const packet = { topic: "mesh.fsync", from, dedupeKey, text: "once" };
+  const sync = fs.fsyncSync.bind(fs);
+  const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+    if (sameFile(fd, events(mesh.root))) throw new Error("live barrier failed");
+    sync(fd);
+  });
+  await expect(mesh.publish(packet)).rejects.toThrow("live barrier failed");
+  fail.mockRestore();
+  const intentPath = receipt(mesh.root, dedupeKey, ".pending.json");
+  expect(fs.existsSync(intentPath)).toBe(true);
+  return { packet, intentPath, committed: mesh.read().find(event => event.dedupeKey === dedupeKey)! };
+};
+
+/** Append fillers through a store with the default (large) cap: no compaction trigger runs. */
+const fillPast = async (root: string, bytes: number, durable = false) => {
+  const big = new MeshStore(root, 1024, 100);
+  for (let index = 0; fs.statSync(events(root)).size <= bytes; index++) {
+    await big.publish({ topic: "mesh.fsync", from, durable, text: `fill ${index} ${"x".repeat(120)}` });
+  }
+};
+
+const generationOf = (root: string) =>
+  fs.existsSync(path.join(root, "generation")) ? fs.readFileSync(path.join(root, "generation"), "utf8") : "0";
+
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
@@ -316,26 +346,183 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(await mesh.publish(packet)).toEqual(committed);
   });
 
-  it("compaction: past twice the cap a pending no-archive intent is settled under the lock so the log stays bounded", async () => {
+  it("compaction: past twice the cap a dead publisher's no-archive intent is settled off-lock (no barrier under the lock); the next publish compacts", async () => {
     const mesh = compacting();
-    const packet = { topic: "mesh.fsync", from, dedupeKey: "pending-hard-bound", text: "once" };
-    const sync = fs.fsyncSync.bind(fs);
-    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-      if (sameFile(fd, events(mesh.root))) throw new Error("live barrier failed");
-      sync(fd);
-    });
-    await expect(mesh.publish(packet)).rejects.toThrow("live barrier failed");
-    fail.mockRestore();
-    const intentPath = receipt(mesh.root, packet.dedupeKey, ".pending.json");
-    const committed = mesh.read()[0]!;
+    const { packet, intentPath, committed } = await strandIntent(mesh, "pending-hard-bound");
+    const watcher = watchBarriers(mesh.root);
     for (let index = 0; fs.existsSync(intentPath) && index < 60; index++) {
       await mesh.publish({ topic: "mesh.fsync", from, text: `fill ${index} ${"x".repeat(120)}` });
     }
+    // Settled past 2x the cap (5600) with every barrier after release; not compacted in that pass.
     expect(fs.existsSync(intentPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
-    expect(fs.readFileSync(path.join(mesh.root, "generation"), "utf8")).not.toBe("0");
-    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(5600);
+    expect(watcher.syncs.some(sync => sync.live && !sync.held)).toBe(true);
+    expect(watcher.held()).toEqual([]);
+    expect(generationOf(mesh.root)).toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeGreaterThan(5600);
+    // The next trigger finds no intent and compacts, still with nothing fsynced under the lock.
+    await mesh.publish({ topic: "mesh.fsync", from, text: "next" });
+    expect(generationOf(mesh.root)).not.toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(2800);
+    expect(watcher.held()).toEqual([]);
     expect(await mesh.publish(packet)).toEqual(committed);
+  });
+
+  it.skipIf(process.platform !== "linux")("no path in event-log fsyncs or syncs a directory while .lock exists, except a fresh intent's fence before its append", async () => {
+    const mesh = compacting();
+    const root = mesh.root;
+    const lockOwner = path.join(root, ".lock", "owner");
+    const holdOf = () => { try { return fs.readFileSync(lockOwner, "utf8").split("\n")[0] ?? ""; } catch { return ""; } };
+    // Per hold: has the live append happened yet? A fence is a fresh intent's durable write
+    // (its file and namespace chain, from #preparePublish), in a hold before its live append.
+    let hold = "", appendedInHold = false;
+    const enter = () => { const now = holdOf(); if (now !== hold) { hold = now; appendedInHold = false; } };
+    const held: Array<{ path: string; fence: boolean; via: string }> = [];
+    const record = (fd: number) => {
+      if (!fs.existsSync(path.join(root, ".lock"))) return;
+      enter();
+      const limit = Error.stackTraceLimit;
+      Error.stackTraceLimit = 100;
+      const stack = new Error().stack ?? "";
+      Error.stackTraceLimit = limit;
+      const via = /settleDedupeIntent|removeDedupeIntent|finishLiveReceipt|confirmEventFile|foldIntoStage|syncPathNamespace|writeFileAtomic/.exec(
+        stack.split("\n").filter(line => !line.includes("atomic-write")).join("\n"))?.[0] ?? "other";
+      // The fresh intent's write is the only writeFileAtomic called directly from the publish
+      // closure (an anonymous event-log frame) before the append; settlement frames are named.
+      const frames = stack.split("\n").map(line => line.trim());
+      const writer = frames.findIndex(line => line.startsWith("at writeFileAtomic "));
+      const fence = !appendedInHold && writer >= 0 && /^at \S*src\/mesh\/event-log\.ts:\d+:\d+$/.test(frames[writer + 1] ?? "") &&
+        !/settleDedupeIntent|removeDedupeIntent|finishLiveReceipt/.test(stack);
+      held.push({ path: fdPath(fd), fence, via });
+    };
+    const append = fs.appendFileSync.bind(fs);
+    vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
+      enter();
+      append(file, data, options);
+      if (file === events(root)) appendedInHold = true;
+    });
+    for (const name of ["fsyncSync", "fdatasyncSync"] as const) {
+      const original = fs[name].bind(fs);
+      vi.spyOn(fs, name).mockImplementation(fd => {
+        record(fd);
+        original(fd);
+      });
+    }
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    // 1. Durable unkeyed publishes crossing the cap: group barrier and compaction.
+    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "mesh.fsync", from, durable: true, text: `durable ${index} ${"x".repeat(120)}` });
+    expect(generationOf(root)).not.toBe("0");
+    // 2. A fresh keyed publish (its fence) and its repeat.
+    const fresh = { topic: "mesh.fsync", from, dedupeKey: "fresh", text: "once" };
+    const first = await mesh.publish(fresh);
+    expect(await mesh.publish(fresh)).toEqual(first);
+    // 3. A stranded committed intent (dead after the live append) ...
+    vi.mocked(fs.fsyncSync).mockRestore();
+    const stranded = await strandIntent(mesh, "stranded");
+    const original = fs.fsyncSync.bind(fs);
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      record(fd);
+      original(fd);
+    });
+    // ... and two never-committed ones (dead before the append): one retried, one abandoned.
+    const dead = (dedupeKey: string) => {
+      const file = receipt(root, dedupeKey, ".pending.json");
+      fs.writeFileSync(file, JSON.stringify({ dedupeKey, reservedSequence: 9_000, eventId: `never-${dedupeKey}`, liveOffset: fs.statSync(events(root)).size + 50_000 }));
+      return file;
+    };
+    dead("retried");
+    const abandoned = dead("abandoned");
+    const retried = await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "retried", text: "retried" });
+    expect(fs.existsSync(receipt(root, "retried", ".pending.json"))).toBe(false);
+    // 4. A torn tail, then fill past twice the cap: compaction settles the stranded and
+    //    abandoned intents off-lock, and the next trigger compacts.
+    fs.appendFileSync(events(root), '{"sequence":99999,"id":"torn"');
+    const compacted = generationOf(root);
+    for (let index = 0; (fs.existsSync(stranded.intentPath) || fs.existsSync(abandoned)) && index < 80; index++) {
+      await mesh.publish({ topic: "mesh.fsync", from, durable: index % 2 === 0, text: `fill ${index} ${"x".repeat(120)}` });
+    }
+    await mesh.publish({ topic: "mesh.fsync", from, durable: true, text: "after settle" });
+    expect(fs.existsSync(stranded.intentPath)).toBe(false);
+    expect(fs.existsSync(abandoned)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receipt(root, "stranded"), "utf8"))).toEqual(stranded.committed);
+    expect(fs.existsSync(receipt(root, "abandoned"))).toBe(false);
+    expect(generationOf(root)).not.toBe(compacted);
+    expect(fs.statSync(events(root)).size).toBeLessThanOrEqual(2800);
+    expect(await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "retried", text: "retried" })).toEqual(retried);
+    expect(warn).not.toHaveBeenCalled();
+    // Every barrier held by `.lock` is a fresh intent's fence (fresh, retried); nothing else.
+    expect(held.filter(sync => !sync.fence)).toEqual([]);
+    expect(held.some(sync => sync.fence)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32").each(["barrier", "unlink"] as const)("SIGKILL during a deferred off-lock settle (%s) leaves the intent as a recoverable anchor", async phase => {
+    const mesh = compacting();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `killed-${phase}`);
+    await fillPast(mesh.root, 5600 + 200);
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-deferred-settle-crash.mjs"), mesh.root, phase], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", bytes => { stderr += bytes; });
+    const signal = await new Promise<NodeJS.Signals | null>(resolve => child.once("close", (_code, killed) => resolve(killed)));
+    expect(signal, stderr).toBe("SIGKILL");
+    // Killed off-lock, after the locked read: no lock is left, nothing was compacted, and the
+    // intent is still the anchor (the receipt is durable only in the unlink phase).
+    expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(false);
+    expect(fs.existsSync(intentPath)).toBe(true);
+    expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey))).toBe(phase === "unlink");
+    expect(generationOf(mesh.root)).toBe("0");
+    // Recovery: exactly once, then the log compacts.
+    const reborn = new MeshStore(mesh.root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    expect(await reborn.publish(packet)).toEqual(committed);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
+    await reborn.publish({ topic: "mesh.fsync", from, text: "next" });
+    expect(generationOf(mesh.root)).not.toBe("0");
+    expect(fs.statSync(events(mesh.root)).size).toBeLessThanOrEqual(2800);
+    expect(await reborn.publish(packet)).toEqual(committed);
+    // Never appended twice: every live line for the key is the committed one (it may be compacted away).
+    expect(fs.readFileSync(events(mesh.root), "utf8").split("\n").filter(line => line.includes(`"dedupeKey":"${packet.dedupeKey}"`))
+      .every(line => line.includes(`"id":"${committed.id}"`))).toBe(true);
+  });
+
+  it.skipIf(process.platform !== "linux")("power cut during a deferred off-lock settle: the durable image plus the intent recover exactly once", async () => {
+    const mesh = compacting();
+    const { packet, intentPath, committed } = await strandIntent(mesh, "power-cut");
+    await fillPast(mesh.root, 5600 + 200, true);
+    const image = durableImage(mesh.root);
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    let cut = false;
+    const sync = fs.fsyncSync.bind(fs);
+    const heldSyncs: string[] = [];
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (held()) heldSyncs.push(fdPath(fd));
+      // Power fails as the off-lock receipt stage is about to become durable: the live barrier
+      // has run, the receipt has not, the intent is still there.
+      if (!cut && !held() && /\/event-receipts\/[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(fdPath(fd))) {
+        cut = true;
+        throw new Error("power cut");
+      }
+      sync(fd);
+      image.capture(fd);
+    });
+    vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    await mesh.publish({ topic: "mesh.fsync", from, text: "trigger" });
+    vi.restoreAllMocks();
+    expect(cut).toBe(true);
+    expect(heldSyncs).toEqual([]);
+    // Only the fsynced image survives, plus a torn prefix; the unsynced receipt stage is gone.
+    expect(image.get().toString("utf8")).toContain(`"id":"${committed.id}"`);
+    fs.writeFileSync(events(mesh.root), Buffer.concat([image.get(), Buffer.from('{"sequence":99999,"id":"lost","to')]));
+    const receipts = path.join(mesh.root, "event-receipts");
+    for (const name of fs.readdirSync(receipts)) if (name.endsWith(".tmp")) fs.rmSync(path.join(receipts, name));
+    expect(fs.existsSync(intentPath)).toBe(true);
+    expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey))).toBe(false);
+    const rebooted = new MeshStore(mesh.root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    expect(await rebooted.publish(packet)).toEqual(committed);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(await rebooted.publish(packet)).toEqual(committed);
+    // Never appended twice: every live line for the key is the committed one (it may be compacted away).
+    expect(fs.readFileSync(events(mesh.root), "utf8").split("\n").filter(line => line.includes(`"dedupeKey":"${packet.dedupeKey}"`))
+      .every(line => line.includes(`"id":"${committed.id}"`))).toBe(true);
   });
 
   it("recovery: a receipt the original publisher installs after the first lookup is confirmed and its intent unlinked after release", async () => {

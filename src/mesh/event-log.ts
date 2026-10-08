@@ -332,6 +332,15 @@ export class EventLog {
       after.finish = this.#finishLiveReceipt(event, file, this.#dedupePath(intent.dedupeKey, ".json"));
       return event;
     }
+    if (!event && !archive && after) {
+      // No-archive, nothing committed at the intent's offset (a partial or failed append): the
+      // unlink is ordered under the lock (a same-key writer may replace the intent next), its
+      // namespace barrier runs after release. A crash before it may bring the intent back,
+      // which settles to nothing again: no line can ever match its unique event id.
+      fs.rmSync(file, { force: true });
+      after.finish = () => syncPathNamespace(path.dirname(file));
+      return undefined;
+    }
     if (event && !prior) {
       if (live) {
         this.#confirmEventFile(this.#eventsPath);
@@ -354,6 +363,29 @@ export class EventLog {
     for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
       this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
     }
+  }
+
+  /**
+   * No-archive intents with nothing durable written under `.lock` (pi-fabric#649 review round 3).
+   * Under the lock only reads and the ordered unlink of a never-committed intent; after release,
+   * for each committed one: the live barrier, the durable receipt, then the unlink and its
+   * namespace barrier (`#finishLiveReceipt`). Until its receipt is durable each intent stays
+   * the recovery anchor, so a crash here leaves exactly the "died after the live append" state.
+   */
+  async #settleDedupeIntentsAfterUnlock(): Promise<void> {
+    const directory = path.join(this.root, "event-receipts");
+    const finishes: Array<() => Promise<void> | void> = [];
+    await this.#lock.withLock(() => {
+      let names: string[];
+      try { names = fs.readdirSync(directory); }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
+        const after: AfterUnlock = {};
+        this.#settleDedupeIntent(path.join(directory, name), undefined, undefined, after);
+        if (after.finish) finishes.push(after.finish);
+      }
+    }, undefined, "publish");
+    for (const finish of finishes) await finish();
   }
 
   #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
@@ -1133,12 +1165,14 @@ export class EventLog {
    *    Every byte of the new inode was fsynced before the rename, so a returned publish's
    *    bytes survive whether or not the rename does.
    * 3. Off-lock: the directory barrier that makes the rename durable.
-   * Only if appends outrun every round AND the log has reached twice its cap does the last
-   * fold (a few lines) fsync under the lock, so the log stays bounded under sustained load.
-   * A pending no-archive dedupe intent (a keyed publisher in flight, or a dead one) defers
-   * compaction: it settles only on its off-lock path, and the next publish after that compacts.
-   * Archive-coupled intents, and any intent once the log reaches twice its cap, are settled
-   * first through the locked legacy protocol; an intent that appears later refuses the rename.
+   * Nothing is fsynced under the lock: if appends outrun every round, this pass defers and the
+   * next publish over the cap (each one triggers) retries.
+   * A pending no-archive dedupe intent (a keyed publisher in flight, or a dead one) always
+   * defers compaction in this pass. Below twice the cap it settles on its own off-lock path
+   * (the publisher, or a same-key retry). Past twice the cap (a dead publisher nobody retries)
+   * this pass settles it with `#settleDedupeIntentsAfterUnlock` (no fsync under the lock), and
+   * the next publish compacts. Archive-coupled intents are settled first through the locked
+   * legacy protocol (smarty-dev#6000); an intent that appears later refuses the rename.
    */
   async #compactAfterUnlock(): Promise<void> {
     const file = this.#eventsPath;
@@ -1155,11 +1189,13 @@ export class EventLog {
       if (this.#hasPendingIntents()) {
         // Never rewrite away an event named by a durable intent (byte offsets).
         const archive = MeshArchive.fromRoot(this.root);
-        // No-archive: defer rather than fsync the log, receipt and namespace under `.lock`.
-        // The intent settles off-lock (its publisher, or a same-key retry); the next trigger compacts.
-        // ponytail: past twice the cap (a dead publisher's intent nobody retries) the locked
-        // legacy settlement below still runs, so the log stays bounded; its fsyncs hold `.lock`.
-        if (!archive && size <= 2 * this.#maxEventLogBytes) return;
+        // No-archive: never settle with an fsync under `.lock`, and never compact in this pass.
+        // Past twice the cap, settle off-lock so a dead publisher's intent cannot pin the log;
+        // the next trigger compacts once the intent is gone.
+        if (!archive) {
+          if (size > 2 * this.#maxEventLogBytes) await this.#settleDedupeIntentsAfterUnlock();
+          return;
+        }
         await this.#lock.withLock(() => this.#settleDedupeIntents(archive), undefined, "publish");
       }
       // Snapshot the retained tail. A concurrent repair (under the lock) may truncate a torn
@@ -1210,12 +1246,10 @@ export class EventLog {
         const outcome = await this.#lock.withLock((): "done" | "stop" | "behind" => {
           const stat = this.#liveStat();
           if (!sameInode(stat) || this.#readGeneration() !== generation || this.#hasPendingIntents()) return "stop";
-          if (stat.size > staged) {
-            // A torn tail of a dead writer is never folded: it is a partial line.
-            if (!final) return "behind";
-            if (stat.size <= 2 * this.#maxEventLogBytes) return "stop"; // Next trigger retries.
-            staged += this.#foldIntoStage(stage!, ino, staged, stat.size);
-          }
+          // Unfolded appends: fold them off-lock and retry; after the last round the next trigger
+          // retries. Never fold (fsync) under the lock. A torn tail of a dead writer is never
+          // folded: it is a partial line.
+          if (stat.size > staged) return final ? "stop" : "behind";
           renameAtomic(stagePath!, file);
           stagePath = undefined;
           atomicWrite(this.#generationPath, this.#readGeneration() + 1);

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { StateProjector } from "../src/mesh/state-projector.js";
+import { projectorDatabaseRoot, StateProjector } from "../src/mesh/state-projector.js";
 import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -71,7 +71,7 @@ const openProjector = async (root: string, owner: string): Promise<StateProjecto
 };
 
 const meta = (root: string, name: string): unknown => {
-  const raw = openNodeSqlite(path.join(root, "state.db"));
+  const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
   try { return raw.prepare("SELECT value FROM meta WHERE name = ?").get(name)?.value; }
   finally { raw.close(); }
 };
@@ -80,7 +80,7 @@ const expectInStep = async (root: string): Promise<void> => {
   const file = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8")) as {
     entries: Record<string, unknown>; versions?: Record<string, number>; tombstoneOrder?: string[]; highWater: number;
   };
-  const store = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+  const store = await SqliteStateStore.open(projectorDatabaseRoot(root), 64 * 1024, 1_000);
   try {
     const projected = store.exportState();
     expect(projected.entries).toEqual(file.entries);

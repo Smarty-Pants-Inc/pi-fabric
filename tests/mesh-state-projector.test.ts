@@ -2,11 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { STATE_PROJECTOR_STATUS_FILE, StateProjector, type StateProjectorEvent, type StateProjectorOptions } from "../src/mesh/state-projector.js";
+import { projectorDatabaseRoot, STATE_PROJECTOR_STATUS_FILE, StateProjector, type StateProjectorEvent, type StateProjectorOptions } from "../src/mesh/state-projector.js";
 import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
-// Lane L3 of smarty-dev#6477: the projector keeps <root>/state.db in step with state.json.
+// Lane L3 of smarty-dev#6477: the projector keeps <root>/state-projector/state.db in step with state.json
+// (W1: <root>/state.db is the cutover flag, which fences file-mode writes).
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const roots: string[] = [];
 const projectors: StateProjector[] = [];
@@ -24,8 +25,8 @@ const openProjector = async (root: string, options: Partial<StateProjectorOption
   return projector;
 };
 
-const openStore = async (root: string): Promise<SqliteStateStore> => {
-  const store = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+const openStore = async (root: string, databaseRoot = projectorDatabaseRoot(root)): Promise<SqliteStateStore> => {
+  const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000);
   stores.push(store);
   return store;
 };
@@ -190,7 +191,7 @@ describe("state projector (shadow)", () => {
     expect(await projector.verify()).toEqual([]);
 
     // Edits that bypass the projector and every commit counter.
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try {
       raw.prepare("UPDATE kv SET value = ? WHERE key = ?").run(JSON.stringify("tampered"), "k/0");
       raw.prepare("DELETE FROM kv WHERE key = ?").run("k/4");
@@ -225,7 +226,7 @@ describe("state projector (shadow)", () => {
     expect(await projector.verify()).toEqual([]);
 
     // Same keys, same versions; only the ords of t/a and t/c are swapped (ord is UNIQUE: via a free slot).
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     let before: Array<{ key: string; version: number; ord: number }>;
     try {
       before = raw.prepare("SELECT key, version, ord FROM tombstones ORDER BY ord").all() as typeof before;
@@ -258,7 +259,7 @@ describe("state projector (shadow)", () => {
     const projector = await openProjector(root);
     await projector.tick();
     expect(await projector.verify()).toEqual([]);
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try { raw.prepare("UPDATE tombstones SET ord = ord + 1000 WHERE key = ?").run("t/a"); } finally { raw.close(); }
     expect((await projector.verify()).map(divergence => [divergence.key, divergence.field])).toEqual([["t/a", "tombstone-order"]]);
     expect(await projector.verify()).toEqual([]);
@@ -279,7 +280,7 @@ describe("state projector (shadow)", () => {
     expect(reader.stateStamp()).toMatch(new RegExp(`:${base}$`));
 
     // Same versions, different value (k/a) and metadata (k/b): no commit counter moves.
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try {
       raw.prepare("UPDATE kv SET value = ? WHERE key = ?").run(JSON.stringify("tampered"), "k/a");
       raw.prepare("UPDATE kv SET updated_by = ? WHERE key = ?").run(JSON.stringify({ id: "other", name: "other", kind: "agent" }), "k/b");
@@ -321,7 +322,7 @@ describe("state projector (shadow)", () => {
     expect(projector.status().commit).toBe(base);
 
     // Swap the ords of t/a and t/c: same keys, same versions, only the order differs.
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try {
       const rows = raw.prepare("SELECT key, ord FROM tombstones").all() as Array<{ key: string; ord: number }>;
       const ordOf = (key: string) => rows.find(row => row.key === key)!.ord;
@@ -354,7 +355,7 @@ describe("state projector (shadow)", () => {
     await file.put({ key: "k/a", value: 1, identity });
     const projector = await openProjector(root, { repairDivergence: false });
     await projector.tick();
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try { raw.prepare("UPDATE kv SET updated_at = 1 WHERE key = ?").run("k/a"); } finally { raw.close(); }
     expect((await projector.verify()).map(divergence => divergence.field)).toEqual(["updatedAt"]);
     expect((await projector.verify()).map(divergence => divergence.field)).toEqual(["updatedAt"]);
@@ -416,7 +417,7 @@ describe("state projector (shadow)", () => {
     await expectInStep(root);
 
     // Fencing: a projector whose lease was taken cannot commit.
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try {
       raw.prepare("UPDATE meta SET value = ? WHERE name = 'projector.lease'").run(JSON.stringify({ owner: "intruder", expiresAt: Date.now() + 60_000 }));
     } finally { raw.close(); }
@@ -468,7 +469,7 @@ describe("state projector (shadow)", () => {
     const published = JSON.parse(fs.readFileSync(path.join(root, STATE_PROJECTOR_STATUS_FILE), "utf8")) as { role: string };
     expect(published.role).toBe("stopped");
     // Lease released, no pass after stop.
-    const raw = openNodeSqlite(path.join(root, "state.db"));
+    const raw = openNodeSqlite(path.join(projectorDatabaseRoot(root), "state.db"));
     try { expect(raw.prepare("SELECT value FROM meta WHERE name = 'projector.lease'").get()).toBeUndefined(); }
     finally { raw.close(); }
     await file.put({ key: "k/after-stop", value: 1, identity });
@@ -482,7 +483,7 @@ describe("state projector (shadow)", () => {
 describe("state projector (sqlite, after cutover)", () => {
   it("maintains the authoritative database without touching its rows", async () => {
     const root = tempRoot("maintain");
-    const authority = await openStore(root);
+    const authority = await openStore(root, root);
     for (let step = 0; step < 20; step += 1) await authority.put({ key: `k/${step}`, value: step, identity });
     const before = authority.exportState();
     const projector = await openProjector(root, { mode: "sqlite", checkpointMs: 10 });

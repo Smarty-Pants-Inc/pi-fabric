@@ -8,7 +8,7 @@ import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError }
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import type { MeshIdentity } from "./event-log.js";
-import type { MeshCommitEffects, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
+import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
 // writes, revisions, tombstones, namespaces, the read signal and write snapshots.
@@ -450,6 +450,18 @@ export class MeshStateFileReadChangedError extends Error {
 
 /** Internal: a fileRead stamp did not hold inside the transaction; the backend re-reads and retries. */
 export const FILE_READ_CHANGED: Error = new Error("Fabric mesh fileRead stamp changed");
+
+/**
+ * Internal: runs `fileRead.read()` bracketed by two stamps. Differing stamps mean a file changed
+ * during the read, so the value may be older than any stamp taken afterwards: returns undefined and
+ * the caller retries. Otherwise returns the value with the PRE-read stamp, the one the transaction
+ * re-checks (a stamp taken only after the read could pair an old read with a newer file).
+ */
+export const bracketFileRead = (fileRead: MeshStateFileRead): { value: unknown; stamp: string | undefined } | undefined => {
+  const stamp = fileRead.stamp();
+  const value = fileRead.read();
+  return fileRead.stamp() === stamp ? { value, stamp } : undefined;
+};
 
 // A copy of a committed state, readable after the transaction (commitOutbox effects).
 const detachedView = (state: MeshStateFile): MeshBatchView => ({
@@ -1046,18 +1058,21 @@ export class StateFile implements StateBackend {
   // Returns one result per operation, in order.
   // R11 (L2a): fileRead runs before the lock and its stamp is re-checked under it; commitOutbox
   // runs after the lock is released (see StateBackendBatchInput in state-backend.ts).
-  async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
+  // `committed` (internal, the shadow backend's mirror) receives the changed keys right after the
+  // state file commit, before afterCommit/commitOutbox, so a throwing callback cannot hide a commit.
+  async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
-      const fileValue = fileRead?.read();
-      const stamp = fileRead?.stamp();
+      const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       let outcome: { results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> };
       try {
-        outcome = await this.#writeBatchOnce(input, caller, fileValue, fileRead ? () => fileRead.stamp() === stamp : undefined);
+        if (fileRead && !bracket) throw FILE_READ_CHANGED;
+        outcome = await this.#writeBatchOnce(input, caller, bracket?.value,
+          fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed);
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
         if (attempt >= retries) throw new MeshStateFileReadChangedError(attempt + 1);
@@ -1069,7 +1084,7 @@ export class StateFile implements StateBackend {
   }
 
   #writeBatchOnce(input: StateBackendBatchInput, caller: string[] | undefined, fileValue: unknown,
-    stampHolds: (() => boolean) | undefined): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
+    stampHolds: (() => boolean) | undefined, committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
     return this.#withWriteSnapshot(snapshot => {
       const omitted = new Set(input.ops.map(op => op.key));
       const reuse = new Map(snapshot.reuse);
@@ -1155,7 +1170,9 @@ export class StateFile implements StateBackend {
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller, namespaces);
+        const changedKeys = results.filter(result => result.applied).map(result => result.key);
+        this.#commitState(state, reuse, changedKeys, caller, namespaces);
+        committed?.(changedKeys);
       }
       input.afterCommit?.(view);
       if (!input.commitOutbox) return { results };

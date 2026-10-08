@@ -29,7 +29,7 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
-import { FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
+import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
 import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteStateStoreOptions } from "./state-sqlite.js";
 
@@ -59,10 +59,12 @@ export interface MeshStateBusy extends MeshLockTimeoutError {
 
 /**
  * R11, file reads a write needs. They run BEFORE the transaction begins (`BEGIN IMMEDIATE`, or the
- * `.lock` acquisition of the file backend), never inside it. `stamp()` is captured right after
- * `read()` and checked AGAIN inside the transaction, before `prepare`: a different stamp means a
- * file changed in between, so the backend rolls back, re-runs `read()` outside the transaction and
- * retries (at most `retries` times, default 3; then it throws `MeshStateFileReadChangedError`).
+ * `.lock` acquisition of the file backend), never inside it. `stamp()` is taken right before AND
+ * right after `read()`: differing stamps mean a file changed during the read, so the read is
+ * discarded and retried. The pre-read stamp is checked AGAIN inside the transaction, before
+ * `prepare`: a different stamp means a file changed in between, so the backend rolls back, re-runs
+ * the bracketed `read()` outside the transaction and retries (at most `retries` times in total,
+ * default 3; then it throws `MeshStateFileReadChangedError`).
  * `stamp` must be cheap and synchronous (a `stat`, never a parse). Both run synchronously.
  */
 export interface MeshStateFileRead<F = unknown> {
@@ -96,7 +98,7 @@ export interface MeshCommitEffects {
  * meaning; `fileRead` and `commitOutbox` are the R11 additions.
  *
  * Transaction and callback semantics (every backend):
- * 1. `fileRead.read()` (if any) runs before the transaction; see `MeshStateFileRead`.
+ * 1. `fileRead.read()` (if any) runs before the transaction, bracketed by stamps; see `MeshStateFileRead`.
  * 2. The transaction begins: the `.lock` (file) or `BEGIN IMMEDIATE` (sqlite).
  * 3. `fileRead.stamp()` is re-checked; a mismatch rolls back and goes to 1.
  * 4. `prepare(view, fileReadValue)` runs synchronously on the ONE authoritative snapshot of this
@@ -430,15 +432,15 @@ export class SqliteStateBackend implements StateBackend {
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
-      const fileValue = fileRead?.read();
-      const stamp = fileRead?.stamp();
+      const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       const userPrepare = input.prepare;
       const prepare = fileRead || userPrepare ? (view: MeshBatchView): MeshBatchOperation[] => {
-        if (fileRead && fileRead.stamp() !== stamp) throw FILE_READ_CHANGED;
-        return userPrepare?.(view, fileValue) ?? [];
+        if (fileRead && (!bracket || fileRead.stamp() !== bracket.stamp)) throw FILE_READ_CHANGED;
+        return userPrepare?.(view, bracket?.value) ?? [];
       } : undefined;
       let results: MeshBatchResult[];
       try {
+        if (fileRead && !bracket) throw FILE_READ_CHANGED;
         results = await this.#write((store) => store.writeBatch({
           identity: input.identity, ops: input.ops,
           ...(prepare ? { prepare } : {}),
@@ -709,9 +711,15 @@ export class ShadowStateBackend implements StateBackend {
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
     const outbox = input.commitOutbox;
-    const results = await this.#file.writeBatch(outbox ? { ...input, commitOutbox: (effects) => outbox({ ...effects, backend: "shadow" }) } : input);
-    this.#enqueue(results.filter((result) => result.applied).map((result) => result.key));
-    return results;
+    // Captured at the file commit, before afterCommit/commitOutbox run: a throwing callback rejects
+    // this call, but the commit stands, so its keys are mirrored whenever the file committed.
+    let committed: readonly string[] = [];
+    try {
+      return await this.#file.writeBatch(outbox ? { ...input, commitOutbox: (effects) => outbox({ ...effects, backend: "shadow" }) } : input,
+        (changed) => { committed = changed; });
+    } finally {
+      this.#enqueue(committed);
+    }
   }
 
   confirmWritable(onAcquired?: (at: number) => void): Promise<void> { return this.#file.confirmWritable(onAcquired); }

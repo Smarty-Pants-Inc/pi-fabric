@@ -159,15 +159,16 @@ describe("file and sqlite give identical reads for the same operation sequence",
 describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (kind) => {
   it("re-reads when the fileRead stamp changes before the transaction and gives prepare the fresh read", async () => {
     const store = open(tempRoot(`fileread-${kind}`), { stateBackend: kind });
-    let generation = 0;
+    let stamps = 0;
     let reads = 0;
     const seen: unknown[] = [];
     const results = await store.writeBatch({
       identity, ops: [],
       fileRead: {
         read: () => { reads += 1; return `read-${reads}`; },
-        // The first stamp goes stale before the transaction re-checks it.
-        stamp: () => (reads === 1 ? `s${generation++}` : "stable"),
+        // The first read's bracket (stamps 1 and 2) holds; the file changes before the transaction
+        // re-checks it (stamp 3), so the read is redone once.
+        stamp: () => ((stamps += 1) <= 2 ? "before" : "after"),
       },
       prepare: (_view, value) => { seen.push(value); return [{ kind: "put", key: "k", value }]; },
     });
@@ -175,6 +176,33 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
     expect(seen).toEqual(["read-2"]);
     expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
     expect(store.get("k")?.value).toBe("read-2");
+  });
+
+  it("a write between read() and the stamp forces a retry and never commits the stale read", async () => {
+    const root = tempRoot(`fileread-race-${kind}`);
+    const source = path.join(root, "source.txt");
+    fs.writeFileSync(source, "v1");
+    let reads = 0;
+    const seen: unknown[] = [];
+    const store = open(root, { stateBackend: kind });
+    const results = await store.writeBatch({
+      identity, ops: [],
+      fileRead: {
+        read: () => {
+          reads += 1;
+          const value = fs.readFileSync(source, "utf8");
+          // A concurrent writer lands after the read returned, before any later stamp.
+          if (reads === 1) fs.writeFileSync(source, "v2");
+          return value;
+        },
+        stamp: () => fs.readFileSync(source, "utf8"),
+      },
+      prepare: (_view, value) => { seen.push(value); return [{ kind: "put", key: "k", value }]; },
+    });
+    expect(reads).toBe(2);
+    expect(seen).toEqual(["v2"]);
+    expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
+    expect(store.get("k")?.value).toBe("v2");
   });
 
   it("gives up with MeshStateFileReadChangedError and writes nothing when the stamp never holds", async () => {
@@ -322,6 +350,25 @@ describe("shadow backend", () => {
     await shadow.repair();
     expect(await shadow.verify()).toEqual([]);
     expect(shadow.shadow.get("a")?.value).toBe("foreign");
+  });
+
+  it("mirrors a committed batch even when afterCommit or commitOutbox throws", async () => {
+    const store = open(tempRoot("shadow-callback-throw"), { stateBackend: "shadow" });
+    const shadow = shadowOf(store);
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "a", value: 1 }],
+      afterCommit: () => { throw new Error("after down"); } })).rejects.toThrow("after down");
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "b", value: 2 }],
+      commitOutbox: () => { throw new Error("outbox down"); } })).rejects.toThrow("outbox down");
+    expect(store.get("a")?.value).toBe(1);
+    expect(store.get("b")?.value).toBe(2);
+    await shadow.flush();
+    expect(shadow.shadow.listAll("").map(entry => [entry.key, entry.value])).toEqual([["a", 1], ["b", 2]]);
+    expect(await shadow.verify()).toEqual([]);
+    // A rejected batch (nothing committed) mirrors nothing.
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "c", value: 3, ifVersion: 9 }] }))
+      .rejects.toBeInstanceOf(MeshBatchConflictError);
+    await shadow.flush();
+    expect(shadow.shadow.get("c")).toBeUndefined();
   });
 
   it("seeds the shadow from the existing file state on first use", async () => {

@@ -412,11 +412,13 @@ describe("mesh writer census", () => {
   });
 
   it("opens a sqlite or shadow backend when the census record cannot be written (advisory, smarty-dev#6982)", async () => {
-    const mesh = root();
-    // A regular file where the record directory belongs: every attempt fails.
-    fs.writeFileSync(path.join(mesh, ".writer-census"), "");
     const mkdir = vi.spyOn(fs, "mkdirSync");
     for (const stateBackend of ["sqlite", "shadow"] as const) {
+      // One root per backend: a sqlite store flags state.db backend=sqlite, which fences a later
+      // shadow (file-authority) writer of the same root (smarty-dev#6477 W1 file-write guard).
+      const mesh = root();
+      // A regular file where the record directory belongs: every attempt fails.
+      fs.writeFileSync(path.join(mesh, ".writer-census"), "");
       mkdir.mockClear();
       const store = new MeshStore(mesh, 4096, 100, { stateBackend });
       try {
@@ -788,25 +790,28 @@ describe("mesh writer census", () => {
   });
 
   it("changes no store behaviour on unknown evidence, and nothing in src consumes the census", async () => {
-    const mesh = root();
-    fs.mkdirSync(path.join(mesh, ".writer-census"));
-    fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
-    writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
-    expect((await census(mesh)).unknown.length).toBeGreaterThan(0);
     for (const stateBackend of ["file", "sqlite", "shadow"] as const) {
+      // One root per backend: sqlite flags state.db, which fences a later shadow writer (W1 guard).
+      const mesh = root();
+      fs.mkdirSync(path.join(mesh, ".writer-census"));
+      fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
+      writeRecord(mesh, { pid: deadPid(), host: "other-host.example", startedAt: Date.now() - 1000 });
+      expect((await census(mesh)).unknown.length).toBeGreaterThan(0);
       const store = new MeshStore(mesh, 4096, 100, { stateBackend });
       try {
         await store.put({ key: `census/${stateBackend}`, value: 1, identity });
         expect(store.get(`census/${stateBackend}`)?.value).toBe(1);
       } finally { store.closeState(); }
     }
-    // No startup, CLI or migration path imports the census: it can only be called for a report.
+    // No startup or migration path imports the census: it can only be called for a report. The one
+    // importer is the operator CLI, which only prints it as "advisory: N writers, M unknown" (org
+    // decision 10-08: the cutover is fenced on .lock and custody.lock, never on the census).
     const importers = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
       const file = path.join(dir, entry.name);
       if (entry.isDirectory()) return importers(file);
       return /\.[cm]?ts$/.test(entry.name) && file !== path.join("src", "mesh", "writer-census.ts") &&
         /writer-census\.js["']/.test(fs.readFileSync(file, "utf8")) ? [file] : [];
     });
-    expect(importers("src")).toEqual([]);
+    expect(importers("src")).toEqual([path.join("src", "mesh", "mesh-backend-cli.ts")]);
   });
 });

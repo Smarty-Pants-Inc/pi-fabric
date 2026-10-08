@@ -11,9 +11,15 @@
  *   roll-back (flag BEFORE marker removal): exporting E+1, export and verify, commit backend=file, THEN replace the marker; abort restores the marker before exporting -> sqlite.
  *   Hence, at every crash point, backend=sqlite implies the marker, and a missing marker implies state.json is the authority (each sequence runs under ONE `.lock` hold).
  *
- * Rollback commit order, all under ONE `.lock` hold after the census (each step is a crash point;
- * a rerun converges from the stored flag and the marker):
- *   1. The census shows no writer left (or the operator attests it with `assumeNoWriters`).
+ * The fence is `.lock` plus `custody.lock` (smarty-dev#6477, org decision 10-08): every mutating
+ * operation (import, cutover, rollback, abort-rollback) holds both, custody first, for its whole
+ * section. The writer census (writer-census.ts) is ADVISORY (smarty-dev#6982): when a provider is
+ * given it runs once inside the fence and its report ("advisory: N writers, M unknown") is returned
+ * and passed to `onAdvisory`; it never blocks, permits or changes an operation.
+ *
+ * Rollback commit order, all under ONE fence hold (each step is a crash point; a rerun converges
+ * from the stored flag and the marker):
+ *   1. The operator stops every v3 writer and the projector (the advisory census informs, it proves nothing).
  *   2. Flag: one BEGIN IMMEDIATE transaction at synchronous=FULL checks backend=sqlite at epoch E,
  *      sets backend=exporting and epoch=E+1. state-sqlite.ts writers check the flag after BEGIN
  *      IMMEDIATE and fail closed (MeshStateRetiredError), so nothing commits after this point.
@@ -37,8 +43,8 @@
  * database epoch, backend=file at another epoch, an unknown flag, a missing state.db under an
  * epoch-stamped state.json) fails closed with `MeshBackendFenceError` and an alarm.
  *
- * Import (file -> sqlite, also the roll forward) runs the cutover section below (census or
- * `assumeNoWriters`, `.lock` held throughout, the marker last). Its core: under the mesh `.lock` (no file-mode writer can
+ * Import (file -> sqlite, also the roll forward) runs the cutover section below (`.lock` and
+ * `custody.lock` held throughout, the marker last). Its core: under the mesh `.lock` (no file-mode writer can
  * commit), state.json is read through the normal decoder and cross-checked against the store's own
  * read path (which follows the read journal), then written into state.db in ONE transaction that
  * replaces kv, tombstones and the change feed, sets backend=importing and epoch=E+1 (not authoritative:
@@ -52,10 +58,10 @@
  * backend=file, epoch 0 (the legacy file authority), never at an authoritative empty sqlite.
  *
  * Cutover holds the mesh `.lock` for the WHOLE critical section (file-mode writers serialize on it, so
- * none commits inside): census (no writer outside the cutover modes) -> read state.json (generation
- * and digest G0) -> import at backend=importing E+1 (BEGIN IMMEDIATE, FULL), digest verification -> second
- * census -> state.json re-read against G0 -> copy, marker -> backend=sqlite. Only then is `.lock` released. A file-mode writer seen by
- * the second census (or a failed census, or a state.json that moved) fails the cutover: the rollback
+ * none commits inside; `custody.lock` is held too): advisory census -> read state.json (generation
+ * and digest G0) -> import at backend=importing E+1 (BEGIN IMMEDIATE, FULL), digest verification ->
+ * state.json re-read against G0 -> copy, marker -> backend=sqlite. Only then are the locks released. A state.json that
+ * moved (a writer that ignored `.lock`) fails the cutover: the rollback
  * fence runs under the same `.lock` back to backend=file at E+2 and the error is thrown
  * (MeshCutoverFailedError); a cutover never succeeds "with an alarm". On success, before `.lock` is
  * released, cutover copies state.json to `state.json.cutover-<E+1>` (fsync), atomically replaces
@@ -67,11 +73,11 @@
  * re-exported here): StateFile calls it on every commit under `.lock`, right before the state.json
  * rename, so a refused write leaves state.json untouched.
  * ponytail: an OLD tolerant reader (recoverDamage=true) sees an empty mesh after cutover. Accepted:
- * the census admits no old process into a cutover, and the marker exists only while backend=sqlite.
+ * the operator stops old processes before a cutover, and the marker exists only while backend=sqlite.
  *
- * Lock order: this tool is the one place where `.lock` is held around a state transaction
- * (R20). Its own connection uses a synchronous busy handler (default 5 s): it is a dedicated
- * process and the census stopped every writer, so it never freezes a session's event loop.
+ * Lock order: custody, then `.lock` (as withMeshCustody). This tool is the one place where `.lock`
+ * is held around a state transaction (R20). Its own connection uses a synchronous busy handler
+ * (default 5 s): it is a dedicated process, so it never freezes a session's event loop.
  * Schema knowledge (tables, meta keys, the byte accounting) mirrors state-sqlite.ts; the tests
  * check both against a store-created database.
  */
@@ -83,6 +89,7 @@ import { storageRevision } from "../verified/storage.js";
 import { assertFileStateWritable, encodeMeshStateMovedMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf, readMeshStateMovedMarker,
   readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
+import { acquireMeshCustodyLock } from "./custody-lock.js";
 import { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
@@ -100,19 +107,30 @@ export type MeshBackendStep =
   | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
-/** Provided by the census lane (writer-census.ts): every live process that may write the root. */
-export type MeshWriterCensus = () => Promise<{ writers: MeshCensusWriter[] }>;
+/** Provided by the census lane (writer-census.ts): the writers it attributed and the evidence it could not. */
+export type MeshWriterCensus = () => Promise<{ writers: MeshCensusWriter[]; unknown?: MeshCensusWriter[] }>;
+
+/** What one run saw from the census: ADVISORY only (smarty-dev#6982), never a verdict or a gate. */
+export interface MeshCensusAdvisory {
+  writers: MeshCensusWriter[];
+  unknown: MeshCensusWriter[];
+  /** The census itself failed; the operation went ahead regardless. */
+  error?: string;
+}
+
+/** "advisory: N writers, M unknown": never "safe" or "clean" (an empty report proves nothing). */
+export const describeCensusAdvisory = (advisory: MeshCensusAdvisory): string => advisory.error !== undefined
+  ? `advisory: census failed (${advisory.error})`
+  : `advisory: ${advisory.writers.length} writer${advisory.writers.length === 1 ? "" : "s"}, ${advisory.unknown.length} unknown`;
 
 export interface MeshBackendOptions {
-  /** The writer census. Cutover and rollback refuse without it unless `assumeNoWriters`. */
+  /** The writer census: ADVISORY. Run once per operation, reported, never blocks or permits it. */
   census?: MeshWriterCensus;
-  /** Operator attestation that no process writes the root (no census lane available). */
-  assumeNoWriters?: boolean;
-  /** Census modes a cutover accepts; any other mode (`file` above all) refuses. Default sqlite, auto. */
-  cutoverModes?: readonly string[];
+  /** Receives the advisory census report of each operation (logs, the CLI). Never throws into it. */
+  onAdvisory?: (advisory: MeshCensusAdvisory) => void;
   /** The mesh `.lock` protocol of the fleet. Default 1 (as mesh-bridge). */
   lockProtocol?: 1 | 2;
-  /** Budget for the mesh `.lock`. Default 60 s. */
+  /** Budget for each fence lock (`custody.lock`, then `.lock`). Default 60 s. */
   lockTimeoutMs?: number;
   /** Synchronous SQLite busy handler of the tool's own connection. Default 5,000 ms. */
   busyTimeoutMs?: number;
@@ -127,19 +145,18 @@ export interface MeshBackendOptions {
 }
 
 /**
- * A cutover found a file-mode writer (or a moved state.json, or no census) inside its critical
+ * A cutover found a moved state.json (a writer that ignored `.lock`) inside its critical
  * section: it did not succeed. `rollback` is the fence run back to backend=file (absent when the
  * flag never moved or the rollback itself failed; rerun `rollback` then).
  */
 export class MeshCutoverFailedError extends MeshBackendFenceError {
-  constructor(message: string, readonly lateWriters: MeshCensusWriter[], readonly rollback?: MeshRollbackResult,
-    readonly conflictFile?: string) {
+  constructor(message: string, readonly rollback?: MeshRollbackResult, readonly conflictFile?: string) {
     super(message);
     this.name = "MeshCutoverFailedError";
   }
 }
 
-/** A precondition (census, flag) refuses the operation; nothing was changed. */
+/** A precondition (flag, root) refuses the operation; nothing was changed. */
 export class MeshBackendRefusedError extends Error {
   readonly code = "FABRIC_MESH_BACKEND_REFUSED";
   constructor(message: string) {
@@ -173,7 +190,10 @@ export interface MeshImportResult {
 }
 
 export interface MeshCutoverResult extends MeshImportResult {
+  /** The advisory census writers (empty without a provider); informational only. */
   writers: MeshCensusWriter[];
+  /** The advisory census report, when a provider ran. */
+  census?: MeshCensusAdvisory;
   /** The retired state.json, kept at `state.json.cutover-<epoch>`; state.json is now the moved marker. */
   stateCopy: string;
 }
@@ -187,6 +207,8 @@ export interface MeshRollbackResult {
   /** Steps this run executed (a rerun starts from the stored flag). */
   steps: number[];
   converged: boolean;
+  /** The advisory census report, when a provider ran. */
+  census?: MeshCensusAdvisory;
 }
 
 export interface MeshAbortRollbackResult { root: string; backend: "sqlite"; epoch: number; converged: boolean }
@@ -210,7 +232,9 @@ export interface MeshBackendStatus {
   reader: { source: "sqlite" | "file" } | { error: string };
   /** File epoch <= database epoch; with backend=file equal. */
   fenceHolds: boolean;
+  /** Advisory census (never part of the fence verdict). */
   writers?: MeshCensusWriter[];
+  unknownWriters?: MeshCensusWriter[];
   censusError?: string;
 }
 
@@ -224,7 +248,6 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_BUSY_MS = 5_000;
 const DEFAULT_LOCK_MS = 60_000;
 const ENVELOPE_BYTES = 256;
-const DEFAULT_CUTOVER_MODES = ["sqlite", "auto"];
 // Mirrors state-sqlite.ts (schema 1). The tests compare it with a store-created database.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta(name TEXT PRIMARY KEY NOT NULL, value) WITHOUT ROWID;
@@ -511,15 +534,18 @@ const maxBytesOf = (options: MeshBackendOptions): number => Math.max(1, Math.flo
 const meshLock = (root: string, options: MeshBackendOptions): MeshLock =>
   new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, () => undefined);
 
-const withMeshLock = <T>(root: string, options: MeshBackendOptions, operation: (lock: MeshLock) => T): Promise<T> => {
-  const lock = meshLock(root, options);
-  return lock.withLock(() => operation(lock), options.lockTimeoutMs ?? DEFAULT_LOCK_MS, "other");
-};
-
-/** `.lock` held across awaits (the cutover's census): this tool is a dedicated process. */
-const holdMeshLock = <T>(root: string, options: MeshBackendOptions, operation: (lock: MeshLock) => Promise<T>): Promise<T> => {
-  const lock = meshLock(root, options);
-  return lock.withLockAcrossAwait(() => operation(lock), options.lockTimeoutMs ?? DEFAULT_LOCK_MS, "other");
+/**
+ * The migration fence (smarty-dev#6477, org decision 10-08): `custody.lock` then `.lock` (the
+ * order of withMeshCustody), both held across awaits for the whole section; this tool is a
+ * dedicated process. Nothing else gates a mutating operation: the census is advisory.
+ */
+const holdFence = async <T>(root: string, options: MeshBackendOptions, operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
+  const timeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_MS;
+  const releaseCustody = await acquireMeshCustodyLock(root, timeoutMs);
+  try {
+    const lock = meshLock(root, options);
+    return await lock.withLockAcrossAwait(async () => operation(lock), timeoutMs, "other");
+  } finally { releaseCustody(); }
 };
 
 const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
@@ -541,29 +567,24 @@ export const readStateFileEpoch = (root: string, options: Pick<MeshBackendOption
 const alarm = (options: MeshBackendOptions, root: string, message: string, detail: Partial<MeshBackendAlarm> = {}): MeshBackendFenceError =>
   meshFenceAlarm(options, root, message, detail);
 
-const censusWriters = async (options: MeshBackendOptions): Promise<MeshCensusWriter[] | undefined> => {
+/**
+ * The advisory census (smarty-dev#6982): run the provider once, report what it saw. It never throws
+ * and its result never decides anything; a failed census is reported as such and the operation
+ * goes ahead on the fence alone. Undefined without a provider.
+ */
+const adviseCensus = async (options: MeshBackendOptions): Promise<MeshCensusAdvisory | undefined> => {
   if (!options.census) return undefined;
-  const result = await options.census();
-  if (!result || !Array.isArray(result.writers)) throw new MeshBackendRefusedError("The writer census returned no writer list");
-  return result.writers.filter(writer => writer.pid !== process.pid);
-};
-
-const describeWriters = (writers: MeshCensusWriter[]): string =>
-  writers.map(writer => `pid ${writer.pid} (${writer.mode}, ${writer.release})`).join(", ");
-
-const censusMissing = (operation: string, need: string): MeshBackendRefusedError =>
-  new MeshBackendRefusedError(`${operation} needs the writer census (${need}); without one pass --assume-no-writers after stopping every writer`);
-
-const requireCensus = async (options: MeshBackendOptions, operation: string,
-  refuses: (writer: MeshCensusWriter) => boolean, need: string): Promise<MeshCensusWriter[]> => {
-  const writers = await censusWriters(options);
-  if (writers === undefined) {
-    if (options.assumeNoWriters) return [];
-    throw censusMissing(operation, need);
+  const others = (list: unknown): MeshCensusWriter[] =>
+    Array.isArray(list) ? (list as MeshCensusWriter[]).filter(writer => writer?.pid !== process.pid) : [];
+  let advisory: MeshCensusAdvisory;
+  try {
+    const result = await options.census();
+    advisory = { writers: others(result?.writers), unknown: others(result?.unknown) };
+  } catch (error) {
+    advisory = { writers: [], unknown: [], error: error instanceof Error ? error.message : String(error) };
   }
-  const offenders = writers.filter(refuses);
-  if (offenders.length > 0) throw new MeshBackendRefusedError(`${operation} refused: the census shows ${describeWriters(offenders)} (${need})`);
-  return writers;
+  try { options.onAdvisory?.(advisory); } catch { /* a log sink never changes the operation */ }
+  return advisory;
 };
 
 const fsyncDirectory = (directory: string): void => {
@@ -725,42 +746,34 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
 
 /**
  * Import (file -> sqlite, also the roll forward) and cutover are ONE fenced section (pi-fabric#627
- * review round 4): an import commits backend=sqlite, so it needs the census (or the operator's
- * `assumeNoWriters`) exactly like cutover, holds `.lock` throughout, and installs the moved marker
+ * review round 4): an import commits backend=sqlite, so it holds the same fence as cutover
+ * (`.lock` and `custody.lock` throughout; the census only advises), and installs the moved marker
  * BEFORE it commits backend=sqlite (review round 5), so a legacy file-mode writer can never commit
  * to a state.json that readers ignore, even after a crash.
  */
 export const importMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
-  fencedCutover(root, options, "import");
+  fencedCutover(root, options);
 
 /**
- * Cutover: one critical section under the mesh `.lock` (file-mode writers serialize on it):
- * census -> G0 -> import at backend=importing E+1 -> verify -> second census -> state.json against G0 ->
- * the moved marker -> backend=sqlite. A file-mode writer (or a moved state.json) found after the import
- * fails the cutover and runs the rollback fence back to backend=file at E+2 before `.lock` is released.
+ * Cutover: one critical section fenced on `custody.lock` and the mesh `.lock` (file-mode writers
+ * serialize on it): advisory census -> G0 -> import at backend=importing E+1 -> verify -> state.json
+ * against G0 -> the moved marker -> backend=sqlite. A moved state.json found after the import fails the
+ * cutover and runs the rollback fence back to backend=file at E+2 before the locks are released.
+ * The census never gates it (smarty-dev#6982): its report is returned and passed to `onAdvisory`.
  */
 export const cutoverMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
-  fencedCutover(root, options, "cutover");
+  fencedCutover(root, options);
 
-const fencedCutover = async (root: string, options: MeshBackendOptions, operation: "import" | "cutover"): Promise<MeshCutoverResult> => {
+const fencedCutover = async (root: string, options: MeshBackendOptions): Promise<MeshCutoverResult> => {
   root = path.resolve(root);
-  const modes = new Set(options.cutoverModes ?? DEFAULT_CUTOVER_MODES);
-  const refuses = (writer: MeshCensusWriter): boolean => !modes.has(writer.mode);
-  const need = `no writer outside ${[...modes].join("/")} mode`;
-  if (!options.census && !options.assumeNoWriters) throw censusMissing(operation, need);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
-  return holdMeshLock(root, options, async (lock) => {
-    const writers = await requireCensus(options, operation, refuses, need);
+  return holdFence(root, options, async (lock) => {
+    const census = await adviseCensus(options);
     const fence = FenceDb.open(root, options, "write", true)!;
     try {
       // G0, import, flag at E+1 and verification; a state.json that moved before COMMIT aborts it.
       const imported = importUnderLock(root, options, fence, lock);
       const failures: string[] = [];
-      let lateWriters: MeshCensusWriter[] = [];
-      try {
-        lateWriters = ((await censusWriters(options)) ?? []).filter(refuses);
-        if (lateWriters.length > 0) failures.push(`the second census shows ${describeWriters(lateWriters)}`);
-      } catch (error) { failures.push(`the second census failed (${(error as Error).message})`); }
       let conflictFile: string | undefined;
       // A rerun after the marker: the reconcile ran before it, and the marker is not state.
       const moved = readMeshStateMovedMarker(root)?.epoch === imported.epoch;
@@ -779,7 +792,7 @@ const fencedCutover = async (root: string, options: MeshBackendOptions, operatio
         const stateCopy = path.join(root, `${STATE_JSON}.cutover-${imported.epoch}`);
         if (!moved) retireStateFile(root, options, imported.epoch, stateCopy);
         commitRollForward(root, options, fence, imported);
-        return { ...imported, writers, stateCopy };
+        return { ...imported, writers: census?.writers ?? [], ...(census ? { census } : {}), stateCopy };
       }
       const reason = failures.join("; ");
       try {
@@ -790,10 +803,10 @@ const fencedCutover = async (root: string, options: MeshBackendOptions, operatio
       try { rollback = rollbackUnderLock(root, options, fence, lock); }
       catch (error) {
         throw new MeshCutoverFailedError(`Fabric mesh cutover failed: ${reason}; the rollback to backend=file did not complete `
-          + `(${(error as Error).message}): rerun rollback`, lateWriters, undefined, conflictFile);
+          + `(${(error as Error).message}): rerun rollback`, undefined, conflictFile);
       }
       throw new MeshCutoverFailedError(`Fabric mesh cutover failed: ${reason}; rolled back to backend=file at epoch ${rollback.epoch}`
-        + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), lateWriters, rollback, conflictFile);
+        + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), rollback, conflictFile);
     } finally { fence.close(); }
   });
 };
@@ -856,8 +869,8 @@ const writeMovedMarker = (root: string, epoch: number): void => {
  * Rollback (pi-fabric#627 review round 4) keeps ONE invariant: while the moved marker is state.json,
  * legacy writers fail closed (their strict read throws "invalid state format") and new ones are
  * refused (the reader rule reads SQLite); the marker is removed only by the very last step, after
- * backend=file is committed. Under one `.lock` hold:
- *   (1) census (outside `.lock`, before the flag); the marker is put in place if state.json is not it;
+ * backend=file is committed. Under one fence hold (`custody.lock`, then `.lock`):
+ *   (1) the operator stopped every writer (the advisory census only reports); the marker is put in place if state.json is not it;
  *   (2) flag sqlite -> exporting at E+1 (BEGIN IMMEDIATE, FULL): sqlite-mode writers fail closed;
  *   (3) export to `state.json.rollback-<E+1>.tmp`, fsync it and the directory, and verify it by
  *       reading it back (epoch, generation, recorded digest, file digest = database digest);
@@ -1000,10 +1013,10 @@ const rollbackReplace = (root: string, options: MeshBackendOptions, temporary: s
 };
 
 /**
- * Steps 2 to 5 (and the reruns) under a `.lock` the caller holds. `censused`: step 1 ran for this
- * flag, so backend=sqlite may be flagged (a failed cutover holds `.lock` since its own census).
+ * Steps 2 to 5 (and the reruns) under the fence the caller holds. `fromCutover`: a failed cutover
+ * rolls back its own backend=importing; a standalone rollback refuses an interrupted import instead.
  */
-const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, steps: number[], censused: boolean):
+const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, steps: number[], fromCutover: boolean):
   MeshRollbackResult => {
   let meta = fence.meta();
   const done = (exported: ExportMark, converged: boolean): MeshRollbackResult =>
@@ -1027,11 +1040,10 @@ const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceD
     verifyExport(root, options, fence, lock, recorded);
     return done(recorded, false);
   }
-  if (meta.backend === "importing" && !censused) {
+  if (meta.backend === "importing" && !fromCutover) {
     throw new MeshBackendRefusedError(`Fabric mesh backend=importing at epoch ${meta.epoch}: an import or cutover was interrupted; rerun it (or roll it back by rerunning after it completes)`);
   }
   if (meta.backend === "sqlite" || meta.backend === "importing") {
-    if (!censused) throw new MeshBackendRefusedError(`Fabric mesh rollback raced: backend=sqlite at epoch ${meta.epoch} without a census`);
     // A state.json that is not the marker (an older tool, a failed cutover) is not authority under sqlite;
     // a failed cutover at importing exports the state it imported (a conflicting state.json is kept aside).
     ensureMovedMarker(root, meta.epoch);
@@ -1054,7 +1066,7 @@ const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceD
   return done(exported, false);
 };
 
-/** A failed cutover's way back to file, under its held `.lock` (its census was step 1). */
+/** A failed cutover's way back to file, under its held fence. */
 const rollbackUnderLock = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock): MeshRollbackResult => {
   const meta = fence.meta();
   if (meta.backend !== "sqlite" && meta.backend !== "importing") {
@@ -1070,19 +1082,18 @@ export const rollbackMeshState = async (root: string, options: MeshBackendOption
   const fence = FenceDb.open(root, options, "write");
   if (!fence) throw new MeshBackendRefusedError(`No state.db at ${root}: the root is on the file backend`);
   try {
-    const steps: number[] = [];
-    if (fence.meta().backend === "sqlite") {
-      // Step 1: no writer, no projector.
-      await requireCensus(options, "rollback", () => true, "every v3 writer and the projector stopped");
-      steps.push(1);
-    }
-    return await withMeshLock(root, options, lock => rollbackLocked(root, options, fence, lock, steps, steps.includes(1)));
+    return await holdFence(root, options, async lock => {
+      const census = await adviseCensus(options);
+      // Step 1 is the operator's (every v3 writer and the projector stopped); the census only reports.
+      const steps: number[] = fence.meta().backend === "sqlite" ? [1] : [];
+      return { ...rollbackLocked(root, options, fence, lock, steps, false), ...(census ? { census } : {}) };
+    });
   } finally { fence.close(); }
 };
 
 /**
- * `exporting` back to `sqlite`, keeping epoch E+1 (stores opened at E reopen). `.lock` is taken
- * FIRST; the marker is ensured (restored if anything replaced it) before the flag moves, so no
+ * `exporting` back to `sqlite`, keeping epoch E+1 (stores opened at E reopen). The fence
+ * (`custody.lock`, `.lock`) is taken FIRST; the marker is ensured (restored if anything replaced it) before the flag moves, so no
  * legacy writer queued on `.lock` ever sees a real state.json while SQLite is the authority.
  */
 export const abortMeshRollback = async (root: string, options: MeshBackendOptions = {}): Promise<MeshAbortRollbackResult> => {
@@ -1090,7 +1101,7 @@ export const abortMeshRollback = async (root: string, options: MeshBackendOption
   const fence = FenceDb.open(root, options, "write");
   if (!fence) throw new MeshBackendRefusedError(`No state.db at ${root}`);
   try {
-    return await withMeshLock(root, options, () => {
+    return await holdFence(root, options, () => {
       const meta = fence.meta();
       const converged = meta.backend === "sqlite" && Number(meta.values.get("aborted_rollback_epoch")) === meta.epoch;
       if (!converged && meta.backend !== "exporting") {
@@ -1149,10 +1160,9 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
   const { onAlarm: _quiet, ...quiet } = options;
   try { status.reader = { source: resolveMeshStateSource(root, quiet).source }; }
   catch (error) { status.reader = { error: (error as Error).message }; }
-  try {
-    const writers = await censusWriters(options);
-    if (writers) status.writers = writers;
-  }
-  catch (error) { status.censusError = (error as Error).message; }
+  // Advisory only: the census never enters fenceHolds or the reader decision.
+  const census = await adviseCensus(options);
+  if (census?.error !== undefined) status.censusError = census.error;
+  else if (census) { status.writers = census.writers; status.unknownWriters = census.unknown; }
   return status;
 };

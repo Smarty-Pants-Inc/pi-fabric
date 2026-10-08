@@ -79,7 +79,7 @@ const run = async (...argv: string[]): Promise<{ code: number; out: string; err:
 };
 
 describe("fabric-mesh-backend with the writer census (W1)", () => {
-  it("census -> cutover refused while a file writer lives -> cutover -> sqlite reads -> rollback -> file reads, no lost write", async () => {
+  it("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-"));
     roots.push(root);
     const operator = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -87,25 +87,27 @@ describe("fabric-mesh-backend with the writer census (W1)", () => {
     const writer = startWriter(root);
     await writer.send("put keep/writer-1 11");
 
-    // The live writer of this release is a verified local file-mode writer.
+    // The census is advisory (smarty-dev#6982): it reports the live writer, exits 0, never says "safe".
     const census = await run("census", "--root", root);
-    expect(census.code).toBe(3);
+    expect(census.code).toBe(0);
+    expect(census.out).toContain("census        advisory: 1 writer, 0 unknown");
     expect(census.out).toContain(`pid ${writer.child.pid}  file  w1-this-release`);
-    const refused = await run("cutover", "--root", root);
-    expect(refused.code).toBe(3);
-    expect(refused.err).toContain(`cutover refused: the census shows pid ${writer.child.pid} (file, w1-this-release)`);
-    // The attestation covers only writers this host cannot verify, never a live local file writer.
-    expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(3);
+    expect(census.out).not.toMatch(/safe|clean/i);
+    // The removed attestation flag is a usage error: nothing gates on the census any more.
+    expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(2);
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
-    // Refused cutovers changed nothing: the writer still commits to state.json.
     await writer.send("put keep/writer-2 12");
 
+    // The operator stops the writers; the cutover is fenced on .lock and custody.lock only.
     writer.child.stdin.write("exit\n");
     await new Promise(resolve => writer.child.once("exit", resolve));
-    expect(await run("census", "--root", root)).toMatchObject({ code: 0, out: "writers       0\n" });
+    expect(await run("census", "--root", root)).toMatchObject({ code: 0, out: "census        advisory: 0 writers, 0 unknown\n" });
     const cutover = await run("cutover", "--root", root, "--json");
     expect(cutover.code).toBe(0);
-    expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1 });
+    expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
+    expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1,
+      census: { writers: [], unknown: [] } });
+    expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
 
     const sqlite = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
     expect(sqlite.stateBackend).toBe("sqlite");

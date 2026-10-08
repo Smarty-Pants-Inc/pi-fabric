@@ -32,7 +32,7 @@ import { pathToFileURL } from "node:url";
 const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
 const migration = await jiti.import("./src/mesh/backend-migration.ts");
 const [operation, root, killAt] = process.argv.slice(-3);
-const options = { assumeNoWriters: true, onStep: (step) => {
+const options = { onStep: (step) => {
   if (step !== killAt) return;
   process.kill(process.pid, "SIGKILL");
   for (;;) { /* never return into the next step */ }
@@ -191,7 +191,7 @@ describe("mesh backend tool killed after each step", () => {
       }
       assertFence(root);
       const expected = committed ? meshSnapshotDigest(fileState(root)) : original;
-      const rerun = await (operation === "import" ? importMeshState : cutoverMeshState)(root, { assumeNoWriters: true, lockTimeoutMs: 20_000 });
+      const rerun = await (operation === "import" ? importMeshState : cutoverMeshState)(root, { lockTimeoutMs: 20_000 });
       // Before the marker the rerun redoes the import from state.json; after it only the flag commit.
       expect(rerun).toMatchObject({ backend: "sqlite", epoch: 1, digest: expected, converged: markerLanded });
       assertFence(root);
@@ -212,7 +212,7 @@ describe("mesh backend tool killed after each step", () => {
       const root = tempRoot(step);
       await seed(root);
       // A real cutover: state.json is the moved marker until the export (step 3) replaces it.
-      await cutoverMeshState(root, { assumeNoWriters: true });
+      await cutoverMeshState(root);
       const store = await SqliteStateStore.open(root, 64 * 1024, 1_000);
       await store.put({ key: "kill/live", value: "written on sqlite", identity });
       store.close();
@@ -244,7 +244,7 @@ describe("mesh backend tool killed after each step", () => {
   it.each(["rollback-flag", "rollback-verify"] as const)("abort-rollback after a kill at %s returns to sqlite at E+1", async (step) => {
     const root = tempRoot(`abort-${step}`);
     await seed(root);
-    await cutoverMeshState(root, { assumeNoWriters: true });
+    await cutoverMeshState(root);
     const committed = await dbDigest(root);
     expectKilled(await runChild("rollback", root, step));
     expectKilled(await runChild("abort", root, "abort-rollback"));
@@ -259,7 +259,7 @@ describe("mesh backend tool killed after each step", () => {
     try { expect(meshSnapshotDigest(store.exportState())).toBe(committed); }
     finally { store.close(); }
     // The next rollback takes E+2; the file epoch never passes the database epoch.
-    expect(await rollbackMeshState(root, { assumeNoWriters: true })).toMatchObject({ backend: "file", epoch: 3 });
+    expect(await rollbackMeshState(root)).toMatchObject({ backend: "file", epoch: 3 });
     assertFence(root);
   }, 120_000);
 });

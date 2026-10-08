@@ -447,6 +447,7 @@ export class StoreBridgeSide implements BridgeSide {
     await this.store.writeBatch({
       // Each put below supplies its checked owner identity; this default is unused for deletes.
       identity: { id: `bridge:${this.peer}`, name: this.peer, kind: "main" },
+      lockClass: "bridge",
       ops: [],
       // Admission, reservations and CAS all observe ONE authoritative snapshot under the
       // write lock. No native takeover can fit between that observation and this commit

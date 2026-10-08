@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
 done
 case "$profile" in
   fleet) profile_flags=(--mains-per-process 4 --heap-mb 640 --mem-budget-mb 32768 --state-mb 10
-    --actor-save-s 10 --saves-in-flight 4 --churn-s 120 --burn-duty 0.5) ;;
+    --actor-save-s 10 --saves-in-flight 4 --churn-s 300 --burn-duty 0.5) ;;
   legacy) profile_flags=() ;;
   *) echo "unknown --profile $profile (fleet or legacy)" >&2; exit 2 ;;
 esac

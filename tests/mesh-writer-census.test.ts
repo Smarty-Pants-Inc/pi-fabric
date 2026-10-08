@@ -2,11 +2,11 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { census } from "../src/mesh/writer-census.js";
 import { MeshStore, censusRecordFileName, meshProcessStartedAt, pruneDeadCensusRecords } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { meshWriterLeaseRecord, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 
 const ownStartedAt = (): number => Math.floor(Date.now() - process.uptime() * 1000);
 const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
@@ -67,6 +67,7 @@ const root = (): string => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const value of roots.splice(0)) fs.rmSync(value, { recursive: true, force: true });
 });
 
@@ -354,6 +355,70 @@ describe("mesh writer census", () => {
     expect(bad).not.toHaveProperty("startedAt");
     expect(unknown.find(writer => writer.pid === zero)).not.toHaveProperty("startedAt");
     expect(fs.existsSync(emptyFile)).toBe(true);
+  });
+
+  it("does not let a later process's lease (same host and pid, other start time) vouch for a stale record", async () => {
+    const mesh = root();
+    const now = Date.now();
+    const pid = deadPid();
+    const stale = { pid, host: "other-host.example", startedAt: now - 3_600_000 };
+    writeRecord(mesh, stale);
+    const writer = { ...stale, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite", startedAt: now - 1000 };
+    writeHostLease(mesh, { id: "host:reused", rootId: "session:reused", identityId: "identity:reused",
+      updatedAt: now, expiresAt: now + 60_000, writer });
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toEqual([expect.objectContaining({ ...stale, source: "process-record" })]);
+    // The new process is listed in its own right, not merged into the stale record.
+    expect(result.writers).toContainEqual(expect.objectContaining({ ...writer, source: "host-lease", name: "host:reused" }));
+    expect(result.writers.filter(item => item.pid === pid)).toHaveLength(2);
+  });
+
+  it("merges this process's lease and record when both carry its exact start time", async () => {
+    const mesh = root();
+    new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    const now = Date.now();
+    writeHostLease(mesh, { id: "host:self", rootId: "session:self", identityId: "identity:self",
+      updatedAt: now, expiresAt: now + 60_000, writer: meshWriterLeaseRecord(2, "file", meshProcessStartedAt) });
+    const result = await census(mesh);
+    expect(result.writers.filter(item => item.pid === process.pid)).toEqual([
+      expect.objectContaining({ host: os.hostname(), startedAt: meshProcessStartedAt, source: "process-record" })]);
+  });
+
+  it("refuses a sqlite or shadow backend when the census record cannot be written, after one retry", () => {
+    const mesh = root();
+    // A regular file where the record directory belongs: every attempt fails.
+    fs.writeFileSync(path.join(mesh, ".writer-census"), "");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    for (const stateBackend of ["sqlite", "shadow"] as const) {
+      mkdir.mockClear();
+      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
+        .toThrow(new RegExp(`cannot record this process in the writer census.*refusing to open the ${stateBackend} state backend`));
+      expect(mkdir.mock.calls.filter(([dir]) => String(dir).endsWith(".writer-census"))).toHaveLength(2);
+    }
+    // File mode stays available: its writes take .lock, which the census counts.
+    expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
+  });
+
+  it("retries a failed census record write once and opens the sqlite backend", async () => {
+    const mesh = root();
+    const real = fs.renameSync;
+    let failures = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to).includes(".writer-census") && failures++ === 0) throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+      return real(from, to);
+    });
+    const store = new MeshStore(mesh, 4096, 100, { stateBackend: "sqlite" });
+    try {
+      expect(store.stateBackend).toBe("sqlite");
+      expect(failures).toBe(2);
+      const result = await census(mesh);
+      expect(result.writers).toContainEqual(expect.objectContaining({ pid: process.pid, stateBackend: "sqlite",
+        source: "process-record" }));
+      expect(fs.readdirSync(path.join(mesh, ".writer-census")).filter(name => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      store.closeState();
+    }
   });
 
   it("keeps a lock ticket whose pid belongs to another host's writer", async () => {

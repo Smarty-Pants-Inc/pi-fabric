@@ -56,15 +56,21 @@ const isKnown = (writer: CensusWriter): boolean => validWriterPid(writer.pid) &&
   validWriterReleaseSha(writer.releaseSha) && validWriterLockProtocol(writer.lockProtocol) &&
   validWriterStateBackend(writer.stateBackend) && validWriterStartedAt(writer.startedAt);
 
-const writerKey = (writer: CensusWriter): string =>
-  writer.pid === undefined ? `${writer.source}:${writer.name ?? "?"}` : `pid:${writer.host ?? "?"}:${writer.pid}`;
+/**
+ * A writer's identity is (host, pid, startedAt): after PID reuse, a stale record and the new
+ * process's lease share host and pid but not start time, and must stay two writers.
+ */
+const writerKey = (writer: CensusWriter): string => writer.pid === undefined
+  ? `${writer.source}:${writer.name ?? "?"}`
+  : `pid:${writer.host ?? "?"}:${writer.pid}:${writer.startedAt ?? "?"}`;
 
 /**
  * Snapshot current writer leases plus live legacy lock evidence for the L4b cutover tool.
  * Liveness (pid alive, same /proc incarnation) is judged only for exactly this host's records with
  * valid metadata, and only those are deleted when dead (best effort, `censusRecordPrunable`).
  * Another host's pid proves nothing here: its record is never dropped, and is unknown unless an
- * unexpired host lease names that writer. A record without a valid host, pid or start time, or
+ * unexpired host lease names that writer: same host, pid and start time (a lease of a later process
+ * that reused the pid does not vouch for the record). A record without a valid host, pid or start time, or
  * with unsupported metadata, is retained and counted unknown (fail closed).
  */
 export async function census(root: string): Promise<WriterCensus> {
@@ -74,8 +80,9 @@ export async function census(root: string): Promise<WriterCensus> {
   const host = os.hostname();
   const now = Date.now();
   const leases = [...readHostLeases(root).values()];
-  const leased = (writer: CensusWriter): boolean => leases.some(lease => lease.expiresAt > now &&
-    lease.writer?.host === writer.host && lease.writer?.pid === writer.pid);
+  const leased = (writer: CensusWriter): boolean => validWriterStartedAt(writer.startedAt) &&
+    leases.some(lease => lease.expiresAt > now && lease.writer?.host === writer.host &&
+      lease.writer?.pid === writer.pid && lease.writer?.startedAt === writer.startedAt);
   // Exact local match only: a hostless or empty-host record is neither local nor foreign.
   const local = (writer: { host?: unknown }): boolean => writer.host === host;
   const foreign = (writer: { host?: unknown }): boolean => validWriterHost(writer.host) && writer.host !== host;

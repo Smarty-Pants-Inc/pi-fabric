@@ -108,19 +108,12 @@ const removeOwnCensusRecords = (): void => {
   for (const file of ownCensusRecords) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };
 
-const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): void => {
-  const directory = path.join(root, ".writer-census");
-  if (!prunedCensusRoots.has(directory)) {
-    prunedCensusRoots.add(directory);
-    pruneDeadCensusRecords(root);
-  }
-  // Host-scoped: two hosts' writers with the same pid and start time never share a file, so neither
-  // skips its record nor removes the other's on exit. Only an earlier store in this process matches.
-  const host = os.hostname();
-  const file = path.join(directory, censusRecordFileName(host, process.pid, meshProcessStartedAt));
+/** Writes this process's census record once; returns the failure, or undefined once recorded. */
+const writeMeshWriterRecord = (directory: string, file: string, host: string, lockProtocol: number,
+  stateBackend: string): unknown => {
   try {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if (fs.existsSync(file)) return;
+    if (fs.existsSync(file)) return undefined;
     const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
     const writer = { format: 1, pid: process.pid, host,
       releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
@@ -130,13 +123,28 @@ const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: stri
     catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
     if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
     ownCensusRecords.add(file);
-  } catch {
-    // ponytail: a read-only or full disk must not fail MeshStore construction, so this process
-    // writes no census record and no new mechanism records the failure. While it queues for or
-    // holds the mesh lock its ticket/owner has no census metadata, so census() lists it unknown
-    // (clean:false). Otherwise only its host lease shows it: a sqlite writer between custody
-    // operations takes no .lock, and without a lease the census cannot see it.
+    return undefined;
+  } catch (error) {
+    return error ?? new Error("census record write failed");
   }
+};
+
+/**
+ * Records this process in the census (one retry); returns the failure, or undefined once recorded.
+ * The caller fails closed for a backend whose writes the census could not otherwise see.
+ */
+const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): unknown => {
+  const directory = path.join(root, ".writer-census");
+  if (!prunedCensusRoots.has(directory)) {
+    prunedCensusRoots.add(directory);
+    pruneDeadCensusRecords(root);
+  }
+  // Host-scoped: two hosts' writers with the same pid and start time never share a file, so neither
+  // skips its record nor removes the other's on exit. Only an earlier store in this process matches.
+  const host = os.hostname();
+  const file = path.join(directory, censusRecordFileName(host, process.pid, meshProcessStartedAt));
+  const first = writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
+  return first === undefined ? undefined : writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
 };
 
 export interface MeshStoreOptions {
@@ -186,7 +194,18 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
+    const unrecorded = recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
+    // A process the census cannot see must not write where only the census would see it (pi-fabric#638).
+    // A sqlite or shadow writer takes no .lock for state, so without its record the census may
+    // report clean while it writes: refuse that backend (fail closed). A file-mode writer may go
+    // on: every state write takes .lock, whose owner record and queue ticket census() counts as an
+    // unknown writer while it waits or writes, and cutover fences writers on .lock in any case.
+    if (unrecorded !== undefined && this.#state.kind !== "file") {
+      this.#state.close();
+      const reason = unrecorded instanceof Error ? unrecorded.message : String(unrecorded);
+      throw new Error(`Fabric mesh: cannot record this process in the writer census (${path.join(root, ".writer-census")}): ` +
+        `${reason}; refusing to open the ${this.#state.kind} state backend`, { cause: unrecorded });
+    }
   }
 
   get lockProtocol(): MeshLockProtocol {

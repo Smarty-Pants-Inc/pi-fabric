@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { isMeshLockTimeout } from "../src/core/atomic-write.js";
+import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 // Four processes write one sqlite-backed mesh root concurrently (smarty-dev#6477 L2a). Each child
@@ -83,4 +85,65 @@ describe("sqlite state backend across processes", () => {
       expect(store.listAll("own/").map(entry => entry.value)).toEqual([count - 1, count - 1, count - 1, count - 1]);
     } finally { store.closeState(); }
   }, 120_000);
+});
+
+// pi-fabric#626 review round 1: another process holds BEGIN IMMEDIATE on a fresh root's state.db,
+// so this store's first write cannot initialise the database. The withTryLock budget must bound
+// that first open (schema, WAL setup, busy wait), not the store's much longer lockTimeoutMs.
+const HOLDER = `
+const { DatabaseSync } = await import("node:sqlite");
+const db = new DatabaseSync(process.argv[1]);
+if (process.argv[2] === "wal") db.exec("PRAGMA journal_mode = WAL");
+db.exec("BEGIN IMMEDIATE");
+process.stdout.write("held\\n");
+setInterval(() => undefined, 1_000);
+`;
+
+const holdState = (root: string, mode: "wal" | "delete"): Promise<() => Promise<void>> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", HOLDER, path.join(root, "state.db"), mode],
+    { stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise<void>((done) => child.once("close", () => done()));
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.once("error", reject);
+  child.once("close", (code) => reject(new Error(`holder exited ${code}: ${stderr}`)));
+  child.stdout.on("data", (chunk) => {
+    if (String(chunk).includes("held")) resolve(async () => { child.kill("SIGKILL"); await exited; });
+  });
+});
+
+const firstOpenIdentity = { id: "first-open", name: "first-open", kind: "agent" as const };
+
+describe("sqlite state backend first open under a foreign BEGIN IMMEDIATE", () => {
+  const budgetMs = 50;
+  it.each(["wal", "delete"] as const)("a bounded try returns the timeout within its budget (holder journal %s)", async (mode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-first-open-"));
+    roots.push(root);
+    const release = await holdState(root, mode);
+    const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite", lockTimeoutMs: 5_000 });
+    try {
+      // The try starts the first open; an ordinary writer joins it and must keep its own budget.
+      const started = performance.now();
+      const tried = store.withTryLock(() => store.put({ key: "k", value: "try", identity: firstOpenIdentity }), budgetMs)
+        .then(() => undefined, (error: unknown) => ({ error, waited: performance.now() - started }));
+      const ordinary = store.put({ key: "k", value: "ordinary", identity: firstOpenIdentity });
+      const outcome = await tried;
+      expect(outcome?.error).toBeInstanceOf(MeshStateBusyError);
+      expect(isMeshLockTimeout(outcome?.error)).toBe(true);
+      expect(outcome!.waited).toBeLessThan(budgetMs + 250);
+      // Now the ordinary writer's open is in flight: a bounded try that joins it keeps its own budget.
+      const joinStarted = performance.now();
+      const joined = await store.withTryLock(() => store.put({ key: "j", value: "try", identity: firstOpenIdentity }), budgetMs)
+        .then(() => undefined, (error: unknown) => ({ error, waited: performance.now() - joinStarted }));
+      expect(joined?.error).toBeInstanceOf(MeshStateBusyError);
+      expect(joined!.waited).toBeLessThan(budgetMs + 250);
+      expect(store.stateDiagnostics().busyTimeouts).toBe(2);
+      await release();
+      expect((await ordinary).value).toBe("ordinary");
+      expect((await store.put({ key: "k", value: "after", identity: firstOpenIdentity })).value).toBe("after");
+    } finally {
+      await release();
+      store.closeState();
+    }
+  }, 30_000);
 });

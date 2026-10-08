@@ -273,6 +273,14 @@ const sqliteBusy = (error: unknown): boolean => {
 // Only for the first synchronous read of a process: one database open, bounded to ~50 ms.
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
+// A bounded wait for a shared open: rejects with BUDGET_SPENT when `ms` runs out first.
+const BUDGET_SPENT: unique symbol = Symbol("budget spent");
+const withinBudget = <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const spent = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(BUDGET_SPENT), Math.max(0, ms)); });
+  return Promise.race([promise, spent]).finally(() => clearTimeout(timer));
+};
+
 const sqliteUnavailable = (): string | undefined => {
   try { return process.getBuiltinModule?.("node:sqlite")?.DatabaseSync ? undefined : "node:sqlite is unavailable"; }
   catch { return "node:sqlite is unavailable"; }
@@ -522,23 +530,61 @@ export class SqliteStateBackend implements StateBackend {
     }
   }
 
-  async #openAsync(): Promise<SqliteStateStore> {
+  /**
+   * The store for a write. `deadline` (a `performance.now()` time) ends the caller's budget for the
+   * WHOLE write when it is bounded (an active withTryLock scope): the first open, with its WAL setup,
+   * schema initialisation and busy waits, gets only what remains of it, and running out throws
+   * `MeshLockTimeoutError` (pi-fabric#626 review round 1). Without a deadline the open waits for
+   * `lockTimeoutMs`; a busy expiry is a `MeshLockTimeoutError` there too.
+   */
+  async #openAsync(deadline?: number): Promise<SqliteStateStore> {
     if (this.#store) return this.#store;
     if (this.#closed) throw new Error("Fabric mesh SQLite state backend is closed");
+    let attempts = 1;
     try {
       this.#store = SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions);
       return this.#store;
     } catch (error) {
       if (!sqliteBusy(error)) throw error;
     }
-    this.#opening ??= SqliteStateStore.open(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions)
+    for (;;) {
+      if (this.#store) return this.#store;
+      if (this.#closed) throw new Error("Fabric mesh SQLite state backend is closed");
+      const remaining = deadline === undefined ? undefined : deadline - performance.now();
+      if (remaining !== undefined && remaining <= 0) throw this.#openTimeout(attempts);
+      // One open at a time per backend. A caller that joins an open started under a longer budget
+      // stops waiting at its own deadline; the open goes on for the caller that started it.
+      const own = !this.#opening;
+      const opening = this.#opening ??= this.#startOpen(remaining);
+      attempts += 1;
+      try {
+        return remaining === undefined ? await opening : await withinBudget(opening, remaining);
+      } catch (error) {
+        if (error === BUDGET_SPENT) throw this.#openTimeout(attempts);
+        // A joined open started under a shorter budget ran out: open again under this caller's own.
+        if (own || !(error instanceof MeshLockTimeoutError)) throw error;
+      }
+    }
+  }
+
+  #startOpen(budgetMs: number | undefined): Promise<SqliteStateStore> {
+    const opening: Promise<SqliteStateStore> = SqliteStateStore.open(this.root, this.#context.maxEventBytes,
+      this.#context.maxReadEvents, this.#storeOptions, budgetMs === undefined ? undefined : Math.max(0, budgetMs))
       .then((store) => {
-        if (this.#store || this.#closed) { store.close(); if (this.#store) return this.#store; throw new Error("closed"); }
+        if (this.#store || this.#closed) {
+          store.close();
+          if (this.#store) return this.#store;
+          throw new Error("Fabric mesh SQLite state backend is closed");
+        }
         this.#store = store;
         return store;
-      })
-      .finally(() => { this.#opening = undefined; });
-    return this.#opening;
+      }, (error: unknown) => { throw sqliteBusy(error) ? this.#openTimeout(0) : error; })
+      .finally(() => { if (this.#opening === opening) this.#opening = undefined; });
+    return opening;
+  }
+
+  #openTimeout(attempts: number): MeshLockTimeoutError {
+    return new MeshLockTimeoutError(` (SQLite state ${this.database}, first open)`, attempts, 0);
   }
 
   // The caller's budget: the mesh store's withTryLock scope (registry-fenced tries) bounds the
@@ -546,11 +592,17 @@ export class SqliteStateBackend implements StateBackend {
   async #write<T>(operation: (store: SqliteStateStore) => Promise<T>): Promise<T> {
     const started = performance.now();
     const scope = this.#context.lock.tryLockScope.getStore();
+    // A bounded try spends ONE budget on the whole write: first open included (review round 1).
+    const deadline = scope?.active
+      ? started + Math.max(0, Math.min(scope.timeoutMs, this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
+      : undefined;
     let store: SqliteStateStore | undefined;
     try {
-      store = await this.#openAsync();
+      store = await this.#openAsync(deadline);
       const ready = store;
-      const result = scope?.active ? await ready.withTryLock(() => operation(ready), scope.timeoutMs) : await operation(ready);
+      const result = deadline !== undefined
+        ? await ready.withTryLock(() => operation(ready), Math.max(0, deadline - performance.now()))
+        : await operation(ready);
       this.#snapshot = undefined;
       return result;
     } catch (error) {

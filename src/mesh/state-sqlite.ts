@@ -447,9 +447,13 @@ export class SqliteStateStore {
     }
   }
 
-  /** Opens (creating when absent) `<root>/state.db`. Initialisation retries asynchronously while busy. */
+  /**
+   * Opens (creating when absent) `<root>/state.db`. Initialisation (WAL setup, schema, seed) retries
+   * asynchronously while busy, for `initTimeoutMs` (default `lockTimeoutMs`); then the driver's busy
+   * error is thrown. `initTimeoutMs` bounds only this open, never the store's later writes.
+   */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
-    options: SqliteStateStoreOptions = {}): Promise<SqliteStateStore> {
+    options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -459,7 +463,7 @@ export class SqliteStateStore {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = (options.open ?? openNodeSqlite)(file);
-    const deadline = Date.now() + Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
+    const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
       for (;;) {

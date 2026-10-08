@@ -60,7 +60,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
-import { publicationGeneration } from "../topology/publication-generation.js";
+import { observeActorOwnership } from "../topology/publication-generation.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -4448,7 +4448,13 @@ export class ActorManager {
       committed = await this.#registry.update(current => {
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
-      const ownershipGeneration = publicationGeneration(this.mesh.root);
+      // smarty-dev#6829: observe only the ownership inputs of this manager's actors (their
+      // participant records, owner host leases/records, lineage closures) BEFORE deciding,
+      // not the fleet-wide directory stamps every heartbeat anywhere on the mesh changes.
+      const ownership = observeActorOwnership(this.mesh.root, [...this.#actors.keys(), ...removedIds], () => {
+        const snapshot = this.mesh.stateToken({ fresh: true });
+        return key => this.mesh.get(key, { snapshot });
+      });
       return this.#withOwnershipRead(() => {
         // Source selection is speculative. update validates the atomic registry
         // generation AND the ownership observation after acquisition, or retries.
@@ -4470,10 +4476,13 @@ export class ActorManager {
           registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
         }))];
         const saved = { owned: this.#registryState(rows), critical: this.#criticalRegistryState(rows) };
+        // A save written under one ownership view must not commit after ANY written or
+        // revoked actor's ownership changed; others' heartbeats no longer veto it.
+        ownership.scope([...owned.map(actor => actor.id), ...revoked]);
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownership.unchanged() &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),

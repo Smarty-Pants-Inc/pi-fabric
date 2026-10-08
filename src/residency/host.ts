@@ -76,48 +76,14 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
-import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
-import { hasPreservedResidentResult } from "./preserved-result.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
-export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
-
-/** Called under the host fence, before constructing the manager: every existing run is untracked. */
-export const sweepResidentRuns = (
-  runsRoot: string, now = Date.now(), budgetMs = 100,
-  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean } = {},
-): string[] => {
-  const removed: string[] = [];
-  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
-  const started = performance.now();
-  const expired = () => performance.now() - started >= budgetMs;
-  const retained = retainedActorRunIds(options.actorRoots ?? []);
-  if (retained.has("*")) return removed;
-  let directory: fs.Dir;
-  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
-  try {
-    let entry: fs.Dirent | null;
-    while (!expired() && (entry = directory.readSync())) {
-      if (!entry.isDirectory() || retained.has(entry.name)) continue;
-      const run = path.join(runsRoot, entry.name);
-      const stat = ownedStat(run);
-      if (!stat?.isDirectory()) continue;
-      if (!options.retainRuns && now - stat.mtimeMs > RESIDENT_RUN_RETENTION_MS &&
-          !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
-          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
-        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
-      } else {
-        compactTerminalRunEvents(run, { ...options, now, expired });
-      }
-    }
-  } finally { directory.closeSync(); }
-  return removed;
-};
-
+// Moved to ./retention.js so the mesh-wide sweep (storage/retention-cli.ts) can run it under the
+// dead host's fence without loading the host (smarty-dev#3252).
+export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
 // The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the

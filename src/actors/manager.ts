@@ -31,7 +31,11 @@ import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
-import { pruneActorSessionBackups } from "../storage/retention.js";
+import { claimMeshRetentionSweep, pruneActorSessionBackups } from "../storage/retention.js";
+import { spawn } from "node:child_process";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -241,6 +245,8 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
+const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
 /** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
@@ -502,6 +508,7 @@ export class ActorManager {
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  readonly #meshRetentionSweepPath: string | undefined;
   #retentionSweep: Promise<void> | undefined;
   #initialRetentionPending = true;
   readonly #pendingPresence = new Set<string>();
@@ -587,6 +594,8 @@ export class ActorManager {
       /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
       prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
+      /** Detached mesh-wide retention sweep script; defaults to the built retention CLI, off in source runs. */
+      meshRetentionSweepPath?: string | false;
       /**
        * agents.deadRootFilter, read per activation (smarty-dev#6062). The resident host supplies it;
        * absent or mode "off" never skips. Only durable actors' callerless mesh/host events are checked.
@@ -638,6 +647,8 @@ export class ActorManager {
   ) {
     this.#actorRoot =
       options.actorRoot ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-actors-"));
+    this.#meshRetentionSweepPath = options.meshRetentionSweepPath === false ? undefined : options.meshRetentionSweepPath ??
+      (import.meta.url.endsWith(".js") ? fileURLToPath(new URL("../storage/retention-cli.js", import.meta.url)) : undefined);
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#releasePaused = options.releasePaused ?? false;
@@ -4012,6 +4023,30 @@ export class ActorManager {
     if (!pending.size) this.#pendingRunArchives.delete(actor.id);
   }
 
+  /**
+   * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
+   * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
+   * niced process: it removes terminal runs older than the actor archive TTL mesh-wide under the
+   * owners' own fences, and a dead resident root's runs under that root's flock.
+   */
+  async #startMeshRetentionSweep(): Promise<void> {
+    const script = this.#meshRetentionSweepPath;
+    const meshRoot = this.mesh.root;
+    const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
+    if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
+    try {
+      const [runtime, ...args] = await scriptSpawnArgs(script,
+        [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs)]);
+      if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
+      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
+      child.on("error", () => undefined);
+      if (child.pid) {
+        try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
+      }
+      child.unref();
+    } catch { /* the next slot retries */ }
+  }
+
   #startRetentionSweep(): void {
     if (this.#retentionSweep || this.#closing) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
@@ -4059,6 +4094,7 @@ export class ActorManager {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     if (this.#closing || this.#canConsumeMesh?.() === false) return;
+    if (this.#persistent && this.meshConfig.enabled) void this.#startMeshRetentionSweep();
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,

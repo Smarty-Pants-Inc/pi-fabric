@@ -1281,7 +1281,8 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "followUp",
           context,
-          { binding: actorRunBinding(args) },
+          { binding: actorRunBinding(args),
+            ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "steer":
         return this.routeMessage(

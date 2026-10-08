@@ -164,6 +164,52 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
     await vi.waitFor(() => expect(directory.degraded).toBe(false), { timeout: 2_000 });
   }, 15_000);
 
+  /** Captures each runtime's ParticipantDirectory and invokes its onLifecycleLost; returns the degraded events. */
+  const lostLifecycleEvents = async (h: ReturnType<typeof harness>, sessionId: string): Promise<Array<Record<string, unknown>>> => {
+    const directories: ParticipantDirectory[] = [];
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      if (!directories.includes(this)) directories.push(this);
+      return register.call(this, source);
+    });
+    const one = h.generation();
+    const first = h.session(sessionId);
+    await h.sessionStart(one.state, first.value as unknown as ExtensionContext);
+    await one.state.ensure(first.value as unknown as ExtensionContext);
+    const [directory] = directories;
+    const lost = (directory as unknown as { options: { onLifecycleLost?: (ticks: number) => void } }).options.onLifecycleLost;
+    expect(lost).toBeTypeOf("function");
+    lost!(3);
+    const mesh = new MeshStore(h.meshRoot, 64 * 1024, 1_000);
+    let found: Array<Record<string, unknown>> = [];
+    await vi.waitFor(() => {
+      found = mesh.read({ topic: "ops.fabric.presence" })
+        .filter((event) => event.kind === "fabric.presence.degraded")
+        .map((event) => event.data as Record<string, unknown>);
+      expect(found.length).toBeGreaterThan(0);
+    }, { timeout: 3_000 });
+    return found;
+  };
+
+  it("a lost lifecycle reports the affected runtime's own id: Main as mainAgentId, a non-Main as itself (pi-fabric#660)", async () => {
+    const mainSession = "6600aaaa-0000-0000-0000-000000000001";
+    const main = harness();
+    const mainEvents = JSON.stringify(await lostLifecycleEvents(main, mainSession));
+    expect(mainEvents).toContain(`"participantId":"session:${mainSession}"`);
+    expect(mainEvents).toContain(`"hostId":"session:${mainSession}"`);
+    vi.restoreAllMocks();
+
+    const agentSession = "6600aaaa-0000-0000-0000-000000000002";
+    const child = harness();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "agent-run-660");
+    vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", `session:${mainSession}`);
+    const childEvents = JSON.stringify(await lostLifecycleEvents(child, agentSession));
+    expect(childEvents).toContain('"participantId":"agent-run-660"');
+    expect(childEvents).toContain(`"sessionId":"${agentSession}"`);
+    expect(childEvents).toContain(`"hostId":"runtime:${agentSession}"`);
+    expect(childEvents).not.toContain(`"participantId":"session:${mainSession}"`);
+  }, 30_000);
+
   it("the Main runtime routes a lost lifecycle to the fleet ops topic", async () => {
     const h = harness();
     const directories: ParticipantDirectory[] = [];

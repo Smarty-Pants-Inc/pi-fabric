@@ -709,9 +709,12 @@ export class FabricRuntimeState {
       live: live.current,
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
       // ops topic instead of vanishing from the directory in silence. The UI ctx is retired too.
+      // Non-Main runtimes (actors, agents) heartbeat their own host lease too, so they report
+      // their own participant and session, never the Main they belong to (pi-fabric#660).
       onLifecycleLost: ticks => {
         void this.publishOpsEvent("ops.fabric.presence", "fabric.presence.degraded", {
-          participantId: mainAgentId, hostId, ticks, reason: "no live session ctx (session replaced or reloaded)",
+          participantId: identity.kind === "main" ? mainAgentId : identity.id, sessionId, hostId, ticks,
+          reason: "no live session ctx (session replaced or reloaded)",
         }).catch(() => undefined);
       },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID

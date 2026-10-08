@@ -107,6 +107,18 @@ Commswatch reads the L8 metrics of each lock (`.lock`, `custody.lock`, SQLite wr
 
 A reader uses `state.json` only when `backend=file` and it is a real state file whose epoch equals `meta.epoch`, or `backend=importing` without the marker and a file epoch below `meta.epoch`. With `exporting`, or while `state.json` is the marker (whatever the flag), it reads SQLite; any other mismatch fails closed with an alarm. An interrupted rollback reruns from the stored flag: `exporting` repeats steps 3 to 5 (the fence blocked every write, so the export is identical); `file` with the marker repeats step 5 (after step 3 with the recorded generation if the temp is missing or unverifiable); `file` with a real `state.json` only verifies. `mesh-backend abort-rollback` takes `.lock` first, ensures the marker, then sets `exporting` back to `sqlite` and keeps E+1. The file epoch never exceeds the database epoch and equals it only after a verified export. L9a kills the tool after each step and checks this.
 
+**Operator commands (W1).** `fabric-mesh-backend` (package `bin`, `bin/fabric-mesh-backend`) runs on the host of the root, from the new release, with every writer stopped first. In shadow mode the residency host runs the L3 projector (database `<mesh>/state-projector/state.db`, never `<mesh>/state.db`, which is the cutover flag) and stops it on shutdown or reload, so stopping the host stops both.
+
+```sh
+fabric-mesh-backend census   --root <mesh>   # the L4a writer census: pid, mode, release of each writer; 0 none, 3 writers
+fabric-mesh-backend status   --root <mesh>   # flag, epochs, digests, reader decision, census writers; 0 fence holds, 3 violated
+fabric-mesh-backend cutover  --root <mesh>   # file -> sqlite (the fenced section above); 0 done, 3 refused
+fabric-mesh-backend rollback --root <mesh>   # sqlite -> file, steps 1 to 5; 0 done (a rerun converges), 3 refused
+fabric-mesh-backend abort-rollback --root <mesh>  # exporting -> sqlite at E+1; 0 done, 3 refused
+```
+
+Exit codes: 0 done, 1 error, 2 usage, 3 refused or fence violation (nothing unsafe was done). Cutover, import and rollback refuse while the census shows a writer: a verified writer on this host in file or shadow mode (any mode for rollback) always refuses; a writer the host cannot verify (unknown metadata, no build SHA, lock evidence only) or one on another host refuses unless `--assume-no-writers`, the operator's attestation that it is stopped. `--json` prints the result as JSON.
+
 ## 6. Start now, in parallel
 
 L8, L1 (with the fence test) and A1 run now, with no dependencies. C1 follows the L8 format and counts acceptance windows per host. L6, L7 finish round 2. E1's owner states an ETA today; E1 merges before L0. RC3.1.5x tonight records the "before" numbers.

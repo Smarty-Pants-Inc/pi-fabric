@@ -4,6 +4,9 @@
  * In "shadow" mode the file store (state.json behind the mesh .lock) stays the authority. ONE
  * projector per mesh root keeps <databaseRoot>/state.db in step with it, revision for revision, so
  * readers and the divergence check (gate G4: 0 divergences in 24 h) can use SQLite before cutover.
+ * The shadow database defaults to <root>/state-projector/state.db: <root>/state.db, once seeded
+ * (backend=sqlite), is the cutover flag, and the L4b fence then refuses every file-mode write
+ * (smarty-dev#6477 W1).
  * After cutover ("sqlite" mode) the projector only maintains the database: it is the elected WAL
  * checkpointer (R10) and reports the WAL size. It keeps NO state.json projection after cutover:
  * section 5 of docs/mesh-lock-plan.md exports state.json once, inside the rollback fence (L4), and
@@ -60,6 +63,10 @@ import { openNodeSqlite, SqliteStateStore, type SqliteConnection, type SqliteOpe
 
 /** Written by the active projector in the mesh root (never one of the state*.db* files). */
 export const STATE_PROJECTOR_STATUS_FILE = "state-projector.status.json";
+
+/** Where the projector's state.db lives by default: shadow projects beside the root, sqlite maintains the root's. */
+export const projectorDatabaseRoot = (root: string, mode: StateProjectorMode = "shadow"): string =>
+  mode === "sqlite" ? path.resolve(root) : path.join(path.resolve(root), "state-projector");
 const LEASE_META = "projector.lease";
 const PROGRESS_META = "projector.progress";
 const STATE_FILE = "state.json";
@@ -139,7 +146,7 @@ export type StateProjectorEvent =
 export interface StateProjectorOptions {
   /** The mesh root (state.json, the read journal, the status file). */
   root: string;
-  /** Where state.db lives. Default: the mesh root (<root>/state.db). */
+  /** Where state.db lives. Default `projectorDatabaseRoot`: <root>/state-projector (shadow), <root> (sqlite). */
   databaseRoot?: string;
   /** "shadow" (default): project state.json. "sqlite": after cutover, maintain only. */
   mode?: StateProjectorMode;
@@ -526,7 +533,7 @@ export class StateProjector {
 
   /** Opens (and, when absent, creates) the database and a projector connection. Does not start the loop. */
   static async open(options: StateProjectorOptions): Promise<StateProjector> {
-    const databaseRoot = path.resolve(options.databaseRoot ?? options.root);
+    const databaseRoot = path.resolve(options.databaseRoot ?? projectorDatabaseRoot(options.root, options.mode));
     // The L1 store creates the schema and WAL mode and refuses a non-local filesystem (R16) or a
     // retired database; the projector checkpoints through it (R10) and never writes through it.
     const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, {

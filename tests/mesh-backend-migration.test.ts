@@ -869,13 +869,20 @@ describe("fabric-mesh-backend CLI", () => {
     const status = await run("status", "--root", root, "--json");
     expect(status.code).toBe(0);
     expect(JSON.parse(status.out)).toMatchObject({ backend: "none", reader: { source: "file" } });
+    // W1: the CLI runs the L4a writer census; a record it cannot verify is an unknown writer.
+    fs.mkdirSync(path.join(root, ".writer-census"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".writer-census", "torn.json"), "{");
+    const census = await run("census", "--root", root);
+    expect(census.code).toBe(3);
+    expect(census.out).toMatch(/pid 0 {2}unknown process-record torn\.json/);
     const refused = await run("cutover", "--root", root);
     expect(refused.code).toBe(3);
+    expect(refused.err).toMatch(/cutover refused: the census shows pid 0 \(unknown process-record torn\.json/);
     expect(refused.err).toMatch(/assume-no-writers/);
     // Import commits backend=sqlite: the same census or attestation as cutover (review round 4).
     const importRefused = await run("import", "--root", root);
     expect(importRefused.code).toBe(3);
-    expect(importRefused.err).toMatch(/import refused: import needs the writer census.*assume-no-writers/);
+    expect(importRefused.err).toMatch(/import refused: the census shows pid 0 \(unknown/);
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     const cutover = await run("cutover", "--root", root, "--assume-no-writers", "--json");
     expect(cutover.code).toBe(0);

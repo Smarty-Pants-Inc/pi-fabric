@@ -53,6 +53,21 @@ const runChild = (operation: string, root: string, killAt: MeshBackendStep): Pro
     child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
 
+type ChildResult = Awaited<ReturnType<typeof runChild>>;
+
+/** The child died by its own SIGKILL. On Windows Node emulates it with TerminateProcess:
+ *  signalCode stays null and the exit code is non-zero instead. */
+const expectKilled = (child: ChildResult): void => {
+  expect(child.stdout, child.stderr).not.toContain("completed");
+  if (process.platform === "win32") {
+    expect(child.signal, child.stderr).toBeNull();
+    expect(child.code, child.stderr).not.toBeNull();
+    expect(child.code, child.stderr).not.toBe(0);
+  } else {
+    expect(child.signal, child.stderr).toBe("SIGKILL");
+  }
+};
+
 const seed = async (root: string): Promise<void> => {
   const store = new MeshStore(root, 64 * 1024, 1_000);
   await store.writeBatch({ identity, ops: Array.from({ length: 40 }, (_, index) => ({ kind: "put" as const, key: `kill/n${index % 4}/${index}`, value: { index } })) });
@@ -118,7 +133,7 @@ describe("mesh backend tool killed after each step", () => {
     await seed(root);
     const original = meshSnapshotDigest(fileState(root));
     const killed = await runChild("import", root, step);
-    expect(killed.signal, killed.stderr).toBe("SIGKILL");
+    expectKilled(killed);
     assertFence(root);
     expect(meta(root).backend).toBe(step === "import-read" ? "file" : "sqlite");
     // The rerun takes over the dead tool's .lock and converges.
@@ -135,7 +150,7 @@ describe("mesh backend tool killed after each step", () => {
       await seed(root);
       const original = meshSnapshotDigest(fileState(root));
       const killed = await runChild("cutover", root, step);
-      expect(killed.signal, killed.stderr).toBe("SIGKILL");
+      expectKilled(killed);
       // It died holding .lock: no file-mode writer could have committed meanwhile.
       expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
       assertFence(root);
@@ -163,7 +178,7 @@ describe("mesh backend tool killed after each step", () => {
       store.close();
       const committed = await dbDigest(root);
       const killed = await runChild("rollback", root, step);
-      expect(killed.signal, killed.stderr).toBe("SIGKILL");
+      expectKilled(killed);
       assertFence(root);
       expect(meta(root)).toMatchObject({ backend: step === "rollback-switch" ? "file" : "exporting", epoch: 2 });
       if (step === "rollback-export-temp") expect(temps(root)).toHaveLength(1);
@@ -182,9 +197,8 @@ describe("mesh backend tool killed after each step", () => {
     await seed(root);
     await cutoverMeshState(root, { assumeNoWriters: true });
     const committed = await dbDigest(root);
-    expect((await runChild("rollback", root, step)).signal).toBe("SIGKILL");
-    const killedAbort = await runChild("abort", root, "abort-rollback");
-    expect(killedAbort.signal).toBe("SIGKILL");
+    expectKilled(await runChild("rollback", root, step));
+    expectKilled(await runChild("abort", root, "abort-rollback"));
     assertFence(root);
     expect(await abortMeshRollback(root)).toMatchObject({ backend: "sqlite", epoch: 2, converged: true });
     assertFence(root);

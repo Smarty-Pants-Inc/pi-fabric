@@ -1,0 +1,109 @@
+{
+  "note": "file store (MeshStore, lock protocol 1) at 034dff34 + final L9a harness; proof run 3 of 3 on ryzen5 (32 CPUs, shared host, load1 17.1-21.8 during the runs, nice -n 19); default load: 80 participants in 8 processes, seed 6477, 120 s + 15 s warm-up, 4.8 MB state.json",
+  "benchmark": "mesh-lock",
+  "schema": 1,
+  "store": "file",
+  "host": {
+    "name": "ryzen5.smartypants.ai",
+    "cpus": 32,
+    "load1": 17.37,
+    "node": "v24.19.0",
+    "platform": "linux"
+  },
+  "recordedAt": "2026-10-08T01:47:16.586Z",
+  "wallMs": 136249,
+  "load": {
+    "participants": 80,
+    "processes": 8,
+    "seed": 6477,
+    "durationS": 120,
+    "warmupS": 15,
+    "stateMb": 4.8,
+    "heartbeatS": 5,
+    "hostRenewS": 600,
+    "putRate": 1,
+    "deleteRate": 0.25,
+    "publishRate": 2,
+    "steerRate": 0.2,
+    "dirReadRate": 4,
+    "registryKeys": 200,
+    "pollMs": 100,
+    "lockTimeoutMs": 10000,
+    "lockProtocol": 1
+  },
+  "fixture": {
+    "stateBytes": 4808334,
+    "entries": 4412,
+    "fillerEntries": 4052
+  },
+  "loadInsensitive": {
+    "acquisitionsPerOp": 0.82658,
+    "holdsPerOp": 0.82658,
+    "stateRewritesPerOp": 0.06147,
+    "bytesRewrittenPerOp": 295263,
+    "timeoutsPer10kOps": 0
+  },
+  "timing": {
+    "lockWaitP95Ms": 0.523,
+    "lockHoldP95Ms": 0.653,
+    "receiptP95Ms": 136.531,
+    "lockBusyPct": 0.7
+  },
+  "reported": {
+    "ops": 2912,
+    "opsPerS": 24.27,
+    "opsByKind": {
+      "heartbeat": 1920,
+      "dirRead": 529,
+      "hostRenew": 19,
+      "put": 137,
+      "publish": 258,
+      "delete": 25,
+      "steer": 24
+    },
+    "lockAcquisitionsPerS": 20.06,
+    "lockAcquisitionsByClass": {
+      "heartbeat/confirm": 1920,
+      "publish": 306,
+      "writeBatch": 19,
+      "put/delete": 162
+    },
+    "lockWaitP95BucketMs": 1,
+    "lockHoldP95BucketMs": 1,
+    "lockWaitMeanMs": 0.754,
+    "lockHoldMeanMs": 0.35,
+    "lockWaitMaxMs": 41.53,
+    "lockHoldMaxMs": 25.36,
+    "lockTimeouts": 0,
+    "boundedTries": 0,
+    "lockTimeoutsPer10kOps": 0,
+    "opLockTimeoutErrors": 0,
+    "directoryUnavailable": 0,
+    "directoryUnavailablePer10kOps": 0,
+    "steers": 24,
+    "steersFailed": 0,
+    "receipts": 24,
+    "receiptP50Ms": 101.552,
+    "stateRewrites": 179,
+    "bytesRewritten": 859807113,
+    "scheduleLagP95Ms": 0.976
+  },
+  "validation": {
+    "plannedOps": 2912,
+    "ranOps": 2912,
+    "opsMatch": true,
+    "unexpectedErrors": {},
+    "errorSamples": [],
+    "missingReceipts": 0,
+    "lockAcquisitionsOutsideOps": 0,
+    "l8Files": 8,
+    "l8Acquisitions": 2697,
+    "harnessAcquisitions": 2697,
+    "l8Match": true,
+    "ok": true
+  },
+  "codes": {
+    "lockTimeout": "FABRIC_MESH_LOCK_TIMEOUT",
+    "directoryUnavailable": "FABRIC_DIRECTORY_UNAVAILABLE"
+  }
+}

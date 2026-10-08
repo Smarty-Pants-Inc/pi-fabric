@@ -60,7 +60,8 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
-import { publicationGeneration } from "../topology/publication-generation.js";
+import { observeActorOwnership } from "../topology/publication-generation.js";
+import { withStateFence } from "../mesh/commit-outbox.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -242,6 +243,10 @@ const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
+/** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
+ * rewrites an unchanged entry only this rarely: far inside the 24 h dead-session
+ * presence window, and never once per beat per (often stopped) actor (smarty-dev#6729). */
+export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
 const warnedActivationFilters = new Set<string>();
@@ -503,6 +508,9 @@ export class ActorManager {
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
   readonly #presenceRevisions = new Map<string, object>();
+  /** Serialized presence this instance committed through the host heartbeat. A new
+   * instance (restart) starts empty, so its first full heartbeat republishes all once. */
+  readonly #publishedPresence = new Map<string, string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -939,21 +947,45 @@ export class ActorManager {
       const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
       const ids = new Set(pending.keys());
       if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
+      // A full heartbeat renews every live actor's presence (#4383), but only verifies and
+      // repairs a STOPPED actor's: each put is re-versioned and re-encoded in the locked
+      // shared commit, and a host can own hundreds of stopped actors (smarty-dev#6729).
+      // An unchanged stopped entry this instance committed, still in the shared state as
+      // written, is skipped until PRESENCE_REFRESH_MS. The shared read is lazy, so a
+      // host without stopped actors does exactly what it did before.
+      let shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, sharedRead = false;
+      const sharedPresence = () => {
+        if (!sharedRead) { sharedRead = true; shared = this.#sharedPresence(); }
+        return shared;
+      };
+      const now = Date.now();
+      const written = new Map<string, string | undefined>();
       const ops: MeshBatchOperation[] = [];
       for (const id of ids) {
         const actor = this.#actors.get(id);
         if (actor) {
           if (this.#ownershipDecision(id)) {
             const value = this.#presenceValue(actor);
-            if (value) ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+            if (!value) continue;
+            const serialized = actor.status === "stopped" ? JSON.stringify(value) : undefined;
+            if (full && serialized !== undefined && !pending.has(id) &&
+              this.#presenceUnchanged(id, serialized, sharedPresence(), now)) continue;
+            ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
+            // Only stopped presence is remembered; a live put or delete forgets it.
+            written.set(id, serialized);
           }
         } else {
           const fence = this.#orphanPresence.get(id);
           ops.push({ kind: "delete", key: this.#presenceKey(id),
             ...(fence !== undefined ? { ifVersion: fence, onConflict: "skip" as const } : {}) });
+          written.set(id, undefined);
         }
       }
       return { ops, committed: () => {
+        for (const [id, serialized] of written) {
+          if (serialized === undefined) this.#publishedPresence.delete(id);
+          else this.#publishedPresence.set(id, serialized);
+        }
         for (const [id, revision] of pending) {
           // A mutation while the shared write waited belongs to the next refresh.
           if (this.#presenceRevisions.get(id) !== revision) continue;
@@ -963,6 +995,24 @@ export class ActorManager {
         }
       } };
     });
+  }
+
+  /** This session's presence entries from the current (exact-on-change) shared read;
+   * undefined when unreadable, which publishes every owned actor as before. */
+  #sharedPresence(): ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined {
+    try {
+      return new Map(this.mesh.listAllShared(`actors/${this.sessionId}/`).map(entry => [entry.key, entry] as const));
+    } catch {
+      return undefined;
+    }
+  }
+
+  #presenceUnchanged(id: string, serialized: string,
+    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, now: number): boolean {
+    if (!shared || this.#publishedPresence.get(id) !== serialized) return false;
+    const entry = shared.get(this.#presenceKey(id));
+    return entry !== undefined && entry.updatedBy.id === this.identity.id &&
+      now - entry.updatedAt < PRESENCE_REFRESH_MS && JSON.stringify(entry.value) === serialized;
   }
 
   async cede(id: string): Promise<FabricActorInfo> {
@@ -4448,7 +4498,15 @@ export class ActorManager {
       committed = await this.#registry.update(current => {
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
-      const ownershipGeneration = publicationGeneration(this.mesh.root);
+      // smarty-dev#6829: observe only the ownership inputs of this manager's actors (their
+      // participant records, owner host leases/records, lineage closures) BEFORE deciding,
+      // not the fleet-wide directory stamps every heartbeat anywhere on the mesh changes.
+      // pi-fabric#640: pass the store, not its root, so the shared-state stamp is the ACTIVE
+      // backend's revision (SQLite commits never touch state.json); reads go through the store.
+      const ownership = observeActorOwnership(this.mesh, [...this.#actors.keys(), ...removedIds], () => {
+        const snapshot = this.mesh.stateToken({ fresh: true });
+        return key => this.mesh.get(key, { snapshot });
+      });
       return this.#withOwnershipRead(() => {
         // Source selection is speculative. update validates the atomic registry
         // generation AND the ownership observation after acquisition, or retries.
@@ -4470,10 +4528,13 @@ export class ActorManager {
           registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
         }))];
         const saved = { owned: this.#registryState(rows), critical: this.#criticalRegistryState(rows) };
+        // A save written under one ownership view must not commit after ANY written or
+        // revoked actor's ownership changed; others' heartbeats no longer veto it.
+        ownership.scope([...owned.map(actor => actor.id), ...revoked]);
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownership.unchanged() &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
@@ -5348,10 +5409,11 @@ export class ActorManager {
         // #535's order and zero-wait mesh acquisition are unchanged. Generation
         // validation fences the prepared merge; fresh death/owner checks remain
         // under mesh custody and no selected snapshot crosses a retry wait.
-        // Deliberately the mesh lock, not file custody (smarty-dev#6477 L5): the
-        // lineage death proof is shared state, and holding the mesh lock is what
-        // serializes this claim with resumeLineage()'s state delete.
-        adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
+        // Deliberately the state lock, not file custody (smarty-dev#6477 L5): the
+        // lineage death proof is shared state, and holding the state write lock is what
+        // serializes this claim with resumeLineage()'s state delete. A state fence that
+        // writes nothing; the registry commit inside it is the R11 exception (plan, A1 X15).
+        adopted = await ActorRegistryStore.withLocks([this.#registry], () => withStateFence(this.mesh, this.identity, () =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
             if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
             if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;

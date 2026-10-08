@@ -12,9 +12,12 @@ import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, Mes
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
 // (event-log.ts) take this lock; neither owns it.
 // Lock order, one direction only (smarty-dev#6477 R20): actor registries (sorted path) first, then
-// the state transaction. Today the state transaction is this mesh `.lock`: the second and innermost
-// lock, whose critical sections are synchronous. Once state has its own transaction, `.lock` may be
-// taken inside it only by migration tools.
+// the state transaction. On the file backend the state transaction is this mesh `.lock`: the second
+// and innermost lock, whose critical sections are synchronous. On SQLite, state has its own
+// transaction: `.lock` may then be held around it (the bridge's R20 write fence, a single
+// synchronous `BEGIN IMMEDIATE` attempt inside an event append), never taken inside it, except by
+// migration tools. A SQLite transaction is one synchronous segment and `.lock` is only acquired
+// asynchronously, so the reverse order cannot occur in this process.
 
 // Mesh-lock wait/hold by caller class under <root>/lock-stats (smarty-dev#6477 L8). On unless
 // PI_FABRIC_LOCK_STATS=0; no extra lock, no fsync, and no timer or file before an acquisition.
@@ -171,8 +174,23 @@ export class MeshLock {
   // here or wrap resident async controls in this second/innermost lock.
   // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
-  async withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
+  withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
     bounded = false): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false);
+  }
+
+  /**
+   * Holds `.lock` until the asynchronous operation settles. Only for a dedicated migration process
+   * (the backend cutover holds it across its writer census, smarty-dev#6477 R1); never in a session,
+   * whose mesh critical sections stay synchronous.
+   */
+  withLockAcrossAwait<T>(operation: () => Promise<T>, lockTimeoutMs = this.#lockTimeoutMs,
+    lockClass: MeshLockClass = "other"): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true);
+  }
+
+  async #withLock<T>(operation: () => T | Promise<T>, lockTimeoutMs: number, lockClass: MeshLockClass,
+    bounded: boolean, acrossAwait: boolean): Promise<T> {
     const lockWaitStart = lockStats ? performance.now() : 0;
     let lockHeldAt = -1;
     let holdMs = -1;
@@ -221,7 +239,8 @@ export class MeshLock {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
           if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          await delay(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
           continue;
         }
         const attemptAt = Date.now();
@@ -287,16 +306,16 @@ export class MeshLock {
           if (Date.now() >= deadline) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
-          // Only the FIFO head probes promptly. After the bounded admission fallback,
-          // full jitter spreads plain contenders; the original deadline bounds every sleep.
-          await delay(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
-            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+          // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
+          // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
+          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }
       if (lockStats) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();
-        return operation();
+        return acrossAwait ? await operation() : operation();
       } catch (error) {
         // A failed write (a version conflict above all) means this store's view is behind: the
         // next read parses the file again instead of reusing a recent parse.

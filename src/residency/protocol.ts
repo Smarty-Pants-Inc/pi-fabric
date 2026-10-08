@@ -171,7 +171,9 @@ export class ResidentOutcomeUnknownError extends Error {
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
     super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
       `, ${kind}Id=${id ?? "not yet known"}` +
-      `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}. ` +
+      `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}` +
+      // smarty-dev#6829: the request journal committed; the registry save may still be retrying.
+      `${decision?.state === "committed" ? `, state=accepted; ${kind === "actor" ? "registry save" : "publication"} pending` : ""}. ` +
       `Do not retry or reassign this work. Check agents.${kind === "actor" ? "actorStatus" : "status"}` +
       ` / agents.list${id ? ` for ${id}` : ` and request ${command.requestId}`}; ` +
       `publication may still be pending. Use agents.stop with the known ID once registered to cancel. ` +

@@ -54,6 +54,12 @@ export interface MeshPublishInput {
   principal?: FabricPrincipal | undefined;
   /** A function receives commit time under the lock. */
   data?: unknown;
+  /**
+   * Host-only (smarty-dev#6477 R20): runs the commit step, from the `data` stamp through the live
+   * append, inside a caller's synchronous fence (the bridge's state write fence), under `.lock`.
+   * A fence that throws before running it leaves nothing appended.
+   */
+  fence?: <T>(commit: () => T) => T;
 }
 
 export interface MeshTailResult {
@@ -444,64 +450,68 @@ export class EventLog {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
         if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
       }
-      const createdAt = Date.now();
-      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
-      const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-      const event: MeshEvent = {
-        id: randomUUID(),
-        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-        sequence,
-        topic: input.topic,
-        kind: input.kind?.trim() || "message",
-        from: jsonClone(input.from),
-        ...(principal ? { principal } : {}),
-        // Old bridges only wrote data.bridge. It can veto a native attestation, but
-        // arbitrary payload data cannot establish bridge verification or any authority.
-        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-          : { verification: "mesh" as const }),
-        ...(input.to ? { to: input.to } : {}),
-        ...(input.text !== undefined ? { text: input.text } : {}),
-        ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt,
+      const append = (): { event: MeshEvent; line: string } => {
+        const createdAt = Date.now();
+        const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
+        const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+        const event: MeshEvent = {
+          id: randomUUID(),
+          ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+          sequence,
+          topic: input.topic,
+          kind: input.kind?.trim() || "message",
+          from: jsonClone(input.from),
+          ...(principal ? { principal } : {}),
+          // Old bridges only wrote data.bridge. It can veto a native attestation, but
+          // arbitrary payload data cannot establish bridge verification or any authority.
+          ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
+            : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
+            : { verification: "mesh" as const }),
+          ...(input.to ? { to: input.to } : {}),
+          ...(input.text !== undefined ? { text: input.text } : {}),
+          ...(eventData !== undefined ? { data: eventData } : {}),
+          createdAt,
+        };
+        const line = JSON.stringify(event);
+        if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
+          throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+        }
+        // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+        // The archive holds the event durably before it goes live (smarty-dev#754); the live
+        // append commits it. If either step fails, the event is cut back out of the archive.
+        // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
+        // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
+        // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
+        atomicWrite(this.#counterPath, sequence);
+        let liveOffset = 0;
+        try { liveOffset = fs.statSync(this.#eventsPath).size; }
+        catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+        if (intentPath) {
+          // A durable negative lookup exists before the intent. Only begin() can replace it
+          // with the synced archive line address, before any live append.
+          archive?.reserveLookup(sequence);
+          // This is the crash fence: the intent is durable before the live append begins.
+          writeFileAtomic(intentPath, JSON.stringify({
+            dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+            ...(archive ? { archiveDir: archive.dir } : {}),
+          } satisfies MeshDedupeIntent), { durable: true });
+        }
+        const pending = archive?.begin({ event, line });
+        // Test-only process-death fence: unlike an append exception, no rollback can run.
+        if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
+        try {
+          if (batch) batch.appendStarted = true;
+          fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        } catch (error) {
+          if (pending) archive!.rollback(pending);
+          throw error;
+        }
+        // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+        if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
+        if (pending) archive!.commit(pending);
+        return { event, line };
       };
-      const line = JSON.stringify(event);
-      if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
-        throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-      }
-      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive holds the event durably before it goes live (smarty-dev#754); the live
-      // append commits it. If either step fails, the event is cut back out of the archive.
-      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
-      atomicWrite(this.#counterPath, sequence);
-      let liveOffset = 0;
-      try { liveOffset = fs.statSync(this.#eventsPath).size; }
-      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-      if (intentPath) {
-        // A durable negative lookup exists before the intent. Only begin() can replace it
-        // with the synced archive line address, before any live append.
-        archive?.reserveLookup(sequence);
-        // This is the crash fence: the intent is durable before the live append begins.
-        writeFileAtomic(intentPath, JSON.stringify({
-          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
-          ...(archive ? { archiveDir: archive.dir } : {}),
-        } satisfies MeshDedupeIntent), { durable: true });
-      }
-      const pending = archive?.begin({ event, line });
-      // Test-only process-death fence: unlike an append exception, no rollback can run.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
-      try {
-        if (batch) batch.appendStarted = true;
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-      } catch (error) {
-        if (pending) archive!.rollback(pending);
-        throw error;
-      }
-      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-      if (pending) archive!.commit(pending);
+      const { event, line } = input.fence ? input.fence(append) : append();
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
       if (receiptPath && after && !archive) {

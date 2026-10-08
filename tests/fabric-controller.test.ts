@@ -235,6 +235,54 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it("fences pending dashboard model discovery at controller stop (#5962)", async () => {
+    const state = stubState();
+    vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, runner: "claude" } as never]);
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    Object.assign(state.agents, { claudeModels: () => { entered(); return new Promise(resolve => { release = () => resolve([]); }); } });
+    const context = { mode: "tui", modelRegistry: { getAvailable: () => [] },
+      ui: { notify: vi.fn(), setWidget: vi.fn(), custom: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const opening = controller.openDashboard(context);
+    try {
+      await started;
+      controller.stop();
+      const oldUi = context.ui;
+      Object.defineProperty(context, "ui", { get() { throw new Error("stale ctx"); } });
+      release();
+      await expect(opening).resolves.toBeUndefined();
+      expect(oldUi.custom).not.toHaveBeenCalled();
+      expect(oldUi.notify).not.toHaveBeenCalled();
+    } finally { release(); await opening; controller.stop(); }
+  });
+
+  it.each(["resolve", "reject"] as const)("drops late dashboard action %s notices after controller stop (#5962)", async outcome => {
+    const state = stubState();
+    let resolve!: () => void; let reject!: (error: Error) => void;
+    vi.mocked(state.queueUserMessage).mockImplementation(() => new Promise<any>((yes, no) => { resolve = () => yes({ queued: true }); reject = no; }));
+    const controller = new FabricUiController(state);
+    let dashboard: FabricDashboard | undefined;
+    const context = { mode: "tui", modelRegistry: { getAvailable: () => [] }, ui: {
+      custom: vi.fn(async (factory: (t: TUI, theme: Theme, keys: unknown, done: () => void) => FabricDashboard) => {
+        dashboard = factory({ requestRender: vi.fn() } as unknown as TUI, theme, {}, () => {});
+      }), notify: vi.fn(), setWidget: vi.fn(),
+    } } as unknown as ExtensionContext;
+    try {
+      await controller.openDashboard(context);
+      for (const input of ["l", "g", "s", "finish the review", "\r"]) dashboard!.handleInput(input);
+      expect(state.queueUserMessage).toHaveBeenCalledOnce();
+      controller.stop();
+      const oldUi = context.ui;
+      let staleReads = 0;
+      Object.defineProperty(context, "ui", { get() { staleReads++; throw new Error("stale ctx"); } });
+      if (outcome === "resolve") resolve(); else reject(new Error("old update failed"));
+      await new Promise(done => setImmediate(done));
+      expect(staleReads).toBe(0);
+      expect(oldUi.notify).not.toHaveBeenCalled();
+    } finally { dashboard?.dispose(); controller.stop(); }
+  });
+
   it("routes Main dashboard messages through FabricState", async () => {
     const state = stubState();
     const controller = new FabricUiController(state);

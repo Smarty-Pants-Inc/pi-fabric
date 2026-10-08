@@ -270,6 +270,21 @@ export class ResidencyClient {
     }
   }
 
+  /**
+   * Host-only agents.wakeText after a live Main config reload (smarty-dev#6144 review round 3). The
+   * resident host reads it from config.json at every activation, so enabling applies and removing
+   * revokes at once, with no host restart.
+   */
+  updateWakeText(wakeText: ResidentHostConfig["agents"]["wakeText"]): void {
+    const agents = this.options.config.agents;
+    if (JSON.stringify(agents.wakeText) === JSON.stringify(wakeText)) return;
+    if (wakeText) agents.wakeText = structuredClone(wakeText);
+    else delete agents.wakeText;
+    if (fs.existsSync(this.options.config.residencyRoot)) {
+      atomicWrite(this.#configPath, this.options.config);
+    }
+  }
+
   updateModelGuidance(guidance: readonly FabricOwnedModelGuidance[]): void {
     const snapshot: FabricOwnedModelGuidance[] = structuredClone([...guidance]);
     const serialized = JSON.stringify(snapshot);

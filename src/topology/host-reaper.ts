@@ -146,7 +146,7 @@ const staleDirectoryDeletes = (
  * Returns how many it removed.
  */
 export const reapDeadHostRecords = async (
-  mesh: Pick<MeshStore, "listAll" | "writeBatch" | "exclusive"> & { root?: string },
+  mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & { root?: string },
   identity: MeshIdentity,
   options: { ownHostId: string; now?: number; deadAfterMs?: number },
 ): Promise<number> => {
@@ -158,7 +158,7 @@ export const reapDeadHostRecords = async (
     const root = mesh.root;
     // Recovery can restore a detached key lock. A sweep must not unlink its owner
     // between the detach and the recovery recheck (smarty-dev#2570, P3 sweep).
-    await sweepParticipantLockLeftovers({ root, exclusive: (operation) => mesh.exclusive(operation) }, 60 * 60 * 1000)
+    await sweepParticipantLockLeftovers({ root, custody: (operation) => mesh.custody(operation) }, 60 * 60 * 1000)
       .catch(() => undefined);
   }
   if (found.length === 0 && bookkeeping.length === 0) return 0;
@@ -197,7 +197,7 @@ export const reapDeadHostRecords = async (
         const host = mesh.listAll(hostKey(hostId), { fresh: true }).find((candidate) => candidate.key === hostKey(hostId));
         return !host || leaseGone(host, cutoff, fileLeases(mesh));
       };
-      const gone = await removeParticipantFileIf({ root: mesh.root, exclusive: (operation) => mesh.exclusive(operation) }, entry.key, (current) =>
+      const gone = await removeParticipantFileIf({ root: mesh.root, custody: (operation) => mesh.custody(operation) }, entry.key, (current) =>
         current.version === entry.version && current.updatedAt === entry.updatedAt && hostGone()).catch(() => false);
       if (gone) removed += 1;
     }

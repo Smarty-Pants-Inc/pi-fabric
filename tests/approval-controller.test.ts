@@ -34,6 +34,26 @@ const tuiContext = (
 } as unknown as ExtensionContext);
 
 describe("ApprovalController", () => {
+  it("retires pending and queued approvals without stale ctx reads or successor grants (#5962)", async () => {
+    let release!: () => void; let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const custom = vi.fn(() => { entered(); return new Promise(resolve => { release = () => resolve("allow-session"); }); });
+    const context = tuiContext(custom);
+    const session = new FabricSessionApprovals();
+    const controller = new ApprovalController(policies, context, session);
+    const first = controller.approve(action).catch(error => error);
+    await started;
+    const queued = controller.approve(action).catch(error => error);
+    session.reset();
+    await expect(new ApprovalController(policies, tuiContext(async () => "allow-once"), session).approve(action)).resolves.toBeUndefined();
+    Object.defineProperty(context, "ui", { get() { throw new Error("stale ctx"); } });
+    release();
+    expect(await first).toMatchObject({ message: "Fabric approval session closed; no approval was granted" });
+    expect(await queued).toMatchObject({ message: "Fabric approval session closed; no approval was granted" });
+    expect(custom).toHaveBeenCalledOnce();
+    expect(session.approvedRisks.size).toBe(0);
+  });
+
   it("fails closed when approval is required without a UI", async () => {
     const controller = new ApprovalController(policies, { hasUI: false } as ExtensionContext);
     await expect(controller.approve(action)).rejects.toThrow("no interactive UI");

@@ -1,6 +1,7 @@
 import type { MeshLockProtocol } from "../config.js";
 import fs from "node:fs";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { withMeshCustody } from "./custody-lock.js";
 import { StateFile, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView, type MeshReadOptions,
   type MeshStateEntry } from "./state-file.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
@@ -181,5 +182,17 @@ export class MeshStore {
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     // An explicit zero budget is a bounded try (lock stats count it as a try, not a timeout).
     return this.#lock.withLock(operation, lockTimeoutMs, "custody", lockTimeoutMs === 0);
+  }
+
+  /** File custody (smarty-dev#6477 L5): the custody lock, plus the mesh lock in the default
+   * transition-safe "dual" mode. For operations that guard only files beside the mesh. */
+  async custody<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
+    return withMeshCustody(this, operation, lockTimeoutMs);
+  }
+
+  /** The active withTryLock budget in this async context, if any. */
+  get tryLockBudgetMs(): number | undefined {
+    const scope = this.#lock.tryLockScope.getStore();
+    return scope?.active ? scope.timeoutMs : undefined;
   }
 }

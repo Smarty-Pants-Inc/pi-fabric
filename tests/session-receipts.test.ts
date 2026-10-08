@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { confirmedSessionEntries, confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../src/core/session-receipts.js";
-import { confirmedRootInboxSession, rootInboxSession } from "../src/topology/root-inbox.js";
+import { confirmedMainInboxIds, confirmedRootInboxSession, projectRootInboxReceipt, rootInboxSession } from "../src/topology/root-inbox.js";
 
 const matches = (line: string) => line.includes("pi-fabric-inbox") || line.includes("pi-fabric-agent-message");
 const receipt = (id: string) => JSON.stringify({ type: "custom_message", customType: "pi-fabric-inbox", timestamp: "2026-01-01T00:00:00.000Z", details: { ids: [id] } }) + "\n";
@@ -25,6 +25,56 @@ const full = (file: string): unknown[] => {
 const bytesRead = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.results.reduce((sum: number, result: { type: string; value?: unknown }) => sum + (result.type === "return" && typeof result.value === "number" ? result.value : 0), 0);
 
 describe("incremental confirmed session receipts", () => {
+  it("retains receipt identity, not a second copy of delivered text or metadata (#2177)", () => {
+    const body = "large delivered body ".repeat(100_000);
+    const entry = { type: "custom_message", id: "native", timestamp: "2026-01-01T00:00:00.000Z",
+      customType: "pi-fabric-agent-message", content: body, display: true,
+      details: { text: body, id: "delivery", chain: "chain", from: { id: "sender", name: body },
+        data: { key: " work ", ref: "ref", deliveryId: "data-delivery", messageId: "message", body },
+        items: [{ id: "item", chain: "item-chain", deliveryId: "item-delivery", text: body,
+          from: { id: "other", name: body }, data: { ref: " item-ref ", body } }] } };
+    const { manager, file } = fixture(JSON.stringify({ type: "session", id: "session" }) + "\n" + JSON.stringify(entry) + "\n");
+    const project = projectRootInboxReceipt;
+    const snapshot = confirmedSessionReceiptSnapshot(manager, matches, project);
+    const encoded = JSON.stringify([...snapshot.entries.values()]);
+    expect(encoded.length).toBeLessThan(1_000);
+    expect(encoded).not.toContain("large delivered body");
+    const expected = rootInboxSession([entry]);
+    const actual = confirmedRootInboxSession(manager);
+    expect([...actual.delivered!]).toEqual([...expected.delivered!]);
+    expect([...actual.deliveredAt!]).toEqual([...expected.deliveredAt!]);
+    expect(actual.holdsSteer("other", "item-ref")).toBe(false);
+    expect(confirmedMainInboxIds(manager, "session")).toEqual(new Set(["delivery", "chain", "item", "item-chain"]));
+    expect(() => confirmedMainInboxIds(manager, "wrong")).toThrow("identity mismatch");
+    // Changing the projection cannot inherit a compact cache as canonical data.
+    expect(confirmedSessionReceiptSnapshot(manager, matches).entries.get(1)).toEqual(entry);
+    expect(fs.readFileSync(file, "utf8")).toContain("large delivered body");
+  });
+
+  it("isolates projected caches, keeps original indices, and reprojects only appended lines", () => {
+    const { manager, file } = fixture(other + receipt("first"));
+    const project = vi.fn((value: unknown) => ({ identity: (value as { details: unknown }).details }));
+    const before = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect(project).toHaveBeenCalledTimes(1);
+    expect(confirmedSessionReceiptSnapshot(manager, matches, project).entries).toBe(before.entries);
+    expect(project).toHaveBeenCalledTimes(1);
+    fs.appendFileSync(file, "{pi-fabric-inbox malformed}\n" + other + receipt("second"));
+    const after = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect([...after.entries.keys()]).toEqual([1, 4]);
+    expect(after.count).toBe(5);
+    expect(project).toHaveBeenCalledTimes(2);
+    const otherProject = (entry: unknown) => entry;
+    expect(confirmedSessionReceiptSnapshot(manager, matches, otherProject).entries.get(1)).toEqual(JSON.parse(receipt("first")));
+  });
+
+  it("fails closed when projection throws and does not poison later receipts", () => {
+    const { manager } = fixture();
+    expect(() => confirmedSessionReceiptSnapshot(manager, matches, () => { throw new Error("projection failed"); })).toThrow("projection failed");
+    expect(confirmedSessionReceiptSnapshot(manager, matches, projectRootInboxReceipt).entries.size).toBe(1);
+    const memory = { getEntries: () => [JSON.parse(receipt("memory"))], isPersisted: () => false };
+    expect(rootInboxSession([...confirmedSessionReceiptSnapshot(memory, matches, projectRootInboxReceipt).entries.values()]).holdsBatch(["memory"])).toBe(true);
+  });
+
   it("reads zero bytes on an unchanged 150 MiB file, retaining only matching entries", () => {
     const { file, manager } = fixture();
     const line = JSON.stringify({ type: "custom", data: "x".repeat(1024 * 1024 - 28) }) + "\n";

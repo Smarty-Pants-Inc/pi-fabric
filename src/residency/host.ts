@@ -507,6 +507,14 @@ export class ResidentHost {
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
+    // Host-only agents.wakeText (smarty-dev#6144), read at every activation from the accepted config.json
+    // snapshot that Main rewrites on a live reload, so enabling applies and removal revokes at once. Fail
+    // closed: an unreadable, invalid or other-generation snapshot (currentConfig() fell back to the startup
+    // config) gives no text, never the startup policy. ActorManager revalidates whatever this returns.
+    const currentWakeText = (): ResidentHostConfig["agents"]["wakeText"] => {
+      const overlay = currentConfig();
+      return overlay === config ? undefined : overlay.agents?.wakeText;
+    };
     this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
       config.sessionId,
@@ -552,6 +560,7 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
+        wakeText: currentWakeText,
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
@@ -938,6 +947,8 @@ export class ResidentHost {
     if (typeof rootId === "function") {
       // Serialize proof+absence, target selection and the irreversible outbox
       // write with resumed-root proof invalidation. Never persist a stale choice.
+      // This stays on the mesh lock, not file custody (smarty-dev#6477 L5):
+      // resumeLineage() invalidates the proof with a shared-state delete.
       try { await this.mesh.exclusive(() => persist(rootId())); }
       catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
     } else persist(rootId);

@@ -1,0 +1,211 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
+
+// smarty-dev#6729 gate 1 (pi-fabric#646): a root Main reloads while the shared mesh lock is busy,
+// so quiesce("reload")'s shared write times out (FABRIC_MESH_LOCK_TIMEOUT). The REAL mesh .lock is
+// held (a live owner receipt, never a mock), the old release tears down (quiesce + close), and the
+// same release is re-imported in-process (vi.resetModules + dynamic import) and started. A 100 ms
+// sampler checks the host lease file and the root record the whole time.
+
+const LOCK_TIMEOUT_MS = 1_000;
+const MAX_LEASE_AGE_MS = 15_000;
+const roots: string[] = [];
+const cleanup: Array<() => Promise<unknown> | unknown> = [];
+afterEach(async () => {
+  for (const close of cleanup.splice(0).reverse()) await close();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+const sessionId = "6729ffff-bbbb-cccc-dddd-eeeeeeeeeeee";
+const identity: MeshIdentity = { id: "session:" + sessionId, sessionId, name: "Main", kind: "main" };
+const reader: MeshIdentity = { id: "session:reader", sessionId: "reader", name: "reader", kind: "main" };
+const record = (): FabricParticipantRecord => ({
+  format: 1, id: identity.id, rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
+  kind: "root", name: "Main", status: "idle", capabilities: ["steer", "followUp", "fabric"],
+  runner: "pi", transport: "host", controlProtocol: "v1", sessionId, cwd: process.cwd(), startedAt: 1, updatedAt: Date.now(),
+});
+
+type Sample = { at: number; phase: string; lease: boolean; leaseAgeMs: number; leaseExpired: boolean; root: boolean };
+
+const fixture = () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-reload-continuity-"));
+  roots.push(base);
+  const meshRoot = path.join(base, "mesh");
+  const realNow = Date.now.bind(Date);
+  let skew = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+  const options = { lockTimeoutMs: LOCK_TIMEOUT_MS };
+  const observer = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, options), {
+    enabled: true, hostId: reader.id, rootId: reader.id, identity: reader, reapDeadHosts: false,
+  });
+  const lockPath = path.join(meshRoot, ".lock");
+  // A live holder: our own pid, a complete protocol-1 receipt. Never stale, so every
+  // acquisition in this process waits LOCK_TIMEOUT_MS and throws MeshLockTimeoutError.
+  const holdLock = () => {
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), randomUUID() + "\n" + process.pid + "\n" + realNow() + "\n");
+  };
+  const releaseLock = () => fs.rmSync(lockPath, { recursive: true, force: true });
+  cleanup.push(releaseLock);
+  let phase = "start";
+  const samples: Sample[] = [];
+  const sample = (): Sample => {
+    const now = Date.now();
+    const lease = readHostLeases(meshRoot).get(identity.id);
+    let root = false;
+    try { root = observer.list({ kinds: ["root"], fresh: true }).some((p) => p.id === identity.id); } catch { root = false; }
+    const s = { at: now, phase, lease: lease !== undefined, leaseAgeMs: lease ? now - lease.updatedAt : Infinity,
+      leaseExpired: lease ? lease.expiresAt <= now : true, root };
+    samples.push(s);
+    return s;
+  };
+  let timer: NodeJS.Timeout | undefined;
+  const startSampling = () => { timer = setInterval(sample, 100); };
+  const stopSampling = () => { if (timer) clearInterval(timer); timer = undefined; sample(); };
+  cleanup.push(stopSampling);
+  return { meshRoot, options, holdLock, releaseLock, sample, samples, startSampling, stopSampling,
+    setPhase: (p: string) => { phase = p; }, advance: (ms: number) => { skew += ms; } };
+};
+
+/** A Fabric release's directory, built from the given (possibly re-imported) modules. */
+const directoryFrom = (modules: { MeshStore: typeof MeshStore; ParticipantDirectory: typeof ParticipantDirectory },
+  meshRoot: string, options: { lockTimeoutMs: number }) => {
+  const directory = new modules.ParticipantDirectory(new modules.MeshStore(meshRoot, 64 * 1024, 1_000, options), {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+  });
+  directory.registerSource(() => [record()]);
+  cleanup.push(() => directory.close());
+  return directory;
+};
+
+/** The next release's import: a fresh module graph in this process. */
+const reimport = async () => {
+  vi.resetModules();
+  const [store, directory] = await Promise.all([
+    import("../src/mesh/store.js"), import("../src/topology/participant-directory.js"),
+  ]);
+  return { MeshStore: store.MeshStore, ParticipantDirectory: directory.ParticipantDirectory };
+};
+
+const summary = (samples: Sample[]) => ({
+  samples: samples.length,
+  leaseMissing: samples.filter((s) => !s.lease).length,
+  leaseExpired: samples.filter((s) => s.leaseExpired).length,
+  rootMissing: samples.filter((s) => !s.root).length,
+  maxLeaseAgeMs: Math.max(...samples.filter((s) => s.lease).map((s) => s.leaseAgeMs), 0),
+  firstLeaseMissing: samples.find((s) => !s.lease)?.phase,
+  firstRootMissing: samples.find((s) => !s.root)?.phase,
+  maxSampleGapMs: samples.slice(1).reduce((max, s, i) => Math.max(max, s.at - samples[i]!.at), 0),
+});
+
+const report = (name: string, value: unknown) => {
+  const line = JSON.stringify({ test: name, ...(value as object) });
+  console.log("RELOAD-LEASE " + line);
+  if (process.env.RELOAD_LEASE_REPORT) fs.appendFileSync(process.env.RELOAD_LEASE_REPORT, line + "\n");
+};
+
+describe("root Main lease continuity through a reload whose quiesce write times out (smarty-dev#6729 gate 1)", () => {
+  it("keeps the root record and a fresh host lease file through teardown + in-process re-import", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    expect(f.sample()).toMatchObject({ lease: true, root: true, leaseExpired: false });
+    f.startSampling();
+
+    // Fleet lock load: the shared mesh lock is busy through the old release's whole teardown.
+    f.holdLock();
+    f.setPhase("quiesce");
+    const t0 = Date.now();
+    const quiesceError = await old.quiesce("reload").then(() => undefined, (error: unknown) => error);
+    const quiesceMs = Date.now() - t0;
+    // session_shutdown swallows the failure (fabric-runtime-state.ts) and closes anyway.
+    expect((quiesceError as { code?: string } | undefined)?.code).toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    f.setPhase("close");
+    const t1 = Date.now();
+    await old.close();
+    const closeMs = Date.now() - t1;
+    f.releaseLock();
+
+    f.setPhase("import");
+    const t2 = Date.now();
+    const next = await reimport();
+    const importMs = Date.now() - t2;
+    f.setPhase("first-heartbeat");
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    await fresh.start();
+    f.setPhase("after");
+    const heartbeatGapMs = Date.now() - t1;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    f.stopSampling();
+
+    const s = summary(f.samples);
+    report("in-process", { quiesceMs, closeMs, importMs, closeToFirstHeartbeatMs: heartbeatGapMs, ...s });
+    expect(s.firstLeaseMissing, "host lease file missing").toBeUndefined();
+    expect(s.firstRootMissing, "root record missing").toBeUndefined();
+    expect(s.leaseExpired, "host lease expired").toBe(0);
+    expect(s.maxLeaseAgeMs, "host lease age").toBeLessThanOrEqual(MAX_LEASE_AGE_MS);
+    expect(s.maxSampleGapMs, "sampler starved").toBeLessThan(MAX_LEASE_AGE_MS);
+  }, 60_000);
+
+  // Second gap: the soak's self-reload import took p50 51 s, max 68 s, with nothing renewing the
+  // lease in between. Measured, not gated on age: the lease is kept, but how stale does it get, and
+  // what does the new release's first heartbeat do while the lock is still busy?
+  it.each([
+    [51_000, false], [68_000, false], [51_000, true], [68_000, true],
+  ])("second gap: a %i ms import under lock load (files-only policy: %s)", async (importDelayMs, filesOnly) => {
+    const f = fixture();
+    if (filesOnly) {
+      await new MeshStore(f.meshRoot, 64 * 1024, 1_000, f.options).put({ key: LIVENESS_POLICY_KEY,
+        value: { version: 1, participants: "files", hostLeases: "files" }, identity });
+    }
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    f.setPhase("quiesce");
+    await old.quiesce("reload").catch(() => undefined);
+    f.setPhase("close");
+    await old.close();
+    f.sample();
+    const reloadLease = readHostLeases(f.meshRoot).get(identity.id);
+    // The import: injected clock advanced in 100 ms steps, sampled at every step.
+    f.setPhase("import");
+    const next = await reimport();
+    for (let elapsed = 0; elapsed < importDelayMs; elapsed += 100) { f.advance(100); f.sample(); }
+    const teardownAndImport = summary(f.samples);
+    // The new release's first heartbeat while the lock is STILL busy.
+    f.setPhase("first-heartbeat-locked");
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    const startError = await fresh.start().then(() => undefined, (error: unknown) => error);
+    const lockedLease = readHostLeases(f.meshRoot).get(identity.id);
+    const afterLockedStart = f.sample();
+    // Lock load clears; the next heartbeat commits.
+    f.releaseLock();
+    f.setPhase("heartbeat-unlocked");
+    await fresh.refresh();
+    const afterCommit = f.sample();
+    report("second-gap-" + importDelayMs + (filesOnly ? "-files" : "-mesh"), {
+      importDelayMs, filesOnly, ...teardownAndImport,
+      reloadLeaseExpiresInMs: (reloadLease?.expiresAt ?? 0) - (reloadLease?.updatedAt ?? 0),
+      lockedStart: { error: (startError as { code?: string } | undefined)?.code ?? null,
+        leaseRewrittenByNewIncarnation: lockedLease?.startedAt !== reloadLease?.startedAt,
+        leaseTtlMs: (lockedLease?.expiresAt ?? 0) - Date.now(), leaseAgeMs: afterLockedStart.leaseAgeMs,
+        rootVisible: afterLockedStart.root },
+      afterCommit: { leaseAgeMs: afterCommit.leaseAgeMs, rootVisible: afterCommit.root },
+    });
+    // Kept through teardown and the whole import, on the reload grace, never refreshed.
+    expect(teardownAndImport.firstLeaseMissing, "host lease file missing").toBeUndefined();
+    expect(teardownAndImport.firstRootMissing, "root record missing").toBeUndefined();
+    expect(teardownAndImport.leaseExpired, "host lease expired").toBe(0);
+    expect(teardownAndImport.maxLeaseAgeMs).toBeGreaterThanOrEqual(importDelayMs);
+    expect(afterCommit).toMatchObject({ lease: true, root: true, leaseExpired: false });
+    expect(afterCommit.leaseAgeMs).toBeLessThanOrEqual(MAX_LEASE_AGE_MS);
+  }, 60_000);
+});

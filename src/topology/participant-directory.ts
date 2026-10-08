@@ -26,6 +26,7 @@ import {
   hostLiveness,
   LIVENESS_POLICY_KEY,
   readHostLease,
+  readHostLeaseCurrent,
   readHostLeaseSnapshot,
   participantLeaseGraceMs,
   waitForHostLeaseRenewal,
@@ -764,7 +765,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshedAt = committed;
       // Every commit witness up to here is accounted for by this receipt, our own commit's included.
       this.#commitWitnessSeen = latestCommitWitness(this.mesh.root);
+      const firstConfirmation = !this.#leaseConfirmed;
       this.#leaseConfirmed = true;
+      // This incarnation's host record is committed now: take over a predecessor's kept reload lease.
+      if (firstConfirmation && this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) {
+        try { this.#renewFileLease(); } catch { /* the next heartbeat renews it */ }
+      }
       this.#refreshError = undefined;
       this.#cancelPublicationRetry();
       this.#publicationRetryDelay = 750;
@@ -2131,8 +2137,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
       latest > this.#commitWitnessSeen && evidence > this.#refreshedAt && at - evidence <= this.#heartbeatMs;
   }
 
+  /** smarty-dev#6729 gate 1: a listing pairs a root with its owner's shared host record, extended
+   * only by a lease file of the same incarnation (hostLiveness). Until this incarnation's first
+   * shared commit stamps its own host record, that record is still the predecessor's; replacing
+   * the predecessor's live reload lease file with this incarnation's (new startedAt) dropped the
+   * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
+   * Its reloadUntil still bounds the listing if this release never commits. */
+  #keepsPredecessorReloadLease(at: number): boolean {
+    if (this.#leaseConfirmed) return false;
+    const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+    return lease !== undefined && lease.rootId === this.options.rootId &&
+      lease.identityId === this.options.identity.id && lease.startedAt !== undefined &&
+      lease.startedAt < this.#startedAt && lease.expiresAt > at && lease.expiresAt - lease.updatedAt > this.#leaseMs;
+  }
+
   #renewFileLease(): number {
     const leaseAt = Date.now();
+    if (this.#keepsPredecessorReloadLease(leaseAt)) return leaseAt;
     const root = this.#localRecords.get(this.options.rootId);
     writeHostLease(this.mesh.root, {
       id: this.options.hostId,

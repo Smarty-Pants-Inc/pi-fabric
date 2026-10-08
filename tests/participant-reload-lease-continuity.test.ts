@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -208,4 +208,87 @@ describe("root Main lease continuity through a reload whose quiesce write times 
     expect(afterCommit).toMatchObject({ lease: true, root: true, leaseExpired: false });
     expect(afterCommit.leaseAgeMs).toBeLessThanOrEqual(MAX_LEASE_AGE_MS);
   }, 60_000);
+});
+
+// The directory gap (smarty-dev#6729 gate 1, after #646): the soak kept every lease, yet 12 root
+// Mains vanished from the fleet directory for ~10-55 s each during their reload. A listing pairs a
+// root record with its owner's SHARED host record, extended only by a lease file of the same
+// incarnation (hostLiveness: matching startedAt). The new release's first heartbeat replaced the
+// predecessor's live reload lease file with its own (new startedAt) before its shared host record
+// could commit under lock load, so the old host record lost its lease and the root dropped out
+// until that commit landed. Sampled from a reader's directory listing every 100 ms.
+describe("root Main stays in the directory listing through a reload under lock load (smarty-dev#6729 gate 1)", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("lists the Main through close(), a 51 s import and the new release's locked first heartbeats", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    expect(f.sample()).toMatchObject({ lease: true, root: true });
+    f.startSampling();
+    f.holdLock();
+    f.setPhase("quiesce");
+    await old.quiesce("reload").catch(() => undefined);
+    f.setPhase("close");
+    await old.close();
+    f.setPhase("import");
+    const next = await reimport();
+    for (let elapsed = 0; elapsed < 51_000; elapsed += 100) { f.advance(100); f.sample(); }
+    // The new release starts while the lock is still busy: its first heartbeat and a retry time out.
+    f.setPhase("first-heartbeat-locked");
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    const startError = await fresh.start().then(() => undefined, (error: unknown) => error);
+    f.setPhase("retry-locked");
+    const retryError = await fresh.refresh().then(() => undefined, (error: unknown) => error);
+    await sleep(500);
+    f.releaseLock();
+    f.setPhase("heartbeat-unlocked");
+    await fresh.refresh();
+    await sleep(300);
+    f.stopSampling();
+    const s = summary(f.samples);
+    const missing = f.samples.filter((x) => !x.root);
+    report("directory-gap", { ...s, rootMissingPhases: [...new Set(missing.map((x) => x.phase))],
+      rootMissingSpanMs: missing.length ? missing.at(-1)!.at - missing[0]!.at : 0 });
+    expect((startError as { code?: string } | undefined)?.code).toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    expect((retryError as { code?: string } | undefined)?.code).toBe("FABRIC_MESH_LOCK_TIMEOUT");
+    expect(s.firstRootMissing, "root Main missing from the directory listing").toBeUndefined();
+    expect(s.rootMissing).toBe(0);
+    expect(s.leaseExpired, "host lease expired").toBe(0);
+    expect(f.samples.at(-1)).toMatchObject({ lease: true, root: true, leaseExpired: false });
+    expect(f.samples.at(-1)!.leaseAgeMs).toBeLessThanOrEqual(MAX_LEASE_AGE_MS);
+  }, 60_000);
+
+  it("drops a Main whose process is gone once its reload lease expires", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    f.releaseLock();
+    // The process died mid-reload: nothing renews the reload lease and no release starts.
+    f.advance(MAIN_RELOAD_LEASE_MS - 5_000);
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    f.advance(10_000);
+    expect(f.sample()).toMatchObject({ root: false, leaseExpired: true });
+  }, 30_000);
+
+  it("drops a Main whose next release never commits once the predecessor's reload lease expires", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    await fresh.start().catch(() => undefined);
+    expect(f.sample()).toMatchObject({ root: true });
+    // The lock never clears for it: the reload lease, not the stalled release, bounds the listing.
+    f.advance(MAIN_RELOAD_LEASE_MS + 5_000);
+    await fresh.refresh().catch(() => undefined);
+    expect(f.sample()).toMatchObject({ root: false });
+    f.releaseLock();
+  }, 30_000);
 });

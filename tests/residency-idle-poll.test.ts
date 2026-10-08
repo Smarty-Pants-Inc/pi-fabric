@@ -102,4 +102,48 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("counts the idle window from a durable actor run that started and ended between two cached samples", async () => {
+    let idled = 0;
+    const { root, host } = fixture(() => { idled++; });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await host.start();
+      // Close to the idle window with no actor: the next tick caches an inactive observation.
+      now += 29_000;
+      await sleep(200);
+      expect(idled).toBe(0);
+      const sampledAt = now;
+      const runs = vi.spyOn(host.agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+        onSpawned?.({ id: "run-between-samples" } as never);
+        return { id: "run-between-samples", status: "completed", text: "done", toolCalls: 0 } as never;
+      });
+      // A durable actor is created, runs and stops, all inside the same one-second cached sample.
+      const actor = await host.actors.create({ name: "between-samples", instructions: "wait", residency: "durable" });
+      host.actors.tell(actor.id, "go");
+      for (let waited = 0; waited < 5_000 && !(runs.mock.calls.length === 1 && host.actors.status(actor.id).status === "idle"); waited += 20) await sleep(20);
+      expect(runs).toHaveBeenCalledTimes(1);
+      await host.actors.stop(actor.id);
+      expect(host.actors.status(actor.id).status).toBe("stopped");
+      // The clock did not move: by time alone every tick during the run reused the inactive sample.
+      expect(Date.now()).toBe(sampledAt);
+      const ended = now;
+      // Past the window since the host started, but only 1.1 s after the run ended.
+      now += 1_100;
+      await sleep(200);
+      expect(idled).toBe(0);
+      now = ended + 29_900;
+      await sleep(200);
+      expect(idled).toBe(0);
+      // The full window after the run ended: the host exits.
+      now = ended + 30_100;
+      await sleep(200);
+      expect(idled).toBeGreaterThan(0);
+    } finally {
+      clock.mockRestore();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

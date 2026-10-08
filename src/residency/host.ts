@@ -124,6 +124,9 @@ const IDLE_EXIT_MS = 30_000;
 // stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
 // Requests, admissions and agents are still checked on every tick; the actor check is
 // reused for at most this long, and an exit is always confirmed by a current actor check.
+// Every actor change signal (create, run start and end, stop, ownership) restarts the idle
+// window and drops the reused observation, so a run that starts and ends between two samples
+// still counts: the window always runs from the last real actor activity.
 const IDLE_ACTOR_CHECK_MS = 1_000;
 const COMPLETION_MAX_CHARS = 8_000;
 const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
@@ -646,6 +649,7 @@ export class ResidentHost {
       );
       this.agents.subscribeUi(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.participants.scheduleRefresh());
+      this.actors.subscribe(() => this.#noteActorActivity());
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
@@ -1088,6 +1092,13 @@ export class ResidentHost {
     const retention = this.#effectiveConfig?.().retention ?? this.config.retention;
     this.#retentionOverlay = stamp === undefined ? undefined : { stamp, retention };
     return retention;
+  }
+
+  /** Actor activity seen through the manager's change signal: count the idle window from now and
+   * take a current actor observation at the next idle check instead of the reused one. */
+  #noteActorActivity(): void {
+    this.#idleSince = Date.now();
+    this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   }
 
   #hasActiveActor(now: number, current = false): boolean {

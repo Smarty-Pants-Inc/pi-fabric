@@ -259,8 +259,10 @@ describe("sqlite backend acquisition", () => {
       expect((error as Error).message).toContain(MESH_STATE_BUSY_CODE);
       expect(waited).toBeGreaterThanOrEqual(190);
       expect(waited).toBeLessThan(2_000);
-      // The event loop kept running during the wait: the wait is asynchronous.
-      expect(ticks).toBeGreaterThanOrEqual(10);
+      // The event loop kept running during the wait: the wait is asynchronous (a synchronous wait
+      // gives 0 ticks). Windows timers resolve at ~15.6 ms and CI hosts are loaded, so the 5 ms
+      // interval fires far fewer than waited / 5 times; require a few ticks, not a rate.
+      expect(ticks).toBeGreaterThanOrEqual(3);
       // A withTryLock budget bounds it further, as for .lock.
       const tryStarted = performance.now();
       await expect(store.withTryLock(() => store.put({ key: "a", value: 3, identity }), 20)).rejects.toBeInstanceOf(MeshStateBusyError);

@@ -45,8 +45,11 @@ process.stdout.write(JSON.stringify({ lockAttempts, conflicts }) + "\\n");
 
 interface ChildResult { code: number | null; stdout: string; stderr: string }
 
+// node:sqlite prints "ExperimentalWarning: SQLite is an experimental feature" on Node 22 (CI's
+// runner Node); production does not suppress it, so only these test children silence that one
+// warning class. Every other stderr byte still fails the assertion below.
 const runChild = (root: string, count: number): Promise<ChildResult> => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD, root, String(count)],
+  const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", CHILD, root, String(count)],
     { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
   let stdout = "";
   let stderr = "";

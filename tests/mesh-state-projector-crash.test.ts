@@ -40,6 +40,15 @@ const runChild = (root: string, kind: "record" | "snapshot", killAt: number): Pr
   child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
 });
 
+// On Windows, SIGKILL terminates the process without a signal: close reports signal null and a non-zero exit code.
+const expectKilled = (child: ChildResult): void => {
+  if (process.platform === "win32") {
+    expect(child.signal).toBeNull();
+    expect(child.code).not.toBeNull();
+    expect(child.code).not.toBe(0);
+  } else expect(child.signal).toBe("SIGKILL");
+};
+
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const roots: string[] = [];
 const projectors: StateProjector[] = [];
@@ -109,7 +118,7 @@ describe("state projector crash", () => {
     // Killed while applying the 4th of 7 generations, after three committed.
     const child = await runChild(root, "record", 3);
     expect(child.stderr).toBe("");
-    expect(child.signal).toBe("SIGKILL");
+    expectKilled(child);
     expect(child.stdout).toBe("dying\n");
     expect(Number(meta(root, "commit_no"))).toBe(seeded.commit + 3);
     expect(JSON.parse(String(meta(root, "projector.lease")))).toMatchObject({ owner: "child" });
@@ -128,7 +137,7 @@ describe("state projector crash", () => {
     const file = new MeshStore(root, 64 * 1024, 1_000, { maxStateTombstones: 2 });
     await write(file, 9);
     const child = await runChild(root, "snapshot", 0);
-    expect(child.signal).toBe("SIGKILL");
+    expectKilled(child);
     expect(Number(meta(root, "commit_no"))).toBe(0);
     expect(meta(root, "projector.progress")).toBeUndefined();
 

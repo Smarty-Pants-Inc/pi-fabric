@@ -100,6 +100,8 @@ const writerKey = (writer: CensusWriter): string => writer.pid === undefined
  * unexpired host lease names that writer: same host, pid and start time (a lease of a later process
  * that reused the pid does not vouch for the record). A record without a valid host, pid or start time, or
  * with unsupported metadata, is retained and counted unknown (fail closed).
+ * A lock owner or queue ticket names only a pid: it is attributed to a writer by that pid (live here, or
+ * another host's record or lease), and evidence no writer names is unknown, never dropped as dead.
  * Only an absent file or directory (ENOENT) is no evidence: any other read failure of the census
  * directory, a record, a host lease, the lock owner or the lock queue, and an owner record without
  * a valid pid, is counted unknown with its path and errno, so the census is never clean on it.
@@ -141,10 +143,19 @@ export async function census(root: string): Promise<WriterCensus> {
   const addLockEvidence = (pid: number, source: "lock-owner" | "lock-ticket", name: string | undefined): void => {
     const metadata = byPid.get(pid) ?? [];
     const mine = metadata.find(record => local(record) && censusRecordAlive(record.pid, record));
-    if (processAlive(pid)) add({ ...(mine ? leaseWriter(mine) : { pid }), source, ...(name ? { name } : {}) });
+    const others = metadata.filter(record => !local(record));
+    const alive = processAlive(pid);
+    if (alive) add({ ...(mine ? leaseWriter(mine) : { pid }), source, ...(name ? { name } : {}) });
     // A same-pid writer on another (or an unnamed) host may own this evidence: never treat it as
     // dead (fail closed).
-    for (const record of metadata.filter(record => !local(record))) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
+    for (const record of others) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
+    // pi-fabric#638 round 8: lock owners and tickets name a pid but no host or boot, so a pid not
+    // live here never proves the evidence is this host's dead process: a pre-census remote writer
+    // leaves exactly this. Evidence no writer record or lease names is unknown, never dropped.
+    if (!alive && others.length === 0) {
+      add({ pid, source, ...(name ? { name } : {}),
+        reason: `${source} ${name ?? "unknown"}: pid ${pid} is not live on ${host} and no writer record or lease names it` });
+    }
   };
   const initialized: string[] = [];
   for (const name of DATABASE_FILES) {

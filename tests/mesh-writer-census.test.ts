@@ -642,6 +642,24 @@ describe("mesh writer census", () => {
       setup: mesh => sqliteResidue(mesh, path.join("state-shadow", "state.db")) },
     { label: "mixed: a legacy sqlite writer's open database beside a recorded file writer", clean: false,
       setup: mesh => { sqliteResidue(mesh); writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), stateBackend: "file" }); } },
+    { label: "round 8: a pre-census remote writer's lock owner and ticket, pid not live here, no metadata", clean: false,
+      setup: mesh => {
+        const pid = deadPid();
+        const token = "01234567-89ab-cdef-0123-456789abcdef";
+        fs.mkdirSync(path.join(mesh, ".lock"));
+        fs.writeFileSync(path.join(mesh, ".lock", "owner"), `${token}\n${pid}\n${Date.now()}\n`);
+        const queue = meshLockQueueDirectory(mesh);
+        fs.mkdirSync(queue, { recursive: true });
+        fs.writeFileSync(path.join(queue, `${"5".repeat(24)}-${pid}-${token}`), "");
+      },
+      check: result => {
+        const [writer] = result.unknown;
+        expect(result.unknown).toHaveLength(1);
+        expect(writer).toEqual(expect.objectContaining({ source: "lock-owner", name: "01234567-89ab-cdef-0123-456789abcdef",
+          reason: expect.stringMatching(/is not live on .* and no writer record or lease names it/) }));
+        expect(writer?.evidence).toEqual(["lock-owner:01234567-89ab-cdef-0123-456789abcdef",
+          `lock-ticket:${"5".repeat(24)}-${writer?.pid}-01234567-89ab-cdef-0123-456789abcdef`]);
+      } },
     { label: "mixed: a legacy live lock owner beside a recorded new writer", clean: false,
       setup: mesh => {
         writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt(), stateBackend: "file" });

@@ -100,10 +100,12 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const read = vi.spyOn(atomic, "processIncarnation").mockImplementation(() => slowRead(incarnation));
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
-    const exclusive = mesh.exclusive.bind(mesh);
-    const attempt = vi.spyOn(mesh, "exclusive").mockImplementation((operation, timeout) => {
+    // Adoption claims through a zero-wait state fence (smarty-dev#6477 L2b: withStateFence, a
+    // writeBatch under mesh.withTryLock), no longer mesh.exclusive: spy on the bounded try itself.
+    const tryLock = mesh.withTryLock.bind(mesh);
+    const attempt = vi.spyOn(mesh, "withTryLock").mockImplementation((operation, timeout) => {
       expect(fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner"))).toBe(true);
-      expect(timeout).toBe(0); entered(); return exclusive(operation, timeout);
+      expect(timeout).toBe(0); entered(); return tryLock(operation, timeout);
     });
     const agentManager = new AgentManager(base, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(base, "runs"),

@@ -1959,18 +1959,51 @@ describe("FabricControlPlane", () => {
       .resolves.toMatchObject({ acknowledged: true, messageId: "late-but-delivered" });
   });
 
-  it("still times out, after the deadline plus a bounded grace, when no owner answers", async () => {
+  it("still times out, after the deadline plus a bounded grace, when no owner answers, and withdraws the unclaimed message", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
-    const sender = plane(path.join(root, "mesh"), "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
     sender.start(() => ({ accepted: false }));
     const started = Date.now();
-    // No receiver runs. The outcome is unknown, so the error must not promise a safe retry.
-    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "nobody home" }))
-      .rejects.toThrow("the outcome is unknown and it may still be delivered, so a retry can deliver it twice");
+    // No receiver runs, so nobody claimed it: smarty-dev#6729 makes that a definite non-delivery.
+    const error = await sender.request("host:receiver", "agent:target", "steer", { message: "nobody home" })
+      .then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("Timed out waiting for the remote Fabric owner to acknowledge agent:target");
+    expect(error?.message).toContain("not delivered, nothing was queued");
+    expect(error?.message).not.toContain("outcome is unknown");
+    expect(error).toMatchObject({ code: "FABRIC_CONTROL_NOT_DELIVERED", notDelivered: true });
     const waited = Date.now() - started;
     expect(waited).toBeGreaterThanOrEqual(100 + 200 - 20);   // the deadline plus 2 x 100 ms of grace
     expect(waited).toBeLessThan(2_000);
+
+    // The owner resumes later: it answers the withdrawn command as expired and never runs it.
+    const handler = vi.fn(() => ({ accepted: true, messageId: "late" }));
+    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    receiver.start(handler);
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack" })).toHaveLength(1));
+    expect(mesh.read({ topic: "fabric.control.ack" })[0]!.data).toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps the outcome unknown when the owner claimed the message before the sender timed out", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    sender.start(() => ({ accepted: false }));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const handler = vi.fn(async () => { await held; return { accepted: true, messageId: "slow" }; });
+    receiver.start(handler);
+    const error = await sender.request("host:receiver", "agent:target", "steer", { message: "claimed" })
+      .then(() => undefined, (failure: Error) => failure);
+    release();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(error?.message).toContain("the outcome is unknown and it may still be delivered");
+    expect(error).not.toHaveProperty("notDelivered");
   });
 
   it("surfaces owner rejection instead of reporting an unverified queue", async () => {

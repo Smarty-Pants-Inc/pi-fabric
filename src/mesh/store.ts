@@ -2,19 +2,21 @@ import type { MeshLockProtocol } from "../config.js";
 import fs from "node:fs";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { withMeshCustody } from "./custody-lock.js";
-import { StateFile, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView, type MeshReadOptions,
-  type MeshStateEntry } from "./state-file.js";
+import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
+import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
+  type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError } from "./event-log.js";
 export type { MeshStateEntry, MeshReadOptions, MeshBatchOperation, MeshBatchView, MeshBatchResult } from "./state-file.js";
 export { RUNTIME_MESH_READ_CACHE_MS, MIN_BACKGROUND_MESH_READ_CACHE_MS, assertMeshStateReadable, MeshBatchConflictError } from "./state-file.js";
+export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // The public mesh store (smarty-dev#6477 L0): a thin facade over three lock domains.
 //   mesh-lock.ts   the `.lock` acquisition, its tickets, timeouts, metrics and stale-owner recovery;
 //                  the lock order is written there.
-//   state-file.ts  keyed state on state.json.
+//   state-file.ts  keyed state on state.json; state-backend.ts selects it, sqlite or shadow (L2a).
 //   event-log.ts   events, receipts, the live log, compaction and the archive.
 // Each domain keeps its own private fields; they share only the context (root, bounds, lock).
 
@@ -44,11 +46,13 @@ export interface MeshStoreOptions {
   readActive?: () => boolean;
   /** Disable optional delta publication, e.g. for legacy-writer compatibility probes. */
   writeReadJournal?: boolean;
+  /** Keyed-state backend (smarty-dev#6477 L2a). Explicit wins; else PI_FABRIC_MESH_STATE_BACKEND; else "file". */
+  stateBackend?: MeshStateBackendKind;
 }
 
 export class MeshStore {
   readonly #lock: MeshLock;
-  readonly #state: StateFile;
+  readonly #state: StateBackend;
   readonly #events: EventLog;
 
   constructor(
@@ -60,13 +64,27 @@ export class MeshStore {
     // A failed operation under the lock drops the parsed state (see MeshLock.withLock).
     this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
-    this.#state = new StateFile(context, options);
+    this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
   get lockProtocol(): MeshLockProtocol {
     return this.#lock.lockProtocol;
+  }
+
+  /** The keyed-state backend in use (after any fallback to "file"). */
+  get stateBackend(): MeshStateBackendKind {
+    return this.#state.kind;
+  }
+
+  stateDiagnostics(): StateBackendDiagnostics {
+    return this.#state.diagnostics();
+  }
+
+  /** Releases the state database handle (sqlite, shadow); the file backend holds none. */
+  closeState(): void {
+    this.#state.close();
   }
 
   get readCacheMs(): number {
@@ -149,14 +167,8 @@ export class MeshStore {
     return this.#state.delete(input);
   }
 
-  writeBatch(input: {
-    identity: MeshIdentity;
-    ops: MeshBatchOperation[];
-    prepare?: (view: MeshBatchView) => MeshBatchOperation[];
-    afterCommit?: (view: MeshBatchView) => void;
-    /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
-    lockClass?: "bridge";
-  }): Promise<MeshBatchResult[]> {
+  /** Transaction and callback semantics: StateBackendBatchInput (state-backend.ts). */
+  writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
     return this.#state.writeBatch(input);
   }
 

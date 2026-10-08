@@ -2195,7 +2195,12 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
     } finally { clock.mockRestore(); }
   });
 
-  it("lets one real confirmation on an idle mesh serve another idle participant without the lock", async () => {
+  // Windows CI on #592: Node defines fs.constants.O_NOFOLLOW only on POSIX. Since review round 4 the
+  // product never writes the confirmation witness without an atomic no-follow open, so on Windows a
+  // real confirmation leaves no witness for another idle participant (by design, not a timing race).
+  // There, the native test below asserts that contract instead; this one runs wherever the witness exists.
+  const nativeNoFollow = typeof fs.constants.O_NOFOLLOW === "number" && fs.constants.O_NOFOLLOW !== 0;
+  it.skipIf(!nativeNoFollow)("lets one real confirmation on an idle mesh serve another idle participant without the lock", async () => {
     const f = await idleFixture();
     const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
     const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
@@ -2294,35 +2299,41 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
   // Review round 4 on #592: without an atomic no-follow open, an lstat-then-open could be raced by a
   // swap to a symlink. Such a platform never opens or writes the witness: no lock-free proof from
   // it, so the next idle participant takes the lock too.
+  const expectNoWitnessSharing = async () => {
+    const f = await idleFixture();
+    const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
+    const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
+      rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
+    second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
+    directories.push(second);
+    await second.refresh();
+    await second.refresh();
+    await f.directory.refresh();                               // absorbs the second's first commits
+    const witness = plantedWitness(f.mesh.root);
+    fs.rmSync(witness, { force: true });
+    const opens = vi.spyOn(fs, "openSync");
+    const confirmationsBefore = f.confirmations.mock.calls.length;
+    fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
+    await f.directory.refresh();                               // a real acquisition, but no witness
+    expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
+    expect(opens.mock.calls.some(([file]) => file === witness)).toBe(false);
+    expect(fs.existsSync(witness)).toBe(false);
+    const baseline = f.acquisitions();
+    const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
+    await second.refresh();
+    expect(secondConfirms).toHaveBeenCalledOnce();
+    expect(f.acquisitions() - baseline).toBe(1);
+    expect(fs.existsSync(witness)).toBe(false);
+  };
   it("never opens or writes the witness without O_NOFOLLOW, so idle participants take the lock", async () => {
     const platform = confirmWitnessPlatform.constants;
     confirmWitnessPlatform.constants = { ...fs.constants, O_NOFOLLOW: undefined };
-    try {
-      const f = await idleFixture();
-      const identity: MeshIdentity = { id: "session:second", name: "main", kind: "main", sessionId: "second" };
-      const second = new ParticipantDirectory(new MeshStore(f.mesh.root, 64 * 1024, 1_000), { enabled: true, hostId: identity.id,
-        rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false });
-      second.registerSource(() => [rootRecord(identity.id, identity.id, "second")]);
-      directories.push(second);
-      await second.refresh();
-      await second.refresh();
-      await f.directory.refresh();                               // absorbs the second's first commits
-      const witness = plantedWitness(f.mesh.root);
-      fs.rmSync(witness, { force: true });
-      const opens = vi.spyOn(fs, "openSync");
-      const confirmationsBefore = f.confirmations.mock.calls.length;
-      fileClockPast(f.mesh.root, second.confirmedAt(), f.directory.confirmedAt());
-      await f.directory.refresh();                               // a real acquisition, but no witness
-      expect(f.confirmations.mock.calls.length - confirmationsBefore).toBe(1);
-      expect(opens.mock.calls.some(([file]) => file === witness)).toBe(false);
-      expect(fs.existsSync(witness)).toBe(false);
-      const baseline = f.acquisitions();
-      const secondConfirms = vi.spyOn(second.mesh, "confirmWritable");
-      await second.refresh();
-      expect(secondConfirms).toHaveBeenCalledOnce();
-      expect(f.acquisitions() - baseline).toBe(1);
-      expect(fs.existsSync(witness)).toBe(false);
-    } finally { confirmWitnessPlatform.constants = platform; }
+    try { await expectNoWitnessSharing(); } finally { confirmWitnessPlatform.constants = platform; }
+  });
+  // The same contract with the platform's real constants (Windows): no seam, no witness, the lock.
+  it.runIf(!nativeNoFollow)("on this platform without O_NOFOLLOW, a real confirmation leaves no witness and the next idle participant takes the lock", async () => {
+    expect(confirmWitnessPlatform.constants.O_NOFOLLOW).toBeUndefined();
+    await expectNoWitnessSharing();
   });
 
   // Review round 4 on #592: the descriptor must be the file lstat saw. A regular file of this user

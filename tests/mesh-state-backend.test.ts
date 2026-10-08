@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { MESH_STATE_BUSY_CODE, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
-  ShadowStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
-import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
+  ShadowStateBackend, SqliteStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
+import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
   type MeshStoreOptions } from "../src/mesh/store.js";
 
@@ -319,6 +319,71 @@ describe("sqlite backend acquisition", () => {
       holder.exec("ROLLBACK");
       holder.close();
     }
+  });
+});
+
+describe("sqlite readers notice a retired state.db (pi-fabric#626 review round 3)", () => {
+  const sqliteOf = (store: MeshStore): SqliteStateBackend => {
+    const backend = store.stateBackendHandle;
+    if (!(backend instanceof SqliteStateBackend)) throw new Error(`not a sqlite backend: ${backend.kind}`);
+    return backend;
+  };
+
+  it("a cached snapshot is not reused after another SqliteStateStore retires the database", async () => {
+    const root = tempRoot("retired-cache");
+    const a = open(root, { stateBackend: "sqlite" });
+    await a.put({ key: "r/1", value: 1, identity });
+    const token = a.stateToken();                                        // A caches a snapshot
+    expect(a.list("r/").map(entry => entry.value)).toEqual([1]);
+    expect(a.get("r/1", { snapshot: token })?.value).toBe(1);
+    const before = a.stateStamp();
+    const b = await SqliteStateStore.open(root, 64 * 1024, 1_000);   // a separate connection
+    try { expect(await b.retire()).toBe(2); } finally { b.close(); }
+    // Retirement leaves commit_no unchanged, but the stamp reads the current epoch and backend.
+    expect(a.stateStamp()).toBeDefined();
+    expect(a.stateStamp()).not.toBe(before);
+    expect(() => a.list("r/")).toThrow(MeshStateRetiredError);
+    expect(() => a.listAllShared("")).toThrow(MeshStateRetiredError);
+    expect(() => a.stateToken()).toThrow(MeshStateRetiredError);
+    expect(() => a.get("r/1", { snapshot: token })).toThrow(MeshStateRetiredError);
+    expect(() => a.get("r/1")).toThrow(MeshStateRetiredError);
+    expect(() => a.listAll("")).toThrow(MeshStateRetiredError);
+  });
+
+  it("a cache miss never exports a retired database (another connection, retirement flag only)", async () => {
+    const root = tempRoot("retired-miss");
+    const a = open(root, { stateBackend: "sqlite" });
+    await a.put({ key: "r/1", value: 1, identity });
+    const before = a.stateStamp();
+    // Another connection (as another process would) flips only the flag: no epoch bump, no commit_no.
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    try { raw.exec("UPDATE meta SET value = 'retired' WHERE name = 'backend'"); } finally { raw.close(); }
+    expect(a.stateStamp()).not.toBe(before);
+    expect(() => a.list("r/")).toThrow(MeshStateRetiredError);      // first snapshot: a miss
+    expect(() => a.stateToken()).toThrow(MeshStateRetiredError);
+    const store = sqliteOf(a).store;
+    expect(() => store.exportState({ live: true })).toThrow(MeshStateRetiredError);
+    expect(() => store.changesSince(0)).toThrow(MeshStateRetiredError);
+    // Maintenance (rollback) still exports the retired database explicitly.
+    expect(store.exportState()).toMatchObject({ backend: "retired", entries: { "r/1": { value: 1 } } });
+  });
+
+  it("a store's own stamp changes when another store retires and stays stable otherwise", async () => {
+    const root = tempRoot("retired-stamp");
+    const a = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+    const b = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+    try {
+      await a.put({ key: "s/1", value: 1, identity });
+      const live = a.stateStamp();
+      expect(a.stateStamp()).toBe(live);
+      expect(a.exportState({ live: true }).entries["s/1"]?.value).toBe(1);
+      await b.retire();
+      expect(a.stateStamp()).not.toBe(live);
+      expect(() => a.assertLive()).toThrow(MeshStateRetiredError);
+      expect(() => a.exportState({ live: true })).toThrow(MeshStateRetiredError);
+      // b retired it itself: its stamp moved too, and its own live reads fail closed.
+      expect(() => b.exportState({ live: true })).toThrow(MeshStateRetiredError);
+    } finally { a.close(); b.close(); }
   });
 });
 

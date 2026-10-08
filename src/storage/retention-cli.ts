@@ -135,7 +135,9 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
     if (options.runRetentionMs !== undefined) {
       // Mesh-wide, independent of any owner being alive (smarty-dev#3252, #5652): the owning
       // manager's own pruneRuns rule (terminal, safe exit-proven tree, not the latest run),
-      // plus every registry's latest and in-flight runs, re-read when a registry changes.
+      // plus every registry's latest, in-flight, preparing and pending-removal runs, re-read when a
+      // registry changes. The final pre-delete check re-reads every discovered registry uncached;
+      // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
       const fingerprint = () => registries.map(root => {
         const stat = ownedStat(path.join(root, "actors.json"));
         return stat ? `${stat.ino}:${stat.size}:${stat.mtimeMs}` : "-";
@@ -145,6 +147,10 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         const key = fingerprint();
         if (key !== references.key) references = { key, ids: retainedActorRunIds(registries) };
         return references.ids.has("*") || references.ids.has(id);
+      };
+      const referencedNow = (id: string): boolean => {
+        const ids = retainedActorRunIds(registries, { requireRegistries: true });
+        return ids.has("*") || ids.has(id);
       };
       for (const registryRoot of registries) {
         try {
@@ -160,7 +166,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
             pruneActorRunArchives({
               runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun,
               ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
-              isRetained: run => run === inFlight || referenced(run),
+              isRetained: (run, final) => run === inFlight || (final ? referencedNow(run) : referenced(run)),
               onRemove: run => { changes.push({ path: run, beforeBytes: treeBytes(run), afterBytes: 0 }); removedRuns.push(run); },
               onCompact: change => changes.push(change),
             });

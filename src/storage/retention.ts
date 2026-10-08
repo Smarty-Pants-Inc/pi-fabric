@@ -461,29 +461,52 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
   return result;
 };
 
-/** Full persisted latest-run references, shared by resident startup and streaming retention.
- * An unreadable registry is a wildcard veto, never proof that a lastRunId is absent. */
-export const retainedActorRunIds = (actorRoots: readonly string[]): Set<string> => {
+type RegistryRunRow = { id?: unknown; lastRunId?: unknown; inFlightRun?: unknown; preparing?: unknown; removal?: unknown };
+/** Every run a registry row references: latest, in-flight, preparing and pending-removal runs.
+ * A malformed reference throws (the caller turns that into a wildcard veto). */
+const rowRunIds = (actor: RegistryRunRow): string[] => {
+  const ids: string[] = [];
+  if (actor.lastRunId !== undefined) {
+    if (typeof actor.lastRunId !== "string") throw new Error("Unknown actor run reference");
+    if (actor.lastRunId) ids.push(actor.lastRunId);
+  }
+  for (const [field, key] of [["inFlightRun", "id"], ["preparing", "runId"], ["removal", "runId"]] as const) {
+    const value = actor[field];
+    if (value === undefined) continue;
+    if (!value || typeof value !== "object") throw new Error("Unknown actor run reference");
+    const id = (value as Record<string, unknown>)[key];
+    if (field === "inFlightRun" ? typeof id !== "string" : id !== undefined && typeof id !== "string") {
+      throw new Error("Unknown actor run reference");
+    }
+    if (typeof id === "string" && id) ids.push(id);
+  }
+  return ids;
+};
+/** Full persisted run references (latest, in-flight, preparing, pending-removal) of every
+ * registry, shared by resident startup, streaming retention and the mesh sweep.
+ * An unreadable registry is a wildcard veto, never proof that a reference is absent.
+ * `requireRegistries`: a registry root without actors.json is uncertain, not empty
+ * (the mesh sweep's final pre-delete check over registries it discovered). */
+export const retainedActorRunIds = (actorRoots: readonly string[], options: { requireRegistries?: boolean } = {}): Set<string> => {
   const refs = new Set<string>();
   try {
     for (const root of actorRoots) {
       try { fs.lstatSync(root); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
       if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
       const file = path.join(root, "actors.json");
       try { fs.lstatSync(file); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
       // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
       // actor includes instructions and up to 100 message bodies, so even one
       // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
       // JSON contract rather than inventing a fleet-size limit that disables all
       // retention. Ownership, JSON/schema errors and unsafe references still veto.
-      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file, Number.MAX_SAFE_INTEGER);
+      const registry = readJson<{ actors?: RegistryRunRow[] }>(file, Number.MAX_SAFE_INTEGER);
       if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
       for (const actor of registry.actors) {
-        if (!actor || typeof actor.id !== "string" ||
-            (actor.lastRunId !== undefined && typeof actor.lastRunId !== "string")) throw new Error("Unknown actor run reference");
-        if (actor.lastRunId) refs.add(actor.lastRunId);
+        if (!actor || typeof actor.id !== "string") throw new Error("Unknown actor run reference");
+        for (const id of rowRunIds(actor)) refs.add(id);
       }
     }
   } catch { refs.add("*"); }
@@ -632,8 +655,9 @@ export const pruneActorRunArchives = (options: {
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
   now?: number;
-  /** Further live references (registry latest/in-flight runs), checked again just before removal. */
-  isRetained?: (runId: string) => boolean;
+  /** Further live references (registry latest/in-flight runs), checked again just before removal;
+   * `final` marks that last pre-delete check (callers re-read their references uncached). */
+  isRetained?: (runId: string, final?: boolean) => boolean;
   dryRun?: boolean;
   /** Called before a run directory is removed (or, in a dry run, would be). */
   onRemove?: (directory: string) => void;
@@ -659,7 +683,7 @@ export const pruneActorRunArchives = (options: {
       });
       continue;
     }
-    if (options.isRetained?.(entry.name)) continue;
+    if (options.isRetained?.(entry.name, true)) continue;
     options.onRemove?.(directory);
     if (options.dryRun) { removed.push(directory); continue; }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}

@@ -7,7 +7,7 @@ import path from "node:path";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable } from "./backend-fence.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, type MeshStateMovedMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
@@ -161,13 +161,15 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
+  let moved: MeshStateMovedMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    throw new Error("invalid state format");
+    if (!isMeshStateMovedMarker(parsed)) throw new Error("invalid state format");
+    moved = parsed;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
     // startup can tolerate damage, but mutations require a repaired snapshot.
@@ -177,6 +179,10 @@ const readState = (
     // Preserve the original bytes at this path as a barrier to clock reset.
     return emptyState();
   }
+  // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
+  // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
+  // refused before it stages anything; a reader does not report false absence).
+  throw meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit

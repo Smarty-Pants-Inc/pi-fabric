@@ -61,7 +61,7 @@ const formatStatus = (status: MeshBackendStatus): string => {
   const lines = [
     `root          ${status.root}`,
     `backend       ${status.backend}  epoch ${status.epoch}${status.commit === undefined ? "" : `  commit ${status.commit}`}`,
-    `state.json    ${status.fileError ? `unreadable: ${status.fileError}` : `epoch ${status.fileEpoch}  generation ${status.fileGeneration ?? "-"}`}`,
+    `state.json    ${status.fileMoved ? `moved marker (backend=sqlite at epoch ${status.fileEpoch})` : status.fileError ? `unreadable: ${status.fileError}` : `epoch ${status.fileEpoch}  generation ${status.fileGeneration ?? "-"}`}`,
     `db digest     ${status.dbDigest ?? "-"}`,
     `file digest   ${status.fileDigest ?? "-"}`,
     `readers use   ${"source" in status.reader ? status.reader.source : `NOTHING (fails closed: ${status.reader.error})`}`,

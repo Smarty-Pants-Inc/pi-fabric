@@ -5,11 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { abortMeshRollback, assertFileStateWritable, cutoverMeshState, importMeshState, meshBackendStatus, MeshBackendFenceError,
-  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState, type MeshBackendAlarm,
-  type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
+  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, readMeshStateMovedMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
+  type MeshBackendAlarm, type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
-import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
+import { assertMeshStateReadable, decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
+import { legacyReadState } from "./fixtures/legacy-mesh-state-04930dfd.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -271,8 +272,9 @@ describe("mesh backend cutover census", () => {
     expect(resolveMeshStateSource(root).source).toBe("file");
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
 
+    const g0 = decodeFile(root).readGeneration;
     const result = await cutoverMeshState(root, { census: async () => ({ writers: [sqliteWriter] }) });
-    expect(result).toMatchObject({ backend: "sqlite", epoch: 1, writers: [{ pid: 101 }], generation: decodeFile(root).readGeneration });
+    expect(result).toMatchObject({ backend: "sqlite", epoch: 1, writers: [{ pid: 101 }], generation: g0 });
     expect(result).not.toHaveProperty("lateWriters");
     const status = await meshBackendStatus(root, { census: async () => ({ writers: [sqliteWriter] }) });
     expect(status).toMatchObject({ backend: "sqlite", writers: [{ pid: 101, mode: "sqlite" }] });
@@ -422,8 +424,9 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
 
 interface WriterReply { ok: boolean; name?: string; code?: string; message?: string }
 
-const startWriter = async (root: string): Promise<{ pid: number; send: (op: "put" | "delete" | "batch", key: string) => Promise<WriterReply>; stop: () => Promise<void> }> => {
-  const child = spawn(process.execPath, ["--input-type=module", "-e", WRITER, root], { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
+const startWriter = async (root: string, script = WRITER): Promise<{ pid: number; send: (op: "put" | "delete" | "batch", key: string) => Promise<WriterReply>;
+  next: () => Promise<string>; stop: () => Promise<void> }> => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, root], { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
   children.push(child);
   let buffer = "";
   let stderr = "";
@@ -452,6 +455,7 @@ const startWriter = async (root: string): Promise<{ pid: number; send: (op: "put
       child.stdin.write(`${JSON.stringify([op, key])}\n`);
       return JSON.parse(await reply) as WriterReply;
     },
+    next,
     stop: () => new Promise((resolve) => { child.once("exit", () => resolve()); child.stdin.end(); }),
   };
 };
@@ -475,7 +479,8 @@ describe("file-mode writer fence on the real StateFile commit path (pi-fabric#62
     for (const [op, key] of [["put", "writer/after"], ["delete", "writer/before"], ["batch", "writer/batch"]] as const) {
       const reply = await writer.send(op, key);
       expect(reply).toMatchObject({ ok: false, name: "MeshBackendFenceError", code: "FABRIC_MESH_BACKEND_FENCE" });
-      expect(reply.message).toMatch(/file-mode write refused: backend=sqlite at epoch 1/);
+      // The strict read meets cutover's moved marker first (review round 3): refused before staging.
+      expect(reply.message).toMatch(/state\.json was moved to state\.db \(backend=sqlite at epoch 1/);
     }
     expect(fs.readFileSync(statePath).equals(frozen)).toBe(true);
     expect(fs.statSync(statePath).ino).toBe(frozenInode);
@@ -516,6 +521,138 @@ describe("file-mode writer fence on the real StateFile commit path (pi-fabric#62
     console.log(`[fence-cost] no state.db: ${(absent * 1000).toFixed(2)} us per write guard (5000 calls); state.db backend=file: ${(present * 1000).toFixed(1)} us per call (200 calls)`);
     expect(absent).toBeLessThan(0.2);
   });
+});
+
+// A LEGACY file-mode writer in a second process: the deployed release's decode/write rule
+// (tests/fixtures/legacy-mesh-state-04930dfd.ts, a verbatim copy at 04930dfd), no backend guard.
+const LEGACY_WRITER = `
+import { createJiti } from "jiti";
+import readline from "node:readline";
+import { pathToFileURL } from "node:url";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { legacyPut } = await jiti.import("./tests/fixtures/legacy-mesh-state-04930dfd.ts");
+const root = process.argv.at(-1);
+process.stdout.write("ready\\n");
+for await (const line of readline.createInterface({ input: process.stdin })) {
+  const [, key] = JSON.parse(line);
+  process.stdout.write(JSON.stringify({ ok: true, waiting: true }) + "\\n");
+  let acquiredAt;
+  try {
+    await legacyPut(root, key, { legacy: process.pid }, () => { acquiredAt = Date.now(); });
+    process.stdout.write(JSON.stringify({ ok: true, acquiredAt }) + "\\n");
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, acquiredAt, name: error.name, message: error.message }) + "\\n");
+  }
+}
+`;
+
+describe("cutover's moved marker fails legacy writers closed (pi-fabric#627 review round 3)", () => {
+  it("a legacy writer blocked on .lock during cutover fails with invalid state format and leaves the marker byte-identical; rollback admits both writers", async () => {
+    const root = tempRoot("legacy-writer");
+    await seedFileRoot(root);
+    const statePath = path.join(root, "state.json");
+    const legacy = await startWriter(root, LEGACY_WRITER);
+    const legacyPut = async (key: string): Promise<WriterReply & { acquiredAt?: number }> => {
+      expect(await legacy.send("put", key)).toEqual({ ok: true, waiting: true });
+      return JSON.parse(await legacy.next()) as WriterReply & { acquiredAt?: number };
+    };
+    expect(await legacyPut("legacy/before")).toMatchObject({ ok: true });
+    const g0 = decodeFile(root).readGeneration;
+
+    let census = 0;
+    let pending: Promise<string> | undefined;
+    let markerAt = 0;
+    let marker: Buffer | undefined;
+    const cut = await cutoverMeshState(root, {
+      census: async () => {
+        // The second census runs after the flag commit, under the held .lock: the legacy writer
+        // (started right after it, invisible to the census) queues on .lock.
+        if (census++ === 1) {
+          expect(await legacy.send("put", "legacy/after")).toEqual({ ok: true, waiting: true });
+          pending = legacy.next();
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+        return { writers: [] };
+      },
+      onStep: (step) => {
+        if (step !== "cutover-marker") return;
+        markerAt = Date.now();
+        marker = fs.readFileSync(statePath);
+      },
+    });
+    expect(cut).toMatchObject({ backend: "sqlite", epoch: 1, generation: g0, stateCopy: path.join(root, "state.json.cutover-1") });
+    expect(JSON.parse(marker!.toString("utf8"))).toEqual({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 1, at: expect.any(String) });
+    expect(marker!.toString("utf8")).toMatch(/^\{"format":"sqlite","movedTo":"state\.db","backend":"sqlite","epoch":1,"at":"/);
+
+    // It got .lock only after the marker, and the deployed strict read refused before any write.
+    const reply = JSON.parse(await pending!) as WriterReply & { acquiredAt?: number };
+    expect(reply).toMatchObject({ ok: false, message: "Failed to read Fabric mesh state: invalid state format" });
+    expect(reply.acquiredAt).toBeGreaterThanOrEqual(markerAt);
+    expect(fs.readFileSync(statePath).equals(marker!)).toBe(true);
+    expect(fs.readdirSync(root).filter(name => name.endsWith(".legacy.tmp"))).toEqual([]);
+    // And again whenever it retries.
+    expect(await legacyPut("legacy/retry")).toMatchObject({ ok: false, message: "Failed to read Fabric mesh state: invalid state format" });
+    expect(fs.readFileSync(statePath).equals(marker!)).toBe(true);
+
+    // The retired state.json is kept; SQLite has every write before the cutover and none after.
+    expect(decodeMeshStateFile(cut.stateCopy, 64 * 1024 * 1024, false).readGeneration).toBe(g0);
+    const sqlite = await openSqlite(root);
+    expect(sqlite.get("legacy/before")?.value).toEqual({ legacy: legacy.pid });
+    expect(sqlite.get("legacy/after")).toBeUndefined();
+    sqlite.close();
+    // ponytail: an OLD tolerant reader (recoverDamage=true) sees an empty mesh; the census admits none.
+    expect(legacyReadState(statePath, 64 * 1024 * 1024, true).entries).toEqual({});
+    expect(resolveMeshStateSource(root)).toEqual({ source: "sqlite", backend: "sqlite", epoch: 1, fileEpoch: 1 });
+    expect(await meshBackendStatus(root)).toMatchObject({ fileMoved: true, fileEpoch: 1, fenceHolds: true, reader: { source: "sqlite" } });
+
+    // Rollback step 3 replaces the marker with the export; both writers commit again.
+    expect(await rollbackMeshState(root, { assumeNoWriters: true })).toMatchObject({ backend: "file", epoch: 2 });
+    expect(readMeshStateMovedMarker(root)).toBeUndefined();
+    expect(await legacyPut("legacy/after-rollback")).toMatchObject({ ok: true });
+    await fileStore(root).put({ key: "new/after-rollback", value: 2, identity });
+    const files = fileStore(root);
+    expect(files.get("legacy/after-rollback", { fresh: true })?.value).toEqual({ legacy: legacy.pid });
+    expect(files.get("new/after-rollback", { fresh: true })?.value).toBe(2);
+    expect(files.get("legacy/before", { fresh: true })?.value).toEqual({ legacy: legacy.pid });
+    await legacy.stop();
+  }, 60_000);
+
+  it("new code reads the marker as backend=sqlite: file-mode writers and readers fail closed, without state.db it alarms, abort-rollback restores it", async () => {
+    const root = tempRoot("marker-new-code");
+    await seedFileRoot(root);
+    await cutoverMeshState(root, { assumeNoWriters: true });
+    const marker = fs.readFileSync(path.join(root, "state.json"));
+    expect(readMeshStateMovedMarker(root)).toMatchObject({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 1 });
+    expect(readStateFileEpoch(root)).toBe(1);
+    await expect(fileStore(root).put({ key: "new/refused", value: 1, identity })).rejects.toThrow(MeshBackendFenceError);
+    await expect(fileStore(root).writeBatch({ identity, ops: [{ kind: "put", key: "new/batch", value: 1 }] })).rejects.toThrow(MeshBackendFenceError);
+    await expect(fileStore(root).delete({ key: "seed/solo" })).rejects.toThrow(MeshBackendFenceError);
+    expect(() => fileStore(root).get("seed/solo", { fresh: true })).toThrow(MeshBackendFenceError);
+    expect(() => assertFileStateWritable(root)).toThrow(/backend=sqlite at epoch 1/);
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(marker)).toBe(true);
+
+    // The marker without its database: an alarm, never an empty mesh.
+    const orphan = tempRoot("marker-orphan");
+    fs.writeFileSync(path.join(orphan, "state.json"), marker);
+    const alarms: MeshBackendAlarm[] = [];
+    expect(() => resolveMeshStateSource(orphan, { onAlarm: (alarm) => { alarms.push(alarm); } }))
+      .toThrow(/moved marker \(state\.db at epoch 1\) but state\.db is missing/);
+    expect(alarms.map(alarm => alarm.code)).toEqual(["FABRIC_MESH_BACKEND_FENCE"]);
+    await expect(fileStore(orphan).put({ key: "orphan/x", value: 1, identity })).rejects.toThrow(MeshBackendFenceError);
+    expect(() => fileStore(orphan).get("seed/solo", { fresh: true })).toThrow(MeshBackendFenceError);
+    expect(() => assertMeshStateReadable(orphan)).toThrow(MeshBackendFenceError);
+    expect((await meshBackendStatus(orphan)).fenceHolds).toBe(false);
+    expect(fs.readFileSync(path.join(orphan, "state.json")).equals(marker)).toBe(true);
+
+    // A rollback stopped after its export, then aborted back to sqlite: the marker returns.
+    const stop = new Error("stop after the export");
+    await expect(rollbackMeshState(root, { assumeNoWriters: true, onStep: (step) => { if (step === "rollback-verify") throw stop; } })).rejects.toBe(stop);
+    expect(readMeshStateMovedMarker(root)).toBeUndefined();
+    expect(await abortMeshRollback(root)).toMatchObject({ backend: "sqlite", epoch: 2, converged: false });
+    expect(readMeshStateMovedMarker(root)).toMatchObject({ epoch: 2 });
+    expect(() => legacyReadState(path.join(root, "state.json"), 64 * 1024 * 1024, false)).toThrow("Failed to read Fabric mesh state: invalid state format");
+    await expect(fileStore(root).put({ key: "new/refused", value: 1, identity })).rejects.toThrow(MeshBackendFenceError);
+  }, 60_000);
 });
 
 describe("mesh backend 5 MB round trip", () => {

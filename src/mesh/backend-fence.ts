@@ -84,23 +84,83 @@ const decodeEpochDefault = (file: string, maxBytes: number): number => {
   return epoch === undefined ? 0 : storageRevision(epoch);
 };
 
-/** The epoch recorded in state.json: a bounded header read, else the (injected) full decoder. */
-export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceOptions, "maxStateBytes" | "decodeFileEpoch"> = {}): number => {
-  const file = path.join(path.resolve(root), STATE_JSON);
+/**
+ * The moved marker (pi-fabric#627 review round 3). Cutover's LAST step under its `.lock` hold replaces
+ * state.json with this small document (after keeping a copy at `state.json.cutover-<E+1>`). Its
+ * `format` is not 1 or 2, so no release decodes it as a state envelope: every deployed write path
+ * (put, delete, writeBatch, tombstone compaction) reads state.json with recoverDamage=false and
+ * throws "invalid state format" before it commits. A LEGACY file-mode writer (no backend guard) that
+ * waited on `.lock` through the cutover therefore fails closed and writes nothing. New code treats
+ * it as backend=sqlite (never as state, damage or an empty mesh); without state.db it is an alarm.
+ * Rollback step 3 replaces it with the exported state.json.
+ */
+export interface MeshStateMovedMarker {
+  format: "sqlite";
+  movedTo: "state.db";
+  backend: "sqlite";
+  epoch: number;
+  at: string;
+}
+
+export const isMeshStateMovedMarker = (value: unknown): value is MeshStateMovedMarker => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const marker = value as Record<string, unknown>;
+  return marker.format === "sqlite" && marker.movedTo === STATE_DB && marker.backend === "sqlite"
+    && typeof marker.epoch === "number" && Number.isSafeInteger(marker.epoch) && marker.epoch >= 1;
+};
+
+/** The marker's exact bytes (field order fixed; no release reads `format: "sqlite"` as state). */
+export const encodeMeshStateMovedMarker = (epoch: number, at = new Date().toISOString()): string =>
+  JSON.stringify({ format: "sqlite", movedTo: STATE_DB, backend: "sqlite", epoch: storageRevision(epoch), at } satisfies MeshStateMovedMarker);
+
+/** A state.json that is the moved marker: fail closed, never an empty or damaged state. */
+export const meshStateMovedError = (file: string, marker: MeshStateMovedMarker): MeshBackendFenceError =>
+  new MeshBackendFenceError(`Fabric mesh state.json was moved to state.db (backend=sqlite at epoch ${marker.epoch}, ${marker.at}): `
+    + `${file} is not state; this release must run in sqlite mode`);
+
+const parseMovedMarker = (text: string): MeshStateMovedMarker | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isMeshStateMovedMarker(parsed) ? parsed : undefined;
+  } catch { return undefined; }
+};
+
+/** state.json's bounded head (HEADER_BYTES) and whether that is the whole file; undefined when absent. */
+const readStateHead = (file: string): { head: string; complete: boolean } | undefined => {
   let descriptor: number;
   try { descriptor = fs.openSync(file, "r"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
-  let header = "";
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
   try {
     const buffer = Buffer.alloc(HEADER_BYTES);
-    header = buffer.subarray(0, fs.readSync(descriptor, buffer, 0, HEADER_BYTES, 0)).toString("utf8");
+    const read = fs.readSync(descriptor, buffer, 0, HEADER_BYTES, 0);
+    return { head: buffer.subarray(0, read).toString("utf8"), complete: read < HEADER_BYTES };
   } finally { fs.closeSync(descriptor); }
-  const match = EPOCH_HEADER.exec(header);
-  if (match) return storageRevision(Number(match[1]));
-  return options.decodeFileEpoch
-    ? options.decodeFileEpoch(file)
-    : decodeEpochDefault(file, Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES)));
 };
+
+/** The moved marker at `<root>/state.json` (a bounded read), or undefined (absent, state, damage). */
+export const readMeshStateMovedMarker = (root: string): MeshStateMovedMarker | undefined => {
+  const head = readStateHead(path.join(path.resolve(root), STATE_JSON));
+  return head?.complete ? parseMovedMarker(head.head) : undefined;
+};
+
+/** The epoch recorded in state.json (the marker's epoch for a moved marker) and whether it is that marker. */
+const readStateFileMark = (root: string, options: Pick<MeshBackendFenceOptions, "maxStateBytes" | "decodeFileEpoch">):
+  { epoch: number; moved: boolean } => {
+  const file = path.join(path.resolve(root), STATE_JSON);
+  const read = readStateHead(file);
+  if (read === undefined) return { epoch: 0, moved: false };
+  const match = EPOCH_HEADER.exec(read.head);
+  if (match) return { epoch: storageRevision(Number(match[1])), moved: false };
+  const marker = read.complete ? parseMovedMarker(read.head) : undefined;
+  if (marker) return { epoch: marker.epoch, moved: true };
+  return { epoch: options.decodeFileEpoch
+    ? options.decodeFileEpoch(file)
+    : decodeEpochDefault(file, Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES))), moved: false };
+};
+
+/** The epoch recorded in state.json: a bounded header read (or the moved marker's), else the (injected) full decoder. */
+export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceOptions, "maxStateBytes" | "decodeFileEpoch"> = {}): number =>
+  readStateFileMark(root, options).epoch;
 
 /**
  * The reader rule (plan section 5) for a known database flag (`none`: state.db absent or
@@ -109,7 +169,8 @@ export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceO
  */
 export const meshStateSourceOf = (root: string, backend: string, epoch: number, options: MeshBackendFenceOptions = {}): MeshStateSource => {
   let fileEpoch: number;
-  try { fileEpoch = readStateFileEpoch(root, options); }
+  let moved = false;
+  try { ({ epoch: fileEpoch, moved } = readStateFileMark(root, options)); }
   catch (error) {
     // A damaged state.json is not authority under sqlite/exporting; the legacy store tolerates it.
     if (backend === "sqlite" || backend === "exporting") return { source: "sqlite", backend, epoch, fileEpoch: Number.NaN };
@@ -117,6 +178,12 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
     throw meshFenceAlarm(options, root, `Fabric mesh state.json is unreadable under backend=${backend} epoch ${epoch}: ${(error as Error).message}`, { backend, epoch });
   }
   const detail = { backend, epoch, fileEpoch };
+  // The moved marker means backend=sqlite: only sqlite/exporting agree with it; never state, damage or empty.
+  if (moved && backend !== "sqlite" && backend !== "exporting") {
+    throw meshFenceAlarm(options, root, backend === "none"
+      ? `Fabric mesh state.json is the moved marker (state.db at epoch ${fileEpoch}) but state.db is missing or uninitialised`
+      : `Fabric mesh state.json is the moved marker (epoch ${fileEpoch}) but state.db has backend=${backend} at epoch ${epoch}`, detail);
+  }
   if (!Number.isSafeInteger(epoch) || epoch < 0) throw meshFenceAlarm(options, root, `Fabric mesh state.db has an invalid epoch (${String(epoch)})`, detail);
   if (fileEpoch > epoch) {
     throw meshFenceAlarm(options, root, backend === "none"

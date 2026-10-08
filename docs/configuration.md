@@ -295,6 +295,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
   },
   "mesh": {
     "lockProtocol": 1,
+    "stateBackend": "file",
     "enabled": true,
     "announce": false,
     "actorScope": "project",
@@ -662,6 +663,14 @@ See the [interface reference](interface.md).
 Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a relative or absolute path to relocate durable topics, shared state, and actor sessions. Add `.pi/fabric/mesh/` to the project's ignore file unless you version the coordination log on purpose. Set `mesh.enabled` to `false` to disable both mesh actions and ambient actor restoration.
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
+
+`mesh.stateBackend` selects where keyed mesh state lives: `"file"` (the default, `state.json` behind the mesh
+`.lock`), `"shadow"` (`state.json` stays the authority; committed values are also mirrored to
+`<mesh>/state-shadow/state.db` for divergence checks, and a SQLite failure never fails a write) or `"sqlite"`
+(`<mesh>/state.db`, SQLite WAL, no mesh `.lock` for state; see `src/mesh/state-backend.ts`). The environment
+variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesystem or a runtime without
+`node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration and writer census of
+smarty-dev#6477 (L4); do not set it by hand on a shared mesh.
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing

@@ -7,7 +7,7 @@ import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -792,7 +792,7 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     const f = await fixture();
     await f.owner.quiesce("reload");
     await f.owner.close();
-    const now = Date.now() + 120_000;
+    const now = Date.now() + MAIN_RELOAD_LEASE_MS + 90_000;
     const get = f.observer.get.bind(f.observer);
     const known = f.observer.lastKnown.bind(f.observer);
     const peers = f.observer.peers.bind(f.observer);

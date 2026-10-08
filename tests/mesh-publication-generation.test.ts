@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,6 +26,11 @@ const stat = (file: string) => { try { const s = fs.statSync(file, { bigint: tru
 const owner = { id: "session:other", name: "other", kind: "main" as const, sessionId: "other" };
 const ownershipChange = (mesh: MeshStore) => mesh.put({ key: "topology/hosts/other", identity: owner,
   value: { format: 1, id: owner.id, rootId: owner.id, identity: owner, startedAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 15_000 } });
+// smarty-dev#6829: the registry save observes only its OWN actors' ownership inputs. This commits a
+// shared participant record for the actor (an observed input) whose ownership facts differ.
+const actorOwnershipChange = (mesh: MeshStore, actorId: string) => mesh.put({
+  key: `topology/participants/${createHash("sha256").update(actorId).digest("hex")}`, identity: owner,
+  value: { format: 1, id: actorId, kind: "actor", rootId: "session:gen", ownerHostId: "session:gen", residency: "session" } });
 
 describe.each(["sqlite", "file"] as const)("publication generation follows the active state backend (%s)", (stateBackend) => {
   const options: MeshStoreOptions = { stateBackend };
@@ -73,7 +79,8 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
     expect(fs.existsSync(mesh.root)).toBe(false);
   });
 
-  it.each([false, true])("ActorManager's registry save validation fails iff ownership changed after its snapshot (changed=%s)", async (changed) => {
+  it.each(["none", "unrelated", "owned"] as const)("ActorManager's registry save validation fails iff its actors' ownership changed after its snapshot (change=%s)", async (change) => {
+    const changed = change === "owned";
     const dir = tempRoot();
     const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100, options);
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(dir, "runs") });
@@ -99,7 +106,11 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
       return (realUpdate as any).call(this, (current: unknown) => {
         const mutation = select(current);
         if (!mutation || typeof mutation.validate !== "function") return mutation;
-        if (outcomes.length === 0 && changed) pending = ownershipChange(mesh);
+        // "unrelated": another host's record moves; the narrow observation (smarty-dev#6829) must
+        // not veto. "owned": the actor's own participant record moves; on SQLite only the backend
+        // revision sees that commit (state.json is untouched), so it must still veto (pi-fabric#640).
+        if (outcomes.length === 0 && change === "unrelated") pending = ownershipChange(mesh);
+        if (outcomes.length === 0 && change === "owned") pending = actorOwnershipChange(mesh, actor.id);
         return { ...mutation, validate: () => { const valid = mutation.validate(); outcomes.push(valid); return valid; } };
       });
     } as any);

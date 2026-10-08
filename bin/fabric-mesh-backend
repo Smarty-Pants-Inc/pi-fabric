@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Import, cutover and rollback of a mesh root's state backend with the R1 fence (smarty-dev#6477 L4b).
+import { main } from "../dist/mesh/mesh-backend-cli.js";
+try { process.exitCode = await main(process.argv.slice(2)); }
+catch (error) {
+  process.stderr.write(`fabric-mesh-backend: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

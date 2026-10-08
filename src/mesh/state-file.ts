@@ -7,8 +7,9 @@ import path from "node:path";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, type MeshStateMovedMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
-import type { MeshCommitEffects, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
+import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
 // writes, revisions, tombstones, namespaces, the read signal and write snapshots.
@@ -161,13 +162,15 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
+  let moved: MeshStateMovedMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    throw new Error("invalid state format");
+    if (!isMeshStateMovedMarker(parsed)) throw new Error("invalid state format");
+    moved = parsed;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
     // startup can tolerate damage, but mutations require a repaired snapshot.
@@ -177,6 +180,10 @@ const readState = (
     // Preserve the original bytes at this path as a barrier to clock reset.
     return emptyState();
   }
+  // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
+  // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
+  // refused before it stages anything; a reader does not report false absence).
+  throw meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit
@@ -450,6 +457,18 @@ export class MeshStateFileReadChangedError extends Error {
 
 /** Internal: a fileRead stamp did not hold inside the transaction; the backend re-reads and retries. */
 export const FILE_READ_CHANGED: Error = new Error("Fabric mesh fileRead stamp changed");
+
+/**
+ * Internal: runs `fileRead.read()` bracketed by two stamps. Differing stamps mean a file changed
+ * during the read, so the value may be older than any stamp taken afterwards: returns undefined and
+ * the caller retries. Otherwise returns the value with the PRE-read stamp, the one the transaction
+ * re-checks (a stamp taken only after the read could pair an old read with a newer file).
+ */
+export const bracketFileRead = (fileRead: MeshStateFileRead): { value: unknown; stamp: string | undefined } | undefined => {
+  const stamp = fileRead.stamp();
+  const value = fileRead.read();
+  return fileRead.stamp() === stamp ? { value, stamp } : undefined;
+};
 
 // A copy of a committed state, readable after the transaction (commitOutbox effects).
 const detachedView = (state: MeshStateFile): MeshBatchView => ({
@@ -874,11 +893,22 @@ export class StateFile implements StateBackend {
       serializedText: encoded.serialized.toString("utf8") };
   }
 
+  // The fence's fallback when state.json's bounded header does not carry backendEpoch: this store's decoder.
+  readonly #decodeFileEpoch = (file: string): number => {
+    const epoch = (readState(file, this.#maxStateBytes, false) as MeshStateFile & { backendEpoch?: unknown }).backendEpoch;
+    return epoch === undefined ? 0 : storageRevision(epoch);
+  };
+
   #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
     // this payload's hash. ctime is read after the rename (rename updates it).
+    // smarty-dev#6477 L4b (R1): under .lock and before the rename, for every write (put, delete,
+    // batch, tombstone compaction). After a cutover set backend=sqlite (or during a rollback export)
+    // state.json is not the authority: refuse with MeshBackendFenceError and leave it untouched.
+    // One stat of state.db when absent; nothing is cached across lock holds.
+    assertFileStateWritable(this.root, { maxStateBytes: this.#maxStateBytes, decodeFileEpoch: this.#decodeFileEpoch });
     let staged: number | undefined;
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;
@@ -1051,18 +1081,21 @@ export class StateFile implements StateBackend {
   // Returns one result per operation, in order.
   // R11 (L2a): fileRead runs before the lock and its stamp is re-checked under it; commitOutbox
   // runs after the lock is released (see StateBackendBatchInput in state-backend.ts).
-  async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
+  // `committed` (internal, the shadow backend's mirror) receives the changed keys right after the
+  // state file commit, before afterCommit/commitOutbox, so a throwing callback cannot hide a commit.
+  async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
-      const fileValue = fileRead?.read();
-      const stamp = fileRead?.stamp();
+      const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       let outcome: { results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> };
       try {
-        outcome = await this.#writeBatchOnce(input, caller, fileValue, fileRead ? () => fileRead.stamp() === stamp : undefined);
+        if (fileRead && !bracket) throw FILE_READ_CHANGED;
+        outcome = await this.#writeBatchOnce(input, caller, bracket?.value,
+          fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed);
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
         if (attempt >= retries) throw new MeshStateFileReadChangedError(attempt + 1);
@@ -1074,7 +1107,7 @@ export class StateFile implements StateBackend {
   }
 
   #writeBatchOnce(input: StateBackendBatchInput, caller: string[] | undefined, fileValue: unknown,
-    stampHolds: (() => boolean) | undefined): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
+    stampHolds: (() => boolean) | undefined, committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
     return this.#withWriteSnapshot(snapshot => {
       const omitted = new Set(input.ops.map(op => op.key));
       const reuse = new Map(snapshot.reuse);
@@ -1160,7 +1193,9 @@ export class StateFile implements StateBackend {
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller, namespaces);
+        const changedKeys = results.filter(result => result.applied).map(result => result.key);
+        this.#commitState(state, reuse, changedKeys, caller, namespaces);
+        committed?.(changedKeys);
       }
       input.afterCommit?.(view);
       if (!input.commitOutbox) return { results };
@@ -1379,3 +1414,7 @@ export class StateFile implements StateBackend {
     }
   }
 }
+
+// smarty-dev#6477 L4b: the backend migration tool (backend-migration.ts) imports and exports
+// state.json through this exact decoder and encoder.
+export { readState as decodeMeshStateFile, encodeState as encodeMeshStateFile, type MeshStateFile };

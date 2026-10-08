@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { MESH_STATE_BUSY_CODE, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
-  ShadowStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
-import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
+  ShadowStateBackend, SqliteStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
+import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
   type MeshStoreOptions } from "../src/mesh/store.js";
 
@@ -159,15 +159,16 @@ describe("file and sqlite give identical reads for the same operation sequence",
 describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (kind) => {
   it("re-reads when the fileRead stamp changes before the transaction and gives prepare the fresh read", async () => {
     const store = open(tempRoot(`fileread-${kind}`), { stateBackend: kind });
-    let generation = 0;
+    let stamps = 0;
     let reads = 0;
     const seen: unknown[] = [];
     const results = await store.writeBatch({
       identity, ops: [],
       fileRead: {
         read: () => { reads += 1; return `read-${reads}`; },
-        // The first stamp goes stale before the transaction re-checks it.
-        stamp: () => (reads === 1 ? `s${generation++}` : "stable"),
+        // The first read's bracket (stamps 1 and 2) holds; the file changes before the transaction
+        // re-checks it (stamp 3), so the read is redone once.
+        stamp: () => ((stamps += 1) <= 2 ? "before" : "after"),
       },
       prepare: (_view, value) => { seen.push(value); return [{ kind: "put", key: "k", value }]; },
     });
@@ -175,6 +176,33 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
     expect(seen).toEqual(["read-2"]);
     expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
     expect(store.get("k")?.value).toBe("read-2");
+  });
+
+  it("a write between read() and the stamp forces a retry and never commits the stale read", async () => {
+    const root = tempRoot(`fileread-race-${kind}`);
+    const source = path.join(root, "source.txt");
+    fs.writeFileSync(source, "v1");
+    let reads = 0;
+    const seen: unknown[] = [];
+    const store = open(root, { stateBackend: kind });
+    const results = await store.writeBatch({
+      identity, ops: [],
+      fileRead: {
+        read: () => {
+          reads += 1;
+          const value = fs.readFileSync(source, "utf8");
+          // A concurrent writer lands after the read returned, before any later stamp.
+          if (reads === 1) fs.writeFileSync(source, "v2");
+          return value;
+        },
+        stamp: () => fs.readFileSync(source, "utf8"),
+      },
+      prepare: (_view, value) => { seen.push(value); return [{ kind: "put", key: "k", value }]; },
+    });
+    expect(reads).toBe(2);
+    expect(seen).toEqual(["v2"]);
+    expect(results).toEqual([{ key: "k", applied: true, version: 1 }]);
+    expect(store.get("k")?.value).toBe("v2");
   });
 
   it("gives up with MeshStateFileReadChangedError and writes nothing when the stamp never holds", async () => {
@@ -294,6 +322,71 @@ describe("sqlite backend acquisition", () => {
   });
 });
 
+describe("sqlite readers notice a retired state.db (pi-fabric#626 review round 3)", () => {
+  const sqliteOf = (store: MeshStore): SqliteStateBackend => {
+    const backend = store.stateBackendHandle;
+    if (!(backend instanceof SqliteStateBackend)) throw new Error(`not a sqlite backend: ${backend.kind}`);
+    return backend;
+  };
+
+  it("a cached snapshot is not reused after another SqliteStateStore retires the database", async () => {
+    const root = tempRoot("retired-cache");
+    const a = open(root, { stateBackend: "sqlite" });
+    await a.put({ key: "r/1", value: 1, identity });
+    const token = a.stateToken();                                        // A caches a snapshot
+    expect(a.list("r/").map(entry => entry.value)).toEqual([1]);
+    expect(a.get("r/1", { snapshot: token })?.value).toBe(1);
+    const before = a.stateStamp();
+    const b = await SqliteStateStore.open(root, 64 * 1024, 1_000);   // a separate connection
+    try { expect(await b.retire()).toBe(2); } finally { b.close(); }
+    // Retirement leaves commit_no unchanged, but the stamp reads the current epoch and backend.
+    expect(a.stateStamp()).toBeDefined();
+    expect(a.stateStamp()).not.toBe(before);
+    expect(() => a.list("r/")).toThrow(MeshStateRetiredError);
+    expect(() => a.listAllShared("")).toThrow(MeshStateRetiredError);
+    expect(() => a.stateToken()).toThrow(MeshStateRetiredError);
+    expect(() => a.get("r/1", { snapshot: token })).toThrow(MeshStateRetiredError);
+    expect(() => a.get("r/1")).toThrow(MeshStateRetiredError);
+    expect(() => a.listAll("")).toThrow(MeshStateRetiredError);
+  });
+
+  it("a cache miss never exports a retired database (another connection, retirement flag only)", async () => {
+    const root = tempRoot("retired-miss");
+    const a = open(root, { stateBackend: "sqlite" });
+    await a.put({ key: "r/1", value: 1, identity });
+    const before = a.stateStamp();
+    // Another connection (as another process would) flips only the flag: no epoch bump, no commit_no.
+    const raw = openNodeSqlite(path.join(root, "state.db"));
+    try { raw.exec("UPDATE meta SET value = 'retired' WHERE name = 'backend'"); } finally { raw.close(); }
+    expect(a.stateStamp()).not.toBe(before);
+    expect(() => a.list("r/")).toThrow(MeshStateRetiredError);      // first snapshot: a miss
+    expect(() => a.stateToken()).toThrow(MeshStateRetiredError);
+    const store = sqliteOf(a).store;
+    expect(() => store.exportState({ live: true })).toThrow(MeshStateRetiredError);
+    expect(() => store.changesSince(0)).toThrow(MeshStateRetiredError);
+    // Maintenance (rollback) still exports the retired database explicitly.
+    expect(store.exportState()).toMatchObject({ backend: "retired", entries: { "r/1": { value: 1 } } });
+  });
+
+  it("a store's own stamp changes when another store retires and stays stable otherwise", async () => {
+    const root = tempRoot("retired-stamp");
+    const a = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+    const b = await SqliteStateStore.open(root, 64 * 1024, 1_000);
+    try {
+      await a.put({ key: "s/1", value: 1, identity });
+      const live = a.stateStamp();
+      expect(a.stateStamp()).toBe(live);
+      expect(a.exportState({ live: true }).entries["s/1"]?.value).toBe(1);
+      await b.retire();
+      expect(a.stateStamp()).not.toBe(live);
+      expect(() => a.assertLive()).toThrow(MeshStateRetiredError);
+      expect(() => a.exportState({ live: true })).toThrow(MeshStateRetiredError);
+      // b retired it itself: its stamp moved too, and its own live reads fail closed.
+      expect(() => b.exportState({ live: true })).toThrow(MeshStateRetiredError);
+    } finally { a.close(); b.close(); }
+  });
+});
+
 describe("shadow backend", () => {
   it("keeps the file authoritative, mirrors committed values, and detects and repairs a divergence", async () => {
     const root = tempRoot("shadow");
@@ -322,6 +415,25 @@ describe("shadow backend", () => {
     await shadow.repair();
     expect(await shadow.verify()).toEqual([]);
     expect(shadow.shadow.get("a")?.value).toBe("foreign");
+  });
+
+  it("mirrors a committed batch even when afterCommit or commitOutbox throws", async () => {
+    const store = open(tempRoot("shadow-callback-throw"), { stateBackend: "shadow" });
+    const shadow = shadowOf(store);
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "a", value: 1 }],
+      afterCommit: () => { throw new Error("after down"); } })).rejects.toThrow("after down");
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "b", value: 2 }],
+      commitOutbox: () => { throw new Error("outbox down"); } })).rejects.toThrow("outbox down");
+    expect(store.get("a")?.value).toBe(1);
+    expect(store.get("b")?.value).toBe(2);
+    await shadow.flush();
+    expect(shadow.shadow.listAll("").map(entry => [entry.key, entry.value])).toEqual([["a", 1], ["b", 2]]);
+    expect(await shadow.verify()).toEqual([]);
+    // A rejected batch (nothing committed) mirrors nothing.
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "c", value: 3, ifVersion: 9 }] }))
+      .rejects.toBeInstanceOf(MeshBatchConflictError);
+    await shadow.flush();
+    expect(shadow.shadow.get("c")).toBeUndefined();
   });
 
   it("seeds the shadow from the existing file state on first use", async () => {

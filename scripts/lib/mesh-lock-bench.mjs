@@ -148,7 +148,7 @@ export const compareToBaseline = (result, baseline, { maxRegressPct = 10, gateTi
     const regressPct = base > 0 ? (current / base - 1) * 100 : current > 0 ? Number.POSITIVE_INFINITY : 0;
     const ok = !gated || current <= limit;
     checks.push({ metric, class: metricClass, baseline: base, current, limit, regressPct, gated, ok });
-    if (!ok) problems.push(`${metric}: ${current} > ${limit} (baseline ${base}, +${maxRegressPct}%)`);
+    if (!ok) problems.push(`${metric}: ${current} > ${Math.round(limit * 1000) / 1000} (baseline ${base}, +${maxRegressPct}%)`);
   };
   for (const metric of LOAD_INSENSITIVE_METRICS) check(metric, "loadInsensitive", true);
   for (const metric of TIMING_METRICS) check(metric, "timing", gateTiming);

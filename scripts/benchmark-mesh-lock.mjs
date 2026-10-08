@@ -259,10 +259,10 @@ const FLAGS = {
   "delete-rate": "deleteRate", "publish-rate": "publishRate", "steer-rate": "steerRate", "dir-read-rate": "dirReadRate",
   "registry-keys": "registryKeys", "poll-ms": "pollMs", "lock-timeout-ms": "lockTimeoutMs", "lock-protocol": "lockProtocol",
 };
-const HARNESS_FLAGS = new Set(["out", "baseline", "max-regress", "write-baseline", "note"]);
+const HARNESS_FLAGS = new Set(["out", "baseline", "max-regress", "write-baseline", "note", "from"]);
 const usage = () => [
   "usage: node scripts/benchmark-mesh-lock.mjs [load flags] [--out FILE] [--baseline FILE [--max-regress PCT] [--gate-timing]]",
-  "                                          [--write-baseline FILE [--note TEXT]]",
+  "                                          [--write-baseline FILE [--note TEXT]] [--from RESULT.json (compare only, no run)]",
   `load flags (defaults): ${Object.entries(FLAGS).map(([flag, key]) => `--${flag} ${DEFAULT_LOAD[key]}`).join(" ")}`,
 ].join("\n");
 const parseArgs = argv => {
@@ -481,6 +481,11 @@ const main = async () => {
   try { parsed = parseArgs(process.argv.slice(2)); }
   catch (error) { console.error(error.message); return 2; }
   const { load, harness } = parsed;
+  if (harness.from) {
+    // Compare a saved result (for example a CI artifact) without running the load again.
+    const result = JSON.parse(fs.readFileSync(harness.from, "utf8"));
+    return report(result, harness);
+  }
   if (!fs.existsSync(distMesh)) { console.error(`${distMesh} is missing: run bun run build first`); return 2; }
   // Seeding is not part of the measurement: the parent records nothing.
   process.env.PI_FABRIC_LOCK_STATS = "0";
@@ -496,25 +501,29 @@ const main = async () => {
     const schedule = planSchedule(load);
     const started = performance.now();
     const workers = await runWorkers(load, root, leases, scratch);
-    const result = summarize(load, fixture, schedule, workers, readL8Files(root), performance.now() - started);
-    let comparison;
-    if (harness.baseline) {
-      const baseline = JSON.parse(fs.readFileSync(harness.baseline, "utf8"));
-      comparison = compareToBaseline(result, baseline, { maxRegressPct: harness.maxRegress, gateTiming: harness.gateTiming });
-      result.ratchet = { baseline: harness.baseline, maxRegressPct: harness.maxRegress, gateTiming: harness.gateTiming, ...comparison };
-    }
-    if (harness.writeBaseline) {
-      if (!result.validation.ok) throw new Error("refusing to write a baseline from an invalid run");
-      const { ratchet: _ratchet, ...baseline } = result;
-      fs.writeFileSync(harness.writeBaseline, JSON.stringify({ note: harness.note ?? "", ...baseline }, null, 2) + "\n");
-    }
-    if (harness.out) fs.writeFileSync(harness.out, JSON.stringify(result, null, 2) + "\n");
-    console.error(table(result, comparison));
-    if (!result.validation.ok) console.error(`INVALID RUN: ${JSON.stringify(result.validation)}`);
-    if (comparison && !comparison.ok) console.error(`RATCHET FAILED:\n  ${comparison.problems.join("\n  ")}`);
-    console.log(JSON.stringify(result, null, 2));
-    return !result.validation.ok ? 2 : comparison && !comparison.ok ? 1 : 0;
+    return report(summarize(load, fixture, schedule, workers, readL8Files(root), performance.now() - started), harness);
   } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+};
+
+const report = (result, harness) => {
+  delete result.ratchet;
+  let comparison;
+  if (harness.baseline) {
+    const baseline = JSON.parse(fs.readFileSync(harness.baseline, "utf8"));
+    comparison = compareToBaseline(result, baseline, { maxRegressPct: harness.maxRegress, gateTiming: harness.gateTiming });
+    result.ratchet = { baseline: harness.baseline, maxRegressPct: harness.maxRegress, gateTiming: harness.gateTiming, ...comparison };
+  }
+  if (harness.writeBaseline) {
+    if (!result.validation.ok) throw new Error("refusing to write a baseline from an invalid run");
+    const { ratchet: _ratchet, ...baseline } = result;
+    fs.writeFileSync(harness.writeBaseline, JSON.stringify({ note: harness.note ?? "", ...baseline }, null, 2) + "\n");
+  }
+  if (harness.out) fs.writeFileSync(harness.out, JSON.stringify(result, null, 2) + "\n");
+  console.error(table(result, comparison));
+  if (!result.validation.ok) console.error(`INVALID RUN: ${JSON.stringify(result.validation)}`);
+  if (comparison && !comparison.ok) console.error(`RATCHET FAILED:\n  ${comparison.problems.join("\n  ")}`);
+  console.log(JSON.stringify(result, null, 2));
+  return !result.validation.ok ? 2 : comparison && !comparison.ok ? 1 : 0;
 };
 
 if (process.argv[2] === "--worker") {

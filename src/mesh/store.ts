@@ -1,4 +1,4 @@
-import { createCommitStats } from "./commit-stats.js";
+import { createCommitStats, createLockStats, type MeshLockClass } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
 import { withMeshCustody } from "./custody-lock.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -139,6 +139,9 @@ export interface MeshStoreOptions {
 // Capture the opt-in once at process startup/module load: no timer, key classification,
 // counters, extra serialization, filesystem work or per-commit environment lookup when off.
 const commitStats = createCommitStats();
+// Mesh-lock wait/hold by caller class under <root>/lock-stats (smarty-dev#6477 L8). On unless
+// PI_FABRIC_LOCK_STATS=0; no extra lock, no fsync, and no timer or file before an acquisition.
+const lockStats = createLockStats();
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
 // Capture before entering the async lock so the actual writer survives the await boundary.
@@ -1078,7 +1081,7 @@ export class MeshStore {
     input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lockTimeoutMs;
     for (;;) {
-      try { return await this.#withLock(this.#preparePublish(input)); }
+      try { return await this.#withLock(this.#preparePublish(input), undefined, "publish"); }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
@@ -1123,7 +1126,7 @@ export class MeshStore {
           this.#compactEventLog();
           this.#confirmEventFile(this.#eventsPath);
           return events;
-        });
+        }, undefined, "bridge");
       } catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
@@ -1791,7 +1794,7 @@ export class MeshStore {
   }
 
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
-    commit: (prepared: P) => T, cleanup?: (prepared: P) => void): Promise<T> {
+    commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other"): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const deadline = Date.now() + this.#lockTimeoutMs;
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
@@ -1807,7 +1810,7 @@ export class MeshStore {
         return this.#withLock(() => {
           const prepared = prepare(this.#readStateForWrite());
           try { return commit(prepared); } finally { cleanup?.(prepared); }
-        });
+        }, undefined, lockClass);
       }
       let admitted = false;
       let prepared: P | undefined;
@@ -1818,7 +1821,7 @@ export class MeshStore {
           if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
           admitted = true;
           return commit(prepared!);
-        }, Math.max(0, deadline - Date.now()));
+        }, Math.max(0, deadline - Date.now()), lockClass);
       } catch (error) {
         // A stale CAS/parse/size error belongs to the snapshot, not the current file.
         if (error !== WRITE_SNAPSHOT_CHANGED && (admitted || this.#stateWriteIdentity() === identity)) {
@@ -1828,6 +1831,7 @@ export class MeshStore {
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
         if (scope?.active || Date.now() >= deadline) {
+          if (!(error instanceof MeshLockTimeoutError)) lockStats?.failed(this.root, lockClass, 0, Boolean(scope?.active));
           throw new MeshLockTimeoutError(describeLockHolder(path.join(this.#lockPath, "owner")), 0, 0);
         }
         await delay(0, this.#writeAbortSignal);
@@ -1859,7 +1863,7 @@ export class MeshStore {
       if (prepared?.temporary) {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
       }
-    });
+    }, "put/delete");
   }
 
   // A commit's write, signal and cache, under the lock. The stamp is taken right after the rename,
@@ -2035,7 +2039,8 @@ export class MeshStore {
 
   /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs);
+    // An explicit zero budget is a bounded try (lock stats count it as a try, not a timeout).
+    return this.#withLock(operation, lockTimeoutMs, "custody", lockTimeoutMs === 0);
   }
 
   /** File custody (smarty-dev#6477 L5): the custody lock, plus the mesh lock in the default
@@ -2062,7 +2067,7 @@ export class MeshStore {
       this.#requireCanonicalRead = true;
       if (this.#stateCache) this.#stateCache = { ...this.#stateCache, parsedAt: 0 };
       onAcquired?.(Date.now());
-    });
+    }, undefined, "heartbeat/confirm");
   }
 
   async delete(input: {
@@ -2114,6 +2119,8 @@ export class MeshStore {
     ops: MeshBatchOperation[];
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
+    /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
+    lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
@@ -2206,7 +2213,7 @@ export class MeshStore {
       }
       input.afterCommit?.(view);
       return results;
-    });
+    }, undefined, input.lockClass === "bridge" ? "bridge" : "writeBatch");
   }
 
   /**
@@ -2399,7 +2406,14 @@ export class MeshStore {
   // Global actor-custody order: actor registries (sorted path), then mesh.
   // Mesh critical sections are synchronous: never await a registry mutation
   // here or wrap resident async controls in this second/innermost lock.
-  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
+  // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
+  // reduced remaining budget from an ordinary caller is never a try.
+  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
+    bounded = false): Promise<T> {
+    const lockWaitStart = lockStats ? performance.now() : 0;
+    let lockHeldAt = -1;
+    let holdMs = -1;
+    let failedWaitMs = -1;
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
@@ -2409,6 +2423,8 @@ export class MeshStore {
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
       (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      // Fails closed before the common accounting below: count it once here.
+      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
       throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
     }
     const startTime = this.#lockProtocol === 2
@@ -2514,6 +2530,7 @@ export class MeshStore {
             : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }
+      if (lockStats) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();
         return operation();
@@ -2524,8 +2541,17 @@ export class MeshStore {
         throw error;
       } finally {
         releaseOwned();
+        if (lockStats) holdMs = performance.now() - lockHeldAt;
       }
-    } finally { ticket.close(); }
+    } catch (error) {
+      if (lockStats && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      throw error;
+    } finally {
+      ticket.close();
+      // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
+      if (holdMs >= 0) lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
+      else if (failedWaitMs >= 0) lockStats?.failed(this.root, lockClass, failedWaitMs, Boolean(scope?.active) || bounded);
+    }
   }
 
   // Complete dead/different-incarnation receipts recover immediately. Empty ownerless

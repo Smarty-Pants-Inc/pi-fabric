@@ -13,6 +13,7 @@ const primaryEntryPoints = [
   "src/actors-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
+  "src/mesh-lock-stats-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/agents/worker-protocol.ts",

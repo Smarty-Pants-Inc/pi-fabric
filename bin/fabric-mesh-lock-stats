@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Fleet view of a mesh root's lock: busy %, timeouts, top classes and pids (smarty-dev#6477 L8).
+import { main } from "../dist/mesh-lock-stats-cli.js";
+try { process.exitCode = main(process.argv.slice(2)); }
+catch (error) {
+  process.stderr.write(`fabric-mesh-lock-stats: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

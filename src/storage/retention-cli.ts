@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { sweepResidentRuns } from "../residency/retention.js";
-import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
+import { actorRunReferencedNow, compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
 const read = (file: string, maxBytes = 1024 * 1024): Record<string, unknown> => {
@@ -101,8 +101,10 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined && !dryRun) {
+        // Same final pre-delete check as the actor-run pass below: every discovered registry is
+        // re-read uncached before each delete; a vanished or unreadable one vetoes (review round 2).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, retainRuns: false,
+          actorRoots: registries, retainRuns: false, requireRegistries: true,
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
         }));
       } else compactRuns(path.join(root, "runs"));
@@ -148,10 +150,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         if (key !== references.key) references = { key, ids: retainedActorRunIds(registries) };
         return references.ids.has("*") || references.ids.has(id);
       };
-      const referencedNow = (id: string): boolean => {
-        const ids = retainedActorRunIds(registries, { requireRegistries: true });
-        return ids.has("*") || ids.has(id);
-      };
+      const referencedNow = (id: string): boolean => actorRunReferencedNow(registries, id, { requireRegistries: true });
       for (const registryRoot of registries) {
         try {
           const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);

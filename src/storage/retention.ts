@@ -512,6 +512,13 @@ export const retainedActorRunIds = (actorRoots: readonly string[], options: { re
   } catch { refs.add("*"); }
   return refs;
 };
+/** The final pre-delete check of every mesh retention removal (pi-fabric#645 review rounds 1-2):
+ * re-reads every registry uncached immediately before a run is deleted. An unreadable registry
+ * (and, with `requireRegistries`, a vanished root or actors.json) is a wildcard veto. */
+export const actorRunReferencedNow = (actorRoots: readonly string[], runId: string, options: { requireRegistries?: boolean } = {}): boolean => {
+  const ids = retainedActorRunIds(actorRoots, options);
+  return ids.has("*") || ids.has(runId);
+};
 
 export interface TerminalRunEventsRetention {
   terminalRunEventsAgeMs?: number;

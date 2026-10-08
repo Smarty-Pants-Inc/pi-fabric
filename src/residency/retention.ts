@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
@@ -12,17 +12,22 @@ import { isResidentCommandOperation, readResidentRequestDecision, type ResidentC
 export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
 /** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
- * host is proven dead and flock-fenced. Every existing run is then untracked. */
+ * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
+ * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
+ * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry. */
 export const sweepResidentRuns = (
   runsRoot: string, now = Date.now(), budgetMs = 100,
-  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number } = {},
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean } = {},
 ): string[] => {
   const removed: string[] = [];
   if (!ownedStat(runsRoot)?.isDirectory()) return removed;
   const started = performance.now();
   const expired = () => performance.now() - started >= budgetMs;
-  const retained = retainedActorRunIds(options.actorRoots ?? []);
+  const actorRoots = options.actorRoots ?? [];
+  const registryOptions = options.requireRegistries ? { requireRegistries: true } : {};
+  const retained = retainedActorRunIds(actorRoots, registryOptions);
   if (retained.has("*")) return removed;
+  const referencedNow = (id: string): boolean => actorRunReferencedNow(actorRoots, id, registryOptions);
   let directory: fs.Dir;
   try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
   try {
@@ -34,13 +39,13 @@ export const sweepResidentRuns = (
       if (!stat?.isDirectory()) continue;
       if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
           !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
-          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired() && !referencedNow(entry.name)) {
         try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
           ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
-          now, expired });
+          now, expired, isRetained: () => referencedNow(path.basename(run)) });
       }
     }
   } finally { directory.closeSync(); }

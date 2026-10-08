@@ -171,6 +171,70 @@ describe("mesh-wide age-based run retention", () => {
   });
 });
 
+// pi-fabric#645 review round 2: the dead-resident sweep runs the same final pre-delete check.
+describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-delete check", () => {
+  const deadResident = () => {
+    const mesh = deadRootMesh();
+    const host = path.join(mesh.root, "residency", "host");
+    write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+    write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:dead-host", residencyRoot: host, meshRoot: mesh.root }));
+    const resident = run(path.join(host, "runs", "old-resident"), { status: "completed", finishedAt: NOW - 2 * DAY });
+    fs.utimesSync(resident, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
+    const other = path.join(mesh.root, "actors", "01a118ab-live-session");
+    write(path.join(other, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle" }] }));
+    return { mesh, resident, other };
+  };
+  const afterSnapshot = (candidate: string, change: () => void) => {
+    const original = fs.readFileSync;
+    let done = false;
+    // The resident run's status.json is first read by the exit/tree checks, after the sweep's
+    // reference snapshot and before its final pre-delete check.
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (!done && file === path.join(candidate, "status.json")) { done = true; change(); }
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync);
+    return () => done;
+  };
+
+  it("removes the dead resident's old run when nothing references it (control)", async () => {
+    const { mesh, resident } = deadResident();
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
+    expect(applied.removedRuns).toContain(resident);
+    expect(fs.existsSync(resident)).toBe(false);
+  });
+
+  for (const [name, row] of [
+    ["latest", { status: "idle", lastRunId: "old-resident" }],
+    ["in-flight", { status: "running", inFlightRun: { id: "old-resident", startedAt: NOW, ageS: 0 } }],
+    ["preparing", { status: "preparing", preparing: { phase: "admission", startedAt: NOW, attempts: 1, runId: "old-resident" } }],
+    ["pending-removal", { status: "running", removal: { requestedAt: NOW, runId: "old-resident" } }],
+  ] as const) {
+    it(`keeps a dead resident's run another registry references as its ${name} run after the snapshot`, async () => {
+      const { mesh, resident, other } = deadResident();
+      const injected = afterSnapshot(resident, () =>
+        write(path.join(other, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", ...row }] })));
+      const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
+      expect(injected()).toBe(true);
+      expect(applied.removedRuns).not.toContain(resident);
+      expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
+    });
+  }
+
+  for (const [name, change] of [
+    ["unreadable", (other: string) => write(path.join(other, "actors.json"), "{not json")],
+    ["vanished", (other: string) => fs.rmSync(path.join(other, "actors.json"))],
+  ] as const) {
+    it(`deletes nothing of the dead resident when a registry becomes ${name} after the snapshot`, async () => {
+      const { mesh, resident, other } = deadResident();
+      const injected = afterSnapshot(resident, () => change(other));
+      const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
+      expect(injected()).toBe(true);
+      expect(applied.removedRuns.filter(item => item.startsWith(path.join(mesh.root, "residency")))).toEqual([]);
+      expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
+    });
+  }
+});
+
 describe("mesh retention sweep claim", () => {
   it("lets exactly one owner claim each interval, and drops stale slots", () => {
     const root = tmp("fabric-mesh-claim-");

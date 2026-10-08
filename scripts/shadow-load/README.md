@@ -6,8 +6,13 @@ release next to a baseline release at fleet load and under CPU contention, chang
 and restarts the bridges, then reports PASS or FAIL.
 
 ```sh
-scripts/shadow-load/run.sh <candidate-release> <baseline-release> [minutes] [flags]   # default 30 minutes
+scripts/shadow-load/run.sh <candidate-release> <baseline-release> [minutes] [--profile fleet|legacy] [flags]   # default 30 minutes
 ```
+
+`--profile fleet` (the default) applies the values calibrated against Ryzen 1's fleet (see
+[Calibration](#calibration)); flags after it override single values. `--profile legacy` runs
+orchestrate.mjs's built-in defaults, the harness before calibration. The table below lists the
+built-in defaults; the fleet profile's overrides are in the calibration section.
 
 Each release is a built release: an installed one, such as
 `~/.local/share/smarty-dev/fabric/releases/<sha>`, or a checkout after `bun run build`. Pass the
@@ -33,8 +38,9 @@ that `dist/participants-cli.js` or `dist/residency/host.js` imports. Nothing is 
 | Fleet-sized state | `--state-mb 4.8`, `--host-leases 600`, `--seed-participants 20`, `--actor-records 300`, `--actor-roots 40` | `seed.mjs`: before any Main starts, state.json is padded to 4.8 MB with participant- and actor-shaped records through the release's own `writeBatch`. Once the Mains run, a keeper clones a live Main's host lease and participant file into seeded hosts (new ids, shifted times) up to 600 host-lease files and ~500 listed participants, writes the missing actor registries (150 actors on 25 roots, with the live hosts' 150 on 15 roots: 300 on 40), and renews every seeded lease and record each 5 s like its owner would. Only the fleet's summary counts are used; no real record is copied. |
 | Events | 1/s on the hub (`--rate`), 0.5/s per spoke (`--spoke-rate`), forwarder ~60/min (`--forward-per-min`, bursts averaging `--forward-burst` 6) | `fleet.work.*` (bridged). The github-factory-like forwarder publishes `fleet.work.github.<kind>` bursts, every third addressed to a spoke Main. |
 | Review wakes | every 5 s (`--wake-s`) | a Main publishes `fleet.work.review.requested` addressed to one of its durable actors, then polls `actorStatus` through the resident host. |
-| Registry saves | each actor every 30 s (`--actor-save-s`) | a `setTools` call through the candidate's `ResidentActorClient`, made as the owning Main. |
-| CPU contention | `--burn-pct 80`, `--burn-threads $(nproc)` | `run.sh` starts `burner.mjs` at nice 0 before the harness: one duty-cycled busy loop per CPU, controlled on `/proc/stat` so the whole host (other tenants and the harness included) stays near 80% busy. The report gives host busy % and CPU PSI over the load window. `--burn-pct 0` disables it. |
+| Registry saves | each actor every 30 s (`--actor-save-s`), at most `--saves-in-flight` (1) per host | a `setTools` call through the candidate's `ResidentActorClient`, made as the owning Main. |
+| Turn churn | off (`--churn-s 0`) | with `--churn-s S`, each hub Main's root status flips idle/running on average every S s (jitter 0.5S to 1.5S) and its directory publishes the changed record (`scheduleRefresh`), as a Main that starts and ends turns does. |
+| CPU contention | `--burn-pct 80`, `--burn-threads $(nproc)` | `run.sh` starts `burner.mjs` at nice 0 before the harness: one duty-cycled busy loop per CPU, controlled on `/proc/stat` so the whole host (other tenants and the harness included) stays near 80% busy. With `--burn-duty D` the controller is off and every thread burns a fixed D of each 50 ms slice (D x threads CPUs of nice-0 work, however busy the host already is; on a host the harness saturates by itself the controller backs off to 0). The report gives host busy % and CPU PSI over the load window. `--burn-pct 0` disables it. |
 
 The harness and every child run at `nice -n 19` (the burner does not), each child with
 `--max-old-space-size=240` (`--heap-mb`). Total PSS is sampled every second; above

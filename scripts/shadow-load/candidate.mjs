@@ -75,16 +75,25 @@ export const startMain = async (candidate, root, main, cwd) => {
   const store = openStore(candidate, root, { backgroundReadCacheMs: 5_000 });
   const identity = { id: main.id, name: main.name, kind: 'main', sessionId: main.sessionId };
   const startedAt = Date.now();
+  // The root's turn status, as Pi's runtime reports it: churnMain() flips it like a turn would.
+  const live = { status: 'idle', updatedAt: startedAt };
   const directory = new candidate.ParticipantDirectory(store, {
     enabled: true, hostId: main.id, rootId: main.id, identity,
     onRootCollision: collision => process.stderr.write(`root collision ${JSON.stringify(collision)}\n`),
   });
-  directory.registerSource(() => [directory.root({ id: main.id, cwd, sessionId: main.sessionId, status: 'idle',
-    startedAt, updatedAt: startedAt, pendingMessages: 0 }, true, main.name, { role: undefined })]);
+  directory.registerSource(() => [directory.root({ id: main.id, cwd, sessionId: main.sessionId, status: live.status,
+    startedAt, updatedAt: live.updatedAt, pendingMessages: 0 }, true, main.name, { role: undefined })]);
   await directory.resumeLineage();
   try { await directory.start(); }
-  catch (error) { return { store, directory, identity, startError: error }; }
-  return { store, directory, identity };
+  catch (error) { return { store, directory, identity, live, startError: error }; }
+  return { store, directory, identity, live };
+};
+
+/** A turn starts or ends: the root record changes and the directory publishes it (scheduleRefresh), as Pi does. */
+export const churnMain = (started) => {
+  started.live.status = started.live.status === 'idle' ? 'running' : 'idle';
+  started.live.updatedAt = Date.now();
+  started.directory.scheduleRefresh();
 };
 
 export const sha256 = value => createHash('sha256').update(value).digest('hex');

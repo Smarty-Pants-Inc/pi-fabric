@@ -25,12 +25,12 @@ const opt = {
   hosts: num('hosts', 15), actors: Math.max(2, num('actors', 10)),
   spokes: Math.max(1, num('spokes', 4)), spokeLinks: num('spoke-links', 1), spokeMains: Math.max(1, num('spoke-mains', 62)), spokeMainsPerProcess: Math.max(1, num('spoke-mains-per-process', 62)),
   rate: num('rate', 1), spokeRate: num('spoke-rate', 0.5), forwardPerMin: num('forward-per-min', 60), forwardBurst: Math.max(1, num('forward-burst', 6)),
-  wakeS: num('wake-s', 5), actorSaveS: num('actor-save-s', 30),
+  wakeS: num('wake-s', 5), actorSaveS: num('actor-save-s', 30), churnS: num('churn-s', 0), savesInFlight: Math.max(1, num('saves-in-flight', 1)),
   stateMb: num('state-mb', 4.8), hostLeases: num('host-leases', 600), seedParticipants: num('seed-participants', 20), actorRecords: num('actor-records', 300), actorRoots: num('actor-roots', 40),
   autoReloadFraction: Math.min(1, num('auto-reload-fraction', 0.5)), pinAt: num('pin-at', 0.4), reloadJitterS: num('reload-jitter-s', 10), restartAt: num('restart-at', 0.6),
   maxBusy: num('max-busy', 30), maxTimeouts: num('max-timeouts', 0), maxLeaseS: num('max-lease-s', 15), maxWaitP99S: num('max-wait-p99-s', 5), maxCountDriftPct: num('max-count-drift-pct', 2),
   memBudgetMb: num('mem-budget-mb', 8192), heapMb: num('heap-mb', 240), semiSpaceMb: num('semi-space-mb', 4), canaryEveryS: num('canary-every-s', 120),
-  burnPct: num('burn-pct', 80), burnThreads: num('burn-threads', os.cpus().length), burnDuty: args['burn-duty'] === undefined ? null : num('burn-duty', 0), keep: Boolean(args.keep),
+  burnPct: num('burn-pct', 80), burnThreads: num('burn-threads', os.cpus().length), burnDuty: args['burn-duty'] === undefined || args['burn-duty'] === 'off' ? null : num('burn-duty', 0), profile: String(args.profile ?? 'none'), keep: Boolean(args.keep),
 };
 if (opt.hosts > opt.mains) throw new Error('--hosts cannot exceed --mains: each resident host belongs to a Main');
 for (const dir of new Set(Object.values(releases))) {
@@ -228,7 +228,7 @@ try {
     mainsOuts.push(outFile);
     all.mains.push(launch(`mains-${index}`, [path.join(here, 'mains.mjs'), '--release', releases[block.slot], '--plan', planFile, '--mesh', dirs.hub, '--list', 'mains',
       '--from', String(block.from), '--count', String(block.count), '--cwd', dirs.project, '--out', outFile, '--slot', block.slot,
-      '--pin', pinFile, '--pin-release', release, '--reload-jitter-ms', String(opt.reloadJitterS * 1_000)], { SHADOW_RELEASE: releases[block.slot] }));
+      '--pin', pinFile, '--pin-release', release, '--reload-jitter-ms', String(opt.reloadJitterS * 1_000), '--churn-s', String(opt.churnS)], { SHADOW_RELEASE: releases[block.slot] }));
     if (index % 10 === 9) await delay(1_000);
   }
   await waitUntil('Mains ready', 300_000, () => all.mains.every((entry, index) => fs.existsSync(`${mainsOuts[index]}.ready`) || entry.exited) && true);
@@ -322,7 +322,7 @@ try {
     '--out', observerOut, '--max-lease-s', String(opt.maxLeaseS)]);
   const driver = launch('driver', [path.join(here, 'driver.mjs'), ...common, '--hub', dirs.hub, '--spokes', plan.spokes.map(spoke => spoke.mesh).join(','),
     '--rate', String(opt.rate), '--spoke-rate', String(opt.spokeRate), '--forward-per-min', String(opt.forwardPerMin), '--forward-burst', String(opt.forwardBurst),
-    '--wake-s', String(opt.wakeS), '--actor-save-s', String(opt.actorSaveS), '--out', driverOut]);
+    '--wake-s', String(opt.wakeS), '--actor-save-s', String(opt.actorSaveS), '--saves-in-flight', String(opt.savesInFlight), '--out', driverOut]);
   all.aux.push(observer, driver);
 
   // 5. Full load for N minutes: the pin change, the bridge restart, a canary round every --canary-every-s.

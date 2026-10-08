@@ -5,9 +5,12 @@
 // directory for "reload" and closes it, the same process loads the pinned release's code, and the
 // new runtime resumes the lineage, starts its directory and publishes ops.fabric.reloaded.
 //   node mains.mjs --release DIR --mesh ROOT --plan FILE --list mains|spokeNMains --from I --count N --cwd DIR --out FILE
-//     [--slot baseline|candidate --pin FILE --pin-release DIR --reload-jitter-ms 10000]
+//     [--slot baseline|candidate --pin FILE --pin-release DIR --reload-jitter-ms 10000] [--churn-s 0]
+// With --churn-s S > 0 each Main's turn status flips (idle <-> running) on average every S seconds
+// (uniform jitter 0.5S..1.5S), and its directory publishes the changed root record, as a Main
+// that starts and ends turns does. 0 (the default) keeps every Main idle.
 import fs from 'node:fs';
-import { argMap, delay, loadCandidate, readJson, startMain, writeJson } from './candidate.mjs';
+import { argMap, churnMain, delay, loadCandidate, readJson, startMain, writeJson } from './candidate.mjs';
 
 const args = argMap(process.argv.slice(2));
 const candidate = await loadCandidate(args.release, { directory: true });
@@ -101,6 +104,19 @@ if (args.pin) {
       setTimeout(() => void reload(row, pin), Math.floor(Math.random() * Number(args['reload-jitter-ms'] ?? 10_000)));
     }
   }, 1_000);
+}
+const churnS = Number(args['churn-s'] ?? 0);
+let churns = 0;
+if (churnS > 0) {
+  for (const row of running) {
+    const tick = () => {
+      if (stopping) return;
+      if (!row.reloading && row.live) { try { churnMain(row); churns++; } catch { /* a closed directory */ } }
+      setTimeout(tick, churnS * 1_000 * (0.5 + Math.random())).unref();
+    };
+    setTimeout(tick, churnS * 1_000 * Math.random()).unref();
+  }
+  setInterval(() => { for (const row of running) if (health[row.main.id]) health[row.main.id].churns = churns; }, 10_000).unref();
 }
 const timer = setInterval(save, 10_000);
 let stopping = false;

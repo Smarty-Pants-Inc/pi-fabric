@@ -3,7 +3,7 @@
 // resident host, all through the candidate's own MeshStore and ResidentActorClient, sent as the
 // hub's and spokes' Mains would send them.
 //   node driver.mjs --release DIR --hub ROOT --spokes ROOT,ROOT,... --plan FILE --rate 1 --spoke-rate 0.5
-//     --forward-per-min 60 --forward-burst 6 --wake-s 5 --actor-save-s 30 --out FILE
+//     --forward-per-min 60 --forward-burst 6 --wake-s 5 --actor-save-s 30 [--saves-in-flight 1] --out FILE
 import { argMap, isLockTimeout, loadCandidate, openStore, readJson, writeJson } from './candidate.mjs';
 
 const args = argMap(process.argv.slice(2));
@@ -80,27 +80,28 @@ if (forwardPerMin > 0) {
 }
 
 // Registry saves and review-actor-style wakes go to each host's load actors (the canary actor is
-// left alone). One request in flight per host.
+// left alone). At most --saves-in-flight (1) registry saves in flight per host.
 const targets = [];
 const hostStates = [];
 for (const host of plan.hosts) {
   const client = new candidate.ResidentActorClient(args.hub, host.rootId);
   const caller = { identity: { id: host.rootId, name: host.mainName, kind: 'main', sessionId: host.sessionId }, hostId: host.rootId };
-  const state = { client, caller, busy: false, host };
+  const state = { client, caller, busy: 0, host };
   hostStates.push(state);
   for (const id of host.loadActors) targets.push({ id, state, flip: false });
 }
 if (targets.length) {
+  const savesInFlight = Math.max(1, Number(args['saves-in-flight'] ?? 1));
   let next = 0;
   setInterval(() => {
     const target = targets[next++ % targets.length];
-    if (target.state.busy) { stats.saves.skipped++; return; }
-    target.state.busy = true;
+    if (target.state.busy >= savesInFlight) { stats.saves.skipped++; return; }
+    target.state.busy++;
     target.flip = !target.flip;
     const started = performance.now();
     target.state.client.setActor({ operation: 'setTools', id: target.id, tools: target.flip ? ['read', 'grep'] : ['read'] }, undefined, target.state.caller)
       .then(() => record(stats.saves, started), error => record(stats.saves, started, error))
-      .finally(() => { target.state.busy = false; });
+      .finally(() => { target.state.busy--; });
   }, Math.max(20, Math.round(Number(args['actor-save-s'] ?? 30) * 1_000 / targets.length)));
 
   // A review wake: the owning Main publishes a review request addressed to the actor on the hub,

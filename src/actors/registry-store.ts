@@ -168,22 +168,28 @@ export class ActorRegistryStore {
       return row;
     }));
     const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
-    // File data and pre-rename namespace barriers happen outside custody.
+    // Message appends (payload.prepare), checkpoint temp files and the registry temp
+    // file are all written and fsynced here, outside custody (smarty-dev#6477 L7).
+    // Data is durable before any pointer rename, as before; a crash before the
+    // registry rename leaves only unreferenced bytes or files.
+    const heads = this.#payloads.stageHeads(changedHeads);
     try { writeFileAtomic(temporary, serialized, { durable }); }
     catch (error) {
       try { fs.rmSync(temporary, { force: true }); } catch { /* Preserve the failed preparation barrier. */ }
+      heads.dispose();
       throw error;
     }
     let renamed = false;
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
+      // Under custody exactly as before smarty-dev#6477 L7, including the failure
+      // path: only the payload appends no longer run here.
       commit: (): void => {
         try {
-          payload.commit();
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
           if (durable) syncDirectoryChain(this.#actorRoot);
-          this.#payloads.publishHeads(changedHeads);
+          heads.publish();
           this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
         } catch (error) {
           if (renamed) {
@@ -194,7 +200,7 @@ export class ActorRegistryStore {
           throw error;
         }
       },
-      dispose: () => fs.rmSync(temporary, { force: true }),
+      dispose: () => { fs.rmSync(temporary, { force: true }); heads.dispose(); },
     };
   }
 
@@ -237,6 +243,8 @@ export class ActorRegistryStore {
     // Caller-local cancellation/ownership validation still vetoes publication. A veto
     // re-selects from a fresh snapshot; one that persists is never reported as
     // success: undefined means only that select() declined to write.
+    // Under custody, a fresh preparation also appends under custody: that cost is
+    // paid only after a race, never on the uncontended path.
     const attempt = (): T | undefined | typeof VETOED => {
       live();
       const current = this.snapshot();

@@ -1,0 +1,82 @@
+{
+  "healthy": [
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "barrier registry fails once from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "barrier registry fails persistently from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "crash at every step; barrier registry fails persistently after the registry rename": [
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}"
+  ],
+  "barrier a fails once from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "barrier a fails persistently from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "crash at every step; barrier a fails persistently after the registry rename": [
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}"
+  ],
+  "barrier b fails once from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "barrier b fails persistently from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "crash at every step; barrier b fails persistently after the registry rename": [
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}"
+  ],
+  "barrier c fails once from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "barrier c fails persistently from every step": [
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ],
+  "crash at every step; barrier c fails persistently after the registry rename": [
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"error\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}"
+  ],
+  "crash at every step; healthy barriers": [
+    "{\"result\":\"crashed\",\"restart\":[\"all m0\",\"all m0,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0\",\"all m0,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0 c:m0\",\"a:m0,m1,m1 b:m0,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"a:m0,m1 b:m0,m1 c:m0\",\"a:m0,m1,m1 b:m0,m1,m1 c:m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0\",\"all m0,m1\"]}",
+    "{\"result\":\"crashed\",\"restart\":[\"all m0,m1\",\"all m0,m1,m1\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m1\"],\"older\":[\"all m0,m1\",\"all m0,m1,m1\"]}",
+    "{\"result\":\"ok\",\"restart\":[\"all m0,m1\",\"all m0,m1,m2\"],\"osCrash\":[\"all m0,m1\",\"all m0,m1,m2\"],\"older\":[\"all m0,m1\",\"all m0,m1,m2\"]}"
+  ]
+}

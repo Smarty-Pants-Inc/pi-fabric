@@ -21,14 +21,37 @@ Existing actor/root retention and removal delete these files together with the
 actor directory; this change adds no periodic archive rewrite or retention job.
 
 An append is synced, including namespace barriers, before publishing its
-reference. New payload heads, custody and removal decisions are committed
-immediately with the existing durable atomic registry rename and rollback
-protocol. Before acknowledging a save, the writer also durably checkpoints each
-changed accepted head to `<actor-id>/registry/messages-head.json`, under the same
-registry lock. This small checkpoint is independent of unknown registry fields:
-it survives a legacy owned-row save that removes `messageHistory`. Unchanged
-checkpoints are not rewritten. A checkpoint failure rolls back changed
-checkpoints and the registry; later commits never select an abandoned append.
+reference, and **before the registry lock is taken** (smarty-dev#6477 L7). A
+save prepares outside custody: it appends every new transaction at its
+speculative offset, fsyncs the log and its namespace, then reads the bytes back.
+Another appender that won the tail makes that preparation invalid; its bytes
+stay behind as an unreferenced archive and the save re-selects under the lock.
+Each changed checkpoint and the new registry are also written to fsynced
+`*.prepared` temp files before custody. Data is therefore durable before any
+pointer rename, exactly as before. Only a save that already lost a race
+prepares, and therefore appends, under the lock.
+
+Under the registry lock a save checks the registry generation and the log
+identities (a `stat`), then runs the same commit as before L7: the registry
+rename and its directory barrier (durable saves), then each changed checkpoint
+(`<actor-id>/registry/messages-head.json`) is renamed into place and gets the same
+directory barrier `writeFileAtomic` takes. This small checkpoint is independent of
+unknown registry fields: it survives a legacy owned-row save that removes
+`messageHistory`. Unchanged checkpoints are not rewritten.
+
+The failure handling is unchanged from before L7 (pi-fabric#590 round 6 scope
+cut): a failed checkpoint publish restores the checkpoints it replaced, a failed
+commit restores the previous registry, and the original (or restore) error is
+thrown; nothing is acknowledged. `tests/actor-registry-main-equivalence.test.ts`
+sweeps barrier faults (once and persistent, on the registry and on each checkpoint
+directory, starting at every file-system step) and crashes at every step, followed
+by a restart, an OS crash, or an older-release writer that drops `messageHistory`
+plus an OS crash, then the manager's next save. It asserts that the set of
+observable outcomes equals the set recorded on main.
+`tests/actor-registry-crash-points.test.ts` checks the barrier order under the lock
+and that a crash at any step leaves the registry selecting only complete payloads.
+A crash may leave stray `messages-head.json.*.prepared` temp files; they are never
+read.
 
 Explicit registry references take precedence over checkpoints, so interrupted
 publication remains readable by new releases. If a process dies between the

@@ -93,8 +93,33 @@ export const planSchedule = (load) => {
   return ops;
 };
 
-/** Participant p runs in worker process floor(p / perProcess). */
-export const processOf = (load, p) => Math.floor(p / Math.ceil(load.participants / load.processes));
+/**
+ * One balanced, contiguous, non-empty partition of participants over worker processes: every worker gets
+ * floor(N / P) participants and the first N % P workers one more (80/8 -> 10 each, 5/4 -> 2,1,1,1).
+ * `participantsOf` and `processOf` are inverses; both require 1 <= processes <= participants.
+ */
+const partition = (load) => {
+  const { participants, processes } = load;
+  if (!Number.isInteger(participants) || !Number.isInteger(processes) || processes < 1 || participants < processes) {
+    throw new Error(`cannot give each of ${processes} worker processes at least one of ${participants} participants`);
+  }
+  return { base: Math.floor(participants / processes), extra: participants % processes };
+};
+
+/** The participants worker process `index` runs, in order. */
+export const participantsOf = (load, index) => {
+  const { base, extra } = partition(load);
+  if (!Number.isInteger(index) || index < 0 || index >= load.processes) return [];
+  const start = index * base + Math.min(index, extra);
+  return Array.from({ length: base + (index < extra ? 1 : 0) }, (_, i) => start + i);
+};
+
+/** The worker process participant p runs in. */
+export const processOf = (load, p) => {
+  const { base, extra } = partition(load);
+  const wide = extra * (base + 1);
+  return p < wide ? Math.floor(p / (base + 1)) : extra + Math.floor((p - wide) / base);
+};
 
 export const histogramIndex = (ms) => {
   let index = 0;

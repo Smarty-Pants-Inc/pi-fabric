@@ -49,6 +49,7 @@ export const LOAD_INSENSITIVE_METRICS: readonly string[];
 export const TIMING_METRICS: readonly string[];
 export function seededRandom(seed: number): () => number;
 export function planSchedule(load: MeshLockLoad): PlannedOp[];
+export function participantsOf(load: MeshLockLoad, index: number): number[];
 export function processOf(load: MeshLockLoad, p: number): number;
 export function histogramIndex(ms: number): number;
 export function histogramPercentile(histogram: readonly number[], fraction: number): number;

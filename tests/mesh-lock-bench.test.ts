@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_LOAD, L8_BOUNDS_MS, compareToBaseline, histogramPercentile, planSchedule, processOf, samplePercentile,
+  DEFAULT_LOAD, L8_BOUNDS_MS, compareToBaseline, histogramPercentile, participantsOf, planSchedule, processOf,
+  samplePercentile,
 } from "../scripts/lib/mesh-lock-bench.mjs";
 import { LOCK_STATS_BOUNDS_MS } from "../src/mesh/commit-stats.js";
 
@@ -27,6 +28,29 @@ describe("mesh lock benchmark (smarty-dev#6477 L9a)", () => {
       if (op.kind === "steer") expect(op.to).not.toBe(op.p);
     }
     expect(new Set(a.map(op => processOf(DEFAULT_LOAD, op.p)))).toEqual(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
+  });
+
+  it("partitions participants so every worker process gets at least one, consistently", () => {
+    const pairs: Array<[number, number]> = [[5, 4], [7, 3], [80, 8], [2, 2], [9, 1]];
+    for (const [participants, processes] of pairs) {
+      const load = { ...DEFAULT_LOAD, participants, processes };
+      const seen: number[] = [];
+      for (let index = 0; index < processes; index++) {
+        const mine = participantsOf(load, index);
+        expect(mine.length, `${participants}/${processes} worker ${index}`).toBeGreaterThanOrEqual(1);
+        // Balanced: sizes differ by at most one.
+        expect(mine.length).toBeGreaterThanOrEqual(Math.floor(participants / processes));
+        expect(mine.length).toBeLessThanOrEqual(Math.ceil(participants / processes));
+        for (const p of mine) expect(processOf(load, p)).toBe(index);
+        seen.push(...mine);
+      }
+      expect(seen).toEqual(Array.from({ length: participants }, (_, p) => p));
+    }
+    expect(participantsOf({ ...DEFAULT_LOAD, participants: 5, processes: 4 }, 0)).toEqual([0, 1]);
+    expect(participantsOf({ ...DEFAULT_LOAD, participants: 7, processes: 3 }, 2)).toEqual([5, 6]);
+    // The default 80/8 partition is unchanged (contiguous blocks of 10), so the committed baseline stays valid.
+    for (let p = 0; p < DEFAULT_LOAD.participants; p++) expect(processOf(DEFAULT_LOAD, p)).toBe(Math.floor(p / 10));
+    expect(() => participantsOf({ ...DEFAULT_LOAD, participants: 3, processes: 4 }, 0)).toThrow(/at least one/);
   });
 
   it("mirrors L8's histogram bounds and percentile", () => {

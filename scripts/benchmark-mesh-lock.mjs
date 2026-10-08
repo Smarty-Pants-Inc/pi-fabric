@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   DEFAULT_LOAD, L8_BOUNDS_MS, LOAD_INSENSITIVE_METRICS, TIMING_METRICS, compareToBaseline, histogramIndex,
-  histogramPercentile, planSchedule, processOf, samplePercentile,
+  histogramPercentile, participantsOf, planSchedule, processOf, samplePercentile,
 } from "./lib/mesh-lock-bench.mjs";
 
 const self = fileURLToPath(import.meta.url);
@@ -102,9 +102,7 @@ const worker = async () => {
     if (code !== LOCK_TIMEOUT && phase.errorSamples.length < 5) phase.errorSamples.push(String(error?.stack ?? error));
   };
 
-  const perProcess = Math.ceil(load.participants / load.processes);
-  const mine = [];
-  for (let p = index * perProcess; p < Math.min(load.participants, (index + 1) * perProcess); p++) mine.push(p);
+  const mine = participantsOf(load, index);
   // Configured as a Main's runtime store (fabric-runtime-state.ts), idle.
   const options = { lockTimeoutMs: load.lockTimeoutMs, lockProtocol: load.lockProtocol, backgroundReadCacheMs: 5_000, readActive: () => false };
   const stores = new Map(mine.map(p => [p, new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, options)]));
@@ -286,7 +284,11 @@ const parseArgs = argv => {
   for (const key of ["participants", "processes", "seed", "registryKeys", "lockProtocol"]) {
     if (!Number.isInteger(load[key])) throw new Error(`${key} must be an integer`);
   }
-  if (load.participants < 2 || load.processes < 1 || load.processes > load.participants) throw new Error("need 2+ participants and 1..participants processes");
+  if (load.participants < 2) throw new Error("--participants must be at least 2");
+  if (load.processes < 1) throw new Error("--processes must be at least 1");
+  if (load.participants < load.processes) {
+    throw new Error(`--participants (${load.participants}) must be at least --processes (${load.processes}): every worker process needs a participant`);
+  }
   if (!(load.durationS > 0) || !(load.heartbeatS > 0) || !(load.pollMs > 0) || !(load.registryKeys > 0)) {
     throw new Error("duration, heartbeat, poll interval and registry keys must be positive");
   }

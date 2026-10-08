@@ -109,6 +109,14 @@ interface MeshDedupeIntent {
   archiveDir?: string;
 }
 
+/** Durability work a single publish runs AFTER `.lock` is released and before it resolves
+ * (smarty-dev#6477 E1). Set by the committed hold only; a failed attempt never sets it. */
+interface AfterUnlock { finish?: (() => Promise<void> | void) | undefined }
+
+// One live-log barrier per root, shared by every confirmation queued before it STARTS. A
+// later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
+const eventBarriers = new Map<string, Promise<void>>();
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -178,7 +186,36 @@ export class EventLog {
     try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
   }
 
-  #readDedupeReceipt(dedupeKey: string): MeshEvent | undefined {
+  /** Fsync the live log and its namespace outside `.lock`. Group commit: callers whose append
+   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). */
+  #confirmEventsAfterRelease(): Promise<void> {
+    const file = this.#eventsPath;
+    const queued = eventBarriers.get(file);
+    if (queued) return queued;
+    const barrier = new Promise<void>((resolve, reject) => {
+      setImmediate(() => {
+        eventBarriers.delete(file);
+        try { this.#confirmEventFile(file); resolve(); }
+        catch (error) { reject(error); }
+      });
+    });
+    eventBarriers.set(file, barrier);
+    return barrier;
+  }
+
+  /** After release: a no-archive keyed event's live barrier, then its durable receipt, then
+   * the intent's removal. Until the receipt is durable the intent stays, so a crash (or a
+   * concurrent same-key writer, or compaction) recovers exactly as from a death after the
+   * live append; a second writer can only install the identical receipt. */
+  #finishLiveReceipt(event: MeshEvent, intentPath: string, receiptPath: string): () => Promise<void> {
+    return async () => {
+      await this.#confirmEventsAfterRelease();
+      writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+      if (fs.existsSync(intentPath)) this.#removeDedupeIntent(intentPath);
+    };
+  }
+
+  #readDedupeReceipt(dedupeKey: string, confirm = true): MeshEvent | undefined {
     const file = this.#dedupePath(dedupeKey, ".json");
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
@@ -188,7 +225,7 @@ export class EventLog {
       throw new Error("Invalid event publication receipt");
     }
     // A visible rename whose final barrier failed is not yet a durable receipt.
-    this.#confirmEventFile(file);
+    if (confirm) this.#confirmEventFile(file);
     return event;
   }
 
@@ -219,7 +256,7 @@ export class EventLog {
     }
   }
 
-  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive): MeshEvent | undefined {
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -234,7 +271,18 @@ export class EventLog {
       throw new Error("Invalid event publication intent");
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
-    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
+    if (prior && after) {
+      // The original publisher installed the receipt after our first lookup missed (it writes
+      // it after release). Confirm it and unlink the intent after release too: no fsync and
+      // no namespace barrier under the lock, as on the no-archive off-lock path.
+      const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
+      after.finish = () => {
+        this.#confirmEventFile(receiptPath);
+        if (fs.existsSync(file)) this.#removeDedupeIntent(file);
+      };
+      return prior;
+    }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
@@ -280,6 +328,21 @@ export class EventLog {
         event = archived;
       }
     }
+    if (event && !prior && live && !archive && after) {
+      // No-archive recovery of a dead publisher's live append: nothing durable is written
+      // under the lock. The intent stays until the receipt is durable (after release).
+      after.finish = this.#finishLiveReceipt(event, file, this.#dedupePath(intent.dedupeKey, ".json"));
+      return event;
+    }
+    if (!event && !archive && after) {
+      // No-archive, nothing committed at the intent's offset (a partial or failed append): the
+      // unlink is ordered under the lock (a same-key writer may replace the intent next), its
+      // namespace barrier runs after release. A crash before it may bring the intent back,
+      // which settles to nothing again: no line can ever match its unique event id.
+      fs.rmSync(file, { force: true });
+      after.finish = () => syncPathNamespace(path.dirname(file));
+      return undefined;
+    }
     if (event && !prior) {
       if (live) {
         this.#confirmEventFile(this.#eventsPath);
@@ -304,7 +367,7 @@ export class EventLog {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }): () => MeshEvent {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     const principal = input.principal;
@@ -338,14 +401,21 @@ export class EventLog {
       throw error;
     }
     return () => {
+      if (after) after.finish = undefined;
       input.signal?.throwIfAborted();
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
       if (input.dedupeKey) {
-        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          // A single publish confirms the visible receipt and unlinks after release.
+          if (after) {
+            after.finish = () => {
+              this.#confirmEventFile(receiptPath!);
+              if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+            };
+          } else if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
           return prior;
         }
       }
@@ -373,7 +443,7 @@ export class EventLog {
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after);
         if (prior) return prior;
       }
       if (archive) {
@@ -444,15 +514,25 @@ export class EventLog {
       const { event, line } = input.fence ? input.fence(append) : append();
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
-      if (receiptPath) {
+      if (receiptPath && after && !archive) {
+        // No-archive keyed publish: the durable intent (above) is the crash fence; the live
+        // barrier, receipt and unlink run after release, before the publish resolves.
+        after.finish = this.#finishLiveReceipt(event, intentPath!, receiptPath);
+      } else if (receiptPath) {
+        // Archive-coupled and legacy batch receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
         if (intentPath) this.#removeDedupeIntent(intentPath);
       }
       if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
       else {
+        // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
         this.#compactEventLog();
-        if (input.durable && !receiptPath) this.#confirmEventFile(this.#eventsPath);
+        if (input.durable && !receiptPath) {
+          // Unkeyed durable publish: the live-log barrier runs after release (group commit).
+          if (after) after.finish = () => this.#confirmEventsAfterRelease();
+          else this.#confirmEventFile(this.#eventsPath);
+        }
       }
       return event;
     };
@@ -462,13 +542,19 @@ export class EventLog {
     // Freeze ordinary payload/principal bytes once, even if archive validation retries.
     input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
+    const after: AfterUnlock = {};
+    let event: MeshEvent;
     for (;;) {
-      try { return await this.#lock.withLock(this.#preparePublish(input), undefined, "publish"); }
+      try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after), undefined, "publish"); break; }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
       }
     }
+    // Committed. Never retry from here: a failed barrier must not append the event twice.
+    // The publish resolves only after its bytes (and any receipt) are durable.
+    await after.finish?.();
+    return event;
   }
 
   /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work

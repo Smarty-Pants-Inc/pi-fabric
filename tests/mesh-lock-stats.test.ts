@@ -69,7 +69,7 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(ownFile(root))).toBe(false);
     vi.advanceTimersByTime(14_000); // past the minute plus the pid spread (<= 2.5 s)
     const file = read(root);
-    expect(file).toMatchObject({ version: 1, host: lockStatsHost(), pid: process.pid, root: path.resolve(root) });
+    expect(file).toMatchObject({ version: 1, host: lockStatsHost(), pid: process.pid, root: fs.realpathSync.native(root) });
     expect(file.minutes).toHaveLength(1);
     expect(file.minutes[0]!.minute).toBe(MINUTE0);
     const { publish, custody } = file.minutes[0]!.classes;
@@ -202,6 +202,51 @@ describe("mesh lock stats recorder", () => {
     vi.advanceTimersByTime(61 * 60_000);
     expect(readdir.mock.calls.filter(([target]) => String(target).startsWith(root))).toHaveLength(0);
     expect(fs.existsSync(root)).toBe(false);
+  });
+
+  it("prunes its own file by age: kept while fresh, removed after 24 h without acquisitions", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const parent = temp();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(root);
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    vi.advanceTimersByTime(63_000); // written (and pruned once); quiet from now on
+    // File times follow the real clock; pin the own file to the fake write time.
+    fs.utimesSync(ownFile(root), T0 / 1000, T0 / 1000);
+    vi.advanceTimersByTime(23 * 60 * 60_000); // several hourly prunes within the retention
+    expect(fs.existsSync(ownFile(root))).toBe(true);
+    vi.advanceTimersByTime(2 * 60 * 60_000); // past 24 h with no acquisition
+    expect(fs.existsSync(ownFile(root))).toBe(false);
+    // Still tracked: the next acquisition recreates the file.
+    stats.acquired(root, "publish", 1, 2);
+    registry[lockKey]!.flush();
+    expect(read(root).minutes.at(-1)!.classes.publish).toMatchObject({ n: 1, holdMs: 2 });
+  });
+
+  it("merges spellings of one root into one bucket and one file", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const parent = temp();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(root);
+    const link = path.join(temp(), "link");
+    fs.symlinkSync(root, link, "junction");
+    const spellings = [root, `${root}${path.sep}`, path.relative(process.cwd(), root) || ".", link, path.join(link, "..", "link")];
+    if (process.platform === "win32") spellings.push(root.toUpperCase());
+    const stats = createLockStats("1")!;
+    for (const spelling of spellings) {
+      stats.acquired(spelling, "publish", 1, 10);
+      stats.failed(spelling, "custody", 5, false);
+    }
+    registry[lockKey]!.flush();
+    expect(fs.readdirSync(path.join(root, "lock-stats"))).toEqual([path.basename(ownFile(root))]);
+    const file = read(root);
+    expect(file.root).toBe(fs.realpathSync.native(root));
+    const classes = file.minutes.at(-1)!.classes;
+    expect(classes.publish).toMatchObject({ n: spellings.length, holdMs: 10 * spellings.length });
+    expect(classes.custody).toMatchObject({ timeouts: spellings.length, failedWaitMs: 5 * spellings.length });
   });
 
   it("captures a disabled setting once across a release reload", async () => {

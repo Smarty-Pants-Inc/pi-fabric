@@ -175,9 +175,11 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
   let timer: ReturnType<typeof setTimeout> | undefined;
   let started = false;
 
-  const prune = (directory: string, own: string, now: number): void => {
+  // By age only, the own file included: a fresh own file is never stale, and a stale one (no
+  // acquisition here for a day) is safe to delete because the next write recreates it by rename.
+  const prune = (directory: string, now: number): void => {
     for (const name of fs.readdirSync(directory)) {
-      if (name === own || !(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
+      if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
       const file = path.join(directory, name);
       try {
         if (now - fs.statSync(file).mtimeMs > LOCK_STATS_STALE_FILE_MS) fs.rmSync(file, { force: true });
@@ -211,7 +213,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
         // Hourly and read-only, also for a quiet root: never creates the directory.
         if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
           entry.prunedAt = now;
-          prune(path.join(entry.root, LOCK_STATS_DIR), `${host}-${process.pid}.json`, now);
+          prune(path.join(entry.root, LOCK_STATS_DIR), now);
         }
       } catch (error) {
         // A removed root is forgotten; any other failure retries at the next flush.
@@ -229,12 +231,28 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
     timer.unref?.();
   };
   const onExit = (): void => flush();
-  const bucketOf = (root: string, lockClass: MeshLockClass): LockStatsBucket | undefined => {
-    let entry = roots.get(root);
+  // One bucket per real root, whatever the spelling (relative, trailing slash, symlink, case on
+  // Windows): two buckets would write and overwrite the same <host>-<pid>.json and lose counts.
+  // Computed once per spelling; the cache is bounded like the roots.
+  const canonical = new Map<string, { key: string; root: string }>();
+  const canonicalOf = (spelling: string): { key: string; root: string } => {
+    let known = canonical.get(spelling);
+    if (!known) {
+      const resolved = path.resolve(spelling);
+      let real = resolved;
+      try { real = fs.realpathSync.native?.(resolved) ?? fs.realpathSync(resolved); } catch { /* Fall back to resolve. */ }
+      known = { key: process.platform === "win32" ? real.toLowerCase() : real, root: real };
+      if (canonical.size < LOCK_STATS_MAX_ROOTS * 8) canonical.set(spelling, known);
+    }
+    return known;
+  };
+  const bucketOf = (spelling: string, lockClass: MeshLockClass): LockStatsBucket | undefined => {
+    const { key, root } = canonicalOf(spelling);
+    let entry = roots.get(key);
     if (!entry) {
       if (roots.size >= LOCK_STATS_MAX_ROOTS) return undefined;
-      entry = { root: path.resolve(root), minutes: new Map(), dirty: false, prunedAt: 0 };
-      roots.set(root, entry);
+      entry = { root, minutes: new Map(), dirty: false, prunedAt: 0 };
+      roots.set(key, entry);
       if (!started) {
         started = true;
         schedule();

@@ -8,6 +8,7 @@ import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError }
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import type { MeshIdentity } from "./event-log.js";
+import type { MeshCommitEffects, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
 // writes, revisions, tombstones, namespaces, the read signal and write snapshots.
@@ -435,6 +436,29 @@ export interface MeshBatchResult {
   version: number;
 }
 
+/**
+ * R11 (smarty-dev#6477 L2a): the files a writeBatch read before its transaction kept changing, so its
+ * stamp never held inside the transaction within the allowed retries. Nothing was written.
+ */
+export class MeshStateFileReadChangedError extends Error {
+  readonly code = "FABRIC_MESH_STATE_FILE_READ_CHANGED";
+  constructor(readonly attempts: number) {
+    super(`Fabric mesh writeBatch: the files read before the transaction changed ${attempts} times`);
+    this.name = "MeshStateFileReadChangedError";
+  }
+}
+
+/** Internal: a fileRead stamp did not hold inside the transaction; the backend re-reads and retries. */
+export const FILE_READ_CHANGED: Error = new Error("Fabric mesh fileRead stamp changed");
+
+// A copy of a committed state, readable after the transaction (commitOutbox effects).
+const detachedView = (state: MeshStateFile): MeshBatchView => ({
+  get: (key) => Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined,
+  listAll: (prefix) => Object.keys(state.entries).filter((key) => key.startsWith(prefix))
+    .sort((left, right) => left.localeCompare(right)).map((key) => jsonClone(state.entries[key]!)),
+  version: (key) => stateSlot(state, key).version,
+});
+
 export class MeshBatchConflictError extends Error {
   constructor(readonly key: string, readonly expected: number, readonly found: number) {
     super(`Mesh compare-and-swap failed for ${key}: expected version ${expected}, found ${found}`);
@@ -471,7 +495,10 @@ export interface StateFileOptions {
   writeReadJournal?: boolean;
 }
 
-export class StateFile {
+export class StateFile implements StateBackend {
+  readonly kind = "file" as const;
+  /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
+  fallback: string | undefined;
   readonly root: string;
   readonly maxEventBytes: number;
   readonly maxReadEvents: number;
@@ -1017,17 +1044,32 @@ export class StateFile {
   // view returns copies, never mutable state. afterCommit runs under that lock after a successful
   // commit (also for a no-op batch), for ownership-bound file leases; it must not call store writers.
   // Returns one result per operation, in order.
-  async writeBatch(input: {
-    identity: MeshIdentity;
-    ops: MeshBatchOperation[];
-    prepare?: (view: MeshBatchView) => MeshBatchOperation[];
-    afterCommit?: (view: MeshBatchView) => void;
-    /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
-    lockClass?: "bridge";
-  }): Promise<MeshBatchResult[]> {
+  // R11 (L2a): fileRead runs before the lock and its stamp is re-checked under it; commitOutbox
+  // runs after the lock is released (see StateBackendBatchInput in state-backend.ts).
+  async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    const fileRead = input.fileRead;
+    const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
+    for (let attempt = 0; ; attempt += 1) {
+      const fileValue = fileRead?.read();
+      const stamp = fileRead?.stamp();
+      let outcome: { results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> };
+      try {
+        outcome = await this.#writeBatchOnce(input, caller, fileValue, fileRead ? () => fileRead.stamp() === stamp : undefined);
+      } catch (error) {
+        if (error !== FILE_READ_CHANGED) throw error;
+        if (attempt >= retries) throw new MeshStateFileReadChangedError(attempt + 1);
+        continue;
+      }
+      if (input.commitOutbox && outcome.effects) input.commitOutbox({ ...outcome.effects, stamp: this.stateStamp() });
+      return outcome.results;
+    }
+  }
+
+  #writeBatchOnce(input: StateBackendBatchInput, caller: string[] | undefined, fileValue: unknown,
+    stampHolds: (() => boolean) | undefined): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
     return this.#withWriteSnapshot(snapshot => {
       const omitted = new Set(input.ops.map(op => op.key));
       const reuse = new Map(snapshot.reuse);
@@ -1041,6 +1083,7 @@ export class StateFile {
       const namespaces = this.#signalNamespaces(reuse, {}, new Set(input.ops.map(op => keyNamespace(op.key))));
       return { ...snapshot, reuse, namespaces };
     }, ({ state, reuse, base, namespaces }) => {
+      if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED;
       this.#journalBase = base;
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
@@ -1058,7 +1101,7 @@ export class StateFile {
           .sort((left, right) => left.localeCompare(right)).map((key) => jsonClone(state.entries[key]!)),
         version: (key) => stateSlot(state, key).version,
       };
-      const ops = [...input.ops, ...(input.prepare?.(view) ?? [])];
+      const ops = [...input.ops, ...(input.prepare?.(view, fileValue) ?? [])];
       for (const op of ops) this.#validateKey(op.key);
       for (const op of ops) {
         const slot = stateSlot(state, op.key);
@@ -1115,9 +1158,22 @@ export class StateFile {
         this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller, namespaces);
       }
       input.afterCommit?.(view);
-      return results;
+      if (!input.commitOutbox) return { results };
+      return { results, effects: {
+        backend: "file" as const,
+        results: results.map((result) => ({ ...result })),
+        changed: results.filter((result) => result.applied).map((result) => result.key),
+        view: detachedView(jsonClone(state)),
+      } };
     }, undefined, input.lockClass === "bridge" ? "bridge" : "writeBatch");
   }
+
+  diagnostics(): StateBackendDiagnostics {
+    return { kind: "file", ...(this.fallback ? { fallback: this.fallback } : {}) };
+  }
+
+  /** Nothing to release: state.json is opened per operation. */
+  close(): void {}
 
   /**
    * Changes whenever the shared state file does, from its metadata alone: a poll can test it

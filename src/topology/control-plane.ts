@@ -387,7 +387,8 @@ export class FabricControlPlane {
       path.join(mesh.root, "control-seen", createHash("sha256").update(options.hostId).digest("hex").slice(0, 32)),
       mesh.maxEventBytes,
       mesh.maxReadEvents,
-      { lockProtocol: mesh.lockProtocol },
+      // control-seen stays on the file backend (smarty-dev#6477 R20).
+      { lockProtocol: mesh.lockProtocol, stateBackend: "file" },
     );
     // Replay the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.

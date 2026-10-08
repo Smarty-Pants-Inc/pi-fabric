@@ -77,8 +77,10 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { MeshLockTicket } from "./lock-queue.js";
-import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView, type MeshIdentity,
-  type MeshReadOptions, type MeshStateEntry } from "./store.js";
+// From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
+import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
+  type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
+import type { MeshIdentity } from "./event-log.js";
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -445,9 +447,13 @@ export class SqliteStateStore {
     }
   }
 
-  /** Opens (creating when absent) `<root>/state.db`. Initialisation retries asynchronously while busy. */
+  /**
+   * Opens (creating when absent) `<root>/state.db`. Initialisation (WAL setup, schema, seed) retries
+   * asynchronously while busy, for `initTimeoutMs` (default `lockTimeoutMs`); then the driver's busy
+   * error is thrown. `initTimeoutMs` bounds only this open, never the store's later writes.
+   */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
-    options: SqliteStateStoreOptions = {}): Promise<SqliteStateStore> {
+    options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -457,7 +463,7 @@ export class SqliteStateStore {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = (options.open ?? openNodeSqlite)(file);
-    const deadline = Date.now() + Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
+    const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
       for (;;) {
@@ -473,6 +479,28 @@ export class SqliteStateStore {
         }
       }
     } catch (error) {
+      try { db.close(); } catch { /* best effort */ }
+      throw error;
+    }
+  }
+
+  /**
+   * One synchronous open attempt (lane L2a: the first synchronous read of a sqlite-backed MeshStore).
+   * Throws the driver's busy error unchanged; the caller decides whether and how to retry.
+   */
+  static openSync(root: string, maxEventBytes: number, maxReadEvents: number,
+    options: SqliteStateStoreOptions = {}): SqliteStateStore {
+    const refusal = filesystemRefusal(root);
+    if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const file = path.join(root, "state.db");
+    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const db = (options.open ?? openNodeSqlite)(file);
+    try {
+      return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, initialise(db, options), options);
+    } catch (error) {
+      if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
       try { db.close(); } catch { /* best effort */ }
       throw error;
     }

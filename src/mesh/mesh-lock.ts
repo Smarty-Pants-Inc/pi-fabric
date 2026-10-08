@@ -221,7 +221,8 @@ export class MeshLock {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
           if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          await delay(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
           continue;
         }
         const attemptAt = Date.now();
@@ -287,10 +288,10 @@ export class MeshLock {
           if (Date.now() >= deadline) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
-          // Only the FIFO head probes promptly. After the bounded admission fallback,
-          // full jitter spreads plain contenders; the original deadline bounds every sleep.
-          await delay(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
-            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+          // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
+          // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
+          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }
       if (lockStats) lockHeldAt = performance.now();

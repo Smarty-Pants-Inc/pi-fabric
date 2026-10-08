@@ -20,8 +20,8 @@ Keyed state goes into `<mesh>/state.db` (SQLite WAL, `synchronous=NORMAL`, local
 | R1 | Rollback loses no update and exposes no stale `state.json` (O P0-1, Q5; L P1-4; #599) | Two-phase fence with a fixed commit order: section 5 (L4, L9a). |
 | R2 | No synchronous 10 s busy wait (O P1-1) | `busy_timeout` 5 ms or less; async retry on `MeshLockTicket`; obey `writeSignal`, `withTryLock` (L2a). |
 | R3 | Classify `exclusive()` sites (O P1-2; L P2-8) | 13 sites into state, events, custody, none (A1). State sites run in `BEGIN IMMEDIATE`, one test each (L2b). |
-| R4 | L5 unsafe on a mixed fleet (O P1-3) | #591 uses "dual" mode (custody, then mesh); adoption stays on mesh. "own" mode only after the census (L4). |
-| R5 | The fence is partial (O P1-4, P2-8; L P1-1) | The census is the fence: each writer, bridge agent and CLI shows `meshProtocol`, or cutover stops (L4). Table for each operation (A1). Durable marker first (L4). Projector stops on a foreign write, with alarm (L3). Fence test now (L1). |
+| R4 | L5 unsafe on a mixed fleet (O P1-3) | #591 uses "dual" mode (custody, then mesh); adoption stays on mesh. "own" mode only after the cutover fence (L4); the advisory census only informs it. |
+| R5 | The fence is partial (O P1-4, P2-8; L P1-1) | The census is advisory, never the fence (smarty-dev#6982): it lists each writer, bridge agent and CLI with `meshProtocol` for operators; cutover never blocks or proceeds on it (L4). Table for each operation (A1). Durable marker first (L4). Projector stops on a foreign write, with alarm (L3). Fence test now (L1). |
 | R6 | Stage-2 dual reads are stale (O P1-5) | Stage 2 is removed. Shadow goes directly to cutover. |
 | R7 | Change detection uses `state.json` (O P1-6) | `publicationGeneration`, `stateStamp` users, the L6 witness use `data_version` or a `meta` counter (L2b). |
 | R8 | Measure first (O P1-7, P3-5; L P2-6, P2-7) | L8: class, wait, hold, CPU, fsync time, bytes per hold; byte share per key family. Busy = holder-timed hold / wall time. G1 reads the split. Before and after numbers go on #6477. |
@@ -75,7 +75,7 @@ Path: L8, E1, L0, G1, L2a, L3, L4, L9, RC, shadow, canary, hub, acceptance: 22.5
 | Fri 09 03:00 | L9 done. RC 3.2 on all hosts in `shadow` mode. | G2 spec review; G3 Windows CI, power-cut drill |
 | Sat 10 03:00 | Cutover ryzen5 (canary); one rollback drill, roll forward. | G4: 0 divergences in 24 h |
 | Sun 11 03:00 | Cutover ryzen3, ryzen4. Restart the old processes that the Ryzen 1 census lists. | G5: canary 24 h, 0 timeouts |
-| Sun 11 15:00 | Cutover Ryzen 1 (hub); custody "own" mode. Acceptance windows start on all four hosts. | G6: census clean |
+| Sun 11 15:00 | Cutover Ryzen 1 (hub); custody "own" mode. Acceptance windows start on all four hosts. | G6: census report reviewed (advisory, #6982) |
 | **Mon 12 Oct 15:00** | **ETA: no single lock for state, 0 timeouts at full load.** | G7: section 4 |
 | 2 releases later | L10 removes the legacy path. | G8: no rollback in 2 releases |
 
@@ -97,9 +97,11 @@ Commswatch reads the L8 metrics of each lock (`.lock`, `custody.lock`, SQLite wr
 | 3 cutover, each root | `mesh-backend rollback` from the new release with the fence below, then older binaries only if necessary. Roll forward is a fresh import. |
 | 4 / L10 | L10 starts only after 2 releases with no rollback. Then: last release before L10, then the stage 3 rollback. |
 
+**Writer census is advisory (smarty-dev#6982).** `src/mesh/writer-census.ts` reports writers (release, lock protocol, backends) and `unknown` evidence, each with a reason, for logs and operators. It has no `clean` verdict and is never a cutover gate: lock owners and queue tickets name only a pid, so a remote writer whose pid matches a live local writer cannot be told apart (pi-fabric#638 review round 9). No startup, CLI or migration path blocks, permits or changes behaviour on it.
+
 **Rollback fence (R1).** `meta.backend` is `sqlite`, `importing`, `exporting` or `file`. `meta.epoch` only grows; `state.json` records the epoch of its export. Import and cutover (one fenced section: census or `--assume-no-writers`, `.lock` held throughout) roll forward marker BEFORE flag (pi-fabric#627 review round 5): fill SQLite at `backend=importing` E+1 (not authoritative; `state.json` still is), verify, replace `state.json` with the moved marker, then commit `backend=sqlite`. A rerun at `importing` without the marker redoes the import from `state.json`; with the marker it only commits `sqlite`. Rollback is the mirror (review round 4): while the marker is in place legacy writers fail closed; it is removed only by the last rollback step, after `backend=file` is committed. Commit order, steps 2 to 5 under one `.lock` hold:
 
-1. Stop v3 writers and the projector; the census shows none left.
+1. Stop v3 writers and the projector; check the advisory census report for any left (it informs the operator, it does not prove none remain).
 2. DB flag: one `BEGIN IMMEDIATE` transaction at `synchronous=FULL` checks `backend=sqlite`, sets `backend=exporting` and `epoch=E+1`, commits. Writers read the flag after `BEGIN IMMEDIATE` and wait on `exporting`; readers stay on SQLite.
 3. File export: the committed snapshot through the normal encoder (`readGeneration`, revision 2, epoch E+1, snapshot digest) into `state.json.rollback-<E+1>.tmp`; fsync it and the directory; the old reader reads it back (epoch E+1, generation and digest must match). `state.json` is still the marker; `state.db*` stay in place.
 4. Reader switch: `BEGIN IMMEDIATE` at `FULL` checks `backend=exporting` and `epoch=E+1`, sets `backend=file`, commits.

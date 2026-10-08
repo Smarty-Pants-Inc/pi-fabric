@@ -190,7 +190,7 @@ The bridge also calls `target.publish`/`target.publishBatch` at `mesh/bridge.ts:
 
 ## 2. Operation census (R5)
 
-The census must see `meshProtocol` from each process that does an operation before cutover. "Pi runtime" is `FabricRuntimeState` (`fabric-runtime-state.ts:607`). It runs in Main and in child agent and actor Pi sessions (`identity.kind` `agent`/`actor` get a `writeSignal`, `:605`).
+The census should see `meshProtocol` from each process that does an operation before cutover. It is advisory only (smarty-dev#6982): it reports, it never blocks or permits a cutover, because pid-only lock evidence cannot be attributed safely. "Pi runtime" is `FabricRuntimeState` (`fabric-runtime-state.ts:607`). It runs in Main and in child agent and actor Pi sessions (`identity.kind` `agent`/`actor` get a `writeSignal`, `:605`).
 
 | Operation | Domain | Main | Child / actor Pi session | Resident host | Bridge (`bin/mesh-bridge` run and agent) | CLIs in `bin/` |
 |---|---|---|---|---|---|---|

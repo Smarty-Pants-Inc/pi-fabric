@@ -48,29 +48,38 @@ export const censusRecordFileName = (host: string, pid: number, startedAt: numbe
 /** This process's census start time (epoch ms), fixed at module load. */
 export const meshProcessStartedAt = Math.floor(Date.now() - process.uptime() * 1000);
 
-let bootTimeMs: number | undefined;
-/** Linux only: the pid's start time in epoch ms from /proc (USER_HZ is 100); else undefined. */
-const procStartedAt = (pid: number): number | undefined => {
+/**
+ * Linux only: a pid's clock-independent incarnation, the kernel boot id and the pid's start time in
+ * clock ticks since boot (/proc/<pid>/stat field 22); else undefined. The wall clock never decides
+ * liveness: it steps (NTP, VM resume), so a start time in epoch ms cannot prove a pid was reused
+ * (smarty-dev#6982).
+ */
+const procIncarnation = (pid: number): { bootId: string; startTicks: number } | undefined => {
   if (process.platform !== "linux") return undefined;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
-    bootTimeMs ??= Number(/^btime\s+(\d+)\s*$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]) * 1000;
-    return Number.isFinite(ticks) && Number.isFinite(bootTimeMs) ? bootTimeMs + ticks * 10 : undefined;
+    const startTicks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return Number.isSafeInteger(startTicks) && bootId.length > 0 ? { bootId, startTicks } : undefined;
   } catch { return undefined; }
 };
+let ownIncarnation: { bootId: string; startTicks: number } | null | undefined;
 
 /**
- * Same-host census liveness (smarty-dev#6477 L4a): the pid is alive and, where /proc tells, is the
- * same incarnation (start within 2 s of the record). A record without startedAt cannot be refuted
- * and stays live (fail closed). Meaningless for another host's pid.
+ * Same-host census liveness (smarty-dev#6477 L4a, smarty-dev#6982): a record's process is dead only
+ * on positive proof: its pid is gone (ESRCH), or the record names its incarnation (bootId,
+ * startTicks) and the live pid is another one (another boot, or the same boot and another start
+ * tick: the pid was reused). Without that proof (no incarnation, no /proc, EPERM) it stays live
+ * (fail closed). Meaningless for another host's pid.
  */
-export const censusRecordAlive = (pid: number, startedAt: unknown): boolean => {
+export const censusRecordAlive = (pid: number, record?: unknown): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
-  const started = procStartedAt(pid);
-  return started === undefined || typeof startedAt !== "number" || Math.abs(started - startedAt) <= 2000;
+  const fields = typeof record === "object" && record !== null ? record as Record<string, unknown> : {};
+  if (typeof fields.bootId !== "string" || fields.bootId.length === 0 || !Number.isSafeInteger(fields.startTicks)) return true;
+  const current = procIncarnation(pid);
+  return current === undefined || (current.bootId === fields.bootId && current.startTicks === fields.startTicks);
 };
 
 /**
@@ -83,7 +92,7 @@ export const censusRecordPrunable = (value: unknown, host = os.hostname()): bool
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return record.format === 1 && validWriterPid(record.pid) && validWriterHost(record.host) && record.host === host &&
-    validWriterStartedAt(record.startedAt) && !censusRecordAlive(record.pid, record.startedAt);
+    validWriterStartedAt(record.startedAt) && !censusRecordAlive(record.pid, record);
 };
 
 /** Best effort: removes this host's census records whose process is gone; never throws. */
@@ -94,11 +103,10 @@ export const pruneDeadCensusRecords = (root: string): void => {
   const host = os.hostname();
   const prefix = `${censusHostSlug(host)}-`;
   for (const name of names) {
-    // This host's records are <hostSlug>-<pid>-<startedAt>.json: another host's are never opened,
-    // and only a name that already looks dead is.
+    // This host's records are <hostSlug>-<pid>-<startedAt>.json: another host's are never opened.
+    // The name carries no incarnation, so only the content can prove a live pid was reused.
     if (!name.startsWith(prefix)) continue;
-    const match = /^(\d+)-(\d+)\.json$/.exec(name.slice(prefix.length));
-    if (!match || censusRecordAlive(Number(match[1]), Number(match[2]))) continue;
+    if (!/^\d+-\d+\.json$/.test(name.slice(prefix.length))) continue;
     const file = path.join(directory, name);
     try {
       if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
@@ -106,19 +114,37 @@ export const pruneDeadCensusRecords = (root: string): void => {
   }
 };
 
+/**
+ * Canonical filesystem identity of a census directory (created first): its real path, else its
+ * device and inode. A mesh root and its symlink/junction alias reach the same census file, so
+ * every per-root map below is keyed by this identity, never by the path a store was opened with
+ * (pi-fabric#638): otherwise closing a store opened through one path would remove the record
+ * another, still open, store opened through the other path relies on.
+ */
+const censusDirectoryIdentity = (directory: string, create = true): string => {
+  if (create) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try { return fs.realpathSync.native(directory); }
+  catch {
+    const stat = fs.statSync(directory);
+    return `${stat.dev}:${stat.ino}`;
+  }
+};
+
+/** Census directories (by identity) whose dead records this process has pruned once. */
 const prunedCensusRoots = new Set<string>();
-/** This process's census record files, each with the number of its stores still open. */
-const ownCensusRecords = new Map<string, number>();
+/** This process's census records by directory identity: the file and its stores still open. */
+const ownCensusRecords = new Map<string, { file: string; stores: number }>();
 const removeOwnCensusRecords = (): void => {
-  for (const file of ownCensusRecords.keys()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+  for (const { file } of ownCensusRecords.values()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };
 
 /** One store of this process closed: the record goes with the last one (else at exit). */
-const releaseMeshWriterRecord = (file: string): void => {
-  const stores = (ownCensusRecords.get(file) ?? 0) - 1;
-  if (stores > 0) { ownCensusRecords.set(file, stores); return; }
-  ownCensusRecords.delete(file);
-  try { fs.rmSync(file, { force: true }); } catch { /* best effort; pruned once this process is gone */ }
+const releaseMeshWriterRecord = (identity: string): void => {
+  const record = ownCensusRecords.get(identity);
+  if (record === undefined) return;
+  if (--record.stores > 0) return;
+  ownCensusRecords.delete(identity);
+  try { fs.rmSync(record.file, { force: true }); } catch { /* best effort; pruned once this process is gone */ }
 };
 
 const unique = <T>(values: T[]): T[] => [...new Set(values)].sort();
@@ -132,9 +158,9 @@ const unique = <T>(values: T[]): T[] => [...new Set(values)].sort();
  * registration fails (pi-fabric#638). Returns the failure, or undefined once recorded.
  */
 const writeMeshWriterRecord = (directory: string, file: string, host: string, lockProtocol: number,
-  stateBackend: string): unknown => {
+  stateBackend: string): { identity: string } | { error: unknown } => {
   try {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const identity = censusDirectoryIdentity(directory);
     let text: string | undefined;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -158,8 +184,9 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
       releaseSha = prior.releaseSha;
     }
     const strongest = backends.reduce((a, b) => writerBackendRank[b]! > writerBackendRank[a]! ? b : a);
+    if (ownIncarnation === undefined) ownIncarnation = procIncarnation(process.pid) ?? null;
     const writer = { format: 1, pid: process.pid, host, releaseSha, lockProtocol: Math.min(...protocols),
-      stateBackend: strongest, startedAt: meshProcessStartedAt,
+      stateBackend: strongest, startedAt: meshProcessStartedAt, ...(ownIncarnation ?? {}),
       ...(backends.length > 1 ? { stateBackends: backends } : {}), ...(protocols.length > 1 ? { lockProtocols: protocols } : {}) };
     const serialized = JSON.stringify(writer);
     if (serialized !== text) {
@@ -169,21 +196,27 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
       catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
     }
     if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
-    ownCensusRecords.set(file, (ownCensusRecords.get(file) ?? 0) + 1);
-    return undefined;
+    const own = ownCensusRecords.get(identity);
+    if (own === undefined) ownCensusRecords.set(identity, { file, stores: 1 });
+    else own.stores += 1;
+    return { identity };
   } catch (error) {
-    return error ?? new Error("census record write failed");
+    return { error: error ?? new Error("census record write failed") };
   }
 };
 
 /**
- * Records this process in the census (one retry); returns the record file, or the failure.
- * The caller fails closed for a backend whose writes the census could not otherwise see.
+ * Records this process in the census (one retry); returns the record's directory identity (the
+ * key closeState() releases), or the failure. The writer census is advisory (smarty-dev#6982), so
+ * a failed record never stops the store: the census then reports its evidence as unknown.
  */
-const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): { file: string } | { error: unknown } => {
+const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): { identity: string } | { error: unknown } => {
   const directory = path.join(root, ".writer-census");
-  if (!prunedCensusRoots.has(directory)) {
-    prunedCensusRoots.add(directory);
+  // Not created here: a missing directory has nothing to prune (and its path is then the key).
+  let pruneKey: string;
+  try { pruneKey = censusDirectoryIdentity(directory, false); } catch { pruneKey = path.resolve(directory); }
+  if (!prunedCensusRoots.has(pruneKey)) {
+    prunedCensusRoots.add(pruneKey);
     pruneDeadCensusRecords(root);
   }
   // Host-scoped: two hosts' writers with the same pid and start time never share a file, so neither
@@ -191,8 +224,7 @@ const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: stri
   const host = os.hostname();
   const file = path.join(directory, censusRecordFileName(host, process.pid, meshProcessStartedAt));
   const first = writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
-  const error = first === undefined ? undefined : writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
-  return error === undefined ? { file } : { error };
+  return "identity" in first ? first : writeMeshWriterRecord(directory, file, host, lockProtocol, stateBackend);
 };
 
 export interface MeshStoreOptions {
@@ -232,7 +264,7 @@ export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
   readonly #events: EventLog;
-  /** This store's census registration, released once by closeState(). */
+  /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
 
   constructor(
@@ -247,20 +279,10 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    // Best effort: the writer census is advisory, never a gate (smarty-dev#6982), so a failed
+    // record changes nothing here; the census reports the writer's evidence as unknown instead.
     const recorded = recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
-    const unrecorded = "error" in recorded ? recorded.error : undefined;
-    if ("file" in recorded) this.#censusRecord = recorded.file;
-    // A process the census cannot see must not write where only the census would see it (pi-fabric#638).
-    // A sqlite or shadow writer takes no .lock for state, so without its record the census may
-    // report clean while it writes: refuse that backend (fail closed). A file-mode writer may go
-    // on: every state write takes .lock, whose owner record and queue ticket census() counts as an
-    // unknown writer while it waits or writes, and cutover fences writers on .lock in any case.
-    if (unrecorded !== undefined && this.#state.kind !== "file") {
-      this.#state.close();
-      const reason = unrecorded instanceof Error ? unrecorded.message : String(unrecorded);
-      throw new Error(`Fabric mesh: cannot record this process in the writer census (${path.join(root, ".writer-census")}): ` +
-        `${reason}; refusing to open the ${this.#state.kind} state backend`, { cause: unrecorded });
-    }
+    if ("identity" in recorded) this.#censusRecord = recorded.identity;
   }
 
   get lockProtocol(): MeshLockProtocol {

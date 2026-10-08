@@ -47,6 +47,23 @@ const validOwner = (owner: RunRootOwner | undefined): owner is RunRootOwner => !
   (owner.closedAt === undefined || time(owner.closedAt)) &&
   (owner.orphanedAt === undefined || time(owner.orphanedAt)) &&
   (owner.childrenStopped === undefined || typeof owner.childrenStopped === "boolean");
+/**
+ * Automatic retention's live-writer fence. By default any live PID vetoes, whatever its saved
+ * birth identity: routed workers, temp run roots and every pre-existing caller keep the strict
+ * live veto (pi-fabric#645 CI: a routed run naming a live process was swept). Only the mesh-wide
+ * sweep opts into `acceptPidReuse` (smarty-dev#3252): there a live PID is the run's saved worker
+ * unless its checked start identity proves reuse (the saved start time was read and differs from
+ * the live process's). A missing saved identity or an unreadable current one still counts as live.
+ */
+const savedWriterAlive = (pid: number, record: RunRecordSummary | undefined, acceptPidReuse = false): boolean => {
+  if (!processAlive(pid)) return false;
+  if (!acceptPidReuse) return true;
+  const saved = typeof record?.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
+    ? record.processStartTime : undefined;
+  if (saved === undefined) return true;
+  const current = processStartTime(pid);
+  return current === undefined || current === saved;
+};
 const writeOwner = (root: string, owner: RunRootOwner): void => {
   if (fs.existsSync(root) && !ownedStat(root)?.isDirectory()) throw new Error("Unsafe Fabric run root");
   const file = ownerPath(root);
@@ -102,8 +119,8 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
  * External transports currently have no durable native exit-receipt contract: skip
  * them even when a surviving host once observed a terminal result. */
 export const runTreeExitVeto = (
-  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
-): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit);
+  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false, acceptPidReuse = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit, acceptPidReuse);
 /** Native resource safety is independent of full-result archival. This only
  * authorizes pre-launch worktree rollback or isolation of shutdown obligations;
  * its tracked root has native transport custody, but descendants need saved exit
@@ -113,6 +130,7 @@ export const runTreeResourceVeto = (
 ): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit);
 const runTreeVeto = (
   directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
+  acceptPidReuse = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -154,7 +172,7 @@ const runTreeVeto = (
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return `worker exit is unconfirmed: unknown ${worker} identity`;
-      if (processAlive(pid)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
+      if (savedWriterAlive(pid, record, acceptPidReuse)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -176,10 +194,8 @@ const runTreeVeto = (
           }
         }
       }
-      const savedStart = typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
-        ? record.processStartTime : undefined;
-      const currentStart = alive && savedStart ? processStartTime(pid) : undefined;
-      if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
+      // Explicit cleanup's own PID-reuse proof (pre-existing); the persisted-exit fence above stays strict.
+      if (!validPid || (alive && savedWriterAlive(pid, record, true))) {
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
@@ -188,7 +204,7 @@ const runTreeVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit);
+      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, acceptPidReuse);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -231,20 +247,20 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
   // authorize recordless pre-launch rollback through the non-retention mode.
-  if (runTreeExitVeto(root, 0, expired, true)) return false;
+  if (runTreeExitVeto(root, 0, expired, true, acceptPidReuse)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
-  // Automatic retention keeps its independent live-writer fence. A mismatched
-  // birth identity can clear explicit cleanup's exit veto, but never authorizes
-  // a sweep to remove a run with a live or unknown saved PID. Apply this at
-  // every level, including descendants, alongside the recursive exit proof.
+  // Automatic retention keeps its independent live-writer fence at every level,
+  // including descendants, alongside the recursive exit proof. A live PID vetoes;
+  // only the mesh-wide sweep's opt-in accepts checked PID reuse (smarty-dev#3252).
+  // Unknown identity always vetoes.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
-  if (pid !== undefined && processAlive(pid)) return false;
+  if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
@@ -282,7 +298,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
         continue;
       }
       return false;
@@ -292,9 +308,9 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
 };
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
-export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
@@ -340,6 +356,29 @@ const pruneClosedRunRoot = (
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
+};
+/** Per-interval claim files of the mesh-wide retention sweep (smarty-dev#3252). */
+export const MESH_RETENTION_SWEEP_PREFIX = ".mesh-retention-sweep-";
+/**
+ * Claim this interval's mesh-wide sweep. Exactly one process per mesh wins a slot: the claim
+ * is an exclusive create of the slot's file, so two owners never both start a sweep in the
+ * same interval. Older slot files are dropped once a newer slot is claimed.
+ */
+export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, now = Date.now()): boolean => {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
+  const slot = Math.floor(now / intervalMs);
+  const name = `${MESH_RETENTION_SWEEP_PREFIX}${slot}.json`;
+  try {
+    const fd = fs.openSync(path.join(meshRoot, name), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, claimedAt: now })); } finally { fs.closeSync(fd); }
+  } catch { return false; }
+  try {
+    for (const other of fs.readdirSync(meshRoot)) {
+      const match = other.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(other.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
+      if (match && Number(match[1]) < slot - 1) fs.rmSync(path.join(meshRoot, other), { force: true });
+    }
+  } catch { /* stale slot files are tiny; the next claim retries */ }
+  return true;
 };
 /** Host-wide marker of the last temp-root sweep; a dotfile, so the root pattern never matches it. */
 export const RUN_ROOT_SWEEP_MARKER = ".pi-fabric-runs-sweep.json";
@@ -428,33 +467,63 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
   return result;
 };
 
-/** Full persisted latest-run references, shared by resident startup and streaming retention.
- * An unreadable registry is a wildcard veto, never proof that a lastRunId is absent. */
-export const retainedActorRunIds = (actorRoots: readonly string[]): Set<string> => {
+type RegistryRunRow = { id?: unknown; lastRunId?: unknown; inFlightRun?: unknown; preparing?: unknown; removal?: unknown };
+/** Every run a registry row references: latest, in-flight, preparing and pending-removal runs.
+ * A malformed reference throws (the caller turns that into a wildcard veto). */
+const rowRunIds = (actor: RegistryRunRow): string[] => {
+  const ids: string[] = [];
+  if (actor.lastRunId !== undefined) {
+    if (typeof actor.lastRunId !== "string") throw new Error("Unknown actor run reference");
+    if (actor.lastRunId) ids.push(actor.lastRunId);
+  }
+  for (const [field, key] of [["inFlightRun", "id"], ["preparing", "runId"], ["removal", "runId"]] as const) {
+    const value = actor[field];
+    if (value === undefined) continue;
+    if (!value || typeof value !== "object") throw new Error("Unknown actor run reference");
+    const id = (value as Record<string, unknown>)[key];
+    if (field === "inFlightRun" ? typeof id !== "string" : id !== undefined && typeof id !== "string") {
+      throw new Error("Unknown actor run reference");
+    }
+    if (typeof id === "string" && id) ids.push(id);
+  }
+  return ids;
+};
+/** Full persisted run references (latest, in-flight, preparing, pending-removal) of every
+ * registry, shared by resident startup, streaming retention and the mesh sweep.
+ * An unreadable registry is a wildcard veto, never proof that a reference is absent.
+ * `requireRegistries`: a registry root without actors.json is uncertain, not empty
+ * (the mesh sweep's final pre-delete check over registries it discovered). */
+export const retainedActorRunIds = (actorRoots: readonly string[], options: { requireRegistries?: boolean } = {}): Set<string> => {
   const refs = new Set<string>();
   try {
     for (const root of actorRoots) {
       try { fs.lstatSync(root); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
       if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
       const file = path.join(root, "actors.json");
       try { fs.lstatSync(file); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
       // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
       // actor includes instructions and up to 100 message bodies, so even one
       // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
       // JSON contract rather than inventing a fleet-size limit that disables all
       // retention. Ownership, JSON/schema errors and unsafe references still veto.
-      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file, Number.MAX_SAFE_INTEGER);
+      const registry = readJson<{ actors?: RegistryRunRow[] }>(file, Number.MAX_SAFE_INTEGER);
       if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
       for (const actor of registry.actors) {
-        if (!actor || typeof actor.id !== "string" ||
-            (actor.lastRunId !== undefined && typeof actor.lastRunId !== "string")) throw new Error("Unknown actor run reference");
-        if (actor.lastRunId) refs.add(actor.lastRunId);
+        if (!actor || typeof actor.id !== "string") throw new Error("Unknown actor run reference");
+        for (const id of rowRunIds(actor)) refs.add(id);
       }
     }
   } catch { refs.add("*"); }
   return refs;
+};
+/** The final pre-delete check of every mesh retention removal (pi-fabric#645 review rounds 1-2):
+ * re-reads every registry uncached immediately before a run is deleted. An unreadable registry
+ * (and, with `requireRegistries`, a vanished root or actors.json) is a wildcard veto. */
+export const actorRunReferencedNow = (actorRoots: readonly string[], runId: string, options: { requireRegistries?: boolean } = {}): boolean => {
+  const ids = retainedActorRunIds(actorRoots, options);
+  return ids.has("*") || ids.has(runId);
 };
 
 export interface TerminalRunEventsRetention {
@@ -599,6 +668,19 @@ export const pruneActorRunArchives = (options: {
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
   now?: number;
+  /** Further live references (registry latest/in-flight runs), checked again just before removal;
+   * `final` marks that last pre-delete check (callers re-read their references uncached). */
+  isRetained?: (runId: string, final?: boolean) => boolean;
+  dryRun?: boolean;
+  /** Size accounting of a removal candidate, done before the final check so nothing slow runs
+   * between that check and the delete (pi-fabric#645 review round 4). */
+  measure?: (directory: string) => number;
+  /** Called after a run directory is removed (or, in a dry run, would be), with its `measure` bytes. */
+  onRemove?: (directory: string, bytes: number) => void;
+  onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
+  /** Mesh-wide sweep only (smarty-dev#3252): a live PID whose checked birth identity differs is reuse,
+   * not the run's writer. Every other caller keeps the strict live-PID veto. */
+  acceptPidReuse?: boolean;
 }): string[] => {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
@@ -606,15 +688,51 @@ export const pruneActorRunArchives = (options: {
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === options.latestRunId) continue;
+    if (!entry.isDirectory() || entry.name === options.latestRunId || options.isRetained?.(entry.name)) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) continue;
     if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
-      compactTerminalRunEvents(directory, { ...options, now });
+      compactTerminalRunEvents(directory, {
+        ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
+        ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+        now, isRetained: () => !!options.isRetained?.(entry.name),
+        ...(options.dryRun !== undefined ? { dryRun: options.dryRun } : {}),
+        ...(options.onCompact ? { onCompact: options.onCompact } : {}),
+      });
       continue;
     }
-    try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
+    const bytes = options.measure?.(directory) ?? 0;
+    const isRetained = options.isRetained;
+    if (!removeUnreferencedRun(directory, isRetained && (() => isRetained(entry.name, true)), options.dryRun)) continue;
+    removed.push(directory);
+    options.onRemove?.(directory, bytes);
   }
   return removed;
+};
+
+/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4). Without
+ * `referenced` a plain delete. With it: check; rename the run to a sibling tombstone; check again; then
+ * delete the tombstone, or rename it back when the re-check finds a reference (a throwing check counts
+ * as a reference). A dry run takes only the first check. Returns whether the run was (or would be) removed.
+ * ponytail: no fence excludes registry writers. ActorRegistryStore's lock is an exclusive, async mkdir
+ * lock with no shared mode; holding every registry's lock across each delete would stall every actor's
+ * saves, and these sweeps are synchronous. The tombstone narrows the remaining window to a reference
+ * written after the re-check, which names a run already renamed away: its writer finds the run missing,
+ * exactly as after any completed deletion. A tombstone left by a crash is a run proven unreferenced; the
+ * next sweep treats it as an ordinary run entry. */
+export const removeUnreferencedRun = (directory: string, referenced?: () => boolean, dryRun = false): boolean => {
+  const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
+  if (check()) return false;
+  if (dryRun) return true;
+  if (!referenced) {
+    try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }
+  }
+  const tombstone = path.join(path.dirname(directory), `.retention-tombstone-${path.basename(directory)}`);
+  try { fs.renameSync(directory, tombstone); } catch { return false; }
+  if (check()) {
+    try { fs.renameSync(tombstone, directory); } catch { /* Kept under the tombstone name; never deleted while referenced. */ }
+    return false;
+  }
+  try { fs.rmSync(tombstone, { recursive: true, force: true }); return true; } catch { return false; }
 };

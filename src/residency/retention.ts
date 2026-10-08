@@ -4,10 +4,68 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
+
+export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
+ * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
+ * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
+ * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry.
+ * `dryRun`: the same selection and fences, with no removal or compaction; the returned runs are the
+ * ones an apply would delete (pi-fabric#645 review round 3). `measure` sizes a candidate before its final
+ * check, `isRetained` is a further veto of that check, and the check and delete run back to back through
+ * `removeUnreferencedRun`; `onRemove` is called after a run is removed (or, in a dry run, would be) with its
+ * measured bytes (pi-fabric#645 review round 4). */
+export const sweepResidentRuns = (
+  runsRoot: string, now = Date.now(), budgetMs = 100,
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean;
+    dryRun?: boolean; measure?: (run: string) => number; isRetained?: (runId: string) => boolean;
+    /** Mesh-wide sweep only (smarty-dev#3252): accept a checked PID-reuse proof; default keeps the strict live-PID veto. */
+    acceptPidReuse?: boolean;
+    onRemove?: (run: string, bytes: number) => void;
+    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
+): string[] => {
+  const removed: string[] = [];
+  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  const started = performance.now();
+  const expired = () => performance.now() - started >= budgetMs;
+  const actorRoots = options.actorRoots ?? [];
+  const registryOptions = options.requireRegistries ? { requireRegistries: true } : {};
+  const retained = retainedActorRunIds(actorRoots, registryOptions);
+  if (retained.has("*")) return removed;
+  const referencedNow = (id: string): boolean => actorRunReferencedNow(actorRoots, id, registryOptions) || !!options.isRetained?.(id);
+  let directory: fs.Dir;
+  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
+  try {
+    let entry: fs.Dirent | null;
+    while (!expired() && (entry = directory.readSync())) {
+      if (!entry.isDirectory() || retained.has(entry.name)) continue;
+      const run = path.join(runsRoot, entry.name);
+      const stat = ownedStat(run);
+      if (!stat?.isDirectory()) continue;
+      if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
+          !runTreeExitVeto(run, 0, expired, true, options.acceptPidReuse === true) &&
+          canRemoveTerminalRun(run, expired, options.acceptPidReuse === true) &&
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        // A referenced candidate is kept as is; compaction would veto it on the same reference.
+        const name = entry.name, bytes = options.measure?.(run) ?? 0;
+        if (removeUnreferencedRun(run, () => referencedNow(name), options.dryRun)) { removed.push(run); options.onRemove?.(run, bytes); }
+      } else {
+        compactTerminalRunEvents(run, {
+          ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
+          ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+          ...(options.dryRun ? { dryRun: true } : {}), ...(options.onCompact ? { onCompact: options.onCompact } : {}),
+          now, expired, isRetained: () => referencedNow(path.basename(run)) });
+      }
+    }
+  } finally { directory.closeSync(); }
+  return removed;
+};
+
 
 const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;

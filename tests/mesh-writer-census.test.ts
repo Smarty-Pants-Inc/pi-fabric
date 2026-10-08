@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { census } from "../src/mesh/writer-census.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 
 const ownStartedAt = (): number => Math.floor(Date.now() - process.uptime() * 1000);
 const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
@@ -163,6 +163,45 @@ describe("mesh writer census", () => {
     const expired = await census(mesh);
     expect(expired.clean).toBe(false);
     expect(expired.unknown).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
+  });
+
+  it.each([
+    { label: "an empty host and start time 0", host: "", startedAt: 0 },
+    { label: "an empty host", host: "", startedAt: Date.now() - 1000 },
+    { label: "start time 0", host: "lease-host", startedAt: 0 },
+    { label: "a negative start time", host: "lease-host", startedAt: -1 },
+  ])("drops lease writer metadata with $label, so census is not clean", async ({ host, startedAt }) => {
+    const mesh = root();
+    const now = Date.now();
+    const writer = { pid: process.pid, host, releaseSha: "release-456", lockProtocol: 2, stateBackend: "sqlite", startedAt };
+    writeHostLease(mesh, { id: "host:bad", rootId: "session:bad", identityId: "identity:bad",
+      updatedAt: now, expiresAt: now + 60_000, writer });
+    expect(readHostLeases(mesh).get("host:bad")?.writer).toBeUndefined();
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual({ source: "host-lease", name: "host:bad" });
+  });
+
+  it("counts a process record with an empty host or non-positive start time as unknown", async () => {
+    const mesh = root();
+    const now = Date.now();
+    const empty = deadPid();
+    const emptyFile = writeRecord(mesh, { pid: empty, host: "", startedAt: 0 });
+    // Even under an unexpired, valid lease for the same writer, start time 0 stays absent.
+    const zero = deadPid();
+    writeRecord(mesh, { pid: zero, host: "other-host.example", startedAt: 0 });
+    writeHostLease(mesh, { id: "host:other", rootId: "session:other", identityId: "identity:other",
+      updatedAt: now, expiresAt: now + 60_000, writer: { pid: zero, host: "other-host.example", releaseSha: "abc123",
+        lockProtocol: 2, stateBackend: "sqlite", startedAt: now - 1000 } });
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    const unknown = result.unknown.filter(writer => writer.source === "process-record");
+    expect(unknown).toHaveLength(2);
+    const bad = unknown.find(writer => writer.pid === empty)!;
+    expect(bad).not.toHaveProperty("host");
+    expect(bad).not.toHaveProperty("startedAt");
+    expect(unknown.find(writer => writer.pid === zero)).not.toHaveProperty("startedAt");
+    expect(fs.existsSync(emptyFile)).toBe(true);
   });
 
   it("keeps a lock ticket whose pid belongs to another host's writer", async () => {

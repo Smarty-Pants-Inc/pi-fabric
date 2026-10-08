@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
 import { censusRecordAlive } from "./store.js";
-import { readHostLeases, type FabricHostLease, type MeshWriterRecord } from "../topology/host-leases.js";
+import {
+  readHostLeases, validWriterHost, validWriterStartedAt, type FabricHostLease, type MeshWriterRecord,
+} from "../topology/host-leases.js";
 
 export interface CensusWriter {
   pid?: number;
@@ -26,19 +28,30 @@ export interface WriterCensus {
 
 const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined);
 
-const leaseWriter = (record: MeshWriterRecord): Omit<CensusWriter, "source" | "name"> => ({
-  pid: record.pid, host: record.host, releaseSha: record.releaseSha,
-  lockProtocol: record.lockProtocol, stateBackend: record.stateBackend, startedAt: record.startedAt,
-});
+/**
+ * Writer metadata with every invalid field left absent. Leases are validated on read; process
+ * records are not, so an empty host or a non-positive start time must not reach `isKnown`.
+ */
+const leaseWriter = (record: MeshWriterRecord): Omit<CensusWriter, "source" | "name"> => {
+  const value = record as unknown as Record<string, unknown>;
+  return {
+    ...(Number.isSafeInteger(value.pid) ? { pid: value.pid as number } : {}),
+    ...(validWriterHost(value.host) ? { host: value.host } : {}),
+    ...(typeof value.releaseSha === "string" ? { releaseSha: value.releaseSha } : {}),
+    ...(typeof value.lockProtocol === "number" ? { lockProtocol: value.lockProtocol } : {}),
+    ...(typeof value.stateBackend === "string" ? { stateBackend: value.stateBackend } : {}),
+    ...(validWriterStartedAt(value.startedAt) ? { startedAt: value.startedAt } : {}),
+  };
+};
 
 const fromLease = (lease: FabricHostLease): CensusWriter => ({
   ...(lease.writer ? leaseWriter(lease.writer) : {}), source: "host-lease", name: lease.id,
 });
 
-const isKnown = (writer: CensusWriter): boolean => typeof writer.pid === "number" &&
-  typeof writer.host === "string" && Boolean(writer.releaseSha) && writer.releaseSha !== "unknown" &&
+const isKnown = (writer: CensusWriter): boolean => Number.isSafeInteger(writer.pid) && writer.pid! > 0 &&
+  validWriterHost(writer.host) && Boolean(writer.releaseSha) && writer.releaseSha !== "unknown" &&
   typeof writer.lockProtocol === "number" && typeof writer.stateBackend === "string" &&
-  typeof writer.startedAt === "number";
+  validWriterStartedAt(writer.startedAt);
 
 const writerKey = (writer: CensusWriter): string =>
   writer.pid === undefined ? `${writer.source}:${writer.name ?? "?"}` : `pid:${writer.host ?? "?"}:${writer.pid}`;

@@ -61,6 +61,7 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { publicationGeneration } from "../topology/publication-generation.js";
+import { withStateFence } from "../mesh/commit-outbox.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -4448,7 +4449,7 @@ export class ActorManager {
       committed = await this.#registry.update(current => {
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
-      const ownershipGeneration = publicationGeneration(this.mesh.root);
+      const ownershipGeneration = publicationGeneration(this.mesh);
       return this.#withOwnershipRead(() => {
         // Source selection is speculative. update validates the atomic registry
         // generation AND the ownership observation after acquisition, or retries.
@@ -4473,7 +4474,7 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh.root) &&
+          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownershipGeneration === publicationGeneration(this.mesh) &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
@@ -5348,10 +5349,11 @@ export class ActorManager {
         // #535's order and zero-wait mesh acquisition are unchanged. Generation
         // validation fences the prepared merge; fresh death/owner checks remain
         // under mesh custody and no selected snapshot crosses a retry wait.
-        // Deliberately the mesh lock, not file custody (smarty-dev#6477 L5): the
-        // lineage death proof is shared state, and holding the mesh lock is what
-        // serializes this claim with resumeLineage()'s state delete.
-        adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() =>
+        // Deliberately the state lock, not file custody (smarty-dev#6477 L5): the
+        // lineage death proof is shared state, and holding the state write lock is what
+        // serializes this claim with resumeLineage()'s state delete. A state fence that
+        // writes nothing; the registry commit inside it is the R11 exception (plan, A1 X15).
+        adopted = await ActorRegistryStore.withLocks([this.#registry], () => withStateFence(this.mesh, this.identity, () =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
             if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
             if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;

@@ -49,11 +49,12 @@ describe("bridge mirror commit outbox", () => {
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
       const prepare = input.prepare;
-      return writeBatch({ ...input, prepare: prepare && ((view) => {
+      if (!prepare) return writeBatch(input);
+      return writeBatch({ ...input, prepare: (view) => {
         const ops = prepare(view);
         batches.push({ keys: ops.map((op) => op.key) });
         return ops;
-      }) });
+      } });
     });
     await side.mirror(peer.presence);
     expect(exclusive).not.toHaveBeenCalled();

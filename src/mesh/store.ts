@@ -169,6 +169,9 @@ export interface MeshStoreOptions {
   stateBackend?: MeshStateBackendKind;
 }
 
+/** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
+let unreadableStateRevisions = 0;
+
 export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
@@ -311,6 +314,19 @@ export class MeshStore {
 
   stateStamp(): string | undefined {
     return this.#state.stateStamp();
+  }
+
+  /**
+   * The committed-state revision of the ACTIVE backend, for validating an observation across a
+   * state commit (publicationGeneration; pi-fabric#640 review round 1, P1). file and shadow:
+   * undefined, because state.json is their authority and the caller stamps that file (bigint stat,
+   * nanosecond times). sqlite: the backend stamp `<store>:<epoch>:<commit_no>`; SQLite state
+   * commits never touch state.json, so its stat would pass a stale observation. A SQLite stamp that
+   * cannot be read is unique, so a validation across it fails instead of passing.
+   */
+  stateRevision(): string | undefined {
+    if (this.#state.kind !== "sqlite") return undefined;
+    return this.#state.stateStamp() ?? `unreadable:${++unreadableStateRevisions}`;
   }
 
   cachedStateStamp(fresh = false, revalidateGeneration = false): string | undefined {

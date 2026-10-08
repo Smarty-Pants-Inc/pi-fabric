@@ -195,7 +195,7 @@ const settled = (value: Record<string, unknown>): string =>
 interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number }
 /**
  * A removed mirror's lease identity, as its lease file carries it (root, identity, incarnation).
- * Rows of an older release carry only `key` and `id`: they prove no owner, so they remove nothing.
+ * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
  */
 interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number }
 
@@ -204,7 +204,8 @@ const incarnationOf = (record: { startedAt?: unknown }): { startedAt?: number } 
 
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
-  // that commit (smarty-dev#6477 R11): a crash in between leaves them for #recover().
+  // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
+  // replays them on its own snapshot (CommitOutboxPlan.replay) before it stages anything.
   readonly #outbox: CommitOutbox;
   #recovered = false;
 
@@ -219,7 +220,8 @@ export class StoreBridgeSide implements BridgeSide {
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
       // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
       unlease: (gone: BridgeUnlease, view) => {
-        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string") return;
+        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
+          typeof gone.startedAt !== "number") return;
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
         removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
@@ -373,9 +375,10 @@ export class StoreBridgeSide implements BridgeSide {
   // A busy state write fence (SQLite) refused the event before its stamp: nothing was appended,
   // so it is retried with .lock released in between, for a bounded time; then the busy error
   // (a lock timeout) goes to the bridge loop's own backoff. A batch whose later event met a busy
-  // fence returns its committed prefix instead, like any other suffix failure.
+  // fence returns its committed prefix instead, like any other suffix failure. Inside a bounded mesh
+  // try (withTryLock) the retries never outlast that try's budget (pi-fabric#640 review round 1).
   async #fenceRetry<T>(publish: () => Promise<T>): Promise<T> {
-    const deadline = Date.now() + BRIDGE_FENCE_RETRY_MS;
+    const deadline = Date.now() + Math.min(BRIDGE_FENCE_RETRY_MS, this.store.tryLockBudgetMs ?? BRIDGE_FENCE_RETRY_MS);
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await publish();
@@ -474,7 +477,7 @@ export class StoreBridgeSide implements BridgeSide {
    */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#recover()).then(() => this.#mirror(presence, false, observedAt));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -540,6 +543,9 @@ export class StoreBridgeSide implements BridgeSide {
       // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
       prepare: (view) => {
         if (halted()) return plan.stage([], []);
+        // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
+        // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
+        if (!this.#recovered) plan.replay(view);
         const hostEntries = view.listAll(HOST_PREFIX);
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const participantFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp
@@ -618,26 +624,23 @@ export class StoreBridgeSide implements BridgeSide {
       // After the commit, on the committed owner, never a fresh per-record state read.
       afterCommit: (view) => { plan.run(view, halted); },
     });
+    // Only a committed pass ends recovery; a failed one leaves the rows for the next pass.
+    if (!final) this.#recovered = true;
   }
 
   #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
     const entry = view.get(keyFor(HOST_PREFIX, lease.id));
     const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
     if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
+    // Only the incarnation the lease was planned for: an overlapping writer may have installed a
+    // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
+    // and a stale effect must not overwrite its lease (pi-fabric#640 review round 2). A row of an
+    // earlier release carries no incarnation and proves none: it is discarded, and a later pass
+    // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
+    if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt) return;
     // A replayed row never shortens a lease that a later pass already renewed.
     if (replay && (readHostLease(this.store.root, lease.id)?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
     writeHostLease(this.store.root, lease);
-  }
-
-  // Effects a crashed predecessor of this link committed but did not run. Retried on the next pass.
-  async #recover(): Promise<void> {
-    if (this.#recovered) return;
-    try {
-      await this.#outbox.recover();
-      this.#recovered = true;
-    } catch {
-      // Lock timeout or IO failure: the rows stay; the mirror itself still runs.
-    }
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {

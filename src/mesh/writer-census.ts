@@ -1,6 +1,8 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
+import { censusRecordAlive } from "./store.js";
 import { readHostLeases, type FabricHostLease, type MeshWriterRecord } from "../topology/host-leases.js";
 
 export interface CensusWriter {
@@ -22,11 +24,7 @@ export interface WriterCensus {
   clean: boolean;
 }
 
-const processAlive = (pid: number): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-};
+const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined);
 
 const leaseWriter = (record: MeshWriterRecord): Omit<CensusWriter, "source" | "name"> => ({
   pid: record.pid, host: record.host, releaseSha: record.releaseSha,
@@ -42,17 +40,33 @@ const isKnown = (writer: CensusWriter): boolean => typeof writer.pid === "number
   typeof writer.lockProtocol === "number" && typeof writer.stateBackend === "string" &&
   typeof writer.startedAt === "number";
 
-/** Snapshot current writer leases plus live legacy lock evidence for the L4b cutover tool. */
+const writerKey = (writer: CensusWriter): string =>
+  writer.pid === undefined ? `${writer.source}:${writer.name ?? "?"}` : `pid:${writer.host ?? "?"}:${writer.pid}`;
+
+/**
+ * Snapshot current writer leases plus live legacy lock evidence for the L4b cutover tool.
+ * Liveness (pid alive, same /proc incarnation) is judged only for this host's records, and this
+ * host's dead records are deleted (best effort). Another host's pid proves nothing here: its
+ * record is never dropped, and is unknown unless an unexpired host lease names that writer.
+ */
 export async function census(root: string): Promise<WriterCensus> {
   const writers: CensusWriter[] = [];
   const unknown: CensusWriter[] = [];
   const seen = new Set<string>();
+  const host = os.hostname();
+  const now = Date.now();
   const leases = [...readHostLeases(root).values()];
-  const byPid = new Map<number, MeshWriterRecord>(leases.filter(lease => lease.writer).map(lease => [lease.writer!.pid, lease.writer!]));
+  const leased = (writer: CensusWriter): boolean => leases.some(lease => lease.expiresAt > now &&
+    lease.writer?.host === writer.host && lease.writer?.pid === writer.pid);
+  const foreign = (writer: { host?: unknown }): boolean => typeof writer.host === "string" && writer.host !== host;
+  // Lock owners/tickets name only a pid; metadata (and so a host) comes from records and leases.
+  const byPid = new Map<number, MeshWriterRecord[]>();
+  const remember = (record: MeshWriterRecord): void => { byPid.set(record.pid, [...(byPid.get(record.pid) ?? []), record]); };
+  for (const lease of leases) if (lease.writer) remember(lease.writer);
   const add = (writer: CensusWriter): void => {
-    const key = writer.pid === undefined ? `${writer.source}:${writer.name ?? "?"}` : `pid:${writer.pid}`;
+    const key = writerKey(writer);
     if (seen.has(key)) {
-      const prior = writers.find(item => (item.pid === undefined ? `${item.source}:${item.name ?? "?"}` : `pid:${item.pid}`) === key)!;
+      const prior = writers.find(item => writerKey(item) === key)!;
       if (writer.source === "lock-owner" || writer.source === "lock-ticket") {
         prior.evidence = [...(prior.evidence ?? []), `${writer.source}:${writer.name ?? "unknown"}`];
       }
@@ -63,42 +77,46 @@ export async function census(root: string): Promise<WriterCensus> {
       writer.evidence = [`${writer.source}:${writer.name ?? "unknown"}`];
     }
     writers.push(writer);
-    if (!isKnown(writer)) unknown.push(writer);
+    if (!isKnown(writer) || (foreign(writer) && !leased(writer))) unknown.push(writer);
+  };
+  const addLockEvidence = (pid: number, source: "lock-owner" | "lock-ticket", name: string | undefined): void => {
+    const metadata = byPid.get(pid) ?? [];
+    const local = metadata.find(record => !foreign(record) && censusRecordAlive(record.pid, record.startedAt));
+    if (processAlive(pid)) add({ ...(local ? leaseWriter(local) : { pid }), source, ...(name ? { name } : {}) });
+    // A same-pid writer on another host may own this evidence: never treat it as dead (fail closed).
+    for (const record of metadata.filter(foreign)) add({ ...leaseWriter(record), source, ...(name ? { name } : {}) });
   };
   try {
-    for (const name of fs.readdirSync(path.join(root, ".writer-census"))) {
+    const directory = path.join(root, ".writer-census");
+    for (const name of fs.readdirSync(directory)) {
       if (!name.endsWith(".json")) continue;
       try {
-        const value = JSON.parse(fs.readFileSync(path.join(root, ".writer-census", name), "utf8")) as Record<string, unknown>;
-        if (value.format !== 1 || !Number.isSafeInteger(value.pid) || !processAlive(Number(value.pid))) continue;
+        const value = JSON.parse(fs.readFileSync(path.join(directory, name), "utf8")) as Record<string, unknown>;
+        if (value.format !== 1 || !Number.isSafeInteger(value.pid)) continue;
+        if (!foreign(value) && !censusRecordAlive(Number(value.pid), value.startedAt)) {
+          try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+          continue;
+        }
         const record = value as unknown as MeshWriterRecord;
-        byPid.set(record.pid, record);
+        remember(record);
         add({ ...leaseWriter(record), source: "process-record", name });
       } catch { /* incomplete record is not trusted */ }
     }
   } catch { /* old release, before census records */ }
 
-  for (const lease of leases) if (lease.expiresAt > Date.now()) add(fromLease(lease));
+  for (const lease of leases) if (lease.expiresAt > now) add(fromLease(lease));
 
   try {
     const owner = fs.readFileSync(path.join(root, ".lock", "owner"), "utf8").split(/\r?\n/);
-    const pid = Number(owner[1]);
-    if (processAlive(pid)) {
-      const metadata = byPid.get(pid);
-      add({ ...(metadata ? leaseWriter(metadata) : { pid }), source: "lock-owner", ...(owner[0] ? { name: owner[0] } : {}) });
-    }
+    addLockEvidence(Number(owner[1]), "lock-owner", owner[0] || undefined);
   } catch { /* absent owner record */ }
 
   try {
     const queue = meshLockQueueDirectory(root);
     for (const name of fs.readdirSync(queue).filter(item => /^\d{24}-\d+-[a-f0-9-]+$/.test(item))) {
-      const pid = Number(name.split("-")[1]);
-      if (!processAlive(pid)) continue;
-      const metadata = byPid.get(pid);
-      add({ ...(metadata ? leaseWriter(metadata) : { pid }), source: "lock-ticket", name });
+      addLockEvidence(Number(name.split("-")[1]), "lock-ticket", name);
     }
   } catch { /* no queue or queue is not readable */ }
 
   return { writers, unknown, clean: unknown.length === 0 };
 }
-

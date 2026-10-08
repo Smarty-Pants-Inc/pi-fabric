@@ -24,18 +24,81 @@ export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateB
 
 const meshProcessStartedAt = Math.floor(Date.now() - process.uptime() * 1000);
 
+let bootTimeMs: number | undefined;
+/** Linux only: the pid's start time in epoch ms from /proc (USER_HZ is 100); else undefined. */
+const procStartedAt = (pid: number): number | undefined => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]);
+    bootTimeMs ??= Number(/^btime\s+(\d+)\s*$/m.exec(fs.readFileSync("/proc/stat", "utf8"))?.[1]) * 1000;
+    return Number.isFinite(ticks) && Number.isFinite(bootTimeMs) ? bootTimeMs + ticks * 10 : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * Same-host census liveness (smarty-dev#6477 L4a): the pid is alive and, where /proc tells, is the
+ * same incarnation (start within 2 s of the record). A record without startedAt cannot be refuted
+ * and stays live (fail closed). Meaningless for another host's pid.
+ */
+export const censusRecordAlive = (pid: number, startedAt: unknown): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
+  const started = procStartedAt(pid);
+  return started === undefined || typeof startedAt !== "number" || Math.abs(started - startedAt) <= 2000;
+};
+
+/** Best effort: removes this host's census records whose process is gone; never throws. */
+export const pruneDeadCensusRecords = (root: string): void => {
+  const directory = path.join(root, ".writer-census");
+  let names: string[];
+  try { names = fs.readdirSync(directory); } catch { return; }
+  const host = os.hostname();
+  for (const name of names) {
+    // Records are <pid>-<startedAt>.json: only a name that already looks dead is opened.
+    const match = /^(\d+)-(\d+)\.json$/.exec(name);
+    if (!match || censusRecordAlive(Number(match[1]), Number(match[2]))) continue;
+    const file = path.join(directory, name);
+    try {
+      const value = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+      if (value.host === host && !censusRecordAlive(Number(value.pid), value.startedAt)) fs.rmSync(file, { force: true });
+    } catch { /* unreadable or already gone: left to the next prune */ }
+  }
+};
+
+const prunedCensusRoots = new Set<string>();
+const ownCensusRecords = new Set<string>();
+const removeOwnCensusRecords = (): void => {
+  for (const file of ownCensusRecords) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+};
+
 const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): void => {
   const directory = path.join(root, ".writer-census");
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (!prunedCensusRoots.has(directory)) {
+    prunedCensusRoots.add(directory);
+    pruneDeadCensusRecords(root);
+  }
   const file = path.join(directory, `${process.pid}-${meshProcessStartedAt}.json`);
-  if (fs.existsSync(file)) return;
-  const temporary = `${file}.tmp`;
-  const writer = { format: 1, pid: process.pid, host: os.hostname(),
-    releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
-    lockProtocol, stateBackend, startedAt: meshProcessStartedAt };
-  fs.writeFileSync(temporary, JSON.stringify(writer), { flag: "w", mode: 0o600 });
-  try { fs.renameSync(temporary, file); }
-  catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+  try {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (fs.existsSync(file)) return;
+    const temporary = `${file}.tmp`;
+    const writer = { format: 1, pid: process.pid, host: os.hostname(),
+      releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+      lockProtocol, stateBackend, startedAt: meshProcessStartedAt };
+    fs.writeFileSync(temporary, JSON.stringify(writer), { flag: "w", mode: 0o600 });
+    try { fs.renameSync(temporary, file); }
+    catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+    if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
+    ownCensusRecords.add(file);
+  } catch {
+    // ponytail: a read-only or full disk must not fail MeshStore construction, so this process
+    // writes no census record and no new mechanism records the failure. While it queues for or
+    // holds the mesh lock its ticket/owner has no census metadata, so census() lists it unknown
+    // (clean:false). Otherwise only its host lease shows it: a sqlite writer between custody
+    // operations takes no .lock, and without a lease the census cannot see it.
+  }
 };
 
 export interface MeshStoreOptions {

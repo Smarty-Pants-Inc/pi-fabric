@@ -1,3 +1,4 @@
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,28 @@ import { census } from "../src/mesh/writer-census.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
+
+const ownStartedAt = (): number => Math.floor(Date.now() - process.uptime() * 1000);
+const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
+const writeRecord = (mesh: string, record: Record<string, unknown>): string => {
+  const directory = path.join(mesh, ".writer-census");
+  fs.mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, `${String(record.pid)}-${String(record.startedAt)}.json`);
+  fs.writeFileSync(file, JSON.stringify({ format: 1, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite", ...record }));
+  return file;
+};
+
+const CHILD = `
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+const [root] = process.argv.slice(1);
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+new MeshStore(root, 4096, 100, { stateBackend: "file" });
+process.stdout.write(JSON.stringify(fs.readdirSync(path.join(root, ".writer-census"))) + "\\n");
+`;
 
 const roots: string[] = [];
 const root = (): string => {
@@ -40,8 +63,8 @@ describe("mesh writer census", () => {
     const mesh = root();
     const directory = path.join(mesh, ".writer-census");
     fs.mkdirSync(directory);
-    const writer = { pid: process.pid, host: "test-host", releaseSha: "abc123", lockProtocol: 2,
-      stateBackend: "sqlite", startedAt: Date.now() - 1000 };
+    const writer = { pid: process.pid, host: os.hostname(), releaseSha: "abc123", lockProtocol: 2,
+      stateBackend: "sqlite", startedAt: ownStartedAt() };
     fs.writeFileSync(path.join(directory, `${process.pid}.json`), JSON.stringify({ format: 1, ...writer }));
     const result = await census(mesh);
     expect(result.clean).toBe(true);
@@ -84,5 +107,75 @@ describe("mesh writer census", () => {
     const result = await census(mesh);
     expect(result.clean).toBe(false);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-ticket", name }));
+  });
+  it("deletes this host's record of a dead process", async () => {
+    const mesh = root();
+    const pid = deadPid();
+    const file = writeRecord(mesh, { pid, host: os.hostname(), startedAt: ownStartedAt() });
+    const result = await census(mesh);
+    expect(result.writers.find(writer => writer.pid === pid)).toBeUndefined();
+    expect(result.clean).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("removes its own record when the process exits", async () => {
+    const mesh = root();
+    const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD, mesh],
+      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+    expect(JSON.parse(stdout)).toEqual([expect.stringMatching(new RegExp(`^${child.pid}-\\d+\\.json$`))]);
+    expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]);
+  }, 30_000);
+
+  it.runIf(process.platform === "linux")("treats a live pid with another start time as a reused, dead record", async () => {
+    const mesh = root();
+    const file = writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() - 3_600_000 });
+    const result = await census(mesh);
+    expect(result.writers.find(writer => writer.source === "process-record")).toBeUndefined();
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("never drops another host's record, and counts it unknown without its unexpired lease", async () => {
+    const mesh = root();
+    const pid = deadPid();
+    const record = { pid, host: "other-host.example", startedAt: Date.now() - 1000 };
+    const file = writeRecord(mesh, record);
+    const first = await census(mesh);
+    expect(first.clean).toBe(false);
+    expect(first.writers).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
+    expect(first.unknown).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
+    expect(fs.existsSync(file)).toBe(true);
+
+    const now = Date.now();
+    const writer = { ...record, releaseSha: "abc123", lockProtocol: 2, stateBackend: "sqlite" };
+    writeHostLease(mesh, { id: "host:other", rootId: "session:other", identityId: "identity:other",
+      updatedAt: now, expiresAt: now + 60_000, writer });
+    const leased = await census(mesh);
+    expect(leased.clean).toBe(true);
+    expect(leased.writers).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
+
+    writeHostLease(mesh, { id: "host:other", rootId: "session:other", identityId: "identity:other",
+      updatedAt: now - 120_000, expiresAt: now - 60_000, writer });
+    const expired = await census(mesh);
+    expect(expired.clean).toBe(false);
+    expect(expired.unknown).toContainEqual(expect.objectContaining({ ...record, source: "process-record" }));
+  });
+
+  it("keeps a lock ticket whose pid belongs to another host's writer", async () => {
+    const mesh = root();
+    const pid = deadPid();
+    writeRecord(mesh, { pid, host: "other-host.example", startedAt: Date.now() - 1000 });
+    const queue = meshLockQueueDirectory(mesh);
+    fs.mkdirSync(queue, { recursive: true });
+    const ticket = `${"3".repeat(24)}-${pid}-01234567-89ab-cdef-0123-456789abcdef`;
+    fs.writeFileSync(path.join(queue, ticket), "");
+    const result = await census(mesh);
+    expect(result.clean).toBe(false);
+    expect(result.unknown).toContainEqual(expect.objectContaining({ pid, host: "other-host.example",
+      evidence: [`lock-ticket:${ticket}`] }));
   });
 });

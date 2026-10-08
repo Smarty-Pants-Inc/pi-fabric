@@ -432,6 +432,12 @@ export interface ParticipantDirectoryOptions {
   presencePassMs?: number;
   /** Told once when close() could not withdraw this host's entries (default: console.warn). */
   onWithdrawalFailure?: (message: string) => void;
+  /**
+   * Session lifecycle token (smarty-dev#5962). False once the owner's extension ctx retired
+   * (reload, session replacement): background ticks skip quietly until the owner rebinds.
+   * Explicit refresh()/quiesce() calls still publish from the owner's last live snapshot.
+   */
+  live?: () => boolean;
 }
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
@@ -507,6 +513,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
   }
 
+  /** A retired owner lifecycle skips background work; a throwing token is retired too. */
+  #live(): boolean {
+    try { return this.options.live?.() ?? true; } catch { return false; }
+  }
+
   registerSource(source: ParticipantSnapshotSource): () => void {
     this.#sources.add(source);
     if (this.#timer) this.scheduleRefresh();
@@ -530,7 +541,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
       this.#timer = setInterval(() => {
-        if (this.#closed) return;
+        if (this.#closed || !this.#live()) return;
         void this.#renewActors();
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;
@@ -635,6 +646,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!this.#refreshScheduled || this.#closed) return;
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
+      if (!this.#live()) return;
       void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
@@ -788,6 +800,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
     this.#publicationRetryTimer = setTimeout(() => {
       this.#publicationRetryTimer = undefined;
+      if (!this.#live()) return;
       const work = this.#retryPublication();
       this.#publicationRetrying = work;
       void work.finally(() => {

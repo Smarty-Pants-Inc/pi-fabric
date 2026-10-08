@@ -150,7 +150,8 @@ describe("bridge participant reconciliation (smarty-dev#5036)", () => {
     expect(writes.mock.calls.filter(([, file]) => [path.join(f.hub.root, "state.json"), path.join(f.far.root, "state.json")].includes(String(file))))
       .toHaveLength(0);
     expect([f.hub.listAll(), f.far.listAll()]).toEqual(before);
-    expect(readHostLeases(f.far.root).get(f.lead.identity.id)!.updatedAt).toBe(Date.now());
+    // The lease file is still renewed without a state write, capped at the origin's expiry.
+    expect(readHostLeases(f.far.root).get(f.lead.identity.id)!.expiresAt).toBe(Date.now() + BRIDGE_LEASE_MS);
     f.visible();
   });
 

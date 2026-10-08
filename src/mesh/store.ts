@@ -1,5 +1,6 @@
 import { createCommitStats } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
+import { withMeshCustody } from "./custody-lock.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
@@ -2048,6 +2049,18 @@ export class MeshStore {
   /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return this.#withLock(operation, lockTimeoutMs);
+  }
+
+  /** File custody (smarty-dev#6477 L5): the custody lock, plus the mesh lock in the default
+   * transition-safe "dual" mode. For operations that guard only files beside the mesh. */
+  async custody<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
+    return withMeshCustody(this, operation, lockTimeoutMs);
+  }
+
+  /** The active withTryLock budget in this async context, if any. */
+  get tryLockBudgetMs(): number | undefined {
+    const scope = this.#tryLockScope.getStore();
+    return scope?.active ? scope.timeoutMs : undefined;
   }
 
   /**

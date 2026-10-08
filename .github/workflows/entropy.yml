@@ -25,3 +25,4 @@ jobs:
         with:
           name: entropy-report
           path: entropy-report.json
+          retention-days: 3 # smarty-dev#1246

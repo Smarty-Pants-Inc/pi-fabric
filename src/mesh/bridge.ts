@@ -124,8 +124,11 @@ export interface BridgeSide {
   holds?(id: string): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
   mirrored?(id: string): boolean;
-  /** Replace this side's mirror of the peer's presence. */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
+  /**
+   * Replace this side's mirror of the peer's presence. `observedAt` (this side's clock, never a
+   * peer's) is when the snapshot was requested; liveness is judged then, not at commit.
+   */
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
   bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
@@ -392,9 +395,9 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> {
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#mirror(presence, false));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -430,10 +433,16 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean): Promise<void> {
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
-    const leases: Array<{ id: string; rootId: string; identityId: string; expiresAt: number }> = [];
+    // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
+    // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
+    // root of such a spoke on every pass (smarty-dev#6477). Never later than now. A non-finite
+    // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
+    // one for a full lease (independent review, P2).
+    const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
+    const leases: Array<{ id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number }> = [];
     const removed: Array<{ key: string; id: string }> = [];
     await this.store.writeBatch({
       // Each put below supplies its checked owner identity; this default is unused for deletes.
@@ -451,23 +460,32 @@ export class StoreBridgeSide implements BridgeSide {
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt } of presence.hosts) {
+          // Only a peer's natives are mirrored; a record another link mirrored is never relayed.
+          if (remoteHostOf(record) !== undefined) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // Mirror a still-live observation for one source TTL from this side's sync,
-          // not until the source's absolute expiry. Even a final observation just before
-          // the source expires can therefore extend a stopped host by at most one TTL.
-          const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
-          if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
-          const until = now + ttl;
+          // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
+          // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
+          // A mirror never renews: its lease carries the origin's last renewal, not this sync.
+          // Liveness is judged when the snapshot was requested (liveAt); the origin's remaining
+          // life is then counted from this commit, so a slow pass does not lapse a live mirror.
+          // That shift is at most this pass's latency (zero when no observedAt is given) and never
+          // more than one BRIDGE_LEASE_MS, so a stalled pass cannot keep a dead origin's mirror
+          // alive longer than one lease past the origin (independent review, P2). A mirror that
+          // the capped shift leaves already lapsed is not written: it is dropped like any other.
+          if (!Number.isFinite(expiresAt) || expiresAt <= liveAt) continue;
+          const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          if (until <= now) continue;
+          const renewedAt = Math.min(record.updatedAt, now);
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
             identity: record.identity,
           });
-          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, expiresAt: until });
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, updatedAt: renewedAt, expiresAt: until });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (!owner || participant.kind !== "root" || own.has(participant.id) || remoteHostOf(participant) !== undefined) continue;
           if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
           wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
             value: { ...participant, remoteHost: this.peer },
@@ -510,7 +528,7 @@ export class StoreBridgeSide implements BridgeSide {
           const entry = view.get(keyFor(HOST_PREFIX, lease.id));
           const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
           if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) continue;
-          writeHostLease(this.store.root, { ...lease, updatedAt: now });
+          writeHostLease(this.store.root, lease);
         }
         for (const { key, id } of removed) {
           if (halted()) return;
@@ -978,7 +996,7 @@ export class MeshBridge {
     const outbound = boundPresence(local);
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
+    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];

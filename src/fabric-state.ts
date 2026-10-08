@@ -70,11 +70,13 @@ export interface FabricStateOptions {
 }
 
 // Survives extension generations (reload, session replacement) in this Pi process.
-const PUBLISHED_MAIN_MESH_ROOTS = Symbol.for("pi-fabric.published-main-mesh-roots.v1");
-const publishedMainMeshRoots = (): Set<string> => {
+// A shared mesh is not a session scope: unrelated cwds must not inherit a Main's re-arm hint.
+const PUBLISHED_MAIN_SCOPES = Symbol.for("pi-fabric.published-main-scopes.v1");
+const publishedMainScopes = (): Set<string> => {
   const holder = globalThis as Record<symbol, Set<string> | undefined>;
-  return holder[PUBLISHED_MAIN_MESH_ROOTS] ??= new Set<string>();
+  return holder[PUBLISHED_MAIN_SCOPES] ??= new Set<string>();
 };
+const mainPresenceScope = (meshRoot: string, cwd: string): string => JSON.stringify([meshRoot, path.resolve(cwd)]);
 
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
 type ActivationFailureHook = () => void | Promise<void>;
@@ -290,7 +292,7 @@ export class FabricState {
     // Re-arm on session_start (smarty-dev#5962/#4313): a Main this process already published
     // keeps its presence across /reload and session replacement. Its old heartbeat retired with
     // the old ctx; waiting for first tool use let the lease lapse and the Main vanish silently.
-    if (publishedMainMeshRoots().has(meshRoot)) return true;
+    if (publishedMainScopes().has(mainPresenceScope(meshRoot, context.cwd))) return true;
     const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const actorRoots = [
       path.join(meshRoot, "actors"),
@@ -601,7 +603,7 @@ export class FabricState {
         try {
           if (config.mesh.enabled && context.isProjectTrusted() &&
             resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {
-            publishedMainMeshRoots().add(this.#meshRoot(context));
+            publishedMainScopes().add(mainPresenceScope(this.#meshRoot(context), context.cwd));
           }
         } catch { /* best-effort re-arm hint; the next first use still activates */ }
         return candidate;

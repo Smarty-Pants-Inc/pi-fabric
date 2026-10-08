@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from "./store.js";
 
@@ -64,7 +64,8 @@ export interface CommitOutboxEffect {
  * never let it regress them. Must be synchronous and must not call the store's writers. */
 export type CommitOutboxHandler = (payload: any, view: MeshBatchView, replay: boolean) => void;
 
-interface OutboxRow { format: 1; scope: string; kind: string; key: string; payload: unknown; recordedAt: number }
+/** `stamp` names the exact recording: an afterCommit retires the row only while it still holds it. */
+interface OutboxRow { format: 1; scope: string; kind: string; key: string; payload: unknown; recordedAt: number; stamp?: string }
 
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 
@@ -100,7 +101,7 @@ export interface CommitOutboxPlan {
   run(view: MeshBatchView, halted?: () => boolean): number;
 }
 
-type StagedEffect = { row: string; effect: CommitOutboxEffect };
+type StagedEffect = { row: string; effect: CommitOutboxEffect; stamp: string };
 
 export class CommitOutbox {
   /** Every row of this scope starts with it. */
@@ -168,12 +169,12 @@ export class CommitOutbox {
       byRow.delete(row);
       byRow.set(row, effect);
     }
-    const plan = [...byRow].map(([row, effect]) => ({ row, effect }));
+    const plan = [...byRow].map(([row, effect]) => ({ row, effect, stamp: randomUUID() }));
     if (ops.length === 0 && !options.durable) return { ops, staged: plan };
     const recordedAt = Date.now();
     const staged: MeshBatchOperation[] = [...ops];
-    for (const [row, { kind, key, payload }] of byRow) {
-      const value: OutboxRow = { format: 1, scope: this.scope, kind, key, payload, recordedAt };
+    for (const { row, effect: { kind, key, payload }, stamp } of plan) {
+      const value: OutboxRow = { format: 1, scope: this.scope, kind, key, payload, recordedAt, stamp };
       staged.push({ kind: "put", key: row, value });
     }
     for (const [row, version] of this.#done) {
@@ -185,9 +186,9 @@ export class CommitOutbox {
   #run(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): number {
     let ran = 0;
     for (const row of [...this.#done.keys()]) if (!view.get(row)) this.#done.delete(row);
-    for (const { row, effect } of staged) {
+    for (const { row, effect, stamp } of staged) {
       if (halted?.()) return ran;
-      if (this.#execute(row, effect.kind, effect.payload, view, false)) ran += 1;
+      if (this.#execute(row, effect.kind, effect.payload, view, false, stamp)) ran += 1;
     }
     for (const row of [...this.#failed]) {
       if (halted?.()) return ran;
@@ -232,7 +233,9 @@ export class CommitOutbox {
     for (const [key, version] of done) if (this.#done.get(key) === version) this.#done.delete(key);
   }
 
-  #execute(row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean): boolean {
+  /** `stamp`: the recording a staged effect ran; the row is retired only if it still holds that one.
+   * A newer same-key recording committed before this (late) afterCommit stays pending (smarty-dev#7023). */
+  #execute(row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean, stamp?: string): boolean {
     const handler = this.handlers[kind];
     // An unknown kind belongs to another release of this writer: leave its row alone.
     if (!handler) return false;
@@ -243,8 +246,8 @@ export class CommitOutbox {
       return false;
     }
     this.#failed.delete(row);
-    const version = view.get(row)?.version;
-    if (version !== undefined) this.#done.set(row, version);
+    const entry = view.get(row);
+    if (entry && (stamp === undefined || rowOf(entry.value)?.stamp === stamp)) this.#done.set(row, entry.version);
     return true;
   }
 }

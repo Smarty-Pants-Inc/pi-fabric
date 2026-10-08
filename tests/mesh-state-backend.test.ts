@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { normalizeFabricConfig } from "../src/config.js";
-import { MESH_STATE_BUSY_CODE, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
+import { MESH_STATE_BUSY_CODE, MeshShadowNotReconciledError, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
   ShadowStateBackend, SqliteStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
@@ -445,6 +445,50 @@ describe("shadow backend", () => {
     await shadowOf(store).flush();
     expect(shadowOf(store).shadow.listAll("").map(entry => entry.key)).toEqual(["new", "old"]);
     expect(await shadowOf(store).verify()).toEqual([]);
+  });
+
+  it("verify() before any write runs the initial reconcile first (smarty-dev#6900)", async () => {
+    const root = tempRoot("shadow-verify-first");
+    const before = open(root, { stateBackend: "file" });
+    await before.put({ key: "a", value: 1, identity });
+    await before.put({ key: "b", value: { nested: true }, identity });
+    const store = open(root, { stateBackend: "shadow" });
+    const shadow = shadowOf(store);
+    // No write, no repair, no flush: verify() is the first use.
+    expect(await shadow.verify()).toEqual([]);
+    expect(shadow.shadow.listAll("").map(entry => entry.key)).toEqual(["a", "b"]);
+    // Repeated (timer) checks stay clean and never count a divergence.
+    expect(await shadow.verify()).toEqual([]);
+    expect(store.stateDiagnostics()).toMatchObject({ kind: "shadow", divergences: 0, divergentKeys: [], shadowFailures: 0 });
+  });
+
+  it("verify() never compares before the first reconcile: a failed one is retried, else 'not reconciled' (pi-fabric#671)", async () => {
+    const root = tempRoot("shadow-verify-unreconciled");
+    const before = open(root, { stateBackend: "file" });
+    await before.put({ key: "a", value: 1, identity });
+    await before.put({ key: "b", value: 2, identity });
+    const store = open(root, { stateBackend: "shadow" });
+    const shadow = shadowOf(store);
+    const busy = (): Error => Object.assign(new Error("SQLITE_BUSY: database is locked"), { errcode: 5 });
+    // The initial full mirror (started by the first write) fails, e.g. SQLite busy.
+    const failing = vi.spyOn(shadow.shadow, "writeBatch").mockRejectedValue(busy());
+    await store.put({ key: "c", value: 3, identity });
+    await shadow.flush();
+    expect(shadow.shadow.listAll("")).toEqual([]);
+    // While it keeps failing, verify() retries (bounded) and then says so: never divergences.
+    await expect(shadow.verify()).rejects.toBeInstanceOf(MeshShadowNotReconciledError);
+    await expect(shadow.verify()).rejects.toThrow(/not reconciled/);
+    expect(store.stateDiagnostics()).toMatchObject({ divergences: 0, divergentKeys: [] });
+    expect(store.stateDiagnostics().shadowFailures).toBe(1 + 2 * 3);
+    // One more transient failure: verify() retries the reconcile itself and compares a clean shadow.
+    failing.mockReset();
+    failing.mockRejectedValueOnce(busy());
+    failing.mockImplementation(SqliteStateBackend.prototype.writeBatch.bind(shadow.shadow) as never);
+    expect(await shadow.verify()).toEqual([]);
+    expect(shadow.shadow.listAll("").map(entry => entry.key)).toEqual(["a", "b", "c"]);
+    expect(await shadow.verify()).toEqual([]);
+    expect(store.stateDiagnostics()).toMatchObject({ divergences: 0, divergentKeys: [], shadowFailures: 8 });
+    failing.mockRestore();
   });
 
   it("a SQLite failure never fails or changes the caller's write", async () => {

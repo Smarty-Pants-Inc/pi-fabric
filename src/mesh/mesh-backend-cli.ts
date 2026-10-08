@@ -1,31 +1,58 @@
 // fabric-mesh-backend: import, cutover, rollback and status of a mesh root's state backend
 // (smarty-dev#6477 L4b). The fence and the commit order live in backend-migration.ts; see
 // docs/mesh-lock-plan.md section 5.
+import os from "node:os";
 import path from "node:path";
-import { abortMeshRollback, cutoverMeshState, importMeshState, meshBackendStatus, MeshBackendFenceError, MeshBackendRefusedError,
-  rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus, type MeshWriterCensus } from "./backend-migration.js";
+import { census as writerCensus, type CensusWriter } from "./writer-census.js";
+import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
+  MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
+  type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
 
-const COMMANDS = ["import", "status", "cutover", "rollback", "abort-rollback"] as const;
+const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback"] as const;
 type Command = typeof COMMANDS[number];
 
-const USAGE = `Usage: fabric-mesh-backend <import|status|cutover|rollback|abort-rollback> --root DIR [--json]
-                          [--assume-no-writers] [--lock-protocol 1|2] [--lock-timeout-ms N]
+const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback|abort-rollback> --root DIR [--json]
+                          [--lock-protocol 1|2] [--lock-timeout-ms N]
 
-  status          backend flag, epochs, digests, the reader decision and the census writers.
+  census          the ADVISORY writer census (writer-census.ts): the processes it attributed (mode,
+                  release) and the evidence it could not. Informational; always exit 0 when it ran.
+  status          backend flag, epochs, digests, the reader decision; the census as advisory.
   import          the cutover section (also the roll forward): state.json -> state.db under the
-                  mesh .lock at backend=importing E+1, digest verified both ways, state.json replaced
+                  fence at backend=importing E+1, digest verified both ways, state.json replaced
                   by the moved marker, then backend=sqlite. Refuses a diverged sqlite root.
-  cutover         import, refused unless the writer census shows no file-mode writer.
+  cutover         import (the same fenced section).
   rollback        the R1 fence: flag exporting (E+1), export to a verified temp, switch to file,
                   then replace the marker (last). A rerun converges from the stored flag.
-                  Refused while the census shows writers.
-  abort-rollback  under .lock: restore the marker, then exporting -> sqlite, keeping epoch E+1.
+  abort-rollback  under the fence: restore the marker, then exporting -> sqlite, keeping epoch E+1.
 
-Without a census provider, import, cutover and rollback need --assume-no-writers: the operator attests that
-every writer (Pi sessions, actors, mesh-bridge, the projector) on the root is stopped.
+The fence is the mesh .lock plus custody.lock, held for the whole section of import, cutover,
+rollback and abort-rollback. Stop every writer (Pi sessions, actors, mesh-bridge, the projector) first.
+The writer census is advisory only (smarty-dev#6982): each of those commands prints
+"advisory: N writers, M unknown" and never blocks, permits or changes the operation on it.
 Exit status: 0 done, 1 error, 2 usage, 3 refused or fence violation (nothing unsafe was done).`;
 
-interface Options { command: Command; root: string; json: boolean; assumeNoWriters: boolean; lockProtocol: 1 | 2; lockTimeoutMs?: number }
+/**
+ * smarty-dev#6477 W1: L4a's writer census as the advisory census provider (smarty-dev#6982). An
+ * attributed writer keeps its mode (file, shadow, sqlite; "foreign host H" when another host's);
+ * evidence the census could not attribute is listed as unknown, with its source and reason.
+ * Reported only: nothing accepts or refuses on it.
+ */
+export const meshWriterCensus = (root: string): MeshWriterCensus => async () => {
+  const result = await writerCensus(root);
+  const host = os.hostname();
+  const unknownSet = new Set<CensusWriter>(result.unknown);
+  const where = (writer: CensusWriter): string => writer.name ? ` ${writer.source} ${writer.name}` : ` ${writer.source}`;
+  const writers: MeshCensusWriter[] = result.writers.filter(writer => !unknownSet.has(writer)).map(writer => {
+    const foreign = writer.host !== undefined && writer.host !== host;
+    return { pid: writer.pid ?? 0, release: writer.releaseSha ?? "unknown",
+      mode: foreign ? `foreign host ${writer.host} ${writer.stateBackend ?? "?"}${where(writer)}` : writer.stateBackend ?? "?" };
+  });
+  const unknown: MeshCensusWriter[] = result.unknown.map(writer => ({ pid: writer.pid ?? 0, release: writer.releaseSha ?? "unknown",
+    mode: `unknown${where(writer)}${writer.reason ? `: ${writer.reason}` : ""}` }));
+  return { writers, unknown };
+};
+
+interface Options { command: Command; root: string; json: boolean; lockProtocol: 1 | 2; lockTimeoutMs?: number }
 
 class UsageError extends Error {}
 
@@ -35,13 +62,11 @@ const parseArgs = (argv: string[]): Options | "help" => {
   if (!COMMANDS.includes(command as Command)) throw new UsageError(`Unknown command ${String(command)}`);
   let root: string | undefined;
   let json = false;
-  let assumeNoWriters = false;
   let lockProtocol: 1 | 2 = 1;
   let lockTimeoutMs: number | undefined;
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
-    if (flag === "--assume-no-writers") { assumeNoWriters = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
@@ -55,7 +80,7 @@ const parseArgs = (argv: string[]): Options | "help" => {
     } else throw new UsageError(`Bad argument: ${flag}`);
   }
   if (!root) throw new UsageError("--root DIR is required");
-  return { command: command as Command, root: path.resolve(root), json, assumeNoWriters, lockProtocol,
+  return { command: command as Command, root: path.resolve(root), json, lockProtocol,
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) };
 };
 
@@ -71,13 +96,19 @@ const formatStatus = (status: MeshBackendStatus): string => {
   ];
   if (status.importDigest) lines.push(`last import   ${status.importDigest}`);
   if (status.exportDigest) lines.push(`last export   ${status.exportDigest} (${status.exportGeneration ?? "-"})`);
-  if (status.censusError) lines.push(`census        failed: ${status.censusError}`);
-  else if (status.writers) {
-    lines.push(`writers       ${status.writers.length}`);
-    for (const writer of status.writers) lines.push(`  pid ${writer.pid}  ${writer.mode}  ${writer.release}`);
-  } else lines.push("writers       unknown (no census provider)");
+  if (status.censusError !== undefined || status.writers) {
+    lines.push(...formatAdvisory({ writers: status.writers ?? [], unknown: status.unknownWriters ?? [],
+      ...(status.censusError === undefined ? {} : { error: status.censusError }) }));
+  } else lines.push("census        none (no census provider)");
   return lines.join("\n");
 };
+
+/** The advisory census, never a verdict: "advisory: N writers, M unknown" and the entries. */
+const formatAdvisory = (advisory: MeshCensusAdvisory): string[] => [
+  `census        ${describeCensusAdvisory(advisory)}`,
+  ...advisory.writers.map(writer => `  pid ${writer.pid}  ${writer.mode}  ${writer.release}`),
+  ...advisory.unknown.map(writer => `  pid ${writer.pid}  ${writer.mode}  ${writer.release}`),
+];
 
 const formatResult = (command: Command, result: Record<string, unknown>): string => {
   const done = result.converged ? "already done (verified)" : "done";
@@ -93,7 +124,7 @@ const formatResult = (command: Command, result: Record<string, unknown>): string
 
 export const main = async (argv: string[], io: {
   stdout?: (text: string) => void; stderr?: (text: string) => void;
-  /** The census lane plugs its provider in here (writer-census.ts). */
+  /** The writer census; default `meshWriterCensus` (writer-census.ts) of --root. */
   census?: MeshWriterCensus;
   /** Extra library options (tests: onStep, open). */
   options?: Partial<MeshBackendOptions>;
@@ -112,12 +143,25 @@ export const main = async (argv: string[], io: {
   const library: MeshBackendOptions = {
     ...io.options,
     lockProtocol: options.lockProtocol,
-    assumeNoWriters: options.assumeNoWriters,
     onAlarm: (alarm) => { alarms.push(alarm); warn(`fabric-mesh-backend: ALARM ${alarm.code}: ${alarm.message}\n`); },
-    ...(io.census ? { census: io.census } : {}),
+    census: io.census ?? meshWriterCensus(options.root),
     ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
   };
   try {
+    if (options.command === "census") {
+      // Advisory (smarty-dev#6982): exit 0 whatever it shows; an empty report proves nothing.
+      const report = await library.census!();
+      const others = (list: MeshCensusWriter[] | undefined): MeshCensusWriter[] => (list ?? []).filter(writer => writer.pid !== process.pid);
+      const advisory: MeshCensusAdvisory = { writers: others(report.writers), unknown: others(report.unknown) };
+      if (options.json) write(`${JSON.stringify({ command: "census", root: options.root, advisory: true, ...advisory }, null, 2)}\n`);
+      else write(`${formatAdvisory(advisory).join("\n")}\n`);
+      return 0;
+    }
+    // Mutating commands log the census report as advisory on stderr; it never decides anything.
+    library.onAdvisory = (advisory) => {
+      warn(`fabric-mesh-backend: ${describeCensusAdvisory(advisory)}\n`);
+      io.options?.onAdvisory?.(advisory);
+    };
     if (options.command === "status") {
       const status = await meshBackendStatus(options.root, library);
       write(`${options.json ? JSON.stringify(status, null, 2) : formatStatus(status)}\n`);

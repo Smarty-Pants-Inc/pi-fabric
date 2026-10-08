@@ -669,8 +669,9 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 `<mesh>/state-shadow/state.db` for divergence checks, and a SQLite failure never fails a write) or `"sqlite"`
 (`<mesh>/state.db`, SQLite WAL, no mesh `.lock` for state; see `src/mesh/state-backend.ts`). The environment
 variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesystem or a runtime without
-`node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); its writer census is
-advisory only and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
+`node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); `fabric-mesh-backend cutover` is
+fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
+`advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing

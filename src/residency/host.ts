@@ -36,6 +36,7 @@ import { ActorDirectory } from "../actors/directory.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
+import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -237,6 +238,7 @@ export class ResidentHost {
   #staged = false;
   #publicationFailed = false;
   #reloadEvent: Promise<unknown> | undefined;
+  #stateProjector: Promise<StateProjector | undefined> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
   readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
@@ -686,6 +688,7 @@ export class ResidentHost {
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
       if (retentionV2Enabled()) {
@@ -711,9 +714,34 @@ export class ResidentHost {
     }
   }
 
+  /**
+   * smarty-dev#6477 W1: with mesh.stateBackend=shadow (the effective backend, after the env override
+   * and the R16/R19 fallback) this host runs the L3 projector for its mesh root. The lease elects one
+   * active projector per root; another host's stays standby. Loaded on first use; a projector that
+   * cannot open never fails the host (shadow state is not the authority). Its database is the
+   * shadow default <mesh>/state-projector/state.db (projectorDatabaseRoot), never <mesh>/state.db.
+   */
+  #startStateProjector(): void {
+    if (this.mesh.stateBackend !== "shadow" || this.#stateProjector) return;
+    this.#stateProjector = import("../mesh/state-projector.js").then(async ({ StateProjector }) => {
+      const projector = await StateProjector.open({ root: this.config.meshRoot, mode: "shadow" });
+      if (!this.#closed) return projector.run();
+      await projector.stop();
+      return undefined;
+    }).catch(() => undefined);
+  }
+
+  /** The running L3 projector (shadow mode); undefined in file or sqlite mode or when it failed to open. */
+  get stateProjector(): Promise<StateProjector | undefined> {
+    return this.#stateProjector ?? Promise.resolve(undefined);
+  }
+
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    // Stops with the host (shutdown and the release handover's exit alike): the lease is released
+    // so the successor host's projector takes over at once.
+    const projectorStopped = this.#stateProjector?.then(projector => projector?.stop()).catch(() => undefined);
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
@@ -743,6 +771,7 @@ export class ResidentHost {
           await this.#backgroundDeliveries.close();
           await this.#flushingDeliveries;
           await this.participants?.close().catch(() => undefined);
+          await projectorStopped;
           // The host owns its MeshStore: release the state database handle before the host fence,
           // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
           try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }

@@ -45,14 +45,18 @@ describe("MeshStore lock-timing hook", () => {
     await mesh.put({ key: "presence/a", value: { ok: true }, identity });
     await mesh.delete({ key: "presence/a" });
     await mesh.writeBatch({ identity, ops: [{ kind: "put", key: "topology/hosts/a", value: 1 }] });
-    await mesh.writeBatch({ identity: { id: "bridge:peer", name: "peer", kind: "main" }, ops: [], prepare: () => [] });
+    // The class comes from the explicit option of the bridge's own call site, never the identity text.
+    for (let spoof = 0; spoof < 2; spoof++) {
+      await mesh.writeBatch({ identity: { id: "bridge:spoof", name: "spoof", kind: "main" }, ops: [], prepare: () => [] });
+    }
+    await mesh.writeBatch({ identity: { id: "main-1", name: "peer", kind: "main" }, lockClass: "bridge", ops: [], prepare: () => [] });
     await mesh.publish({ topic: "team.auth", from: identity, text: "one" });
     await mesh.publishBatch([{ topic: "team.bridge", from: identity, text: "two" }]);
     expect(await mesh.exclusive(() => 7)).toBe(7);
     await mesh.confirmWritable();
     const recorded = classes(root);
     expect(Object.fromEntries(Object.entries(recorded).map(([name, row]) => [name, row.n]))).toEqual({
-      "put/delete": 2, writeBatch: 1, bridge: 2, publish: 1, custody: 1, "heartbeat/confirm": 1,
+      "put/delete": 2, writeBatch: 3, bridge: 2, publish: 1, custody: 1, "heartbeat/confirm": 1,
     });
     for (const row of Object.values(recorded)) {
       expect(row.holdMs).toBeGreaterThan(0);
@@ -78,6 +82,56 @@ describe("MeshStore lock-timing hook", () => {
     const recorded = classes(root);
     expect(recorded.custody).toMatchObject({ n: 2, timeouts: 1, tries: 0 });
     expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
+  });
+
+  it("counts an ordinary write whose budget ran out before custody as a timeout, never a try", async () => {
+    const root = temp();
+    const mesh = new store.MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    await mesh.put({ key: "presence/a", value: 0, identity }); // state exists: the snapshot path
+    fs.mkdirSync(path.join(root, ".lock"));
+    fs.writeFileSync(path.join(root, ".lock", "owner"), `held\n${process.pid}\n${Date.now()}\n`);
+    // Snapshot preparation (its off-lock staging write) spends the whole budget: #withLock gets 0.
+    const atomic = await import("../src/core/atomic-write.js");
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    const original = atomic.writeFileAtomic;
+    const staging = vi.spyOn(atomic, "writeFileAtomic").mockImplementation((...args: Parameters<typeof original>) => {
+      skew += 1_000;
+      return original(...args);
+    });
+    try {
+      await expect(mesh.put({ key: "presence/a", value: 1, identity })).rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+      expect(staging).toHaveBeenCalled();
+    } finally {
+      staging.mockRestore();
+      clock.mockRestore();
+    }
+    expect(classes(root)["put/delete"]).toMatchObject({ n: 1, timeouts: 1, tries: 0 });
+    // A withTryLock scope and an explicit zero-wait exclusive are still bounded tries.
+    await expect(mesh.withTryLock(() => mesh.put({ key: "presence/a", value: 2, identity }), 0))
+      .rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+    await expect(mesh.exclusive(() => undefined, 0)).rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+    const recorded = classes(root);
+    expect(recorded["put/delete"]).toMatchObject({ n: 1, timeouts: 1, tries: 1 });
+    expect(recorded.custody).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
+  });
+
+  it("closes the FIFO ticket before recording, so bookkeeping never delays a follower", async () => {
+    const root = temp();
+    const mesh = new store.MeshStore(root, 64 * 1024, 100);
+    const { MeshLockTicket } = await import("../src/mesh/lock-queue.js");
+    const close = vi.spyOn(MeshLockTicket.prototype, "close");
+    const acquired = vi.spyOn(registry[lockKey]!.stats as { acquired(): void }, "acquired");
+    try {
+      await mesh.exclusive(() => undefined);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(acquired).toHaveBeenCalledTimes(1);
+      expect(close.mock.invocationCallOrder[0]!).toBeLessThan(acquired.mock.invocationCallOrder[0]!);
+    } finally {
+      close.mockRestore();
+      acquired.mockRestore();
+    }
   });
 
   it("counts one failed try per bounded attempt of a cold protocol-2 store, and no timeout", async () => {

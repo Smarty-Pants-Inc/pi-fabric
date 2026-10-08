@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -79,6 +80,7 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 
 /** Who took the mesh lock: the store entry point, never a stack walk. */
 export type MeshLockClass = "publish" | "put/delete" | "writeBatch" | "heartbeat/confirm" | "custody" | "bridge" | "other";
+const LOCK_CLASSES: ReadonlySet<string> = new Set<MeshLockClass>(["publish", "put/delete", "writeBatch", "heartbeat/confirm", "custody", "bridge", "other"]);
 
 export interface LockStats {
   /** One acquisition: wait runs from the request to custody, hold from custody to release (ms). */
@@ -96,6 +98,9 @@ export const LOCK_STATS_RETAIN_MINUTES = 60;
 const LOCK_STATS_MAX_ROOTS = 32;
 const LOCK_STATS_STALE_FILE_MS = 24 * 60 * 60_000;
 const LOCK_STATS_PRUNE_EVERY_MS = 60 * 60_000;
+/** Reader caps: a stats file is a few KiB; anything near these is not ours. */
+export const LOCK_STATS_MAX_FILE_BYTES = 1024 * 1024;
+export const LOCK_STATS_MAX_FILES = 4096;
 
 export interface LockStatsBucket {
   /** Successful acquisitions. */
@@ -131,7 +136,14 @@ interface ProcessLockStats {
   flush(): void;
   dispose(): void;
 }
-interface RootLockStats { root: string; minutes: Map<number, Partial<Record<MeshLockClass, LockStatsBucket>>>; dirty: boolean; prunedAt: number }
+interface RootLockStats {
+  root: string;
+  minutes: Map<number, Partial<Record<MeshLockClass, LockStatsBucket>>>;
+  dirty: boolean;
+  prunedAt: number;
+  /** The lock-stats directory is unsafe to write: nothing more is recorded for this root. */
+  disabled: boolean;
+}
 const lockKey = Symbol.for("pi-fabric.mesh.lock-stats");
 const lockGlobals = globalThis as typeof globalThis & { [lockKey]?: ProcessLockStats };
 
@@ -155,6 +167,33 @@ const trimMinutes = (minutes: Map<number, unknown>, current: number): void => {
 const lockStatsDisabled = (setting: string | undefined): boolean =>
   setting !== undefined && /^(?:0|off|false|no)$/i.test(setting.trim());
 
+const UNSAFE_DIRECTORY = "FABRIC_LOCK_STATS_UNSAFE_DIRECTORY";
+/** Refuse a lock-stats directory another local user could redirect or plant files in. */
+const checkStatsDirectory = (directory: string): void => {
+  const stat = fs.lstatSync(directory);
+  const uid = process.platform === "win32" ? undefined : process.getuid?.();
+  const reason = stat.isSymbolicLink() ? "is a symlink"
+    : !stat.isDirectory() ? "is not a directory"
+    : uid !== undefined && stat.uid !== uid ? `is owned by uid ${stat.uid}, not ${uid}`
+    : uid !== undefined && (stat.mode & 0o022) !== 0 ? `is group- or other-writable (mode ${(stat.mode & 0o777).toString(8)})`
+    : undefined;
+  if (reason) throw Object.assign(new Error(`${directory} ${reason}`), { code: UNSAFE_DIRECTORY });
+};
+// No private log facility exists for the store: one line per refused root to the profile's
+// private file (never stderr, which belongs to the TUI). Best effort; a missing profile skips it.
+// The profile is resolved inline (as core/agent-dir.ts does): this module stays self-contained
+// because every release generation loads its own copy.
+const warnPrivately = (message: string): void => {
+  try {
+    const configured = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = configured ? configured.replace(/^~(?=$|[\\/])/, os.homedir()) : path.join(os.homedir(), ".pi", "agent");
+    fs.appendFileSync(path.join(agentDir, "fabric-lock-stats.log"),
+      `${new Date().toISOString()} pid ${process.pid}: ${message}\n`, { mode: 0o600 });
+  } catch { /* Diagnostics only. */ }
+};
+const WRITE_FLAGS = process.platform === "win32" ? "wx"
+  : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
+
 /** Sanitized host label used in file names. */
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
@@ -162,7 +201,8 @@ export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^
  * The process's mesh-lock recorder, captured once (including disabled) across module and
  * release reloads, as for commit stats: later generations reuse the first owner's recorder.
  */
-export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): LockStats | undefined => {
+export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
+  options: { warn?: (message: string) => void } = {}): LockStats | undefined => {
   const existing = lockGlobals[lockKey];
   if (existing) return existing.stats;
   if (lockStatsDisabled(setting)) {
@@ -174,15 +214,25 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
   const roots = new Map<string, RootLockStats>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let started = false;
+  const warn = options.warn ?? warnPrivately;
 
   // By age only, the own file included: a fresh own file is never stale, and a stale one (no
   // acquisition here for a day) is safe to delete because the next write recreates it by rename.
   const prune = (directory: string, now: number): void => {
+    checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
       if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
       const file = path.join(directory, name);
       try {
-        if (now - fs.statSync(file).mtimeMs > LOCK_STATS_STALE_FILE_MS) fs.rmSync(file, { force: true });
+        const seen = fs.lstatSync(file);
+        if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
+        // ponytail: re-lstat right before the unlink and skip a file its owner refreshed
+        // (rename = new inode, or a new mtime) since the age check. Best effort: a refresh
+        // between this lstat and the unlink still loses that file, until its owner's next
+        // write after an acquisition recreates it with the whole retained window.
+        const again = fs.lstatSync(file);
+        if (again.ino !== seen.ino || again.mtimeMs !== seen.mtimeMs) continue;
+        fs.unlinkSync(file);
       } catch { /* Raced with its owner or another pruner. */ }
     }
   };
@@ -191,6 +241,8 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
     // Never recreate a removed mesh root: a missing parent fails with ENOENT.
     try { fs.mkdirSync(directory, { mode: 0o700 }); }
     catch (error) { if (errorCodeOf(error) !== "EEXIST") throw error; }
+    // An existing name may be anyone's: write only into our own private directory.
+    checkStatsDirectory(directory);
     trimMinutes(entry.minutes, Math.floor(now / 60_000));
     const name = `${host}-${process.pid}.json`;
     const file = path.join(directory, name);
@@ -198,13 +250,24 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
       version: 1, host, pid: process.pid, root: entry.root, startedAt, updatedAt: now,
       minutes: [...entry.minutes].sort(([a], [b]) => a - b).map(([minute, classes]) => ({ minute, classes })),
     };
-    // Atomic for readers; deliberately not durable (diagnostics, no fsync).
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(body, roundMs), { mode: 0o600 });
-    fs.renameSync(`${file}.tmp`, file);
+    // Atomic for readers; deliberately not durable (diagnostics, no fsync). A unique temporary,
+    // created exclusively and never through a symlink, then renamed over the name (rename
+    // replaces a planted symlink rather than following it).
+    const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+    const descriptor = fs.openSync(temporary, WRITE_FLAGS, 0o600);
+    try {
+      try { fs.writeSync(descriptor, JSON.stringify(body, roundMs)); }
+      finally { fs.closeSync(descriptor); }
+      fs.renameSync(temporary, file);
+    } catch (error) {
+      try { fs.unlinkSync(temporary); } catch { /* Already renamed or gone. */ }
+      throw error;
+    }
   };
   const flush = (): void => {
     const now = Date.now();
     for (const [key, entry] of roots) {
+      if (entry.disabled) continue;
       try {
         if (entry.dirty) {
           write(entry, now);
@@ -216,8 +279,14 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
           prune(path.join(entry.root, LOCK_STATS_DIR), now);
         }
       } catch (error) {
-        // A removed root is forgotten; any other failure retries at the next flush.
-        if (errorCodeOf(error) === "ENOENT" || errorCodeOf(error) === "ENOTDIR") roots.delete(key);
+        // A removed root is forgotten; an unsafe directory disables the root, once and quietly;
+        // any other failure retries at the next flush.
+        if (errorCodeOf(error) === UNSAFE_DIRECTORY) {
+          entry.disabled = true;
+          entry.minutes.clear();
+          entry.dirty = false;
+          warn(`mesh lock stats disabled for ${entry.root}: ${(error as Error).message}`);
+        } else if (errorCodeOf(error) === "ENOENT" || errorCodeOf(error) === "ENOTDIR") roots.delete(key);
       }
     }
   };
@@ -251,7 +320,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
     let entry = roots.get(key);
     if (!entry) {
       if (roots.size >= LOCK_STATS_MAX_ROOTS) return undefined;
-      entry = { root, minutes: new Map(), dirty: false, prunedAt: 0 };
+      entry = { root, minutes: new Map(), dirty: false, prunedAt: 0, disabled: false };
       roots.set(key, entry);
       if (!started) {
         started = true;
@@ -259,6 +328,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
         process.once("exit", onExit);
       }
     }
+    if (entry.disabled) return undefined;
     const minute = Math.floor(Date.now() / 60_000);
     let classes = entry.minutes.get(minute);
     if (!classes) {
@@ -302,33 +372,84 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS): Loc
 // ---------------------------------------------------------------------------------------------
 // Reading and summarizing (fabric-mesh-lock-stats).
 
+const isCount = (value: unknown): boolean => Number.isSafeInteger(value) && (value as number) >= 0;
+const isDuration = (value: unknown): boolean => typeof value === "number" && Number.isFinite(value) && value >= 0;
+const isHistogram = (value: unknown): boolean =>
+  Array.isArray(value) && value.length === LOCK_STATS_BOUNDS_MS.length + 1 && value.every(isCount);
 const isBucket = (value: unknown): value is LockStatsBucket => {
-  const bucket = value as LockStatsBucket | undefined;
-  return !!bucket && typeof bucket === "object" && [bucket.n, bucket.waitMs, bucket.waitMaxMs, bucket.holdMs, bucket.holdMaxMs,
-    bucket.timeouts, bucket.tries].every(Number.isFinite) && Array.isArray(bucket.waitHist) && Array.isArray(bucket.holdHist);
+  const bucket = value as Record<string, unknown> | null;
+  return !!bucket && typeof bucket === "object" && !Array.isArray(bucket) &&
+    [bucket.n, bucket.timeouts, bucket.tries].every(isCount) &&
+    [bucket.waitMs, bucket.waitMaxMs, bucket.holdMs, bucket.holdMaxMs, bucket.failedWaitMs].every(isDuration) &&
+    isHistogram(bucket.waitHist) && isHistogram(bucket.holdHist);
+};
+/** Why a parsed stats file is invalid, or undefined. A file is used whole or not at all. */
+const invalidLockStats = (value: unknown): string | undefined => {
+  const file = value as Partial<LockStatsFile> | null;
+  if (!file || typeof file !== "object" || file.version !== 1) return "not a version-1 stats file";
+  if (typeof file.host !== "string" || !file.host || file.host.length > 256) return "bad host";
+  if (!Number.isSafeInteger(file.pid) || file.pid! < 0) return "bad pid";
+  if (!Array.isArray(file.minutes) || file.minutes.length > LOCK_STATS_RETAIN_MINUTES + 1) return "bad minutes";
+  for (const minute of file.minutes as unknown[]) {
+    const { minute: at, classes } = (minute ?? {}) as Partial<LockStatsMinute>;
+    if (!isCount(at) || !classes || typeof classes !== "object" || Array.isArray(classes)) return "bad minute";
+    for (const [lockClass, bucket] of Object.entries(classes)) {
+      if (!LOCK_CLASSES.has(lockClass)) return "unknown lock class";
+      if (!isBucket(bucket)) return `invalid ${lockClass} counters`;
+    }
+  }
+  return undefined;
+};
+const READ_FLAGS = fs.constants.O_RDONLY | (process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW ?? 0);
+const readRegularFile = (file: string): string => {
+  // Regular files only, never through a symlink, and never more than the cap.
+  if (!fs.lstatSync(file).isFile()) throw new Error("not a regular file");
+  const descriptor = fs.openSync(file, READ_FLAGS);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("not a regular file");
+    if (stat.size > LOCK_STATS_MAX_FILE_BYTES) throw new Error(`larger than ${LOCK_STATS_MAX_FILE_BYTES} bytes`);
+    const buffer = Buffer.alloc(stat.size);
+    let read = 0;
+    while (read < buffer.length) {
+      const count = fs.readSync(descriptor, buffer, read, buffer.length - read, read);
+      if (!count) break;
+      read += count;
+    }
+    return buffer.toString("utf8", 0, read);
+  } finally { fs.closeSync(descriptor); }
 };
 
-/** Every process's file under `<root>/lock-stats`; unreadable or foreign files are skipped. */
-export const readLockStats = (root: string): LockStatsFile[] => {
+/**
+ * Every process's file under `<root>/lock-stats`. Unreadable, oversized, foreign or invalid
+ * files are skipped and named in `problems` (a gate must not pass on what it could not read).
+ */
+export const readLockStats = (root: string, problems: string[] = []): LockStatsFile[] => {
   const directory = path.join(root, LOCK_STATS_DIR);
   let names: string[];
-  try { names = fs.readdirSync(directory); }
-  catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
+  try {
+    if (!fs.lstatSync(directory).isDirectory()) {
+      problems.push(`${directory}: not a directory`);
+      return [];
+    }
+    names = fs.readdirSync(directory);
+  } catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
+  const candidates = names.filter(name => name.endsWith(".json")).sort();
+  if (candidates.length > LOCK_STATS_MAX_FILES) {
+    problems.push(`${directory}: ${candidates.length} stats files, read only the first ${LOCK_STATS_MAX_FILES}`);
+    candidates.length = LOCK_STATS_MAX_FILES;
+  }
   const files: LockStatsFile[] = [];
-  for (const name of names.filter(name => name.endsWith(".json")).sort()) {
+  for (const name of candidates) {
     try {
-      const file = JSON.parse(fs.readFileSync(path.join(directory, name), "utf8")) as LockStatsFile;
-      if (file?.version !== 1 || typeof file.host !== "string" || !Number.isSafeInteger(file.pid) ||
-        !Array.isArray(file.minutes)) continue;
-      file.minutes = file.minutes.filter(minute => Number.isSafeInteger(minute?.minute) && minute.classes &&
-        typeof minute.classes === "object");
-      for (const minute of file.minutes) {
-        for (const [lockClass, bucket] of Object.entries(minute.classes)) {
-          if (!isBucket(bucket)) delete minute.classes[lockClass as MeshLockClass];
-        }
-      }
-      files.push(file);
-    } catch { /* Torn by an older writer or unrelated: skip. */ }
+      const file = JSON.parse(readRegularFile(path.join(directory, name))) as unknown;
+      const invalid = invalidLockStats(file);
+      if (invalid) problems.push(`${name}: ${invalid}`);
+      else files.push(file as LockStatsFile);
+    } catch (error) {
+      // Removed by a pruner since the listing: not a problem.
+      if (errorCodeOf(error) !== "ENOENT") problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   return files;
 };
@@ -368,7 +489,7 @@ const mergeBucket = (into: LockStatsBucket, from: LockStatsBucket): void => {
   into.holdMaxMs = Math.max(into.holdMaxMs, from.holdMaxMs);
   into.timeouts += from.timeouts;
   into.tries += from.tries;
-  into.failedWaitMs += from.failedWaitMs ?? 0;
+  into.failedWaitMs += from.failedWaitMs;
   for (let index = 0; index < into.waitHist.length; index++) {
     into.waitHist[index]! += from.waitHist[index] ?? 0;
     into.holdHist[index]! += from.holdHist[index] ?? 0;

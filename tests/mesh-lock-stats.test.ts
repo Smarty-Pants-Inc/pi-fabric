@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createLockStats, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
+  createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
@@ -153,7 +153,7 @@ describe("mesh lock stats recorder", () => {
   it("never recreates a removed root or throws, and prunes stale files of dead processes", () => {
     const parent = temp();
     const root = path.join(parent, "mesh");
-    fs.mkdirSync(path.join(root, "lock-stats"), { recursive: true });
+    fs.mkdirSync(path.join(root, "lock-stats"), { recursive: true, mode: 0o700 });
     const stale = path.join(root, "lock-stats", "gone-1.json");
     const fresh = path.join(root, "lock-stats", "alive-2.json");
     fs.writeFileSync(stale, "{}");
@@ -170,6 +170,95 @@ describe("mesh lock stats recorder", () => {
     stats.acquired(root, "custody", 1, 1);
     expect(() => registry[lockKey]!.flush()).not.toThrow();
     expect(fs.existsSync(root)).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("writes through a unique exclusive temporary and never follows a planted symlink", () => {
+    const parent = temp();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(path.join(root, "lock-stats"), { recursive: true, mode: 0o700 });
+    const victim = path.join(parent, "victim.txt");
+    const other = path.join(parent, "other.txt");
+    fs.writeFileSync(victim, "precious");
+    fs.writeFileSync(other, "also precious");
+    // The old predictable temporary name, and the final name, both planted as symlinks.
+    fs.symlinkSync(victim, `${ownFile(root)}.tmp`);
+    fs.symlinkSync(other, ownFile(root));
+    const warn = vi.fn();
+    const stats = createLockStats("1", { warn })!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect(fs.readFileSync(victim, "utf8")).toBe("precious");
+    expect(fs.readFileSync(other, "utf8")).toBe("also precious");
+    expect(fs.lstatSync(`${ownFile(root)}.tmp`).isSymbolicLink()).toBe(true);
+    // The rename replaced the planted link itself with the private regular file.
+    const written = fs.lstatSync(ownFile(root));
+    expect(written.isFile() && (written.mode & 0o777)).toBe(0o600);
+    expect(read(root).minutes.at(-1)!.classes.custody).toMatchObject({ n: 1, holdMs: 1 });
+    // No temporary is left behind besides the planted one.
+    expect(fs.readdirSync(path.join(root, "lock-stats")).sort())
+      .toEqual([path.basename(ownFile(root)), `${path.basename(ownFile(root))}.tmp`]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("disables a root whose lock-stats directory is a symlink or writable by others, once", () => {
+    const parent = temp();
+    const linked = path.join(parent, "linked");
+    const elsewhere = path.join(parent, "elsewhere");
+    fs.mkdirSync(linked);
+    fs.mkdirSync(elsewhere, { mode: 0o700 });
+    fs.symlinkSync(elsewhere, path.join(linked, "lock-stats"));
+    const open = path.join(parent, "open");
+    fs.mkdirSync(path.join(open, "lock-stats"), { recursive: true });
+    fs.chmodSync(path.join(open, "lock-stats"), 0o777);
+    const normal = path.join(parent, "normal");
+    fs.mkdirSync(normal);
+    const warn = vi.fn();
+    const stats = createLockStats("1", { warn })!;
+    for (const root of [linked, open, normal]) stats.acquired(root, "custody", 1, 1);
+    expect(() => registry[lockKey]!.flush()).not.toThrow();
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(fs.readdirSync(path.join(open, "lock-stats"))).toEqual([]);
+    expect(read(normal).minutes.at(-1)!.classes.custody).toMatchObject({ n: 1 });
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0]![0]).toMatch(/lock-stats is a symlink/);
+    expect(warn.mock.calls[1]![0]).toMatch(/lock-stats is group- or other-writable \(mode 777\)/);
+    // Disabled for good: later acquisitions neither write nor warn again.
+    for (const root of [linked, open]) stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(fs.readdirSync(path.join(open, "lock-stats"))).toEqual([]);
+  });
+
+  it("re-checks a stale file just before unlinking it and keeps one its owner refreshed meanwhile", () => {
+    const parent = temp();
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(path.join(root, "lock-stats"), { recursive: true, mode: 0o700 });
+    const racing = path.join(root, "lock-stats", "alive-3.json");
+    const stale = path.join(root, "lock-stats", "gone-1.json");
+    const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+    for (const file of [racing, stale]) {
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+    }
+    const lstat = fs.lstatSync;
+    let refreshed = false;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const result = (lstat as (...args: unknown[]) => fs.Stats)(file, ...rest);
+      if (file === racing && !refreshed) {
+        // The owner's rename lands between the age check and the unlink.
+        refreshed = true;
+        fs.writeFileSync(`${racing}.next`, "{\"fresh\":true}");
+        fs.renameSync(`${racing}.next`, racing);
+      }
+      return result;
+    }) as typeof fs.lstatSync);
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect(refreshed).toBe(true);
+    expect(fs.readFileSync(racing, "utf8")).toBe("{\"fresh\":true}");
+    expect(fs.existsSync(stale)).toBe(false);
   });
 
   it("prunes a quiet root hourly without new acquisitions and drops a removed root", () => {
@@ -315,15 +404,28 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     seed(root);
     const now = (MINUTE0 + 2) * 60_000 + 5_000;
     let out = "";
-    const io = { stdout: (text: string) => { out += text; }, now };
+    let err = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: (text: string) => { err += text; }, now };
     expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
+    expect(err).toContain("ignored torn-1.json:");
     expect(out).toContain("busy 15.5% (peak minute 21.0%), 114 acquisitions, timeouts 2, failed tries 3");
     expect(out).toMatch(/classes by hold time:\nclass\s+acq/);
     expect(out.indexOf("writeBatch")).toBeLessThan(out.indexOf("heartbeat/confirm"));
     expect(out).toMatch(/ryzen1-100\s+110/);
+    // The torn file fails any gate, even one the readable files pass.
+    err = "";
+    expect(main(["--mesh", root, "--minutes", "2", "--max-busy", "30"], io)).toBe(3);
+    expect(err).toContain("gate not passed: 1 stats file could not be read or validated");
+    fs.rmSync(path.join(root, "lock-stats", "torn-1.json"));
     out = "";
     expect(main(["--mesh", root, "--minutes", "2", "--json", "--max-busy", "30"], io)).toBe(0);
-    expect(JSON.parse(out)).toMatchObject({ n: 114, timeouts: 2 });
+    const summary = JSON.parse(out) as { n: number; timeouts: number; busyPct: number };
+    expect(summary).toMatchObject({ n: 114, timeouts: 2 });
+    // --max-busy is the bound to stay under (busy < PCT): equality fails. --max-timeouts N allows N.
+    expect(main(["--mesh", root, "--minutes", "2", "--max-busy", String(summary.busyPct)], io)).toBe(3);
+    expect(main(["--mesh", root, "--minutes", "2", "--max-busy", String(summary.busyPct + 0.01)], io)).toBe(0);
+    expect(main(["--mesh", root, "--minutes", "2", "--max-timeouts", "2"], io)).toBe(0);
+    expect(main(["--mesh", root, "--minutes", "2", "--max-timeouts", "1"], io)).toBe(3);
     expect(main(["--mesh", root, "--minutes", "2", "--max-busy", "10"], io)).toBe(3);
     expect(main(["--mesh", root, "--minutes", "2", "--max-timeouts", "0"], io)).toBe(3);
     out = "";
@@ -331,5 +433,50 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(out).toContain("no lock acquisitions recorded in this window");
     expect(() => main(["--minutes"], io)).toThrow(/Missing value/);
     expect(() => main(["--bogus", "1"], io)).toThrow(/Bad argument/);
+  });
+
+  it("ignores invalid counters, unknown classes, symlinks and oversized files, and no gate passes on them", () => {
+    const root = temp();
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    fixture(root, "ryzen1", 100, [{ minute: MINUTE0, classes: { publish: bucket({ n: 1, holdMs: 10 }) } }]);
+    fixture(root, "evil", 1, [{ minute: MINUTE0, classes: { custody: bucket({ timeouts: -1 }) } }]);
+    fixture(root, "evil", 2, [{ minute: MINUTE0, classes: { custody: bucket({ n: 1.5 }) } }]);
+    fixture(root, "evil", 3, [{ minute: MINUTE0, classes: { custody: bucket({ waitHist: [1] }) } }]);
+    fixture(root, "evil", 4, [{ minute: MINUTE0, classes: { bogus: bucket({}) } as LockStatsFile["minutes"][number]["classes"] }]);
+    fixture(root, "evil", 5, [{ minute: MINUTE0, classes: { custody: bucket({ holdMs: -5, failedWaitMs: Number.NaN }) } }]);
+    fs.writeFileSync(path.join(root, "lock-stats", "big-7.json"), " ".repeat(LOCK_STATS_MAX_FILE_BYTES + 1));
+    const symlinks = process.platform !== "win32";
+    if (symlinks) fs.symlinkSync(path.join(root, "lock-stats", "ryzen1-100.json"), path.join(root, "lock-stats", "link-6.json"));
+    const problems: string[] = [];
+    expect(readLockStats(root, problems).map(file => file.pid)).toEqual([100]);
+    expect(problems).toHaveLength(symlinks ? 7 : 6);
+    expect(problems).toEqual(expect.arrayContaining([
+      "evil-1.json: invalid custody counters", "evil-2.json: invalid custody counters",
+      "evil-3.json: invalid custody counters", "evil-4.json: unknown lock class", "evil-5.json: invalid custody counters",
+      `big-7.json: larger than ${LOCK_STATS_MAX_FILE_BYTES} bytes`,
+      ...symlinks ? ["link-6.json: not a regular file"] : [],
+    ]));
+    let out = "";
+    let err = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: (text: string) => { err += text; }, now };
+    // timeouts:-1 must not make --max-timeouts 0 pass: the file is ignored, and the gate fails on it.
+    expect(main(["--mesh", root, "--minutes", "2", "--max-timeouts", "0"], io)).toBe(3);
+    expect(err).toContain("ignored evil-1.json: invalid custody counters");
+    expect(err).toContain(`gate not passed: ${problems.length} stats files could not be read or validated`);
+    expect(out).toContain("timeouts 0");
+    // Without a gate the view prints and exits 0; the warnings stay on stderr.
+    expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
+  });
+
+  it("escapes control characters in printed host labels", () => {
+    const root = temp();
+    fs.mkdirSync(path.join(root, "lock-stats"));
+    const file: LockStatsFile = { version: 1, host: "a\u001b[2Jb\nc", pid: 9, root, startedAt: T0, updatedAt: T0,
+      minutes: [{ minute: MINUTE0, classes: { publish: bucket({ n: 1, holdMs: 10 }) } }] };
+    fs.writeFileSync(path.join(root, "lock-stats", "x-9.json"), JSON.stringify(file));
+    let out = "";
+    expect(main(["--mesh", root, "--minutes", "2"], { stdout: (text: string) => { out += text; }, now: (MINUTE0 + 2) * 60_000 })).toBe(0);
+    expect(out).toContain("a\\u001b[2Jb\\u000ac-9");
+    expect(out).not.toContain("\u001b");
   });
 });

@@ -9,7 +9,9 @@ const USAGE = `Usage: fabric-mesh-lock-stats [--mesh DIR] [--minutes N] [--top K
 
 Prints the mesh lock's busy %, timeouts, top caller classes by hold time and top pids over
 the last N complete minutes (default 10, at most ${LOCK_STATS_RETAIN_MINUTES}), summed over every process on the root.
---max-busy and --max-timeouts exit 3 when the window exceeds them (a stage gate).`;
+Stage gates exit 3: --max-busy PCT when busy % is at or above PCT (the gate is busy < PCT),
+--max-timeouts N when there are more than N timeouts. With either gate, an unreadable or invalid
+stats file also exits 3: the gate never passes on files it could not read.`;
 
 interface Options { mesh?: string; minutes: number; top: number; json: boolean; maxBusy?: number; maxTimeouts?: number }
 
@@ -36,6 +38,9 @@ const parseArgs = (argv: string[]): Options | "help" => {
 const ms = (value: number): string => value === Number.POSITIVE_INFINITY ? ">10s"
   : value >= 1_000 ? `${(value / 1_000).toFixed(2)}s` : `${value.toFixed(value >= 100 ? 0 : 1)}ms`;
 const pct = (value: number): string => `${value.toFixed(1)}%`;
+// Labels come from files any process on the root can write: never print raw control or bidi characters.
+const label = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+  (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const clock = (minute: number): string => new Date(minute * 60_000).toISOString().slice(11, 16);
 const table = (rows: string[][]): string => {
   const widths = rows[0]!.map((_, column) => Math.max(...rows.map(row => row[column]!.length)));
@@ -45,7 +50,7 @@ const table = (rows: string[][]): string => {
 
 const formatLockStats = (summary: LockStatsSummary): string => {
   const lines = [
-    `mesh lock ${summary.root}: last ${summary.minutes} min (${clock(summary.fromMinute)}-${clock(summary.toMinute + 1)} UTC), ` +
+    `mesh lock ${label(summary.root)}: last ${summary.minutes} min (${clock(summary.fromMinute)}-${clock(summary.toMinute + 1)} UTC), ` +
       `${summary.processes} process${summary.processes === 1 ? "" : "es"}`,
     `busy ${pct(summary.busyPct)} (peak minute ${pct(summary.peakMinuteBusyPct)}), ${summary.n} acquisitions, ` +
       `timeouts ${summary.timeouts}, failed tries ${summary.tries}`,
@@ -55,26 +60,37 @@ const formatLockStats = (summary: LockStatsSummary): string => {
   if (!summary.n && !summary.timeouts && !summary.tries) return [...lines, "no lock acquisitions recorded in this window"].join("\n");
   lines.push("", "classes by hold time:", table([
     ["class", "acq", "hold", "share", "busy", "hold mean", "hold p99<=", "hold max", "wait mean", "wait p99<=", "wait max", "timeouts", "tries"],
-    ...summary.classes.map(row => [row.lockClass, String(row.n), ms(row.holdMs), pct(row.holdSharePct), pct(row.busyPct),
+    ...summary.classes.map(row => [label(row.lockClass), String(row.n), ms(row.holdMs), pct(row.holdSharePct), pct(row.busyPct),
       ms(row.holdMeanMs), ms(row.holdP99Ms), ms(row.holdMaxMs), ms(row.waitMeanMs), ms(row.waitP99Ms), ms(row.waitMaxMs),
       String(row.timeouts), String(row.tries)]),
   ]), "", "top pids by hold time:", table([
     ["host-pid", "acq", "hold", "busy", "hold mean", "wait mean", "wait max", "timeouts", "tries", "top class"],
-    ...summary.pids.map(row => [`${row.host}-${row.pid}`, String(row.n), ms(row.holdMs), pct(row.busyPct), ms(row.holdMeanMs),
+    ...summary.pids.map(row => [`${label(row.host)}-${row.pid}`, String(row.n), ms(row.holdMs), pct(row.busyPct), ms(row.holdMeanMs),
       ms(row.waitMeanMs), ms(row.waitMaxMs), String(row.timeouts), String(row.tries), row.topClass ?? "-"]),
   ]));
   return lines.join("\n");
 };
 
-export const main = (argv: string[], io: { stdout?: (text: string) => void; now?: number; env?: NodeJS.ProcessEnv; cwd?: string } = {}): number => {
+export const main = (argv: string[], io: {
+  stdout?: (text: string) => void; stderr?: (text: string) => void; now?: number; env?: NodeJS.ProcessEnv; cwd?: string;
+} = {}): number => {
   const write = io.stdout ?? ((text: string) => void process.stdout.write(text));
+  const warn = io.stderr ?? ((text: string) => void process.stderr.write(text));
   const options = parseArgs(argv);
   if (options === "help") { write(`${USAGE}\n`); return 0; }
   const root = path.resolve(options.mesh ?? resolveMeshRoot(io.env, io.cwd));
-  const summary = summarizeLockStats(root, readLockStats(root), { minutes: options.minutes, top: options.top, now: io.now });
+  const problems: string[] = [];
+  const summary = summarizeLockStats(root, readLockStats(root, problems), { minutes: options.minutes, top: options.top, now: io.now });
+  for (const problem of problems) warn(`fabric-mesh-lock-stats: ignored ${label(problem)}\n`);
+  const gated = options.maxBusy !== undefined || options.maxTimeouts !== undefined;
   write(`${options.json ? JSON.stringify(summary, (_key, value: unknown) =>
     value === Number.POSITIVE_INFINITY ? "Infinity" : value, 2) : formatLockStats(summary)}\n`);
-  const over = (options.maxBusy !== undefined && summary.busyPct > options.maxBusy) ||
+  // --max-busy is the bound the gate must stay under (busy < PCT); --max-timeouts N allows N.
+  const over = (options.maxBusy !== undefined && summary.busyPct >= options.maxBusy) ||
     (options.maxTimeouts !== undefined && summary.timeouts > options.maxTimeouts);
+  if (gated && problems.length) {
+    warn(`fabric-mesh-lock-stats: gate not passed: ${problems.length} stats file${problems.length === 1 ? "" : "s"} could not be read or validated\n`);
+    return 3;
+  }
   return over ? 3 : 0;
 };

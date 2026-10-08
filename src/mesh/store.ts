@@ -2038,7 +2038,8 @@ export class MeshStore {
 
   /** Runs a synchronous operation under mesh custody without writing shared state. */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs, "custody");
+    // An explicit zero budget is a bounded try (lock stats count it as a try, not a timeout).
+    return this.#withLock(operation, lockTimeoutMs, "custody", lockTimeoutMs === 0);
   }
 
   /**
@@ -2105,6 +2106,8 @@ export class MeshStore {
     ops: MeshBatchOperation[];
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
+    /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
+    lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
@@ -2197,7 +2200,7 @@ export class MeshStore {
       }
       input.afterCommit?.(view);
       return results;
-    }, undefined, input.identity.id.startsWith("bridge:") ? "bridge" : "writeBatch");
+    }, undefined, input.lockClass === "bridge" ? "bridge" : "writeBatch");
   }
 
   /**
@@ -2390,9 +2393,14 @@ export class MeshStore {
   // Global actor-custody order: actor registries (sorted path), then mesh.
   // Mesh critical sections are synchronous: never await a registry mutation
   // here or wrap resident async controls in this second/innermost lock.
-  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other"): Promise<T> {
+  // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
+  // reduced remaining budget from an ordinary caller is never a try.
+  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
+    bounded = false): Promise<T> {
     const lockWaitStart = lockStats ? performance.now() : 0;
     let lockHeldAt = -1;
+    let holdMs = -1;
+    let failedWaitMs = -1;
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
@@ -2402,8 +2410,8 @@ export class MeshStore {
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
       (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // A bounded try that fails closed before the common accounting below: count it once here.
-      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, true);
+      // Fails closed before the common accounting below: count it once here.
+      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
       throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
     }
     const startTime = this.#lockProtocol === 2
@@ -2520,14 +2528,17 @@ export class MeshStore {
         throw error;
       } finally {
         releaseOwned();
-        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, performance.now() - lockHeldAt);
+        if (lockStats) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (lockHeldAt < 0 && error instanceof MeshLockTimeoutError) {
-        lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || lockTimeoutMs === 0);
-      }
+      if (lockStats && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
       throw error;
-    } finally { ticket.close(); }
+    } finally {
+      ticket.close();
+      // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
+      if (holdMs >= 0) lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
+      else if (failedWaitMs >= 0) lockStats?.failed(this.root, lockClass, failedWaitMs, Boolean(scope?.active) || bounded);
+    }
   }
 
   // Complete dead/different-incarnation receipts recover immediately. Empty ownerless

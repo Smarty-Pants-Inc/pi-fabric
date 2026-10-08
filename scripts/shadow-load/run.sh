@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full-load shadow soak of a Fabric release candidate against a baseline (smarty-dev#6477 stage 1).
-#   scripts/shadow-load/run.sh <candidate-release> <baseline-release> [minutes] [--profile fleet|legacy] [orchestrate.mjs flags...]
-# Default 30 minutes, profile fleet (README.md, calibration). Exit 0 PASS, 1 FAIL, 2 harness error. The report directory is printed at the end.
+#   scripts/shadow-load/run.sh <candidate-release> <baseline-release> [minutes] [--profile fleet|legacy] [--reference REPORT.json] [--lock-stats 0|1] [orchestrate.mjs flags...]
+# Default 30 minutes, profile fleet. --reference judges with the relative release gates (gate.mjs); --lock-stats sets PI_FABRIC_LOCK_STATS (default 1). README.md. Exit 0 PASS, 1 FAIL, 2 harness error.
 set -euo pipefail
 if [[ $# -lt 2 || "$1" == -h || "$1" == --help ]]; then
   sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'

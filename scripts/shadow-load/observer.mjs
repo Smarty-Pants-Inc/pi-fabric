@@ -15,12 +15,14 @@ const startedAt = Date.now();
 
 let expected = { participants: [] };
 let expectedStamp = '';
+let expectedIndex = new Map();
 const reloadExpected = () => {
   try {
     const stat = fs.statSync(args.expected);
     const stamp = `${stat.mtimeMs}:${stat.size}`;
     if (stamp === expectedStamp) return;
     expected = readJson(args.expected) ?? expected;
+    expectedIndex = new Map(expected.participants.map((participant, index) => [participant.id, index]));
     expectedStamp = stamp;
   } catch { /* not written yet */ }
 };
@@ -44,6 +46,17 @@ const leaseOf = id => {
 };
 const leaseLimitMs = Number(args['max-lease-s'] ?? 15) * 1_000;
 const overEvents = [];
+// Timeline in 10 s buckets, uncapped: max lease age, lapsed and missing participants (as indexes into
+// the expected list) and directory misses, so the gates can judge any window (before the pin change,
+// the reload window, after the bridge restart) exactly.
+const BUCKET_MS = 10_000;
+const timeline = new Map();
+const bucketOf = at => {
+  const t = Math.floor(at / BUCKET_MS) * BUCKET_MS;
+  let row = timeline.get(t);
+  if (!row) timeline.set(t, row = { t, leaseMaxMs: 0, overSamples: 0, over: new Set(), misses: 0, missing: new Set(), listErrors: 0 });
+  return row;
+};
 setInterval(() => {
   reloadExpected();
   const now = Date.now();
@@ -67,8 +80,12 @@ setInterval(() => {
       age = Math.max(age, envelopeAge);
     }
     if (age > row.maxAgeMs) { row.maxAgeMs = age; row.maxAgeAt = now; }
+    const bucket = bucketOf(now);
+    bucket.leaseMaxMs = Math.max(bucket.leaseMaxMs, age);
     if (age > leaseLimitMs) {
       row.over++;
+      bucket.overSamples++;
+      bucket.over.add(expectedIndex.get(participant.id) ?? -1);
       if (overEvents.length < 200) overEvents.push({ at: now, id: participant.id, name: participant.name, kind: participant.kind, ageMs: age });
     }
   }
@@ -86,6 +103,7 @@ setInterval(() => {
   try { listed = reader.list({ scope: 'project', fresh: true, includeStale: true }); }
   catch (error) {
     directory.misses++;
+    bucketOf(Date.now()).listErrors++;
     if (directory.missEvents.length < 200) directory.missEvents.push({ at: Date.now(), error: String(error?.message ?? error).slice(0, 200) });
     return;
   }
@@ -104,6 +122,9 @@ setInterval(() => {
     const info = byId.get(participant.id);
     if (info && !info.stale) continue;
     directory.misses++;
+    const bucket = bucketOf(Date.now());
+    bucket.misses++;
+    bucket.missing.add(expectedIndex.get(participant.id) ?? -1);
     directory.missingIds.set(participant.id, (directory.missingIds.get(participant.id) ?? 0) + 1);
     if (directory.missEvents.length < 200) directory.missEvents.push({ at: Date.now(), id: participant.id, name: participant.name, kind: participant.kind, reason: info ? 'stale' : 'absent' });
   }
@@ -125,7 +146,9 @@ const summary = () => {
       worst: rows.slice(0, 8).map(row => ({ ...row, name: names.get(row.id)?.name, kind: names.get(row.id)?.kind })), overEvents },
     directory: { samples: directory.samples, misses: directory.misses, missingParticipants: directory.missingIds.size,
       missing: [...directory.missingIds.entries()].slice(0, 20).map(([id, count]) => ({ id, name: names.get(id)?.name, count })),
-      missEvents: directory.missEvents, counts, remote: directory.remote, local: directory.local,
+      missEvents: directory.missEvents, counts, remote: directory.remote,
+      timeline: { bucketMs: BUCKET_MS, buckets: [...timeline.values()].sort((a, b) => a.t - b.t).map(row => ({ t: row.t, leaseMaxMs: row.leaseMaxMs,
+        overSamples: row.overSamples, over: [...row.over], misses: row.misses, missing: [...row.missing], listErrors: row.listErrors })) }, local: directory.local,
       listMeanMs: directory.samples ? Math.round(directory.listMs.sum / directory.samples) : null, listMaxMs: Math.round(directory.listMs.max) },
   };
 };

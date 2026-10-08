@@ -12,6 +12,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { argMap, delay, entryImport, readJson, residentHostId, residentRoot, writeJson } from './candidate.mjs';
+import { gateMetrics, judge, marginsFrom, metricsOf, renderGate } from './gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = argMap(process.argv.slice(2));
@@ -31,7 +32,17 @@ const opt = {
   maxBusy: num('max-busy', 30), maxTimeouts: num('max-timeouts', 0), maxLeaseS: num('max-lease-s', 15), maxWaitP99S: num('max-wait-p99-s', 5), maxCountDriftPct: num('max-count-drift-pct', 2),
   memBudgetMb: num('mem-budget-mb', 8192), heapMb: num('heap-mb', 240), semiSpaceMb: num('semi-space-mb', 4), canaryEveryS: num('canary-every-s', 120),
   burnPct: num('burn-pct', 80), burnThreads: num('burn-threads', os.cpus().length), burnDuty: args['burn-duty'] === undefined || args['burn-duty'] === 'off' ? null : num('burn-duty', 0), profile: String(args.profile ?? 'none'), keep: Boolean(args.keep),
+  // PI_FABRIC_LOCK_STATS for every child. Only releases with L8 lock stats read it, so with a
+  // pre-L8 baseline this switches the candidate's lock stats (its Mains, hosts, spokes, bridges).
+  lockStats: String(args['lock-stats'] ?? '1'),
 };
+// --reference REPORT.json: judge with the relative release gates (gate.mjs) instead of the absolute ones.
+let reference = null;
+const gateMargins = marginsFrom(args, true);
+if (args.reference) {
+  try { reference = { file: path.resolve(String(args.reference)), metrics: metricsOf(path.resolve(String(args.reference))) }; }
+  catch (error) { process.stderr.write(`Bad --reference: ${error?.message ?? error}\n`); process.exit(2); }
+}
 if (opt.hosts > opt.mains) throw new Error('--hosts cannot exceed --mains: each resident host belongs to a Main');
 for (const dir of new Set(Object.values(releases))) {
   for (const entry of ['dist/mesh.js', 'dist/participants-cli.js', 'dist/residency/host.js', 'dist/residency/actor-client.js', 'dist/fabric-runtime-state.js', 'bin/mesh-bridge']) {
@@ -60,7 +71,7 @@ const baseEnv = {
   // A small young generation keeps each process's RSS near its live heap: V8 otherwise grows
   // semi-spaces to 32+ MB per process before collecting the parsed mesh state it churns through.
   NODE_OPTIONS: `--max-old-space-size=${opt.heapMb} --max-semi-space-size=${opt.semiSpaceMb} --import=${pathToFileURL(path.join(here, 'instrument.mjs')).href}`,
-  SHADOW_RELEASE: release, SHADOW_STATS_DIR: dirs.stats, SHADOW_HUB: dirs.hub, PI_FABRIC_LOCK_STATS: '1',
+  SHADOW_RELEASE: release, SHADOW_STATS_DIR: dirs.stats, SHADOW_HUB: dirs.hub, PI_FABRIC_LOCK_STATS: opt.lockStats,
 };
 const procs = [];
 const unexpectedExits = [];
@@ -419,7 +430,8 @@ try {
   const afterRestart = list => restartMarker ? (list ?? []).filter(event => event.at >= restartMarker).length : 0;
 
   // 7. Verdicts.
-  const hasL8 = Boolean(l8 && !l8.error);
+  // With PI_FABRIC_LOCK_STATS=0 the stats CLI finds no records: the instrument is the source then.
+  const hasL8 = Boolean(l8 && !l8.error && l8.n > 0);
   const lock = {
     source: hasL8 ? 'L8 lock-stats (candidate)' : 'instrument (candidate predates L8 lock stats): owner-record wait, hold sum',
     busyPct: hasL8 ? Math.round(l8.busyPct * 10) / 10 : instrumented.busyPct ?? observed.lock?.busyPct ?? null,
@@ -469,10 +481,19 @@ try {
     f: { name: 'pin change: every autoReload Main self-reloaded onto the candidate', pass: pinned && pin.done === pin.due && pin.errors.length === 0 },
     memory: { name: `total PSS <= ${opt.memBudgetMb} MB`, pass: !memoryExceeded && memory.peakTotalMb <= opt.memBudgetMb },
   };
-  const pass = Object.values(verdicts).every(verdict => verdict.pass);
-  Object.assign(result, { pass, verdicts, lock, lease: leaseCheck, participantCount, pin, cpu, canary: canaryResults, driver: driven,
+  const absolutePass = Object.values(verdicts).every(verdict => verdict.pass);
+  Object.assign(result, { pass: absolutePass, verdicts, lock, lease: leaseCheck, participantCount, pin, cpu, canary: canaryResults, driver: driven,
     memory: { ...memory, budgetMb: opt.memBudgetMb }, unexpectedExits, restarted, finishedAt: Date.now(), processes: procs.length });
-  exitCode = pass ? 0 : 1;
+  // The figures the release gate judges, embedded so this report can serve as a --reference alone.
+  try { result.metrics = gateMetrics(result, observed); }
+  catch (error) { result.metricsError = String(error?.stack ?? error); log(`gate metrics failed (rerun gate.mjs on report.json): ${error?.message ?? error}`); }
+  if (reference && result.metrics) {
+    const gate = judge(result.metrics, reference.metrics, gateMargins);
+    result.gate = { reference: reference.file, referenceMetrics: reference.metrics, ...gate };
+    result.absolutePass = absolutePass;
+    result.pass = gate.pass;
+  }
+  exitCode = reference && !result.metrics ? 2 : result.pass ? 0 : 1;
 } catch (error) {
   result.error = String(error?.stack ?? error);
   log(`HARNESS ERROR: ${error?.message ?? error}`);
@@ -495,7 +516,7 @@ function renderReport(r) {
   const minutes = ((r.loadEndedAt - r.loadStartedAt) / 60_000).toFixed(1);
   const o = r.options;
   const lines = [
-    `# Fabric full-load shadow test: ${mark(r.pass)}`, '',
+    `# Fabric full-load shadow test: ${mark(r.pass)}${r.gate ? ' (release gate against the reference; absolute checks below are informational)' : ''}`, '',
     `Candidate \`${r.candidate}\` vs baseline \`${r.baseline}\`, ${minutes} min at load; ${o.mains} hub Mains (${Math.round(o.mains * o.baselineFraction)} baseline), ` +
       `${o.hosts} resident hosts x ${o.actors} actors, ${o.spokes} spokes x ${o.spokeMains} Mains, bridges ${r.bridges?.join(', ')} (restarted once: ${r.restarted}), ` +
       `${o.rate}/s + forwarder ${o.forwardPerMin}/min (bursts ~${o.forwardBurst}), wakes every ${o.wakeS} s; ${r.processes} processes.`, '',
@@ -529,5 +550,6 @@ function renderReport(r) {
     `- peak total PSS ${r.memory.peakTotalMb} MB (budget ${r.memory.budgetMb}; plain RSS sum peak ${r.memory.peakRssSumMb} MB); largest process ${r.memory.peakProcess} ${r.memory.peakProcessMb} MB PSS`,
     ...(r.driver.errors?.length ? ['', 'First driver errors:', ...r.driver.errors.slice(0, 5).map(item => `- ${item.message}`)] : []),
   ];
-  return `${lines.join('\n')}\n`;
+  const gate = r.gate ? ['', renderGate(r.gate, r.metrics, r.gate.referenceMetrics, { reference: r.gate.reference })] : [];
+  return `${[...lines, ...gate].join('\n')}\n`;
 }

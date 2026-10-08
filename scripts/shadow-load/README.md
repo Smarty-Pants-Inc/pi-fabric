@@ -44,8 +44,17 @@ that `dist/participants-cli.js` or `dist/residency/host.js` imports. Nothing is 
 
 The harness and every child run at `nice -n 19` (the burner does not), each child with
 `--max-old-space-size=240` (`--heap-mb`). Total PSS is sampled every second; above
-`--mem-budget-mb` (8192) the run aborts and FAILs. With the defaults it peaks near 7.5 to 8 GB
-(the 4.8 MB state is parsed by every Main's store). The burner is outside the budget (a few MB).
+`--mem-budget-mb` (8192) the run aborts and FAILs. With the built-in defaults it peaks near 7.5
+to 8.5 GB (the 4.8 MB state is parsed by every Main's store) and 8 Mains per process with a
+240 MB heap run out of heap at the pin change (the reload holds a second store per Main). The
+fleet profile (4 Mains per process, 640 MB heap, 10 MB state) peaks at 15 to 17 GB under a
+32 GB budget. The burner is outside the budget (a few MB).
+
+A Main whose `start()` rejects (its initial publish hit a busy lock) keeps its directory: the
+release arms the heartbeat timer before that publish, so the directory joins later on its own.
+Before calibration the harness started a second directory for the same Main on each retry, which
+left up to 6 heartbeating directories per Main after a pin change and turned the reload into a
+lock storm that never settled.
 
 ## The checks
 
@@ -75,6 +84,53 @@ minus that, hold = acquisition until the `.lock.released.<token>` rename, busy %
 complete load minutes. It also counts `FABRIC_MESH_LOCK_TIMEOUT` rejections of full-budget
 `MeshStore` entry points (bounded tries separately, as L8 does), and wraps the reload target's
 `MeshStore` too. The `.lock` presence sampler is reported as a cross-check.
+
+## Calibration
+
+Target (smarty-dev#6477 stage 1): release 04930dfd against itself over 15 min should show Ryzen 1's
+fleet lock load, lock busy 55 to 65% and 20 to 30 `FABRIC_MESH_LOCK_TIMEOUT` per minute, with
+host CPU PSI near 50 to 60%, inside a 32 GB memory cap on epyc1 (32 CPUs, shared with other
+tenants). Calibrated 2026-10-08 on epyc1; lock numbers from the instrument (04930dfd predates L8).
+Runs r1 to r12 are 3 to 5 min, c1 and c2 the 15-min profile runs. "late pin" runs move the pin
+change and the bridge restart to 90/95% of the run, so the window measures steady state.
+
+| run | knobs (changed from the row above) | PSS peak | host CPU | PSI | lock busy | wait p99 | timeouts/min | gates failed |
+|---|---|---|---|---|---|---|---|---|
+| r1 | legacy defaults (ppp 8, heap 240, state 4.8, burner controller 80%), cap 32 GB | 8.6 GB | 84% | 18% | 19.3% | <=10 s | 33.6 | a b c d e f; 3 Mains processes OOM at the pin |
+| r2 | ppp 4, heap 640, state 9 | 17.6 GB | 90% | 27% | 28.8% (41% pre-pin) | <=7.5 s | 70.1 (0 pre-pin) | a b c d e f |
+| r3 | state 10, actor-save-s 10 | 17.9 GB | 86% | 22% | 23.8% | <=7.5 s | 60.7 | a b c d e f |
+| r4 | fix: keep a Main's directory when start() rejects | 15.6 GB | 84% | 20% | 24.8% (35% pre-pin) | <=5 s | 28.1 (0 pre-pin) | a b d e |
+| r5 | burner fixed duty 0.25 | 14.9 GB | 92% | 33% | 22.4% | <=7.5 s | 30 | a b c d e |
+| r6 | state 12, saves-in-flight 4, duty 0.4, late pin | 15.3 GB | 90% | 27% | 33.1% | <=5 s | 15.5 | a b c d e |
+| r7 | duty 0.7, late pin | 15.0 GB | 97% | 38% | 31.2% | <=2 s | 14.3 | a b c d |
+| r8 | state 10, duty 0.4, churn-s 15, late pin | 16.0 GB | 95% | 39% | 19.0% | <=5 s | 157 | a b c d e |
+| r9 | ppp 2 (as r8) | 19.0 GB | 97% | 48% | 21.5% | <=10 s | 168 | a b c d e f |
+| r10 | ppp 4, state 16, churn off, duty 0.5, late pin | 18.2 GB | 95% | 33% | 29.8% | <=3 s | 13.8 | a b c d |
+| r11 | state 10, actors 20 per host, late pin | 14.1 GB | 96% | 34% | 30.5% | <=3 s | 19 | a b c d |
+| r12 | actors 10, churn-s 40, pin 40% | 16.1 GB | 96% | 39% | 19.8% | <=7.5 s | 118.6 | a b c d e |
+| c1 | fleet profile with churn-s 120, 15 min | 16.7 GB | 96% | 42% | 20.2% (peak 28.3) | <=5 s | 45.3 | a b c d e |
+| c2 | fleet profile (churn-s 300), 15 min | __C2__ |
+
+What the runs show:
+
+- Memory: 4 Mains per process with a 640 MB heap removes the reload OOM; 2 per process costs
+  +3 GB and changes no lock number (r9 vs r8), so per-process packing is not what limits the lock.
+- Lock busy has a ceiling near 30 to 35% on epyc1 with this release. More state (9 to 16 MB),
+  more actors, more registry saves in flight and a hotter burner barely lengthen the holds (host
+  holds stay 14 to 20 ms, bridge holds 30 to 45 ms). More writers do not raise busy either: turn
+  churn at 15 to 40 s per Main drops busy to about 20% while timeouts jump to 120 to 170/min. The
+  lock's FIFO admission then idles the lock while CPU-starved queue heads (nice 19) come back,
+  and most timeouts are queued waiters that never got an attempt ("after 0 attempts").
+- So 55 to 65% busy and 20 to 30 timeouts/min cannot be reached together here: the timeout rate
+  is the knob that can be matched (turn churn), lock busy stays near 20 to 30%. The fleet's busy
+  figure needs re-checking against the instrument's definition (hold from owner record to
+  release; the `.lock` presence sampler agrees within a few points) before it is used as a gate.
+- PSI: the fixed-duty burner (0.5 x 32 CPUs at nice 0) gives 34 to 48% PSI; the controller
+  (`--burn-pct 80`) adds nothing because the harness and other tenants keep the host above 80%.
+
+The fleet profile (`run.sh` default; `--profile legacy` restores the built-in defaults):
+`--mains-per-process 4 --heap-mb 640 --mem-budget-mb 32768 --state-mb 10 --actor-save-s 10
+--saves-in-flight 4 --churn-s 300 --burn-duty 0.5`.
 
 ## Files
 

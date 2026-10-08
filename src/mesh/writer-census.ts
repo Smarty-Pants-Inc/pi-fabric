@@ -15,6 +15,10 @@ export interface CensusWriter {
   releaseSha?: string;
   lockProtocol?: number;
   stateBackend?: string;
+  /** Every backend the process opened, when more than one; stateBackend is the most dangerous. */
+  stateBackends?: string[];
+  /** Every lock protocol the process opened, when more than one; lockProtocol is the oldest. */
+  lockProtocols?: number[];
   startedAt?: number;
   source: "process-record" | "host-lease" | "lock-owner" | "lock-ticket";
   name?: string;
@@ -28,6 +32,8 @@ export interface WriterCensus {
   clean: boolean;
 }
 
+const backendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
+
 const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined);
 
 /**
@@ -38,12 +44,22 @@ const processAlive = (pid: number): boolean => censusRecordAlive(pid, undefined)
  */
 const leaseWriter = (record: MeshWriterRecord): Omit<CensusWriter, "source" | "name"> => {
   const value = record as unknown as Record<string, unknown>;
+  // A process that opened several backends or protocols lists them all; its top-level fields must
+  // name the most dangerous backend and the oldest protocol, or they are not trusted (pi-fabric#638).
+  const backends = value.stateBackends ?? [value.stateBackend];
+  const protocols = value.lockProtocols ?? [value.lockProtocol];
+  const backendsAgree = Array.isArray(backends) && backends.includes(value.stateBackend) &&
+    backends.every(item => validWriterStateBackend(item) && backendRank[item]! <= backendRank[value.stateBackend as string]!);
+  const protocolsAgree = Array.isArray(protocols) && protocols.includes(value.lockProtocol) &&
+    protocols.every(item => validWriterLockProtocol(item) && item >= (value.lockProtocol as number));
   return {
     ...(validWriterPid(value.pid) ? { pid: value.pid } : {}),
     ...(validWriterHost(value.host) ? { host: value.host } : {}),
     ...(typeof value.releaseSha === "string" && value.releaseSha.length > 0 ? { releaseSha: value.releaseSha } : {}),
-    ...(validWriterLockProtocol(value.lockProtocol) ? { lockProtocol: value.lockProtocol } : {}),
-    ...(validWriterStateBackend(value.stateBackend) ? { stateBackend: value.stateBackend } : {}),
+    ...(validWriterLockProtocol(value.lockProtocol) && protocolsAgree ? { lockProtocol: value.lockProtocol } : {}),
+    ...(validWriterStateBackend(value.stateBackend) && backendsAgree ? { stateBackend: value.stateBackend } : {}),
+    ...(Array.isArray(value.stateBackends) && backendsAgree ? { stateBackends: value.stateBackends as string[] } : {}),
+    ...(Array.isArray(value.lockProtocols) && protocolsAgree ? { lockProtocols: value.lockProtocols as number[] } : {}),
     ...(validWriterStartedAt(value.startedAt) ? { startedAt: value.startedAt } : {}),
   };
 };

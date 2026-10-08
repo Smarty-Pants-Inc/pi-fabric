@@ -245,6 +245,10 @@ describe("mesh writer census", () => {
     { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
     { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
     { label: "an empty backend", fields: { stateBackend: "" }, absent: "stateBackend" },
+    { label: "a backend weaker than one it lists", fields: { stateBackend: "file", stateBackends: ["file", "sqlite"] }, absent: "stateBackend" },
+    { label: "a backend list without its backend", fields: { stateBackend: "sqlite", stateBackends: ["file"] }, absent: "stateBackend" },
+    { label: "a non-list of backends", fields: { stateBackends: "sqlite" }, absent: "stateBackend" },
+    { label: "a protocol newer than one it lists", fields: { lockProtocol: 2, lockProtocols: [1, 2] }, absent: "lockProtocol" },
     { label: "an unknown release", fields: { releaseSha: "unknown" }, absent: undefined },
     { label: "an empty release", fields: { releaseSha: "" }, absent: "releaseSha" },
   ])("counts a live writer with $label unknown", async ({ fields, absent }) => {
@@ -419,6 +423,49 @@ describe("mesh writer census", () => {
     } finally {
       store.closeState();
     }
+  });
+
+  it("widens this process's record to every backend it opened, and keeps it until the last store closes", async () => {
+    const mesh = root();
+    const file = path.join(mesh, ".writer-census", censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
+    const plain = new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ lockProtocol: 2, stateBackend: "file" }));
+    const sqlite = new MeshStore(mesh, 4096, 100, { lockProtocol: 1, stateBackend: "sqlite" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ pid: process.pid,
+      stateBackend: "sqlite", stateBackends: ["file", "sqlite"], lockProtocol: 1, lockProtocols: [1, 2] }));
+    const own = (await census(mesh)).writers.filter(writer => writer.pid === process.pid);
+    // The cutover sees a sqlite writer (which takes no .lock), not the earlier file store.
+    expect(own).toEqual([expect.objectContaining({ source: "process-record", stateBackend: "sqlite",
+      stateBackends: ["file", "sqlite"], lockProtocol: 1 })]);
+    // A third store of a weaker backend never narrows the record.
+    const third = new MeshStore(mesh, 4096, 100, { lockProtocol: 2, stateBackend: "file" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ stateBackend: "sqlite", lockProtocol: 1 }));
+    sqlite.closeState();
+    sqlite.closeState();
+    third.closeState();
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expect.objectContaining({ stateBackend: "sqlite" }));
+    plain.closeState();
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it.each([
+    { label: "corrupt", text: "{not json" },
+    { label: "another start time", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "file", startedAt: meshProcessStartedAt + 1 }) },
+    { label: "an unsupported backend", text: JSON.stringify({ format: 1, pid: process.pid, host: os.hostname(), releaseSha: "abc123",
+      lockProtocol: 2, stateBackend: "redis", startedAt: meshProcessStartedAt }) },
+  ])("fails closed on an existing $label record instead of trusting or overwriting it", ({ text }) => {
+    const mesh = root();
+    const directory = path.join(mesh, ".writer-census");
+    fs.mkdirSync(directory);
+    const file = path.join(directory, censusRecordFileName(os.hostname(), process.pid, meshProcessStartedAt));
+    fs.writeFileSync(file, text);
+    for (const stateBackend of ["sqlite", "shadow"] as const) {
+      expect(() => new MeshStore(mesh, 4096, 100, { stateBackend }))
+        .toThrow(new RegExp(`cannot record this process in the writer census.*not this process's valid record.*refusing to open the ${stateBackend}`));
+    }
+    expect(new MeshStore(mesh, 4096, 100, { stateBackend: "file" }).stateBackend).toBe("file");
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
   });
 
   it("keeps a lock ticket whose pid belongs to another host's writer", async () => {

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BridgeOwnershipError, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -20,11 +20,17 @@ afterEach(() => {
 const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
 const hostKey = (id: string) => key("topology/hosts/", id);
 const participantKey = (id: string) => key("topology/participants/", id);
-const store = () => {
+const opened: MeshStore[] = [];
+const store = (stateBackend?: "sqlite") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-bridge-outbox-"));
   roots.push(root);
-  return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, stateBackend ? { stateBackend } : {});
+  opened.push(mesh);
+  return mesh;
 };
+afterEach(() => { for (const mesh of opened.splice(0)) mesh.closeState(); });
+// A rename that installs a lease file (not the owner-matched removal's rename aside).
+const leaseWrite = (to: string) => to.includes(`${path.sep}host-leases${path.sep}`) && to.endsWith(".json");
 const bridgeIdentity: MeshIdentity = { id: "bridge:ryzen2", name: "ryzen2", kind: "main" };
 
 // A native of the peer, as the far side reports it.
@@ -76,7 +82,7 @@ describe("bridge mirror commit outbox", () => {
     // What a bridge that died between COMMIT and its effect leaves: the mirror and its row, no lease.
     const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
     const lease = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, updatedAt: now, expiresAt: now + 30_000 };
-    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.stage([{
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([{
       kind: "put", key: hostKey(peer.identity.id), identity: peer.identity,
       value: { ...peer.host, updatedAt: now, expiresAt: now + 30_000, remoteHost: "ryzen2" },
     }], [{ kind: "lease", key: `lease:${peer.identity.id}`, payload: lease }]) });
@@ -87,7 +93,7 @@ describe("bridge mirror commit outbox", () => {
     // An empty presence: only the recovered row can write the lease; the pass then withdraws the
     // mirror (the peer no longer reports it) and removes the lease again.
     await side.mirror({ hosts: [], participants: [] });
-    const leaseWrites = writes.mock.calls.filter(([, to]) => String(to).includes(`${path.sep}host-leases${path.sep}`));
+    const leaseWrites = writes.mock.calls.filter(([, to]) => leaseWrite(String(to)));
     expect(leaseWrites).toHaveLength(1);
     expect(hub.get(hostKey(peer.identity.id), { fresh: true })).toBeUndefined();
     expect(readHostLease(hub.root, peer.identity.id)).toBeUndefined();
@@ -104,7 +110,7 @@ describe("bridge mirror commit outbox", () => {
     const old = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, updatedAt: now, expiresAt: now + 10_000 };
     const other = remote("delta", now);
     await hub.put({ key: hostKey(other.identity.id), identity: other.identity, value: other.host });
-    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.stage([{
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([{
       kind: "put", key: hostKey(peer.identity.id), identity: peer.identity,
       value: { ...peer.host, remoteHost: "ryzen2" },
     }], [
@@ -117,7 +123,7 @@ describe("bridge mirror commit outbox", () => {
     const writes = vi.spyOn(fs, "renameSync");
     await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
     // Neither replay wrote a lease (the renewed one is newer); the pass then withdrew the mirror.
-    expect(writes.mock.calls.filter(([, to]) => String(to).includes(`${path.sep}host-leases${path.sep}`))).toEqual([]);
+    expect(writes.mock.calls.filter(([, to]) => leaseWrite(String(to)))).toEqual([]);
     expect(readHostLease(hub.root, peer.identity.id)).toBeUndefined();
     expect(readHostLease(hub.root, other.identity.id)).toBeDefined();
     // The replayed rows are gone; only this pass's own removal row waits for the next commit.
@@ -142,3 +148,147 @@ describe("bridge mirror commit outbox", () => {
     expect(hub.get(participantKey(peer.identity.id), { fresh: true })).toBeUndefined();
   });
 });
+
+describe("owner-matched unlease (smarty-dev#6477 L2b owner review, P2)", () => {
+  // A removal whose effect did not run (a crash between COMMIT and the effect): its row stays.
+  const removeWithoutEffect = async (hub: MeshStore, side: StoreBridgeSide) => {
+    const writeBatch = hub.writeBatch.bind(hub);
+    // Only the mirror's own batch (recovery of earlier rows runs as usual).
+    const spy = vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
+      if (input.lockClass !== "bridge") return writeBatch(input);
+      const { afterCommit: _dropped, ...rest } = input;
+      return writeBatch(rest);
+    });
+    await side.mirror({ hosts: [], participants: [] });
+    spy.mockRestore();
+  };
+
+  it("records the removed mirror's lease identity and a delayed replay removes only that lease", async () => {
+    const hub = store();
+    const peer = remote("zeta", Date.now());
+    await new StoreBridgeSide(hub, "ryzen2").mirror(peer.presence);
+    // The mirror's lease carries the origin's incarnation.
+    expect(readHostLease(hub.root, peer.identity.id)?.startedAt).toBe(peer.host.startedAt);
+    await removeWithoutEffect(hub, new StoreBridgeSide(hub, "ryzen2"));
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })).toBeUndefined();
+    const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    expect(hub.get(rows.rowKey(`lease:${peer.identity.id}`), { fresh: true })?.value).toMatchObject({ kind: "unlease", payload: {
+      key: hostKey(peer.identity.id), id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id, startedAt: peer.host.startedAt,
+    } });
+    expect(readHostLease(hub.root, peer.identity.id)).toBeDefined();
+    // The replay finds the mirror's own lease and removes it.
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
+    expect(readHostLease(hub.root, peer.identity.id)).toBeUndefined();
+  });
+
+  it("a delayed replay keeps the lease of a replacement owner that wrote its file lease first", async () => {
+    const hub = store();
+    const now = Date.now();
+    const peer = remote("eta", now);
+    await new StoreBridgeSide(hub, "ryzen2").mirror(peer.presence);
+    await removeWithoutEffect(hub, new StoreBridgeSide(hub, "ryzen2"));
+    // A replacement owner of the same id (a new incarnation) writes its file lease before its
+    // state record: the shared-state key is absent when the removal replays.
+    const replacement = { id: peer.identity.id, rootId: peer.identity.id, identityId: peer.identity.id,
+      startedAt: now + 5_000, updatedAt: now + 5_000, expiresAt: now + 60_000 };
+    writeHostLease(hub.root, replacement);
+    expect(hub.get(hostKey(peer.identity.id), { fresh: true })).toBeUndefined();
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
+    expect(readHostLease(hub.root, peer.identity.id)).toEqual(replacement);
+    // The replayed row is retired all the same.
+    const rows = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    await new StoreBridgeSide(hub, "ryzen2").mirror({ hosts: [], participants: [] });
+    expect(hub.get(rows.rowKey(`lease:${peer.identity.id}`), { fresh: true })).toBeUndefined();
+    expect(readHostLease(hub.root, peer.identity.id)).toEqual(replacement);
+  });
+});
+
+describe("R20 bridge write fence on SQLite (smarty-dev#6477 L2b owner review, P1)", () => {
+  const event = (id: string, from: MeshIdentity): BridgePublish => ({
+    topic: "fleet.work.task", kind: "ask", from, to: "session:hub-main", data: { bridge: { from: "ryzen2", id } },
+  });
+  const rawDatabase = async (root: string) => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(path.join(root, "state.db"));
+    db.exec("PRAGMA busy_timeout = 0");
+    return db;
+  };
+
+  it("holds the SQLite write lock from holds() through the append: a takeover commits after it, then refuses the stale owner", async () => {
+    const hub = store("sqlite");
+    expect(hub.stateBackend).toBe("sqlite");
+    const peer = remote("theta", Date.now());
+    const side = new StoreBridgeSide(hub, "ryzen2");
+    await side.mirror(peer.presence);
+    expect(side.holds(peer.identity.id)).toBe(true);
+    // A native takeover of the same id, through another connection to the same database.
+    const native = new MeshStore(hub.root, 64 * 1024, 100, { stateBackend: "sqlite" });
+    opened.push(native);
+    const raw = await rawDatabase(hub.root);
+    const holds = side.holds.bind(side);
+    let probe: string | undefined;
+    let takeover: Promise<unknown> | undefined;
+    let sequenceAtTakeover = -1;
+    vi.spyOn(side, "holds").mockImplementation((id) => {
+      const held = holds(id);
+      if (takeover) return held;
+      // Between holds() and the append: another writer cannot take the write lock...
+      try { raw.exec("BEGIN IMMEDIATE"); raw.exec("ROLLBACK"); probe = "acquired"; }
+      catch (error) { probe = (error as { errcode?: number }).errcode === undefined ? String(error) : `errcode:${(error as { errcode: number }).errcode & 0xff}`; }
+      // ...and a takeover's commit, attempted now, runs only after the append.
+      takeover = native.writeBatch({ identity: peer.identity, ops: [], prepare: () => {
+        sequenceAtTakeover = native.latestSequence();
+        return [{ kind: "put", key: hostKey(peer.identity.id), value: { ...peer.host, startedAt: peer.host.startedAt + 1 }, identity: peer.identity }];
+      } });
+      return held;
+    });
+    const published = await side.publish(event("e1", peer.identity), [peer.identity.id]);
+    expect(probe).toBe("errcode:5"); // SQLITE_BUSY
+    await takeover;
+    expect(sequenceAtTakeover).toBeGreaterThanOrEqual(published.sequence);
+    raw.close();
+    // The takeover committed: the stale owner's next publish is refused, nothing is appended.
+    vi.mocked(side.holds).mockRestore();
+    expect(side.holds(peer.identity.id)).toBe(false);
+    await expect(side.publish(event("e2", peer.identity), [peer.identity.id])).rejects.toBeInstanceOf(BridgeOwnershipError);
+    expect(hub.latestSequence()).toBe(published.sequence);
+    // The fence wrote nothing and is released: an ordinary write goes through.
+    await hub.put({ key: "probe/after", value: 1, identity: bridgeIdentity });
+  });
+
+  it("a busy write lock refuses the fenced event before its stamp and the publish retries after it is free", async () => {
+    const hub = store("sqlite");
+    const peer = remote("iota", Date.now());
+    const side = new StoreBridgeSide(hub, "ryzen2");
+    await side.mirror(peer.presence);
+    const before = hub.latestSequence();
+    const raw = await rawDatabase(hub.root);
+    raw.exec("BEGIN IMMEDIATE");
+    const checks = vi.spyOn(side, "holds");
+    let settled = false;
+    const publishing = side.publish(event("e3", peer.identity), [peer.identity.id]).finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(settled).toBe(false);
+    // Refused before the ownership check and the append, never published unfenced.
+    expect(checks).not.toHaveBeenCalled();
+    expect(hub.latestSequence()).toBe(before);
+    raw.exec("ROLLBACK");
+    raw.close();
+    const published = await publishing;
+    expect(published.sequence).toBeGreaterThan(before);
+    expect(checks).toHaveBeenCalledWith(peer.identity.id);
+  });
+
+  it("an event with no held ids takes no state fence", async () => {
+    const hub = store("sqlite");
+    const peer = remote("kappa", Date.now());
+    const side = new StoreBridgeSide(hub, "ryzen2");
+    const fence = vi.spyOn(hub, "withStateWriteFence");
+    await side.publish(event("e4", peer.identity));
+    expect(fence).not.toHaveBeenCalled();
+    await side.mirror(peer.presence);
+    await side.publish(event("e5", peer.identity), [peer.identity.id]);
+    expect(fence).toHaveBeenCalledTimes(1);
+  });
+});
+

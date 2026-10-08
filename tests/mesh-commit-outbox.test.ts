@@ -58,13 +58,16 @@ describe("CommitOutbox", () => {
     const mesh = store();
     const log: string[] = [];
     const outbox = new CommitOutbox(mesh, "scope-a", identity, effects(log));
-    const commit = (n: number) => mesh.writeBatch({ identity, ops: [],
-      prepare: () => outbox.stage([{ kind: "put", key: `subject/${n}`, value: n }], [{ kind: "touch", key: `k${n}`, payload: { n } }]),
-      afterCommit: (view) => {
-        // The row is committed by the time the effect runs.
-        expect(view.get(outbox.rowKey(`k${n}`))).toBeDefined();
-        outbox.run(view);
-      } });
+    const commit = (n: number) => {
+      const plan = outbox.plan();
+      return mesh.writeBatch({ identity, ops: [],
+        prepare: () => plan.stage([{ kind: "put", key: `subject/${n}`, value: n }], [{ kind: "touch", key: `k${n}`, payload: { n } }]),
+        afterCommit: (view) => {
+          // The row is committed by the time the effect runs.
+          expect(view.get(outbox.rowKey(`k${n}`))).toBeDefined();
+          plan.run(view);
+        } });
+    };
     await commit(1);
     expect(log).toEqual(["1"]);
     expect(mesh.listAll(outbox.prefix, { fresh: true })).toHaveLength(1);
@@ -82,8 +85,9 @@ describe("CommitOutbox", () => {
     const mesh = store();
     const log: string[] = [];
     const outbox = new CommitOutbox(mesh, "scope-b", identity, effects(log));
-    await mesh.writeBatch({ identity, ops: [], prepare: () => outbox.stage([], [{ kind: "touch", key: "k", payload: { n: 7 } }]),
-      afterCommit: (view) => { outbox.run(view); } });
+    const plan = outbox.plan();
+    await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], [{ kind: "touch", key: "k", payload: { n: 7 } }]),
+      afterCommit: (view) => { plan.run(view); } });
     expect(log).toEqual(["7"]);
     expect(mesh.stateStamp()).toBeUndefined();
     expect(outbox.retiring).toBe(0);
@@ -99,9 +103,10 @@ describe("CommitOutbox", () => {
         log.push(`${payload.n}${replay ? ":replay" : ""}`);
       },
     });
-    await mesh.writeBatch({ identity, ops: [], prepare: () => outbox.stage([{ kind: "put", key: "subject/x", value: 1 }],
+    const plan = outbox.plan();
+    await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([{ kind: "put", key: "subject/x", value: 1 }],
       [{ kind: "touch", key: "same", payload: { n: 1 } }, { kind: "touch", key: "same", payload: { n: 2 } }]),
-    afterCommit: (view) => { outbox.run(view); } });
+    afterCommit: (view) => { plan.run(view); } });
     const rows = mesh.listAll(outbox.prefix, { fresh: true });
     expect(rows).toHaveLength(1);
     expect((rows[0]!.value as { payload: { n: number } }).payload.n).toBe(2);
@@ -113,6 +118,50 @@ describe("CommitOutbox", () => {
     expect(log).toEqual(["2:replay"]);
     expect(await restarted.recover()).toBe(0);
     expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+  });
+
+  it("concurrent batches on SQLite each run exactly their own effect and get their own result (owner review P2)", async () => {
+    // ResidentHost.#queueDelivery's shape: a durable batch whose afterCommit decides "chosen".
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: "sqlite" });
+    try {
+      expect(mesh.stateBackend).toBe("sqlite");
+      const log: string[] = [];
+      const order: string[] = [];
+      const outbox = new CommitOutbox(mesh, "scope-concurrent", identity, effects(log));
+      const deliver = async (n: number) => {
+        const plan = outbox.plan();
+        let ran = -1;
+        let mine: string[] = [];
+        await mesh.writeBatch({ identity, ops: [],
+          prepare: () => {
+            order.push(`prepare:${n}`);
+            return plan.stage([], [{ kind: "touch", key: `delivery:${n}`, payload: { n } }], { durable: true });
+          },
+          afterCommit: (view) => {
+            order.push(`after:${n}`);
+            const before = log.length;
+            ran = plan.run(view);
+            mine = log.slice(before);
+          } });
+        return { n, ran, mine };
+      };
+      const ids = [1, 2, 3, 4, 5, 6];
+      const results = await Promise.all(ids.map(deliver));
+      // SQLite commits a batch, then re-acquires custody for its afterCommit: another batch's
+      // prepare ran in between (the interleaving a shared stage got wrong).
+      expect(ids.some((n) => {
+        const own = order.indexOf(`prepare:${n}`);
+        const after = order.indexOf(`after:${n}`);
+        return order.slice(own + 1, after).some((step) => step.startsWith("prepare:"));
+      })).toBe(true);
+      for (const result of results) {
+        expect(result.ran).toBe(1);
+        expect(result.mine).toEqual([String(result.n)]);
+      }
+      expect([...log].sort()).toEqual(ids.map(String));
+    } finally {
+      mesh.closeState();
+    }
   });
 
   it("does not take the lock to recover when nothing is pending", async () => {
@@ -141,18 +190,21 @@ describe("CommitOutbox", () => {
       const outbox = new CommitOutbox(store, "crash", identity, {
         touch: () => { process.kill(process.pid, "SIGKILL"); fs.appendFileSync(effectLog, "child\\n"); },
       });
+      const plan = outbox.plan();
       await store.writeBatch({ identity, ops: [],
-        prepare: () => outbox.stage([{ kind: "put", key: "crash/subject", value: 1 }], [{ kind: "touch", key: "subject", payload: { n: 1 } }]),
-        afterCommit: view => { outbox.run(view); } });
+        prepare: () => plan.stage([{ kind: "put", key: "crash/subject", value: 1 }], [{ kind: "touch", key: "subject", payload: { n: 1 } }]),
+        afterCommit: view => { plan.run(view); } });
       fs.appendFileSync(effectLog, "survived\\n");`;
     const child = spawn(process.execPath, ["--input-type=module", "-e", code, root, effectLog], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const signal = await new Promise<NodeJS.Signals | null>((resolve, reject) => {
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.once("error", reject);
-      child.once("close", (_code, signal) => resolve(signal));
+      child.once("close", (code, signal) => resolve({ code, signal }));
     });
-    expect(signal, stderr).toBe("SIGKILL");
+    // Windows reports a killed child with signalCode null and a non-zero exit code.
+    if (process.platform === "win32" && exit.signal === null) expect(exit.code, stderr).not.toBe(0);
+    else expect(exit.signal, stderr).toBe("SIGKILL");
     expect(fs.existsSync(effectLog)).toBe(false);
     const mesh = store(root);
     expect(mesh.get("crash/subject", { fresh: true })?.value).toBe(1);

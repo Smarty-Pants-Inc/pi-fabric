@@ -689,6 +689,39 @@ export class SqliteStateStore {
     return this.#write(() => operation(), lockTimeoutMs);
   }
 
+  /**
+   * The R20 write fence (smarty-dev#6477 L2b): ONE synchronous `BEGIN IMMEDIATE` attempt (bounded by
+   * `busy_timeout`, <= 5 ms), `operation` on that transaction's snapshot, then ROLLBACK. No other
+   * connection commits while it runs, and it writes nothing. It never waits asynchronously, so a
+   * caller that holds `.lock` (lock order: `.lock`, then this) never holds `.lock` through a SQLite
+   * wait: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and the caller
+   * retries after releasing `.lock`. `operation` must be synchronous and must not call writers.
+   */
+  fenceSync<T>(operation: () => T): T {
+    this.#assertOpen();
+    if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
+    try {
+      this.#db.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      if (!isBusy(error) && !isTransient(error)) throw error;
+      this.#stats.busyRetries += 1;
+      throw new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
+    }
+    this.#inTransaction = true;
+    try {
+      const meta = this.#meta();
+      if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
+      const result = operation();
+      if (result !== null && typeof result === "object" && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("Fabric mesh state fences must be synchronous");
+      }
+      return result;
+    } finally {
+      try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* connection ends it */ }
+      this.#inTransaction = false;
+    }
+  }
+
   /** Proves the state is writable now (and not retired): acquires and releases the write lock. */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
     await this.#write(() => { onAcquired?.(Date.now()); });

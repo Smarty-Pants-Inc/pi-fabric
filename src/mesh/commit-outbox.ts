@@ -10,7 +10,10 @@ import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from 
 // is one `BEGIN IMMEDIATE` transaction that writes nothing. The backend decides, not the caller.
 //
 // CommitOutbox: file side effects of a state commit (host leases, delivery files) are recorded as
-// rows in the SAME commit and run after it, against the committed view. A crash between the commit
+// rows in the SAME commit and run after it, against the committed view. What a batch staged lives in
+// that batch's own plan (`outbox.plan()`, one per writeBatch), never on the shared outbox: on SQLite
+// a batch COMMITs and re-acquires custody for its afterCommit, so another batch's prepare can run in
+// between, and a shared stage would hand it the other batch's effects (L2b owner review, P2). A crash between the commit
 // and the effect leaves the row; recover() runs it on the next start. Each effect has an
 // idempotency key: a later effect with the same key supersedes the earlier one, and the row is
 // deleted (version-fenced) once its effect, or a newer one for the same key, has run.
@@ -74,10 +77,26 @@ const rowOf = (value: unknown): OutboxRow | undefined => {
 
 export type CommitOutboxStore = Pick<MeshStore, "writeBatch" | "listAll">;
 
+/** One batch's staged effects: create one per writeBatch, use it in that batch's prepare and
+ * afterCommit only. */
+export interface CommitOutboxPlan {
+  /**
+   * For the batch's `prepare`: returns `ops` plus, when the batch commits anything (`ops` not empty,
+   * or `durable`), one row per effect and the deletes of rows already run. A batch with nothing
+   * to commit records nothing: it loses nothing in a crash, and run() still runs its effects.
+   * A retried prepare replaces what an earlier attempt staged.
+   */
+  stage(ops: MeshBatchOperation[], effects: CommitOutboxEffect[], options?: { durable?: boolean }): MeshBatchOperation[];
+  /** For the same batch's `afterCommit`: runs this plan's effects, then retries failed rows.
+   * Returns how many of this plan's effects ran. */
+  run(view: MeshBatchView, halted?: () => boolean): number;
+}
+
+type StagedEffect = { row: string; effect: CommitOutboxEffect };
+
 export class CommitOutbox {
   /** Every row of this scope starts with it. */
   readonly prefix: string;
-  #staged: Array<{ row: string; effect: CommitOutboxEffect }> = [];
   /** Rows whose effect (or a newer one for the same key) ran, by the version that ran. */
   readonly #done = new Map<string, number>();
   /** Rows whose effect threw: retried on the next run and by recover(). */
@@ -102,20 +121,35 @@ export class CommitOutbox {
     return this.#done.size;
   }
 
-  /**
-   * For a batch's `prepare`: returns `ops` plus, when the batch commits anything (`ops` not empty,
-   * or `durable`), one row per effect and the deletes of rows already run. A batch with nothing
-   * to commit records nothing: it loses nothing in a crash, and run() still runs its effects.
-   */
-  stage(ops: MeshBatchOperation[], effects: CommitOutboxEffect[], options: { durable?: boolean } = {}): MeshBatchOperation[] {
+  /** A fresh, batch-local plan (see CommitOutboxPlan). */
+  plan(): CommitOutboxPlan {
+    let staged: readonly StagedEffect[] = [];
+    let ran = false;
+    return {
+      stage: (ops, effects, options = {}) => {
+        const result = this.#stage(ops, effects, options);
+        staged = result.staged;
+        return result.ops;
+      },
+      run: (view, halted) => {
+        // One afterCommit per batch: a second run never repeats this batch's effects.
+        if (ran) return 0;
+        ran = true;
+        return this.#run(staged, view, halted);
+      },
+    };
+  }
+
+  #stage(ops: MeshBatchOperation[], effects: CommitOutboxEffect[], options: { durable?: boolean }):
+    { ops: MeshBatchOperation[]; staged: StagedEffect[] } {
     const byRow = new Map<string, CommitOutboxEffect>();
     for (const effect of effects) {
       const row = this.rowKey(effect.key);
       byRow.delete(row);
       byRow.set(row, effect);
     }
-    this.#staged = [...byRow].map(([row, effect]) => ({ row, effect }));
-    if (ops.length === 0 && !options.durable) return ops;
+    const plan = [...byRow].map(([row, effect]) => ({ row, effect }));
+    if (ops.length === 0 && !options.durable) return { ops, staged: plan };
     const recordedAt = Date.now();
     const staged: MeshBatchOperation[] = [...ops];
     for (const [row, { kind, key, payload }] of byRow) {
@@ -125,14 +159,10 @@ export class CommitOutbox {
     for (const [row, version] of this.#done) {
       if (!byRow.has(row)) staged.push({ kind: "delete", key: row, ifVersion: version, onConflict: "skip" });
     }
-    return staged;
+    return { ops: staged, staged: plan };
   }
 
-  /** For the same batch's `afterCommit`: runs the staged effects, then retries failed rows.
-   * Returns how many of the staged effects ran. */
-  run(view: MeshBatchView, halted?: () => boolean): number {
-    const staged = this.#staged;
-    this.#staged = [];
+  #run(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): number {
     let ran = 0;
     for (const row of [...this.#done.keys()]) if (!view.get(row)) this.#done.delete(row);
     for (const { row, effect } of staged) {

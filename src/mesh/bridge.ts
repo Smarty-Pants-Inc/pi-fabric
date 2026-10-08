@@ -5,13 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
+import { isMeshStateBusy } from "./state-backend.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -29,6 +30,8 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** A mirrored host lease lasts this long past its last renewal, so a dead bridge lapses it. */
 export const BRIDGE_LEASE_MS = 15_000;
+/** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
+const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A bridge call the remote has not answered by then closes the transport. */
@@ -189,7 +192,15 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
-interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number }
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number }
+/**
+ * A removed mirror's lease identity, as its lease file carries it (root, identity, incarnation).
+ * Rows of an older release carry only `key` and `id`: they prove no owner, so they remove nothing.
+ */
+interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number }
+
+const incarnationOf = (record: { startedAt?: unknown }): { startedAt?: number } =>
+  typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {};
 
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
@@ -205,8 +216,14 @@ export class StoreBridgeSide implements BridgeSide {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
       lease: (lease: BridgeLease, view, replay) => this.#applyLease(lease, view, replay),
-      unlease: ({ key, id }: { key: string; id: string }, view) => {
-        if (!view.get(key)) removeHostLease(this.store.root, id);
+      // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
+      // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
+      unlease: (gone: BridgeUnlease, view) => {
+        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string") return;
+        // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
+        // before lease incarnations): root and identity decide it, as before.
+        removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
+          lease.identityId === gone.identityId && (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
       },
     });
   }
@@ -344,13 +361,30 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
-    const published = await this.store.publish(this.#publication(event, held));
+    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
-    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [])));
+    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
     return published.map(({ sequence }) => ({ sequence }));
+  }
+
+  // A busy state write fence (SQLite) refused the event before its stamp: nothing was appended,
+  // so it is retried with .lock released in between, for a bounded time; then the busy error
+  // (a lock timeout) goes to the bridge loop's own backoff. A batch whose later event met a busy
+  // fence returns its committed prefix instead, like any other suffix failure.
+  async #fenceRetry<T>(publish: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + BRIDGE_FENCE_RETRY_MS;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await publish();
+      } catch (error) {
+        if (!isMeshStateBusy(error) || Date.now() >= deadline) throw error;
+        const cap = Math.min(25, 2 ** Math.min(attempt, 5));
+        await new Promise((resolve) => setTimeout(resolve, cap * (0.5 + Math.random() / 2)));
+      }
+    }
   }
 
   #publication(event: BridgePublish, held: string[]): Parameters<MeshStore["publish"]>[0] {
@@ -363,10 +397,17 @@ export class StoreBridgeSide implements BridgeSide {
       from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
-      // round 3, F2). Every state writer takes the same lock on the `file` backend. With state in
-      // SQLite this must run in a state transaction held until the append (plan R20, L2a hook). Under the participants-files policy a
-      // native's first file is written without it; its host record, which reserves the root id,
-      // still goes through the lock, and a mirror never outranks a native file (#142 S2).
+      // round 3, F2). Every state writer takes the same lock on the `file` backend. SQLite state
+      // writers do not take `.lock`, so a held event also runs in the state write fence (plan
+      // R20, smarty-dev#6477 L2b owner review P1): with `.lock` held, one `BEGIN IMMEDIATE`, then
+      // this check on that transaction's snapshot and the synchronous append, then ROLLBACK. A
+      // takeover's commit waits for the append, or commits first and this check refuses. Lock
+      // order is `.lock`, then the SQLite write lock, never the reverse (a SQLite transaction is
+      // one synchronous segment and `.lock` is only acquired asynchronously). Under the
+      // participants-files policy a native's first file is written without it; its host record,
+      // which reserves the root id, still goes through the lock, and a mirror never outranks a
+      // native file (#142 S2).
+      ...(held.length > 0 ? { fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit) } : {}),
       data: () => {
         for (const id of held) {
           if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
@@ -377,8 +418,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   /**
-   * Whether this link holds `id` now. Run under the mesh lock that commits a bridged event, so it
-   * decides on the ownership at commit (security review rounds 3 and 4, F2). Any record for the
+   * Whether this link holds `id` now. Run under the mesh lock that commits a bridged event, and in
+   * its state write fence (R20), so it decides on the ownership at commit (security review rounds
+   * 3 and 4, F2). Any record for the
    * id that is not this link's live mirror (a native, another link's, or a reserved id anywhere
    * on this side) is a denial, never a gap to fill from another mirror: `id` must be this
    * link's host, with a live lease, and its root, if present, must be this link's too.
@@ -478,7 +520,7 @@ export class StoreBridgeSide implements BridgeSide {
     // one for a full lease (independent review, P2).
     const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
     const leases: BridgeLease[] = [];
-    const removed: Array<{ key: string; id: string }> = [];
+    const removed: BridgeUnlease[] = [];
     // One idempotency key per host: a later lease write or removal supersedes an earlier one.
     const effects = (): CommitOutboxEffect[] => [
       ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
@@ -488,6 +530,7 @@ export class StoreBridgeSide implements BridgeSide {
     // directory stamp (R11): only a change in between reads them again under the lock.
     const filesStamp = meshDirectoryStamp(this.store.root, "participants");
     const files = participantFileSnapshot(this.store.root);
+    const plan = this.#outbox.plan();
     await this.store.writeBatch({
       identity: this.#identity(),
       lockClass: "bridge",
@@ -496,7 +539,7 @@ export class StoreBridgeSide implements BridgeSide {
       // write lock. No native takeover can fit between that observation and this commit
       // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
       prepare: (view) => {
-        if (halted()) return this.#outbox.stage([], []);
+        if (halted()) return plan.stage([], []);
         const hostEntries = view.listAll(HOST_PREFIX);
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const participantFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp
@@ -526,7 +569,9 @@ export class StoreBridgeSide implements BridgeSide {
             value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
             identity: record.identity,
           });
-          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, updatedAt: renewedAt, expiresAt: until });
+          // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
+            updatedAt: renewedAt, expiresAt: until });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
@@ -552,23 +597,26 @@ export class StoreBridgeSide implements BridgeSide {
               ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
               : existing.value.updatedAt === value.updatedAt)
           ) continue;
-          if (halted()) return this.#outbox.stage([], []);
+          if (halted()) return plan.stage([], []);
           ops.push({ kind: "put", key, value, identity, ifVersion: view.version(key), onConflict: "skip" });
         }
         for (const [key, { value, version }] of mirrored) {
-          if (halted()) return this.#outbox.stage([], []);
+          if (halted()) return plan.stage([], []);
           if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
-            removed.push({ key, id: value.id });
+            const gone = hostOf(key, value);
+            removed.push(gone
+              ? { key, id: gone.id, rootId: gone.rootId, identityId: gone.identity.id, ...incarnationOf(gone) }
+              : { key, id: value.id });
           }
           ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
         }
         // A changing commit records its lease effects in the same commit; a lease-only renewal
         // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-        return this.#outbox.stage(ops, effects());
+        return plan.stage(ops, effects());
       },
       // After the commit, on the committed owner, never a fresh per-record state read.
-      afterCommit: (view) => { this.#outbox.run(view, halted); },
+      afterCommit: (view) => { plan.run(view, halted); },
     });
   }
 

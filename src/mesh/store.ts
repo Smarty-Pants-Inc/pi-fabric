@@ -181,6 +181,14 @@ export class MeshStore {
     return this.#state.confirmWritable(onAcquired);
   }
 
+  /**
+   * The R20 write fence (StateBackend.withWriteFence): `operation` runs synchronously while no state
+   * commit can happen. Only with `.lock` held or no lock at all: never take `.lock` inside it.
+   */
+  withStateWriteFence<T>(operation: () => T): T {
+    return this.#state.withWriteFence(operation);
+  }
+
   stateStamp(): string | undefined {
     return this.#state.stateStamp();
   }

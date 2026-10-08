@@ -959,11 +959,14 @@ export class ResidentHost {
       // so the choice is a state commit (smarty-dev#6477 L5, R11). The irreversible
       // outbox write is that commit's effect: recorded in it, written after it, and
       // replayed after a crash. Never persist a stale choice.
+      // The plan is this call's own: concurrent deliveries never run each other's effect or
+      // read each other's result (on SQLite another batch can commit before this afterCommit).
       let chosen = false;
+      const plan = this.#deliveryCommits.plan();
       try {
         await this.mesh.writeBatch({ identity: this.identity, ops: [],
-          prepare: () => this.#deliveryCommits.stage([], [{ kind: "delivery", key: id, payload: record(rootId()) }], { durable: true }),
-          afterCommit: view => { chosen = this.#deliveryCommits.run(view) === 1; } });
+          prepare: () => plan.stage([], [{ kind: "delivery", key: id, payload: record(rootId()) }], { durable: true }),
+          afterCommit: view => { chosen = plan.run(view) === 1; } });
         await this.#deliveryCommits.retire().catch(() => undefined);
       } catch { /* no commit: the original mailbox below */ }
       if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.

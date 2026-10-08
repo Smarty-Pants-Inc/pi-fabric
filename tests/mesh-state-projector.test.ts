@@ -561,4 +561,34 @@ describe("state projector (sqlite, after cutover)", () => {
     expect(authority.exportState().entries).toEqual({ ...before.entries, "k/after": authority.get("k/after") });
     expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
   });
+
+  it.each(["exporting", "file"])("halts retired when meta.backend leaves sqlite (%s): no renewal, no checkpoint (smarty-dev#7064)", async backend => {
+    const root = tempRoot(`backend-${backend}`);
+    const authority = await openStore(root, root);
+    await authority.put({ key: "k/0", value: 0, identity });
+    const events: StateProjectorEvent[] = [];
+    // A short lease so the next tick would renew it, a short checkpoint period so it would checkpoint.
+    const projector = await openProjector(root, { mode: "sqlite", checkpointMs: 10, leaseMs: 100, onEvent: event => events.push(event) });
+    expect(await projector.tick()).toMatchObject({ role: "active", checkpoints: 1 });
+    const database = path.join(root, "state.db");
+    const leaseOf = (): string | undefined => {
+      const raw = openNodeSqlite(database);
+      try { return raw.prepare("SELECT value FROM meta WHERE name = 'projector.lease'").get()?.value as string | undefined; }
+      finally { raw.close(); }
+    };
+    const lease = leaseOf();
+    expect(lease).toBeDefined();
+    // A rollback flips the flag while the projector runs.
+    const raw = openNodeSqlite(database);
+    try { raw.prepare("UPDATE meta SET value = ? WHERE name = 'backend'").run(backend); } finally { raw.close(); }
+    await new Promise(resolve => setTimeout(resolve, 70));
+    const status = await projector.tick();
+    expect(status).toMatchObject({ role: "stopped", haltReason: "retired", checkpoints: 1 });
+    expect(events.some(event => event.type === "alarm" && event.alarm === "retired")).toBe(true);
+    // The lease is neither renewed nor rewritten: the retired database is left to the rollback.
+    expect(leaseOf()).toBe(lease);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(await projector.tick()).toMatchObject({ role: "stopped", haltReason: "retired", checkpoints: 1 });
+    expect(leaseOf()).toBe(lease);
+  });
 });

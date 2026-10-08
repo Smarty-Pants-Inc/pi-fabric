@@ -645,6 +645,9 @@ export class StateProjector {
   async #tick(): Promise<StateProjectorStatus> {
     if (this.#role === "stopped") return this.status();
     await this.#guard(async () => {
+      // smarty-dev#7064: the backend fence comes before election and maintenance in every mode, so a
+      // sqlite-mode projector never renews its lease on, or checkpoints, a retired/exporting database.
+      this.#backendFence();
       if (!(await this.#elect())) return;
       if (this.mode === "shadow") await this.#project();
       this.#maintain();
@@ -695,12 +698,15 @@ export class StateProjector {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     const wasActive = this.#role === "active";
-    try {
-      // Release the lease so a standby takes over at once (a crash releases it by expiry).
-      await this.#transaction(() => {
-        if (this.#readMeta().lease?.owner === this.owner) this.#sql.metaDelete.run(LEASE_META);
-      }, 250);
-    } catch { /* expiry releases it */ }
+    // Release the lease so a standby takes over at once (a crash releases it by expiry). A retired
+    // database is never written again (smarty-dev#7064): a rollback/export owns it, expiry releases it.
+    if (reason !== "retired") {
+      try {
+        await this.#transaction(() => {
+          if (this.#readMeta().lease?.owner === this.owner) this.#sql.metaDelete.run(LEASE_META);
+        }, 250);
+      } catch { /* expiry releases it */ }
+    }
     this.#haltReason = reason;
     this.#role = "stopped";
     this.#leaseHolder = undefined;
@@ -746,10 +752,16 @@ export class StateProjector {
     };
   }
 
+  // The backend half of the R5 fence, for every mode: only a backend=sqlite database is renewed,
+  // checkpointed or projected into; anything else (exporting, file, retired) halts with retired.
+  #backendFence(backend = this.#readMeta().backend): void {
+    if (backend !== "sqlite") throw new ProjectorFence("retired", `state database backend is ${backend}`);
+  }
+
   // The R5 fence. In a transaction it also requires the lease; returns the progress to extend.
   #fence(inTransaction: boolean): Progress {
     const meta = this.#readMeta();
-    if (meta.backend !== "sqlite") throw new ProjectorFence("retired", `state database backend is ${meta.backend}`);
+    this.#backendFence(meta.backend);
     if (inTransaction && meta.lease?.owner !== this.owner) throw new ProjectorFence("lease-lost", "projector lease lost");
     if (!meta.progress) {
       const empty = meta.commit === 0 && Number(this.#sql.kvCount.get()?.n ?? 0) === 0 && Number(this.#sql.tombCount.get()?.n ?? 0) === 0;
@@ -772,7 +784,10 @@ export class StateProjector {
     }
     if (!current || current.owner !== this.owner || current.expiresAt - now <= this.#leaseMs / 2) {
       const holder = await this.#transaction(() => {
-        const lease = this.#readMeta().lease;
+        const meta = this.#readMeta();
+        // Atomic with the renewal: a backend switch committed before this transaction halts it.
+        this.#backendFence(meta.backend);
+        const lease = meta.lease;
         const at = Date.now();
         if (lease && lease.owner !== this.owner && lease.expiresAt > at) return lease.owner;
         this.#sql.metaPut.run(LEASE_META, JSON.stringify({ owner: this.owner, expiresAt: at + this.#leaseMs, pid: process.pid, host: os.hostname() }));
@@ -790,6 +805,8 @@ export class StateProjector {
   #maintain(): void {
     const now = Date.now();
     if (now - this.#lastCheckpointAt >= this.#checkpointMs) {
+      // Re-checked here: election may have awaited, and a checkpoint of an exporting database is refused.
+      this.#backendFence();
       this.#lastCheckpointAt = now;
       try {
         // R10: the elected projector is the checkpointer: PASSIVE, TRUNCATE when large and growing.

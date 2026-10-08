@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { actorRunReferencedNow, canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
@@ -16,12 +16,15 @@ export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
  * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
  * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry.
  * `dryRun`: the same selection and fences, with no removal or compaction; the returned runs are the
- * ones an apply would delete (pi-fabric#645 review round 3). `onRemove` is called before a run is
- * removed (or, in a dry run, would be). */
+ * ones an apply would delete (pi-fabric#645 review round 3). `measure` sizes a candidate before its final
+ * check, `isRetained` is a further veto of that check, and the check and delete run back to back through
+ * `removeUnreferencedRun`; `onRemove` is called after a run is removed (or, in a dry run, would be) with its
+ * measured bytes (pi-fabric#645 review round 4). */
 export const sweepResidentRuns = (
   runsRoot: string, now = Date.now(), budgetMs = 100,
   options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean;
-    dryRun?: boolean; onRemove?: (run: string) => void;
+    dryRun?: boolean; measure?: (run: string) => number; isRetained?: (runId: string) => boolean;
+    onRemove?: (run: string, bytes: number) => void;
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
   const removed: string[] = [];
@@ -32,7 +35,7 @@ export const sweepResidentRuns = (
   const registryOptions = options.requireRegistries ? { requireRegistries: true } : {};
   const retained = retainedActorRunIds(actorRoots, registryOptions);
   if (retained.has("*")) return removed;
-  const referencedNow = (id: string): boolean => actorRunReferencedNow(actorRoots, id, registryOptions);
+  const referencedNow = (id: string): boolean => actorRunReferencedNow(actorRoots, id, registryOptions) || !!options.isRetained?.(id);
   let directory: fs.Dir;
   try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
   try {
@@ -44,10 +47,10 @@ export const sweepResidentRuns = (
       if (!stat?.isDirectory()) continue;
       if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
           !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
-          hasPreservedResidentResult(runsRoot, entry.name) && !expired() && !referencedNow(entry.name)) {
-        options.onRemove?.(run);
-        if (options.dryRun) removed.push(run);
-        else try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        // A referenced candidate is kept as is; compaction would veto it on the same reference.
+        const name = entry.name, bytes = options.measure?.(run) ?? 0;
+        if (removeUnreferencedRun(run, () => referencedNow(name), options.dryRun)) { removed.push(run); options.onRemove?.(run, bytes); }
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),

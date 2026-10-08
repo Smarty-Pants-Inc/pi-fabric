@@ -666,8 +666,11 @@ export const pruneActorRunArchives = (options: {
    * `final` marks that last pre-delete check (callers re-read their references uncached). */
   isRetained?: (runId: string, final?: boolean) => boolean;
   dryRun?: boolean;
-  /** Called before a run directory is removed (or, in a dry run, would be). */
-  onRemove?: (directory: string) => void;
+  /** Size accounting of a removal candidate, done before the final check so nothing slow runs
+   * between that check and the delete (pi-fabric#645 review round 4). */
+  measure?: (directory: string) => number;
+  /** Called after a run directory is removed (or, in a dry run, would be), with its `measure` bytes. */
+  onRemove?: (directory: string, bytes: number) => void;
   onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void;
 }): string[] => {
   const now = options.now ?? Date.now();
@@ -690,10 +693,37 @@ export const pruneActorRunArchives = (options: {
       });
       continue;
     }
-    if (options.isRetained?.(entry.name, true)) continue;
-    options.onRemove?.(directory);
-    if (options.dryRun) { removed.push(directory); continue; }
-    try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
+    const bytes = options.measure?.(directory) ?? 0;
+    const isRetained = options.isRetained;
+    if (!removeUnreferencedRun(directory, isRetained && (() => isRetained(entry.name, true)), options.dryRun)) continue;
+    removed.push(directory);
+    options.onRemove?.(directory, bytes);
   }
   return removed;
+};
+
+/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4). Without
+ * `referenced` a plain delete. With it: check; rename the run to a sibling tombstone; check again; then
+ * delete the tombstone, or rename it back when the re-check finds a reference (a throwing check counts
+ * as a reference). A dry run takes only the first check. Returns whether the run was (or would be) removed.
+ * ponytail: no fence excludes registry writers. ActorRegistryStore's lock is an exclusive, async mkdir
+ * lock with no shared mode; holding every registry's lock across each delete would stall every actor's
+ * saves, and these sweeps are synchronous. The tombstone narrows the remaining window to a reference
+ * written after the re-check, which names a run already renamed away: its writer finds the run missing,
+ * exactly as after any completed deletion. A tombstone left by a crash is a run proven unreferenced; the
+ * next sweep treats it as an ordinary run entry. */
+export const removeUnreferencedRun = (directory: string, referenced?: () => boolean, dryRun = false): boolean => {
+  const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
+  if (check()) return false;
+  if (dryRun) return true;
+  if (!referenced) {
+    try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }
+  }
+  const tombstone = path.join(path.dirname(directory), `.retention-tombstone-${path.basename(directory)}`);
+  try { fs.renameSync(directory, tombstone); } catch { return false; }
+  if (check()) {
+    try { fs.renameSync(tombstone, directory); } catch { /* Kept under the tombstone name; never deleted while referenced. */ }
+    return false;
+  }
+  try { fs.rmSync(tombstone, { recursive: true, force: true }); return true; } catch { return false; }
 };

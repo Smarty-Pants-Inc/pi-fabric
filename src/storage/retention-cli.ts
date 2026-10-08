@@ -54,19 +54,36 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   const residents = new Map<string, string>();
   const ambiguous = new Set<string>();
   const registries: string[] = [];
-  const discover = (root: string, depth = 0): void => {
+  const discover = (root: string, depth = 0, found = registries): void => {
     if (absent(root)) return;
     if (depth > 4 || !ownedStat(root)?.isDirectory()) throw new Error(`Actor references are uncertain: ${root}`);
-    if (!absent(path.join(root, "actors.json"))) registries.push(root);
+    if (!absent(path.join(root, "actors.json"))) found.push(root);
     for (const name of fs.readdirSync(root)) {
       if (["runs", "handoff-session", "child-completions"].includes(name)) continue;
       const child = path.join(root, name); const stat = ownedStat(child);
       if (!stat) throw new Error(`Actor references are uncertain: ${child}`);
-      if (stat.isDirectory()) discover(child, depth + 1);
+      if (stat.isDirectory()) discover(child, depth + 1, found);
     }
   };
   if (!ownedStat(meshRoot)?.isDirectory()) throw new Error("Mesh root must be an owned directory");
-  discover(path.join(meshRoot, "actors"));
+  const actorsRoot = path.join(meshRoot, "actors");
+  discover(actorsRoot);
+  // pi-fabric#645 review round 4: every final pre-delete check re-discovers the registry roots. A root
+  // created (or removed) since discovery may hold a cross-root reference the reread of `registries`
+  // cannot see: every later delete fails closed and the sweep reports it. Sticky once changed.
+  const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
+  const discovered = rootSet(registries);
+  let rootsChanged = false;
+  const registryRootsChanged = (): boolean => {
+    if (rootsChanged) return true;
+    let current: string | undefined;
+    try { const found: string[] = []; discover(actorsRoot, 0, found); current = rootSet(found); } catch { /* uncertain: changed */ }
+    if (current !== discovered) {
+      rootsChanged = true;
+      skipped.push({ path: actorsRoot, reason: "actor registry roots changed during the sweep; no further run is deleted" });
+    }
+    return rootsChanged;
+  };
   try {
     for (const root of directories(path.join(meshRoot, "residency"))) {
       let fd: number | undefined;
@@ -104,10 +121,12 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         // Same final pre-delete check as the actor-run pass below: every discovered registry is
         // re-read uncached before each delete; a vanished or unreadable one vetoes (review round 2).
         // A dry run takes the same selection and fences without mutating, so its preview lists
-        // the runs --apply deletes (review round 3).
+        // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
+        // re-discovers the registry roots, and the check and delete run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
           actorRoots: registries, retainRuns: false, requireRegistries: true, dryRun,
-          onRemove: run => changes.push({ path: run, beforeBytes: treeBytes(run), afterBytes: 0 }),
+          isRetained: registryRootsChanged, measure: treeBytes,
+          onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
         }));
@@ -154,7 +173,8 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         if (key !== references.key) references = { key, ids: retainedActorRunIds(registries) };
         return references.ids.has("*") || references.ids.has(id);
       };
-      const referencedNow = (id: string): boolean => actorRunReferencedNow(registries, id, { requireRegistries: true });
+      const referencedNow = (id: string): boolean =>
+        actorRunReferencedNow(registries, id, { requireRegistries: true }) || registryRootsChanged();
       for (const registryRoot of registries) {
         try {
           const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
@@ -170,7 +190,9 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
               runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun,
               ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
               isRetained: (run, final) => run === inFlight || (final ? referencedNow(run) : referenced(run)),
-              onRemove: run => { changes.push({ path: run, beforeBytes: treeBytes(run), afterBytes: 0 }); removedRuns.push(run); },
+              // Sized before the final check; check and delete back to back (review round 4).
+              measure: treeBytes,
+              onRemove: (run, bytes) => { changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }); removedRuns.push(run); },
               onCompact: change => changes.push(change),
             });
             // Rotation history of an actor whose writer is joined: keep only the newest backup.

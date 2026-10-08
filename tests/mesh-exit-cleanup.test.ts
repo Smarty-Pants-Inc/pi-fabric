@@ -228,6 +228,37 @@ describe("directory withdrawal on exit (smarty-dev#6622)", () => {
     await expectLapse(setup, meshRoot, warnings);
   }, 20_000);
 
+  // An exit while close() still awaits its withdrawal is an un-withdrawn close: the hook must
+  // not preserve the reload lease (smarty-dev#6622, review round 4).
+  it("an exit while a reload close() awaits a lock-blocked withdrawal never preserves the reload lease", async () => {
+    const meshRoot = tempRoot();
+    const warnings: string[] = [];
+    const setup = await reloadingDirectory(meshRoot, warnings);
+    const { identity, child, hook, hooked } = setup;
+    const lease = readHostLeaseCurrent(meshRoot, identity.id)!;
+    expect(lease).toBeDefined();
+    const release = holdLock(meshRoot);
+    let closing: Promise<void> | undefined;
+    try {
+      const batches = vi.spyOn(setup.mesh, "writeBatch");
+      closing = setup.directory.close();
+      // close() is now inside its withdrawal, blocked on the held mesh lock.
+      await vi.waitFor(() => expect(batches).toHaveBeenCalled(), { timeout: 5_000, interval: 5 });
+      expect(warnings).toEqual([]);
+      expect(hooked()).toBe(true);
+      (hook as () => void)(); // the process exits here
+      expect(readHostLeaseCurrent(meshRoot, identity.id)).toBeUndefined();
+      await closing;
+    } finally { release(); await closing?.catch(() => undefined); }
+    process.removeListener("exit", hook);
+    // The child was never withdrawn; with no lease file it lapses within one (reload) lease.
+    expect(setup.mesh.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id))
+      .toContain("agent:child");
+    expect(readHostLeaseCurrent(meshRoot, identity.id)).toBeUndefined();
+    expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
+    expect(child(lease.expiresAt + 1)).toMatchObject({ stale: true });
+  }, 20_000);
+
   it("a reload withdrawal whose delete is always skipped on a conflict counts as not done", async () => {
     const meshRoot = tempRoot();
     const warnings: string[] = [];

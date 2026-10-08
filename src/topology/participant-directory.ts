@@ -498,6 +498,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #withdrawn = false;
   /** close() could not withdraw: the entries lapse with their unrenewed lease instead. */
   #withdrawalFailed = false;
+  /** close() started but its withdrawal has not committed yet: an exit treats this as failed. */
+  #withdrawalPending = false;
   #withdrawalWarned = false;
   #exitHook: (() => void) | undefined;
 
@@ -573,14 +575,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // leave this host fresh: synchronously drop its lease file so its records expire with
   // the stored lease, as close() would (smarty-dev#6622). A published reload keeps both, but
   // only when its withdrawal committed: otherwise the reload lease would keep stale child or
-  // legacy entries alive after the process is gone (smarty-dev#6622, review round 2).
+  // legacy entries alive after the process is gone (smarty-dev#6622, review round 2). A close()
+  // still awaiting its withdrawal has not committed either (round 4).
   #installExitHook(): void {
     this.#withdrawn = false;
     this.#withdrawalFailed = false;
+    this.#withdrawalPending = false;
     if (this.#exitHook) return;
     this.#exitHook = () => {
       if (this.#withdrawn || !this.options.enabled) return;
-      if (this.#reloadPublished && !this.#withdrawalFailed) return;
+      if (this.#reloadPublished && !this.#withdrawalFailed && !this.#withdrawalPending) return;
       try {
         // Only this incarnation's lease: a reloaded successor in this process writes its own.
         const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
@@ -1531,6 +1535,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#withdrawalPending = true;
     this.#cancelPublicationRetry();
     await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
@@ -1575,6 +1580,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#reloadPublished) {
       if (!records.ok) { this.#withdrawalFailure(records.reason); return; }
       this.#withdrawn = true;
+      this.#withdrawalPending = false;
       this.#removeExitHook();
       return;
     }
@@ -1582,6 +1588,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // The lease file is gone either way; only a committed withdrawal retires the exit hook.
     if (!records.ok) { this.#withdrawalFailure(records.reason); return; }
     this.#withdrawn = true;
+    this.#withdrawalPending = false;
     this.#removeExitHook();
   }
 

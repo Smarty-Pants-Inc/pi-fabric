@@ -8,6 +8,7 @@ import { abortMeshRollback, cutoverMeshState, importMeshState, meshSnapshotDiges
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
 import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { legacyPut } from "./fixtures/legacy-mesh-state-04930dfd.js";
 
 // smarty-dev#6477 L4b: the tool is SIGKILLed after each step of its commit order (plan section 5);
 // the rerun converges, and the file epoch never exceeds the database epoch at any crash point.
@@ -112,6 +113,13 @@ const assertFence = (root: string): void => {
   const { backend, epoch, values } = meta(root);
   expect(["sqlite", "exporting", "file"]).toContain(backend);
   expect(fileEpoch).toBeLessThanOrEqual(epoch);
+  const moved = readMeshStateMovedMarker(root) !== undefined;
+  if (backend === "file" && moved) {
+    // Between the switch and the replace (review round 4): the marker still stands, readers use SQLite.
+    expect(fileEpoch).toBeLessThan(epoch);
+    expect(resolveMeshStateSource(root).source).toBe("sqlite");
+    return;
+  }
   if (backend === "file") {
     // Equal only after a verified export: the switch records it, and the bytes still match it.
     expect(fileEpoch).toBe(epoch);
@@ -125,31 +133,27 @@ const assertFence = (root: string): void => {
   expect(resolveMeshStateSource(root).source).toBe(backend === "file" ? "file" : "sqlite");
 };
 
-const temps = (root: string): string[] => fs.readdirSync(root).filter(name => name.startsWith("state.json.mesh-backend-"));
+const temps = (root: string): string[] =>
+  fs.readdirSync(root).filter(name => name.startsWith("state.json.mesh-backend-") || /^state\.json\.rollback-\d+\.tmp$/.test(name));
+
+/** A legacy (04930dfd) put: true when it committed, false when the strict read refused the marker. */
+const legacyCommits = async (root: string, key: string): Promise<boolean> => {
+  try { await legacyPut(root, key, { legacy: true }); return true; }
+  catch (error) {
+    expect((error as Error).message).toBe("Failed to read Fabric mesh state: invalid state format");
+    return false;
+  }
+};
 
 describe("mesh backend tool killed after each step", () => {
-  it.each(["import-read", "import-commit", "import-verify"] as const)("import killed after %s converges on rerun", async (step) => {
-    const root = tempRoot(step);
-    await seed(root);
-    const original = meshSnapshotDigest(fileState(root));
-    const killed = await runChild("import", root, step);
-    expectKilled(killed);
-    assertFence(root);
-    expect(meta(root).backend).toBe(step === "import-read" ? "file" : "sqlite");
-    // The rerun takes over the dead tool's .lock and converges.
-    const rerun = await importMeshState(root, { lockTimeoutMs: 20_000 });
-    expect(rerun).toMatchObject({ backend: "sqlite", epoch: 1, digest: original, converged: step !== "import-read" });
-    assertFence(root);
-    expect(await dbDigest(root)).toBe(original);
-    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
-  }, 120_000);
-
-  it.each(["import-read", "import-commit", "import-verify", "cutover-reconcile", "cutover-copy", "cutover-marker"] as const)(
-    "cutover killed after %s (inside its .lock section) converges on rerun", async (step) => {
-      const root = tempRoot(`cutover-${step}`);
+  const fencedSteps = ["import-read", "import-commit", "import-verify", "cutover-reconcile", "cutover-copy", "cutover-marker"] as const;
+  // Import commits backend=sqlite, so it runs the same fenced section as cutover (review round 4).
+  it.each((["import", "cutover"] as const).flatMap(operation => fencedSteps.map(step => [operation, step] as const)))(
+    "%s killed after %s (inside its .lock section) converges on rerun", async (operation, step) => {
+      const root = tempRoot(`${operation}-${step}`);
       await seed(root);
       const original = meshSnapshotDigest(fileState(root));
-      const killed = await runChild("cutover", root, step);
+      const killed = await runChild(operation, root, step);
       expectKilled(killed);
       // It died holding .lock: no file-mode writer could have committed meanwhile.
       expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
@@ -157,7 +161,7 @@ describe("mesh backend tool killed after each step", () => {
       expect(meta(root).backend).toBe(step === "import-read" ? "file" : "sqlite");
       // Before its last step state.json is still the imported file; the marker is written only last.
       expect(readMeshStateMovedMarker(root)?.epoch).toBe(step === "cutover-marker" ? 1 : undefined);
-      const rerun = await cutoverMeshState(root, { assumeNoWriters: true, lockTimeoutMs: 20_000 });
+      const rerun = await (operation === "import" ? importMeshState : cutoverMeshState)(root, { assumeNoWriters: true, lockTimeoutMs: 20_000 });
       expect(rerun).toMatchObject({ backend: "sqlite", epoch: 1, digest: original, converged: step !== "import-read" });
       assertFence(root);
       expect(await dbDigest(root)).toBe(original);
@@ -165,10 +169,12 @@ describe("mesh backend tool killed after each step", () => {
       expect(readMeshStateMovedMarker(root)?.epoch).toBe(1);
       expect(meshSnapshotDigest(decodeMeshStateFile(path.join(root, "state.json.cutover-1"), 64 * 1024 * 1024, false) as never)).toBe(original);
       expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+      // And a legacy writer stays refused.
+      expect(await legacyCommits(root, "legacy/after-import")).toBe(false);
     }, 120_000);
 
-  it.each(["rollback-flag", "rollback-export-temp", "rollback-export", "rollback-verify", "rollback-switch"] as const)(
-    "rollback killed after %s converges on rerun", async (step) => {
+  it.each(["rollback-flag", "rollback-export-temp", "rollback-verify", "rollback-switch", "rollback-replace"] as const)(
+    "rollback killed after %s converges on rerun; a legacy writer never commits before the replace", async (step) => {
       const root = tempRoot(step);
       await seed(root);
       // A real cutover: state.json is the moved marker until the export (step 3) replaces it.
@@ -180,11 +186,20 @@ describe("mesh backend tool killed after each step", () => {
       const killed = await runChild("rollback", root, step);
       expectKilled(killed);
       assertFence(root);
-      expect(meta(root)).toMatchObject({ backend: step === "rollback-switch" ? "file" : "exporting", epoch: 2 });
-      if (step === "rollback-export-temp") expect(temps(root)).toHaveLength(1);
-      expect(readMeshStateMovedMarker(root)?.epoch).toBe(step === "rollback-flag" || step === "rollback-export-temp" ? 1 : undefined);
+      const switched = step === "rollback-switch" || step === "rollback-replace";
+      expect(meta(root)).toMatchObject({ backend: switched ? "file" : "exporting", epoch: 2 });
+      expect(temps(root)).toHaveLength(step === "rollback-flag" || step === "rollback-replace" ? 0 : 1);
+      // The marker stands until the very last step (the replace).
+      expect(readMeshStateMovedMarker(root)?.epoch).toBe(step === "rollback-replace" ? undefined : 1);
+      if (step !== "rollback-replace") {
+        const marker = fs.readFileSync(path.join(root, "state.json"));
+        // A legacy writer takes over the dead tool's .lock and meets the marker: nothing commits.
+        expect(await legacyCommits(root, "legacy/after-kill")).toBe(false);
+        expect(fs.readFileSync(path.join(root, "state.json")).equals(marker)).toBe(true);
+      }
       const rerun = await rollbackMeshState(root, { lockTimeoutMs: 20_000 });
-      expect(rerun).toMatchObject({ backend: "file", epoch: 2, converged: step === "rollback-switch" });
+      expect(rerun).toMatchObject({ backend: "file", epoch: 2, converged: step === "rollback-replace",
+        steps: step === "rollback-replace" ? [] : step === "rollback-switch" ? [5] : [3, 4, 5] });
       assertFence(root);
       expect(temps(root)).toEqual([]);
       expect(meshSnapshotDigest(fileState(root))).toBe(committed);
@@ -192,7 +207,7 @@ describe("mesh backend tool killed after each step", () => {
       expect(new MeshStore(root, 64 * 1024, 1_000).get("kill/live", { fresh: true })?.value).toBe("written on sqlite");
     }, 120_000);
 
-  it.each(["rollback-flag", "rollback-export"] as const)("abort-rollback after a kill at %s returns to sqlite at E+1", async (step) => {
+  it.each(["rollback-flag", "rollback-verify"] as const)("abort-rollback after a kill at %s returns to sqlite at E+1", async (step) => {
     const root = tempRoot(`abort-${step}`);
     await seed(root);
     await cutoverMeshState(root, { assumeNoWriters: true });
@@ -202,8 +217,10 @@ describe("mesh backend tool killed after each step", () => {
     assertFence(root);
     expect(await abortMeshRollback(root)).toMatchObject({ backend: "sqlite", epoch: 2, converged: true });
     assertFence(root);
-    // Back on sqlite: an export already written is replaced by the marker again (legacy writers stay fenced).
-    expect(readMeshStateMovedMarker(root)?.epoch).toBe(step === "rollback-flag" ? 1 : 2);
+    // Back on sqlite: the marker never left (review round 4), the export temp is gone, legacy writers stay fenced.
+    expect(readMeshStateMovedMarker(root)?.epoch).toBe(1);
+    expect(temps(root)).toEqual([]);
+    expect(await legacyCommits(root, "legacy/after-abort")).toBe(false);
     const store = await SqliteStateStore.open(root, 64 * 1024, 1_000);
     try { expect(meshSnapshotDigest(store.exportState())).toBe(committed); }
     finally { store.close(); }

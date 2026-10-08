@@ -92,7 +92,8 @@ const decodeEpochDefault = (file: string, maxBytes: number): number => {
  * throws "invalid state format" before it commits. A LEGACY file-mode writer (no backend guard) that
  * waited on `.lock` through the cutover therefore fails closed and writes nothing. New code treats
  * it as backend=sqlite (never as state, damage or an empty mesh); without state.db it is an alarm.
- * Rollback step 3 replaces it with the exported state.json.
+ * Rollback replaces it with the exported state.json only as its very last step, after backend=file
+ * committed (review round 4); until then every reader reads SQLite and every writer fails closed.
  */
 export interface MeshStateMovedMarker {
   format: "sqlite";
@@ -164,8 +165,12 @@ export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceO
 
 /**
  * The reader rule (plan section 5) for a known database flag (`none`: state.db absent or
- * uninitialised): use state.json only when backend=file and its epoch equals meta.epoch; with sqlite
- * or exporting read SQLite; anything else fails closed with MeshBackendFenceError and an alarm.
+ * uninitialised): use state.json only when backend=file and it is a real state file whose epoch
+ * equals meta.epoch; with sqlite or exporting read SQLite; anything else fails closed with
+ * MeshBackendFenceError and an alarm. While state.json is the moved marker SQLite is read whatever
+ * the (valid) flag (pi-fabric#627 review round 4): it is the last committed state, because the flag
+ * fences sqlite-mode writers once it is exporting or file, and rollback removes the marker only as
+ * its very last step, after backend=file committed.
  */
 export const meshStateSourceOf = (root: string, backend: string, epoch: number, options: MeshBackendFenceOptions = {}): MeshStateSource => {
   let fileEpoch: number;
@@ -178,11 +183,9 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
     throw meshFenceAlarm(options, root, `Fabric mesh state.json is unreadable under backend=${backend} epoch ${epoch}: ${(error as Error).message}`, { backend, epoch });
   }
   const detail = { backend, epoch, fileEpoch };
-  // The moved marker means backend=sqlite: only sqlite/exporting agree with it; never state, damage or empty.
-  if (moved && backend !== "sqlite" && backend !== "exporting") {
-    throw meshFenceAlarm(options, root, backend === "none"
-      ? `Fabric mesh state.json is the moved marker (state.db at epoch ${fileEpoch}) but state.db is missing or uninitialised`
-      : `Fabric mesh state.json is the moved marker (epoch ${fileEpoch}) but state.db has backend=${backend} at epoch ${epoch}`, detail);
+  // The moved marker means "read state.db": never state, damage or empty, and an alarm without state.db.
+  if (moved && backend === "none") {
+    throw meshFenceAlarm(options, root, `Fabric mesh state.json is the moved marker (state.db at epoch ${fileEpoch}) but state.db is missing or uninitialised`, detail);
   }
   if (!Number.isSafeInteger(epoch) || epoch < 0) throw meshFenceAlarm(options, root, `Fabric mesh state.db has an invalid epoch (${String(epoch)})`, detail);
   if (fileEpoch > epoch) {
@@ -191,7 +194,7 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
       : `Fabric mesh state.json epoch ${fileEpoch} exceeds the database epoch ${epoch} (backend=${backend})`, detail);
   }
   if (backend === "none") return { source: "file", ...detail };
-  if (backend === "sqlite" || backend === "exporting") return { source: "sqlite", ...detail };
+  if (backend === "sqlite" || backend === "exporting" || (moved && backend === "file")) return { source: "sqlite", ...detail };
   if (backend === "file") {
     if (fileEpoch === epoch) return { source: "file", ...detail };
     throw meshFenceAlarm(options, root, `Fabric mesh backend=file at epoch ${epoch} but state.json carries epoch ${fileEpoch}`, detail);

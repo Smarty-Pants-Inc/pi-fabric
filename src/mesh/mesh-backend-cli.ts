@@ -12,14 +12,16 @@ const USAGE = `Usage: fabric-mesh-backend <import|status|cutover|rollback|abort-
                           [--assume-no-writers] [--lock-protocol 1|2] [--lock-timeout-ms N]
 
   status          backend flag, epochs, digests, the reader decision and the census writers.
-  import          state.json -> state.db under the mesh .lock (also the roll forward), digest
-                  verified both ways; backend=sqlite, epoch E+1. Refuses a diverged sqlite root.
+  import          the cutover section (also the roll forward): state.json -> state.db under the
+                  mesh .lock, digest verified both ways, backend=sqlite at E+1, state.json replaced
+                  by the moved marker. Refuses a diverged sqlite root.
   cutover         import, refused unless the writer census shows no file-mode writer.
-  rollback        the R1 fence: flag exporting (E+1), export state.json, verify, switch to file.
-                  A rerun converges from the stored flag. Refused while the census shows writers.
-  abort-rollback  exporting -> sqlite, keeping epoch E+1.
+  rollback        the R1 fence: flag exporting (E+1), export to a verified temp, switch to file,
+                  then replace the marker (last). A rerun converges from the stored flag.
+                  Refused while the census shows writers.
+  abort-rollback  under .lock: restore the marker, then exporting -> sqlite, keeping epoch E+1.
 
-Without a census provider, cutover and rollback need --assume-no-writers: the operator attests that
+Without a census provider, import, cutover and rollback need --assume-no-writers: the operator attests that
 every writer (Pi sessions, actors, mesh-bridge, the projector) on the root is stopped.
 Exit status: 0 done, 1 error, 2 usage, 3 refused or fence violation (nothing unsafe was done).`;
 

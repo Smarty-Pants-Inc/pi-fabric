@@ -6,30 +6,39 @@
  * its export in `backendEpoch` (and the export's snapshot digest in `backendDigest`), right after
  * `readGeneration`, so older readers and writers keep and ignore both fields.
  *
- * Rollback commit order (each step is a crash point; rerun converges from the stored flag):
+ * Invariant (pi-fabric#627 review round 4): while state.json is the moved marker (backend-fence.ts),
+ * legacy writers fail closed; import and cutover write it as their LAST step under `.lock`, abort
+ * restores it before its flag moves, and rollback removes it only by its very last step, after
+ * backend=file is committed.
+ *
+ * Rollback commit order, all under ONE `.lock` hold after the census (each step is a crash point;
+ * a rerun converges from the stored flag and the marker):
  *   1. The census shows no writer left (or the operator attests it with `assumeNoWriters`).
  *   2. Flag: one BEGIN IMMEDIATE transaction at synchronous=FULL checks backend=sqlite at epoch E,
  *      sets backend=exporting and epoch=E+1. state-sqlite.ts writers check the flag after BEGIN
  *      IMMEDIATE and fail closed (MeshStateRetiredError), so nothing commits after this point.
- *   3. Export, under the mesh `.lock`: the committed snapshot through the normal state.json encoder
- *      (fresh readGeneration, revisionFormat 2, backendEpoch E+1, backendDigest) into a temporary
- *      file; fsync it, rename it over state.json, fsync the directory. state.db* stay in place.
- *   4. Verify, still under `.lock`: the normal decoder reads state.json back; backendEpoch must be
- *      E+1 and its digest must equal the database snapshot's (and the store's own read path agrees).
- *   5. Switch: BEGIN IMMEDIATE at FULL checks backend=exporting at E+1 and sets backend=file. Older
- *      binaries may start only after this step.
+ *   3. Export: the committed snapshot through the normal state.json encoder (fresh readGeneration,
+ *      revisionFormat 2, backendEpoch E+1, backendDigest) into `state.json.rollback-<E+1>.tmp`;
+ *      fsync it and the directory, read it back through the normal decoder and verify epoch,
+ *      generation and digest against the database snapshot. state.json is still the marker.
+ *   4. Switch: BEGIN IMMEDIATE at FULL checks backend=exporting at E+1 and sets backend=file.
+ *   5. Replace: rename the verified temp over the marker, fsync the directory; the store's own read
+ *      path re-checks it. Older binaries may start only after this step.
  * A rerun with `exporting` repeats 3 to 5 (the fence blocked every write, so the export is
- * identical); with `file` it repeats 4. `abortRollback` sets exporting back to sqlite and keeps E+1.
+ * identical); with `file` and the marker it repeats 5 (re-exporting with the recorded generation
+ * first when the temp is missing or unverifiable); with `file` and a real state.json it verifies.
+ * `abortMeshRollback` takes `.lock`, ensures the marker, then sets exporting back to sqlite at E+1.
  * The file epoch never exceeds the database epoch; with backend=file they are equal only after a
- * verified export. With backend=sqlite a file epoch equal to the database epoch (an aborted rollback)
- * is not authority: the reader rule below reads SQLite.
+ * verified export.
  *
- * Reader rule (`resolveMeshStateSource`): use state.json only when backend=file and its epoch equals
- * meta.epoch; with sqlite or exporting read SQLite; any other combination (a file epoch above the
+ * Reader rule (`resolveMeshStateSource`): use state.json only when backend=file and it is a real
+ * state file whose epoch equals meta.epoch; with sqlite or exporting, or while state.json is the
+ * moved marker, read SQLite; any other combination (a file epoch above the
  * database epoch, backend=file at another epoch, an unknown flag, a missing state.db under an
  * epoch-stamped state.json) fails closed with `MeshBackendFenceError` and an alarm.
  *
- * Import (file -> sqlite, also the roll forward): under the mesh `.lock` (no file-mode writer can
+ * Import (file -> sqlite, also the roll forward) runs the cutover section below (census or
+ * `assumeNoWriters`, `.lock` held throughout, the marker last). Its core: under the mesh `.lock` (no file-mode writer can
  * commit), state.json is read through the normal decoder and cross-checked against the store's own
  * read path (which follows the read journal), then written into state.db in ONE transaction that
  * replaces kv, tombstones and the change feed, sets backend=sqlite and epoch=E+1 and verifies the
@@ -50,7 +59,7 @@
  * `state.json.cutover-<E+1>` (fsync) and atomically replaces state.json with the moved marker
  * (backend-fence.ts; temp, fsync, rename, directory fsync). Every deployed write path reads
  * state.json strictly and throws "invalid state format" on it, so a LEGACY file-mode writer that
- * waited on `.lock` (or starts later) fails closed and writes nothing; rollback step 3 replaces the
+ * waited on `.lock` (or starts later) fails closed and writes nothing; rollback step 5 replaces the
  * marker with the export. New writers are also fenced by `assertFileStateWritable` (backend-fence.ts,
  * re-exported here): StateFile calls it on every commit under `.lock`, right before the state.json
  * rename, so a refused write leaves state.json untouched.
@@ -84,7 +93,7 @@ export type MeshBackendFlag = "sqlite" | "exporting" | "file";
 /** Crash points, in commit order. `onStep` runs synchronously right after each one. */
 export type MeshBackendStep =
   | "import-read" | "import-commit" | "import-verify"
-  | "rollback-flag" | "rollback-export-temp" | "rollback-export" | "rollback-verify" | "rollback-switch"
+  | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
   | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
@@ -702,41 +711,33 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
   return result(epoch, previousEpoch, false);
 };
 
-const runImport = async (root: string, options: MeshBackendOptions): Promise<MeshImportResult> => {
-  root = path.resolve(root);
-  if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
-  const fence = FenceDb.open(root, options, "write", true)!;
-  try { return await withMeshLock(root, options, lock => importUnderLock(root, options, fence, lock)); }
-  finally { fence.close(); }
-};
-
 /**
- * Import (file -> sqlite) and the roll forward. With a census it refuses on any writer whose mode
- * a cutover refuses; without one it is the offline import (the operator stopped the root).
+ * Import (file -> sqlite, also the roll forward) and cutover are ONE fenced section (pi-fabric#627
+ * review round 4): an import commits backend=sqlite, so it needs the census (or the operator's
+ * `assumeNoWriters`) exactly like cutover, holds `.lock` throughout, and leaves the moved marker as
+ * its last step, so a legacy file-mode writer can never commit to the retired state.json.
  */
-export const importMeshState = async (root: string, options: MeshBackendOptions = {}): Promise<MeshImportResult> => {
-  if (options.census) {
-    const modes = new Set(options.cutoverModes ?? DEFAULT_CUTOVER_MODES);
-    await requireCensus(options, "import", writer => !modes.has(writer.mode), `no writer outside ${[...modes].join("/")} mode`);
-  }
-  return runImport(root, options);
-};
+export const importMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
+  fencedCutover(root, options, "import");
 
 /**
  * Cutover: one critical section under the mesh `.lock` (file-mode writers serialize on it):
- * census -> G0 -> import and flag at E+1 -> verify -> second census -> state.json against G0.
- * A file-mode writer (or a moved state.json) found after the flag fails the cutover and runs the
- * rollback fence back to backend=file at E+2 before `.lock` is released.
+ * census -> G0 -> import and flag at E+1 -> verify -> second census -> state.json against G0 -> the
+ * moved marker. A file-mode writer (or a moved state.json) found after the flag fails the cutover and
+ * runs the rollback fence back to backend=file at E+2 before `.lock` is released.
  */
-export const cutoverMeshState = async (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> => {
+export const cutoverMeshState = (root: string, options: MeshBackendOptions = {}): Promise<MeshCutoverResult> =>
+  fencedCutover(root, options, "cutover");
+
+const fencedCutover = async (root: string, options: MeshBackendOptions, operation: "import" | "cutover"): Promise<MeshCutoverResult> => {
   root = path.resolve(root);
   const modes = new Set(options.cutoverModes ?? DEFAULT_CUTOVER_MODES);
   const refuses = (writer: MeshCensusWriter): boolean => !modes.has(writer.mode);
   const need = `no writer outside ${[...modes].join("/")} mode`;
-  if (!options.census && !options.assumeNoWriters) throw censusMissing("cutover", need);
+  if (!options.census && !options.assumeNoWriters) throw censusMissing(operation, need);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   return holdMeshLock(root, options, async (lock) => {
-    const writers = await requireCensus(options, "cutover", refuses, need);
+    const writers = await requireCensus(options, operation, refuses, need);
     const fence = FenceDb.open(root, options, "write", true)!;
     try {
       // G0, import, flag at E+1 and verification; a state.json that moved before COMMIT aborts it.
@@ -815,60 +816,97 @@ const writeMovedMarker = (root: string, epoch: number): void => {
 
 // ------------------------------------------------------------------ rollback
 
-const exportAndVerify = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, epoch: number):
-  { digest: string; generation: string } => {
+/**
+ * Rollback (pi-fabric#627 review round 4) keeps ONE invariant: while the moved marker is state.json,
+ * legacy writers fail closed (their strict read throws "invalid state format") and new ones are
+ * refused (the reader rule reads SQLite); the marker is removed only by the very last step, after
+ * backend=file is committed. Under one `.lock` hold:
+ *   (1) census (outside `.lock`, before the flag); the marker is put in place if state.json is not it;
+ *   (2) flag sqlite -> exporting at E+1 (BEGIN IMMEDIATE, FULL): sqlite-mode writers fail closed;
+ *   (3) export to `state.json.rollback-<E+1>.tmp`, fsync it and the directory, and verify it by
+ *       reading it back (epoch, generation, recorded digest, file digest = database digest);
+ *   (4) commit backend=file at E+1 with the export's digest and generation;
+ *   (5) rename the temp over the marker, fsync the directory (then the store read path re-checks it).
+ * Rerun after a crash: exporting -> redo from (3); file + marker + verified temp -> redo (5);
+ * file + marker + no (or an unverifiable) temp -> redo (3) with the recorded generation, then (5);
+ * file + a real state.json -> verify only.
+ */
+const rollbackTempName = (epoch: number): string => `${STATE_JSON}.rollback-${epoch}.tmp`;
+const ROLLBACK_TEMP = /^state\.json\.rollback-\d+\.tmp$/;
+
+const removeRollbackTemps = (root: string, keep?: string): void => {
+  for (const name of fs.readdirSync(root)) {
+    if (ROLLBACK_TEMP.test(name) && name !== keep) fs.rmSync(path.join(root, name), { force: true });
+  }
+};
+
+interface ExportMark { epoch: number; digest: string; generation: string }
+
+/** Why `file` is not the verified export `expected` of the database snapshot `dbDigest`, or undefined. */
+const exportMismatch = (file: string, options: MeshBackendOptions, expected: ExportMark, dbDigest: string): string | undefined => {
+  let back: FencedFile;
+  try { back = decodeMeshStateFile(file, maxBytesOf(options), false) as FencedFile; }
+  catch (error) { return `unreadable (${(error as Error).message})`; }
+  const fileEpoch = fileEpochOf(back);
+  if (fileEpoch !== expected.epoch) return `epoch ${fileEpoch}, expected ${expected.epoch}`;
+  if (back.readGeneration !== expected.generation) return "replaced after the export (another readGeneration)";
+  const fileDigest = meshSnapshotDigest(back);
+  if (back.backendDigest !== expected.digest || fileDigest !== expected.digest || dbDigest !== expected.digest) {
+    return `digest mismatch: recorded ${String(back.backendDigest)}, file ${fileDigest}, state.db ${dbDigest}, expected ${expected.digest}`;
+  }
+  return undefined;
+};
+
+/**
+ * Step 3: the committed snapshot through the normal encoder (readGeneration first; a rerun at
+ * backend=file reuses the recorded generation) into `state.json.rollback-<epoch>.tmp`, fsync, directory
+ * fsync, then read back through the normal decoder and verified. state.json (the marker) is untouched.
+ */
+const writeExportTemp = (root: string, options: MeshBackendOptions, fence: FenceDb, epoch: number, recorded?: { digest: string; generation: string }):
+  ExportMark & { temporary: string } => {
   removeStaleTemps(root);
+  removeRollbackTemps(root);
   const { meta, state } = fence.snapshot();
-  if (meta.backend !== "exporting" || meta.epoch !== epoch) {
-    throw alarm(options, root, `Fabric mesh export expected backend=exporting at epoch ${epoch}, found ${meta.backend} at ${meta.epoch}`,
+  const expectedFlag = recorded ? "file" : "exporting";
+  if (meta.backend !== expectedFlag || meta.epoch !== epoch) {
+    throw alarm(options, root, `Fabric mesh export expected backend=${expectedFlag} at epoch ${epoch}, found ${meta.backend} at ${meta.epoch}`,
       { backend: meta.backend, epoch: meta.epoch });
   }
   const digest = meshSnapshotDigest(state);
-  // Step 3: the normal encoder, readGeneration first (readers take it from the header).
-  const generation = randomUUID();
+  if (recorded && recorded.digest !== digest) {
+    throw alarm(options, root, `Fabric mesh backend=file at epoch ${epoch} recorded export ${recorded.digest} but state.db is ${digest}`,
+      { backend: meta.backend, epoch: meta.epoch });
+  }
+  const generation = recorded?.generation || randomUUID();
   const exported: FencedFile = { readGeneration: generation, backendEpoch: epoch, backendDigest: digest, format: 1, revisionFormat: 2,
     entries: state.entries, versions: state.versions, tombstoneOrder: state.tombstoneOrder, highWater: state.highWater };
   const serialized = encodeMeshStateFile(exported).serialized;
   if (serialized.byteLength > maxBytesOf(options)) throw new Error(`Fabric mesh state exceeds ${maxBytesOf(options)} bytes`);
-  const temporary = path.join(root, `${TEMP_PREFIX}${process.pid}-${randomUUID()}.tmp`);
+  const temporary = path.join(root, rollbackTempName(epoch));
   const descriptor = fs.openSync(temporary, "wx", 0o600);
   try {
     let offset = 0;
     while (offset < serialized.byteLength) offset += fs.writeSync(descriptor, serialized, offset, serialized.byteLength - offset);
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
-  options.onStep?.("rollback-export-temp");
-  renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
-  options.onStep?.("rollback-export");
-  // Step 4: the old reader's decoder reads it back.
-  verifyExport(root, options, fence, lock, { epoch, digest, generation });
+  options.onStep?.("rollback-export-temp");
+  const mismatch = exportMismatch(temporary, options, { epoch, digest, generation }, meshSnapshotDigest(fence.snapshot().state));
+  if (mismatch) throw alarm(options, root, `Fabric mesh export verification of ${temporary}: ${mismatch}`, { epoch, fileEpoch: epoch });
   options.onStep?.("rollback-verify");
-  return { digest, generation };
+  return { epoch, digest, generation, temporary };
 };
 
-const verifyExport = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock,
-  expected: { epoch: number; digest: string; generation: string }): void => {
-  const back = readFile(root, options);
-  const fileEpoch = fileEpochOf(back);
-  if (fileEpoch !== expected.epoch) {
-    throw alarm(options, root, `Fabric mesh export verification: state.json epoch ${fileEpoch}, expected ${expected.epoch}`, { epoch: expected.epoch, fileEpoch });
-  }
-  if (back.readGeneration !== expected.generation) {
-    throw alarm(options, root, "Fabric mesh export verification: state.json was replaced after the export", { epoch: expected.epoch, fileEpoch });
-  }
-  const fileDigest = meshSnapshotDigest(back);
-  const dbDigest = meshSnapshotDigest(fence.snapshot().state);
-  if (back.backendDigest !== expected.digest || fileDigest !== expected.digest || dbDigest !== expected.digest) {
-    throw alarm(options, root, `Fabric mesh export digest mismatch: recorded ${String(back.backendDigest)}, state.json ${fileDigest}, state.db ${dbDigest}`,
-      { epoch: expected.epoch, fileEpoch });
-  }
-  if (storeReadDigest(root, lock, options) !== entriesDigest(normalizeSnapshot(back).entries)) {
-    throw alarm(options, root, "Fabric mesh export verification: the store read path disagrees with state.json", { epoch: expected.epoch, fileEpoch });
+/** After step 5: state.json is the export, and the store's own read path (read journal) agrees. */
+const verifyExport = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, expected: ExportMark): void => {
+  const mismatch = exportMismatch(path.join(root, STATE_JSON), options, expected, meshSnapshotDigest(fence.snapshot().state));
+  if (mismatch) throw alarm(options, root, `Fabric mesh export verification: state.json ${mismatch}`, { epoch: expected.epoch });
+  if (storeReadDigest(root, lock, options) !== entriesDigest(normalizeSnapshot(readFile(root, options)).entries)) {
+    throw alarm(options, root, "Fabric mesh export verification: the store read path disagrees with state.json", { epoch: expected.epoch });
   }
 };
 
-/** Rerun of step 4 on a switched root: a later file-mode commit (new readGeneration) only needs the epoch. */
+/** A rerun on a switched root with a real state.json: a later file-mode commit (new readGeneration) only needs the epoch. */
 const reverifySwitched = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, meta: DbMeta): { digest: string; generation: string } => {
   const back = readFile(root, options);
   const fileEpoch = fileEpochOf(back);
@@ -882,7 +920,12 @@ const reverifySwitched = (root: string, options: MeshBackendOptions, fence: Fenc
   return { digest: meshSnapshotDigest(back), generation: String(back.readGeneration ?? "") };
 };
 
-/** Rollback step 2: BEGIN IMMEDIATE at FULL checks backend=sqlite at E, sets exporting at E+1. */
+/** The marker is state.json (written at `epoch` when it is not): from here on legacy writers fail closed. */
+const ensureMovedMarker = (root: string, epoch: number): void => {
+  if (!readMeshStateMovedMarker(root)) writeMovedMarker(root, epoch);
+};
+
+/** Step 2: BEGIN IMMEDIATE at FULL checks backend=sqlite at E, sets exporting at E+1. */
 const rollbackFlag = (root: string, options: MeshBackendOptions, fence: FenceDb, from: number): number => {
   fence.transaction(() => {
     const current = fence.meta();
@@ -897,12 +940,11 @@ const rollbackFlag = (root: string, options: MeshBackendOptions, fence: FenceDb,
   return from + 1;
 };
 
-/** Rollback step 5: BEGIN IMMEDIATE at FULL checks backend=exporting at E+1, sets file. */
-const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceDb, epoch: number,
-  exported: { digest: string; generation: string }): void => {
+/** Step 4: BEGIN IMMEDIATE at FULL checks backend=exporting at E+1, sets file (the marker still stands). */
+const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceDb, exported: ExportMark): void => {
   fence.transaction(() => {
     const current = fence.meta();
-    if (current.backend !== "exporting" || current.epoch !== epoch) {
+    if (current.backend !== "exporting" || current.epoch !== exported.epoch) {
       throw alarm(options, root, `Fabric mesh rollback switch found backend=${current.backend} epoch ${current.epoch}`,
         { backend: current.backend, epoch: current.epoch });
     }
@@ -914,89 +956,121 @@ const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceD
   options.onStep?.("rollback-switch");
 };
 
+/** Step 5, the very last: the verified temp replaces the marker (atomic rename, directory fsync). */
+const rollbackReplace = (root: string, options: MeshBackendOptions, temporary: string): void => {
+  renameAtomic(temporary, path.join(root, STATE_JSON));
+  fsyncDirectory(root);
+  options.onStep?.("rollback-replace");
+};
+
 /**
- * Steps 2 to 5 under a `.lock` the caller holds: a failed cutover's way back to file. No census
- * (step 1): sqlite-mode writers are fenced by the flag, file-mode writers wait on the held `.lock`.
+ * Steps 2 to 5 (and the reruns) under a `.lock` the caller holds. `censused`: step 1 ran for this
+ * flag, so backend=sqlite may be flagged (a failed cutover holds `.lock` since its own census).
  */
+const rollbackLocked = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock, steps: number[], censused: boolean):
+  MeshRollbackResult => {
+  let meta = fence.meta();
+  const done = (exported: ExportMark, converged: boolean): MeshRollbackResult =>
+    ({ root, backend: "file", epoch: exported.epoch, digest: exported.digest, generation: exported.generation, steps, converged });
+  if (meta.backend === "file") {
+    if (!readMeshStateMovedMarker(root)) {
+      removeRollbackTemps(root);
+      return { ...done({ epoch: meta.epoch, ...reverifySwitched(root, options, fence, lock, meta) }, true), steps: [] };
+    }
+    // Crashed between the switch (4) and the replace (5): the marker still fences legacy writers.
+    const recorded = { epoch: meta.epoch, digest: String(meta.values.get("export_digest") ?? ""), generation: String(meta.values.get("export_generation") ?? "") };
+    let temporary = path.join(root, rollbackTempName(meta.epoch));
+    const verified = fs.existsSync(temporary) && recorded.generation !== ""
+      && exportMismatch(temporary, options, recorded, meshSnapshotDigest(fence.snapshot().state)) === undefined;
+    if (!verified) {
+      ({ temporary } = writeExportTemp(root, options, fence, meta.epoch, recorded));
+      steps.push(3);
+    }
+    rollbackReplace(root, options, temporary);
+    steps.push(5);
+    verifyExport(root, options, fence, lock, recorded);
+    return done(recorded, false);
+  }
+  if (meta.backend === "sqlite") {
+    if (!censused) throw new MeshBackendRefusedError(`Fabric mesh rollback raced: backend=sqlite at epoch ${meta.epoch} without a census`);
+    // A state.json that is not the marker (an older tool, a failed cutover) is not authority under sqlite.
+    ensureMovedMarker(root, meta.epoch);
+    rollbackFlag(root, options, fence, meta.epoch);
+    steps.push(2);
+    meta = fence.meta();
+  }
+  if (meta.backend !== "exporting") {
+    throw alarm(options, root, `Fabric mesh rollback: backend flag ${JSON.stringify(meta.backend)} is not sqlite, exporting or file`,
+      { backend: meta.backend, epoch: meta.epoch });
+  }
+  ensureMovedMarker(root, meta.epoch);
+  const exported = writeExportTemp(root, options, fence, meta.epoch);
+  steps.push(3);
+  rollbackSwitch(root, options, fence, exported);
+  steps.push(4);
+  rollbackReplace(root, options, exported.temporary);
+  steps.push(5);
+  verifyExport(root, options, fence, lock, exported);
+  return done(exported, false);
+};
+
+/** A failed cutover's way back to file, under its held `.lock` (its census was step 1). */
 const rollbackUnderLock = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock): MeshRollbackResult => {
   const meta = fence.meta();
   if (meta.backend !== "sqlite") {
     throw alarm(options, root, `Fabric mesh cutover rollback expected backend=sqlite, found ${meta.backend} at epoch ${meta.epoch}`,
       { backend: meta.backend, epoch: meta.epoch });
   }
-  const epoch = rollbackFlag(root, options, fence, meta.epoch);
-  const exported = exportAndVerify(root, options, fence, lock, epoch);
-  rollbackSwitch(root, options, fence, epoch, exported);
-  return { root, backend: "file", epoch, ...exported, steps: [2, 3, 4, 5], converged: false };
+  return rollbackLocked(root, options, fence, lock, [], true);
 };
 
-/** Rollback (sqlite -> file) with the R1 fence; reruns converge from the stored flag. */
+/** Rollback (sqlite -> file) with the R1 fence; reruns converge from the stored flag and the marker. */
 export const rollbackMeshState = async (root: string, options: MeshBackendOptions = {}): Promise<MeshRollbackResult> => {
   root = path.resolve(root);
   const fence = FenceDb.open(root, options, "write");
   if (!fence) throw new MeshBackendRefusedError(`No state.db at ${root}: the root is on the file backend`);
   try {
     const steps: number[] = [];
-    let meta = fence.meta();
-    if (meta.backend === "file") {
-      const verified = await withMeshLock(root, options, lock => reverifySwitched(root, options, fence, lock, meta));
-      return { root, backend: "file", epoch: meta.epoch, ...verified, steps: [4], converged: true };
-    }
-    if (meta.backend === "sqlite") {
+    if (fence.meta().backend === "sqlite") {
       // Step 1: no writer, no projector.
       await requireCensus(options, "rollback", () => true, "every v3 writer and the projector stopped");
       steps.push(1);
-      // Step 2: the flag, at FULL.
-      rollbackFlag(root, options, fence, meta.epoch);
-      steps.push(2);
-      meta = fence.meta();
     }
-    if (meta.backend !== "exporting") {
-      throw alarm(options, root, `Fabric mesh rollback: backend flag ${JSON.stringify(meta.backend)} is not sqlite, exporting or file`,
-        { backend: meta.backend, epoch: meta.epoch });
-    }
-    const epoch = meta.epoch;
-    // Steps 3 and 4 under the mesh .lock (the file store's write discipline).
-    const exported = await withMeshLock(root, options, lock => exportAndVerify(root, options, fence, lock, epoch));
-    steps.push(3, 4);
-    // Step 5: the reader switch, at FULL.
-    rollbackSwitch(root, options, fence, epoch, exported);
-    steps.push(5);
-    return { root, backend: "file", epoch, ...exported, steps, converged: false };
+    return await withMeshLock(root, options, lock => rollbackLocked(root, options, fence, lock, steps, steps.includes(1)));
   } finally { fence.close(); }
 };
 
-/** `exporting` back to `sqlite`, keeping epoch E+1 (stores opened at E reopen). */
+/**
+ * `exporting` back to `sqlite`, keeping epoch E+1 (stores opened at E reopen). `.lock` is taken
+ * FIRST; the marker is ensured (restored if anything replaced it) before the flag moves, so no
+ * legacy writer queued on `.lock` ever sees a real state.json while SQLite is the authority.
+ */
 export const abortMeshRollback = async (root: string, options: MeshBackendOptions = {}): Promise<MeshAbortRollbackResult> => {
   root = path.resolve(root);
   const fence = FenceDb.open(root, options, "write");
   if (!fence) throw new MeshBackendRefusedError(`No state.db at ${root}`);
   try {
-    const result = fence.transaction(() => {
+    return await withMeshLock(root, options, () => {
       const meta = fence.meta();
-      if (meta.backend === "sqlite" && Number(meta.values.get("aborted_rollback_epoch")) === meta.epoch) {
-        return { epoch: meta.epoch, converged: true };
-      }
-      if (meta.backend !== "exporting") {
+      const converged = meta.backend === "sqlite" && Number(meta.values.get("aborted_rollback_epoch")) === meta.epoch;
+      if (!converged && meta.backend !== "exporting") {
         throw new MeshBackendRefusedError(`abort-rollback needs backend=exporting (found ${meta.backend} at epoch ${meta.epoch})`);
       }
-      fence.setMeta("backend", "sqlite");
-      fence.setMeta("aborted_rollback_epoch", meta.epoch);
-      return { epoch: meta.epoch, converged: false };
-    });
-    if (!result.converged) options.onStep?.("abort-rollback");
-    // Back on sqlite: an export already written (step 3) is not authority, so state.json becomes the
-    // moved marker again and legacy writers keep failing closed (pi-fabric#627 review round 3).
-    if (!readMeshStateMovedMarker(root)) {
-      await withMeshLock(root, options, () => {
-        const meta = fence.meta();
-        if (meta.backend === "sqlite" && meta.epoch === result.epoch && !readMeshStateMovedMarker(root)) {
-          removeStaleTemps(root);
-          writeMovedMarker(root, meta.epoch);
+      ensureMovedMarker(root, meta.epoch);
+      removeRollbackTemps(root);
+      removeStaleTemps(root);
+      if (converged) return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: true };
+      fence.transaction(() => {
+        const current = fence.meta();
+        if (current.backend !== "exporting" || current.epoch !== meta.epoch) {
+          throw new MeshBackendRefusedError(`abort-rollback raced: backend=${current.backend} epoch ${current.epoch}`);
         }
+        fence.setMeta("backend", "sqlite");
+        fence.setMeta("aborted_rollback_epoch", meta.epoch);
       });
-    }
-    return { root, backend: "sqlite", ...result };
+      options.onStep?.("abort-rollback");
+      return { root, backend: "sqlite" as const, epoch: meta.epoch, converged: false };
+    });
   } finally { fence.close(); }
 };
 
@@ -1030,7 +1104,7 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
     status.fileDigest = meshSnapshotDigest(file);
   } catch (error) { status.fileError = (error as Error).message; }
   status.fenceHolds = status.fileEpoch === undefined ? status.backend !== "file"
-    : status.fileEpoch <= status.epoch && (status.fileMoved ? status.backend === "sqlite" || status.backend === "exporting"
+    : status.fileEpoch <= status.epoch && (status.fileMoved ? status.backend === "sqlite" || status.backend === "exporting" || status.backend === "file"
       : status.backend !== "file" || status.fileEpoch === status.epoch);
   const { onAlarm: _quiet, ...quiet } = options;
   try { status.reader = { source: resolveMeshStateSource(root, quiet).source }; }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
@@ -77,6 +78,22 @@ export const waitForHostLeaseRenewal = async (
   }
 };
 
+export interface MeshWriterRecord {
+  pid: number;
+  host: string;
+  /** Build/release commit SHA; "unknown" deliberately fails the cutover census. */
+  releaseSha: string;
+  lockProtocol: number;
+  stateBackend: "file" | "shadow" | "sqlite" | string;
+  startedAt: number;
+}
+
+export const meshWriterLeaseRecord = (lockProtocol: number, stateBackend: string, startedAt = Math.floor(Date.now() - process.uptime() * 1000)): MeshWriterRecord => ({
+  pid: process.pid, host: os.hostname(),
+  releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+  lockProtocol, stateBackend, startedAt,
+});
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -87,6 +104,8 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
+  /** Writer census metadata, absent on leases from pre-census releases. */
+  writer?: MeshWriterRecord;
 }
 
 const fileName = (hostId: string): string =>
@@ -132,6 +151,7 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
+      ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };
   } catch {
     return undefined;
@@ -235,6 +255,15 @@ const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.BigI
     lease: parsed.lease,
   });
   return parsed.lease;
+};
+
+const validWriter = (value: unknown): value is MeshWriterRecord => {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return Number.isSafeInteger(record.pid) && (record.pid as number) > 0 && typeof record.host === "string" &&
+    typeof record.releaseSha === "string" && (record.lockProtocol === 1 || record.lockProtocol === 2) &&
+    ["file", "shadow", "sqlite"].includes(String(record.stateBackend)) &&
+    typeof record.startedAt === "number" && Number.isFinite(record.startedAt);
 };
 
 const validSession = (value: unknown): value is NonNullable<FabricHostLease["session"]> => {

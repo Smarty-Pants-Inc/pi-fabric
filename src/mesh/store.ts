@@ -1,5 +1,7 @@
 import type { MeshLockProtocol } from "../config.js";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
@@ -19,6 +21,22 @@ export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateB
 //   state-file.ts  keyed state on state.json; state-backend.ts selects it, sqlite or shadow (L2a).
 //   event-log.ts   events, receipts, the live log, compaction and the archive.
 // Each domain keeps its own private fields; they share only the context (root, bounds, lock).
+
+const meshProcessStartedAt = Math.floor(Date.now() - process.uptime() * 1000);
+
+const recordMeshWriter = (root: string, lockProtocol: number, stateBackend: string): void => {
+  const directory = path.join(root, ".writer-census");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, `${process.pid}-${meshProcessStartedAt}.json`);
+  if (fs.existsSync(file)) return;
+  const temporary = `${file}.tmp`;
+  const writer = { format: 1, pid: process.pid, host: os.hostname(),
+    releaseSha: process.env.PI_FABRIC_RELEASE_SHA ?? process.env.PI_FABRIC_BUILD_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+    lockProtocol, stateBackend, startedAt: meshProcessStartedAt };
+  fs.writeFileSync(temporary, JSON.stringify(writer), { flag: "w", mode: 0o600 });
+  try { fs.renameSync(temporary, file); }
+  catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+};
 
 export interface MeshStoreOptions {
   /** Captured at construction, never reloaded. Defaults to B68-compatible protocol 1. */
@@ -67,6 +85,7 @@ export class MeshStore {
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    recordMeshWriter(root, this.#lock.lockProtocol, this.#state.kind);
   }
 
   get lockProtocol(): MeshLockProtocol {

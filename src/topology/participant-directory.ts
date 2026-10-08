@@ -33,6 +33,7 @@ import {
   removeHostLease,
   STATE_LEASE_RENEW_MS,
   writeHostLease,
+  meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
@@ -1977,6 +1978,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       startedAt: this.#startedAt,
+      writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend),
       ...(this.options.identity.kind === "main" && root?.sessionId ? {
         session: {
           id: root.sessionId,

@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
+export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
@@ -170,6 +172,8 @@ interface FabricPrewalkConfig {
 }
 
 export interface FabricAgentConfig {
+  /** Optional host-only external spawn/actor model router; off unless enabled. */
+  router?: FabricAgentRouterConfig;
   /** Opt-in shadow routing pins and finite candidates, never live routing. */
   modelRouting?: ModelRoutingConfig;
   enabled: boolean;
@@ -1152,6 +1156,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
       ...(placement ? { placement } : {}),
+      ...(normalizeAgentRouterConfig(agents.router) ? { router: normalizeAgentRouterConfig(agents.router)! } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1726,6 +1731,7 @@ const resolveFabricConfig = (
     }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
+      delete agents.router; // Host-only argv execution and task disclosure policy.
       delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;

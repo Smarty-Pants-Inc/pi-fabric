@@ -579,6 +579,8 @@ On the first stall, the worker aborts and drains its owned Pi child, then retrie
 
 Other agent settings:
 
+- `router`: optional **host-only** external spawn/actor model selection hook: argv `command`, `timeoutMs` (1500 by default, clamped 200–5000), `mode` (`off`/`shadow`/`enforce`, default `off`), and `includeTask` (default `false`). Explicit caller model/thinking bypasses it; failures keep static defaults. See [router command contract, privacy, decisions and rollback](spawn-router.md).
+
 - `modelPolicy.requireReason`: trusted-host-only model prefixes requiring a named `modelReason` on explicit `agents.spawn`, `run`, `create` and actor `setModel` requests. Defaults to `["gpt-6-astra"]` (any provider); provider-qualified entries restrict that provider/model prefix. Reasons must be non-blank and at most 200 characters, and are recorded on run/actor records and `run.spawned` lifecycle events. Omitted models/defaults are unchanged; no silent fallback. Workspace configuration cannot override this list. Set `[]` in the host agent directory's `fabric.json` to roll back. See [explicit model exceptions](agents.md#explicit-model-exceptions-3134).
 
 - `thinking`: default reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), default `medium`.

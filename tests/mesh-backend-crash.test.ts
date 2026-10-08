@@ -54,7 +54,10 @@ describe("mesh backend R11 callback-I/O crash recovery", () => {
   it.each(["file", "sqlite"])("recovers exactly-once file effects after SIGKILL at each boundary (%s)", async kind => {
     for (const stage of ["before-begin", "after-file-read", "before-commit", "after-commit-before-effects", "mid-effects"]) {
       const root = temp(`${kind}-${stage}`); fs.writeFileSync(path.join(root, "input.txt"), "stamp-1"); const id = stage;
-      const killed = await crash(kind, root, stage, id); expect(killed.signal, `${stage}: ${killed.output}`).toBe("SIGKILL");
+      const killed = await crash(kind, root, stage, id);
+      // Windows has no POSIX signals: process.kill(pid, "SIGKILL") terminates with signalCode null and a non-zero exit code.
+      if (process.platform === "win32") { expect(killed.signal, `${stage}: ${killed.output}`).toBeNull(); expect(killed.code, `${stage}: ${killed.output}`).not.toBeNull(); expect(killed.code, `${stage}: ${killed.output}`).not.toBe(0); }
+      else expect(killed.signal, `${stage}: ${killed.output}`).toBe("SIGKILL");
       await recover(kind, root, id); await recover(kind, root, id);
       const check = await open(kind, root);
       try {

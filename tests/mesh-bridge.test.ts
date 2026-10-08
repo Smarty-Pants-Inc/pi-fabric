@@ -347,15 +347,20 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(owned).not.toHaveBeenCalled();
   });
 
-  it.each([3_000, 15_000, 60_000])("mirrors the remote %i ms lease TTL from this side's sync time, capped", async (ttl) => {
+  it.each([3_000, 15_000, 60_000])("mirrors the remote %i ms lease until its origin expiry, capped at one bridge lease from sync", async (ttl) => {
     let now = 1_800_000_000_000;
+    const startedAt = now;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { far, bridge } = setup(undefined, { presenceMs: 60_000 });
     const root = await addRoot(far, "remote", ttl);
+    const lease = () => readHostLeases((bridge.options.local as StoreBridgeSide).store.root).get(root.hostId)!;
+    await bridge.syncPresence();
+    expect(lease().expiresAt).toBe(startedAt + Math.min(ttl, BRIDGE_LEASE_MS));
     now += ttl - 1;
     await bridge.syncPresence();
-    const lease = readHostLeases((bridge.options.local as StoreBridgeSide).store.root).get(root.hostId)!;
-    expect(lease.expiresAt).toBe(now + Math.min(ttl, BRIDGE_LEASE_MS));
+    // The last observation before the origin expires never extends the mirror past it (smarty-dev#6477).
+    expect(lease().expiresAt).toBe(Math.min(startedAt + ttl, now + BRIDGE_LEASE_MS));
+    expect(lease().updatedAt).toBe(startedAt);
   });
 
   it("uses the effective file lease renewal, not the old shared-state heartbeat, for TTL", async () => {
@@ -366,7 +371,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     now += 600_000;
     writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now - 1_000, expiresAt: now + 2_000 });
     await bridge.syncPresence();
-    expect(readHostLeases(hub.root).get(root.hostId)!.expiresAt).toBe(now + 3_000);
+    expect(readHostLeases(hub.root).get(root.hostId)).toMatchObject({ updatedAt: now - 1_000, expiresAt: now + 2_000 });
   });
 
   it("admits a renewing sender after a presence write waits 20 s on the held mesh lock", async () => {

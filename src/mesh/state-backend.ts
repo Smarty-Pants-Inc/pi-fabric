@@ -178,7 +178,8 @@ export interface StateDivergence {
  * backend is always exact (no cache window) and honours `snapshot` tokens from `stateToken()`.
  *
  * `stateStamp()` changes whenever the committed state may have changed (file: the stat stamp of
- * `state.json`; sqlite: `<store>:<epoch>:<commit>`, review-opus P1-6). Equal stamps mean an
+ * `state.json`; sqlite: `<store>:<epoch>:<commit>` with the epoch and retirement read from state.db on
+ * every stamp, review-opus P1-6 and pi-fabric#626 review round 3). Equal stamps mean an
  * unchanged committed state for that backend; stamps of different backends are never compared.
  * `cachedStateStamp()` is the stamp of what reads last returned (file: its cache; sqlite: now).
  *
@@ -491,7 +492,10 @@ export class SqliteStateBackend implements StateBackend {
 
   #pinned(options: MeshReadOptions): SqliteSnapshot | undefined {
     const token = options.snapshot;
-    return token !== undefined && options.fresh !== true && this.#tokens.has(token) ? token as SqliteSnapshot : undefined;
+    if (token === undefined || options.fresh === true || !this.#tokens.has(token)) return undefined;
+    // A pin repeats a captured snapshot, but never one of a database retired since (round 3).
+    this.#open().assertLive();
+    return token as SqliteSnapshot;
   }
 
   #select(prefix: string, options: MeshReadOptions): readonly Readonly<MeshStateEntry>[] {
@@ -502,11 +506,15 @@ export class SqliteStateBackend implements StateBackend {
 
   #current(): SqliteSnapshot {
     const store = this.#open();
+    // The stamp carries the database's CURRENT epoch and retirement (read from state.db), so a
+    // retirement by any connection is a miss; a hit is a live, unchanged state (review round 3).
     const stamp = store.stateStamp();
     if (this.#snapshot?.stamp === stamp) return this.#snapshot;
+    this.#snapshot = undefined;
     // The stamp is read first: a commit in between makes the snapshot newer than its stamp, so
-    // the next call only rebuilds it once more.
-    const exported = store.exportState();
+    // the next call only rebuilds it once more. `live` checks retirement in the export's own read
+    // transaction: a retired database throws MeshStateRetiredError, exactly as get/listAll do.
+    const exported = store.exportState({ live: true });
     const entries = new Map<string, MeshStateEntry>();
     for (const [key, entry] of Object.entries(exported.entries)) entries.set(key, freezeEntry(entry));
     const sorted = Object.freeze([...entries.values()].sort((left, right) => left.key.localeCompare(right.key)));

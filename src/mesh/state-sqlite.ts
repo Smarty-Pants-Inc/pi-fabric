@@ -353,6 +353,8 @@ type Statements = ReturnType<typeof prepareStatements>;
 
 const prepareStatements = (db: SqliteConnection) => ({
   metaAll: db.prepare("SELECT name, value FROM meta"),
+  // One statement (one snapshot) of the rows a change stamp and a liveness check need (PK lookups).
+  metaStamp: db.prepare("SELECT name, value FROM meta WHERE name IN ('commit_no', 'epoch', 'backend')"),
   metaGet: db.prepare("SELECT value FROM meta WHERE name = ?"),
   metaSet: db.prepare("UPDATE meta SET value = ? WHERE name = ?"),
   kvGet: db.prepare("SELECT key, value, version, updated_at, updated_by, bytes FROM kv WHERE key = ?"),
@@ -527,10 +529,27 @@ export class SqliteStateStore {
     return this.#scan(prefix);
   }
 
-  /** Changes whenever any connection commits a state change: `<store>:<epoch>:<commit>` (review-opus P1-6). */
+  /**
+   * Changes whenever any connection commits a state change (review-opus P1-6) OR retires or
+   * re-epochs the database: `<store>:<epoch>:<commit>` with the CURRENT epoch read from state.db,
+   * plus `:<backend>:<opened epoch>` once this store no longer reads a live database. Retirement
+   * leaves commit_no unchanged, so a stamp built from the epoch this store opened would let a cache
+   * keyed on it outlive the retirement (pi-fabric#626 review round 3). One statement: the
+   * backend, epoch and commit come from one snapshot.
+   */
   stateStamp(): string {
     this.#assertOpen();
-    return `${this.#storeId}:${this.#epoch}:${Number(this.#sql.metaGet.get("commit_no")?.value ?? 0)}`;
+    const meta = this.#stampMeta();
+    const live = meta.backend === "sqlite" && meta.epoch === this.#epoch;
+    return `${this.#storeId}:${meta.epoch}:${meta.commit}${live ? "" : `:${meta.backend}:${this.#epoch}`}`;
+  }
+
+  /**
+   * Throws MeshStateRetiredError when state.db was retired or re-epoched since this store opened it
+   * (cheap: a full check only after another connection committed). For readers that serve a copy.
+   */
+  assertLive(): void {
+    this.#assertReadable();
   }
 
   /** Cheap per-connection "did another connection commit?" counter (PRAGMA data_version). */
@@ -543,7 +562,8 @@ export class SqliteStateStore {
   changesSince(after: number): SqliteStateChanges {
     this.#assertReadable();
     return this.#readTransaction(() => {
-      const commit = Number(this.#sql.metaGet.get("commit_no")?.value ?? 0);
+      // Retirement re-checked in the feed's own read transaction (pi-fabric#626 review round 3).
+      const { commit } = this.#assertLiveMeta(this.#stampMeta());
       const oldest = this.#sql.changesOldest.get()?.oldest;
       const complete = after >= commit || (oldest !== null && oldest !== undefined && Number(oldest) <= after + 1);
       const changes = complete ? this.#sql.changesSince.all(after).map(row => ({
@@ -553,11 +573,17 @@ export class SqliteStateStore {
     });
   }
 
-  /** One consistent snapshot in the file store's envelope shape; also works on a retired database. */
-  exportState(): SqliteStateExport {
+  /**
+   * One consistent snapshot in the file store's envelope shape. Maintenance (rollback, projection)
+   * exports a retired database too; `live: true` (every read path, e.g. a backend snapshot rebuild)
+   * checks retirement and epoch in the SAME read transaction as the rows and throws
+   * MeshStateRetiredError instead of exporting retired state (pi-fabric#626 review round 3).
+   */
+  exportState(options: { live?: boolean } = {}): SqliteStateExport {
     this.#assertOpen();
     return this.#readTransaction(() => {
       const meta = this.#meta();
+      if (options.live) this.#assertLiveMeta(meta);
       const entries: Record<string, MeshStateEntry> = {};
       const versions: Record<string, number> = {};
       for (const row of this.#sql.kvAll.all()) {
@@ -857,9 +883,23 @@ export class SqliteStateStore {
     if (this.#inTransaction) return;
     const version = Number(this.#sql.dataVersion.get()?.data_version ?? 0);
     if (version === this.#dataVersion) return;
-    const meta = this.#meta();
-    if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
+    this.#assertLiveMeta(this.#stampMeta());
     this.#dataVersion = version;
+  }
+
+  #assertLiveMeta<M extends { backend: string; epoch: number }>(meta: M): M {
+    if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
+    return meta;
+  }
+
+  #stampMeta(): { backend: string; epoch: number; commit: number } {
+    const values = new Map<string, unknown>();
+    for (const row of this.#sql.metaStamp.all()) values.set(String(row.name), row.value);
+    return {
+      backend: String(values.get("backend") ?? "missing"),
+      epoch: Number(values.get("epoch") ?? 0),
+      commit: Number(values.get("commit_no") ?? 0),
+    };
   }
 
   #meta(): { highWater: number; commit: number; stateBytes: number; tombstoneOrd: number; backend: string; epoch: number } {

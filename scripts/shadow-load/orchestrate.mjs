@@ -30,7 +30,7 @@ const opt = {
   autoReloadFraction: Math.min(1, num('auto-reload-fraction', 0.5)), pinAt: num('pin-at', 0.4), reloadJitterS: num('reload-jitter-s', 10), restartAt: num('restart-at', 0.6),
   maxBusy: num('max-busy', 30), maxTimeouts: num('max-timeouts', 0), maxLeaseS: num('max-lease-s', 15), maxWaitP99S: num('max-wait-p99-s', 5), maxCountDriftPct: num('max-count-drift-pct', 2),
   memBudgetMb: num('mem-budget-mb', 8192), heapMb: num('heap-mb', 240), semiSpaceMb: num('semi-space-mb', 4), canaryEveryS: num('canary-every-s', 120),
-  burnPct: num('burn-pct', 80), burnThreads: num('burn-threads', os.cpus().length), keep: Boolean(args.keep),
+  burnPct: num('burn-pct', 80), burnThreads: num('burn-threads', os.cpus().length), burnDuty: args['burn-duty'] === undefined ? null : num('burn-duty', 0), keep: Boolean(args.keep),
 };
 if (opt.hosts > opt.mains) throw new Error('--hosts cannot exceed --mains: each resident host belongs to a Main');
 for (const dir of new Set(Object.values(releases))) {
@@ -138,7 +138,7 @@ const cpuWindow = (from, to) => {
   const stats = args['burner-stats'] ? readJson(args['burner-stats']) : undefined;
   const rows = (stats?.samples ?? []).filter(row => row.at >= from && row.at <= to);
   const mean = key => { const values = rows.map(row => row[key]).filter(Number.isFinite); return values.length ? Math.round(10 * values.reduce((a, b) => a + b, 0) / values.length) / 10 : null; };
-  return { burner: stats ? { targetPct: stats.targetPct, threads: stats.threads, sliceMs: stats.sliceMs } : null, samples: rows.length,
+  return { burner: stats ? { targetPct: stats.targetPct, threads: stats.threads, sliceMs: stats.sliceMs, fixedDuty: stats.fixedDuty ?? null } : null, samples: rows.length,
     busyPct: mean('busyPct'), psiSome10: mean('psiSome10'), duty: mean('duty'), psiMax: Math.max(0, ...rows.map(row => row.psiSome10 ?? 0)) };
 };
 // Hub lock wait/hold over complete minutes [from, to], summed across every process's instrument.
@@ -502,7 +502,7 @@ function renderReport(r) {
     '| check | verdict |', '|---|---|',
     ...Object.entries(r.verdicts).map(([key, verdict]) => `| (${key}) ${verdict.name} | ${mark(verdict.pass)} |`), '',
     '## Load shape', '',
-    `- host CPU busy ${r.cpu.busyPct}% (burner target ${r.cpu.burner?.targetPct ?? 'off'}%, ${r.cpu.burner?.threads ?? 0} threads, mean duty ${r.cpu.duty}), CPU PSI some avg10 mean ${r.cpu.psiSome10}% (max ${r.cpu.psiMax}%)`,
+    `- host CPU busy ${r.cpu.busyPct}% (burner ${r.cpu.burner?.fixedDuty != null ? `fixed duty ${r.cpu.burner.fixedDuty}` : `target ${r.cpu.burner?.targetPct ?? 'off'}%`}, ${r.cpu.burner?.threads ?? 0} threads, mean duty ${r.cpu.duty}), CPU PSI some avg10 mean ${r.cpu.psiSome10}% (max ${r.cpu.psiMax}%)`,
     `- hub state.json ${r.seed?.state?.stateBytes} bytes; host leases ${(r.seed?.keep?.existingLeases ?? 0) + (r.seed?.keep?.seededLeases ?? 0)} (${r.seed?.keep?.seededLeases} seeded); ` +
       `seeded participants ${r.seed?.keep?.seededParticipants}; actor records ${o.hosts * o.actors} live + ${r.seed?.keep?.actorRecords} seeded on ${o.hosts} + ${r.seed?.keep?.actorRoots} roots`,
     `- participants listed (live): median ${r.participantCount.median}, min ${r.participantCount.min}, max ${r.participantCount.max}, max drift ${r.participantCount.maxDriftPct}% over ${r.participantCount.samples} samples; spoke mirrors listed min ${r.lease.remoteMirrors?.min} max ${r.lease.remoteMirrors?.max}`,

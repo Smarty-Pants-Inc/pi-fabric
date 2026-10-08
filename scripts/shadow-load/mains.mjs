@@ -17,12 +17,22 @@ const slot = args.slot ?? 'candidate';
 const mains = plan[args.list ?? 'mains'].slice(from, from + Number(args.count ?? 1));
 const running = [];
 const health = {};
+let startErrors = 0;
 const startWithRetry = async (code, main) => {
   for (let attempt = 0; ; attempt++) {
-    try { return await startMain(code, args.mesh, main, args.cwd); }
+    try {
+      const started = await startMain(code, args.mesh, main, args.cwd);
+      // A Main whose first publication hits a busy lock keeps its heartbeat and joins later: its
+      // directory's timer is already armed, so it is kept, never replaced by a second directory.
+      if (started.startError) {
+        startErrors++;
+        process.stderr.write(`start ${main.name}: initial publish failed, heartbeat joins later: ${started.startError?.message ?? started.startError}\n`);
+      }
+      const { startError, ...rest } = started;
+      return { ...rest, startError: startError ? String(startError?.message ?? startError).slice(0, 200) : undefined };
+    }
     catch (error) {
-      // A Main whose first publication hits a busy lock keeps its heartbeat and joins later; a
-      // start that failed before the timer existed is retried as a restarted Pi would.
+      // A start that failed before the timer existed (resumeLineage) is retried as a restarted Pi would.
       process.stderr.write(`start ${main.name} attempt ${attempt}: ${error?.message ?? error}\n`);
       if (attempt >= 5) throw error;
       await delay(1_000);
@@ -30,10 +40,11 @@ const startWithRetry = async (code, main) => {
   }
 };
 for (const main of mains) {
-  running.push({ main, slot, ...await startWithRetry(candidate, main) });
+  const { startError, ...started } = await startWithRetry(candidate, main);
+  running.push({ main, slot, ...started });
   health[main.id] = { name: main.name, slot, autoReload: Boolean(main.autoReload), maxConfirmAgeMs: 0, stalledSamples: 0, startedAt: Date.now(), reloads: [] };
 }
-const save = () => writeJson(args.out, { pid: process.pid, ids: mains.map(main => main.id), readyAt, health, savedAt: Date.now() });
+const save = () => writeJson(args.out, { pid: process.pid, ids: mains.map(main => main.id), readyAt, health, startErrors, savedAt: Date.now() });
 const readyAt = Date.now();
 save();
 // The directory's own view of its last committed heartbeat: a Main whose shared write stalls
@@ -64,7 +75,8 @@ const reload = async (row, pin) => {
     target ??= loadCandidate(args['pin-release'] ?? pin.release, { directory: true });
     const code = await target;
     globalThis.__shadowWrapMeshStore?.(code.MeshStore);
-    const next = await startWithRetry(code, row.main);
+    const { startError, ...next } = await startWithRetry(code, row.main);
+    if (startError) entry.startError = startError;
     Object.assign(row, next, { slot: pin.slot });
     entry.ms = Date.now() - started;
     await next.store.publish({ topic: 'ops.fabric.reloaded', from: next.identity,

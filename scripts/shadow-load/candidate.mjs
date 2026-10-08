@@ -65,7 +65,12 @@ export const openReader = (candidate, root, id) => new candidate.ParticipantDire
   enabled: true, hostId: id, rootId: id, identity: { id, name: 'shadow-observer', kind: 'main' }, reapDeadHosts: false,
 });
 
-/** A Main's participant directory: the real 5 s heartbeat, lease files and confirmWritable. */
+/** A Main's participant directory: the real 5 s heartbeat, lease files and confirmWritable.
+ * `start()` arms the heartbeat timer BEFORE its initial publish, so a start that rejects (a busy
+ * lock) still leaves a live directory whose heartbeat publishes later, as Pi's runtime does. The
+ * result then carries `startError`; the caller must keep that directory and never start a second
+ * one for the same Main (that would leak a duplicate heartbeating directory). A failure in
+ * `resumeLineage()` comes before the timer exists and is safe to retry with a new directory. */
 export const startMain = async (candidate, root, main, cwd) => {
   const store = openStore(candidate, root, { backgroundReadCacheMs: 5_000 });
   const identity = { id: main.id, name: main.name, kind: 'main', sessionId: main.sessionId };
@@ -77,7 +82,8 @@ export const startMain = async (candidate, root, main, cwd) => {
   directory.registerSource(() => [directory.root({ id: main.id, cwd, sessionId: main.sessionId, status: 'idle',
     startedAt, updatedAt: startedAt, pendingMessages: 0 }, true, main.name, { role: undefined })]);
   await directory.resumeLineage();
-  await directory.start();
+  try { await directory.start(); }
+  catch (error) { return { store, directory, identity, startError: error }; }
   return { store, directory, identity };
 };
 

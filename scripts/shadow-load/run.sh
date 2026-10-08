@@ -15,11 +15,13 @@ node=${SHADOW_NODE:-node}
 # The CPU burner runs at nice 0 so the harness (nice 19) is CPU-starved like the fleet's lock holders.
 burn_pct=80
 burn_threads=$(nproc)
+burn_duty=
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[i]}" in
     --burn-pct) burn_pct=${args[i+1]:-80} ;;
     --burn-threads) burn_threads=${args[i+1]:-$burn_threads} ;;
+    --burn-duty) burn_duty=${args[i+1]:-} ;;
   esac
 done
 stats=$(mktemp "${TMPDIR:-/tmp}/shadow-burner-XXXXXX")
@@ -31,7 +33,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 if [[ $burn_pct != 0 ]]; then
-  "$node" "$here/burner.mjs" --target-pct "$burn_pct" --threads "$burn_threads" --stats "$stats" &
+  "$node" "$here/burner.mjs" --target-pct "$burn_pct" --threads "$burn_threads" ${burn_duty:+--duty "$burn_duty"} --stats "$stats" &
   burner=$!
 fi
 set +e

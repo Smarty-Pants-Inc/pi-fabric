@@ -78,6 +78,11 @@ describe("external spawn router behavior", () => {
     expect(log[0]!.latencyMs).toBeGreaterThanOrEqual(0);
     expect(JSON.stringify(log)).not.toContain(opts.task);
   });
+  it.each(["simple", "normal", "complex", "delicate"] as const)("forwards %s complexity verbatim to router stdin", async complexity => {
+    const dir = root();
+    expect(await routeAgentCreation({ ...options(dir), complexity })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(request(dir).requestedComplexity).toBe(complexity);
+  });
   it("full task reaches stdin only with includeTask true, never the ledger", async () => {
     const dir = root(); const opts = options(dir);
     await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true } });

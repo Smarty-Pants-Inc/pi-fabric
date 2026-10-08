@@ -38,8 +38,8 @@ export const normalizeAgentRunRequest = (
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
-  if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex") {
-    throw new Error("Invalid agent complexity: expected simple, normal or complex");
+  if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
+    throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
   }
   if (args.needs !== undefined && (!Array.isArray(args.needs) || !args.needs.every(entry => typeof entry === "string" && !!entry.trim()))) {
     throw new Error("Invalid agent needs: expected nonempty capability strings");

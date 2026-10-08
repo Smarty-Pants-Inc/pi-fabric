@@ -67,8 +67,11 @@ to stdout, then exit 0 within the deadline. Example input:
 - `taskLength` counts UTF-8 **bytes**. File-backed actor instructions remain
   owner-only: their supplied SHA-256 is forwarded and length is null; the hook
   does not read or forward the file path/text.
-- `requestedComplexity` is present only if the spawn caller provides the new
-  optional `complexity: "simple" | "normal" | "complex"`; never guessed from text.
+- `requestedComplexity` is present only if the spawn caller provides the
+  optional `complexity: "simple" | "normal" | "complex" | "delicate"`; never
+  guessed from text. All four values pass through verbatim. `delicate` is Paul's
+  delicate-code class (the only class for Opus in the external router's policy),
+  not an alias for `complex`; Fabric does not implement that model policy.
 - The full `task` string is absent unless host `includeTask: true` explicitly
   allows it, and remains absent for an owner-only instruction file.
 - `defaults.model` can be null when the backend default is not statically known.

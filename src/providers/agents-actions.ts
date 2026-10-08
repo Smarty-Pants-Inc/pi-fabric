@@ -122,7 +122,7 @@ const spawnSchema = {
   ...runSchema,
   properties: {
     ...runProperties, residency: residencySchema,
-    complexity: { type: "string", enum: ["simple", "normal", "complex"], description: "Caller complexity hint for the optional host spawn router; never inferred from task text." },
+    complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },

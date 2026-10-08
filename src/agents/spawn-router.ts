@@ -19,7 +19,7 @@ export interface SpawnRouterRequest {
   taskLength: number | null;
   task?: string;
   parentId: string;
-  requestedComplexity?: "simple" | "normal" | "complex";
+  requestedComplexity?: "simple" | "normal" | "complex" | "delicate";
   host: string;
   defaults: { model: string | null; thinking: FabricThinking };
 }

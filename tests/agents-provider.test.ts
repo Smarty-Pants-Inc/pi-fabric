@@ -6215,6 +6215,19 @@ describe("external spawn router hook (#2890)", () => {
       expect(state.requests()[0]).not.toHaveProperty("task");
     }
   });
+  it("advertises all four caller complexity classes in the spawn schema", async () => {
+    const state = routerSetup("off");
+    const spawn = await state.provider.describe("spawn", context);
+    expect(spawn?.inputSchema).toMatchObject({ properties: { complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"] } } });
+  });
+  it.each(["shadow", "enforce"] as const)("accepts delicate and forwards it verbatim in %s mode", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "delicate implementation", complexity: "delicate", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", requestedComplexity: "delicate" })]);
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+  });
   it.each([
     [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
     [{ thinking: "xhigh" }, { model: "provider/model-a", thinking: "xhigh" }],
@@ -6263,14 +6276,14 @@ describe("external spawn router hook (#2890)", () => {
     expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
     expect(state.logs()).toHaveLength(1);
   });
-  it("forwards the selected model and complexity to a durable spawn without a second router call", async () => {
+  it.each(["complex", "delicate"] as const)("forwards the selected model and %s complexity to a durable spawn without a second router call", async complexity => {
     const state = routerSetup("enforce");
     const spawnAgent = vi.fn(async (request: AgentRunRequest) => ({ id: "durable-test", name: "durable", runner: "pi", transport: "process", cwd: process.cwd(), status: "running", model: request.model, thinking: request.thinking }));
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
-    const child = await state.provider.invoke("spawn", { task: "durable", complexity: "complex", residency: "durable" }, context) as AgentHandleInfo;
+    const child = await state.provider.invoke("spawn", { task: "durable", complexity, residency: "durable" }, context) as AgentHandleInfo;
     expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
-    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity: "complex" }), undefined);
-    expect(state.requests()).toHaveLength(1); expect(state.logs()).toHaveLength(1);
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity }), undefined);
+    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]); expect(state.logs()).toHaveLength(1);
   });
   it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
     const state = routerSetup("enforce");
@@ -6282,8 +6295,9 @@ describe("external spawn router hook (#2890)", () => {
   it("validates complexity before command or launch", async () => {
     const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");
     try {
-      await expect(state.provider.invoke("spawn", { task: "bad hint", complexity: "extreme" }, context)).rejects.toThrow("Invalid agent complexity");
+      await expect(state.provider.invoke("spawn", { task: "bad hint", complexity: "extreme" }, context)).rejects.toThrow("Invalid agent complexity: expected simple, normal, complex or delicate");
       expect(launch).not.toHaveBeenCalled(); expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
     } finally { launch.mockRestore(); }
   });
 });

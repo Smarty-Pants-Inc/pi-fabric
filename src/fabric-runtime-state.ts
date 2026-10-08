@@ -81,6 +81,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, type MeshIdentity } from "./mesh/store.js";
+import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
@@ -215,6 +216,7 @@ export class FabricRuntimeState {
   #jevPrograms: JevProgramManager | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
+  #meshActivationReady: () => boolean = () => false;
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
@@ -360,8 +362,10 @@ export class FabricRuntimeState {
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+    if (!this.#meshActivationReady()) return undefined;
     let batch: RootInboxBatch | undefined;
     await this.#inboxRetry.run(async () => {
+      if (!this.#meshActivationReady()) return;
       batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
     });
     return batch;
@@ -502,6 +506,7 @@ export class FabricRuntimeState {
     // teardown. Quiesce, close and in-flight old sources then read no ctx at all, never the
     // successor's; the successor lease is installed only once the old runtime is torn down.
     this.#epoch += 1;
+    this.#meshActivationReady = () => false;
     const epoch = this.#epoch;
     this.#binding = undefined;
     const live = this.#liveReads(epoch);
@@ -691,6 +696,7 @@ export class FabricRuntimeState {
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     const mesh = this.#mesh;
+    const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
     let inboxMaintenance: MainInboxMaintenance | undefined;
     this.#participants = new ParticipantDirectory(this.#mesh, {
@@ -740,16 +746,26 @@ export class FabricRuntimeState {
     const meshConfig = this.#config.mesh;
     const sessionFile = context.sessionManager.getSessionFile?.();
     let meshActivationReady = false;
+    this.#meshActivationReady = () => meshActivationReady && live.current();
     const initializeMeshActivation = async (): Promise<void> => {
       if (meshActivationReady) return;
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
-      // Resumption must invalidate an earlier terminal proof before actors/control
-      // can activate, not merely as part of the later participant publication batch.
-      await participants.resumeLineage();
-      // Install this exact activation under custody BEFORE publishing succession or
-      // attaching the drain. A timeout leaves activation pending, never admitted.
-      const inboxActivation = meshConfig.enabled && mainAgent.local ? await mesh.custody(() =>
-        registerMainInbox(meshRoot, identity, sessionId, sessionFile)) : undefined;
+      let inboxActivation: string | undefined;
+      if (meshConfig.enabled && mainAgent.local) {
+        // resumeLineage awaits a mesh write. Hold file custody across that await;
+        // mesh.custody callbacks are synchronous and would release it too early.
+        const releaseCustody = await acquireMeshCustodyLock(meshRoot);
+        try {
+          if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+          await participants.resumeLineage();
+          // In dual mode, exclude legacy file custodians with the mesh lock too.
+          const register = () => {
+            if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+            return registerMainInbox(meshRoot, identity, sessionId, sessionFile);
+          };
+          inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
+        } finally { releaseCustody(); }
+      } else await participants.resumeLineage();
       if (meshConfig.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
         predecessor.meshRoot === meshRoot && predecessor.cwd === context.cwd) {
         await recordMainSuccessor(mesh, predecessor.id, predecessor.sessionId, mainAgentId);
@@ -760,7 +776,9 @@ export class FabricRuntimeState {
       // never reopen a retired activation during close/reload.
       const activationContext = live.read(ctx => ctx);
       if (!activationContext) throw new Error("Pi Fabric mesh activation lifecycle retired");
-      // No Main admission/drain starts while a prior-generation death proof survives.
+      // Custody admission and succession succeeded: only now open inbox reads/drains.
+      rootInbox?.start();
+      meshActivationReady = true;
       mainAgent.attachFollowUpDrain(
         activationContext,
         followUpDrainSupported() ? meshConfig.followUpFlushMs : 0,
@@ -768,14 +786,13 @@ export class FabricRuntimeState {
         meshConfig.followUpStallSeconds,
         meshConfig.enabled && mainAgent.local ? {
           owns: id => mainInboxOwns(meshRoot, mainAgentId, id),
-          active: () => mainInboxActive(meshRoot, mainAgentId, inboxActivation),
+          active: () => this.#meshActivationReady() && live.current() && mainInboxActive(meshRoot, mainAgentId, inboxActivation),
         } : undefined,
       );
       if (meshConfig.enabled && mainAgent.local) {
         inboxMaintenance = new MainInboxMaintenance(mesh, identity, participants, mainAgent, meshConfig);
         if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
       }
-      meshActivationReady = true;
     };
     try {
       await initializeMeshActivation();
@@ -783,7 +800,6 @@ export class FabricRuntimeState {
       if (!isMeshLockTimeout(error)) throw error;
       initialMeshError = error;
     }
-    this.#rootInbox?.start();
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       enabled: this.#config.mesh.enabled,
       canConsumeMesh: () => meshActivationReady,
@@ -1792,6 +1808,7 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    this.#meshActivationReady = () => false;
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {

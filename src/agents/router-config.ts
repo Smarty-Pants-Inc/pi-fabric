@@ -1,5 +1,7 @@
+import { isAbsolute } from "node:path";
+
 export interface FabricAgentRouterConfig {
-  /** Trusted host command argv; never interpreted by a shell. */
+  /** Trusted host argv with an absolute executable path; no shell or PATH lookup. */
   command: string[];
   timeoutMs?: number;
   mode?: "off" | "shadow" | "enforce";
@@ -12,7 +14,7 @@ export const normalizeAgentRouterConfig = (value: unknown): FabricAgentRouterCon
   return {
     command: Array.isArray(input.command) && input.command.length > 0 &&
       input.command.every(arg => typeof arg === "string" && !arg.includes("\0")) &&
-      typeof input.command[0] === "string" && !!input.command[0].trim()
+      typeof input.command[0] === "string" && isAbsolute(input.command[0])
       ? [...input.command as string[]] : [],
     timeoutMs: typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs)
       ? Math.max(200, Math.min(5000, Math.round(input.timeoutMs))) : 1500,

@@ -19,8 +19,11 @@ configuration cannot execute a router or opt into task disclosure):
 }
 ```
 
-`command` is executable + argv, never shell source. `timeoutMs` defaults to 1500
-and clamps to 200–5000 ms. `mode` defaults to `off` (also the kill switch).
+`command` is executable + argv, never shell source. The executable must be an
+absolute path: bare names and relative paths are rejected, with no PATH lookup.
+The router receives only `PATH=/usr/bin:/bin` and, when set, `HOME`, `LANG`, and
+`TZ`; host credentials, agent variables, and loader hooks are not inherited.
+`timeoutMs` defaults to 1500 and clamps to 200–5000 ms. `mode` defaults to `off` (also the kill switch).
 `shadow` records a validated suggestion but keeps the existing static/default
 binding; `enforce` uses the validated suggestion. A missing/failed command,
 nonzero exit, timeout, oversized output, malformed JSON, unknown/denied model,
@@ -82,15 +85,16 @@ Example output:
 {
   "model": "provider/model",
   "thinking": "high",
-  "reason": "normal implementation policy",
+  "reason": "normal.implementation",
   "policyVersion": "2026-10-v1"
 }
 ```
 
 `model` and `thinking` are required. `reason` (at most 2000 characters) and
 `policyVersion` (at most 256) are optional strings. Stdout is bounded to 64 KiB;
-stderr is not captured in decisions. The subprocess is awaited and killed at
-timeout; POSIX process groups also retire descendants.
+stderr is not captured in decisions. Timeout settles immediately without waiting
+for `close`, closes local pipes, and kills the process tree (detached process
+group on POSIX; `taskkill /T /F /PID` on Windows).
 
 ## Decision ledger and rollback
 
@@ -98,13 +102,22 @@ Enabled modes append one JSON line to `<mesh>/router/decisions.jsonl`:
 `ts`, `requestDigest` (SHA-256 of request metadata excluding raw task), `kind`,
 `mode`, `decision` (`explicit`/`default`/`enforce`), `pick`, `actual`, `latencyMs`,
 and `error` (fixed adapter code or null). A valid pick includes its canonical
-model/thinking and optional reason/version. Raw tasks and router stderr never
-enter the ledger. Router implementations must keep their reason free of task
-text/secrets too, especially when full-task input is enabled.
+model/thinking and optional reason/version codes. Reason and version metadata
+are persisted only as lowercase codes matching `[a-z0-9_.:-]+`, truncated to
+64 characters; other values (including echoes of the supplied task) are replaced
+with `redacted`. Free-form router reasons, raw tasks, and router stderr never
+enter the ledger.
 
-Logging failures warn without failing or changing spawn selection. A read-only
-mesh cannot guarantee a persisted decision; repair permissions before relying
-on shadow evidence. Logs are append-only and have no automatic retention here.
+The router directory is created with mode 0700 and must be a real directory
+(`lstat`, not a symlink), owned by the current uid with private permissions
+where the OS exposes uid/mode checks. The ledger is opened append-only with
+`O_NOFOLLOW` (where supported) and mode 0600; links and non-regular files are
+refused. Before an append would exceed 8 MiB, the ledger rotates to
+`decisions.jsonl.1`, replacing the single previous archive.
+
+Logging failures warn to stderr without failing or changing spawn selection.
+A read-only or unsafe mesh cannot guarantee a persisted decision; repair
+permissions before relying on shadow evidence.
 
 Rollback: set host `agents.router.mode` to `off` and reload Fabric (or remove
 `agents.router`). No command, router module load, or decision write occurs in

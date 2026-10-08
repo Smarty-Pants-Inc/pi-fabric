@@ -1,6 +1,7 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, rename } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
@@ -27,28 +28,102 @@ export interface SpawnRouterRequest {
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 const MAX_OUTPUT_BYTES = 64 * 1024;
 
-// The process and its pipes are retired before this promise settles. No shell,
-// stderr contents, or unbounded stdout can enter the decision ledger.
+const routerEnv = (): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin" };
+  for (const name of ["HOME", "LANG", "TZ"]) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  return env;
+};
+const reasonCode = (value: string, task?: string): string =>
+  value.length > 0 && !/[^a-z0-9_.:-]/.test(value) && (!task || !value.includes(task)) ? value.slice(0, 64) : "redacted";
+const MAX_LEDGER_BYTES = 8 * 1024 * 1024;
+const ledgerWrites = new Map<string, Promise<void>>();
+
+// Serialize this process's rotation/appends; each record is a single O_APPEND write.
+const writeDecision = async (dir: string, record: string): Promise<void> => {
+  const pending = (ledgerWrites.get(dir) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const directory = await lstat(dir);
+    const uid = process.getuid?.();
+    if (!directory.isDirectory() || (uid !== undefined &&
+      (directory.uid !== uid || (directory.mode & 0o077) !== 0))) throw new Error("unsafe-directory");
+    const file = path.join(dir, "decisions.jsonl");
+    const openLedger = async () => {
+      // lstat also rejects links on platforms without O_NOFOLLOW.
+      const existing = await lstat(file).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      });
+      if (existing && !existing.isFile()) throw new Error("unsafe-ledger");
+      const handle = await open(file, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT |
+        (constants.O_NOFOLLOW ?? 0) | constants.O_NONBLOCK, 0o600);
+      try {
+        const info = await handle.stat();
+        const entry = await lstat(file);
+        if (!info.isFile() || !entry.isFile() || info.dev !== entry.dev || info.ino !== entry.ino) {
+          throw new Error("unsafe-ledger");
+        }
+        return { handle, size: info.size };
+      } catch (error) { await handle.close(); throw error; }
+    };
+    let ledger = await openLedger();
+    if (ledger.size + Buffer.byteLength(record) > MAX_LEDGER_BYTES) {
+      await ledger.handle.close();
+      await rename(file, `${file}.1`);
+      ledger = await openLedger();
+    }
+    try { await ledger.handle.appendFile(record); }
+    finally { await ledger.handle.close(); }
+  });
+  ledgerWrites.set(dir, pending);
+  try { await pending; }
+  finally { if (ledgerWrites.get(dir) === pending) ledgerWrites.delete(dir); }
+};
+
+// Never wait for close after a timeout: descendants may retain inherited pipes.
 const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: number, signal?: AbortSignal): Promise<string> =>
   new Promise((resolve, reject) => {
     if (!command.length) { reject(new Error("missing-command")); return; }
+    if (!path.isAbsolute(command[0]!)) { reject(new Error("invalid-command")); return; }
     if (signal?.aborted) { reject(new Error("aborted")); return; }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(command[0]!, command.slice(1), {
-        cwd: input.cwd, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore"],
+        cwd: input.cwd, shell: false, env: routerEnv(), detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore"],
       });
     } catch { reject(new Error("command-error")); return; }
-    let error: string | undefined;
+    let settled = false;
+    let retired = false;
     let output = "";
     let bytes = 0;
     const kill = (): void => {
+      if (retired) return;
+      retired = true;
       try {
-        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        if (process.platform === "win32" && child.pid) {
+          // Never search PATH for the tree killer either.
+          const root = process.env.SystemRoot;
+          const taskkill = path.win32.join(root && path.win32.isAbsolute(root) ? root : "C:\\Windows", "System32", "taskkill.exe");
+          execFile(taskkill, ["/T", "/F", "/PID", String(child.pid)], {
+            env: routerEnv(), windowsHide: true, timeout: 1000,
+          }, () => {});
+        } else if (child.pid) process.kill(-child.pid, "SIGKILL");
         else child.kill("SIGKILL");
       } catch { /* Already retired (or spawn failed). */ }
     };
-    const stop = (reason: string): void => { error ??= reason; kill(); };
+    const finish = (error?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(new Error(error));
+      else resolve(output);
+      kill();
+      child.stdin!.destroy();
+      child.stdout!.destroy();
+    };
+    const stop = (reason: string): void => finish(reason);
     const abort = (): void => stop("aborted");
     const timer = setTimeout(() => stop("timeout"), timeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
@@ -57,19 +132,14 @@ const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: numb
     child.stdout!.on("error", () => stop("stdout-error"));
     child.stdout!.setEncoding("utf8");
     child.stdout!.on("data", (chunk: string) => {
+      if (settled) return;
       bytes += Buffer.byteLength(chunk);
       if (bytes > MAX_OUTPUT_BYTES) stop("output-too-large");
       else output += chunk;
     });
     // Retire descendants even if a router exits without closing inherited pipes.
     child.once("exit", kill);
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      if (error) reject(new Error(error));
-      else if (code !== 0) reject(new Error("nonzero-exit"));
-      else resolve(output);
-    });
+    child.once("close", (code) => finish(code === 0 ? undefined : "nonzero-exit"));
     child.stdin!.end(`${JSON.stringify(input)}\n`);
     if (signal?.aborted) abort();
   });
@@ -132,8 +202,8 @@ export const routeAgentCreation = async (options: {
       let model: string;
       try { model = options.validateModel(value.model.trim()); } catch { throw new Error("unknown-or-denied-model"); }
       pick = { model, thinking: value.thinking,
-        ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
-        ...(typeof value.policyVersion === "string" ? { policyVersion: value.policyVersion } : {}) };
+        ...(typeof value.reason === "string" ? { reason: reasonCode(value.reason, options.task) } : {}),
+        ...(typeof value.policyVersion === "string" ? { policyVersion: reasonCode(value.policyVersion, options.task) } : {}) };
       if (mode === "enforce") {
         selected = { model: pick.model, thinking: pick.thinking };
         actual = { model: pick.model, thinking: pick.thinking };
@@ -150,8 +220,7 @@ export const routeAgentCreation = async (options: {
   };
   try {
     const dir = path.join(options.meshRoot, "router");
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await appendFile(path.join(dir, "decisions.jsonl"), `${JSON.stringify(decision)}\n`, { mode: 0o600 });
+    await writeDecision(dir, `${JSON.stringify(decision)}\n`);
   } catch {
     // A read-only/full mesh must not change launch selection or fail the spawn.
     console.warn("[pi-fabric] spawn router decision log unavailable");

@@ -9,7 +9,7 @@ describe("spawn router cold import and idle", () => {
   it("keeps the subprocess adapter out of configuration and provider imports until first use", async () => {
     vi.resetModules(); loads.mockClear();
     const config = await import("../src/config.js");
-    config.normalizeFabricConfig({ agents: { router: { command: ["smarty-route"], mode: "enforce" } } });
+    config.normalizeFabricConfig({ agents: { router: { command: [process.execPath], mode: "enforce" } } });
     await import("../src/providers/agents-provider.js");
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(loads).not.toHaveBeenCalled();

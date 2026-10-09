@@ -58,14 +58,25 @@ const tryMeshLock = (lock: string, record: string): boolean => {
   }
 };
 
-/** Detach an owned lock before removal, as both lock modules do: never delete a successor. */
-const release = (lock: string, token: string, record: string): void => {
-  try {
-    if (fs.readFileSync(path.join(lock, "owner"), "utf8") !== record) return;
-    const released = `${lock}.released.${token}`;
-    fs.renameSync(lock, released);
-    fs.rmSync(released, { recursive: true, force: true });
-  } catch { /* already recovered or replaced */ }
+/**
+ * Detach first, then verify (pi-fabric#694 security review P1-A). The first read only skips a lock that is
+ * plainly not ours; the verdict is the owner record read INSIDE the detached directory, so a successor that
+ * replaced the lock between that read and the rename is never deleted. A detached foreign lock goes back
+ * under its name when the name is free (renaming a directory onto a non-empty one fails); when a newer holder
+ * took the name, it stays detached and is not deleted (its holder's own release then finds its lock gone,
+ * the "already recovered or replaced" path). `hooks` is a test seam for the interleavings.
+ */
+export const releaseFenceLock = (lock: string, token: string, record: string,
+  hooks: { afterCheck?: () => void; afterDetach?: () => void } = {}): void => {
+  try { if (fs.readFileSync(path.join(lock, "owner"), "utf8") !== record) return; } catch { return; /* already recovered or replaced */ }
+  hooks.afterCheck?.();
+  const released = `${lock}.released.${token}`;
+  try { fs.renameSync(lock, released); } catch { return; /* already recovered or replaced */ }
+  hooks.afterDetach?.();
+  let ours = false;
+  try { ours = fs.readFileSync(path.join(released, "owner"), "utf8") === record; } catch { /* no record: not provably ours */ }
+  if (ours) { try { fs.rmSync(released, { recursive: true, force: true }); } catch { /* private name; best effort */ } return; }
+  try { fs.renameSync(released, lock); } catch { /* a newer holder owns the name: leave the foreign lock detached */ }
 };
 
 /**
@@ -96,7 +107,7 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, now - last);
       attempts += 1;
       last = now;
-      if (attempt(token, record)) return () => release(lock, token, record);
+      if (attempt(token, record)) return () => releaseFenceLock(lock, token, record);
       if (Date.now() >= deadline) {
         let pid: string | undefined;
         try { pid = fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[1]; } catch { /* ownerless or gone */ }

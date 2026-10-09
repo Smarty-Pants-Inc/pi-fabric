@@ -59,24 +59,55 @@ const tryMeshLock = (lock: string, record: string): boolean => {
 };
 
 /**
- * Detach first, then verify (pi-fabric#694 security review P1-A). The first read only skips a lock that is
- * plainly not ours; the verdict is the owner record read INSIDE the detached directory, so a successor that
- * replaced the lock between that read and the rename is never deleted. A detached foreign lock goes back
- * under its name when the name is free (renaming a directory onto a non-empty one fails); when a newer holder
- * took the name, it stays detached and is not deleted (its holder's own release then finds its lock gone,
- * the "already recovered or replaced" path). `hooks` is a test seam for the interleavings.
+ * Release by a verified take of the owner file, then `rmdir` (pi-fabric#694 P1, smarty-dev#6477). The lock
+ * DIRECTORY is never renamed, so a successor's lock is never detached.
+ *
+ * 1. Read `<lock>/owner`; anything but our exact record (a unique token) means it is not ours: return.
+ * 2. Take the owner file by rename to a private name beside the lock (the only atomic conditional unlink:
+ *    a path unlink cannot check what it removes). Re-read the taken file: it is the verdict.
+ * 3. Ours: unlink the taken file, then `rmdir(<lock>)`. rmdir fails closed (ENOTEMPTY) if a successor
+ *    already published its owner there; a successor still between its mkdir and its owner write loses its
+ *    directory and its `wx` owner write fails (ENOENT), so it never enters (tryMeshLock above,
+ *    mesh-lock.ts:254-268). Protocol-2 and custody acquirers publish complete directories by rename.
+ *    The directory is ownerless only between the take and the rmdir; the take itself refreshes its mtime,
+ *    so the ownerless-directory grace (mesh-lock.ts:353) cannot pass inside that window.
+ * 4. Not ours (only if the precondition below was broken): put the foreign record back with a no-clobber
+ *    hard link and leave its directory in place; if the name has another owner now, keep the taken file.
+ *
+ * Precondition (why the step 1 -> 2 gap is not a real window): a LIVE owner's lock is never replaced. Only
+ * three code paths remove a canonical `.lock` or `custody.lock` that holds an owner record, in this tree and
+ * in the 13d1bbef release (byte-identical mesh-lock.ts, custody-lock.ts and core/atomic-write.ts):
+ * - the holder's own release, gated on its unique token (here; mesh-lock.ts:217-229; custody-lock.ts:91-101);
+ * - MeshLock #clearStaleLock (mesh-lock.ts:343-413): renames a complete receipt only if its pid is dead
+ *   (`process.kill(pid, 0)` gives ESRCH, :86-96) or alive with a VALID recorded incarnation that differs
+ *   from the native reading, i.e. pid reuse (:378-398). A live pid with no incarnation line (the fence's
+ *   three-line wire) returns at :379. Age (staleLockMs) gates only the EMPTY ownerless directory (:352-353),
+ *   removed by rmdir (:359), which fails on a directory that holds an owner file;
+ * - clearDeadCustodyLock (custody-lock.ts:107-134): the same dead/different-incarnation rule (:119-126), no
+ *   age rule, never an ownerless directory (:113).
+ * The age-based reapers (core/atomic-write.ts withExclusiveFileLock, state-sqlite.ts tryLockFile) never
+ * name `.lock` or `custody.lock`. The fence's synchronous acquirer recovers nothing (holdMeshFenceSync
+ * below). So while the owner's pid is alive in the same pid namespace, its record stays at `<lock>/owner`
+ * until it releases (tests/mesh-fence-lock.test.ts proves it for both trees). `hooks` is a test seam for
+ * the interleavings.
  */
 export const releaseFenceLock = (lock: string, token: string, record: string,
-  hooks: { afterCheck?: () => void; afterDetach?: () => void } = {}): void => {
-  try { if (fs.readFileSync(path.join(lock, "owner"), "utf8") !== record) return; } catch { return; /* already recovered or replaced */ }
+  hooks: { afterCheck?: () => void; afterTake?: () => void } = {}): void => {
+  const ownerPath = path.join(lock, "owner");
+  try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; /* already recovered or replaced */ }
   hooks.afterCheck?.();
-  const released = `${lock}.released.${token}`;
-  try { fs.renameSync(lock, released); } catch { return; /* already recovered or replaced */ }
-  hooks.afterDetach?.();
+  const taken = `${lock}.released.${token}`;
+  try { fs.renameSync(ownerPath, taken); } catch { return; /* already recovered or replaced */ }
+  hooks.afterTake?.();
   let ours = false;
-  try { ours = fs.readFileSync(path.join(released, "owner"), "utf8") === record; } catch { /* no record: not provably ours */ }
-  if (ours) { try { fs.rmSync(released, { recursive: true, force: true }); } catch { /* private name; best effort */ } return; }
-  try { fs.renameSync(released, lock); } catch { /* a newer holder owns the name: leave the foreign lock detached */ }
+  try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
+  if (ours) {
+    try { fs.unlinkSync(taken); } catch { /* private name; best effort */ }
+    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it, or it is gone: never ours to remove */ }
+    return;
+  }
+  try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
+  catch { /* the name has another owner or is gone: keep the foreign record, never overwrite one */ }
 };
 
 /**

@@ -73,7 +73,7 @@ describe("resident producer durable outbox", () => {
       expect(fs.existsSync(path.join(f.outbox, outboxEntries(f.outbox)[0]!))).toBe(true);
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   });
-  it.skipIf(process.platform !== "linux")("F6 live watchdog recovers a sole completed task after locked idle exit exactly once without explicit restart", { timeout: 120_000 }, async () => {
+  it.skipIf(process.platform !== "linux")("F6 live watchdog recovers a sole completed task after owned host shutdown exactly once without explicit restart", { timeout: 120_000 }, async () => {
     const f = setup();
     const launches = launchLog(f.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
@@ -108,7 +108,10 @@ describe("resident producer durable outbox", () => {
       const pending = JSON.parse(fs.readFileSync(path.join(f.outbox, entry), "utf8"));
       expect(pending.agentCompletionId).toBe(id);
       expect(completions).not.toHaveBeenCalled();
-      await wait(() => !same(originalHost), 75_000); // actual idle shutdown and process exit
+      // A live Main now vetoes idle exit. Request graceful shutdown of only our recorded host.
+      expect(same(originalHost)).toBe(true);
+      process.kill(originalHost.pid, "SIGTERM");
+      await wait(() => !same(originalHost), 75_000);
       // Inject a lock-release delay across the watchdog tick. It can observe the
       // absent owner before this test observes process exit; an automatic ensureHost
       // is legal while the mesh is still locked. Count recovery over the whole exit,
@@ -159,7 +162,7 @@ describe("resident producer durable outbox", () => {
     }
   });
 
-  it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
+  it("retains a completed durable task beyond host shutdown and delivers once after host restart", { timeout: 100_000 }, async () => {
     // Explicit same-process fixture adapter, never the real subprocess watchdog above.
     installInProcessResidentFence();
     const f = setup();
@@ -188,7 +191,9 @@ describe("resident producer durable outbox", () => {
       expect(pending.agentCompletionId).toBe(id);
       let exited = false;
       void running.then(() => { exited = true; });
-      await wait(() => exited, 75_000); // actual 30-second idle threshold plus close lock waits
+      // Live roots retain residents; explicitly stop this fixture while delivery is locked.
+      controller.abort();
+      await wait(() => exited, 75_000);
       await running;
       expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);

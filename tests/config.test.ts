@@ -113,6 +113,16 @@ describe("host-only processSlice (#4383)", () => {
   });
 });
 
+it("normalizes the dead-root resident idle-exit policy, with an explicit disabled rollback", () => {
+  expect(DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({}).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 0 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1_234 } }).mesh.residentIdleExitMs).toBe(1_234);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: -1 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: "bad" } }).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1e12 } }).mesh.residentIdleExitMs).toBe(7 * 24 * 60 * 60_000);
+});
+
 it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
   expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 0 } }).mesh.idleReadCoalesceMs).toBe(0);

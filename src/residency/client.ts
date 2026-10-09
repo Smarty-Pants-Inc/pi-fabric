@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readResidentIdleExit, residentIdleExitPath } from "./idle-exit.js";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
@@ -344,6 +345,8 @@ export class ResidencyClient {
     // destructive watchdog custody while we still saw its live owner.
     assertNoWatchdogCustody(this.options.config.residencyRoot);
     fs.rmSync(this.#errorPath, { force: true });
+    // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
+    fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
     const launcher = await spawnDetached(
       this.#hostPath,
@@ -1043,6 +1046,8 @@ export class ResidencyClient {
       return;
     }
     if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
+    // Intentional dead-root retirement is not a crash, even if retained delivery debt remains.
+    if (readResidentIdleExit(this.options.config.residencyRoot, this.options.config.rootId)) return;
     const work = this.#durableWork();
     if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
     const noProgress = work === this.#watchdogWork;

@@ -2853,6 +2853,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
   it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
     const state = await rootHarness("resident-exit-status");
+    // This case closes Main below: use a short configured dead-root window, not a live-root exit.
+    state.config.mesh = { ...state.config.mesh, residentIdleExitMs: 1_000 };
     const client = new ResidencyClient({
       config: state.config,
       mesh: state.mesh,
@@ -2864,7 +2866,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     expect((await client.waitAgent(handle.id)).status).toBe("completed");
     await client.close();
     await state.participants.close();
-    // The real path: the host exits after 30 s idle and its close removes runs/.
+    // The real path: Main's lease is withdrawn; the host exits after the configured idle window.
     const runsDir = path.join(state.config.residencyRoot, "runs");
     await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 60_000);
     // owner.json goes last: nothing may write under mesh/ once it is gone, or a new host

@@ -846,6 +846,8 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Fenced terminal foreign session-root record; never grants adoption/restart. */
+  sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */

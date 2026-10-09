@@ -329,8 +329,11 @@ export class ResidentHost {
       rootId: config.rootId,
       identity: this.identity,
       reapDeadHosts: false,                                    // its session's runtime sweeps
-      presencePass: () => rootPresenceAlarms(this.mesh, this.identity, this.hostId,
-        this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
+      presencePass: async () => {
+        await rootPresenceAlarms(this.mesh, this.identity, this.hostId,
+          this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs);
+        await this.actors?.reconcileSessionOrphans();
+      },
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true,

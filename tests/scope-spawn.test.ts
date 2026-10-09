@@ -3,8 +3,28 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import { spawnScopedExecution } from "../src/worker/scope-spawn.js";
+import { scopeLauncherEnvironment } from "../src/process-cgroup.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+describe("non-Linux execution scope compatibility", () => {
+  it.each(["win32", "darwin"] as const)("preserves exact launch arguments/options/environment on %s", async platform => {
+    vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    const find = vi.spyOn(processUtils, "findExecutable");
+    const child = new EventEmitter() as ChildProcess;
+    const args = ["literal '$value'", "second line\nthird line"];
+    const env = { KEEP: "literal", DBUS_SESSION_BUS_ADDRESS: "unix:path=/fixture/bus", XDG_RUNTIME_DIR: "/fixture/runtime" };
+    const options: SpawnOptions = { cwd: "/fixture", env, stdio: "pipe" };
+    const launch = vi.fn((_command: string, _args: readonly string[], _options: SpawnOptions) => child);
+    expect(scopeLauncherEnvironment(env)).toBe(env);
+    expect(await spawnScopedExecution(launch, "target", args, options)).toBe(child);
+    expect(launch).toHaveBeenCalledExactlyOnceWith("target", args, options);
+    expect(launch.mock.calls[0]![1]).toBe(args);
+    expect(launch.mock.calls[0]![2]).toBe(options);
+    expect(launch.mock.calls[0]![2].env).toBe(env);
+    expect(find).not.toHaveBeenCalled();
+  });
+});
+
 describe.skipIf(process.platform !== "linux")("scope spawn environment downgrade", () => {
   const options: SpawnOptions = { env: { DBUS_SESSION_BUS_ADDRESS: "unix:path=/fixture/bus", XDG_RUNTIME_DIR: "/fixture/runtime", KEEP: "literal" }, stdio: "ignore" };
   it.each(["incapable-parent", "missing-launcher"] as const)("preserves the original environment/options for %s", async reason => {

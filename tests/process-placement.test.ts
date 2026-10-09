@@ -167,13 +167,33 @@ describe("host process task placement", () => {
     expect(result).toMatchObject({status:"completed",text:`REMOTE: ${task}`,exitCode:0});
     expect(JSON.parse(fs.readFileSync(path.join(f.results,h.id,"argv.json"),"utf8"))).toEqual(["--host","auto","--minutes","1","--cwd",f.root,"--model","test/model","--thinking","high","--",task]);
   });
-  it("ships a Git source cwd with --src rather than the target-only --cwd flag", async () => {
-    const f=fixture(); execFileSync("git",["init","--quiet",f.root]);
+  it.each([undefined, "win32", "darwin"] as const)("ships a Git source cwd with --src rather than --cwd (platform=%s)", async platform => {
+    // This asserts source routing, not a 300ms cold-start performance budget.
+    // Windows process creation/Git startup can exceed the tiny general fixture
+    // limit. Keep production deadlines and explicit timeout tests unchanged.
+    const f=fixture(false, 10_000); execFileSync("git",["init","--quiet",f.root]);
+    f.config.placement.commandTimeoutMs = 5_000;
     f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
+    // Cache native executable readiness before injecting only the product's
+    // platform branches: Linux's node binary has no Windows .exe suffix.
+    expect(probeAgentPlacement(f.config.placement, f.root).reason).toBeUndefined();
+    if (platform) vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    if (platform === "win32") {
+      // Model cold Windows process startup exceeding the old 300ms fixture
+      // limit without relying on runner load to reproduce its failed result.
+      fs.writeFileSync(f.launcher, `await new Promise(resolve => setTimeout(resolve, 350));\n${fake}`);
+    }
+    const scope = vi.spyOn(processUtils, "spawnDetached");
+    const query = vi.spyOn(processUtils, "executeFile");
     const result=await f.manager.run({task:"source packet",transport:"process",model:"test/model",thinking:"high"});
     expect(result).toMatchObject({status:"completed",text:"REMOTE: source packet"});
     const argv=JSON.parse(fs.readFileSync(path.join(f.results,result.id,"argv.json"),"utf8"));
     expect(argv).toEqual(["--host","auto","--minutes","1","--src",f.root,"--model","test/model","--thinking","high","--","source packet"]);
+    expect(scope).not.toHaveBeenCalled(); // remote placement never enters scope launch
+    expect(query.mock.calls.slice(0, 2).map(call => call[1])).toEqual([
+      ["-C", fs.realpathSync(f.root), "rev-parse", "--is-inside-work-tree"],
+      ["-C", fs.realpathSync(f.root), "check-ignore", "-q", "--", fs.realpathSync(f.root)],
+    ]);
   });
   it("resolves Ryzen 3 polling and cancellation through the configured forge alias", async () => {
     const f=fixture(true);

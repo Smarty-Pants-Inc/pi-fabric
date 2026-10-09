@@ -29,9 +29,11 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     const fstat = vi.spyOn(fs, "fstatSync");
     const disk = vi.spyOn(fs, "readFileSync");
     const first = store.read();
-    for (let i = 1; i < 1_000; i++) expect((i % 2 ? alias : store).read()).toBe(first);
+    let last = first;
+    for (let i = 1; i < 1_000; i++) last = (i % 2 ? alias : store).read();
     expect(first).toEqual(value);
     expect(parse).toHaveBeenCalledTimes(1);
+    expect(last).toBe(first);
     expect(fstat).toHaveBeenCalledTimes(1_000);
     expect(stat).not.toHaveBeenCalled();
     expect(disk).toHaveBeenCalledTimes(1);
@@ -128,6 +130,48 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(after).toEqual(JSON.parse(fs.readFileSync(file, "utf8")));
     if (kind !== "downgrade") expect((after as { actors: { id: string }[] }).actors[0]!.id).toBe("new");
   });
+
+  it.skipIf(process.platform === "win32").each(["write", "prepared", "downgrade"] as const)(
+    "invalidates the cached view after %s rolls back a post-replace durability failure",
+    async kind => {
+      const { root, file, value, store } = setup();
+      const original = { ...value, format: 2 };
+      fs.writeFileSync(file, JSON.stringify(original));
+      const alias = new ActorRegistryStore(root);
+      const stamp = fs.statSync(file, { bigint: true });
+      const fstat = fs.fstatSync.bind(fs);
+      vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) =>
+        options?.bigint === true ? stamp : Reflect.apply(fstat, fs, [fd, options])) as typeof fs.fstatSync);
+      const before = alias.read();
+      const descriptors = new Map<number, string>();
+      const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+      let replaced = false, failed = false;
+      vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+        const fd = open(name, flags, mode); descriptors.set(fd, String(name)); return fd;
+      });
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        rename(from, to); if (String(to) === file) replaced = true;
+      });
+      vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+        if (replaced && !failed && descriptors.get(fd) === root) {
+          failed = true; throw new Error("post-replace barrier failed");
+        }
+        sync(fd);
+      });
+      const operation = async () => {
+        if (kind === "write") await store.withLock(() => store.write([{ id: "new" }], { durable: true }));
+        else if (kind === "prepared") {
+          const prepared = store.prepare([{ id: "new" }], { durable: true });
+          try { await store.withLock(() => prepared.commit()); }
+          finally { prepared.dispose(); }
+        } else await store.restoreInlineForDowngrade();
+      };
+      await expect(operation()).rejects.toThrow("post-replace barrier failed");
+      expect(failed).toBe(true);
+      expect(alias.read()).toEqual(original);
+      expect(alias.read()).not.toBe(before); // Forced identical identity makes invalidation observable.
+    },
+  );
 
   it("does not return cached success for malformed or missing files and recovers on a later replace", () => {
     const { file, value, store } = setup();

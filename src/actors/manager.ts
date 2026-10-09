@@ -2209,11 +2209,12 @@ export class ActorManager {
     }
     const instances = new Set([...this.#actors.values(), ...this.#draining.values()]);
     for (const actor of instances) {
-      const cancelExecution = owned.has(actor.id) || this.#actors.get(actor.id) !== actor;
-      if (this.#parked.get(actor.id)?.length || (cancelExecution &&
-          (actor.queue.length || this.#overflow.get(actor.id)?.length || actor.abortController || this.#inFlight.has(actor.id)))) affected.add(actor.id);
-      if (!cancelExecution) continue;
+      const cancelQueued = owned.has(actor.id) || this.#actors.get(actor.id) !== actor;
       const item = this.#inFlight.get(actor.id);
+      if (this.#parked.get(actor.id)?.length || actor.abortController || item || (cancelQueued &&
+          (actor.queue.length || this.#overflow.get(actor.id)?.length))) affected.add(actor.id);
+      // ESC claims every local execution, even if ownership already aborted it.
+      // Queue removal and controller abort below retain their original ownership guard.
       if (item) this.#cancelledInFlight.set(actor.id, new Set([
         ...(this.#cancelledInFlight.get(actor.id) ?? []), item.id,
       ]));

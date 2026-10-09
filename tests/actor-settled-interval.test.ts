@@ -704,6 +704,52 @@ describe("actor settled round 4 durability and cancellation regressions", () => 
     expect(second.actors.status(first.actor.id).queued).toBe(0);
   });
 
+  it("r4: ownership-loss halt excludes a retained execution before finalization and input/regain preserves fresh work", async () => {
+    let owned = true;
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const first = setup(undefined, () => owned, { releasePaused: true });
+    const actor = await first.actors.create({ name: "lost-execution", instructions: "Observe.",
+      events: ["agent_settled"], coalesce: false });
+    let entered!: () => void;
+    const running = new Promise<void>(resolve => { entered = resolve; });
+    let settle!: (reason: Error) => void;
+    const run = vi.spyOn(first.agents, "run").mockImplementation(() => {
+      entered();
+      return new Promise<never>((_resolve, reject) => { settle = reject; });
+    });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "cancelled-inflight" });
+    first.actors.resumeAfterRelease();
+    await running;
+    first.actors.pauseForRelease();
+    const directory = path.join(first.root, "actors", actor.id);
+    const file = path.join(directory, fs.readdirSync(directory).find(name => /^queue-.*\.json$/.test(name))!);
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["cancelled-inflight"]);
+    owned = false;
+    first.actors.listOwned(); // The current local object remains, with an ownership-aborted controller.
+    expect(first.actors.haltAll()).toEqual({ halted: 0 });
+    expect(first.actors.inFlightCount()).toBe(1); // The finalizer cannot supply the cancellation receipt.
+    expect(readQueue(file).items).toEqual([]);
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    expect(readQueue(file).items).toEqual([]);
+    owned = true;
+    first.actors.listOwned(); // Persistent reload while the cancelled old drain is still retained.
+    await Promise.resolve();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "fresh-after-regain" });
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["fresh-after-regain"]);
+    settle(new Error("ownership-aborted worker settled"));
+    await waitFor(() => first.actors.inFlightCount() === 0);
+    expect(first.actors.messages(actor.id).filter(message => message.error?.includes("halted by user interrupt"))).toHaveLength(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["fresh-after-regain"]);
+    await first.close();
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve();
+    expect(second.actors.status(actor.id).queued).toBe(1);
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["fresh-after-regain"]);
+  });
+
   it("r4: halt cancels local pending and parked work after ownership loss without claiming the foreign actor", async () => {
     let owned = true;
     vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});

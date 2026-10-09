@@ -35,6 +35,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
@@ -1206,17 +1207,22 @@ export class ResidentHost {
     this.#idleCheckRequested = true;
     if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
     this.#idleCheckQueued = true;
-    queueMicrotask(() => {
-      this.#idleCheckQueued = false;
-      if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckPending || !this.#idleCheckRequested) return;
-      this.#idleCheckRequested = false;
-      const pending = this.#checkIdle();
-      this.#idleCheckPending = pending;
-      void pending.finally(() => {
-        if (this.#idleCheckPending === pending) this.#idleCheckPending = undefined;
-        if (this.#idleCheckRequested) this.#scheduleIdleCheck();
-      }).catch(() => undefined);
-    });
+    try {
+      queueMicrotask(() => {
+        this.#idleCheckQueued = false;
+        if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckPending || !this.#idleCheckRequested) return;
+        this.#idleCheckRequested = false;
+        const pending = this.#checkIdle();
+        this.#idleCheckPending = pending;
+        void pending.finally(() => {
+          if (this.#idleCheckPending === pending) this.#idleCheckPending = undefined;
+          if (this.#idleCheckRequested) this.#scheduleIdleCheck();
+        }).catch(() => undefined);
+      });
+    } catch (error) {
+      this.#idleCheckQueued = false; // a later eligibility event must still be able to schedule
+      throw error;
+    }
   }
 
   async #ensureWakeWatch(): Promise<boolean> {
@@ -1247,16 +1253,15 @@ export class ResidentHost {
 
   /** Dormancy may release the owner only when delivery can relaunch this exact generation. */
   #hasWakeConfig(): boolean {
-    const saved = readJson<Partial<ResidentHostConfig>>(path.join(this.config.residencyRoot, "config.json"));
-    return saved?.format === RESIDENT_HOST_FORMAT && saved.rootId === this.config.rootId &&
-      saved.sessionId === this.config.sessionId && saved.residencyRoot === this.config.residencyRoot &&
-      saved.meshRoot === this.config.meshRoot && saved.cwd === this.config.cwd &&
-      saved.workerPath === this.config.workerPath &&
-      saved.fabricExtensionPath === this.config.fabricExtensionPath;
+    const saved = readWakeJson<ResidentHostConfig>(path.join(this.config.residencyRoot, "config.json"));
+    if (residentWakeConfigMatches(saved, this.config)) return true;
+    console.warn(`[pi-fabric] resident dormancy disabled: restart config differs or is unreadable for ${this.config.residencyRoot}`);
+    return false;
   }
 
   #writeWakeRoutes(): void {
     const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
+      configJson: canonicalResidentWakeConfig(this.config),
       actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
         .map(actor => {
           // Preserve the host's actual published owner/capability/ACK advertisement for
@@ -1351,8 +1356,8 @@ export class ResidentHost {
     }
     // A bare/in-process host or an invalid generation has no delivery-owned restart.
     // Only check this at an actual exit boundary, not on every request-poll tick.
-    if (!this.#hasWakeConfig() && this.actors.listOwned().some(actor =>
-      actor.residency === "durable" && actor.status !== "stopped")) {
+    if (this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped") && !this.#hasWakeConfig()) {
       this.#idleSince = now;
       return;
     }
@@ -1376,7 +1381,9 @@ export class ResidentHost {
       await this.#backgroundDeliveries.checkpointForRelease();
       await this.actors.checkpointForRelease();
       if (this.#closed || this.#admissions || this.#publications.size || this.actors.hasActiveDurableActor() ||
-          !this.actors.meshCaughtUp() || [this.#requestsPath, this.#processingPath].some(directory =>
+          !this.actors.meshCaughtUp() || (this.actors.listOwned().some(actor =>
+            actor.residency === "durable" && actor.status !== "stopped") && !this.#hasWakeConfig()) ||
+          [this.#requestsPath, this.#processingPath].some(directory =>
             fs.readdirSync(directory).some(entry => entry.endsWith(".json")))) throw new Error("Resident acquired work before dormancy");
       this.onIdle();
     } catch {

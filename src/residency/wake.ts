@@ -10,8 +10,8 @@ import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricParticipantInfo, FabricParticipantRecord } from "../topology/types.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, routesAt, residentDirectories, residentDeliveryMatches, residentUnacknowledgedDeliveries,
-  acknowledgeResidentDelivery, type WakeDelivery } from "./wake-index.js";
-export { readWakeJson, residentOwnerLive, residentOwnerSleeping } from "./wake-index.js";
+  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch, type WakeDelivery } from "./wake-index.js";
+export { readWakeJson, residentOwnerLive, residentOwnerSleeping, ResidentWakeConfigMismatch } from "./wake-index.js";
 
 /** Sleep needs archive retention even on a mesh that previously used only a bounded live log. */
 export async function ensureResidentWakeArchive(mesh: Pick<MeshStore, "root" | "exclusive">): Promise<void> {
@@ -33,6 +33,8 @@ export interface ResidentWakeRoutes {
   format: 1;
   rootId: string;
   hostId: string;
+  /** Canonical snapshot of every field of the exact restart configuration. */
+  configJson: string;
   actors: Array<{ id: string; name: string; topics: string[]; participant?: FabricParticipantRecord }>;
 }
 export interface ResidentWakeRequest { format: 1; id: string; sequence?: number; requestedAt: number }
@@ -190,6 +192,7 @@ export function waitResidentChange(root: string, ready: () => boolean, timeoutMs
       const receipt = value as { event?: string; root?: string; token?: string; reason?: string } | null;
       if (!receipt || receipt.root !== root) return;
       if (receipt.event === "resident-ready" && typeof receipt.token === "string" && receipt.token.length) finish();
+      else if (receipt.event === "resident-wake-config-mismatch") finish(new ResidentWakeConfigMismatch(root));
       else if (receipt.event === "resident-startup-failed") failed(new Error(receipt.reason ?? failure));
       else if (receipt.event === "resident-wake-pending") finish(new ResidentWakePending(root, receipt.reason ?? failure));
     };
@@ -221,8 +224,7 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>,
   onIntentWritten?: (request: ResidentWakeRequest) => Promise<void>): Promise<void> {
   const configPath = path.join(root, "config.json");
-  const config = readWakeJson<ResidentHostConfig>(configPath);
-  if (!config || typeof config.residencyRoot !== "string" || path.resolve(config.residencyRoot) !== path.resolve(root)) throw new Error("Invalid resident wake config");
+  const config = assertResidentWakeConfig(root);
   // Short lock shared with the launcher's final snapshot AND release of lifetime wake.lock.
   // A publisher after that snapshot cannot write intent until the launcher has released custody.
   // Windows has no POSIX wake launcher/custody holder (durable native wake remains
@@ -243,10 +245,12 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   if (written) await onIntentWritten?.(written);
   if (warm) return; // A racing warm owner covers this durable request without a new child.
   // Spawn is outside the short transaction. A busy contender is covered by the holder's final check.
+  assertResidentWakeConfig(root, config);
   if (launch) return launch(configPath, config);
   const { scriptSpawnArgs } = await import("../agents/transports/process-utils.js");
   const [runtime, ...args] = await scriptSpawnArgs(path.join(path.dirname(config.fabricExtensionPath), "residency", "launcher.js"),
     ["--config", configPath, "--wake"]);
+  assertResidentWakeConfig(root, config); // the async runtime lookup may have yielded to a config rewrite
   const child = spawn(runtime!, args, { cwd: config.cwd, detached: process.platform !== "win32",
     stdio: ["ignore", "ignore", "ignore", "ipc"] });
   try {
@@ -272,7 +276,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
   for (const root of residentDirectories(mesh.root)) {
     let delivery: { id: string; sequence?: number } | undefined;
     try {
-      const routes = routesAt(root);
+      const routes = retainedRoutesAt(root);
       if (!routes) continue;
       if (residentOwnerLive(root) && !residentOwnerSleeping(root)) {
         const covered = pending.get(root);
@@ -313,7 +317,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
 /** Explicit wake helper; message routing never calls it before command admission/commit. */
 export async function wakeDormantActor(meshRoot: string, id: string): Promise<boolean> {
   const candidates = residentDirectories(meshRoot).flatMap(root => {
-    const routes = routesAt(root);
+    const routes = retainedRoutesAt(root);
     return routes?.actors.filter(actor => actor.id === id || actor.name === id || actor.id.startsWith(id))
       .map(actor => ({ root, actor })) ?? [];
   });

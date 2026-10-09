@@ -5,6 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { waitResidentChange } from "../src/residency/wake.js";
+import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
 
 const exit = (child: ChildProcess) => new Promise<void>(resolve => {
   if (child.exitCode !== null || child.signalCode !== null) resolve();
@@ -12,6 +13,53 @@ const exit = (child: ChildProcess) => new Promise<void>(resolve => {
 });
 
 describe("resident native startup outcomes", () => {
+  it.skipIf(process.platform === "win32")("propagates a typed config refusal from the compiled wake launcher without starting an owner", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-config-native-"));
+    const config = { rootId: "session:fenced", residencyRoot: root, cwd: root, actorRoot: path.join(root, "actors") };
+    fs.writeFileSync(path.join(root, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId,
+      hostId: "host:fenced", configJson: canonicalResidentWakeConfig(config), actors: [] }));
+    fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({ ...config, actorRoot: path.join(root, "foreign-actors") }));
+    const child = spawn(process.execPath, [path.resolve("dist/residency/launcher.js"), "--config", path.join(root, "config.json"), "--wake"],
+      { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    try {
+      await expect(waitResidentChange(root, () => false, 10_000, "pending", child)).rejects.toMatchObject({
+        code: "RESIDENT_WAKE_CONFIG_MISMATCH", root,
+      });
+      await exit(child);
+      expect(child.exitCode).toBe(1);
+      expect(JSON.parse(fs.readFileSync(path.join(root, "error.json"), "utf8"))).toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      expect(fs.existsSync(path.join(root, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(root, "foreign-actors"))).toBe(false);
+    } finally { await exit(child); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("freezes all config fields before a native wake without a full launch spec", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-config-frozen-"));
+    const pi = path.join(root, "fake-pi.mjs");
+    const configFile = path.join(root, "config.json");
+    const report = path.join(root, "snapshot-report.json");
+    const config = { rootId: "session:frozen", residencyRoot: root, cwd: root, actorRoot: path.join(root, "actors"), piBinary: pi };
+    fs.writeFileSync(pi, `import fs from 'node:fs';
+const file = process.env.PI_FABRIC_RESIDENT_CONFIG;
+const before = JSON.parse(fs.readFileSync(file, 'utf8'));
+fs.writeFileSync(${JSON.stringify(configFile)}, JSON.stringify({...before, actorRoot: '/changed-after-fence'}));
+const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({file, before, after}));
+`);
+    fs.writeFileSync(configFile, JSON.stringify(config));
+    fs.writeFileSync(path.join(root, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId,
+      hostId: "host:frozen", configJson: canonicalResidentWakeConfig(config), actors: [] }));
+    const child = spawn(process.execPath, [path.resolve("dist/residency/launcher.js"), "--config", configFile, "--wake"], { stdio: "ignore" });
+    try {
+      await exit(child);
+      const receipt = JSON.parse(fs.readFileSync(report, "utf8"));
+      expect(receipt.file).not.toBe(configFile);
+      expect(receipt.before).toEqual(config);
+      expect(receipt.after).toEqual(config);
+      expect(JSON.parse(fs.readFileSync(configFile, "utf8")).actorRoot).toBe("/changed-after-fence");
+    } finally { await exit(child); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["silent", "throw", "error"] as const)("uses child IPC ready when the filesystem watcher is %s", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-child-ready-"));
     const close = vi.fn();

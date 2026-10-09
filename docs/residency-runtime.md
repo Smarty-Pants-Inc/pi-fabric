@@ -90,9 +90,21 @@ check commits eligible dormancy directly after proving native wake support and
 revalidating current actor work and live-participant protection. There is no
 actor quiet period, dormancy timeout, timed safety recheck or periodic retry;
 these signals do not replace the existing request polling.
-Dormancy also requires the persisted `config.json` to match this root and release:
-a bare/in-process host or foreign/unavailable snapshot stays serviceable with
-main's ordinary idle behavior rather than releasing an owner it cannot relaunch.
+Dormancy also requires canonical JSON equality of the **entire** persisted
+`config.json` and the host's exact restart configuration. Object key ordering is
+irrelevant; no field is ignored, including `actorRoot`, `sessionActorRoot`,
+`mesh.actorScope` and future authority-bearing fields. Any difference or an
+unreadable snapshot keeps the actor/host resident and logs a one-line reason.
+`wake-routes.json` retains that complete canonical config snapshot. Dormant
+admission, delivery-owned launch and each successor start re-check equality;
+a mismatch refuses with `ResidentWakeConfigMismatch`
+(`RESIDENT_WAKE_CONFIG_MISMATCH`) without changing actor definitions. The
+archive-coupled index still retains deliveries while config is refused, so a
+later config repair and delivery event can retry without losing the cursor.
+Old route snapshots without the config fence cannot authorize a wake. Explicit
+client starts still use the ordinary resident startup protocol.
+A throwing idle-check `queueMicrotask` enqueue clears its queued flag, allowing
+the next eligibility event to schedule (smarty-dev#7988).
 The proven native watcher belongs to that host lifetime; close retires it (and
 joins any outstanding eligibility proof), so a successor proves its own watcher
 and Windows teardown is not held by a process-global watched-directory handle.

@@ -7,6 +7,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { residentRoot } from "../src/residency/protocol.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import * as wake from "../src/residency/wake.js";
+import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 
@@ -36,7 +37,7 @@ describe("resident event wake routing", () => {
     const actorId = "a".repeat(32);
     const config = { rootId: "session:listener", residencyRoot: resident, cwd: root, fabricExtensionPath: path.resolve("dist/index.js") };
     fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify(config));
-    fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId,
+    fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId, configJson: canonicalResidentWakeConfig(config),
       hostId: "host:listener", actors: [{ id: actorId, name: "listener", topics: ["test.topic"] }] }));
     const launch = vi.fn(async () => {
       const request = wake.readWakeJson<{ sequence: number }>(wake.residentWakeRequestPath(resident));
@@ -81,11 +82,12 @@ describe("resident event wake routing", () => {
       residency: "durable", status: "dormant", actorOwnershipToken: actor.ownershipToken,
       ownerHostId: "resident:listener", ownerIdentityId: "resident:listener", capabilities: ["steer", "followUp", "ask", "actor-bindings"],
       controlProtocol: "v1", startedAt: 1, updatedAt: 1 };
-    const routes = { format: 1, rootId: actor.rootId, hostId: participant.ownerHostId,
+    const config = { rootId: actor.rootId, residencyRoot: resident, cwd: root };
+    const routes = { format: 1, rootId: actor.rootId, configJson: canonicalResidentWakeConfig(config), hostId: participant.ownerHostId,
       actors: [{ id: actorId, name: actor.name, topics: [], participant }] };
     const saveRoutes = () => fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify(routes));
     saveRoutes();
-    fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify({ rootId: actor.rootId, residencyRoot: resident, cwd: root }));
+    fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify(config));
     const participants = { get: () => undefined, scheduleRefresh: vi.fn(), lastKnown: () => undefined, writeStalled: () => undefined };
     const actors = { status: (id: string) => { if (id === actorId) return actor; throw new Error(`Unknown Fabric actor: ${id}`); },
       mesh, identity: { id: "publisher", name: "publisher", kind: "main" }, owns: () => false,
@@ -178,8 +180,10 @@ describe("resident event wake routing", () => {
     const roots = ["first", "second"].map(name => {
       const resident = residentRoot(mesh.root, `session:${name}`);
       fs.mkdirSync(resident, { recursive: true });
-      fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify({ rootId: `session:${name}`, residencyRoot: resident, cwd: root }));
+      const config = { rootId: `session:${name}`, residencyRoot: resident, cwd: root };
+      fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify(config));
       fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify({ format: 1, rootId: `session:${name}`, hostId: `host:${name}`,
+        configJson: canonicalResidentWakeConfig(config),
         actors: [{ id: name, name, topics: ["retry.topic"] }] }));
       return resident;
     }).sort();

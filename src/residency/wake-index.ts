@@ -32,13 +32,57 @@ export const residentDirectories = (meshRoot: string): string[] => {
   try { return fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory())
     .map(entry => path.join(directory, entry.name)); } catch { return []; }
 };
-export const routesAt = (root: string): ResidentWakeRoutes | undefined => {
+/** JSON semantics (including omitted undefined fields), with recursively sorted object keys. */
+export const canonicalResidentWakeConfig = (value: unknown): string => {
+  const sort = (json: unknown): unknown => Array.isArray(json) ? json.map(sort) :
+    json !== null && typeof json === "object" ? Object.fromEntries(Object.entries(json)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, field]) => [key, sort(field)])) : json;
+  return JSON.stringify(sort(JSON.parse(JSON.stringify(value))));
+};
+export const residentWakeConfigMatches = (saved: unknown, expected: unknown): boolean => {
+  if (!saved || typeof saved !== "object" || Array.isArray(saved) ||
+      !expected || typeof expected !== "object" || Array.isArray(expected)) return false;
+  try { return canonicalResidentWakeConfig(saved) === canonicalResidentWakeConfig(expected); }
+  catch { return false; }
+};
+
+/** A restart config is never repaired or partially accepted by a delivery-owned wake. */
+export class ResidentWakeConfigMismatch extends Error {
+  readonly code = "RESIDENT_WAKE_CONFIG_MISMATCH";
+  constructor(readonly root: string) {
+    super(`Resident wake config differs from the retained restart snapshot or is unreadable: ${root}`);
+    this.name = "ResidentWakeConfigMismatch";
+  }
+}
+
+/** Retain delivery indexing even on config refusal; this snapshot cannot start a process. */
+export const retainedRoutesAt = (root: string): ResidentWakeRoutes | undefined => {
   const routes = readWakeJson<ResidentWakeRoutes>(path.join(root, "wake-routes.json"));
+  if (routes?.format !== 1 || !Array.isArray(routes.actors) || typeof routes.configJson !== "string") return undefined;
+  try {
+    const config = JSON.parse(routes.configJson) as ResidentHostConfig;
+    if (routes.rootId !== config?.rootId || typeof config.residencyRoot !== "string" ||
+        path.resolve(config.residencyRoot) !== path.resolve(root) ||
+        canonicalResidentWakeConfig(config) !== routes.configJson) return undefined;
+    return routes;
+  } catch { return undefined; }
+};
+export const routesAt = (root: string): ResidentWakeRoutes | undefined => {
+  const routes = retainedRoutesAt(root);
   const config = readWakeJson<ResidentHostConfig>(path.join(root, "config.json"));
-  // Only retained local configuration supplies execution authority, never event paths.
-  if (routes?.format !== 1 || !Array.isArray(routes.actors) || routes.rootId !== config?.rootId ||
-      typeof config.residencyRoot !== "string" || path.resolve(config.residencyRoot) !== path.resolve(root)) return undefined;
+  // Every field, including future authority-bearing fields, is part of admission.
+  if (!routes || !residentWakeConfigMatches(config, JSON.parse(routes.configJson))) return undefined;
   return routes;
+};
+
+/** Re-read persisted config and the host's exact snapshot at each actual wake start. */
+export const assertResidentWakeConfig = (root: string, launchConfig?: ResidentHostConfig): ResidentHostConfig => {
+  const routes = retainedRoutesAt(root);
+  const config = readWakeJson<ResidentHostConfig>(path.join(root, "config.json"));
+  if (!routes || !residentWakeConfigMatches(config, JSON.parse(routes.configJson)) ||
+      (launchConfig !== undefined && !residentWakeConfigMatches(config, launchConfig)))
+    throw new ResidentWakeConfigMismatch(root);
+  return config!;
 };
 export const residentDeliveryMatches = (routes: ResidentWakeRoutes, event: MeshEvent, lifecycle: readonly WakeSubscription[]): boolean => {
   const command = event.topic === "fabric.control.command" ? event.data as { targetId?: string } | undefined : undefined;
@@ -136,7 +180,7 @@ const indexAt = (meshRoot: string): WakeIndex => {
 /** Synchronous, under the archive/live publication lock, BEFORE any wake attempt. */
 export function indexResidentDeliveries(meshRoot: string, event: MeshEvent, lifecycle: readonly WakeSubscription[]): void {
   for (const root of residentDirectories(meshRoot)) {
-    const routes = routesAt(root);
+    const routes = retainedRoutesAt(root);
     if (!routes || (residentOwnerLive(root) && !residentOwnerSleeping(root)) ||
         !residentDeliveryMatches(routes, event, lifecycle)) continue;
     const index = indexAt(meshRoot);

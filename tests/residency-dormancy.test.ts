@@ -12,6 +12,8 @@ import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors } from "../src/residency/wake.js";
 import { superviseWake } from "../src/residency/launcher.js";
+import { canonicalResidentWakeConfig, routesAt } from "../src/residency/wake-index.js";
+import { requestResidentWake, ResidentWakeConfigMismatch } from "../src/residency/wake.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -41,6 +43,9 @@ const fixture = () => {
   };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+  fs.writeFileSync(path.join(config.residencyRoot, "wake-routes.json"), JSON.stringify({
+    format: 1, rootId: config.rootId, hostId: "fixture", configJson: canonicalResidentWakeConfig(config), actors: [],
+  }));
   const idle = vi.fn();
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
@@ -55,20 +60,107 @@ const fakeRun = (host: ResidentHost, consume: (task: string) => Promise<void> = 
 
 // In-process host tests still take the real kernel fence on Linux.
 describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
-  it.each(["missing", "foreign-root", "foreign-generation"] as const)("keeps main's idle behavior with a %s wake config until a valid eligibility event", async invalid => {
+  it("preserves ordinary empty-host idle exit without a persisted restart config", async () => {
+    const { root, config, host, idle } = fixture();
+    fs.rmSync(path.join(config.residencyRoot, "config.json"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await host.start();
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      await until(() => idle.mock.calls.length === 1);
+      expect(warn).not.toHaveBeenCalled();
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["actorRoot", "sessionActorRoot", "mesh.actorScope", "authority", "unreadable"] as const)("refuses a %s-only wake config mismatch with a typed error and retains actors", async field => {
+    const { root, config, host } = fixture();
+    const file = path.join(config.residencyRoot, "config.json");
+    const launch = vi.fn(async () => {});
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "config-fenced", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      host.actors.pauseForRelease(); await host.actors.checkpointForRelease(); await host.close();
+      const before = new ActorRegistryStore(config.actorRoot).records();
+      const changed = { ...config,
+        ...(field === "actorRoot" ? { actorRoot: path.join(root, "foreign-actors") } :
+          field === "sessionActorRoot" ? { sessionActorRoot: path.join(root, "foreign-session-actors") } :
+          field === "mesh.actorScope" ? { mesh: { ...config.mesh, actorScope: config.mesh.actorScope === "session" ? "project" : "session" } } :
+          { futureAuthority: { grants: ["all"] } }),
+      };
+      fs.writeFileSync(file, field === "unreadable" ? "{invalid json" : JSON.stringify(changed));
+      expect(routesAt(config.residencyRoot)).toBeUndefined();
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toBeInstanceOf(ResidentWakeConfigMismatch);
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toMatchObject({
+        code: "RESIDENT_WAKE_CONFIG_MISMATCH", root: config.residencyRoot,
+      });
+      if (process.platform !== "win32") {
+        await expect(superviseWake(file, launch, { wakeOnly: true })).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      }
+      expect(launch).not.toHaveBeenCalled();
+      expect(new ActorRegistryStore(config.actorRoot).records()).toEqual(before);
+      expect(before.find(row => row.id === actor.id)?.status).toBe("dormant");
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      // Identical canonical config, even with reordered object keys, admits the ordinary wake.
+      fs.writeFileSync(file, JSON.stringify(Object.fromEntries(Object.entries(config).reverse())));
+      await requestResidentWake(config.residencyRoot, { id: "accepted" }, launch);
+      expect(launch).toHaveBeenCalledOnce();
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks exact config before every delivery-owned successor", async () => {
+    const { root, config, host } = fixture();
+    const file = path.join(config.residencyRoot, "config.json");
+    const run = vi.fn(async () => {
+      fs.writeFileSync(residentSleepingPath(config.residencyRoot), JSON.stringify({ request: { id: "old" } }));
+      fs.writeFileSync(residentWakeRequestPath(config.residencyRoot), JSON.stringify({ id: "crossing" }));
+      fs.writeFileSync(file, JSON.stringify({ ...config, sessionActorRoot: path.join(root, "replacement-session") }));
+    });
+    try {
+      await expect(superviseWake(file, run, { wakeOnly: true })).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      expect(run).toHaveBeenCalledOnce();
+      expect(readWakeJson<{ id: string }>(residentWakeRequestPath(config.residencyRoot))?.id).toBe("crossing");
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rechecks config after committed intent before starting the wake", async () => {
+    const { root, config, host } = fixture();
+    const file = path.join(config.residencyRoot, "config.json");
+    const launch = vi.fn(async () => {});
+    try {
+      await expect(requestResidentWake(config.residencyRoot, { id: "committed", sequence: 8 }, launch, async () => {
+        fs.writeFileSync(file, JSON.stringify({ ...config, actorRoot: path.join(root, "racing-actors") }));
+      })).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      expect(launch).not.toHaveBeenCalled();
+      expect(readWakeJson<{ id: string }>(residentWakeRequestPath(config.residencyRoot))?.id).toBe("committed");
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+
+  it.each(["missing", "unreadable", "foreign-root", "foreign-generation", "actorRoot", "sessionActorRoot", "mesh.actorScope", "authority"] as const)("keeps main's idle behavior with a %s wake config until a valid eligibility event", async invalid => {
     const { root, config, host } = fixture();
     const configPath = path.join(config.residencyRoot, "config.json");
     const wake = await import("../src/residency/wake.js");
     const probes = vi.spyOn(wake, "assertResidentWakeWatch");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     if (invalid === "missing") fs.rmSync(configPath);
+    else if (invalid === "unreadable") fs.writeFileSync(configPath, "{broken json");
     else fs.writeFileSync(configPath, JSON.stringify({ ...config,
-      ...(invalid === "foreign-root" ? { rootId: "session:foreign" } : { fabricExtensionPath: "other-release/index.js" }) }));
+      ...(invalid === "foreign-root" ? { rootId: "session:foreign" } :
+        invalid === "foreign-generation" ? { fabricExtensionPath: "other-release/index.js" } :
+        invalid === "actorRoot" ? { actorRoot: path.join(root, "other-actors") } :
+        invalid === "sessionActorRoot" ? { sessionActorRoot: path.join(root, "other-session-actors") } :
+        invalid === "mesh.actorScope" ? { mesh: { ...config.mesh, actorScope: config.mesh.actorScope === "session" ? "project" : "session" } } :
+        { futureAuthority: { grants: ["all"] } }) }));
     try {
       await host.start();
       const actor = await host.actors.create({ name: "no-restart", instructions: "wait", residency: "durable" });
       await sleep(200); // allow the actual event-owned eligibility check to complete
       expect(host.actors.status(actor.id).status).toBe("idle");
       expect(probes).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("restart config differs or is unreadable"));
+      expect(warn.mock.calls.every(([line]) => !String(line).includes("\n"))).toBe(true);
       fs.writeFileSync(configPath, JSON.stringify(config));
       await host.actors.setInstructions(actor.id, "valid restart now");
       await until(() => host.actors.status(actor.id).status === "dormant");
@@ -339,7 +431,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       await host.start();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const get = host.participants.get.bind(host.participants);
-      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+      const protection = vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
         ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : get(id, ...rest));
       const checks = vi.spyOn(host.actors, "hasDormantIdleActor");
       const actor = await host.actors.create({ name: `scheduler-error-${outcome}`, instructions: "supervise", events: ["agent_settled"], residency: "durable" });
@@ -358,6 +450,13 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
         [`[pi-fabric] resident idle check scheduling failed: ${String(schedulerError)}`],
         [`[pi-fabric] host actor presence: ${error.message}`],
       ]);
+      // #7988: the failed enqueue must not latch #idleCheckQueued forever.
+      protection.mockRestore();
+      checks.mockClear();
+      await host.actors.setInstructions(actor.id, "next event can schedule");
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(schedule.mock.calls.length).toBeGreaterThan(1);
+      expect(checks).toHaveBeenCalled();
     } finally { if (update) { fail?.(); await update; } vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

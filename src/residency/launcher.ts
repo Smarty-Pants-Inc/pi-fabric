@@ -9,6 +9,7 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { assertResidentWakeConfig, canonicalResidentWakeConfig, ResidentWakeConfigMismatch } from "./wake-index.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
@@ -43,6 +44,7 @@ const writeFailure = (root: string, error: unknown): void => {
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(path.join(root, "error.json"), JSON.stringify({
       error: error instanceof Error ? error.message : String(error), occurredAt: Date.now(),
+      ...(error instanceof ResidentWakeConfigMismatch ? { code: error.code } : {}),
       launcherPid: process.pid, launcherBirth: processStartTime(process.pid),
     }, null, 2));
   } catch { /* Diagnostics can never suppress owned recovery. */ }
@@ -233,7 +235,7 @@ const pruneResidentChildLogs = (root: string, keep: string, now = Date.now()): v
 };
 
 /** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
-export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number } = {}): Promise<void> {
+export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean } = {}): Promise<void> {
   const root = path.dirname(configPath);
   const ownerPath = path.join(root, "owner.json");
   const trace = (event: string, extra: Record<string, unknown> = {}): void => {
@@ -248,7 +250,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) {
     trace("launcher-deferred", { reason: "existing handover custody" }); return;
   }
-  const config = readConfig(configPath);
+  const config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath);
   // Windows has no POSIX birth/session evidence or report-signal recovery.
   // Keep ordinary native child supervision/shutdown, but never enter watchdog custody.
   const watchdogSupported = process.platform !== "win32";
@@ -273,8 +275,16 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   options.signal?.addEventListener("abort", stop, { once: true });
   const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
     const launchConfig = spec?.config ?? config;
+    if (options.wakeOnly) assertResidentWakeConfig(root, launchConfig);
     const launchEntry = spec?.entry ?? entry;
-    const snapshot = spec ? writeLaunchSnapshot(root, spec) : frozenConfigPath ?? configPath;
+    let snapshot = spec ? writeLaunchSnapshot(root, spec) : frozenConfigPath ?? configPath;
+    if (options.wakeOnly && !spec && !frozenConfigPath) {
+      // Legacy/non-Linux starts must not hand a mutable config.json to the child
+      // after the equality fence. Freeze the same complete JSON even without ABI proof.
+      const json = canonicalResidentWakeConfig(launchConfig);
+      snapshot = path.join(root, `wake-config-${createHash("sha256").update(json).digest("hex")}.json`);
+      writeHandoverImmutable(snapshot, JSON.parse(json));
+    }
     const runtime = spec?.runtime ?? launcher.runtime;
     const attemptInfo = plan && kind ? { id: plan.id, kind } : undefined;
     const reportDirectory = path.join(root, "wedges", "reports");
@@ -644,7 +654,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
 export interface ResidentWakePendingResult { status: "wake-pending"; root: string; reason: string }
 
 /** Event-owned launcher: one child owner, no process survives an idle host. */
-export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = supervise,
+export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = file => supervise(file, { wakeOnly: true }),
   options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void | ResidentWakePendingResult> {
   const root = path.dirname(configPath);
   let fd: number | undefined;
@@ -679,6 +689,7 @@ export async function superviseWake(configPath: string, run: (configPath: string
       } finally { fs.closeSync(intent); }
     }
     for (;;) {
+      assertResidentWakeConfig(root);
       await run(configPath); // normal launch and its owned native child exit receipt
       const intent = await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
       try {
@@ -706,10 +717,16 @@ if (isMain) {
     // own wake.lock; suppressing a normal challenger bypassed its custody test.
     if (!process.argv.includes("--wake")) await supervise(configPath);
     else {
-      const result = await superviseWake(configPath, supervise, { wakeOnly: process.argv.includes("--wake") });
+      const result = await superviseWake(configPath, undefined, { wakeOnly: true });
       if (result && process.connected && process.send) process.send({ event: "resident-wake-pending", root: result.root, reason: result.reason }, () => {});
       if (result) appendResidentLog(path.join(result.root, "launcher.log"), `${JSON.stringify({ event: result.status, at: Date.now(), reason: result.reason })}\n`);
     }
   }
-  catch (error) { writeFailure(path.dirname(configPath), error); process.exitCode = 1; }
+  catch (error) {
+    writeFailure(path.dirname(configPath), error);
+    if (error instanceof ResidentWakeConfigMismatch && process.connected && process.send) {
+      await new Promise<void>(resolve => process.send!({ event: "resident-wake-config-mismatch", root: error.root }, () => resolve()));
+    }
+    process.exitCode = 1;
+  }
 }

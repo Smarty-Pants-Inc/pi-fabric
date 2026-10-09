@@ -35,7 +35,7 @@ it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by 
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(path.join(root, "mesh"), "session:dormant-native"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents }, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh },
     retention: { ...DEFAULT_FABRIC_CONFIG.retention }, workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve("dist/index.js"),
-    piBinary: pi, claudeBinary: "claude", vedaBinary: "veda", watchdog: { enabled: false },
+    piBinary: pi, claudeBinary: pi, vedaBinary: pi, watchdog: { enabled: false },
   };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   const configPath = path.join(config.residencyRoot, "config.json");

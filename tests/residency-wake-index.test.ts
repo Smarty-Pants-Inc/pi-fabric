@@ -8,14 +8,17 @@ import { residentRoot } from "../src/residency/protocol.js";
 import * as wake from "../src/residency/wake.js";
 import * as index from "../src/residency/wake-index.js";
 import * as atomic from "../src/core/atomic-write.js";
+import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
 
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-index-"));
   const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 100);
   const resident = residentRoot(mesh.root, "session:index");
   fs.mkdirSync(resident, { recursive: true });
-  fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify({ rootId: "session:index", residencyRoot: resident, cwd: root }));
+  const config = { rootId: "session:index", residencyRoot: resident, cwd: root };
+  fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify(config));
   fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify({ format: 1, rootId: "session:index", hostId: "host:index",
+    configJson: canonicalResidentWakeConfig(config),
     actors: [{ id: "listener", name: "listener", topics: ["indexed.delivery"] }] }));
   return { root, mesh, resident, from: { id: "publisher", name: "publisher", kind: "main" as const } };
 };
@@ -73,6 +76,36 @@ describe("archive-coupled resident wake retry index", () => {
       await f.mesh.publish({ topic: "unrelated.after.retry", from: f.from });
       expect(launch).toHaveBeenCalledOnce();
       expect(requestFailures).toBe(1); expect(receiptFailures).toBe(1);
+    } finally { vi.restoreAllMocks(); f.mesh.closeState(); fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it("retains a delivery refused for config mismatch and retries once after config repair", async () => {
+    const f = fixture();
+    const configFile = path.join(f.resident, "config.json");
+    const saved = fs.readFileSync(configFile, "utf8");
+    const activeWake = await import("../src/residency/wake.js"); // the disk-reload case resets the module graph
+    const launch = vi.fn(async () => {
+      fs.writeFileSync(wake.residentSleepingPath(f.resident), JSON.stringify({ request: wake.readWakeJson(wake.residentWakeRequestPath(f.resident)) }));
+    });
+    const dispatch = activeWake.wakeResidentActors;
+    vi.spyOn(activeWake, "wakeResidentActors").mockImplementation((store, events) => dispatch(store, events, launch));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await wake.ensureResidentWakeArchive(f.mesh);
+      fs.writeFileSync(configFile, JSON.stringify({ ...JSON.parse(saved), actorRoot: "/foreign-actor-root" }));
+      const event = await f.mesh.publish({ topic: "indexed.delivery", from: f.from });
+      expect(launch).not.toHaveBeenCalled();
+      expect(index.routesAt(f.resident)).toBeUndefined();
+      expect(MeshArchive.fromRoot(f.mesh.root)?.lookupEntry(event.sequence)?.event.id).toBe(event.id);
+      expect(wake.readWakeJson<{ delivery: { id: string }; error: string }>(path.join(f.resident, "wake-failure.json"))).toMatchObject({
+        delivery: { id: event.id }, error: expect.stringContaining("ResidentWakeConfigMismatch"),
+      });
+      fs.writeFileSync(configFile, saved);
+      await f.mesh.publish({ topic: "unrelated.config-repaired", from: f.from });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(wake.readWakeJson<{ id: string }>(wake.residentWakeRequestPath(f.resident))?.id).toBe(event.id);
+      await f.mesh.publish({ topic: "unrelated.after-repair", from: f.from });
+      expect(launch).toHaveBeenCalledOnce();
     } finally { vi.restoreAllMocks(); f.mesh.closeState(); fs.rmSync(f.root, { recursive: true, force: true }); }
   });
 

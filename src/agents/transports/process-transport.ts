@@ -158,6 +158,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       sessionId: String(processHandle.pid),
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
+      finishingGraceMs: 7_000,
+      ...(processHandle.forcedCleanupCount ? { forcedCleanupCount: processHandle.forcedCleanupCount } : {}),
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,

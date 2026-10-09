@@ -15,6 +15,7 @@ import type { InheritedSessionPin } from "./session-pins.js";
 export type AgentRunStatus =
   | "queued"
   | "running"
+  | "finishing"
   | "completed"
   | "failed"
   | "stopped"
@@ -399,6 +400,10 @@ export interface AgentTransportHandle {
   sessionId?: string;
   attachCommand?: string;
   livenessPollIntervalMs?: number;
+  /** Natural-exit grace after a native terminal candidate, before custody cleanup. */
+  finishingGraceMs?: number;
+  /** Birth-checked descendants signalled during custody cleanup, counted once. */
+  forcedCleanupCount?(): number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.

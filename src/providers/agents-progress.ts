@@ -156,7 +156,7 @@ const actorWorker = (
   includeTerminal: boolean,
 ): ReturnType<AgentManager["list"]>[number] | undefined => {
   const candidates = manager.list().filter((candidate) => candidate.actorId === actorId);
-  const active = candidates.find((candidate) => candidate.status === "running");
+  const active = candidates.find((candidate) => candidate.status === "running" || candidate.status === "finishing");
   if (active || !includeTerminal) return active;
   // AgentManager.list() preserves run insertion order; the last actor run
   // is therefore the terminal snapshot for the ask that just settled.

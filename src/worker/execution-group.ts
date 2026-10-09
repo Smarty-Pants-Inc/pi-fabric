@@ -22,6 +22,7 @@ export const executionGroup = (child: ChildProcess) => {
   if (process.platform === "win32") throw new Error("Windows execution-tree custody is unsupported");
   const pid = child.pid;
   const owned = new Map<number, string>();
+  const forcedDescendants = new Set<string>();
   let empty = false;
   let closed = false;
   child.once("close", () => { closed = true; });
@@ -50,6 +51,8 @@ export const executionGroup = (child: ChildProcess) => {
   };
   return {
     observe(): void { if (process.platform === "linux") members(); },
+    /** Count every birth-checked descendant signalled, including closeChild escalation. */
+    forcedCleanupCount: (): number => forcedDescendants.size,
     exited(): boolean {
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;
@@ -72,6 +75,9 @@ export const executionGroup = (child: ChildProcess) => {
         }
       } else if (child.exitCode !== null || child.signalCode !== null) {
         throw new Error(`Execution group ${pid} leader exited; birth-safe cleanup unavailable`);
+      }
+      if (process.platform === "linux") {
+        for (const value of members()) if (value.pid !== pid) forcedDescendants.add(`${value.pid}:${value.started}`);
       }
       try { process.kill(-pid, signal); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }

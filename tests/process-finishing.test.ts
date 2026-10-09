@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 
@@ -110,6 +111,32 @@ describe.skipIf(process.platform !== "linux")("process task finishing exit barri
       expect((await f.manager.wait(handle.id)).warnings).toContain("finished with forced cleanup of 1 descendants");
     } finally { fs.writeFileSync(f.release, "exit"); }
   }, 30_000);
+
+  it("does not settle a terminal candidate through unconfirmed tree debt", async () => {
+    const f = fixture("none");
+    const launch = ProcessTransport.prototype.launch;
+    let debt = true;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function(this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      return { ...handle, lostContact: () => debt ? "test tree exit is unconfirmed" : undefined };
+    });
+    const handle = await f.manager.spawn({ task: "unknown tree exit", transport: "process" });
+    let joined = false;
+    const join = f.manager.join(handle.id).then(() => { joined = true; });
+    try {
+      await vi.waitFor(() => expect((f.manager.status(handle.id) as AgentRunRecord).text).toBe("QUIESCENT"), { timeout: 5_000 });
+      expect(f.manager.status(handle.id).status).toBe("finishing");
+      await expect(f.manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
+      expect(joined).toBe(false);
+      expect(f.manager.isSettled(handle.id)).toBe(false);
+      expect(f.manager.status(handle.id).status).toBe("finishing");
+    } finally {
+      debt = false;
+      await f.manager.stop(handle.id);
+      await join;
+      spy.mockRestore();
+    }
+  });
 
   it("leaves normal completion unchanged", async () => {
     const f = fixture("none");

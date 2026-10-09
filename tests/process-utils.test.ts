@@ -371,21 +371,21 @@ process.on("SIGTERM", () => {
     });
   });
 
-  it("latches a worker's exit seen by the probe before its exit event", async () => {
+  it("latches PID absence without claiming exit before captured native close", async () => {
     await withOwnedWorker("setInterval(() => {}, 1_000);\n", async (handle, _root, child) => {
       // The probe reports the worker gone while its native child is still alive.
       const kill = vi.spyOn(process, "kill").mockImplementationOnce(() => {
         throw Object.assign(new Error("no such process"), { code: "ESRCH" });
       });
-      expect(await handle.isAlive()).toBe(false);
+      expect(await handle.isAlive()).toBe(true); // captured close remains outstanding
       expect(child.exitCode).toBeNull();
       expect(child.signalCode).toBeNull();
       kill.mockImplementation(() => true); // the number now names another process
-      expect(await handle.isAlive()).toBe(false);
+      expect(await handle.isAlive()).toBe(true);
       let stopped = false;
       const stopping = handle.stop().then(() => { stopped = true; });
       await Promise.resolve();
-      expect(stopped).toBe(false); // the false probe is not native close
+      expect(stopped).toBe(false); // PID absence is not native close
       expect(kill).toHaveBeenCalledTimes(1); // only the first probe; no signal
       kill.mockRestore();
       child.kill("SIGTERM");

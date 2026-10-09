@@ -660,6 +660,7 @@ const main = async (): Promise<void> => {
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
       observe(): void {},
+      forcedCleanupCount: (): number => 0,
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
         if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
@@ -676,6 +677,11 @@ const main = async (): Promise<void> => {
         do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
         return exited();
       };
+      // After native completion, let remaining descendants exit naturally
+      // within the same grace budget used for cooperative stop.
+      if (!exited() && record.status === "finishing" && !terminalStatus && !externalStopRequested) {
+        await wait(KILL_GRACE_MS);
+      }
       if (!exited()) {
         group.signal("SIGTERM");
         execution.stdin?.end();
@@ -683,6 +689,11 @@ const main = async (): Promise<void> => {
           group.signal("SIGKILL");
           if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
         }
+      }
+      const forced = group.forcedCleanupCount();
+      if (forced > 0) {
+        record.warnings = [...(record.warnings ?? []), `finished with forced cleanup of ${forced} descendants`];
+        update();
       }
       clearInterval(groupObserver);
     })();
@@ -800,6 +811,15 @@ const main = async (): Promise<void> => {
     killChild();
   };
   const closeChild = (): void => {
+    // Capture descendant births at the native boundary BEFORE EOF can reap the
+    // execution root. A periodic sample alone can miss a fast final turn.
+    executionGroups.get(child)?.observe();
+    // This is reached from native settlement, after pending controls/follow-ups,
+    // not from final-text heuristics. A pre-dispatch reseed is still running.
+    if (!contextReseedRequest) {
+      record.status = "finishing";
+      update();
+    }
     piControlLive = false;
     child.stdin?.end();
     recoveryWatchdog.suspend();
@@ -823,7 +843,7 @@ const main = async (): Promise<void> => {
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
-        // Keep the public record running until close drains the streams and
+        // Keep the public record finishing until close drains the streams and
         // reply/schema validation finishes; terminal records can be collected
         // immediately by the manager. Forced exit must not erase this result.
         update();
@@ -1904,6 +1924,8 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    record.status = "running";
+    update();
     sawAgentError = false;
     retryPending = false;
     terminalError = undefined;
@@ -1927,7 +1949,7 @@ const main = async (): Promise<void> => {
   startChildInput();
 
   const timeout = setTimeout(() => {
-    if (terminalStatus) return;
+    if (terminalStatus || record.status === "finishing") return;
     terminalStatus = "timed_out";
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
     if (options.runner === "pi" && !modelControl.ready) {

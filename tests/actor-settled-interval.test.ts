@@ -15,6 +15,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -407,6 +408,452 @@ describe("actor settled round 3 event-driven regressions", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(committed);
     vi.advanceTimersByTime(20_000);
     expect(first.markers()).toEqual(["leading"]); // Closed-manager timers cannot admit the retained work.
+  });
+});
+
+describe("actor settled round 4 durability and cancellation regressions", () => {
+  // Real ActorManager, queue serialization, registry and restart. Only autonomous
+  // monitor polling is disabled; all admission/deadline callbacks are production code.
+  const fixture = async (root?: string, actorId?: string) => {
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const directoryRoot = root ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settled-r4-"));
+    if (!roots.includes(directoryRoot)) roots.push(directoryRoot);
+    const mesh = new MeshStore(path.join(directoryRoot, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(directoryRoot, "runs"),
+    });
+    const actors = new ActorManager("test", identity, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: 1 }, agents, () => {}, {
+        actorRoot: path.join(directoryRoot, "actors"), persistent: true, releasePaused: true, closeGraceMs: 0,
+      });
+    const close = async () => { await actors.close(); await agents.close(); };
+    closers.push(close);
+    const actor = actorId ? actors.status(actorId) : await actors.create({
+      name: "r4-regression", instructions: "Observe.", events: ["agent_settled"],
+      coalesce: false, activation: { minIntervalMs: 1_000 },
+    });
+    actors.resumeQueued();
+    await Promise.resolve();
+    if (!root) {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      vi.setSystemTime(10_000);
+    }
+    const directory = path.join(directoryRoot, "actors", actor.id);
+    const queueFile = () => path.join(directory, fs.readdirSync(directory).find(file => /^queue-.*\.json$/.test(file))!);
+    const markers = () => incoming(actors, actor.id).filter(message => !message.reason)
+      .map(message => (message.data as { marker?: string }).marker);
+    return { root: directoryRoot, actors, agents, actor, close, queueFile, markers };
+  };
+  type QueueSnapshot = {
+    items: Array<{ source: string; payload: { marker?: string } }>;
+    settledWindows?: Array<{ pending?: { payload: { marker?: string } } }>;
+  };
+  const readQueue = (file: string): QueueSnapshot => JSON.parse(fs.readFileSync(file, "utf8"));
+  const queuedMarkers = (file: string) => readQueue(file).items
+    .filter(item => item.source === "host:agent_settled").map(item => item.payload.marker);
+  const seedPending = (actors: ActorManager, id: string, marker = "latest") => {
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker });
+  };
+
+  it("r4: ordinary non-durable pending save is promoted at close and survives power loss exactly once", async () => {
+    const first = await fixture();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    const file = first.queueFile();
+    // Establish a stable pre-crash baseline through the real core persistence API.
+    // The simulated device retains only successful durable core writes thereafter;
+    // rename alone makes bytes visible but does NOT make them survive power loss.
+    let stable = fs.readFileSync(file, "utf8");
+    atomicWrite.writeJsonAtomic(file, JSON.parse(stable), { durable: true });
+    const write = atomicWrite.writeJsonAtomic;
+    const writes: Array<{ durable: boolean; snapshot: QueueSnapshot }> = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      write(target, value, options); // Real atomic writer, including fsync/rename.
+      if (target === file) {
+        writes.push({ durable: options?.durable === true, snapshot: JSON.parse(JSON.stringify(value)) });
+        if (options?.durable) stable = fs.readFileSync(file, "utf8");
+      }
+    });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "superseded" });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    expect(writes.at(-1)).toMatchObject({ durable: false, snapshot: {
+      settledWindows: [{ pending: { payload: { marker: "latest" } } }],
+    } });
+    expect(readQueue(file).settledWindows?.[0]?.pending?.payload.marker).toBe("latest");
+    writes.length = 0;
+    await first.close();
+    const closeWrites = writes.map(entry => ({
+      durable: entry.durable, pending: entry.snapshot.settledWindows?.[0]?.pending?.payload.marker,
+    }));
+    expect.soft(writes.some(entry => entry.durable &&
+      entry.snapshot.settledWindows?.[0]?.pending?.payload.marker === "latest"),
+    "close owes a durable receipt even when an ordinary rename already succeeded").toBe(true);
+    // Power loss discards unsynced replacements, not manager memory or queue fields.
+    // Restoring device bytes is deliberately separate from ActorManager restart.
+    fs.writeFileSync(file, stable);
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(899);
+    expect(second.markers()).toEqual(["leading"]);
+    vi.advanceTimersByTime(1);
+    expect.soft(second.markers(), "latest must survive the simulated device crash").toEqual(["leading", "latest"]);
+    expect.soft(queuedMarkers(file)).toEqual(["leading", "latest"]);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(second.markers()).toEqual(["leading", "latest"]);
+    await second.close();
+    const third = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(queuedMarkers(file), "repeated restart must not duplicate latest").toEqual(["leading", "latest"]);
+    expect.soft(third.actors.status(first.actor.id).queued).toBe(2);
+    console.info("r4: power-loss evidence", JSON.stringify({ closeWrites, restoredMarkers: queuedMarkers(file) }));
+  });
+
+  it.each([false, true])("r4: failed halt queue rename fences cancelled latest across close/restart (fail close retries %s)", async (failCloseRetries) => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "cancelled-latest");
+    const file = first.queueFile();
+    // A real, durable older snapshot exists before cancellation fails.
+    atomicWrite.writeJsonAtomic(file, readQueue(file), { durable: true });
+    const rename = fs.renameSync;
+    let attempts = 0;
+    let rejectWrites = true;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) {
+        attempts++;
+        if (rejectWrites) {
+          if (!failCloseRetries) rejectWrites = false;
+          throw new Error("r4 halt queue rename unavailable");
+        }
+      }
+      return rename(from, to);
+    });
+    first.actors.haltAll();
+    expect(attempts, "inject the failure during halt, not during an earlier checkpoint").toBeGreaterThan(0);
+    expect.soft(first.actors.status(first.actor.id).lastError,
+      "failed cancellation must be diagnosable").toEqual(expect.stringMatching(/r4 halt queue rename unavailable/));
+    await first.close(); // With failCloseRetries, every queue rename still fails here.
+    expect.soft(first.actors.status(first.actor.id).lastError).toEqual(expect.stringMatching(/r4 halt queue rename unavailable/));
+    failed.mockRestore();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(second.markers(), "cancelled latest must never be admitted by the new manager")
+      .not.toContain("cancelled-latest");
+    expect.soft(queuedMarkers(file), "stale durable pending must not become runnable work")
+      .not.toContain("cancelled-latest");
+    // The sink has recovered. Cancellation must not permanently fence legitimate
+    // future work, even when the previous manager had no successful queue rewrite.
+    second.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    expect(second.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "recovered-leading" })).toBe(1);
+    vi.advanceTimersByTime(100);
+    second.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "recovered-latest" });
+    vi.advanceTimersByTime(900);
+    expect.soft(queuedMarkers(file).filter(marker => marker?.startsWith("recovered-")))
+      .toEqual(["recovered-leading", "recovered-latest"]);
+    await second.close();
+    const third = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(third.markers(), "cancellation must survive repeated restart").not.toContain("cancelled-latest");
+    expect.soft(queuedMarkers(file)).not.toContain("cancelled-latest");
+    expect.soft(queuedMarkers(file).filter(marker => marker?.startsWith("recovered-")))
+      .toEqual(["recovered-leading", "recovered-latest"]);
+    console.info("r4: halt-failure evidence", JSON.stringify({ failCloseRetries, attempts,
+      restoredMarkers: queuedMarkers(file) }));
+  });
+
+  it("r4: successful durable halt rewrite never replays pending after restart", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "cancelled-latest");
+    const file = first.queueFile();
+    const write = atomicWrite.writeJsonAtomic;
+    const rewrites: Array<{ durable: boolean; snapshot: QueueSnapshot }> = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      write(target, value, options);
+      if (target === file) rewrites.push({ durable: options?.durable === true,
+        snapshot: JSON.parse(JSON.stringify(value)) });
+    });
+    first.actors.haltAll();
+    expect(rewrites.some(entry => entry.durable && !entry.snapshot.settledWindows?.length)).toBe(true);
+    expect(readQueue(file).settledWindows).toBeUndefined();
+    expect(first.actors.status(first.actor.id).lastError).toBeUndefined();
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(second.markers()).not.toContain("cancelled-latest");
+    expect(queuedMarkers(file)).toEqual([]);
+  });
+
+  it("r4: counterexample without halt delivers successful trailing exactly once", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id);
+    const file = first.queueFile();
+    vi.advanceTimersByTime(899);
+    expect(first.markers()).toEqual(["leading"]);
+    vi.advanceTimersByTime(1);
+    expect(first.markers()).toEqual(["leading", "latest"]);
+    expect(queuedMarkers(file)).toEqual(["leading", "latest"]);
+    expect(readQueue(file).settledWindows).toBeUndefined();
+    vi.advanceTimersByTime(20_000);
+    expect(first.markers()).toEqual(["leading", "latest"]);
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(queuedMarkers(file)).toEqual(["leading", "latest"]);
+    expect(second.actors.status(first.actor.id).queued).toBe(2);
+  });
+
+  it("r4: counterexample input resume allows future new events without resurrecting halted pending", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "cancelled-latest");
+    first.actors.haltAll();
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    expect(first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new-leading" })).toBe(1);
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new-latest" });
+    vi.advanceTimersByTime(900);
+    expect(first.markers()).toEqual(["leading", "new-leading", "new-latest"]);
+    expect(queuedMarkers(first.queueFile())).toEqual(["new-leading", "new-latest"]);
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(second.markers()).not.toContain("cancelled-latest");
+    expect(queuedMarkers(first.queueFile())).toEqual(["new-leading", "new-latest"]);
+  });
+
+  it.each(["persist", "close"] as const)("r4: total queue storage failure cannot acknowledge halt and recovery retries on %s", async (boundary) => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "cancelled-latest");
+    const file = first.queueFile();
+    atomicWrite.writeJsonAtomic(file, readQueue(file), { durable: true });
+    const open = fs.openSync;
+    let unavailable = true;
+    let fallbackAttempts = 0;
+    vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+      if (unavailable && (String(target).startsWith(`${file}.`) || (target === file && (flags === "r+" || (typeof flags === "number" && (flags & fs.constants.O_RDWR) !== 0))))) {
+        if (target === file) fallbackAttempts++;
+        throw new Error("r4 all queue storage unavailable");
+      }
+      return open(target, flags, mode);
+    });
+    const write = atomicWrite.writeJsonAtomic;
+    const attempts: Array<{ durable: boolean; snapshot: QueueSnapshot }> = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      if (target === file) attempts.push({ durable: options?.durable === true, snapshot: JSON.parse(JSON.stringify(value)) });
+      write(target, value, options);
+    });
+    expect(() => first.actors.haltAll()).toThrow(/not durably acknowledged.*all queue storage unavailable/);
+    expect(fallbackAttempts).toBe(1);
+    expect(first.actors.halted).toBe(true);
+    expect(first.actors.status(first.actor.id).lastError).toMatch(/all queue storage unavailable/);
+    expect(first.actors.status(first.actor.id).queued).toBe(0);
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    vi.advanceTimersByTime(20_000);
+    expect(first.markers()).toEqual(["leading"]); // Window and queue stay cancelled even after resumption.
+    expect(attempts.every(entry => entry.durable && !entry.snapshot.items.length && !entry.snapshot.settledWindows?.length)).toBe(true);
+    unavailable = false;
+    attempts.length = 0;
+    if (boundary === "close") await first.close();
+    else first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ durable: true, snapshot: { items: [] } });
+    expect(readQueue(file).settledWindows).toBeUndefined();
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(queuedMarkers(file)).toEqual([]);
+    expect(second.markers()).not.toContain("cancelled-latest");
+    // Restart safety here follows the RECOVERED durable receipt, not the failed halt.
+  });
+
+  it("r4: halt excludes cancelled in-flight work before its deferred finalizer can remove it", async () => {
+    const first = await fixture();
+    let entered!: () => void;
+    const running = new Promise<void>(resolve => { entered = resolve; });
+    let settle!: (reason: Error) => void;
+    vi.spyOn(first.agents, "run").mockImplementation(() => {
+      entered();
+      return new Promise<never>((_resolve, reject) => { settle = reject; });
+    });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "cancelled-inflight" });
+    const file = first.queueFile();
+    first.actors.resumeAfterRelease();
+    await running;
+    first.actors.pauseForRelease();
+    first.actors.tell(first.actor.id, "queued", { marker: "cancelled-queued" });
+    first.actors.tell(first.actor.id, "overflow", { marker: "cancelled-overflow" });
+    const rename = fs.renameSync;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) throw new Error("r4 inflight rename unavailable");
+      return rename(from, to);
+    });
+    expect(first.actors.haltAll()).toEqual({ halted: 1 });
+    expect(first.actors.inFlightCount()).toBe(1); // Finalizer is deliberately still blocked.
+    expect(readQueue(file).items).toEqual([]); // Same-file durable fallback excludes that retained ID.
+    expect(first.actors.status(first.actor.id).queued).toBe(0);
+    failed.mockRestore();
+    // Existing persistence while the old item is still retained must not serialize it again.
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    expect(readQueue(file).items).toEqual([]);
+    settle(new Error("cancelled worker settled"));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(first.actors.inFlightCount()).toBe(0);
+    expect(readQueue(file).items).toEqual([]);
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    expect(second.actors.status(first.actor.id).queued).toBe(0);
+  });
+
+  it("r4: halt cancels local pending and parked work after ownership loss without claiming the foreign actor", async () => {
+    let owned = true;
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const first = setup(undefined, () => owned, { releasePaused: true });
+    const actor = await first.actors.create({ name: "authority", instructions: "Observe.", events: ["agent_settled"],
+      coalesce: false, activation: { minIntervalMs: 1_000 } });
+    // Let the registry catch up, then revoke ownership before halt's refreshed read.
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "parked-leading" });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "cancelled-pending" });
+    owned = false;
+    first.actors.listOwned(); // Existing ownership path parks the formerly owned leading item.
+    expect(first.actors.haltAll()).toEqual({ halted: 0 });
+    owned = true;
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    await Promise.resolve();
+    expect(first.actors.status(actor.id).queued).toBe(0);
+    expect(incoming(first.actors, actor.id).some(message => (message.data as { marker?: string }).marker === "cancelled-pending")).toBe(false);
+  });
+
+  it.each([false, true])("r4: predecessor restore failure preserves ordinary adoption and fences explicitly cancelled absorbed work (cancel %s)", async (cancel) => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "own-pending");
+    const file = first.queueFile();
+    await first.close();
+    const predecessorRoot = "session:r4-predecessor";
+    const key = createHash("sha256").update([predecessorRoot, "session"].join("\0")).digest("hex").slice(0, 16);
+    const predecessorFile = path.join(path.dirname(file), `queue-${key}.json`);
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    saved.settledWindows[0].pending.payload.marker = "predecessor-latest";
+    saved.settledWindows[0].pending.observedAt++;
+    fs.writeFileSync(predecessorFile, JSON.stringify(saved));
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((row: { id: string }) => row.id === first.actor.id).adoptedFrom = [predecessorRoot];
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const rename = fs.renameSync;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) throw new Error("r4 adopted destination unavailable");
+      return rename(from, to);
+    });
+    const second = await fixture(first.root, first.actor.id);
+    expect(fs.existsSync(predecessorFile)).toBe(true);
+    expect(second.actors.status(first.actor.id).lastError).toMatch(/adopted destination unavailable/);
+    if (cancel) {
+      second.actors.haltAll();
+      const fence = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(fence.cancelledPredecessors).toEqual([path.basename(predecessorFile)]);
+      expect(fence.items).toEqual([]);
+      expect(fence.settledWindows).toBeUndefined();
+      await second.close(); // Both canonical retries fail; fallback is the durable receipt.
+    } else {
+      failed.mockRestore();
+      await second.close(); // Ordinary adoption must retain, not cancel, latest.
+      expect(fs.existsSync(predecessorFile)).toBe(false);
+    }
+    failed.mockRestore();
+    const third = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(900);
+    expect(queuedMarkers(file)).toEqual(cancel ? [] : ["leading", "predecessor-latest"]);
+    if (cancel) {
+      expect(fs.existsSync(predecessorFile)).toBe(true); // The absorbed source still exists; it cannot replay.
+      third.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+      third.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new-leading" });
+      vi.advanceTimersByTime(100);
+      third.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new-latest" });
+      vi.advanceTimersByTime(900);
+      expect(queuedMarkers(file)).toEqual(["new-leading", "new-latest"]);
+    }
+    await third.close();
+    const fourth = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(queuedMarkers(file)).toEqual(cancel ? ["new-leading", "new-latest"] : ["leading", "predecessor-latest"]);
+    expect(fourth.actors.status(first.actor.id).queued).toBe(2);
+  });
+
+  it.skipIf(process.platform === "win32")("r4: rename fallback refuses a symlink queue receipt without writing its target", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id, "cancelled-latest");
+    const file = first.queueFile();
+    const unrelated = path.join(first.root, "unrelated.json");
+    const bytes = JSON.stringify({ unrelated: "must remain unchanged" });
+    fs.writeFileSync(unrelated, bytes);
+    fs.rmSync(file);
+    fs.symlinkSync(unrelated, file);
+    const rename = fs.renameSync;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) throw new Error("r4 symlink canonical rename unavailable");
+      return rename(from, to);
+    });
+    expect(() => first.actors.haltAll()).toThrow(/not durably acknowledged.*not a regular file/);
+    expect(first.actors.status(first.actor.id).lastError).toMatch(/not a regular file/);
+    expect(fs.readFileSync(unrelated, "utf8")).toBe(bytes);
+    expect(first.actors.status(first.actor.id).queued).toBe(0);
+    vi.advanceTimersByTime(20_000);
+    expect(first.markers()).toEqual(["leading"]);
+    failed.mockRestore();
+    // Canonical recovery replaces the link itself atomically, never follows it.
+    await first.close();
+    expect(fs.lstatSync(file).isFile()).toBe(true);
+    expect(readQueue(file).items).toEqual([]);
+    expect(fs.readFileSync(unrelated, "utf8")).toBe(bytes);
+  });
+
+  it("r4: own-file restore parse and soft rewrite do not excuse the final durable close barrier", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id);
+    const file = first.queueFile();
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    const fsync = fs.fsyncSync;
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isFile()) throw new Error("r4 restored queue barrier unavailable");
+      return fsync(fd);
+    });
+    const write = atomicWrite.writeJsonAtomic;
+    const attempts: boolean[] = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      if (target === file) attempts.push(options?.durable === true);
+      write(target, value, options);
+    });
+    await second.close();
+    expect(attempts).toEqual([true]);
+    expect(second.actors.status(first.actor.id).lastError).toMatch(/restored queue barrier unavailable/);
+    failed.mockRestore();
+    vi.advanceTimersByTime(20_000);
+    expect(second.markers()).toEqual(["leading"]);
+  });
+
+  it("r4: one failed close save sets lastError even after an ordinary pending save succeeded", async () => {
+    const first = await fixture();
+    seedPending(first.actors, first.actor.id);
+    const file = first.queueFile();
+    const rename = fs.renameSync;
+    let failures = 0;
+    const snapshots: QueueSnapshot[] = [];
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) {
+        snapshots.push(JSON.parse(fs.readFileSync(from, "utf8")));
+        if (failures++ === 0) throw new Error("r4 final close save unavailable");
+      }
+      return rename(from, to);
+    });
+    await first.close();
+    expect.soft(snapshots, "close must attempt stable storage once after a non-durable pending save").toHaveLength(1);
+    for (const snapshot of snapshots) {
+      expect(snapshot.settledWindows?.[0]?.pending?.payload.marker).toBe("latest");
+    }
+    expect.soft(first.actors.status(first.actor.id).lastError).toEqual(expect.stringMatching(/r4 final close save unavailable/));
+    vi.advanceTimersByTime(20_000);
+    expect(first.markers()).toEqual(["leading"]);
   });
 });
 

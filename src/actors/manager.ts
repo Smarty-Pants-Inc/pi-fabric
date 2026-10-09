@@ -67,7 +67,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
@@ -128,7 +128,7 @@ interface SettledWindow {
   acceptedAt: number;
   intervalMs: number;
   pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string; observedAt: number };
-  /** Only the current pending snapshot's successful queue checkpoint grants durability. */
+  /** Only a successful durable write of this exact pending snapshot grants durability. */
   pendingCheckpointed?: boolean;
   timer?: NodeJS.Timeout;
 }
@@ -455,8 +455,14 @@ export class ActorManager {
   readonly #deadLetters = new Map<string, number>();
   readonly #deadLettersDropped = new Map<string, number>();
   readonly #deadLetterAlarms = new Map<string, number>();
-  // Predecessor queue files taken over, deleted after this lineage's own file is next written.
+  // Predecessor queue files taken over, deleted only after this lineage's durable destination receipt.
   readonly #takenOver = new Map<string, Set<string>>();
+  /** Cancellation survives failed rewrites, even after its runnable memory is gone. */
+  readonly #queueCancellationDirty = new Set<string>();
+  /** Suppress cancelled executions until their finalizers release the retained item. */
+  readonly #cancelledInFlight = new Map<string, Set<string>>();
+  /** Only absorbed predecessor snapshots still on disk can replay this cancellation. */
+  readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
   /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
@@ -2033,8 +2039,9 @@ export class ActorManager {
       if (this.#enqueueHostEvent(actor, "agent_settled", pending.payload, pending.images, pending.sourceRootId, sourceId) &&
           this.#settledWindows.get(actorId)?.get(sourceId) === window) {
         // A current skip-only filter intentionally consumes this delivery.
+        this.#queueCancellationDirty.add(actorId);
         delete window.pending;
-        this.#persistQueue(actorId);
+        this.#persistQueue(actorId, true);
       }
     } catch (error) {
       actor.lastError = error instanceof Error ? error.message : String(error);
@@ -2043,23 +2050,26 @@ export class ActorManager {
     }
   }
 
-  #clearSettledWindows(actorId?: string, suspend = false): void {
-    const ids = actorId === undefined ? [...this.#settledWindows.keys()] : [actorId];
+  #clearSettledWindows(actorId?: string, suspend = false, persist = true): void {
+    const ids = actorId === undefined ? [...new Set([
+      ...this.#settledWindows.keys(), ...(suspend ? this.#queueCancellationDirty : []),
+    ])] : [actorId];
     for (const id of ids) {
       const sources = this.#settledWindows.get(id);
-      if (!sources) continue;
-      const pending = [...sources.values()].some(window => window.pending);
-      for (const window of sources.values()) {
+      const pending = [...(sources?.values() ?? [])].some(window => window.pending);
+      for (const window of sources?.values() ?? []) {
         if (window.timer) clearTimeout(window.timer);
         delete window.timer;
       }
       // Suspend may discard memory only after the latest snapshot is saved. A failed
       // final save keeps it here, timer-free, and leaves the earlier committed file intact.
-      if (suspend && this.#persistent && [...sources.values()].some(window => window.pending && !window.pendingCheckpointed) &&
+      if (suspend && this.#persistent && (this.#queueCancellationDirty.has(id) ||
+          [...(sources?.values() ?? [])].some(window => window.pending && !window.pendingCheckpointed)) &&
           !this.#persistQueue(id, true)) continue;
+      if (pending && !suspend) this.#queueCancellationDirty.add(id);
       this.#settledWindows.delete(id);
       // Close suspends the persisted queue; stop/halt/removal cancel its pending work.
-      if (pending && !suspend) this.#persistQueue(id, true);
+      if (pending && !suspend && persist) this.#persistQueue(id, true);
     }
   }
 
@@ -2176,7 +2186,7 @@ export class ActorManager {
    * reject every queued message so subsequent execution is cancelled. Unlike
    * stop(), actors stay alive and idle — they keep their identity, session,
    * and subscriptions, and resume responding to future events. Returns the
-   * number of actors that had work to cancel. Also arms a short cooldown that
+   * number of actors that had work to cancel. Arms a gate until user input that
    * suppresses host-event dispatch so the interrupt's own turn_end /
    * agent_settled events do not immediately re-enqueue the actors.
    */
@@ -2189,41 +2199,62 @@ export class ActorManager {
     // work) so an idle-but-subscribed actor is not re-armed by the interrupt's
     // own settle events.
     this.#halted = true;
-    this.#clearSettledWindows();
-    // An explicit cancel beats an ownership retry: a run that an ownership loss already
-    // aborted must not be parked and run again after the interrupt. Drains are found by
-    // actor id, because a reload may have replaced the object an older drain still runs on.
-    for (const actor of new Set([...this.#actors.values(), ...this.#draining.values()])) {
-      if (!actor.abortController) continue;
-      actor.cancelAbort = actor.abortController;
-      delete actor.ownershipAbort;
-      if (this.#actors.get(actor.id) !== actor) actor.abortController.abort();
+    const owned = new Set([...this.#actors.values()]
+      .filter(actor => actor.status !== "stopped" && this.#canManage(actor.id)).map(actor => actor.id));
+    // Capture the cut before abort/rejection callbacks; never publish an intermediate
+    // snapshot containing another part of the work this halt is cancelling.
+    const affected = new Set(this.#queueCancellationDirty);
+    for (const [id, sources] of this.#settledWindows) {
+      if ([...sources.values()].some(window => window.pending)) affected.add(id);
     }
-    // Parked events are queued work too: an interrupt cancels them (recorded).
+    const instances = new Set([...this.#actors.values(), ...this.#draining.values()]);
+    for (const actor of instances) {
+      const cancelExecution = owned.has(actor.id) || this.#actors.get(actor.id) !== actor;
+      if (this.#parked.get(actor.id)?.length || (cancelExecution &&
+          (actor.queue.length || this.#overflow.get(actor.id)?.length || actor.abortController || this.#inFlight.has(actor.id)))) affected.add(actor.id);
+      if (!cancelExecution) continue;
+      const item = this.#inFlight.get(actor.id);
+      if (item) this.#cancelledInFlight.set(actor.id, new Set([
+        ...(this.#cancelledInFlight.get(actor.id) ?? []), item.id,
+      ]));
+      if (actor.abortController) actor.cancelAbort = actor.abortController;
+      delete actor.ownershipAbort;
+    }
+    for (const id of affected) {
+      this.#queueCancellationDirty.add(id);
+      const sources = this.#takenOver.get(id);
+      if (sources?.size) this.#cancelledPredecessors.set(id, new Set([
+        ...(this.#cancelledPredecessors.get(id) ?? []), ...[...sources].map(file => path.basename(file)),
+      ]));
+    }
+    this.#clearSettledWindows(undefined, false, false);
+    // Match the original local parked cut, including IDs whose registry row vanished.
     for (const [id, items] of [...this.#parked]) {
       this.#parked.delete(id);
       const owner = this.#actors.get(id);
-      if (owner) this.#drop(owner, items, `Fabric actor ${owner.name} (${owner.id}) halted by user interrupt`);
+      if (owner) this.#drop(owner, items, `Fabric actor ${owner.name} (${owner.id}) halted by user interrupt`, false);
     }
-    for (const actor of this.#actors.values()) {
-      if (!this.#canManage(actor.id) || actor.status === "stopped") continue;
-      const inFlight = actor.abortController !== undefined;
-      if (!inFlight && actor.queue.length === 0) continue;
-      // Abort the in-flight run; the drain loop's finally block resets the
-      // actor to idle once the aborted agent settles.
-      actor.abortController?.abort();
-      // Reject every queued item so subsequent execution is cancelled.
-      this.#drop(actor, this.#takeQueued(actor),
-        `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+    for (const actor of instances) {
+      const cancelExecution = owned.has(actor.id) || this.#actors.get(actor.id) !== actor;
+      const inFlight = cancelExecution && actor.abortController !== undefined;
+      const queued = cancelExecution ? this.#takeQueued(actor) : [];
+      if (cancelExecution) actor.abortController?.abort();
+      this.#drop(actor, queued, `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`, false);
+      if (!inFlight && !queued.length) continue;
       actor.updatedAt = Date.now();
-      // If no run is in flight, settle the status now; otherwise the drain
-      // loop's finally block owns the transition once the run settles.
-      if (!inFlight) {
-        actor.status = actor.queue.length > 0 ? "queued" : "idle";
+      if (!inFlight && actor.status !== "stopped") actor.status = "idle";
+      if (this.#actors.get(actor.id) === actor) {
+        halted++;
+        void this.#publishPresence(actor).catch(() => undefined);
       }
-      halted++;
-      void this.#publishPresence(actor).catch(() => undefined);
     }
+    const failures: string[] = [];
+    for (const id of affected) {
+      if (this.#persistent && !this.#persistQueue(id, true, false, undefined, true)) {
+        failures.push(this.#actors.get(id)?.lastError ?? `Actor ${id} cancellation checkpoint failed`);
+      }
+    }
+    if (failures.length) throw new Error(`Fabric actor halt was not durably acknowledged: ${failures.join("; ")}`);
     return { halted };
   }
 
@@ -5112,7 +5143,7 @@ export class ActorManager {
         ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
         ...(this.#deferredHandoffs.get(actor.id) ?? []),
       ];
-      if (held.some((item) => !item.resolve && !item.reject)) this.#persistQueue(actor.id);
+      if (this.#queueCancellationDirty.has(actor.id) || held.some((item) => !item.resolve && !item.reject)) this.#persistQueue(actor.id);
     }
   }
 
@@ -5128,22 +5159,27 @@ export class ActorManager {
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
   #persistQueue(actorId: string, durable = false, release = false, transfer?: {
     sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
-  }): boolean {
-    if (!this.#persistent || this.#closing) return false;
+  }, cancellationFallback = false): boolean {
+    if (!this.#persistent || this.#closing || !this.#ownQueueRead.has(actorId)) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
+    // Ordinary pending saves remain soft. Cancellation and predecessor deletion,
+    // unlike ordinary admission, require a fresh durable destination receipt.
+    durable ||= this.#queueCancellationDirty.has(actorId) || !!this.#takenOver.get(actorId)?.size;
     const inFlight = this.#inFlight.get(actorId);
     const persistedIds = new Set<string>();
     const parked = this.#parked.get(actorId) ?? [];
     const items = [
-      ...(inFlight ? [inFlight] : []),
+      ...(inFlight ? [this.#cancelledInFlight.get(actorId)?.has(inFlight.id) && inFlight.source === "child-completion"
+        ? { ...inFlight, deferredHandoff: true } : inFlight] : []),
       // Bootstrap restores parked leading work ahead of newly admitted trailing work.
       // A transfer checkpoint must already preserve that order if the host dies here.
       ...(transfer ? parked : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(!transfer ? parked : []), ...(this.#deferredHandoffs.get(actorId) ?? []),
     ]
       .filter((item) => {
-        if (item.resolve || item.reject || persistedIds.has(item.id)) return false;
+        if (item.resolve || item.reject || persistedIds.has(item.id) ||
+            (!item.deferredHandoff && this.#cancelledInFlight.get(actorId)?.has(item.id))) return false;
         persistedIds.add(item.id);
         return true;
       });
@@ -5156,12 +5192,14 @@ export class ActorManager {
       !transfer || sourceId !== transfer.sourceId || window !== transfer.window || pending !== transfer.pending);
     const settledWindows = savedPendingWindows.map(({ sourceId, window, pending }) =>
       ({ sourceId, acceptedAt: window.acceptedAt, intervalMs: window.intervalMs, pending }));
+    // A rewrite replaces the checkpoint inode even if bytes happen to be equal.
+    // Parsing, a soft save, and a failed post-rename barrier are not durable receipts.
+    for (const { window } of savedPendingWindows) window.pendingCheckpointed = false;
+    let snapshot: Record<string, unknown> | undefined;
     try {
       if (transfer && (!items.includes(transfer.item) ||
           this.#settledWindows.get(actorId)?.get(transfer.sourceId) !== transfer.window ||
           transfer.window.pending !== transfer.pending)) throw new Error("Held host event queue transfer no longer matches pending work");
-      if (items.length === 0 && settledWindows.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
-      else {
       const records = items.flatMap((item) => {
         try {
           return [JSON.parse(JSON.stringify({
@@ -5184,28 +5222,92 @@ export class ActorManager {
         }
       });
       // What validWhile reads, so it judges the items the same way after a restart.
-        writeJsonAtomic(file, {
-          format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
-          mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-          ...(settledWindows.length ? { settledWindows } : {}),
-          ...(cleanHandover ? { cleanHandover: true } : {}),
-        }, { durable });
-      }
+      const cancelledPredecessors = [...(this.#cancelledPredecessors.get(actorId) ?? [])];
+      snapshot = {
+        format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+        mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
+        ...(settledWindows.length ? { settledWindows } : {}),
+        ...(cleanHandover ? { cleanHandover: true } : {}),
+        ...(cancelledPredecessors.length ? { cancelledPredecessors } : {}),
+      };
+      // Keep the obligation-free soft empty fast path. Durable empty state and
+      // cancellation/predecessor fences require a file + namespace receipt.
+      if (items.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length) {
+        fs.rmSync(file, { force: true });
+      } else writeJsonAtomic(file, snapshot, { durable });
     } catch (error) {
-      if (pendingWindows.length || transfer) actor.lastError = errorText(error);
+      if (durable || pendingWindows.length || transfer) actor.lastError = errorText(error);
       if (release) throw error;
-      return false;                                         // best-effort; memory still runs the work
+      if (cancellationFallback && snapshot) {
+        try {
+          // This marker describes only this snapshot, not a permanent actor disable.
+          const cancelled = settledWindows.length === 0 && items.every(item => item.deferredHandoff);
+          this.#persistCancellationFence(file, { ...snapshot, ...(cancelled ? { cancelled: true } : {}) });
+          return true; // Receipt permits halt acknowledgment; canonical rewrite is STILL dirty.
+        } catch (fallbackError) {
+          actor.lastError = `${errorText(error)}; cancellation fence failed: ${errorText(fallbackError)}`;
+        }
+      }
+      return false;
     }
-    for (const { sourceId, window, pending } of savedPendingWindows) {
-      if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
+    if (durable) {
+      for (const { sourceId, window, pending } of savedPendingWindows) {
+        if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
+      }
+      this.#queueCancellationDirty.delete(actorId);
+      // Source cleanup must never follow a merely visible/soft destination write.
+      const sources = this.#takenOver.get(actorId);
+      for (const source of sources ?? []) {
+        if (source === file) continue;
+        try {
+          fs.rmSync(source, { force: true });
+          syncDirectoryChain(path.dirname(source));
+          sources!.delete(source);
+        } catch (error) { actor.lastError = errorText(error); }
+      }
+      if (!sources?.size) this.#takenOver.delete(actorId);
     }
-    for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
-    this.#takenOver.delete(actorId);
     return true;
+  }
+
+  /** Same own queue, cancellation only: bounded monotonic fallback when rename is unavailable.
+   * Not crash-atomic; acknowledgment requires complete bytes, inode fsync and namespace validation.
+   * Failure retains the canonical dirty obligation and can never revive cancelled memory. */
+  #persistCancellationFence(file: string, snapshot: Record<string, unknown>): void {
+    const bytes = Buffer.from(JSON.stringify(snapshot), "utf8");
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    let fd: number;
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    try {
+      const endpoint = fs.lstatSync(file);
+      if (!endpoint.isFile() || endpoint.isSymbolicLink()) throw new Error("Cancellation queue receipt is not a regular file");
+      fd = fs.openSync(file, fs.constants.O_RDWR | noFollow);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    }
+    try {
+      const receipt = fs.fstatSync(fd);
+      const endpoint = fs.lstatSync(file);
+      if (!receipt.isFile() || !endpoint.isFile() || endpoint.isSymbolicLink() ||
+          receipt.dev !== endpoint.dev || receipt.ino !== endpoint.ino) throw new Error("Cancellation queue receipt is not a bound regular file");
+      let offset = 0;
+      while (offset < bytes.length) {
+        const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (written <= 0) throw new Error("Cancellation queue rewrite made no progress");
+        offset += written;
+      }
+      fs.ftruncateSync(fd, bytes.length);
+      fs.fsyncSync(fd);
+      syncPathNamespace(file, receipt);
+    } finally { fs.closeSync(fd); }
   }
 
   #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
+    const cancelled = this.#cancelledInFlight.get(actorId);
+    cancelled?.delete(item.id);
+    if (!cancelled?.size) this.#cancelledInFlight.delete(actorId);
     const actor = this.#actors.get(actorId);
     const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
@@ -5264,6 +5366,7 @@ export class ActorManager {
     for (const rootId of actor.adoptedFrom ?? []) {
       const file = this.#queueFile(actor.id, rootId, actor.residency);
       if (file === own) continue;
+      if (this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file))) continue;
       const saved = this.#readQueue(file);
       if (saved === undefined) continue;
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
@@ -5279,13 +5382,20 @@ export class ActorManager {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
-      settledWindows?: unknown;
+      settledWindows?: unknown; cancelled?: unknown; cancelledPredecessors?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (Array.isArray(saved.cancelledPredecessors)) {
+      const fences = this.#cancelledPredecessors.get(actor.id) ?? new Set<string>();
+      for (const file of saved.cancelledPredecessors) {
+        if (typeof file === "string" && /^queue-[a-f0-9]{16}\.json$/.test(file)) fences.add(file);
+      }
+      if (fences.size) this.#cancelledPredecessors.set(actor.id, fences);
+    }
     // Import before any queue rewrite (including dropped restart attempts) and
     // before predecessor deletion. Never replace newer same-process pending work.
-    if (actor.status !== "stopped" && !actor.removal && Array.isArray(saved.settledWindows)) {
+    if (saved.cancelled !== true && actor.status !== "stopped" && !actor.removal && Array.isArray(saved.settledWindows)) {
       for (const record of saved.settledWindows) {
         if (typeof record !== "object" || record === null) continue;
         const value = record as SettledWindow & { sourceId?: unknown };
@@ -5300,7 +5410,7 @@ export class ActorManager {
         const existing = windows.get(value.sourceId);
         if (existing?.pending && existing.pending.observedAt >= value.pending.observedAt) continue;
         if (existing?.timer) clearTimeout(existing.timer);
-        windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending, pendingCheckpointed: !foreign });
+        windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending, pendingCheckpointed: false });
       }
     }
     const counter = (value: unknown): number =>
@@ -5345,6 +5455,7 @@ export class ActorManager {
         if (store.received(value.id) && !store.mailboxClaimed(value.id)) continue;
       }
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
+      if (saved.cancelled === true && !deferredHandoff) continue;
       // New snapshots prove whether a worker actually launched since the last
       // restoration. Failed starts/preparation never consume accepted backlog.
       // Unmarked legacy snapshots remain conservative: they may have run.
@@ -5806,6 +5917,7 @@ export class ActorManager {
   #park(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
     const parked = this.#parked.get(actor.id) ?? [];
     for (const item of items) {
+      if (this.#cancelledInFlight.get(actor.id)?.has(item.id)) continue;
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else parked.push(item);
     }
@@ -5960,12 +6072,12 @@ export class ActorManager {
 
   // Explicit cancellation (stop, cede, interrupt): callers are rejected, and every event
   // without a caller is recorded as dropped instead of vanishing.
-  #drop(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
+  #drop(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string, persist = true): void {
     for (const item of items) {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else this.#recordDropped(actor, item, reason);
     }
-    this.#persistQueue(actor.id);
+    if (persist) this.#persistQueue(actor.id);
   }
 
   #recordDropped(actor: ManagedActor, item: ActorQueueItem, reason: string): void {

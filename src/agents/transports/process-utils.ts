@@ -296,9 +296,10 @@ export const spawnDetached = async (
   // Scope admission execs in place: the captured PID and custody IPC stay owned.
   const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
+  const scopeUnit = scopeRoot ? `${path.basename(scopeRoot)}.scope` : undefined;
   const child = spawn(scope?.executable ?? runtime, scope ? [
-    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
-    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", `--unit=${scopeUnit}`, "--",
+    "/bin/sh", "-c", 'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125; printf admitted > "$1" || exit 125; shift; exec "$@"',
     "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
@@ -489,9 +490,93 @@ export const spawnDetached = async (
       throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
     }
   };
+  // The scope owner publishes one tree-empty receipt. Idle workers have no
+  // census timer: on unscoped POSIX only captured native close starts the
+  // existing birth-checked census. The manager's deadline remains the backstop.
+  const posix = process.platform !== "win32";
+  let treeConfirmed = false;
+  let treeFinished = false;
+  let nativeClosed = false;
+  let treeObservationReady = !scope;
+  let censusTimer: ReturnType<typeof setTimeout> | undefined;
+  let scopeWatcher: fs.FSWatcher | undefined;
+  let scopeEvents: string | undefined;
+  let observingTree = false;
+  const scopeIsEmpty = (): boolean => {
+    const populated = fs.readFileSync(scopeEvents!, "utf8").match(/^populated ([01])$/m)?.[1];
+    if (populated === undefined) throw new Error("Owned scope populated receipt is unreadable");
+    return populated === "0";
+  };
+  let resolveTree!: () => void;
+  let rejectTree!: (error: unknown) => void;
+  const treeClosed = posix ? new Promise<void>((resolve, reject) => { resolveTree = resolve; rejectTree = reject; }) : undefined;
+  // Launch can close before its caller subscribes. Preserve the rejection for
+  // monitoring without producing an unhandled rejection in the admission gap.
+  void treeClosed?.catch(() => undefined);
+  const finishTree = (error?: unknown): void => {
+    if (treeFinished) return;
+    treeFinished = true;
+    clearTimeout(censusTimer);
+    scopeWatcher?.close();
+    if (error !== undefined) rejectTree(error);
+    else { treeConfirmed = true; resolveTree(); }
+  };
+  const observeTree = async (): Promise<void> => {
+    if (!posix || treeFinished || observingTree || !nativeClosed || !treeObservationReady) return;
+    clearTimeout(censusTimer);
+    observingTree = true;
+    // cgroup.events is passive even after primary close. Never replace a live
+    // owned scope's populated receipt with a primary-PID absence observation.
+    try {
+      if (scopeEvents && !scopeIsEmpty()) return;
+      const alive = process.platform === "linux"
+        ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (await portableMembers()).length > 0;
+      if (!alive) { finishTree(); return; }
+      // A populated-zero scope may still have separately retained execution
+      // obligations. Census only those obligations until their owned exit.
+      censusTimer = setTimeout(() => { void observeTree(); }, 50);
+      censusTimer.unref?.();
+    } catch (error) { finishTree(error); }
+    finally { observingTree = false; }
+  };
+  const armTreeObservation = (): void => {
+    if (!posix || treeObservationReady) return;
+    treeObservationReady = true;
+    if (scopeUnit && marker) {
+      try {
+        // The admitted shim records its scope before exec. Preserve that owner
+        // identity even when a fast primary is gone before launch returns.
+        const cgroup = fs.readFileSync(`${marker}.cgroup`, "utf8").split("\n")
+          .find(line => line.startsWith("0::"))?.slice(3);
+        // Only our uniquely named admitted scope is an owner receipt. A shared
+        // caller cgroup (including fake systemd-run fixtures) is NOT our tree.
+        if (cgroup && path.posix.basename(cgroup) === scopeUnit) {
+          const directory = path.resolve("/sys/fs/cgroup", `.${cgroup}`);
+          if (!directory.startsWith("/sys/fs/cgroup/")) throw new Error("Owned scope cgroup path escaped its mount");
+          scopeEvents = path.join(directory, "cgroup.events");
+          const changed = (): void => {
+            if (treeFinished) return;
+            try {
+              scopeIsEmpty(); // validate even while the primary is still active
+              void observeTree();
+            } catch (error) { finishTree(error); }
+          };
+          // Subscribe before the initial read to fence the last-exit race.
+          scopeWatcher = fs.watch(scopeEvents, { persistent: false }, changed);
+          scopeWatcher.on("error", finishTree);
+          changed();
+        }
+      } catch (error) { finishTree(error); }
+    }
+    void observeTree();
+  };
+  void closed.then(() => { nativeClosed = true; void observeTree(); });
+
   const handle = {
     pid,
     closed,
+    ...(treeClosed ? { treeClosed } : {}),
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
@@ -570,6 +655,8 @@ export const spawnDetached = async (
       return pending;
     },
     async isAlive() {
+      if (treeConfirmed) return false;
+      if (exited && scopeEvents && !scopeIsEmpty()) return true;
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
       if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
@@ -588,19 +675,17 @@ export const spawnDetached = async (
     },
   };
   if (scope && marker) {
-    let nativeClosed = false;
-    void closed.then(() => { nativeClosed = true; });
     const admissionDeadline = Date.now() + 5_000;
     try {
       while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
         await new Promise<void>(resolve => setTimeout(resolve, 10));
       }
-      if (fs.existsSync(marker)) return handle;
+      if (fs.existsSync(marker)) { armTreeObservation(); return handle; }
       if (!nativeClosed) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
-      if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
+      if (fs.existsSync(marker)) { armTreeObservation(); return handle; } // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }

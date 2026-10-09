@@ -425,8 +425,10 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
-  /** Passive cgroup.events populated-0 receipt from the scope owner. This is
-   * a notification only; native close and custody still have to be joined. */
+  /** Owned tree-empty notification: cgroup.events populated-0 for an admitted
+   * scope, otherwise the post-close birth-checked census reaching empty.
+   * Native close and execution custody must still be joined; failed observation
+   * rejects instead of authorizing collection or a replacement worker. */
   treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;

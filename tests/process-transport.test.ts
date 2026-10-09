@@ -291,7 +291,10 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       expect(await workerStarted(f.root)).toBe(pid);
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8").slice(fs.readFileSync(`/proc/${pid}/stat`, "utf8").lastIndexOf(")") + 2).split(" ");
       expect(Number(stat[2])).toBe(pid); // field 5 is PGID
-      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 6)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", "--"]);
+      const args = fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n");
+      expect(args.slice(0, 5)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect"]);
+      expect(args[5]).toMatch(/^--unit=fabric-scope-[\w-]+\.scope$/);
+      expect(args[6]).toBe("--");
       expect(await handle.isAlive()).toBe(true); expect(warn).not.toHaveBeenCalled();
     } finally { await handle.stop(); await handle.waitForClose?.(); }
     expect(await handle.isAlive()).toBe(false); expect(handle.lostContact?.()).toBeUndefined();
@@ -314,6 +317,60 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     try { expect(await workerStarted(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); }
     finally { await handle.stop(); await handle.waitForClose(); }
   });
+  it.each(["empty", "empty-at-admission", "watch-error", "unreadable"])("joins the owned cgroup.events receipt (%s) after primary close", async outcome => {
+    const f = fixture();
+    fs.writeFileSync(f.worker, outcome === "empty-at-admission"
+      ? 'import fs from "node:fs"; fs.writeFileSync("started", String(process.pid)); process.exit(0);'
+      : 'import fs from "node:fs"; fs.writeFileSync("started", String(process.pid)); setInterval(() => { if (fs.existsSync("exit-primary")) process.exit(0); }, 10);');
+    const events = path.join(f.root, "cgroup.events");
+    fs.writeFileSync(events, `populated ${outcome === "empty-at-admission" ? 0 : 1}\nfrozen 0\n`);
+    const nativeRead = fs.readFileSync.bind(fs);
+    const nativeWatch = fs.watch.bind(fs);
+    let ownedEvents: string | undefined;
+    let watcher: fs.FSWatcher | undefined;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file).endsWith(`${path.sep}admitted.cgroup`)) {
+        const unit = String(nativeRead(path.join(f.root, "scope-args"), "utf8")).split("\n").find(arg => arg.startsWith("--unit="))!.slice(7);
+        ownedEvents = `/sys/fs/cgroup/user.slice/${unit}/cgroup.events`;
+        return `0::/user.slice/${unit}\n`;
+      }
+      return nativeRead(String(file) === ownedEvents ? events : file, options as never);
+    }) as typeof fs.readFileSync);
+    vi.spyOn(fs, "watch").mockImplementation(((file: fs.PathLike, options: fs.WatchOptionsWithStringEncoding, listener: fs.WatchListener<string>) => {
+      const result = nativeWatch(String(file) === ownedEvents ? events : file, options, listener);
+      if (String(file) === ownedEvents) watcher = result;
+      return result;
+    }) as typeof fs.watch);
+    const handle = await new ProcessTransport("batch.slice").launch(f.request);
+    const joined = handle.treeClosed!.then(() => "empty", error => error as Error);
+    let settled = false;
+    void joined.then(() => { settled = true; });
+    try {
+      await workerStarted(f.root);
+      expect(watcher).toBeDefined();
+      if (outcome === "empty-at-admission") {
+        await handle.closed;
+        await vi.waitFor(() => expect(settled).toBe(true));
+        expect(await joined).toBe("empty");
+        expect(await handle.isAlive()).toBe(false);
+        return;
+      }
+      const closeWatch = vi.spyOn(watcher!, "close");
+      fs.writeFileSync(path.join(f.root, "exit-primary"), "");
+      await handle.closed;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(await handle.isAlive()).toBe(true); // populated=1 is still tree custody
+      expect(settled).toBe(false);
+      if (outcome === "watch-error") watcher!.emit("error", new Error("cgroup event source unavailable"));
+      else fs.writeFileSync(events, outcome === "empty" ? "populated 0\nfrozen 0\n" : "frozen 0\n");
+      await vi.waitFor(() => expect(settled).toBe(true));
+      const result = await joined;
+      if (outcome === "empty") { expect(result).toBe("empty"); expect(await handle.isAlive()).toBe(false); }
+      else { expect(result).toBeInstanceOf(Error); expect((result as Error).message).toMatch(/unavailable|unreadable/); }
+      expect(closeWatch).toHaveBeenCalledOnce();
+    } finally { await handle.stop(); await handle.waitForClose?.(); }
+  });
+
   it("does not replay a worker that fails after successful scope admission", async () => {
     const f = fixture(); fs.writeFileSync(f.worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); process.exit(1);');
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

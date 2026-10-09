@@ -74,13 +74,93 @@ describe("native process event liveness", () => {
   });
 });
 
+describe.skipIf(process.platform !== "linux")("native descendant tree-empty delivery", () => {
+  it("settles a real process run at the later descendant exit, not the deadline", async () => {
+    const directory = root();
+    const workerPath = path.join(directory, "descendant-worker.mjs");
+    const descendant = `const fs = require("node:fs");
+      const timer = setInterval(() => {
+        if (fs.existsSync("exit-descendant")) {
+          fs.writeFileSync("descendant-exited", String(Date.now()));
+          clearInterval(timer); process.exit(0);
+        }
+      }, 10);
+      setTimeout(() => process.exit(2), 8000);`;
+    fs.writeFileSync(workerPath, `import fs from "node:fs";
+      import { spawn } from "node:child_process";
+      process.on("message", message => {
+        if (message.type !== "fabric-execution-custody-ack") return;
+        const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { detached: true, stdio: "ignore" });
+        descendant.unref();
+        const fields = fs.readFileSync(\`/proc/\${descendant.pid}/stat\`, "utf8");
+        const started = fields.slice(fields.lastIndexOf(")") + 2).trim().split(/\\s+/)[19];
+        process.send({ type: "fabric-execution-started", pid: descendant.pid, started }, () => {
+          fs.writeFileSync("descendant-ready", String(descendant.pid));
+          setInterval(() => { if (fs.existsSync("exit-parent")) process.exit(0); }, 10);
+        });
+      });
+      process.send({ type: "fabric-execution-custody" });
+      setTimeout(() => process.exit(2), 8000);`);
+    const actualSpawn = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let child!: ChildProcess;
+    vi.mocked(spawn).mockImplementation((...args: Parameters<typeof spawn>) => { child = actualSpawn.spawn(...args); return child; });
+    const actualLaunch = ProcessTransport.prototype.launch;
+    let transport!: AgentTransportHandle;
+    const stop = vi.fn<AgentTransportHandle["stop"]>();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function(this: ProcessTransport, request) {
+      transport = await actualLaunch.call(this, request);
+      stop.mockImplementation(transport.stop);
+      return { ...transport, stop, relaunchable: false };
+    });
+    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, budgetUsd: 0, sessionExport: false }, {
+      workerPath, runRoot: path.join(directory, "runs"),
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "native descendant closes later", transport: "process" });
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "descendant-ready"))).toBe(true), { timeout: 3_000 });
+      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+      fs.writeFileSync(path.join(directory, "exit-parent"), "");
+      await closed; await tick();
+      expect(await transport.isAlive()).toBe(true);
+      expect(manager.status(handle.id).status).toBe("running");
+      let treeEmpty = false;
+      void transport.treeClosed?.then(() => { treeEmpty = true; });
+      await new Promise<void>(resolve => setTimeout(resolve, 100));
+      expect(treeEmpty).toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+      const releasedAt = Date.now();
+      fs.writeFileSync(path.join(directory, "exit-descendant"), "");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let result;
+      try {
+        result = await Promise.race([manager.wait(handle.id), new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("descendant exit did not settle before the run deadline")), 2_000);
+        })]);
+      } finally { clearTimeout(timer); }
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("exited without a result");
+      expect(fs.existsSync(path.join(directory, "descendant-exited"))).toBe(true);
+      expect(Date.now() - releasedAt).toBeLessThan(2_000);
+      expect(transport.treeClosed).toBeDefined();
+      expect(treeEmpty).toBe(true);
+      expect(await transport.isAlive()).toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      fs.writeFileSync(path.join(directory, "exit-parent"), "");
+      fs.writeFileSync(path.join(directory, "exit-descendant"), "");
+      await transport.stop(); await transport.waitForClose?.();
+    }
+  });
+});
+
 const statusRecord = (id: string, task: string): AgentRunRecord => ({
   id, name: task, task, status: "running", runner: "pi", transport: "process", cwd: process.cwd(),
   startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", exitCode: null,
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 });
 
-function monitored() {
+function monitored(relaunchable = false) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
   const close = deferred();
@@ -90,15 +170,15 @@ function monitored() {
   let alive = true;
   const read = vi.fn(async () => alive);
   const stop = vi.fn(async () => { alive = false; close.resolve(); tree.resolve(); });
-  vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValue({
+  const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValue({
     kind: "process", liveness: "events", closed: close.promise, treeClosed: tree.promise,
-    isAlive: read, stop, relaunchable: false,
+    isAlive: read, stop, relaunchable,
   });
   const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1_000, budgetUsd: 0, sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(directory, "runs"),
   });
   managers.push(manager);
-  return { manager, close, tree, watcher, read, stop, die: () => { alive = false; } };
+  return { manager, close, tree, watcher, read, stop, launch, die: () => { alive = false; } };
 }
 
 describe("manager event-only process monitoring", () => {
@@ -181,6 +261,64 @@ describe("manager event-only process monitoring", () => {
     expect(await f.manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "PROCESS_LIVENESS_WATCH_FAILED" });
     expect(f.read).toHaveBeenCalledOnce();
     f.tree.resolve();
+  });
+
+  it.each(["native", "tree", "records"])("keeps a %s watcher failure latched across a later wake and dead process", async source => {
+    const f = monitored(true);
+    const handle = await f.manager.spawn({ task: "dead after watcher failure", transport: "process" });
+    const status = path.join(f.manager.runDirectory(handle.id)!, "status.json");
+    const failure = new Error("event watcher unavailable");
+    if (source === "native") f.close.reject(failure);
+    else if (source === "tree") f.tree.reject(failure);
+    else f.watcher.emit("error", failure);
+    await tick();
+    // A separate status wake must not clear the failure or grant retry admission.
+    f.watcher.emit("rename", "status.json");
+    await tick();
+    f.die();
+    fs.writeFileSync(status, JSON.stringify({ ...statusRecord(handle.id, "dead after watcher failure"), status: "completed", finishedAt: Date.now() }));
+    if (source === "native") f.tree.resolve(); else f.close.resolve();
+    await tick();
+    expect(f.manager.status(handle.id)).toMatchObject({ status: "failed", errorCode: "PROCESS_LIVENESS_WATCH_FAILED" });
+    expect(await f.manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "PROCESS_LIVENESS_WATCH_FAILED" });
+    expect(f.launch).toHaveBeenCalledOnce();
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(f.manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
+    f.close.resolve(); f.tree.resolve();
+  });
+
+  it("vetoes a startup retry when a watcher fails during the exit join", async () => {
+    const f = monitored(true);
+    const handle = await f.manager.spawn({ task: "watcher fails during retry", transport: "process" });
+    f.die(); f.close.resolve();
+    await tick();
+    f.watcher.emit("error", new Error("retry watcher unavailable"));
+    f.tree.resolve();
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.launch).toHaveBeenCalledOnce();
+    expect(await f.manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "PROCESS_LIVENESS_WATCH_FAILED" });
+    expect(fs.existsSync(path.join(f.manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
+  });
+
+  it("joins a replacement admitted just before the old watcher fails, without clearing the failure", async () => {
+    const f = monitored(true);
+    const handle = await f.manager.spawn({ task: "watch failure races native retry admission", transport: "process" });
+    const replacementStop = vi.fn(async () => undefined);
+    f.launch.mockImplementationOnce(async request => {
+      expect(request.authorize?.()).toBe(true);
+      f.watcher.emit("error", new Error("old watch failed during admission"));
+      expect(request.authorize?.()).toBe(false);
+      return { kind: "process", liveness: "events", closed: Promise.resolve(), treeClosed: Promise.resolve(),
+        isAlive: async () => false, stop: replacementStop };
+    });
+    f.die(); f.close.resolve(); f.tree.resolve();
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await f.manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "PROCESS_LIVENESS_WATCH_FAILED" });
+    expect(f.launch).toHaveBeenCalledTimes(2);
+    expect(replacementStop).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(f.manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
   });
 
   it("fails closed when the single deadline safety read rejects, without replacing it with polling", async () => {

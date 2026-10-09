@@ -23,7 +23,8 @@ from render import API, CORE, HOSTS, MAX_PAYLOAD, render
 
 
 class Nats:
-    def __init__(self, port, tlsdir, identity, inbox, timeout=30):
+    def __init__(self, port, tlsdir, identity, inbox, timeout=10):
+        self.timeout = timeout
         self.inbox = inbox
         self.sid = 0
         sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
@@ -49,9 +50,17 @@ class Nats:
             'no_responders': True}).encode() + b'\r\nPING\r\n')
         self.until_pong()
 
+    def read_line(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('NATS operation deadline exceeded')
+        self.sock.settimeout(remaining)
+        return self.file.readline()
+
     def until_pong(self):
+        deadline = time.monotonic() + self.timeout
         while True:
-            line = self.file.readline()
+            line = self.read_line(deadline)
             if line == b'PONG\r\n':
                 return
             self.control(line)
@@ -67,8 +76,10 @@ class Nats:
             raise RuntimeError('unexpected protocol line ' + repr(line))
 
     def message(self):
+        # Keepalive traffic must not extend the total RPC deadline indefinitely.
+        deadline = time.monotonic() + self.timeout
         while True:
-            line = self.file.readline()
+            line = self.read_line(deadline)
             if line.startswith((b'MSG ', b'HMSG ')):
                 parts = line.split()
                 reply = ''
@@ -213,13 +224,21 @@ def main():
     def note(name, evidence):
         result['checks'][name] = evidence
         print(name + ': ' + json.dumps(evidence), flush=True)
-    def connect(host, leaf=True, identity=None):
+    def connect(host, leaf=True, identity=None, timeout=10):
         port = manifest['leaf_ports' if leaf else 'core_ports'][host]
         privileged_inbox = {'fabric.hub': 'hub', 'fabric.ops': 'ops', 'fabric.sys': 'sys'}
         c = Nats(port, tlsdir, identity or 'fabric.' + host,
-                 privileged_inbox.get(identity, host))
+                 privileged_inbox.get(identity, host), timeout=timeout)
         clients.append(c)
         return c
+    def observe(host, subject, body, leaf=True, identity=None):
+        # Retried readiness probes are read-only and use a fresh connection:
+        # a timed-out socket.makefile must not be reused. Writes are never retried.
+        c = connect(host, leaf=leaf, identity=identity, timeout=2)
+        try:
+            return c.api(subject, body)
+        finally:
+            c.close()
     try:
         parts = version.removeprefix('nats-server: v').split('.')
         assert len(parts) == 3 and all(s.isdigit() for s in parts), version
@@ -266,12 +285,19 @@ def main():
             return leaders[0] if leaders and leaders[0] and len(set(leaders)) == 1 else None
         first_leader = eventually('initial meta leader', meta_leader)
         eventually('both leaves linked', lambda: all(health(
-            manifest['monitor_ports']['leaf-' + h], '/leafz').get('leafnodes', 0) >= 1
+            manifest['monitor_ports']['leaf-' + h], '/leafz').get('leafnodes', 0) == 1
             for h in ('ryzen3', 'ryzen5')))
         note('startup', {'meta_leader': first_leader, 'servers': 5, 'leaf_links': 2})
-        initial_meta = health(manifest['monitor_ports'][first_leader], '/jsz')['meta_cluster']
-        assert len(initial_meta.get('replicas', [])) == 2, initial_meta
-        note('metadata_before', initial_meta)
+        def metadata_info(leader, alive=3):
+            info = health(manifest['monitor_ports'][leader], '/jsz')['meta_cluster']
+            live_names = {name for name, proc in processes.items() if proc.poll() is None}
+            assert info['leader'] == leader and leader in live_names, info
+            assert info['cluster_size'] == 3 and len(info.get('replicas', [])) == 2, info
+            assert len([r for r in info['replicas'] if r.get('current')
+                        and r['name'] in live_names]) == alive - 1, info
+            return info
+        note('metadata_before', eventually('metadata followers current',
+                                           lambda: metadata_info(first_leader)))
         admin = connect('ryzen1', leaf=False, identity='fabric.ops')
         definitions = json.loads((configdir / 'streams.json').read_text())
         selected = [s for s in definitions if s['name'] in
@@ -323,11 +349,23 @@ def main():
             'stream_name': 'ROOT_ryzen3', 'config': {'durable_name': 'SMOKE', 'ack_policy': 'explicit',
                 'deliver_policy': 'all', 'replay_policy': 'instant',
                 'filter_subject': 'fabric.root.ryzen3.>', 'num_replicas': 3}})
-        def consumer_ready():
-            info = h3.api(f'{API}.CONSUMER.INFO.ROOT_ryzen3.SMOKE', {})
-            assert info['config']['num_replicas'] == 3
-            assert len([r for r in info['cluster'].get('replicas', []) if r.get('current')]) == 2
-            return info['cluster']
+        def consumer_ready(alive=3):
+            info = observe('ryzen3', f'{API}.CONSUMER.INFO.ROOT_ryzen3.SMOKE', {})
+            live_names = {name for name, proc in processes.items() if proc.poll() is None}
+            assert info['name'] == 'SMOKE' and info['stream_name'] == 'ROOT_ryzen3', info
+            assert info['config']['num_replicas'] == 3, info
+            assert info['config']['ack_policy'] == 'explicit', info
+            assert not info['config'].get('deliver_subject'), info
+            assert info['config']['filter_subject'] == 'fabric.root.ryzen3.>', info
+            cluster = info['cluster']
+            assert cluster['leader'] in live_names, info
+            current = [r for r in cluster.get('replicas', []) if r.get('current')
+                       and r['name'] in live_names]
+            assert len(current) == alive - 1, info
+            return {'name': info['name'], 'stream_name': info['stream_name'],
+                    'configured_replicas': info['config']['num_replicas'],
+                    'leader': cluster['leader'], 'current_followers': len(current),
+                    'ack_floor': info['ack_floor'], 'cluster': cluster}
         note('replicas_before', {'streams': initial_replicas, 'consumer': eventually(
             'consumer replicas', consumer_ready)})
         body, reply = h3.request(f'{API}.CONSUMER.MSG.NEXT.ROOT_ryzen3.SMOKE',
@@ -358,6 +396,47 @@ def main():
         except (RuntimeError, ssl.SSLError, ConnectionError) as exc:
             denials['foreign_host_cert'] = type(exc).__name__
         note('acl_denials', denials)
+        # Exercise the core's mapped leaf identity directly, independent of the
+        # local leaf's ACL. A compromised/relaxed local leaf cannot widen it.
+        core_denials = {}
+        for subject in ('fabric.root.ryzen5.evil', f'{API}.$KV.STATE_ryzen5.evil',
+                        'fabric.hub.control.evil', 'fabric.fleet.work.ryzen5.evil',
+                        f'{API}.CONSUMER.DURABLE.CREATE.ROOT_ryzen3.EVIL'):
+            c = Nats(manifest['core_ports']['ryzen1'], tlsdir, 'leaf-ryzen3', 'ryzen3')
+            clients.append(c)
+            core_denials[subject] = c.denied_publish(subject)
+            c.close()
+        c = Nats(manifest['core_ports']['ryzen1'], tlsdir, 'leaf-ryzen3', 'ryzen3')
+        clients.append(c)
+        own_info = c.api(f'{API}.STREAM.INFO.ROOT_ryzen3', {})
+        assert own_info['config']['name'] == 'ROOT_ryzen3', own_info
+        core_denials['subscribe:foreign-root'] = c.denied_subscribe('fabric.root.ryzen5.>')
+        c.close()
+        note('core_leaf_identity_acl', {'own_api': 'allowed', 'denials': core_denials})
+        # Routes have a separate CA: ordinary application credentials are not
+        # quorum-peer credentials, even if a local client can reach that port.
+        ctx = ssl.create_default_context(cafile=str(tlsdir / 'route-ca.pem'))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(str(tlsdir / 'fabric.ryzen3.pem'), str(tlsdir / 'fabric.ryzen3.key'))
+        try:
+            with socket.create_connection(('127.0.0.1', a.base_port + 100), timeout=5) as raw:
+                with ctx.wrap_socket(raw, server_hostname='127.0.0.1') as route:
+                    route.recv(16384)  # TLS 1.3 server alerts may follow client handshake completion.
+            raise AssertionError('application certificate admitted on route listener')
+        except ssl.SSLError as exc:
+            assert 'ALERT_UNKNOWN_CA' in str(exc) or 'ALERT_BAD_CERTIFICATE' in str(exc), str(exc)
+            note('route_trust_boundary', {'application_cert_rejected': True, 'reason': exc.reason})
+        oversized = connect('ryzen3')
+        try:
+            oversized.publish('fabric.root.ryzen3.oversized', b'X' * (MAX_PAYLOAD + 1))
+            oversized.sock.sendall(b'PING\r\n')
+            oversized.until_pong()
+            raise AssertionError('oversized payload admitted')
+        except RuntimeError as exc:
+            assert 'Maximum Payload Violation' in str(exc), str(exc)
+            note('payload_limit', {'limit': MAX_PAYLOAD, 'rejected_bytes': MAX_PAYLOAD + 1})
+        finally:
+            oversized.close()
         # Separate subscribers avoid mixing persistent replies with shared delivery.
         shared = connect('ryzen5')
         shared.subscribe_once('fabric.fleet.presence.ryzen3.smoke')
@@ -395,27 +474,30 @@ def main():
         new_leader = eventually('meta leader failover', lambda: (
             leader if (leader := meta_leader()) and leader != first_leader else None), 45)
         live = [h for h in CORE if processes['core-' + h].poll() is None]
-        admin = connect(live[0], leaf=False, identity='fabric.ops')
+        survivor_host = new_leader.removeprefix('core-')
         # A metadata mutation, not just an open port, proves the surviving meta quorum.
         kvconfig = next(s for s in selected if s['name'] == 'KV_STATE_ryzen3')
         updated = dict(kvconfig, description='quorum mutation after SIGKILL')
-        surviving_replicas = eventually('data leaders and R2 quorum ready', lambda: {
-            s['name']: replica_info(admin, s['name'], 2) for s in selected}, 60)
+        def surviving_streams_ready():
+            c = connect(survivor_host, leaf=False, identity='fabric.ops', timeout=2)
+            try:
+                return {s['name']: replica_info(c, s['name'], 2) for s in selected}
+            finally:
+                c.close()
+        surviving_replicas = eventually('data leaders and R2 quorum ready',
+                                        surviving_streams_ready, 60)
+        note('surviving_streams_ready', surviving_replicas)
+        admin = connect(survivor_host, leaf=False, identity='fabric.ops')
         update_reply = admin.api(f'{API}.STREAM.UPDATE.KV_STATE_ryzen3', updated)
         assert update_reply['config']['description'] == updated['description'], update_reply
-        h3 = eventually('leaf 3 reconnected', lambda: connect('ryzen3'))
-        h5 = eventually('leaf 5 reconnected', lambda: connect('ryzen5'))
-        for h, client in (('ryzen3', h3), ('ryzen5', h5)):
-            eventually('leaf API recovered ' + h, lambda: client.api(
-                f'{API}.STREAM.INFO.KV_STATE_{h}', {}), 45)
+        for h in ('ryzen3', 'ryzen5'):
+            eventually('leaf API recovered ' + h, lambda: observe(
+                h, f'{API}.STREAM.INFO.KV_STATE_{h}', {}), 45)
+        h3, h5 = connect('ryzen3'), connect('ryzen5')
         after = {'ryzen3': put_get(h3, 'ryzen3', 'after', value),
                  'ryzen5': put_get(h5, 'ryzen5', 'after', value)}
         # Surviving stream AND durable-consumer quorum must process another event.
-        consumer_after = h3.api(f'{API}.CONSUMER.INFO.ROOT_ryzen3.SMOKE', {})
-        assert consumer_after['config']['num_replicas'] == 3, consumer_after
-        assert consumer_after['cluster']['leader'] in {'core-' + h for h in live}, consumer_after
-        assert any(r['current'] and r['name'] in {'core-' + h for h in live}
-                   for r in consumer_after['cluster']['replicas']), consumer_after
+        consumer_after = eventually('surviving consumer quorum', lambda: consumer_ready(2))
         root3_ack = json.loads(h3.request('fabric.root.ryzen3.events.after', event)[0])
         assert root3_ack['stream'] == 'ROOT_ryzen3', root3_ack
         body, reply = h3.request(f'{API}.CONSUMER.MSG.NEXT.ROOT_ryzen3.SMOKE',
@@ -428,11 +510,12 @@ def main():
             f'{API}.CONSUMER.INFO.ROOT_ryzen3.SMOKE', {})['num_ack_pending'] == 0)
         ack = json.loads(h5.request('fabric.root.ryzen5.events.after', event)[0])
         assert ack['stream'] == 'ROOT_ryzen5'
-        note('metadata_after', health(manifest['monitor_ports'][new_leader], '/jsz')['meta_cluster'])
+        note('metadata_after', eventually('surviving metadata follower current',
+                                          lambda: metadata_info(new_leader, 2)))
         note('quorum_after_sigkill', {'killed': first_leader, 'new_meta_leader': new_leader,
             'live_cores': live, 'metadata_update': 'acknowledged', 'kv': after,
             'event': {'bytes': len(event), 'sequence': ack['seq']},
-            'streams': surviving_replicas, 'consumer': consumer_after['cluster'],
+            'streams': surviving_replicas, 'consumer': consumer_after,
             'consumer_after_ack': {'pending': 0, 'event_bytes': len(body)}})
         result['status'] = 'PASS'
     except Exception as exc:

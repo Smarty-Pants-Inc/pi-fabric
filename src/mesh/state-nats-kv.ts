@@ -101,13 +101,14 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
   readonly #nc: NatsConnection;
   readonly #kv: KV;
   readonly #js: JetStreamClient;
+  readonly #timeoutMs: number;
   readonly #watches = new Map<QueuedIterator<KvEntry>, () => void>();
   #closed = false;
   #closing: Promise<void> | undefined;
 
-  private constructor(bucket: string, nc: NatsConnection, kv: KV, js: JetStreamClient, maxValueBytes: number, maxKeys: number) {
+  private constructor(bucket: string, nc: NatsConnection, kv: KV, js: JetStreamClient, maxValueBytes: number, maxKeys: number, timeoutMs: number) {
     this.bucket = bucket; this.#nc = nc; this.#kv = kv; this.#js = js;
-    this.maxValueBytes = maxValueBytes; this.maxKeys = maxKeys;
+    this.maxValueBytes = maxValueBytes; this.maxKeys = maxKeys; this.#timeoutMs = timeoutMs;
   }
 
   static async open(root: string, options: NatsKvStateStoreOptions): Promise<NatsKvStateStore> {
@@ -155,7 +156,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
       }
       // bindOnly does not alter an existing stream. allow_direct=false forces STREAM.MSG.GET at the leader.
       const kv = await js.views.kv(bucket, { bindOnly: true, allow_direct: false, timeout });
-      return new NatsKvStateStore(bucket, nc, kv, js, maxValueBytes, maxKeys);
+      return new NatsKvStateStore(bucket, nc, kv, js, maxValueBytes, maxKeys, timeout);
     } catch (error) { await nc.close(); throw error; }
   }
 
@@ -269,9 +270,46 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
     this.#assertOpen();
     return entries;
   }
+  /** First live matches in stream order, locale-sorted within this bounded page. */
   async list(prefix = "", limit = 100): Promise<MeshStateEntry[]> {
-    positiveLimit(limit, "limit");
-    return (await this.listAll(prefix)).slice(0, Math.min(limit, this.maxKeys));
+    const boundedLimit = Math.min(positiveLimit(limit, "limit"), this.maxKeys);
+    this.#assertOpen();
+    const filter = `$KV.${this.bucket}.${natsKvPrefixFilter(prefix)}`;
+    // nats 2.29.3's KV.keys().stop() does not cancel its background push subscription.
+    // A finite headers-only pull bounds actual server delivery, not just local iteration.
+    const { DeliverPolicy } = await import("nats");
+    const consumer = await this.#js.consumers.get(`KV_${this.bucket}`, {
+      filterSubjects: filter, deliver_policy: DeliverPolicy.LastPerSubject, headers_only: true, inactive_threshold: 5_000,
+    });
+    const entries: MeshStateEntry[] = [];
+    let failed = false;
+    try {
+      let pending = (await consumer.info()).num_pending;
+      while (pending > 0 && entries.length < boundedLimit) {
+        const page = await consumer.fetch({ max_messages: Math.min(boundedLimit - entries.length, pending), expires: Math.max(1_000, this.#timeoutMs) });
+        let received = 0;
+        try {
+          for await (const message of page) {
+            received++; pending = message.info.pending;
+            const operation = message.headers?.get("KV-Operation");
+            if (operation === "DEL" || operation === "PURGE") continue;
+            const key = decodeNatsKvKey(message.subject.slice(`$KV.${this.bucket}.`.length));
+            if (!key.startsWith(prefix)) continue;
+            // A concurrent delete can remove a selected value; fill the page with live entries.
+            const entry = await this.get(key);
+            if (entry) entries.push(entry);
+          }
+        } finally { await page.close(); }
+        if (!received) throw new Error("Fabric KV listing page timed out before pending keys were read");
+      }
+      this.#assertOpen();
+      // Neither this page nor listAll is an atomic snapshot. Global ordering requires listAll.
+      return entries.sort((a, b) => a.key.localeCompare(b.key));
+    } catch (error) { failed = true; throw error; }
+    finally {
+      try { await consumer.delete(); }
+      catch (error) { if (!failed) throw error; } // preserve the read failure; inactive_threshold bounds abandoned consumers
+    }
   }
   async watch(prefix = "", options: NatsKvStateWatchOptions = {}): Promise<NatsKvStateWatch> {
     this.#assertOpen();

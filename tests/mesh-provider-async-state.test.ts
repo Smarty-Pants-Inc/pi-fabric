@@ -54,17 +54,31 @@ describe("explicit NATS async mesh-tool seam (mock adapter, no live durability c
   it("awaits list, merges locale order, filters private/remote host keys and clamps after filtering", async () => {
     const provider = await open();
     for (const key of ["local/z", "shared/stale", "topology/hosts/a", "residency/private"]) await local.put({ key, value: key, identity });
-    const gate = deferred<MeshStateEntry[]>(); vi.mocked(remote.listAll).mockReturnValueOnce(gate.promise);
+    const gate = deferred<MeshStateEntry[]>(); vi.mocked(remote.list).mockReturnValueOnce(gate.promise);
     const pending = provider.invoke("list", {}, context);
     gate.resolve([entry("shared/b"), entry("shared/a"), entry("residency/forged"), entry("topology/hosts/forged")]);
     expect((await pending as MeshStateEntry[]).map(e => e.key)).toEqual(["local/z", "shared/a", "shared/b", "topology/hosts/a"]);
-    expect(remote.listAll).toHaveBeenCalledWith("shared/");
-    vi.mocked(remote.listAll).mockResolvedValue([entry("shared/b"), entry("shared/a")]);
+    expect(remote.list).toHaveBeenCalledWith("shared/", 100);
+    expect(remote.listAll).not.toHaveBeenCalled();
+    vi.mocked(remote.list).mockResolvedValue([entry("shared/b"), entry("shared/a")]);
     expect((await provider.invoke("list", { prefix: "sha", limit: 1 }, context) as MeshStateEntry[]).map(e => e.key)).toEqual(["shared/a"]);
     expect((await provider.invoke("list", { prefix: "shared/b" }, context) as MeshStateEntry[]).map(e => e.key)).toEqual(["shared/b"]);
   });
+  it("passes a limit-ten page to the remote store instead of scanning 10,000 entries", async () => {
+    const provider = await open();
+    const corpus = Array.from({ length: 10_000 }, (_, n) => entry(`shared/item-${String(n).padStart(5, "0")}`));
+    vi.mocked(remote.listAll).mockRejectedValue(new Error("unbounded remote scan"));
+    vi.mocked(remote.list).mockImplementation(async (_prefix, limit) => corpus.slice(0, limit));
+    for (const prefix of ["shared/", "sha", ""]) {
+      expect(await provider.invoke("list", { prefix, limit: 10 }, context)).toEqual(corpus.slice(0, 10));
+      expect(remote.list).toHaveBeenLastCalledWith("shared/", 10);
+    }
+    expect(remote.listAll).not.toHaveBeenCalled();
+    await provider.invoke("list", { prefix: "shared/", limit: 10_000 }, context);
+    expect(remote.list).toHaveBeenLastCalledWith("shared/", local.maxReadEvents);
+  });
   it("does not consult legacy state at all for a wholly shared remote listing", async () => {
-    const provider = await open(); vi.mocked(remote.listAll).mockResolvedValueOnce([entry("shared/a")]);
+    const provider = await open(); vi.mocked(remote.list).mockResolvedValueOnce([entry("shared/a")]);
     const read = vi.spyOn(local, "listAll").mockImplementationOnce(() => { throw new Error("broken unrelated local state"); });
     expect(await provider.invoke("list", { prefix: "shared/" }, context)).toEqual([entry("shared/a")]);
     expect(read).not.toHaveBeenCalled();
@@ -79,7 +93,8 @@ describe("explicit NATS async mesh-tool seam (mock adapter, no live durability c
     await expect(provider.invoke("delete", { key: "actors/a" }, context)).rejects.toThrow(/reserved/);
     await expect(provider.invoke("get", { key: "residency/a" }, context)).rejects.toThrow(/private/);
     await expect(provider.invoke("list", { prefix: "residency/" }, context)).rejects.toThrow(/private/);
-    await provider.invoke("list", { prefix: "topology/" }, context); expect(remote.listAll).not.toHaveBeenCalled();
+    await provider.invoke("list", { prefix: "topology/" }, context);
+    expect(remote.list).not.toHaveBeenCalled(); expect(remote.listAll).not.toHaveBeenCalled();
   });
   it("routes only shared single-key writes with their CAS token and propagates remote failures", async () => {
     const provider = await open();
@@ -88,7 +103,7 @@ describe("explicit NATS async mesh-tool seam (mock adapter, no live durability c
     await provider.invoke("delete", { key: "shared/a", ifVersion: 7 }, context); expect(remote.delete).toHaveBeenCalledWith({ key: "shared/a", ifVersion: 7 });
     const error = new Error("remote unavailable");
     vi.mocked(remote.get).mockRejectedValueOnce(error); await expect(provider.invoke("get", { key: "shared/a" }, context)).rejects.toBe(error);
-    vi.mocked(remote.listAll).mockRejectedValueOnce(error); await expect(provider.invoke("list", {}, context)).rejects.toBe(error);
+    vi.mocked(remote.list).mockRejectedValueOnce(error); await expect(provider.invoke("list", {}, context)).rejects.toBe(error);
     vi.mocked(remote.put).mockRejectedValueOnce(error); await expect(provider.invoke("put", { key: "shared/a", value: 3 }, context)).rejects.toBe(error);
     expect(remote.put).toHaveBeenCalledTimes(2); expect(local.get("shared/a")).toBeUndefined();
   });

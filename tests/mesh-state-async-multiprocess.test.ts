@@ -17,9 +17,13 @@ for (const kind of ["file", "sqlite", "nats-kv"] as const) {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-eight-process-"));
       const store = await openAsyncMeshStateStore(root, kind === "nats-kv"
         ? { backend: kind, nats: { servers: servers!, experimentalNatsKv: true } } : { backend: kind });
+      // FILE serializes each read-modify-write through the filesystem lock. Keep eight
+      // independent contenders and the READY/start barrier, but avoid Windows lock starvation.
+      const operationsPerProcess = kind === "file" ? 5 : 25;
+      const expectedUpdates = 8 * operationsPerProcess;
       const workers: ReturnType<typeof startWorker>[] = [];
       function startWorker() {
-        const child = spawn(process.env.FABRIC_TEST_BUN ?? "bun", ["scripts/state-cas-worker.ts", kind, root, "counter/shared", "25"],
+        const child = spawn(process.env.FABRIC_TEST_BUN ?? "bun", ["scripts/state-cas-worker.ts", kind, root, "counter/shared", String(operationsPerProcess)],
           { cwd: process.cwd(), env: process.env, stdio: ["pipe", "pipe", "pipe"] });
         let stdout = "", stderr = "";
         let announce!: () => void;
@@ -44,9 +48,13 @@ for (const kind of ["file", "sqlite", "nats-kv"] as const) {
         for (const result of results) expect(result.code, result.stderr).toBe(0);
         const parsed = results.map(result => JSON.parse(result.stdout.trim().split("\n").at(-1)!) as { pid: number; count: number; conflicts: number; revisions: number[] });
         expect(new Set(parsed.map(result => result.pid)).size).toBe(8);
-        expect(parsed.reduce((sum, result) => sum + result.count, 0)).toBe(200);
-        expect(new Set(parsed.flatMap(result => result.revisions)).size).toBe(200);
-        expect((await store.get("counter/shared"))?.value).toBe(200);
+        for (const result of parsed) {
+          expect(result.count).toBe(operationsPerProcess);
+          expect(result.revisions).toHaveLength(operationsPerProcess);
+        }
+        expect(parsed.reduce((sum, result) => sum + result.count, 0)).toBe(expectedUpdates);
+        expect(new Set(parsed.flatMap(result => result.revisions)).size).toBe(expectedUpdates);
+        expect((await store.get("counter/shared"))?.value).toBe(expectedUpdates);
         const evidence = process.env.FABRIC_NATS_EVIDENCE_DIR;
         if (evidence) fs.writeFileSync(path.join(evidence, `${kind}-eight-process.json`), JSON.stringify({ kind, final: await store.get("counter/shared"), workers: parsed }, null, 2) + "\n");
       } finally {

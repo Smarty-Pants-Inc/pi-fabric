@@ -55,7 +55,11 @@ for (const kind of ["file", "sqlite", "nats-kv"] as const) {
       await store.put({ key: "github-ingress/other/a", value: 2, identity });
       expect((await store.get("github-ingress/repo/b"))?.value).toEqual(value);
       expect((await store.listAll("github-ingress/repo/")).map(e => e.key)).toEqual(["github-ingress/repo/a", "github-ingress/repo/b"]);
-      expect((await store.list("github-ingress/repo/", 1)).map(e => e.key)).toEqual(["github-ingress/repo/a"]);
+      expect((await store.list("github-ingress/repo/", 2)).map(e => e.key)).toEqual(["github-ingress/repo/a", "github-ingress/repo/b"]);
+      const page = await store.list("github-ingress/repo/", 1);
+      expect(page).toHaveLength(1);
+      expect(["github-ingress/repo/a", "github-ingress/repo/b"]).toContain(page[0]!.key);
+      if (kind !== "nats-kv") expect(page[0]!.key).toBe("github-ingress/repo/a");
       await store.delete({ key: "github-ingress/repo/a" });
       expect((await store.listAll("github-ingress/repo/")).map(e => e.key)).toEqual(["github-ingress/repo/b"]);
     });

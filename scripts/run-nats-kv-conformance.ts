@@ -54,8 +54,9 @@ type RunningNode = { child: ReturnType<typeof spawn>; done: Promise<void>; ready
 const nodes: RunningNode[] = [], current: RunningNode[] = [];
 const streamLeaderWaiters = new Map<string, () => void>();
 let leaderReady!: () => void;
-const metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
-const env = { ...process.env, FABRIC_NATS_TEST_SERVERS: ports.slice(0, 3).map(p => `nats://127.0.0.1:${p}`).join(","), FABRIC_NATS_EVIDENCE_DIR: output };
+let metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
+const env = { ...process.env, FABRIC_NATS_TEST_SERVERS: ports.slice(0, 3).map(p => `nats://127.0.0.1:${p}`).join(","),
+  FABRIC_NATS_TEST_MONITORS: ports.slice(3, 6).map(p => `http://127.0.0.1:${p}`).join(","), FABRIC_NATS_EVIDENCE_DIR: output };
 const run = async (command: string, args: string[], name: string, extra: Record<string, string> = {}) => {
   const log = fs.createWriteStream(path.join(output, name));
   const child = spawn(command, args, { cwd: process.cwd(), env: { ...env, ...extra }, stdio: ["ignore", "pipe", "pipe"] });
@@ -109,7 +110,7 @@ try {
   fs.writeFileSync(path.join(output, "cluster-topology.json"), JSON.stringify({ hostname: os.hostname(), nodes: ports.slice(0, 3), replicas: 3,
     sync_interval: "always", faultDomain: "ONE HOST: local R3 functional conformance only; NOT three-host production durability proof" }, null, 2) + "\n");
   console.log("R3 ready: running dedicated live-NATS backend and async provider cases");
-  await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-nats-kv-live.test.ts", "tests/mesh-provider-nats-live.test.ts"], "live-r3.log");
+  await run("bunx", ["vitest", "run", "--reporter=verbose", "--fileParallelism=false", "tests/mesh-state-nats-kv-live.test.ts", "tests/mesh-provider-nats-live.test.ts"], "live-r3.log");
   console.log("Live cases passed: running complete targeted state conformance (including five formerly skipped NATS cases)");
   await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-async-contract.test.ts", "tests/mesh-state-async-multiprocess.test.ts",
     "tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts"], "conformance-r3.log");
@@ -120,8 +121,11 @@ try {
       stopCluster: () => stopNodes(current),
       restartCluster: async stream => {
         const elected = new Promise<void>(resolve => { streamLeaderWaiters.set(stream, resolve); });
+        // A restored stream can elect before metadata. Wait for BOTH current-generation
+        // events before a reopened client asks JetStreamManager for account/stream authority.
+        metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
         for (let n = 0; n < 3; n++) startNode(n);
-        await deadline(Promise.all([...current.map(node => node.ready), elected]), 60_000);
+        await deadline(Promise.all([...current.map(node => node.ready), elected, metadataLeader]), 60_000);
       },
     });
   }

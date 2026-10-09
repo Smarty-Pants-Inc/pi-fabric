@@ -190,9 +190,9 @@ export class MeshProvider implements FabricProvider {
     return this.#asyncState !== undefined && key.startsWith(ASYNC_STATE_PREFIX);
   }
 
-  async #listState(prefix: string) {
+  async #listState(prefix: string, limit: number) {
     if (this.#asyncState && prefix.startsWith(ASYNC_STATE_PREFIX)) {
-      return (await this.#asyncState.listAll(prefix))
+      return (await this.#asyncState.list(prefix, limit))
         .filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix))
         .sort((a, b) => a.key.localeCompare(b.key));
     }
@@ -200,7 +200,7 @@ export class MeshProvider implements FabricProvider {
     if (!this.#asyncState) return local;
     const selected = local.filter(entry => !entry.key.startsWith(ASYNC_STATE_PREFIX));
     if (prefix.startsWith(ASYNC_STATE_PREFIX) || ASYNC_STATE_PREFIX.startsWith(prefix)) {
-      const remote = await this.#asyncState.listAll(prefix.length < ASYNC_STATE_PREFIX.length ? ASYNC_STATE_PREFIX : prefix);
+      const remote = await this.#asyncState.list(prefix.length < ASYNC_STATE_PREFIX.length ? ASYNC_STATE_PREFIX : prefix, limit);
       selected.push(...remote.filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix)));
     }
     // Mixed listings are not atomic cross-backend snapshots; remote values cannot shadow host state.
@@ -330,7 +330,7 @@ export class MeshProvider implements FabricProvider {
             this.store.maxReadEvents,
           ),
         );
-        return (await this.#listState(prefix))
+        return (await this.#listState(prefix, limit))
           .filter(
             (entry) =>
               !PRIVATE_STATE_PREFIXES.some((privatePrefix) =>

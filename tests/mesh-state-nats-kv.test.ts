@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KvEntry, KvWatchOptions, MsgHdrs, StreamConfig } from "nats";
+import type { JsMsg, KvEntry, KvWatchOptions, MsgHdrs, OrderedConsumerOptions, StreamConfig } from "nats";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
 import { openAsyncMeshStateStore } from "../src/mesh/state-async.js";
 import { decodeNatsKvKey, encodeNatsKvKey, isSupportedNatsKvServer, natsKvBucketForRoot, natsKvPrefixFilter,
@@ -26,7 +26,12 @@ class Queue<T> implements AsyncIterableIterator<T> {
   stop() { this.stopped = true; for (const resolve of this.waiters.splice(0)) resolve({ done: true, value: undefined }); }
   async return(): Promise<IteratorResult<T>> { this.stop(); return { done: true, value: undefined }; }
 }
+class KeyPage extends Queue<JsMsg> {
+  close = vi.fn(async () => { this.stop(); });
+}
 class Broker {
+  keyReads = 0;
+  keyPages: KeyPage[] = [];
   revision = 0;
   state = new Map<string, KvEntry>();
   watchers: Queue<KvEntry>[] = [];
@@ -50,6 +55,25 @@ class Broker {
     for (const entry of this.state.values()) if (entry.operation === "PUT" && entry.key.startsWith(parent)) queue.push(entry.key);
     queue.stop(); return queue;
   });
+  consumerGet = vi.fn(async (_stream: string, options: Partial<OrderedConsumerOptions>) => {
+    const filter = options.filterSubjects as string;
+    const parent = filter.slice(filter.indexOf(".k.") + 1, -1);
+    const snapshot = [...this.state.values()].filter(entry => entry.key.startsWith(parent));
+    let index = 0;
+    return {
+      info: vi.fn(async () => ({ num_pending: snapshot.length - index })),
+      fetch: vi.fn(async ({ max_messages }: { max_messages: number; expires: number }) => {
+        const page = new KeyPage(); this.keyPages.push(page);
+        for (let n = 0; n < max_messages && index < snapshot.length; n++) {
+          const raw = snapshot[index++]!; this.keyReads++;
+          page.push({ subject: `${filter.slice(0, filter.indexOf(".k."))}.${raw.key}`, headers: { get: () => raw.operation === "PUT" ? "" : raw.operation },
+            info: { pending: snapshot.length - index } } as unknown as JsMsg);
+        }
+        page.stop(); return page;
+      }),
+      delete: vi.fn(async () => true),
+    };
+  });
   watch = vi.fn(async (options: KvWatchOptions) => {
     const queue = new Queue<KvEntry>();
     if (options.include === "") for (const raw of this.state.values()) queue.push(raw);
@@ -66,7 +90,7 @@ class Broker {
   view = vi.fn(async () => this);
   connection(version = "2.14.7") {
     return { info: { version, max_payload: 2 * 1024 * 1024 }, close: this.close,
-      jetstream: () => ({ views: { kv: this.view }, publish: this.publish }),
+      jetstream: () => ({ views: { kv: this.view }, publish: this.publish, consumers: { get: this.consumerGet } }),
       jetstreamManager: async () => ({ streams: { info: this.info, add: this.add } }) };
   }
 }
@@ -230,10 +254,77 @@ describe("NATS KV single-key adapter (mock protocol, NOT real R3 evidence)", () 
       await store.put({ ...request, key });
     expect((await store.listAll("topology/part")).map(e => e.key)).toEqual(["topology/participants/1", "topology/participants/2", "topology/party/1"]);
     expect(broker.keys).toHaveBeenLastCalledWith("k.stopology.>");
-    expect((await store.list("topology/participants/", 1)).map(e => e.key)).toEqual(["topology/participants/1"]);
-    expect(broker.keys).toHaveBeenLastCalledWith("k.stopology.sparticipants.>");
+    // A bounded page follows KV iteration order, not the globally lowest key.
+    expect((await store.list("topology/participants/", 1)).map(e => e.key)).toEqual(["topology/participants/2"]);
+    expect(broker.consumerGet).toHaveBeenLastCalledWith(`KV_${store.bucket}`, {
+      filterSubjects: `$KV.${store.bucket}.k.stopology.sparticipants.>`, deliver_policy: "last_per_subject", headers_only: true, inactive_threshold: 5_000,
+    });
     await store.delete({ key: "topology/participants/1" });
     expect((await store.listAll("topology/participants/")).map(e => e.key)).toEqual(["topology/participants/2"]);
+  });
+  it("consumes only ten KV keys and leader reads out of 10,000 for a limit-ten listing", async () => {
+    const store = await open();
+    for (let n = 0; n < 10_000; n++) await store.put({ ...request, key: `shared/item-${String(n).padStart(5, "0")}` });
+    const page = await store.list("shared/", 10);
+    expect(page.map(entry => entry.key)).toEqual(Array.from({ length: 10 }, (_, n) => `shared/item-${String(n).padStart(5, "0")}`));
+    expect(broker.keyReads).toBe(10);
+    expect(broker.get).toHaveBeenCalledTimes(10);
+    expect(broker.keys).not.toHaveBeenCalled();
+    const consumer = await broker.consumerGet.mock.results[0]!.value;
+    expect(consumer.fetch).toHaveBeenCalledExactlyOnceWith({ max_messages: 10, expires: 5_000 });
+    expect(await consumer.info()).toEqual({ num_pending: 9_990 });
+    expect(broker.keyPages[0]!.close).toHaveBeenCalledOnce();
+    expect(consumer.delete).toHaveBeenCalledOnce();
+  });
+  it("fills a bounded page past prefix mismatches and keys deleted before their leader read", async () => {
+    const store = await open();
+    for (const key of ["topology/other", "topology/part-gone", "topology/part-z", "topology/part-a", "topology/part-unused"])
+      await store.put({ ...request, key });
+    broker.get.mockImplementationOnce(async () => null);
+    expect((await store.list("topology/part", 2)).map(entry => entry.key)).toEqual(["topology/part-a", "topology/part-z"]);
+    expect(broker.get.mock.calls.map(([key]) => decodeNatsKvKey(key))).toEqual(["topology/part-gone", "topology/part-z", "topology/part-a"]);
+  });
+  it("closes the bounded page and deletes its consumer when a leader read fails", async () => {
+    const store = await open(); await store.put(request);
+    const error = new Error("leader offline"); broker.get.mockRejectedValueOnce(error);
+    await expect(store.list("actors/", 1)).rejects.toBe(error);
+    expect(broker.keyPages[0]!.close).toHaveBeenCalledOnce();
+    const consumer = await broker.consumerGet.mock.results[0]!.value;
+    expect(consumer.delete).toHaveBeenCalledOnce();
+  });
+  it("skips tombstone headers without reading their values and fills the limited page", async () => {
+    const store = await open(); await store.put({ ...request, key: "shared/gone" });
+    await store.delete({ key: "shared/gone" }); await store.put({ ...request, key: "shared/live" });
+    broker.get.mockClear();
+    expect((await store.list("shared/", 1)).map(entry => entry.key)).toEqual(["shared/live"]);
+    expect(broker.keyReads).toBe(2);
+    expect(broker.get).toHaveBeenCalledExactlyOnceWith(encodeNatsKvKey("shared/live"));
+  });
+  it("does not fetch an empty listing and still deletes the owned consumer", async () => {
+    const store = await open(); expect(await store.list("shared/", 10)).toEqual([]);
+    const consumer = await broker.consumerGet.mock.results[0]!.value;
+    expect(consumer.fetch).not.toHaveBeenCalled(); expect(consumer.delete).toHaveBeenCalledOnce();
+    expect(broker.get).not.toHaveBeenCalled();
+  });
+  it("rejects an expired page with pending keys instead of reporting false absence", async () => {
+    const store = await open(); await store.put(request);
+    const consumer = await broker.consumerGet("", { filterSubjects: `$KV.${store.bucket}.k.>` });
+    const page = new KeyPage(); page.stop(); consumer.fetch.mockResolvedValueOnce(page);
+    broker.consumerGet.mockResolvedValueOnce(consumer);
+    await expect(store.list("actors/", 1)).rejects.toThrow(/listing page timed out/);
+    expect(page.close).toHaveBeenCalledOnce(); expect(consumer.delete).toHaveBeenCalledOnce();
+  });
+  it("preserves a leader read failure even if consumer cleanup fails too", async () => {
+    const store = await open(); await store.put(request);
+    const consumer = await broker.consumerGet("", { filterSubjects: `$KV.${store.bucket}.k.>` });
+    consumer.delete.mockRejectedValueOnce(new Error("cleanup offline")); broker.consumerGet.mockResolvedValueOnce(consumer);
+    const error = new Error("leader offline"); broker.get.mockRejectedValueOnce(error);
+    await expect(store.list("actors/", 1)).rejects.toBe(error);
+    expect(consumer.delete).toHaveBeenCalledOnce(); expect(broker.keyPages[0]!.close).toHaveBeenCalledOnce();
+  });
+  it.each([0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid listing limit %s before reading KV", async limit => {
+    const store = await open(); await expect(store.list("", limit)).rejects.toThrow(/limit/);
+    expect(broker.consumerGet).not.toHaveBeenCalled(); expect(broker.keys).not.toHaveBeenCalled(); expect(broker.get).not.toHaveBeenCalled();
   });
   it("watches push events in revision order including delete, without polling get", async () => {
     const store = await open(); const watch = await store.watch("actors/");

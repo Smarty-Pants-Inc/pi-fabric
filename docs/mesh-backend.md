@@ -72,8 +72,8 @@ sits at `importing`), and has `provedAt` at most 24 h old and at most 5 min in t
 The `readers/` directory itself must be a directory owned by the gate's user and not
 group/other-writable: otherwise the switch refuses and no override lifts that. Windows has no
 POSIX owner (no `process.geteuid`), so nothing can be verified there and the gate fails closed:
-`reader-proof` refuses to write, and every listed proof is unready ("unverifiable"); only
-`--accept-unready NAME` passes a reader there (Windows ACL checks: smarty-dev#7548).
+`reader-proof` refuses to write, and `cutover` and `import` refuse whether or not `readers/` exists;
+no `--accept-unready` lifts it (until Windows ACL checks exist: smarty-dev#7548).
 
 `--accept-unready NAME,...` is the only override.
 

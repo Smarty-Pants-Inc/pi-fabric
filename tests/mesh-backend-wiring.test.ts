@@ -93,7 +93,8 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
     return { code: child.status, out: child.stdout, err: child.stderr };
   };
 
-  it("status, cutover and rollback as a subprocess: exit 0, the advisory census line, the result", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("status, cutover and rollback as a subprocess: exit 0, the advisory census line, the result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-bin-"));
     roots.push(root);
     const seed = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -125,7 +126,8 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
 });
 
 describe("fabric-mesh-backend with the writer census (W1)", () => {
-  it("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-"));
     roots.push(root);
     const operator = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });

@@ -477,24 +477,30 @@ describe("fabric-mesh-backend readiness gate: proofs that cannot be trusted", ()
     expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
   });
 
-  it("fails closed without process.geteuid (Windows): writing a proof refuses, a present proof is unready", async () => {
+  it("fails closed without process.geteuid (Windows): reader-proof, cutover and import refuse, and no override passes", async () => {
     const root = await fileRoot();
     const factory = installRoot("r1");
     const builtins = [{ name: "factory", installRoot: factory }];
+    const withProof = await fileRoot();
+    placeProof(withProof, factoryProof());
     const saved = Object.getOwnPropertyDescriptor(process, "geteuid");
     Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
     try {
       const write = await run(["reader-proof", "--root", root, "--backend", "sqlite"]);
       expect(write.code).toBe(1);
       expect(write.err).toContain("unverifiable: this platform has no POSIX owner (smarty-dev#7548): proof not written");
-      placeProof(root, factoryProof());
-      const required = requiredReaders([], [], builtins, []);
-      expect(readerReadiness(root, "sqlite", required, { fromEpoch: 0, toEpoch: 1 }).unready).toEqual([
-        { name: "factory", reason: "proof file is unverifiable: this platform has no POSIX owner (smarty-dev#7548)" }]);
-      const refused = await run(["cutover", "--root", root], { builtins });
-      expect(refused.code).toBe(3);
-      expect(refused.err).toContain("factory (proof file is unverifiable");
-      expect((await run(["cutover", "--root", root, "--accept-unready", "factory"], { builtins })).code).toBe(0);
+      expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
+      const file = path.join(tempDir("proof"), "factory.json");
+      fs.writeFileSync(file, JSON.stringify(factoryProof()));
+      expect((await run(["reader-proof", "--root", root, "--name", "factory", "--proof-file", file])).code).toBe(1);
+      const everyName = "factory,fabric@unknown,fabric@fabric-rel-a,holder@1,holder@-1";
+      for (const [mesh, command] of [[root, "cutover"], [root, "import"], [withProof, "cutover"]] as const) {
+        const refused = await run([command, "--root", mesh, "--accept-unready", everyName],
+          { builtins, writers: [{ pid: 9, release: "fabric-rel-a", mode: "sqlite" }], unknown: [{ pid: 0, release: "unknown", mode: "unknown lock-owner" }] });
+        expect(refused.code).toBe(3);
+        expect(refused.err).toContain("the readiness gate cannot verify reader proofs on this platform (no POSIX owner; Windows ACL checks: smarty-dev#7548)");
+        expect(await backendOf(mesh)).toBe("none");
+      }
     } finally {
       if (saved) Object.defineProperty(process, "geteuid", saved);
     }

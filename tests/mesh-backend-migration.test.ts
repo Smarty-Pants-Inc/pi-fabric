@@ -410,7 +410,8 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     expect(await rollbackMeshState(root)).toMatchObject({ backend: "file", epoch: 2 });
   });
 
-  it("a file-mode writer reported by the census does not fail a cutover; a moved state.json still does", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("a file-mode writer reported by the census does not fail a cutover; a moved state.json still does", async () => {
     const root = tempRoot("late");
     await seedFileRoot(root);
     const alarms: MeshBackendAlarm[] = [];
@@ -888,7 +889,8 @@ describe("mesh backend 5 MB round trip", () => {
 });
 
 describe("fabric-mesh-backend CLI", () => {
-  it("runs status, cutover and rollback with exit codes", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("runs status, cutover and rollback with exit codes", async () => {
     const root = tempRoot("cli");
     await seedFileRoot(root);
     const run = async (...argv: string[]): Promise<{ code: number; out: string; err: string }> => {

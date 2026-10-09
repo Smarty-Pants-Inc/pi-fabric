@@ -276,8 +276,9 @@ const loadRegistry = (root: string, euid: number | undefined): Map<string, Reade
     throw new Error(`reader registry ${dir} is unreadable (${errno(error)})`);
   }
   if (!stat.isDirectory()) throw new Error(`reader registry ${dir} is not a directory`);
-  // Without an euid the directory cannot be verified either; each proof below is then unready (accept-only).
-  const bad = euid === undefined ? undefined : ownership(stat, euid);
+  // Without an euid (Windows) an existing registry cannot be verified: the same non-overridable refusal as
+  // an unsafe one (smarty-dev#7548). An absent registry has nothing to verify.
+  const bad = ownership(stat, euid);
   if (bad) throw new Error(`reader registry ${dir} is ${bad}`);
   for (const file of fs.readdirSync(dir).filter(item => item.endsWith(".json"))) {
     const name = file.slice(0, -5);
@@ -313,6 +314,9 @@ const proofProblem = (proof: ReaderProof, backend: string, window: { fromEpoch: 
  */
 export const readerReadiness = (root: string, backend: string, required: readonly RequiredReader[],
   window: { fromEpoch: number; toEpoch: number }, now = Date.now(), euid = process.geteuid?.()): ReaderReadiness => {
+  // No POSIX owner (Windows): no proof or registry can be verified, so the gate refuses outright; the
+  // caller turns this into a refusal no --accept-unready lifts (Windows ACL checks: smarty-dev#7548).
+  if (euid === undefined) throw new Error("the readiness gate cannot verify reader proofs on this platform (no POSIX owner; Windows ACL checks: smarty-dev#7548)");
   const proofs = loadRegistry(root, euid);
   const ready: string[] = [];
   const unready: UnreadyReader[] = [];
@@ -355,6 +359,8 @@ const fsyncDirectory = (directory: string): void => {
 /** Writes a proof atomically. The caller holds the migration fence. */
 const writeProof = (root: string, proof: ReaderProof): string => {
   const dir = readersDir(root);
+  // Refuse before creating anything: an unverifiable readers/ would block every later switch (smarty-dev#7548).
+  if (process.geteuid === undefined) throw new Error(`reader registry ${dir} is ${ownership(fs.statSync(root), undefined)}: proof not written`);
   try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   const stat = fs.lstatSync(dir);
   const unsafe = stat.isDirectory() ? ownership(stat, process.geteuid?.()) : "not a directory (or a symlink)";

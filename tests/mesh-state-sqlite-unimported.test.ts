@@ -165,7 +165,8 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     }
   });
 
-  it("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
     const [none, emptyJson, zeroLength, touched] = freshRoots();
     for (const root of [none, emptyJson, zeroLength]) {
       const result = await importMeshState(root);
@@ -388,7 +389,8 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     });
   });
 
-  it("opens an imported root, and the import CLI still imports a populated root", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("opens an imported root, and the import CLI still imports a populated root", async () => {
     const imported = tempRoot("imported");
     await seedFileRoot(imported);
     await importMeshState(imported);

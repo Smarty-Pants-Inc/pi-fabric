@@ -37,7 +37,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
@@ -46,6 +46,7 @@ import type {
   FabricActorBindingScope,
   FabricActorDelivery,
   FabricActorActivation,
+  FabricActorActivationPolicy,
   FabricActorDeliveryRequest,
   FabricActorDirective,
   FabricActorHostEvent,
@@ -144,6 +145,7 @@ interface ManagedActor {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   activationFilterExpiresAt?: number;
   filterSkipped?: FabricActorInfo["filterSkipped"];
@@ -539,6 +541,9 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Admission times belong to the running manager, not replaceable registry objects.
+  // Never serialized: restart/owner transfer starts with a fresh leading edge.
+  readonly #settledWindows = new Map<string, Map<string, number>>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
@@ -824,6 +829,7 @@ export class ActorManager {
     }
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
+    const activation = normalizeActorActivation(request.activation);
     const activationFilter = request.activationFilter === undefined
       ? undefined
       : normalizeActorActivationFilter(request.activationFilter);
@@ -867,6 +873,7 @@ export class ActorManager {
       triggerTurn: deliveryPolicy.triggerTurn,
       coalesce: request.coalesce ?? true,
       ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
+      ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       residency,
       runner,
@@ -1680,6 +1687,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
@@ -1810,21 +1818,7 @@ export class ActorManager {
         continue;
       }
       try {
-        if (this.#skipOnArrival(actor, `host:${event}`, payload)) {
-          delivered++;
-          continue;
-        }
-        this.#enqueue(
-          actor,
-          `host:${event}`,
-          payload,
-          {
-            ...(actor.coalesce ? { coalesceKey: `host:${event}` } : {}),
-            ...(images.length > 0 ? { images } : {}),
-            ownershipChecked: true,
-          },
-        );
-        delivered++;
+        if (this.#enqueueHostEvent(actor, event, payload, images, this.#rootId)) delivered++;
       } catch (error) {
         actor.lastError = error instanceof Error ? error.message : String(error);
       }
@@ -1906,12 +1900,49 @@ export class ActorManager {
             typeof (image as { mimeType?: unknown }).mimeType === "string",
         )
       : [];
-    if (this.#skipOnArrival(actor, `host:${hostEvent}`, data.payload)) return;
-    this.#enqueue(actor, `host:${hostEvent}`, data.payload, {
-      ...(actor.coalesce ? { coalesceKey: `host:${hostEvent}` } : {}),
+    this.#enqueueHostEvent(actor, hostEvent, data.payload, images, event.from.id);
+  }
+
+  /** Shared owner-side admission for local observations and authenticated root relays. */
+  #enqueueHostEvent(
+    actor: ManagedActor,
+    event: FabricActorHostEvent,
+    payload: unknown,
+    images: readonly ImageContent[],
+    sourceRootId: string,
+  ): boolean {
+    if (this.#skipOnArrival(actor, `host:${event}`, payload)) return true;
+    const interval = event === "agent_settled" ? actor.activation?.minIntervalMs ?? 0 : 0;
+    let sourceId: string | undefined;
+    let windows: Map<string, number> | undefined;
+    const now = Date.now();
+    if (interval > 0) {
+      // Host envelopes carry the real observed agent in session.id. In particular,
+      // signal.payload.source is only an input origin (user/extension), not an agent.
+      const sessionId = typeof payload === "object" && payload !== null
+        ? (payload as { session?: { id?: unknown } }).session?.id : undefined;
+      sourceId = typeof sessionId === "string" && sessionId.trim()
+        ? `session:${sessionId}` : sourceRootId;
+      windows = this.#settledWindows.get(actor.id);
+      if (windows) {
+        for (const [source, acceptedAt] of windows) {
+          if (now - acceptedAt >= interval) windows.delete(source);
+        }
+        const acceptedAt = windows.get(sourceId);
+        if (acceptedAt !== undefined && now - acceptedAt < interval) return false;
+      }
+    }
+    this.#enqueue(actor, `host:${event}`, payload, {
+      ...(actor.coalesce ? { coalesceKey: `host:${event}` } : {}),
       ...(images.length > 0 ? { images } : {}),
       ownershipChecked: true,
     });
+    // Only an admitted event arms the window. Dropped/filtered events never slide it.
+    if (sourceId !== undefined) {
+      if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
+      windows.set(sourceId, now);
+    }
+    return true;
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
@@ -2376,6 +2407,7 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
+      this.#settledWindows.delete(actor.id);
       this.#emitChange();
     }
     return this.#finishCleanup(cleanup);
@@ -2413,6 +2445,7 @@ export class ActorManager {
   close(): Promise<void> {
     if (!this.#closePromise) {
       this.#closing = true;
+      this.#settledWindows.clear();
       this.#closePromise = this.#close();
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
@@ -4353,6 +4386,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter
         ? { activationFilter: actor.activationFilter }
         : actor.invalidActivationFilter
@@ -4741,6 +4775,9 @@ export class ActorManager {
       const triggerTurn =
         (delivery === "steer" || delivery === "followUp") && record.triggerTurn === true;
       let requirements: FabricCapabilityRequirement[];
+      let activation: FabricActorActivationPolicy | undefined;
+      // An unreadable optional policy must not remove an otherwise usable actor.
+      try { activation = normalizeActorActivation(record.activation); } catch { /* off */ }
       try {
         validateActorInferenceContext(record.inferenceContext, record.runner ?? "pi");
         requirements = normalizeCapabilityRequirements(
@@ -4809,6 +4846,7 @@ export class ActorManager {
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
           ? { coalesceKey: record.coalesceKey }
           : {}),
+        ...(activation ? { activation } : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
         ...loadedActivationFilter((record as { activationFilter?: unknown }).activationFilter, { id: record.id, name: record.name }),
         ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
@@ -5272,6 +5310,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),

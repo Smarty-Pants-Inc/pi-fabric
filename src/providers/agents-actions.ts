@@ -444,6 +444,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         triggerTurn: { type: "boolean" },
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
+        activation: {
+          type: "object",
+          description: "Optional leading-edge minimum interval per actor/source session for host agent_settled only. First wakes immediately; later events inside the interval are dropped without a trailing wake. Omitted or 0 is off; runtime windows reset on restart.",
+          properties: { minIntervalMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER } },
+          required: ["minIntervalMs"],
+          additionalProperties: false,
+        },
         activationFilter: activationFilterSchema,
         routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },

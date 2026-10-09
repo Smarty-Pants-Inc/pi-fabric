@@ -874,6 +874,28 @@ if (reviewer) await agents.setCoalesceKey({ id: reviewer.id, coalesceKey: "paylo
 
 Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setCoalesceKey` to clear it.
 
+#### Minimum interval for settlement observations
+
+For a supervisor that should not wake on every rapid settlement, pass an optional leading-edge minimum interval to `agents.create`:
+
+```ts
+const supervisor = await agents.create({
+  name: "settlement-supervisor",
+  instructions: "Review meaningful progress; otherwise remain silent.",
+  events: ["agent_settled", "tool_error"],
+  responseMode: "directive",
+  activation: { minIntervalMs: 30_000 },
+});
+```
+
+`activation.minIntervalMs` is a non-negative safe integer in milliseconds. Omit `activation` (the default), or use `0`, to keep today's behavior. It applies **only to host `agent_settled` observations**, independently for each actor and source agent session. The first event is admitted immediately; events from that same source inside the interval are dropped before queueing. A dropped event does not slide the deadline. An event at or after the boundary is admitted immediately. There is no delayed or trailing wake: if no new event arrives after the boundary, nothing runs. "Immediately" means admitted without an interval timer; normal actor serialization, capability waits and queue limits still apply.
+
+Source identity comes from the real host envelope's `session.id`, not `signal.payload.source` (which denotes a user/extension input origin). Older envelopes without a session ID use the trusted local root identity, or the authenticated sending root for a durable-owner relay. Both local and relayed events share the owner's gate. A different source session has its own window. Other host event kinds, mesh events (even those whose kind is `agent_settled`), and direct `ask`/`tell` messages are unaffected.
+
+This is not queue coalescing or trailing-edge debounce. `coalesce: true` still replaces only queued host events of the same kind; `coalesceKey` still groups queued mesh subjects. Those existing options apply after interval admission. `activationFilter` remains a skip-only predicate filter; an event it filters on arrival does not arm the interval. Interval drops are not activation-filter skips and do not increment `filteredCount`.
+
+The configuration is returned in actor status and definitions and survives global template export/import and registry reloads. **Window timestamps are in-memory only**: same-process registry/ownership object reloads retain them, but a process restart or transfer to a new owner runtime resets them, so the next settlement is a fresh first wake. Timestamps are not stored in actor definitions, templates or durable queues. Expired source windows are pruned when another settlement arrives, and removal/close clears runtime state. Configure the interval at creation (or in the template before import).
+
 #### Activation filter
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.

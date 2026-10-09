@@ -708,6 +708,11 @@ interface FabricActorActivationSkipRule {
 }
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
+/** Leading-edge admission for host agent_settled only, independently per actor/source session. */
+interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; omitted activation or 0 is off. Windows reset on restart. */
+  minIntervalMs: number;
+}
 /** Exactly one instruction source; file bytes are verified on the owning host. */
 type FabricActorInstructionsSource =
   | { instructions: string; instructionsFile?: never; sha256?: never }
@@ -725,6 +730,8 @@ interface FabricActorRequestBase {
   coalesce?: boolean;
   /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
   coalesceKey?: string;
+  /** Drops repeat agent_settled events inside the interval; no trailing wake, other kinds unaffected. */
+  activation?: FabricActorActivationPolicy;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
   /** Per-activation shadow routing; requires explicit model/thinking. */
@@ -797,6 +804,7 @@ interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };

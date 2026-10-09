@@ -59,7 +59,7 @@ import type { MeshIdentity } from "./event-log.js";
 import { journalCursorOf, verifyStateJournalEndpoint, type JournalCursor } from "./read-journal.js";
 import type { StateDivergence } from "./state-backend.js";
 import type { MeshStateEntry } from "./state-file.js";
-import { openNodeSqlite, SqliteStateStore, type SqliteConnection, type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
+import { openNodeSqlite, openPrivateStateDb, SqliteStateStore, type SqliteConnection, type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
 
 /** Written by the active projector in the mesh root (never one of the state*.db* files). */
 export const STATE_PROJECTOR_STATUS_FILE = "state-projector.status.json";
@@ -562,7 +562,7 @@ export class StateProjector {
     });
     let db: SqliteConnection | undefined;
     try {
-      db = (options.open ?? openNodeSqlite)(store.file);
+      db = openPrivateStateDb(databaseRoot, false, options.open ?? openNodeSqlite); // the one gate (pi-fabric#694 round 10)
       db.exec("PRAGMA busy_timeout = 2");
       db.exec("PRAGMA synchronous = NORMAL");
       db.exec("PRAGMA wal_autocheckpoint = 0");

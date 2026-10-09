@@ -396,21 +396,47 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     } finally { fs.chmodSync(open, 0o700); }
   });
 
-  it("privateGroup: only a group nobody else can act as", () => {
-    const dir = tempRoot("groups");
-    const write = (group: string, passwd: string) => {
-      fs.writeFileSync(path.join(dir, "group"), group);
-      fs.writeFileSync(path.join(dir, "passwd"), passwd);
-      return { group: path.join(dir, "group"), passwd: path.join(dir, "passwd") };
-    };
+  it("privateGroup: only a group nobody else can act as, judged through the name service, fail closed", () => {
     const passwd = "root:x:0:0::/root:/bin/sh\npaul:x:1000:1000::/home/paul:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n";
-    expect(privateGroup(1000, 1000, write("paul:x:1000:\n", passwd))).toBe(true);
-    expect(privateGroup(1000, 1000, write("paul:x:1000:paul\n", passwd))).toBe(true);
-    expect(privateGroup(1000, 1000, write("paul:x:1000:bob\n", passwd))).toBe(false);
-    expect(privateGroup(1001, 1000, write("bob:x:1001:\n", passwd))).toBe(false); // bob's primary group
-    expect(privateGroup(1000, 1000, write("other:x:7:\n", passwd))).toBe(false); // no such group
-    expect(privateGroup(1000, 1000, { group: path.join(dir, "missing"), passwd: path.join(dir, "passwd") })).toBe(false);
+    const io = (group: string, nsswitch = "passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n") => ({
+      nsswitch: () => nsswitch,
+      getent: (database: "passwd" | "group") => (database === "passwd" ? passwd : group),
+    });
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n"))).toBe(true);
+    expect(privateGroup(1000, 1000, io("paul:x:1000:paul\n"))).toBe(true);
+    expect(privateGroup(1000, 1000, io("paul:x:1000:bob\n"))).toBe(false); // another member
+    expect(privateGroup(1001, 1000, io("bob:x:1001:\n"))).toBe(false); // bob's primary group
+    expect(privateGroup(1000, 1000, io(""))).toBe(false); // no such group
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "passwd: files sss\ngroup: files sss\n"))).toBe(false); // SSSD: not enumerable
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "passwd: files ldap\ngroup: files\n"))).toBe(false);
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "group: files\n"))).toBe(false); // passwd line missing
+    expect(privateGroup(1000, 1000, { nsswitch: () => { throw new Error("unreadable"); } })).toBe(false);
+    expect(privateGroup(1000, 1000, { ...io("paul:x:1000:\n"), getent: () => { throw new Error("getent failed"); } })).toBe(false);
   });
+
+  it("refuses a root reached through a symlinked ancestor that sits in an other-writable directory (lexical walk)", async () => {
+    const parent = tempRoot("lexical");
+    const open = path.join(parent, "open");
+    const safe = path.join(parent, "safe");
+    fs.mkdirSync(open);
+    fs.mkdirSync(safe, { mode: 0o700 });
+    fs.symlinkSync(safe, path.join(open, "link"));
+    fs.chmodSync(open, 0o777);
+    try {
+      // The real path (safe/mesh) is fine; the named path passes through open/, which anyone can rewrite.
+      expect(await refused(path.join(open, "link", "mesh"))).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/ancestor .*open is writable by other/) });
+      (await openStore(path.join(safe, "mesh"))).close();
+    } finally { fs.chmodSync(open, 0o700); }
+  });
+
+  it.skipIf(process.platform !== "linux")("refuses when SQLite's database is not the state.db in the pinned root (an opener that opens elsewhere)", async () => {
+    const root = await prepared("elsewhere");
+    const other = path.join(tempRoot("elsewhere-other"), "state.db");
+    const native = (await import("../src/mesh/state-sqlite.js")).openNodeSqlite;
+    const error = await SqliteStateStore.open(root, 65536, 100, { open: () => native(other) }).then(() => undefined, (e: unknown) => e);
+    expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/not the state\.db in the checked directory/) });
+  });
+
 
   it("refuses an existing 0755 or 0750 root (never repaired) and a symlinked root", async () => {
     const root = await prepared("root-0755");

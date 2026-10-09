@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { storageRevision } from "../verified/storage.js";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
+import { openPrivateStateDb } from "./state-gate.js";
 
 export interface MeshBackendAlarm {
   code: "FABRIC_MESH_BACKEND_FENCE" | "FABRIC_MESH_BACKEND_LATE_WRITER";
@@ -225,7 +226,7 @@ const openDefault = (file: string): Pick<SqliteConnection, "exec" | "prepare" | 
 
 /** meta.backend and meta.epoch of an existing state.db (undefined when uninitialised), on a short-lived connection. */
 const readFenceMeta = (root: string, options: MeshBackendFenceOptions): { backend: string; epoch: number } | undefined => {
-  const db = (options.open ?? openDefault)(path.join(root, STATE_DB));
+  const db = openPrivateStateDb(root, false, options.open ?? openDefault); // the one gate (pi-fabric#694 round 10)
   try {
     db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
     db.exec("PRAGMA trusted_schema = OFF");

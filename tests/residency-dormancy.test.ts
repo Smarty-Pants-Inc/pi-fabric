@@ -55,6 +55,78 @@ const fakeRun = (host: ResidentHost, consume: (task: string) => Promise<void> = 
 
 // In-process host tests still take the real kernel fence on Linux.
 describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
+  it.each(["missing", "foreign-root", "foreign-generation"] as const)("keeps main's idle behavior with a %s wake config until a valid eligibility event", async invalid => {
+    const { root, config, host } = fixture();
+    const configPath = path.join(config.residencyRoot, "config.json");
+    const wake = await import("../src/residency/wake.js");
+    const probes = vi.spyOn(wake, "assertResidentWakeWatch");
+    if (invalid === "missing") fs.rmSync(configPath);
+    else fs.writeFileSync(configPath, JSON.stringify({ ...config,
+      ...(invalid === "foreign-root" ? { rootId: "session:foreign" } : { fabricExtensionPath: "other-release/index.js" }) }));
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "no-restart", instructions: "wait", residency: "durable" });
+      await sleep(200); // allow the actual event-owned eligibility check to complete
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      expect(probes).not.toHaveBeenCalled();
+      fs.writeFileSync(configPath, JSON.stringify(config));
+      await host.actors.setInstructions(actor.id, "valid restart now");
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(probes).toHaveBeenCalledOnce();
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("closes the proven native watcher with its host and re-proves for the next owner", async () => {
+    const { root, config, host } = fixture();
+    const watch = fs.watch;
+    const watchers: fs.FSWatcher[] = [];
+    const closes: ReturnType<typeof vi.spyOn>[] = [];
+    let next: ResidentHost | undefined;
+    vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+      const watcher = watch(...args);
+      if (args[0] === config.residencyRoot) { watchers.push(watcher); closes.push(vi.spyOn(watcher, "close")); }
+      return watcher;
+    });
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "watch-lifetime", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(watchers).toHaveLength(1);
+      expect(closes[0]).not.toHaveBeenCalled();
+      await host.close();
+      expect(closes[0]).toHaveBeenCalledOnce();
+      next = new ResidentHost(config, () => {});
+      await next.start();
+      fakeRun(next);
+      await next.actors.ask(actor.id, "wake and settle");
+      await until(() => next!.actors.status(actor.id).status === "dormant");
+      expect(watchers).toHaveLength(2);
+      await next.close();
+      expect(closes[1]).toHaveBeenCalledOnce();
+    } finally { await next?.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("retires an outstanding watcher proof before normal host close returns", async () => {
+    const { root, config, host } = fixture();
+    const watch = fs.watch;
+    const close = vi.fn();
+    const watcher = Object.assign(new EventEmitter(), { close }) as unknown as fs.FSWatcher;
+    let probing = false;
+    try {
+      await host.start();
+      vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+        if (args[0] !== config.residencyRoot) return watch(...args);
+        probing = true; return watcher; // deliberately no proof notification
+      });
+      const actor = await host.actors.create({ name: "closing-proof", instructions: "wait", residency: "durable" });
+      await until(() => probing);
+      await host.close();
+      expect(close).toHaveBeenCalledOnce();
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      expect(fs.readdirSync(config.residencyRoot).some(name => name.startsWith(".wake-watch-"))).toBe(false);
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {
     const { root, config, host, idle } = fixture();
     try {

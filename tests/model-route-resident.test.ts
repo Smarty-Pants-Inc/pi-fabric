@@ -128,7 +128,9 @@ describe("resident LIVE custody and manual config rollback", () => {
     expect(restored.agents.actorArchiveSources(state.actor.id, state.actor.sessionFile!).get(a.runId!)).toBe(source);
     denied = false;
     const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(cheap.model);
-    await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("idle"));
+    // #752 reviewed contract: docs/residency-runtime.md:64-69, 87-92 at 2f6838c3.
+    // Once repair discharges archive custody, eligibility commits dormancy immediately.
+    await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("dormant"));
     expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(true);
     expect(fs.existsSync(source)).toBe(false);
     expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", reasonCode: "live-choice" });

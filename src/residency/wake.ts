@@ -77,6 +77,7 @@ export class ResidentWakeWatchError extends Error {
 }
 
 const wakeWatchProofs = new Map<string, Promise<void>>();
+const wakeWatchClosers = new Map<string, () => void>();
 const wakeWatchErrors = new Map<string, Set<() => void>>();
 
 /** Subscribe without opening a watcher or arming a timer. */
@@ -87,7 +88,15 @@ export function subscribeResidentWakeWatchErrors(root: string, listener: () => v
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
-    if (!listeners.size) wakeWatchErrors.delete(root);
+    if (!listeners.size) {
+      wakeWatchErrors.delete(root);
+      // The execution owner, not the process-global proof cache, owns this handle.
+      // In particular Windows cannot remove the residency root while it is watched.
+      const close = wakeWatchClosers.get(root);
+      wakeWatchClosers.delete(root);
+      wakeWatchProofs.delete(root);
+      close?.();
+    }
   };
 }
 
@@ -108,16 +117,20 @@ export function assertResidentWakeWatch(root: string): Promise<void> {
       settled = true;
       if (deadline) clearTimeout(deadline);
       fs.rmSync(probe, { force: true });
-      if (error) { watcher?.close(); reject(error); }
+      if (error) { watcher?.close(); wakeWatchClosers.delete(root); reject(error); }
       else { proven = true; watcher?.unref?.(); resolve(); }
     };
+    wakeWatchClosers.set(root, () => {
+      if (!settled) finish(new Error("Resident wake watcher closed with its host"));
+      else watcher?.close();
+    });
     try {
       watcher = fs.watch(root, (_event, filename) => {
         if (!settled && (filename === null || String(filename) === name) && fs.existsSync(probe)) finish();
       });
       watcher.once("error", error => {
         wakeWatchProofs.delete(root);
-        if (proven) watcher?.close();
+        if (proven) { watcher?.close(); wakeWatchClosers.delete(root); }
         else finish(new ResidentWakeWatchError(root, `Resident wake watcher failed: ${String(error)}`, error));
         for (const listener of wakeWatchErrors.get(root) ?? []) listener();
       });

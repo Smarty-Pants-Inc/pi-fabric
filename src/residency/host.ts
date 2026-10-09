@@ -785,6 +785,8 @@ export class ResidentHost {
     // Observed below by closeWithActors, but only after further awaits: a rejection
     // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
     void actorsClosed?.catch(() => undefined);
+    // Retire an eligibility/probe already in flight before releasing host custody.
+    await this.#idleCheckPending?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
@@ -1213,6 +1215,7 @@ export class ResidentHost {
       this.#wakeWatchNeedsReprobe = false;
       return true;
     } catch (error) {
+      if (this.#closed) return false; // host close retired its pending native proof
       const watcherError = error instanceof ResidentWakeWatchError;
       if (watcherError && !this.#wakeWatchReprobeUsed) {
         this.#wakeWatchReprobeUsed = true;
@@ -1227,6 +1230,16 @@ export class ResidentHost {
       console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
       return false;
     }
+  }
+
+  /** Dormancy may release the owner only when delivery can relaunch this exact generation. */
+  #hasWakeConfig(): boolean {
+    const saved = readJson<Partial<ResidentHostConfig>>(path.join(this.config.residencyRoot, "config.json"));
+    return saved?.format === RESIDENT_HOST_FORMAT && saved.rootId === this.config.rootId &&
+      saved.sessionId === this.config.sessionId && saved.residencyRoot === this.config.residencyRoot &&
+      saved.meshRoot === this.config.meshRoot && saved.cwd === this.config.cwd &&
+      saved.workerPath === this.config.workerPath &&
+      saved.fabricExtensionPath === this.config.fabricExtensionPath;
   }
 
   #writeWakeRoutes(): void {
@@ -1276,13 +1289,13 @@ export class ResidentHost {
       const owned = this.actors.listOwned();
       const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
       const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
-      const eligible = hasIdleActor && this.actors.hasDormantIdleActor(protectedIds);
+      const eligible = hasIdleActor && this.#hasWakeConfig() && this.actors.hasDormantIdleActor(protectedIds);
       if (eligible) {
         if (!await this.#ensureWakeWatch()) {
           this.#idleSince = now;
           return;
         }
-        if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
+        if (this.#closed || this.#staged || this.#handover || this.#sleeping || !this.#hasWakeConfig()) return;
         try {
           // The watcher proof may yield to delivery or presence changes. Refresh
           // expected participants; dormantIdleActors rechecks current work custody.
@@ -1320,6 +1333,13 @@ export class ResidentHost {
     if (now - this.#idleSince < IDLE_EXIT_MS) return;
     // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
+      this.#idleSince = now;
+      return;
+    }
+    // A bare/in-process host or an invalid generation has no delivery-owned restart.
+    // Only check this at an actual exit boundary, not on every request-poll tick.
+    if (!this.#hasWakeConfig() && this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped")) {
       this.#idleSince = now;
       return;
     }

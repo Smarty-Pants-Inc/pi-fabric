@@ -90,6 +90,12 @@ check commits eligible dormancy directly after proving native wake support and
 revalidating current actor work and live-participant protection. There is no
 actor quiet period, dormancy timeout, timed safety recheck or periodic retry;
 these signals do not replace the existing request polling.
+Dormancy also requires the persisted `config.json` to match this root and release:
+a bare/in-process host or foreign/unavailable snapshot stays serviceable with
+main's ordinary idle behavior rather than releasing an owner it cannot relaunch.
+The proven native watcher belongs to that host lifetime; close retires it (and
+joins any outstanding eligibility proof), so a successor proves its own watcher
+and Windows teardown is not held by a process-global watched-directory handle.
 
 `MeshStore.publish`/`publishBatch` route wake nudges **after** the existing event
 log durability barrier. Topic/address matches, direct control targets, and

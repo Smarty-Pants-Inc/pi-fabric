@@ -37,11 +37,14 @@ export const decodeNatsKvKey = (encoded: string): string => {
   if (encodeNatsKvKey(key) !== encoded) throw new Error("Non-canonical Fabric KV key encoding");
   return key;
 };
-/** NATS cannot match a partial token. Select the complete parent, then startsWith on decoded keys. */
+/** Slash-aligned prefixes select their exact namespace; only partial tokens need a parent scan. */
 export const natsKvPrefixFilter = (prefix: string): string => {
   validateKey(prefix, true);
-  const complete = prefix.split("/").slice(0, -1);
-  return complete.length ? "k." + complete.map(segment).join(".") + ".>" : "k.>";
+  if (!prefix) return "k.>";
+  // Drop only the terminating boundary, not another complete token (including empty segments).
+  if (prefix.endsWith("/")) return encodeNatsKvKey(prefix.slice(0, -1)) + ".>";
+  const boundary = prefix.lastIndexOf("/");
+  return boundary < 0 ? "k.>" : encodeNatsKvKey(prefix.slice(0, boundary)) + ".>";
 };
 export const natsKvBucketForRoot = (root: string): string => {
   if (!root.trim()) throw new Error("Mesh root must not be empty");
@@ -63,6 +66,21 @@ export interface NatsKvStateStoreOptions {
   maxBucketBytes?: number;
   /** Stream-wide message ceiling; history=1 counts live keys AND retained delete markers. */
   maxKeys?: number;
+}
+export interface NatsKvListPage {
+  /** Live decoded-prefix matches, sorted only within this examined page. */
+  entries: MeshStateEntry[];
+  /** Includes mismatches, tombstones and keys deleted before the leader read. */
+  examined: number;
+  /** Pass to listPage with the SAME bucket/prefix; undefined means this scan was exhausted. */
+  nextRevision?: number;
+}
+export class NatsKvListTimeoutError extends Error {
+  readonly code = "NATS_KV_LIST_TIMEOUT";
+  constructor(readonly examined: number, readonly timeoutMs: number) {
+    super(`Fabric KV listing total time budget of ${timeoutMs}ms exhausted after ${examined} examined keys`);
+    this.name = "NatsKvListTimeoutError";
+  }
 }
 export interface NatsKvStateChange {
   key: string;
@@ -270,45 +288,85 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
     this.#assertOpen();
     return entries;
   }
-  /** First live matches in stream order, locale-sorted within this bounded page. */
+  /** One examined page, NOT a filled result limit or proof of absence. Use listPage to continue. */
   async list(prefix = "", limit = 100): Promise<MeshStateEntry[]> {
+    return (await this.listPage(prefix, limit)).entries;
+  }
+  /** Bounded enumeration in stream order. Continuations are not atomic snapshots. */
+  async listPage(prefix = "", limit = 100, startRevision?: number): Promise<NatsKvListPage> {
     const boundedLimit = Math.min(positiveLimit(limit, "limit"), this.maxKeys);
+    if (startRevision !== undefined) positiveLimit(startRevision, "startRevision");
     this.#assertOpen();
     const filter = `$KV.${this.bucket}.${natsKvPrefixFilter(prefix)}`;
-    // nats 2.29.3's KV.keys().stop() does not cancel its background push subscription.
-    // A finite headers-only pull bounds actual server delivery, not just local iteration.
-    const { DeliverPolicy } = await import("nats");
-    const consumer = await this.#js.consumers.get(`KV_${this.bucket}`, {
-      filterSubjects: filter, deliver_policy: DeliverPolicy.LastPerSubject, headers_only: true, inactive_threshold: 5_000,
-    });
+    const deadline = performance.now() + this.#timeoutMs;
+    let examined = 0;
+    const timeout = () => new NatsKvListTimeoutError(examined, this.#timeoutMs);
+    // One monotonic deadline across setup, headers and all authoritative value reads.
+    const within = async <T>(action: () => Promise<T>, end = deadline, late?: (value: T) => void): Promise<T> => {
+      const remaining = end - performance.now();
+      if (remaining <= 0) throw timeout();
+      let expired = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const work = action();
+      try {
+        const value = await Promise.race([work.then(value => { if (expired) late?.(value); return value; }),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => { expired = true; reject(timeout()); }, remaining); })]);
+        // An already-resolved RPC can win the race after event-loop delay. Check the clock too.
+        if (performance.now() >= end) { late?.(value); throw timeout(); }
+        return value;
+      } finally { clearTimeout(timer); }
+    };
+    const { DeliverPolicy } = await within(() => import("nats"));
+    // KV.keys().stop() leaves background prefetch running in the pinned client. Exactly ONE
+    // finite header-only pull bounds actual delivery, even for mismatches and delete markers.
+    const consumer = await within(() => this.#js.consumers.get(`KV_${this.bucket}`, {
+      filterSubjects: filter, deliver_policy: startRevision === undefined ? DeliverPolicy.LastPerSubject : DeliverPolicy.StartSequence,
+      ...(startRevision === undefined ? {} : { opt_start_seq: startRevision }), headers_only: true, inactive_threshold: 5_000,
+    }), deadline, value => { void value.delete().catch(() => undefined); });
     const entries: MeshStateEntry[] = [];
     let failed = false;
+    let page: Awaited<ReturnType<typeof consumer.fetch>> | undefined;
     try {
-      let pending = (await consumer.info()).num_pending;
-      while (pending > 0 && entries.length < boundedLimit) {
-        const page = await consumer.fetch({ max_messages: Math.min(boundedLimit - entries.length, pending), expires: Math.max(1_000, this.#timeoutMs) });
-        let received = 0;
-        try {
-          for await (const message of page) {
-            received++; pending = message.info.pending;
-            const operation = message.headers?.get("KV-Operation");
-            if (operation === "DEL" || operation === "PURGE") continue;
-            const key = decodeNatsKvKey(message.subject.slice(`$KV.${this.bucket}.`.length));
-            if (!key.startsWith(prefix)) continue;
-            // A concurrent delete can remove a selected value; fill the page with live entries.
-            const entry = await this.get(key);
-            if (entry) entries.push(entry);
-          }
-        } finally { await page.close(); }
-        if (!received) throw new Error("Fabric KV listing page timed out before pending keys were read");
+      let pending = (await within(() => consumer.info())).num_pending;
+      let lastRevision = 0;
+      if (pending > 0) {
+        const requested = Math.min(boundedLimit, pending);
+        page = await within(() => consumer.fetch({ max_messages: requested,
+          // The client requires >=1s; the enclosing deadline still enforces shorter budgets.
+          expires: Math.max(1_000, Math.ceil(deadline - performance.now())) }), deadline,
+          value => { void value.close().catch(() => undefined); });
+        const iterator = page[Symbol.asyncIterator]();
+        while (examined < requested) {
+          const next = await within(() => iterator.next());
+          if (next.done) break;
+          const message = next.value;
+          examined++; pending = message.info.pending; lastRevision = message.info.streamSequence;
+          positiveLimit(lastRevision, "listing revision");
+          const operation = message.headers?.get("KV-Operation");
+          if (operation === "DEL" || operation === "PURGE") continue;
+          const key = decodeNatsKvKey(message.subject.slice(`$KV.${this.bucket}.`.length));
+          if (!key.startsWith(prefix)) continue;
+          const entry = await within(() => this.get(key));
+          if (entry) entries.push(entry);
+        }
+        // A short/expired pull with still-pending keys is a failure, never false exhaustion.
+        if (examined < requested && pending > 0) throw new Error("Fabric KV listing page timed out before pending keys were read");
       }
       this.#assertOpen();
-      // Neither this page nor listAll is an atomic snapshot. Global ordering requires listAll.
-      return entries.sort((a, b) => a.key.localeCompare(b.key));
+      return { entries: entries.sort((a, b) => a.key.localeCompare(b.key)), examined,
+        ...(pending > 0 ? { nextRevision: positiveLimit(lastRevision + 1, "nextRevision") } : {}) };
     } catch (error) { failed = true; throw error; }
     finally {
-      try { await consumer.delete(); }
-      catch (error) { if (!failed) throw error; } // preserve the read failure; inactive_threshold bounds abandoned consumers
+      // Cleanup shares one additional fixed budget, so total awaited wall time <=2*timeoutMs.
+      // Transport RPCs cannot be cancelled; late acquisitions are closed above and abandoned
+      // consumers have a server-side inactivity bound. Preserve the original read failure.
+      const cleanupDeadline = performance.now() + this.#timeoutMs;
+      try { if (page) await within(() => page!.close(), cleanupDeadline); }
+      catch (error) { if (!failed) { failed = true; throw error; } }
+      finally {
+        try { await within(() => consumer.delete(), cleanupDeadline); }
+        catch (error) { if (!failed) throw error; }
+      }
     }
   }
   async watch(prefix = "", options: NatsKvStateWatchOptions = {}): Promise<NatsKvStateWatch> {

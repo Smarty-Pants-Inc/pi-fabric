@@ -107,6 +107,20 @@ describe.skipIf(!servers)("real NATS R3 state contract (no mocks)", () => {
       }
       return result;
     };
+    const missingBefore = await counts(); expect(missingBefore.size).toBe(1);
+    expect(await store.list("shared/missing", 1)).toEqual([]);
+    const missingAfter = await counts();
+    const missingDelivered = [...missingAfter].reduce((sum, [id, count]) => sum + count - missingBefore.get(id)!, 0);
+    // At most one candidate header, no value gets, plus bounded consumer API replies.
+    expect(missingDelivered).toBeLessThanOrEqual(8);
+    const alignedBefore = await counts();
+    expect(await store.listPage("shared/missing/", 1)).toEqual({ entries: [], examined: 0 });
+    const alignedAfter = await counts();
+    const alignedDelivered = [...alignedAfter].reduce((sum, [id, count]) => sum + count - alignedBefore.get(id)!, 0);
+    expect(alignedDelivered).toBeLessThanOrEqual(7);
+    if (process.env.FABRIC_NATS_EVIDENCE_DIR) fs.writeFileSync(path.join(process.env.FABRIC_NATS_EVIDENCE_DIR, "nats-missing-listing.json"),
+      JSON.stringify({ corpus: 10_000, prefix: "shared/missing", limit: 1, entries: [], missingDelivered,
+        alignedPrefix: "shared/missing/", alignedDelivered, alignedExamined: 0 }, null, 2) + "\n");
     const before = await counts(); expect(before.size).toBe(1); // runner serializes live files for this wire probe
     const page = await store.list("shared/", 10);
     const after = await counts(); expect([...after.keys()]).toEqual([...before.keys()]);
@@ -119,6 +133,26 @@ describe.skipIf(!servers)("real NATS R3 state contract (no mocks)", () => {
     if (process.env.FABRIC_NATS_EVIDENCE_DIR) fs.writeFileSync(path.join(process.env.FABRIC_NATS_EVIDENCE_DIR, "nats-bounded-listing.json"),
       JSON.stringify({ corpus: 10_000, limit: 10, delivered, page, before: [...before], after: [...after] }, null, 2) + "\n");
   }, 90_000);
+  it("paginates sparse partial prefixes and retained tombstones in bounded examined pages", async () => {
+    const store = await open();
+    await store.put({ key: "shared/other", value: 0, identity });
+    await store.put({ key: "shared/match-gone", value: 1, identity });
+    const deleted = await store.delete({ key: "shared/match-gone" });
+    await store.put({ key: "shared/match/live", value: 2, identity });
+    await store.put({ key: "shared/matcher", value: 3, identity });
+    const first = await store.listPage("shared/match", 1);
+    expect(first.entries).toEqual([]); expect(first.examined).toBe(1); expect(first.nextRevision).toBeDefined();
+    const tombstone = await store.listPage("shared/match", 1, first.nextRevision);
+    expect(tombstone).toEqual({ entries: [], examined: 1, nextRevision: deleted.version! + 1 });
+    const rest = await store.listPage("shared/match", 2, tombstone.nextRevision);
+    expect(rest.entries.map(entry => entry.key)).toEqual(["shared/match/live", "shared/matcher"]);
+    expect(rest.examined).toBe(2); expect(rest.nextRevision).toBeUndefined();
+    const aligned = await store.listPage("shared/match/", 1);
+    expect(aligned.entries.map(entry => entry.key)).toEqual(["shared/match/live"]);
+    expect(aligned.examined).toBe(1); expect(aligned.nextRevision).toBeUndefined();
+    if (process.env.FABRIC_NATS_EVIDENCE_DIR) fs.writeFileSync(path.join(process.env.FABRIC_NATS_EVIDENCE_DIR, "nats-sparse-tombstone-pages.json"),
+      JSON.stringify({ first, tombstone, rest, aligned }, null, 2) + "\n");
+  });
   it("rejects capacity overflow without evicting existing keys or fencing tombstones", async () => {
     const store = await open(2);
     await store.put({ key: "limit/a", value: 1, identity }); await store.put({ key: "limit/b", value: 2, identity });

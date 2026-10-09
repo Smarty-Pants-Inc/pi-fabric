@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { census as writerCensus, type CensusWriter } from "./writer-census.js";
+import { censusSync as writerCensusSync, type CensusWriter } from "./writer-census.js";
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
@@ -55,8 +55,12 @@ Exit status: 0 done, 1 error, 2 usage, 3 refused or fence violation (nothing uns
  * evidence the census could not attribute is listed as unknown, with its source and reason.
  * Reported only: nothing accepts or refuses on it.
  */
-export const meshWriterCensus = (root: string): MeshWriterCensus => async () => {
-  const result = await writerCensus(root);
+export const meshWriterCensus = (root: string): MeshWriterCensus => async () => meshWriterCensusSync(root)();
+
+/** The same census, synchronous: the readiness gate recomputes its inventory under the fence. */
+export type MeshWriterCensusSync = () => { writers: MeshCensusWriter[]; unknown?: MeshCensusWriter[] };
+export const meshWriterCensusSync = (root: string): MeshWriterCensusSync => () => {
+  const result = writerCensusSync(root);
   const host = os.hostname();
   const unknownSet = new Set<CensusWriter>(result.unknown);
   const where = (writer: CensusWriter): string => writer.name ? ` ${writer.source} ${writer.name}` : ` ${writer.source}`;
@@ -115,8 +119,12 @@ const parseArgs = (argv: string[]): Options | "help" => {
     else if (flag === "--proof-file") proofFile = value;
     else if (flag === "--require-reader") {
       const [readerName, installRoot] = [value.slice(0, value.indexOf("=")), value.slice(value.indexOf("=") + 1)];
-      if (!value.includes("=") || !isReaderName(readerName) || readerName.startsWith("fabric") || !path.isAbsolute(installRoot)) {
-        throw new UsageError(`Bad --require-reader ${value} (NAME=/absolute/release/root; NAME not fabric*)`);
+      // Flags only ADD readers: a built-in's trusted root can never be replaced from the command line.
+      if (readerName.startsWith("fabric") || BUILTIN_READERS.some(reader => reader.name === readerName)) {
+        throw new UsageError(`Bad --require-reader ${value}: reserved reader name ${readerName}`);
+      }
+      if (!value.includes("=") || !isReaderName(readerName) || !path.isAbsolute(installRoot)) {
+        throw new UsageError(`Bad --require-reader ${value} (NAME=/absolute/release/root)`);
       }
       requireReaders.push({ name: readerName, installRoot });
     }
@@ -179,25 +187,31 @@ interface Gate { switchId: string; required: RequiredReader[]; readiness: Reader
  * `beforeCommit`: the whole check again under the fence right before each flag commit, crash reruns too.
  */
 const openGate = async (options: Options, library: MeshBackendOptions, builtins: readonly InstalledReader[],
-  warn: (text: string) => void): Promise<Gate | undefined> => {
+  gateCensus: MeshWriterCensusSync, warn: (text: string) => void): Promise<Gate | undefined> => {
   // No mesh root: the switch itself refuses with nothing changed.
   if (!fs.statSync(options.root, { throwIfNoEntry: false })?.isDirectory()) return undefined;
   const { backend, epoch } = await meshBackendStatus(options.root);
   // sqlite: switched already, a rerun only verifies (no commit); exporting/file+marker: the switch refuses.
   if (backend !== "file" && backend !== "none" && backend !== "importing") return undefined;
-  // Attributed writers only: evidence the census cannot attribute (a pid-only lock owner, a torn record)
-  // never gates (smarty-dev#6982); it is recorded in the intent. A census failure blocks as fabric@unknown.
-  let writers: MeshCensusWriter[];
-  let unattributed: MeshCensusWriter[] = [];
-  try {
-    const report = await library.census?.();
-    writers = (report?.writers ?? []).filter(writer => writer.pid !== process.pid);
-    unattributed = (report?.unknown ?? []).filter(writer => writer.pid !== process.pid);
-  } catch (error) {
-    writers = [{ pid: 0, release: "unknown", mode: `census failed: ${(error as Error).message}` }];
-  }
-  const required = requiredReaders(writers, builtins, options.requireReaders);
-  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string): ReaderReadiness => {
+  // The whole inventory, recomputed for every check (pre-fence and under the fence before each commit).
+  // Evidence the census cannot attribute, and a failed census, are required as fabric@unknown.
+  const inventory = (underFence = false): RequiredReader[] => {
+    let writers: MeshCensusWriter[];
+    let unattributed: MeshCensusWriter[] = [];
+    try {
+      const report = gateCensus();
+      writers = (report.writers ?? []).filter(writer => writer.pid !== process.pid);
+      // ponytail: under the fence this tool holds state.db open itself, so -wal/-shm evidence there
+      // ("state-database", pid 0) is its own connection; before the fence it counts.
+      unattributed = (report.unknown ?? []).filter(writer => writer.pid !== process.pid
+        && !(underFence && writer.mode.startsWith("unknown state-database ")));
+    } catch (error) {
+      writers = [];
+      unattributed = [{ pid: 0, release: "unknown", mode: `census failed: ${(error as Error).message}` }];
+    }
+    return requiredReaders(writers, unattributed, builtins, options.requireReaders);
+  };
+  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory(true)): ReaderReadiness => {
     let readiness: ReaderReadiness;
     try { readiness = readerReadiness(options.root, "sqlite", required, window); }
     catch (error) { throw new MeshBackendRefusedError(`${(error as Error).message}${when}`); }
@@ -209,15 +223,16 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     return readiness;
   };
   const window = backend === "importing" ? { fromEpoch: epoch - 1, toEpoch: epoch } : { fromEpoch: epoch, toEpoch: epoch + 1 };
+  const required = inventory();
   const preview = (() => { try { return readerReadiness(options.root, "sqlite", required, window); } catch { return undefined; } })();
   for (const reader of preview?.unready ?? []) {
     warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
   }
-  const readiness = evaluate(window, "");
+  const readiness = evaluate(window, "", required);
   const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [] };
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
-      required, requireReader: options.requireReaders, unattributedEvidence: unattributed, readersReady: readiness.ready, acceptedUnready: readiness.unready });
+      required, requireReader: options.requireReaders, readersReady: readiness.ready, acceptedUnready: readiness.unready });
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
   }
@@ -243,6 +258,8 @@ export const main = async (argv: string[], io: {
   stdout?: (text: string) => void; stderr?: (text: string) => void;
   /** The writer census; default `meshWriterCensus` (writer-census.ts) of --root. */
   census?: MeshWriterCensus;
+  /** The readiness gate's synchronous census; default `meshWriterCensusSync` of --root. */
+  gateCensus?: MeshWriterCensusSync;
   /** The built-in installed readers; default BUILTIN_READERS (tests replace them). */
   builtinReaders?: readonly InstalledReader[];
   /** Extra library options (tests: onStep, open). */
@@ -298,7 +315,8 @@ export const main = async (argv: string[], io: {
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
-    if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS, warn);
+    if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
+      io.gateCensus ?? meshWriterCensusSync(options.root), warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)
@@ -307,7 +325,7 @@ export const main = async (argv: string[], io: {
       const final = gate.final ?? gate.readiness;
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
-        checkedUnderFence: gate.checked, readersReady: final.ready, acceptedUnready: final.unready });
+        checkedUnderFence: gate.checked, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
     }
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;

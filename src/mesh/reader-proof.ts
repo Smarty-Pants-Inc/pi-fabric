@@ -86,18 +86,18 @@ const validRelease = (release: unknown): release is string => typeof release ===
  * and `fabric@unknown` for live writers without a release (it can never be proved; only accepted).
  */
 export const requiredReaders = (writers: ReadonlyArray<{ pid: number; release: string; mode: string }>,
+  unattributedEvidence: ReadonlyArray<{ pid: number; release: string; mode: string }>,
   builtins: readonly InstalledReader[], extra: readonly InstalledReader[]): RequiredReader[] => {
   const required: RequiredReader[] = [];
   for (const reader of builtins) {
     if (fs.existsSync(reader.installRoot)) required.push({ name: reader.name, kind: "installed", installRoot: reader.installRoot, builtin: true });
   }
   for (const reader of extra) {
-    const index = required.findIndex(item => item.name === reader.name);
-    const entry: RequiredReader = { name: reader.name, kind: "installed", installRoot: reader.installRoot, builtin: false };
-    if (index >= 0) required[index] = entry; else required.push(entry);
+    // Flags only add readers: a built-in (or earlier) name keeps its trusted root.
+    if (!required.some(item => item.name === reader.name)) required.push({ name: reader.name, kind: "installed", installRoot: reader.installRoot, builtin: false });
   }
   const releases = new Map<string, string[]>();
-  const unattributed: string[] = [];
+  const unattributed = unattributedEvidence.map(item => `pid ${item.pid} ${item.mode}`);
   for (const writer of writers) {
     const label = `pid ${writer.pid} ${writer.mode}`;
     if (validRelease(writer.release)) releases.set(writer.release, [...(releases.get(writer.release) ?? []), label]);
@@ -189,7 +189,7 @@ export const readerReadiness = (root: string, backend: string, required: readonl
   for (const reader of required) {
     let reason: string | undefined;
     if (reader.kind === "unattributed") {
-      reason = `live Fabric writer(s) without a release SHA: ${reader.writers.join("; ")}`;
+      reason = `live writer evidence without an attributable release: ${reader.writers.join("; ")}`;
     } else if (reader.kind === "installed") {
       const proof = proofs.get(reader.name);
       let release: string | undefined;
@@ -223,7 +223,10 @@ const fsyncDirectory = (directory: string): void => {
 /** Writes a proof atomically. The caller holds the migration fence. */
 const writeProof = (root: string, proof: ReaderProof): string => {
   const dir = readersDir(root);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const stat = fs.lstatSync(dir);
+  const unsafe = stat.isDirectory() ? ownership(stat, process.geteuid?.()) : "not a directory (or a symlink)";
+  if (unsafe) throw new Error(`reader registry ${dir} is ${unsafe}: proof not written`);
   const file = path.join(dir, `${proof.name}.json`);
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   const descriptor = fs.openSync(temporary, "wx", 0o600);

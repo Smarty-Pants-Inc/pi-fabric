@@ -55,11 +55,14 @@ const placeProof = (root: string, proof: Record<string, unknown>): void => {
   fs.writeFileSync(path.join(root, "readers", `${String(proof.name)}.json`), JSON.stringify(proof), { mode: 0o600 });
 };
 
-interface Harness { builtins: InstalledReader[]; writers: Array<{ pid: number; release: string; mode: string }>; options: Partial<MeshBackendOptions> }
+type Writer = { pid: number; release: string; mode: string };
+interface Harness { builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[]; options: Partial<MeshBackendOptions> }
 const run = async (argv: string[], harness: Partial<Harness> = {}): Promise<{ code: number; out: string; err: string }> => {
   let out = "";
   let err = "";
-  const code = await main(argv, { census: async () => ({ writers: harness.writers ?? [] }), builtinReaders: harness.builtins ?? [],
+  const writers = (): Writer[] => typeof harness.writers === "function" ? harness.writers() : harness.writers ?? [];
+  const code = await main(argv, { census: async () => ({ writers: writers() }), gateCensus: () => ({ writers: writers(), unknown: harness.unknown ?? [] }),
+    builtinReaders: harness.builtins ?? [],
     options: harness.options ?? {}, stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
   return { code, out, err };
 };
@@ -91,7 +94,7 @@ describe("fabric-mesh-backend readiness gate", () => {
     expect(await backendOf(root)).toBe("none");
     expect(records(root)).toEqual([]);
     // Not installed on this host: not required.
-    expect(requiredReaders([], [{ name: "factory", installRoot: path.join(root, "absent") }], [])).toEqual([]);
+    expect(requiredReaders([], [], [{ name: "factory", installRoot: path.join(root, "absent") }], [])).toEqual([]);
   });
 
   it("passes when every required reader proved sqlite, re-checks before both commits, and records intent and outcome", async () => {
@@ -123,7 +126,11 @@ describe("fabric-mesh-backend readiness gate", () => {
     expect(old.err).toContain("fabric@fabric-rel-old (no proof from installed reader fabric release fabric-rel-old (live: pid 7 file))");
     const anonymous = await run(["cutover", "--root", root], { writers: [{ pid: 8, release: "unknown", mode: "sqlite" }] });
     expect(anonymous.code).toBe(3);
-    expect(anonymous.err).toContain("fabric@unknown (live Fabric writer(s) without a release SHA: pid 8 sqlite)");
+    expect(anonymous.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 8 sqlite)");
+    // Evidence the census cannot attribute (a pid-only lock owner, a torn record) is required too.
+    const lockOwner = await run(["cutover", "--root", root], { unknown: [{ pid: 9, release: "unknown", mode: "unknown lock-owner .lock" }] });
+    expect(lockOwner.code).toBe(3);
+    expect(lockOwner.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 9 unknown lock-owner .lock)");
     expect(await backendOf(root)).toBe("none");
     // --accept-unready is the override, recorded in the intent before the switch.
     const accepted = await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { writers: [{ pid: 8, release: "unknown", mode: "sqlite" }] });
@@ -159,7 +166,7 @@ describe("fabric-mesh-backend readiness gate", () => {
   it("refuses a registry that is group/other-writable or foreign-owned, and a proof file that is", async () => {
     const root = await fileRoot();
     const factory = installRoot("r1");
-    const required = requiredReaders([], [{ name: "factory", installRoot: factory }], []);
+    const required = requiredReaders([], [], [{ name: "factory", installRoot: factory }], []);
     placeProof(root, factoryProof());
     expect(readerReadiness(root, "sqlite", required, { fromEpoch: 0, toEpoch: 1 }).ready).toEqual(["factory"]);
     expect(() => readerReadiness(root, "sqlite", required, { fromEpoch: 0, toEpoch: 1 }, Date.now(), process.geteuid!() + 1))
@@ -177,7 +184,7 @@ describe("fabric-mesh-backend readiness gate", () => {
     const root = await fileRoot();
     const hour = 60 * 60 * 1000;
     const names = ["future-epoch", "stale", "over-age", "future-time", "skew-ok", "fraction", "extra"];
-    const required = requiredReaders([], [], names.map(name => ({ name, installRoot: installRoot("r1") })));
+    const required = requiredReaders([], [], [], names.map(name => ({ name, installRoot: installRoot("r1") })));
     placeProof(root, factoryProof({ name: "future-epoch", provedEpoch: 2 }));
     placeProof(root, factoryProof({ name: "stale", provedEpoch: 0 }));
     placeProof(root, factoryProof({ name: "over-age", provedEpoch: 1, provedAt: new Date(Date.now() - 25 * hour).toISOString() }));
@@ -251,6 +258,45 @@ describe("fabric-mesh-backend readiness gate", () => {
     const done = await run(["cutover", "--root", root, "--json"], { builtins });
     expect(done.code, done.err).toBe(0);
     expect(JSON.parse(done.out).readers.checkedUnderFence).toEqual(["importing", "sqlite"]);
+  });
+
+  it("recomputes the inventory under the fence: a writer on a new release that appears before the commit refuses it", async () => {
+    const root = await fileRoot();
+    expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0); // fabric-rel-a
+    let live: Writer[] = [{ pid: 7, release: "fabric-rel-a", mode: "sqlite" }];
+    const result = await run(["cutover", "--root", root], { writers: () => live,
+      options: { beforeCommit: () => { live = [...live, { pid: 11, release: "fabric-rel-new", mode: "sqlite" }]; } } });
+    expect(result.code).toBe(3);
+    expect(result.err).toContain("(under the fence, before the importing commit): fabric@fabric-rel-new (no proof from installed reader fabric release fabric-rel-new");
+    expect(await backendOf(root)).toBe("file");
+  });
+
+  it("reserves built-in reader names: --require-reader only adds readers", async () => {
+    const root = await fileRoot();
+    for (const name of ["factory", "fabric@x", "fabric-y"]) {
+      const result = await run(["cutover", "--root", root, "--require-reader", `${name}=/decoy`]);
+      expect(result.code).toBe(2);
+      expect(result.err).toContain(`reserved reader name ${name}`);
+    }
+    const trusted = installRoot("r1");
+    expect(requiredReaders([], [], [{ name: "factory", installRoot: trusted }], [{ name: "factory", installRoot: "/decoy" }]))
+      .toEqual([{ name: "factory", kind: "installed", installRoot: trusted, builtin: true }]);
+  });
+
+  it("writes a proof only into a private readers/ directory", async () => {
+    const root = await fileRoot();
+    const elsewhere = tempDir("elsewhere");
+    fs.symlinkSync(elsewhere, path.join(root, "readers"));
+    const linked = await run(["reader-proof", "--root", root, "--backend", "sqlite"]);
+    expect(linked.code).toBe(1);
+    expect(linked.err).toContain("is not a directory (or a symlink): proof not written");
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    fs.rmSync(path.join(root, "readers"));
+    fs.mkdirSync(path.join(root, "readers"), { mode: 0o700 });
+    fs.chmodSync(path.join(root, "readers"), 0o777);
+    expect(await proveFactory(root)).toBe(1);
+    fs.chmodSync(path.join(root, "readers"), 0o700);
+    expect(await proveFactory(root)).toBe(0);
   });
 
   it("refuses when the switch record cannot be written", async () => {

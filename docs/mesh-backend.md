@@ -13,14 +13,16 @@ The gate decides from an inventory, never from what readers chose to register:
 1. **Live Fabric releases.** The writer census (`fabric-mesh-backend census`) attributes live
    writers from the host leases (`<mesh>/host-leases/*.json`, field `writer.releaseSha`) and the
    process records (`<mesh>/.writer-census/*`, field `releaseSha`). Topology participant records
-   carry no release. Each distinct release R becomes the required reader `fabric@R`. Attributed live
-   writers without a release (`"unknown"`), or a census that fails, become `fabric@unknown`, which can
-   only be accepted, never proved. Evidence the census cannot attribute (a pid-only lock owner, a torn
-   record) does not gate (smarty-dev#6982); the intent records it as `unattributedEvidence`.
+   carry no release. Each distinct release R becomes the required reader `fabric@R`. Live writers
+   without a release (`"unknown"`), evidence the census cannot attribute (a pid-only lock owner, a
+   torn record, an open `state.db-wal` without a known writer) and a census that fails become
+   `fabric@unknown`, which can only be accepted (`--accept-unready fabric@unknown`), never proved.
+   The census itself stays advisory (smarty-dev#6982); this gate is what refuses.
 2. **Built-in non-Fabric readers**, fixed in code (`BUILTIN_READERS` in `src/mesh/reader-proof.ts`):
    `factory` with the trusted release root `~/.local/share/smarty-dev/factory`. A built-in whose
    release root does not exist on this host is not installed here and not required.
 3. **`--require-reader NAME=/abs/release/root`**, repeatable, always required, recorded in the intent.
+   Flags only add readers: a built-in name (`factory`) or a `fabric*` name exits 2 ("reserved reader name").
 
 Proofs of readers that are not required are ignored.
 
@@ -49,8 +51,9 @@ Order of a switch (crash reruns included):
    `switchId`, the required readers, the overrides and the unattributed evidence. If it cannot be
    written, refuse.
 3. Run the fenced switch. Under the fence, inside the transaction right before EACH flag commit
-   (`backend=importing`, then `backend=sqlite`; a rerun from `importing` included), the full check
-   runs again. A refusal rolls that transaction back. A refusal at the `sqlite` commit leaves the
+   (`backend=importing`, then `backend=sqlite`; a rerun from `importing` included), the whole
+   inventory (census, built-ins, flags) is recomputed and checked again. There `state.db-wal`/`-shm`
+   evidence is ignored: the tool holds `state.db` open itself. A refusal rolls that transaction back. A refusal at the `sqlite` commit leaves the
    root at `importing` with the moved marker; readers keep reading SQLite through the reader rule,
    and a rerun completes the switch once the readers are ready (or `rollback`).
 4. Append the **outcome** with the same `switchId` (best effort), with `checkedUnderFence`.
@@ -82,7 +85,8 @@ No other field is allowed.
 
 ## Writing a proof
 
-Every proof is written under the migration fence, so no proof changes between the final check and
+Every proof is written under the migration fence, into a `readers/` directory that is a real
+directory (not a symlink) owned by the writer's user and not group/other-writable (created 0700), so no proof changes between the final check and
 the commit. The fence is two lock directories at the mesh root, taken in this order and held
 while the proof is renamed into place:
 

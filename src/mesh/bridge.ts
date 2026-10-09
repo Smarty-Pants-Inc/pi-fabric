@@ -26,7 +26,9 @@ import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
  * its recipient is native to the hub. Mirrored records never replace a native record.
  */
 
-export const BRIDGE_PROTOCOL_VERSION = 1;
+/** v2 requires change notifications; v1 remains the explicit pre-capability rollout path. */
+export const BRIDGE_PROTOCOL_VERSION = 2;
+const LEGACY_BRIDGE_PROTOCOL_VERSION = 1;
 const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** A mirrored host lease lasts this long past its last renewal, so a dead bridge lapses it. */
@@ -143,9 +145,11 @@ export interface BridgeSide {
   latestSequence(): Promise<number>;
   read(after: number): Promise<BridgeRead>;
   /** Install before the first snapshot. Changes are latched during in-flight work.
-   * Watch failure is fatal. undefined explicitly selects transitional legacy-remote polling;
-   * local stores always require watches. Manual step() needs no subscription. */
+   * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
+   * reported protocolVersion 1; local stores always require watches. Manual step() needs no subscription. */
   subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
+  /** Reported hello version, required before a remote may use the pre-capability polling path. */
+  readonly protocolVersion?: number | undefined;
   /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
   latestCursor?(): Promise<BridgeHead>;
   tail?(after: number, offset?: number): Promise<BridgeRead>;
@@ -818,21 +822,28 @@ const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: 
 export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable): Promise<void> =>
   new Promise((resolve) => {
     let queue = Promise.resolve();
-    let ended = false;
+    let closed = false;
     let unsubscribe: (() => void) | undefined;
+    const dispose = (): void => {
+      const close = unsubscribe;
+      unsubscribe = undefined;
+      close?.();
+    };
     const reply = (value: unknown): void => {
-      if (!ended) output.write(`${JSON.stringify(value)}\n`);
+      if (!closed) output.write(`${JSON.stringify(value)}\n`);
     };
     const finish = (): void => {
-      if (ended) return;
-      ended = true;
-      unsubscribe?.();
-      void queue.then(() => resolve());
+      const wasClosed = closed;
+      closed = true;
+      dispose(); // also dispose a subscription returned after a reentrant finish()
+      if (wasClosed) return;
+      void queue.then(() => { dispose(); resolve(); });
     };
     lines(
       input,
       (line) => {
         queue = queue.then(async () => {
+          if (closed) return; // stdin may have ended while this request was queued
           let request: RpcRequest;
           try {
             request = JSON.parse(line) as RpcRequest;
@@ -848,8 +859,11 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
                 (kind) => reply({ notification: "change", kind }),
                 (error) => { reply({ notification: "failure", error: error.message }); input.destroy(error); finish(); },
               );
+              if (closed) { finish(); return; }
             }
-            reply({ id: request.id, ok: true, result: await dispatch(side, request) });
+            const result = await dispatch(side, request);
+            if (closed) { finish(); return; }
+            reply({ id: request.id, ok: true, result });
           } catch (error) {
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
@@ -886,7 +900,13 @@ const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participant
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
   switch (request.op) {
-    case "hello": return { version: BRIDGE_PROTOCOL_VERSION, tail: true, publishBatch: typeof side.publishBatch === "function", changes: true };
+    // Unversioned v1 clients must still accept a new agent during host-by-host rollout.
+    // New clients request v2 explicitly; only a reported v1 peer can lack notifications.
+    case "hello": return {
+      version: isObject(request.args) && request.args.version === BRIDGE_PROTOCOL_VERSION
+        ? BRIDGE_PROTOCOL_VERSION : LEGACY_BRIDGE_PROTOCOL_VERSION,
+      tail: true, publishBatch: typeof side.publishBatch === "function", changes: true,
+    };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
     case "tail": return side.tail(numberArg(request.args, "after"),
@@ -911,6 +931,7 @@ class BridgeLegacyNotificationsError extends Error {}
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #supportsTail = false;
+  #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
   publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
@@ -993,16 +1014,31 @@ export class RemoteBridgeSide implements BridgeSide {
     });
   }
 
+  get protocolVersion(): number | undefined { return this.#protocolVersion; }
+
   async hello(changes = false): Promise<void> {
-    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown }>("hello", changes ? { changes: true } : undefined);
-    if (reply?.version !== BRIDGE_PROTOCOL_VERSION) throw new Error(`Bridge agent speaks protocol ${String(reply?.version)}`);
+    const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; changes?: unknown }>("hello", {
+      version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
+    });
+    if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
+      throw new Error(`Bridge agent speaks unsupported protocol ${String(reply?.version)}`);
+    }
+    if (this.#protocolVersion !== undefined && this.#protocolVersion !== reply.version) {
+      throw new Error(`Bridge agent changed protocol ${this.#protocolVersion} to ${reply.version}; refusing protocol downgrade`);
+    }
+    this.#protocolVersion = reply.version;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
     // The CLI explicitly negotiates tail/batch; manual legacy users may have disabled them.
     if (!changes) {
       this.#supportsTail = reply.tail === true;
       if (reply.publishBatch === true) this.publishBatch = events => this.#call("publishBatch", events.map(({ event }) => event));
     }
-    if (changes && reply.changes !== true) throw new BridgeLegacyNotificationsError("Legacy bridge agent lacks change notifications");
+    if (reply.changes !== true) {
+      if (reply.version === BRIDGE_PROTOCOL_VERSION) {
+        throw new Error(`Bridge protocol ${reply.version} requires changes:true; refusing notification downgrade`);
+      }
+      if (changes) throw new BridgeLegacyNotificationsError(`Legacy bridge protocol ${reply.version} predates change notifications`);
+    }
   }
 
   async subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): Promise<(() => void) | undefined> {
@@ -1569,8 +1605,11 @@ export class MeshBridge {
             const unsubscribe = await side.subscribeChanges?.(changed, failed);
             if (!unsubscribe) {
               if (unsubscribers.length === 0) throw new Error("The local bridge side requires filesystem change notifications");
+              if (side.protocolVersion !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
+                throw new Error(`Bridge peer protocol ${String(side.protocolVersion)} has no change subscription; refusing unversioned/current notification downgrade`);
+              }
               this.#legacyPolling = true;
-              this.#log("legacy peer: transitional 250 ms polling until fleet-wide notification-capable install; no events are discarded");
+              this.#log(`legacy peer protocol ${side.protocolVersion}: transitional 250 ms polling until fleet-wide notification-capable install; no events are discarded`);
             }
             unsubscribers.push(unsubscribe ?? (() => undefined));
           }

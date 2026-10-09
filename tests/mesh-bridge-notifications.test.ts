@@ -1,11 +1,13 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { buildSync } from "esbuild";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_PROTOCOL_VERSION, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
 import { watchBridgeStore } from "../src/mesh/change-notifier.js";
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
@@ -89,6 +91,142 @@ const launch = async (bridge: MeshBridge) => {
 };
 
 describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
+  it("exits a native process with no watches when stdin ends before a queued hello runs", () => {
+    const f = fixture(false);
+    const source = String.raw`
+      import fs from "node:fs";
+      import { PassThrough } from "node:stream";
+      import { once } from "node:events";
+      import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+      import { StoreBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
+      const store = new MeshStore(${JSON.stringify(path.join(f.root, "native"))});
+      const side = new StoreBridgeSide(store, "hub");
+      const input = new PassThrough(), output = new PassThrough();
+      let release, entered;
+      const held = new Promise(resolve => { release = resolve; });
+      const started = new Promise(resolve => { entered = resolve; });
+      side.presence = async () => { entered(); await held; return { hosts: [], participants: [], reserved: [] }; };
+      let installed = 0, active = 0;
+      const watch = fs.watch;
+      fs.watch = (...args) => {
+        const watcher = watch(...args);
+        installed++; active++;
+        const close = watcher.close.bind(watcher);
+        let closed = false;
+        watcher.close = () => { if (!closed) { closed = true; active--; } close(); };
+        return watcher;
+      };
+      const serving = serveBridgeAgent(side, input, output);
+      input.write(JSON.stringify({ id: 1, op: "presence" }) + "\n");
+      await started;
+      const ended = once(input, "end");
+      input.end(JSON.stringify({ id: 2, op: "hello", args: { version: ${BRIDGE_PROTOCOL_VERSION}, changes: true } }) + "\n");
+      await ended; // hello is enqueued behind the still-held presence RPC
+      release();
+      await serving;
+      output.end(); store.closeState();
+      console.log(JSON.stringify({ installed, active }));
+    `;
+    const program = path.join(f.root, "queued-hello.mjs");
+    buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program, bundle: true, platform: "node", format: "esm", packages: "external" });
+    const child = spawnSync(process.execPath, [program], { encoding: "utf8", timeout: 3_000 });
+    expect({ error: child.error?.message, status: child.status, stderr: child.stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
+    expect(JSON.parse(child.stdout.trim())).toEqual({ installed: 0, active: 0 });
+  });
+
+  it("disposes a watcher returned after finish runs reentrantly during installation", async () => {
+    const f = fixture(false);
+    const input = new PassThrough(), output = new PassThrough();
+    const subscribe = f.agent.subscribeChanges.bind(f.agent);
+    const close = vi.fn();
+    vi.spyOn(f.agent, "subscribeChanges").mockImplementation((changed, failed) => {
+      const unsubscribe = subscribe(changed, failed);
+      input.emit("end"); // finish runs before the handler can assign unsubscribe
+      return () => { close(); unsubscribe(); };
+    });
+    const serving = serveBridgeAgent(f.agent, input, output);
+    input.write(JSON.stringify({ id: 1, op: "hello", args: { version: BRIDGE_PROTOCOL_VERSION, changes: true } }) + "\n");
+    await serving;
+    expect(close).toHaveBeenCalledTimes(1);
+    input.end(); output.end();
+  });
+
+  it.each([undefined, false])("refuses a current-version peer with changes=%s instead of starting legacy polling", async changes => {
+    const f = fixture(false);
+    const input = new PassThrough(), output = new PassThrough();
+    const operations: string[] = [];
+    input.on("data", chunk => {
+      for (const line of String(chunk).trim().split("\n")) {
+        const request = JSON.parse(line);
+        operations.push(request.op);
+        expect(request.args).toEqual({ version: BRIDGE_PROTOCOL_VERSION, changes: true });
+        output.write(JSON.stringify({ id: request.id, ok: true, result: { version: BRIDGE_PROTOCOL_VERSION, ...(changes === undefined ? {} : { changes }) } }) + "\n");
+      }
+    });
+    const remote = new RemoteBridgeSide(output, input);
+    cleanups.push(() => remote.close());
+    const logs: string[] = [];
+    const bridge = new MeshBridge({ ...f.bridge.options, remote, log: message => logs.push(message) });
+    const start = vi.spyOn(bridge, "start");
+    await expect(bridge.run()).rejects.toThrow(/requires changes:true; refusing notification downgrade/);
+    expect(start).not.toHaveBeenCalled();
+    expect(operations).toEqual(["hello"]);
+    expect(logs).toEqual([]);
+  });
+
+  it.each([undefined, BRIDGE_PROTOCOL_VERSION])("refuses a remote side without a subscription or explicit legacy protocol (%s)", async protocolVersion => {
+    const f = fixture(false);
+    const remote: BridgeSide = {
+      protocolVersion,
+      subscribeChanges: () => undefined,
+      latestSequence: () => f.agent.latestSequence(),
+      read: after => f.agent.read(after),
+      presence: () => f.agent.presence(),
+      mirror: presence => f.agent.mirror(presence),
+      publish: event => f.agent.publish(event),
+      bridgedIds: after => f.agent.bridgedIds(after),
+    };
+    const bridge = new MeshBridge({ ...f.bridge.options, remote });
+    const start = vi.spyOn(bridge, "start");
+    await expect(bridge.run()).rejects.toThrow(/refusing unversioned\/current notification downgrade/);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false])("refuses a current-version peer without changes:true even in ordinary hello (%s)", async changes => {
+    const input = new PassThrough(), output = new PassThrough();
+    input.on("data", chunk => {
+      const request = JSON.parse(String(chunk));
+      output.write(JSON.stringify({ id: request.id, ok: true, result: { version: BRIDGE_PROTOCOL_VERSION, ...(changes === undefined ? {} : { changes }) } }) + "\n");
+    });
+    const remote = new RemoteBridgeSide(output, input);
+    cleanups.push(() => remote.close());
+    await expect(remote.hello()).rejects.toThrow(/requires changes:true/);
+  });
+
+  it("does not let a peer change its reported current protocol to v1 during notification setup", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    let count = 0;
+    input.on("data", chunk => {
+      const request = JSON.parse(String(chunk));
+      output.write(JSON.stringify({ id: request.id, ok: true, result: ++count === 1 ? { version: BRIDGE_PROTOCOL_VERSION, changes: true } : { version: 1 } }) + "\n");
+    });
+    const remote = new RemoteBridgeSide(output, input);
+    cleanups.push(() => remote.close());
+    await remote.hello();
+    await expect(remote.subscribeChanges(() => undefined, () => undefined)).rejects.toThrow(/refusing protocol downgrade/);
+  });
+
+  it.each([undefined, 0, "1", BRIDGE_PROTOCOL_VERSION + 1])("refuses an unknown protocol %s rather than treating it as legacy", async version => {
+    const input = new PassThrough(), output = new PassThrough();
+    input.on("data", chunk => {
+      const request = JSON.parse(String(chunk));
+      output.write(JSON.stringify({ id: request.id, ok: true, result: { version } }) + "\n");
+    });
+    const remote = new RemoteBridgeSide(output, input);
+    cleanups.push(() => remote.close());
+    await expect(remote.subscribeChanges(() => undefined, () => undefined)).rejects.toThrow(/unsupported protocol/);
+  });
+
   it.each([false, true])("has zero timers and passes over 305 idle seconds (stdio: %s)", async rpc => {
     const f = fixture(rpc);
     const live = await launch(f.bridge); // also tests automatic hello for run() callers
@@ -285,7 +423,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     expect(failed).toBeUndefined();
   });
 
-  it("keeps 250 ms polling only for a legacy endpoint and delivers both directions without loss", async () => {
+  it.each([undefined, false])("keeps 250 ms polling only for an explicit v1 endpoint (changes=%s) and delivers both directions without loss", async changes => {
     const f = fixture(false);
     const lead = await native(f.hub, "lead");
     const lane = await native(f.far, "legacy-lane");
@@ -298,7 +436,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
         const request = JSON.parse(line);
         operations.push(request.op);
         const args = request.args;
-        const result = request.op === "hello" ? { version: 1 }
+        const result = request.op === "hello" ? { version: 1, ...(changes === undefined ? {} : { changes }) }
           : request.op === "latestSequence" ? await f.agent.latestSequence()
           : request.op === "read" ? await f.agent.read(args.after)
           : request.op === "presence" ? await f.agent.presence()
@@ -339,7 +477,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     await native(f.far, "legacy-client");
     await settle();
     expect(frames).toHaveLength(1);
-    expect(frames[0]).toMatchObject({ id: 1 });
+    expect(frames[0]).toMatchObject({ id: 1, result: { version: 1, changes: true } });
   });
 
   it("fails rather than polling when fs.watch cannot be installed", async () => {

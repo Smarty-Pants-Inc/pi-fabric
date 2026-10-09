@@ -37,9 +37,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   that mark, so a crash does not forward an event twice. Old sequence-only cursor files migrate
   on first use; explicit manual `step()` calls can still read old v1 agents without tail support.
   Continuous `run()` negotiates change notifications. A new-to-new pair does not poll; when a
-  remote agent lacks that capability, only that peer's legacy path retains the existing 250 ms
-  poll and logs the compatibility mode once. This is a transitional host-by-host rollout path,
-  to remove after the fleet-wide install.
+  remote agent explicitly reports pre-capability protocol v1, only that peer's legacy path retains
+  the existing 250 ms poll and logs the compatibility mode once. Protocol v2 requires `changes:true`:
+  a v2 peer that omits or denies it is refused, never silently downgraded. New clients request v2 in
+  `hello`; unversioned old clients still receive a v1-compatible reply from new agents, without
+  unsolicited frames unless requested. The reported version is pinned for that transport. This is a
+  transitional host-by-host rollout path, to remove after the fleet-wide install under
+  https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7886.
   A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
   when available) before returning to byte tails.
 - The remote is not trusted. An event from it crosses only when all of these are true:

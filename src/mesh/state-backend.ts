@@ -297,10 +297,32 @@ export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1
   return new MeshStateBusyError(database, waitedMs, timeout);
 };
 
-// Synchronous reads: a few short retries (<= ~15 ms on the event loop), then the retryable busy error.
-const READ_BUSY_RETRIES = 5;
+// Synchronous reads: short retries within a wall-clock budget on the event loop, then the retryable busy
+// error. The budget includes SQLite's busy handler (busy_timeout, <= 5 ms per attempt), not only the
+// sleeps between attempts (pi-fabric#691 review P2): an attempt starts only if it ends inside it.
+const READ_BUSY_BUDGET_MS = 15;
+// Only for the first synchronous read of a process: one database open, bounded the same way.
+const OPEN_BUSY_BUDGET_MS = 40;
+const busyHandlerMs = (options: SqliteStateStoreOptions): number => Math.max(0, Math.min(5, Math.floor(options.busyTimeoutMs ?? 2)));
 
-// Only for the first synchronous read of a process: one database open, bounded to ~50 ms.
+/**
+ * Retries a synchronous busy `attempt` until `budgetMs` of wall time (monotonic clock) would be exceeded.
+ * Each attempt may spend `handlerMs` in SQLite's busy handler, so none starts unless it ends in budget.
+ */
+const retrySyncBusy = <T>(attempt: () => T, budgetMs: number, handlerMs: number,
+  onSpent: (error: unknown, attempts: number, waitedMs: number) => Error): T => {
+  const started = performance.now();
+  const deadline = started + budgetMs;
+  for (let attempts = 1; ; attempts += 1) {
+    try { return attempt(); } catch (error) {
+      if (!sqliteBusy(error)) throw error;
+      const room = deadline - performance.now() - handlerMs - 1;
+      if (room <= 0) throw onSpent(error, attempts, performance.now() - started);
+      sleepSync(Math.min(attempts, room));
+    }
+  }
+};
+
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
 // A bounded wait for a shared open: rejects with BUDGET_SPENT when `ms` runs out first.
@@ -536,17 +558,10 @@ export class SqliteStateBackend implements StateBackend {
   // smarty-dev#6477: a synchronous read (and the open under it) never throws a raw "database is locked":
   // a busy read retries briefly, then throws the retryable MeshStateBusyError every caller already retries.
   #read<T>(read: () => T): T {
-    const started = performance.now();
-    for (let attempt = 0; ; attempt += 1) {
-      try { return read(); } catch (error) {
-        if (!sqliteBusy(error)) throw error;
-        if (attempt >= READ_BUSY_RETRIES) {
-          this.#busyTimeouts += 1;
-          throw meshStateBusyFrom(this.database, error, attempt + 1, performance.now() - started);
-        }
-        sleepSync(1 + attempt);
-      }
-    }
+    return retrySyncBusy(read, READ_BUSY_BUDGET_MS, busyHandlerMs(this.#storeOptions), (error, attempts, waitedMs) => {
+      this.#busyTimeouts += 1;
+      return meshStateBusyFrom(this.database, error, attempts, waitedMs);
+    });
   }
 
   #pinned(options: MeshReadOptions): SqliteSnapshot | undefined {
@@ -588,19 +603,14 @@ export class SqliteStateBackend implements StateBackend {
     if (this.#closed) throw new Error("Fabric mesh SQLite state backend is closed");
     // A synchronous read needs the database now. Opening is busy only while another connection
     // initialises the schema or holds the write lock at our first BEGIN IMMEDIATE: retry briefly.
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        this.#store = SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions);
-        return this.#store;
-      } catch (error) {
-        if (!sqliteBusy(error)) throw error;
-        if (attempt >= 25) {
-          this.#busyTimeouts += 1;
-          throw meshStateBusyFrom(this.database, error, attempt + 1, 0, "first open");
-        }
-        sleepSync(1 + attempt % 2);
-      }
-    }
+    // An open runs several statements, each of which may wait in the busy handler; the budget still bounds it.
+    this.#store = retrySyncBusy(
+      () => SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions),
+      OPEN_BUSY_BUDGET_MS, busyHandlerMs(this.#storeOptions), (error, attempts, waitedMs) => {
+        this.#busyTimeouts += 1;
+        return meshStateBusyFrom(this.database, error, attempts, waitedMs, "first open");
+      });
+    return this.#store;
   }
 
   /**

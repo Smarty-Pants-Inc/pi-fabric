@@ -54,6 +54,13 @@
  * its COMMIT once the WAL passes `emergencyCheckpointBytes`, so the WAL stays bounded regardless.
  * `journal_size_limit` caps a reset WAL. `stats()` exports the WAL size and checkpoint progress.
  *
+ * Reader starvation (smarty-dev#6477, full-load soak): with many processes reading constantly, some reader
+ * always holds a WAL read mark, so PASSIVE autocheckpoints copy frames but the WAL never restarts and grows
+ * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (8 MiB), one process at a
+ * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: asynchronous attempts with a 2 ms busy handler,
+ * outside any transaction, so no client stalls on it. While attempts are busy it raises the checkpoint
+ * flag: writers yield, no new frames arrive, and the readers that pin old frames drain within one read.
+ *
  * Rules (design §3B, review-opus P0-1/P3-8): never open `state*.db*` with plain `fs` calls in the
  * same process (closing any descriptor drops that process's POSIX locks; only `stat` is used here);
  * local filesystems only (`filesystemRefusal`); back up with `VACUUM INTO` or the backup API; never
@@ -347,6 +354,8 @@ export interface SqliteStateStoreOptions {
   checkpointIntervalMs?: number;
   /** First busy budget of a TRUNCATE attempt; doubles after each busy attempt up to 400 ms. Default 50 ms. */
   checkpointBusyMs?: number;
+  /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 8 MiB. */
+  walResetBytes?: number;
   /** `journal_size_limit`. Default 16 MiB. */
   journalSizeLimitBytes?: number;
   /** Rows kept in the `changes` feed. Default 4,096. */
@@ -377,7 +386,8 @@ export interface SqliteStateStats {
   maxAfterCommitMs: number;
   afterCommitReacquired: number;
   afterCommitIntervened: number;
-  checkpoints: { passive: number; truncate: number; truncateBusy: number; emergency: number; failed: number; writerYields: number };
+  checkpoints: { passive: number; truncate: number; truncateBusy: number; emergency: number; failed: number; writerYields: number;
+    walResets: number; walResetBusy: number };
   lastCheckpoint?: { busy: number; log: number; checkpointed: number };
   walBytes: number;
   maxWalBytes: number;
@@ -416,6 +426,13 @@ const ENVELOPE_BYTES = 256;
 const CHECKPOINT_FLAG = "state-checkpoint.flag";
 const CHECKPOINT_FLAG_STALE_MS = 1_000;
 const MAX_TRUNCATE_BUDGET_MS = 400;
+// The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, short attempts.
+const WAL_RESET_LOCK = "state-wal-reset.lock";
+const WAL_RESET_LOCK_STALE_MS = 5_000;
+const WAL_RESET_BUDGET_MS = 750;
+const WAL_RESET_BUSY_MS = 2;
+const WAL_RESET_RETRY_MS = 5;
+const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
 const PREFIX_END = "\u007f";
@@ -627,7 +644,8 @@ export class SqliteStateStore {
   readonly #stats: SqliteStateStats = {
     transactions: 0, commits: 0, busyRetries: 0, transientRetries: 0, fifoJoins: 0, maxWaitMs: 0, maxHoldMs: 0,
     totalHoldMs: 0, maxPrepareMs: 0, maxAfterCommitMs: 0, afterCommitReacquired: 0, afterCommitIntervened: 0,
-    checkpoints: { passive: 0, truncate: 0, truncateBusy: 0, emergency: 0, failed: 0, writerYields: 0 }, walBytes: 0, maxWalBytes: 0,
+    checkpoints: { passive: 0, truncate: 0, truncateBusy: 0, emergency: 0, failed: 0, writerYields: 0, walResets: 0, walResetBusy: 0 },
+    walBytes: 0, maxWalBytes: 0,
   };
   #timer: NodeJS.Timeout | undefined;
   #inTransaction = false;
@@ -636,6 +654,9 @@ export class SqliteStateStore {
   #lastEmergencyCheck = 0;
   #truncateBudgetMs: number;
   #lastWalBytes = 0;
+  readonly #walResetBytes: number;
+  #walResetting = false;
+  #lastWalResetCheck = 0;
 
   private constructor(readonly root: string, readonly maxEventBytes: number, readonly maxReadEvents: number,
     db: SqliteConnection, file: string, identity: { epoch: number; storeId: string }, options: SqliteStateStoreOptions) {
@@ -655,6 +676,7 @@ export class SqliteStateStore {
     this.#checkpointBusyMs = Math.max(1, Math.min(MAX_TRUNCATE_BUDGET_MS, options.checkpointBusyMs ?? 50));
     this.#truncateBudgetMs = this.#checkpointBusyMs;
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
+    this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
     if (options.checkpoint === "maintainer") {
       const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
       this.#timer = setInterval(() => {
@@ -1352,7 +1374,7 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) this.#emergencyCheckpoint();
+      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); }
     }
   }
 
@@ -1392,7 +1414,81 @@ export class SqliteStateStore {
       this.checkpoint(this.#checkpointBytes);
     } catch { this.#stats.checkpoints.failed += 1; }
   }
+
+  // Reader starvation (see the module comment): after a COMMIT, throttled to 4/s, a WAL above
+  // `walResetBytes` starts one asynchronous reset, if this process wins the try-lock.
+  #maybeResetWal(): void {
+    if (this.#walResetBytes <= 0 || this.#walResetting) return;
+    const now = Date.now();
+    if (now - this.#lastWalResetCheck < 250) return;
+    this.#lastWalResetCheck = now;
+    try { if (this.walBytes() <= this.#walResetBytes) return; } catch { return; }
+    const lock = path.join(this.root, WAL_RESET_LOCK);
+    if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS)) return;
+    this.#walResetting = true;
+    void this.#resetWal()
+      .catch(() => { this.#stats.checkpoints.failed += 1; })
+      .finally(() => {
+        this.#walResetting = false;
+        try { fs.rmSync(lock, { force: true }); } catch { /* stale after WAL_RESET_LOCK_STALE_MS */ }
+      });
+  }
+
+  // Short TRUNCATE attempts between event-loop turns, for at most WAL_RESET_BUDGET_MS. A busy attempt
+  // raises the checkpoint flag (writers yield), so no new frames arrive and the old readers drain.
+  async #resetWal(): Promise<void> {
+    const flag = path.join(this.root, CHECKPOINT_FLAG);
+    const deadline = performance.now() + WAL_RESET_BUDGET_MS;
+    let flagged = false;
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve)); // after the writer's own continuation
+      for (;;) {
+        if (this.#closed) return;
+        if (!this.#inTransaction && !this.#db.isTransaction && this.#tryTruncate()) {
+          this.#stats.checkpoints.walResets += 1;
+          this.#lastWalBytes = 0;
+          return;
+        }
+        if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return; }
+        try { fs.writeFileSync(flag, `${process.pid}\n`, { mode: 0o600 }); flagged = true; } catch { /* advisory */ }
+        await delay(WAL_RESET_RETRY_MS);
+      }
+    } finally {
+      if (flagged) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+      if (!this.#closed) this.walBytes();
+    }
+  }
+
+  // One TRUNCATE with a 2 ms busy handler: true when the WAL was reset.
+  #tryTruncate(): boolean {
+    this.#db.exec(`PRAGMA busy_timeout = ${WAL_RESET_BUSY_MS}`);
+    try {
+      const result = this.#sql.checkpointTruncate.get() ?? {};
+      return Number(result.busy ?? 1) === 0;
+    } catch (error) {
+      if (!isBusy(error)) throw error;
+      return false;
+    } finally {
+      this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
+    }
+  }
 }
+
+// An advisory try-lock file (O_EXCL); one older than `staleMs` belongs to a crashed holder and is replaced.
+const tryLockFile = (file: string, staleMs: number): boolean => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.closeSync(fs.openSync(file, "wx", 0o600));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      const stat = fs.statSync(file, { throwIfNoEntry: false });
+      if (stat && Date.now() - stat.mtimeMs <= staleMs) return false;
+      if (stat) try { fs.rmSync(file, { force: true }); } catch { return false; }
+    }
+  }
+  return false;
+};
 
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));
 

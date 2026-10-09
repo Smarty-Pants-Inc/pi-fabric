@@ -38,8 +38,10 @@
  * `await sync()` after it: a PASSIVE checkpoint (no writer lock) that confirms the WAL is synced
  * through that commit, or throws when it cannot within its budget.
  *
- * Checkpoints (review-opus P2-1): `wal_autocheckpoint=0` on every connection, so no client commit
- * runs a checkpoint. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
+ * Checkpoints (smarty-dev#6477, replacing review-opus P2-1's `wal_autocheckpoint=0`): every connection
+ * keeps SQLite's built-in autocheckpoint (`WAL_AUTOCHECKPOINT_PAGES`, ~4 MiB). It is PASSIVE and runs on
+ * the committing connection right after its COMMIT, so it never blocks another writer; with it off and
+ * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
  * maintenance holder, tests) checkpoints on an unref'd timer: PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
  * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
@@ -1394,6 +1396,32 @@ export class SqliteStateStore {
 
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));
 
+// SQLite's default: a PASSIVE checkpoint after the COMMIT that takes the WAL past ~4 MiB (4 KiB pages).
+const WAL_AUTOCHECKPOINT_PAGES = 1000;
+
+const SEEDED_META = ["schema", "backend", "epoch", "store_id", "high_water", "commit_no", "state_bytes", "tombstone_ord"];
+
+// The identity of an initialised database from plain reads (no write lock), or undefined when any seeded
+// row is missing. smarty-dev#6477: a restart on a busy hub must not contend for BEGIN IMMEDIATE.
+const readIdentity = (db: SqliteConnection): { schema: number; backend: string; epoch: number; storeId: string } | undefined => {
+  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'changes'").get() === undefined) return undefined;
+  const values = new Map<string, unknown>();
+  for (const row of db.prepare(`SELECT name, value FROM meta WHERE name IN (${SEEDED_META.map(() => "?").join(", ")})`).all(...SEEDED_META)) {
+    values.set(String(row.name), row.value);
+  }
+  if (SEEDED_META.some((name) => values.get(name) === undefined || values.get(name) === null)) return undefined;
+  return { schema: Number(values.get("schema")), backend: String(values.get("backend")), epoch: Number(values.get("epoch")),
+    storeId: String(values.get("store_id")) };
+};
+
+const checkIdentity = (identity: { schema: number; backend: string; epoch: number; storeId: string }): { epoch: number; storeId: string } => {
+  if (identity.schema !== SCHEMA_VERSION) {
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state schema ${identity.schema} is not supported (expected ${SCHEMA_VERSION})`);
+  }
+  if (identity.backend !== "sqlite") throw new MeshStateRetiredError(identity.backend, identity.epoch, identity.epoch);
+  return { epoch: identity.epoch, storeId: identity.storeId };
+};
+
 // Idempotent per-connection setup plus the one-time schema; throws BUSY for the caller to retry.
 const initialise = (db: SqliteConnection, options: SqliteStateStoreOptions): { epoch: number; storeId: string } => {
   db.exec(`PRAGMA busy_timeout = ${clampBusy(options.busyTimeoutMs)}`);
@@ -1402,9 +1430,12 @@ const initialise = (db: SqliteConnection, options: SqliteStateStoreOptions): { e
     throw new MeshStateUnsupportedError(`Fabric mesh SQLite state could not enter WAL mode (${String(mode?.journal_mode)})`);
   }
   db.exec("PRAGMA synchronous = NORMAL");
-  db.exec("PRAGMA wal_autocheckpoint = 0");
+  db.exec(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
   db.exec(`PRAGMA journal_size_limit = ${Math.max(0, Math.floor(options.journalSizeLimitBytes ?? 16 * 1024 * 1024))}`);
   db.exec("PRAGMA trusted_schema = OFF");
+  // smarty-dev#6477: an initialised database opens with plain reads; only a missing schema takes the write lock.
+  const existing = readIdentity(db);
+  if (existing) return checkIdentity(existing);
   db.exec("BEGIN IMMEDIATE");
   db.exec(SCHEMA);
   const seed = db.prepare("INSERT OR IGNORE INTO meta(name, value) VALUES (?, ?)");

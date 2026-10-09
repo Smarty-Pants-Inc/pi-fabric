@@ -26,7 +26,7 @@
  * `iface-changes.md`.
  */
 import path from "node:path";
-import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
@@ -277,10 +277,28 @@ export const isMeshStateBusy = (error: unknown): error is MeshStateBusy =>
 
 const SQLITE_BUSY = 5;
 const SQLITE_LOCKED = 6;
-const sqliteBusy = (error: unknown): boolean => {
+/** A raw driver SQLITE_BUSY / SQLITE_LOCKED ("database is locked"), any extended code. */
+export const isSqliteBusy = (error: unknown): boolean => {
   const code = (error as { errcode?: unknown } | null)?.errcode;
   return typeof code === "number" && ((code & 0xff) === SQLITE_BUSY || (code & 0xff) === SQLITE_LOCKED);
 };
+const sqliteBusy = isSqliteBusy;
+
+/**
+ * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, or a
+ * raw SQLite busy error that escaped a path without its own mapping. Never fatal for a long-lived loop.
+ */
+export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error);
+
+/** Wraps a raw SQLite busy error as the retryable `MeshStateBusyError` (a `MeshLockTimeoutError`). */
+export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1, waitedMs = 0, where = "read"): MeshStateBusyError => {
+  const timeout = new MeshLockTimeoutError(` (SQLite state ${database}, ${where})`, attempts, 0);
+  timeout.cause = error;
+  return new MeshStateBusyError(database, waitedMs, timeout);
+};
+
+// Synchronous reads: a few short retries (<= ~15 ms on the event loop), then the retryable busy error.
+const READ_BUSY_RETRIES = 5;
 
 // Only for the first synchronous read of a process: one database open, bounded to ~50 ms.
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -391,31 +409,35 @@ export class SqliteStateBackend implements StateBackend {
   get readCacheRemainingMs(): number { return 0; }
 
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
-    const pinned = this.#pinned(options);
-    if (!pinned) return this.#open().get(key);
-    validateMeshStateKey(key);
-    const entry = pinned.entries.get(key);
-    return entry ? jsonClone(entry) : undefined;
+    return this.#read(() => {
+      const pinned = this.#pinned(options);
+      if (!pinned) return this.#open().get(key);
+      validateMeshStateKey(key);
+      const entry = pinned.entries.get(key);
+      return entry ? jsonClone(entry) : undefined;
+    });
   }
 
   list(prefix = "", limit = 100, options: MeshReadOptions = {}): MeshStateEntry[] {
     const bounded = Math.max(1, Math.min(Math.floor(limit), this.#context.maxReadEvents));
-    return this.#select(prefix, options).slice(0, bounded).map((entry) => jsonClone(entry));
+    return this.#read(() => this.#select(prefix, options).slice(0, bounded).map((entry) => jsonClone(entry)));
   }
 
   listAll(prefix = "", options: MeshReadOptions = {}): MeshStateEntry[] {
-    const pinned = this.#pinned(options);
-    if (!pinned) return this.#open().listAll(prefix);
-    return this.#select(prefix, options).map((entry) => jsonClone(entry));
+    return this.#read(() => {
+      const pinned = this.#pinned(options);
+      if (!pinned) return this.#open().listAll(prefix);
+      return this.#select(prefix, options).map((entry) => jsonClone(entry));
+    });
   }
 
   listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
-    return this.#select(prefix, options);
+    return this.#read(() => this.#select(prefix, options));
   }
 
   /** One consistent snapshot, reused while the commit stamp is unchanged. */
   stateToken(_options: MeshReadOptions = {}): object {
-    return this.#current();
+    return this.#read(() => this.#current());
   }
 
   stateStamp(): string | undefined {
@@ -470,7 +492,7 @@ export class SqliteStateBackend implements StateBackend {
           results: results.map((result) => ({ ...result })),
           changed: results.filter((result) => result.applied).map((result) => result.key),
           stamp: this.stateStamp(),
-          view: snapshotView(() => (captured ??= this.#current())),
+          view: snapshotView(() => (captured ??= this.#read(() => this.#current()))),
         });
       }
       return results;
@@ -482,7 +504,7 @@ export class SqliteStateBackend implements StateBackend {
   }
 
   withWriteFence<T>(operation: () => T): T {
-    const store = this.#open();
+    const store = this.#read(() => this.#open());
     let entered = false;
     try {
       return store.fenceSync(() => { entered = true; return operation(); });
@@ -510,6 +532,22 @@ export class SqliteStateBackend implements StateBackend {
   }
 
   // ------------------------------------------------------------ internals
+
+  // smarty-dev#6477: a synchronous read (and the open under it) never throws a raw "database is locked":
+  // a busy read retries briefly, then throws the retryable MeshStateBusyError every caller already retries.
+  #read<T>(read: () => T): T {
+    const started = performance.now();
+    for (let attempt = 0; ; attempt += 1) {
+      try { return read(); } catch (error) {
+        if (!sqliteBusy(error)) throw error;
+        if (attempt >= READ_BUSY_RETRIES) {
+          this.#busyTimeouts += 1;
+          throw meshStateBusyFrom(this.database, error, attempt + 1, performance.now() - started);
+        }
+        sleepSync(1 + attempt);
+      }
+    }
+  }
 
   #pinned(options: MeshReadOptions): SqliteSnapshot | undefined {
     const token = options.snapshot;
@@ -555,7 +593,11 @@ export class SqliteStateBackend implements StateBackend {
         this.#store = SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions);
         return this.#store;
       } catch (error) {
-        if (!sqliteBusy(error) || attempt >= 25) throw error;
+        if (!sqliteBusy(error)) throw error;
+        if (attempt >= 25) {
+          this.#busyTimeouts += 1;
+          throw meshStateBusyFrom(this.database, error, attempt + 1, 0, "first open");
+        }
         sleepSync(1 + attempt % 2);
       }
     }
@@ -640,6 +682,10 @@ export class SqliteStateBackend implements StateBackend {
       if (error instanceof MeshLockTimeoutError && !(error instanceof MeshStateBusyError)) {
         this.#busyTimeouts += 1;
         throw new MeshStateBusyError(store?.file ?? this.database, performance.now() - started, error);
+      }
+      if (sqliteBusy(error)) {
+        this.#busyTimeouts += 1;
+        throw meshStateBusyFrom(store?.file ?? this.database, error, 1, performance.now() - started, "write");
       }
       throw error;
     }

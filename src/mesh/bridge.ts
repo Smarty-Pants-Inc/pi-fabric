@@ -12,7 +12,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { isMeshStateBusy } from "./state-backend.js";
+import { isMeshRetryableBusy, isMeshStateBusy } from "./state-backend.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -754,7 +754,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           } catch (error) {
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshLockTimeout(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+              ...(isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
           }
         });
@@ -1110,7 +1110,7 @@ export class MeshBridge {
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
-    const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];
+    const failure = failures.find((result) => !isMeshRetryableBusy(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
@@ -1371,7 +1371,8 @@ export class MeshBridge {
         delay = this.options.pollMs ?? DEFAULT_POLL_MS;
       } catch (error) {
         if (this.#stopped) return;
-        if (!isMeshLockTimeout(error)) throw error;
+        // smarty-dev#6477: a raw SQLite busy is contention too, never a reason to stop the bridge.
+        if (!isMeshRetryableBusy(error)) throw error;
         delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reportedTimeout) {

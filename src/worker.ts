@@ -41,7 +41,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -726,6 +726,18 @@ const main = async (): Promise<void> => {
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
+  let completedToolInTurn = false;
+  let hasCompletedToolTurn = false;
+
+  // Only ordinary tasks with real, completed tool work and retained prose can
+  // return an interrupted report. Never turn cancellation, schema/admission
+  // failures, lost events, or an actor directive into a successful task.
+  const canKeepInterruptedOutput = (error: string): boolean => options.runner === "pi" &&
+    !options.actorId && hasCompletedToolTurn && Boolean(record.partialText || record.lastCompleteText) &&
+    modelControl.ready && !providerAborted && !lostResult && !record.errorCode &&
+    terminalStatus !== "stopped" && terminalStatus !== "timed_out" &&
+    record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight" &&
+    record.compaction?.status !== "failed" && interruptedModelStreamError(error);
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
@@ -1448,11 +1460,29 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
     }
+    if (event.type === "message_start" && !terminalStatus &&
+        (event.message as Record<string, unknown> | undefined)?.role === "assistant") {
+      delete record.partialText;
+      hasFinalText = false;
+      hasFinalResult = false;
+      update(); // Keep lastCompleteText from the previous turn on disk.
+    }
     if (event.type === "message_update" && !terminalStatus) {
-      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      const delta = (event.assistantMessageEvent ?? event.event) as Record<string, unknown> | undefined;
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
           typeof delta.delta === "string" && delta.delta.length > 0) {
         if (!record.inferenceStarted) { record.inferenceStarted = true; update(); }
+      }
+      const message = event.message as Record<string, unknown> | undefined;
+      // Native Pi repeats the complete partial message; legacy frames may only
+      // carry a delta. Never append both, or include thinking/tool arguments.
+      const text = message?.role === "assistant" ? extractText(message)
+        : delta?.type === "text_delta" && typeof delta.delta === "string"
+        ? (record.partialText ?? "") + delta.delta : "";
+      if (text) {
+        record.partialText = latestRunText(text);
+        record.text = record.partialText;
+        update(); // Atomic status.json replacement on every text snapshot.
       }
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
@@ -1528,6 +1558,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      completedToolInTurn = true;
       if (event.isError === true) {
         emitLifecycle("pi.tool_error", {
           ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
@@ -1540,6 +1571,8 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "turn_end") {
+      hasCompletedToolTurn ||= completedToolInTurn;
+      completedToolInTurn = false;
       emitLifecycle("pi.turn_end", {
         ...(typeof event.turnIndex === "number" ? { turnIndex: event.turnIndex } : {}),
       });
@@ -1573,7 +1606,15 @@ const main = async (): Promise<void> => {
       producedFinalAnswer ||= hasFinalText;
       if (text) {
         record.text = latestRunText(text);
+        if (messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+          record.partialText = record.text;
+        } else {
+          record.lastCompleteText = record.text;
+        }
         process.stdout.write(`\n${text}\n`);
+      }
+      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+        delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
       applyUsage(record, messageRecord);
@@ -2024,6 +2065,9 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_whitespace_toolcall_retry", ...resume })}\n`);
       toolCallStreamGuard = createToolCallStreamGuard();
     } else {
+      // Reporting retained output must not invoke another model to regenerate
+      // the final answer or replay any already-completed tool work (#7567).
+      if (canKeepInterruptedOutput(terminalError ?? stderr.trim())) break;
       if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
           (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
           record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
@@ -2194,6 +2238,13 @@ const main = async (): Promise<void> => {
       (exitCode === 0
         ? `${runnerLabel(options.runner)} agent reported an error before exiting`
         : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);
+  }
+  if (record.status === "failed" && canKeepInterruptedOutput(record.error ?? "")) {
+    const warning = `final report interrupted by a model stream error; showing the last persisted output: ${record.error}`;
+    record.status = "completed"; // Existing terminal vocabulary: completed with warning.
+    record.text = `${record.partialText || record.lastCompleteText}\n\n[pi-fabric warning] ${warning}`;
+    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   if (record.status === "completed" && replyFile) {
     // The reply is the tool call's arguments, and nothing else: final text is never parsed for it,

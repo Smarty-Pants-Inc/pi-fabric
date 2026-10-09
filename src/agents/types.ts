@@ -195,6 +195,10 @@ export interface AgentRunRecord {
   inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
+  /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
+  lastCompleteText?: string;
+  /** Current Pi assistant text persisted during streaming, before message_end. */
+  partialText?: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
   replyVia?: "tool";
   value?: unknown;

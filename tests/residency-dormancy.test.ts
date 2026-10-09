@@ -174,7 +174,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const { root, config, host } = fixture();
     const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
     const identity = { id: "session:sender", name: "sender", kind: "main" as const };
-    const sender = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 5_000 });
+    const sender = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 50 });
     let woken: ResidentHost | undefined;
     const seen: string[] = [];
     try {
@@ -198,6 +198,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
           const id = "1".repeat(32); onSpawned?.({ id } as never); seen.push(request.task);
           return { id, status: "completed", text: "done", toolCalls: 0, startedAt: Date.now(), finishedAt: Date.now() } as never;
         });
+        // Cold startup exceeds the ordinary warm ACK deadline; the admitted command
+        // must retain its bounded startup budget rather than expire and get resent.
+        await sleep(250);
         woken = new ResidentHost(config, () => {});
         await woken.start();
       }));
@@ -211,6 +214,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       const result = await router.routeMessage(actor.id, "admitted direct delivery", undefined, "followUp");
       expect(result.acknowledged).toBe(true);
       expect(launches).toBe(1);
+      expect(mesh.read().filter(event => event.topic === "fabric.control.command")).toHaveLength(1);
       await until(() => seen.length === 1);
       expect(seen[0]).toContain("admitted direct delivery");
       await sleep(100);

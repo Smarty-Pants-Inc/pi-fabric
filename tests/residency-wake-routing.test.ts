@@ -117,7 +117,9 @@ describe("resident event wake routing", () => {
       expect(f.direct).not.toHaveBeenCalled();
       expect(f.launch).toHaveBeenCalledOnce();
       expect(f.control.request).toHaveBeenCalledOnce();
-      expect(f.control.request.mock.calls[0]?.slice(0, 3)).toEqual(["resident:listener", f.actorId, kind]);
+      expect(f.control.request).toHaveBeenCalledWith("resident:listener", f.actorId, kind,
+        expect.objectContaining({ message: "work" }), "resident:listener",
+        expect.objectContaining({ timeoutMs: 90_000, idempotencyKey: expect.any(String) }));
       expect(result).toMatchObject({ acknowledged: true, messageId: "once" });
       expect(f.actors.tell).not.toHaveBeenCalled();
     } finally { f.close(); }

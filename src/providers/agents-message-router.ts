@@ -650,7 +650,13 @@ export class AgentMessageRouter {
         ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
       },
       participant.ownerIdentityId,
-      { idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
+      {
+        idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null,
+        // Retained dormant authority has no live-owner ACK window yet. Its committed
+        // command must include bounded cold startup, formerly waited out in preflight.
+        ...(participant.stale ? { timeoutMs: 90_000 } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      },
     );
   }
 

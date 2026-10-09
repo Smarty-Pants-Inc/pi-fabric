@@ -59,8 +59,56 @@ runner session. Shared work must use mesh state, files, or an explicit external
 channel. Residency only keeps the execution owner available for later control
 and reconnection.
 
-The host exits after its normal idle grace once it owns no live durable actor or
-running durable agent.
+## Dormant actors and event-owned wake (#6782 / #2264)
+
+A durable actor with no in-flight activation, queued/overflow/parked/dead-letter
+work, pending ask/reset/removal, or child reply/archive custody becomes
+`dormant`. Its registry identity, subscriptions and session transcript stay on
+disk. Activation workers already close at settlement; dormancy also drops the
+completed drain and child-inbox runtime references. A new delivery returns the
+actor to `queued`, restores its transcript, and uses its ordinary serial drain.
+Session actors are unchanged. A live Main's event/directive supervisor and
+actors subscribed to still-live participants are expected, not truly idle.
+
+A host with only dormant/stopped actors, no running task, and no pending
+request, response/publication or delivery-outbox obligation exits after the
+existing **30-second** `IDLE_EXIT_MS` grace. Ponytail: this constant amortizes
+close/delivery races; it is not a worker keep-warm policy. Before exit the host
+pauses admission, checkpoints control/lifecycle and actor queues/cursors, and
+confirms the actor mesh monitor is caught up. An unconsumed event or new request
+cancels sleep. `config.json`, registry/session files, `wake-routes.json` and
+cursors survive; `owner.json` and the live processes do not.
+
+`MeshStore.publish`/`publishBatch` route wake nudges **after** the existing event
+log durability barrier. Topic/address matches, direct control targets, and
+lifecycle subscriptions select a retained residency configuration. A durable
+`wake-request.json` nudge starts the existing launcher with `--wake`; the nudge
+is not another inbox. One POSIX `wake.lock` serializes these launchers. A nudge
+racing `sleeping.json` waits for the closing owner before launching a successor.
+The sleep receipt covers earlier nudges, so the launcher exits too unless a new
+delivery crossed the final close boundary. There is no polling hostd. The live
+client watchdog explicitly ignores dormant definitions.
+
+Direct steer/followUp to a dormant registry definition first wakes and waits for
+the ordinary owner/readiness publication, then uses the existing lease-validated,
+durable command and ACK path. Wake does not grant ownership, invent a participant,
+or bypass stale-owner/bridge admission. An unacknowledged preflight is not an
+accepted delivery. Once a command is committed, its target also uses the same
+commit-before-wake hook as topic traffic.
+
+Before sleeping an actor-bearing host, residency ensures the existing file event
+archive is enabled under the mesh publication lock. It preserves an operator-selected
+archive, or creates `<mesh>/wake-archive` plus `event-archive.json` when the mesh
+previously had only a bounded live log. A bad/unavailable archive cannot authorize
+sleep. This is retention configuration, not a new inbox or state backend.
+Sleeping resident monitors replay subscribed ordinary topics from that existing
+archive as well as `fleet.*`; a replay-age window cannot drop sleeping work.
+Clean sleep/wake retains the existing queue dedupe and cursor boundaries, so
+wake-window deliveries drain once in order (unless the actor explicitly opts
+into coalescing). Crash/interrupted-run retry semantics are unchanged; this does
+not promise exactly-once external effects across arbitrary process crashes.
+Automatic wake uses the existing POSIX fence; durable Windows Pi launch remains
+unsupported as noted below. File-backed state remains the authority.
 
 ### PR #394 scope cut: recovery supervision deferred
 

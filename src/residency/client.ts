@@ -1065,7 +1065,7 @@ export class ResidencyClient {
     for (const root of actorRoots) {
       const registry = readJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
       for (const actor of registry?.actors ?? []) {
-        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") {
+        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped" && actor.status !== "dormant") {
           work.push(`actor:${root}:${actor.id}:${actor.status}`);
         }
       }

@@ -33,6 +33,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -86,6 +87,7 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
+// ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
 // The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
 // fleet-wide actor ownership view that often: that view lists every project participant and
@@ -228,6 +230,9 @@ export class ResidentHost {
   #started = false;
   #ready = false;
   #idleSince = Date.now();
+  #dormancyAt = Number.NEGATIVE_INFINITY;
+  #sleeping = false;
+  #wakeRoutesJson: string | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
   #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
@@ -688,6 +693,8 @@ export class ResidentHost {
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      this.#writeWakeRoutes();
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
@@ -1091,7 +1098,7 @@ export class ResidentHost {
     } finally {
       this.#pollingRequests = false;
       if (!retentionV2Enabled()) this.#maintainRequests();
-      this.#checkIdle();
+      await this.#checkIdle();
     }
   }
 
@@ -1150,9 +1157,47 @@ export class ResidentHost {
     return this.#activeActor.active;
   }
 
-  #checkIdle(): void {
-    if (this.#closed || this.#staged || this.#handover) return;
+  #writeWakeRoutes(): void {
+    const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
+      actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
+        .map(actor => ({ id: actor.id, name: actor.name, topics: actor.topics })) };
+    const serialized = JSON.stringify(routes);
+    if (serialized === this.#wakeRoutesJson) return;
+    writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });
+    this.#wakeRoutesJson = serialized;
+  }
+
+  #expectedActors(): Set<string> {
+    const protectedIds = new Set<string>();
+    const actors = this.actors.listOwned();
+    try {
+      const main = this.participants.get(this.config.rootId, undefined, { fresh: true });
+      for (const actor of actors) {
+        // A live Main's supervisor is expected, even between its activations.
+        if (main && (actor.events.length > 0 || actor.delivery !== "mailbox" || actor.topics.includes("fabric.participant.lifecycle"))) {
+          protectedIds.add(actor.id);
+        }
+      }
+      // A subscribed live participant can still owe this actor a reply.
+      for (const subscription of this.lifecycle.list()) {
+        if (actors.some(actor => actor.id === subscription.to) && this.participants.get(subscription.from, undefined, { fresh: true })) {
+          protectedIds.add(subscription.to);
+        }
+      }
+    } catch { for (const actor of actors) protectedIds.add(actor.id); } // uncertainty is not idle
+    return protectedIds;
+  }
+
+  async #checkIdle(): Promise<void> {
+    if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
     const now = Date.now();
+    if (now - this.#dormancyAt >= IDLE_ACTOR_CHECK_MS) {
+      this.#dormancyAt = now;
+      try {
+        this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
+        await this.actors.dormantIdleActors(this.#expectedActors());
+      } catch { this.#idleSince = now; return; }
+    }
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
@@ -1161,7 +1206,9 @@ export class ResidentHost {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
+    const pendingDelivery = this.#publications.size > 0 || this.#flushingDeliveries !== undefined ||
+      (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")));
+    if (activeActor || activeAgent || pendingRequest || pendingDelivery || this.#admissions || this.#publicationFailed) {
       this.#idleSince = now;
       return;
     }
@@ -1171,7 +1218,40 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
-    this.onIdle();
+    // Publish the closing boundary before shutting any consumer gate: a racing publisher
+    // now queues a wake whose one-shot launcher waits for this exact owner to exit.
+    this.#sleeping = true;
+    try {
+      // A bounded live log alone cannot retain a long sleeping actor's deliveries.
+      // Enable the existing file archive under the same publication lock before sleeping.
+      if (this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
+        await ensureResidentWakeArchive(this.mesh);
+      }
+      writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+        request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
+      this.#ready = false;
+      this.actors.pauseForRelease();
+      this.control.pause();
+      this.lifecycle.pause();
+      await this.control.checkpointForRelease();
+      await this.lifecycle.checkpointForRelease();
+      await this.#backgroundDeliveries.checkpointForRelease();
+      await this.actors.checkpointForRelease();
+      if (this.#closed || this.#admissions || this.#publications.size || this.actors.hasActiveDurableActor() ||
+          !this.actors.meshCaughtUp() || [this.#requestsPath, this.#processingPath].some(directory =>
+            fs.readdirSync(directory).some(entry => entry.endsWith(".json")))) throw new Error("Resident acquired work before dormancy");
+      this.onIdle();
+    } catch {
+      this.#sleeping = false;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      if (!this.#closed) {
+        this.#ready = true;
+        this.actors.resumeAfterRelease();
+        this.control.resume();
+        this.lifecycle.resume();
+        this.#idleSince = Date.now();
+      }
+    }
   }
 
   #trackPublication(promise: Promise<unknown>): void {

@@ -414,7 +414,7 @@ export class ResidentRequestRetention {
           if (!Array.isArray(registry?.actors) || !registry.actors.every(actor => actor && typeof actor.id === "string")) throw new Error("Unreadable resident actor reference");
           const actor = registry.actors.find(actor => actor.id === decision.id);
           if (actor) {
-            if (!["idle", "queued", "running", "stopped"].includes(String(actor.status))) throw new Error("Unknown resident actor status");
+            if (!["dormant", "idle", "queued", "running", "stopped"].includes(String(actor.status))) throw new Error("Unknown resident actor status");
             // Stopped closes admission; it does not join an executing writer.
             // Only the owning host's full writer/drain snapshot can clear this row.
             if (actor.status !== "stopped" || actor.removal !== undefined || !stoppedWritersGone.has(decision.id!)) return false;

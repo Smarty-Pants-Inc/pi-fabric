@@ -1803,13 +1803,13 @@ export class AgentsProvider implements FabricProvider {
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
     const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
-    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
+    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: actor.status === "dormant" ? "dormant" : "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
     const run = live.actorRun;
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
-    const status = live.status === "idle" || live.status === "queued" ||
+    const status = live.status === "dormant" || live.status === "idle" || live.status === "queued" ||
       live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {

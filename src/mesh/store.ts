@@ -327,12 +327,28 @@ export class MeshStore {
 
   // Events (event-log.ts).
 
-  publish(input: MeshPublishInput): Promise<MeshEvent> {
-    return this.#events.publish(input);
+  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+    const event = await this.#events.publish(input);
+    await this.#wakeAfterPublish([event]);
+    return event;
   }
 
-  publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
-    return this.#events.publishBatch(inputs);
+  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    const events = await this.#events.publishBatch(inputs);
+    await this.#wakeAfterPublish(events);
+    return events;
+  }
+
+  async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
+    if (!events.length || !fs.existsSync(path.join(this.root, "residency"))) return;
+    try {
+      const { wakeResidentActors } = await import("../residency/wake.js");
+      await wakeResidentActors(this, events);
+    } catch (error) {
+      // Already committed: throwing would invite a duplicate publish. The wake request and
+      // archived event remain retryable; report failure rather than inventing delivery.
+      console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
+    }
   }
 
   read(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): MeshEvent[] {

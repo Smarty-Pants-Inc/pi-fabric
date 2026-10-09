@@ -111,7 +111,7 @@ export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -348,6 +348,7 @@ export class AgentMessageRouter {
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
+    if (!provenLocal) await this.#wakeActorDefinition(id);
     let result: FabricAgentMessageResult;
     try {
       result = provenLocal
@@ -791,11 +792,27 @@ export class AgentMessageRouter {
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
   async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    await this.#wakeActorDefinition(id);
     return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id);
+  }
+
+  async #wakeActorDefinition(id: string): Promise<void> {
+    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
+    if (!meshRoot || id.trim().startsWith("session:") || this.mainAgent.matches(id)) return;
+    let actor: FabricActorInfo | undefined;
+    try { actor = this.actorManager.status(id); } catch { return; }
+    // Failed is a public routing overlay: its persisted runtime may still be dormant.
+    // An explicit repair/probe must be able to wake it without changing failure filtering.
+    if (!["dormant", "failed", "failing-preparation"].includes(actor.status) || this.actorManager.owns?.(actor.id)) return;
+    const { wakeDormantActor } = await import("../residency/wake.js");
+    await wakeDormantActor(meshRoot, actor.id);
   }
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
+    // A dormant definition intentionally has no live participant. Wake before the
+    // usual lease resolution, then revalidate the newly published owner normally.
+    await this.#wakeActorDefinition(id);
     const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&

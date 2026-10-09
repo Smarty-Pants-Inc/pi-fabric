@@ -698,6 +698,7 @@ export class ActorManager {
       cursorPath: options.meshCursorPath,
       canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
+      replayAll: options.claimResidency === "durable",
       beforePoll: () => {
         if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
         // Initial publication may have outlived the first deferred slice (or
@@ -942,12 +943,49 @@ export class ActorManager {
       .map((actor) => this.#publicInfo(actor));
   }
 
+  /** Dormancy releases runtime references, not identity, subscriptions or the durable transcript. */
+  async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
+    if (!this.#persistent || this.#closing || this.#releasePaused) return 0;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    const sleeping: ManagedActor[] = [];
+    for (const actor of this.#actors.values()) {
+      if (!this.#canManageCached(actor.id) || actor.residency !== "durable" || actor.status !== "idle" ||
+          protectedIds.has(actor.id) || actor.draining || actor.abortController || actor.inFlightRun || actor.preparing ||
+          actor.removal || this.#inFlight.has(actor.id) || this.#draining.has(actor.id) || actor.queue.length ||
+          this.#overflow.get(actor.id)?.length || this.#parked.get(actor.id)?.length ||
+          this.#deferredHandoffs.get(actor.id)?.length || this.#pendingHandoffConsumption.get(actor.id)?.size ||
+          this.#pendingResets.has(actor.id) || this.#pendingRunArchives.get(actor.id)?.size ||
+          this.#deadLetterCount(actor.id) || this.#childCompletionStore(actor).hasPendingReply()) continue;
+      if (!this.#persistQueue(actor.id, true, true)) continue;
+      actor.status = "dormant";
+      actor.updatedAt = Date.now();
+      sleeping.push(actor);
+    }
+    if (!sleeping.length) return 0;
+    try { await this.#saveActors(new Set(), { durable: true, flush: true }); }
+    catch (error) {
+      for (const actor of sleeping) if (actor.status === "dormant") actor.status = "idle";
+      throw error;
+    }
+    for (const actor of sleeping) {
+      if (actor.status !== "dormant") continue; // Delivery may arrive during the registry commit.
+      delete actor.drain;
+      this.#childCompletionStores.delete(actor.sessionFile);
+      void this.#publishPresence(actor).catch(() => undefined);
+    }
+    this.#emitChange();
+    return sleeping.filter(actor => actor.status === "dormant").length;
+  }
+
+  meshCaughtUp(): boolean { return this.#meshMonitor.caughtUp(); }
+
   /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
   hasActiveDurableActor(): boolean {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()].some(actor =>
-      this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped");
+      this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status !== "stopped" && actor.status !== "dormant");
   }
 
   /** Prepared synchronously before the host publication fence; its registry
@@ -2478,7 +2516,7 @@ export class ActorManager {
         for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
       }
       for (const actor of owned) {
-        if (actor.status !== "stopped") actor.status = "idle";
+        if (actor.status !== "stopped" && actor.status !== "dormant") actor.status = "idle";
         actor.updatedAt = Date.now();
       }
       if (owned.length > 0) await this.#saveActorsAtClose();
@@ -4731,7 +4769,7 @@ export class ActorManager {
       // A temporary hole during revocation is not an invitation to resurrect the registry row.
       if (this.#removeCalls.has(record.id) || this.#removals.has(record.id) || this.#finishCalls.has(record.id) || this.#revoked.has(record.id)) continue;
       if (onlyMissing && this.#actors.has(record.id)) continue;
-      const status = record.status === "stopped" ? "stopped" : "idle";
+      const status = record.status === "stopped" ? "stopped" : record.status === "dormant" ? "dormant" : "idle";
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
         record.delivery === "followUp" ||

@@ -9,6 +9,8 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath } from "./wake.js";
+import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
@@ -611,9 +613,35 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   }
 }
 
+/** Event-owned launcher: contenders exit, and no process survives an idle host. */
+export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = supervise): Promise<void> {
+  const root = path.dirname(configPath);
+  let fd: number;
+  try { fd = await lockFile(path.join(root, "wake.lock"), 0, process.platform === "linux"); }
+  catch (error) { if (error instanceof FileLockBusy) return; throw error; }
+  try {
+    for (;;) {
+      const deadline = Date.now() + 90_000;
+      // A delivery can arrive after the closing gate. Wait for the owner, not a grace timer.
+      while (residentOwnerLive(root)) {
+        if (!residentOwnerSleeping(root)) return;
+        if (Date.now() >= deadline) throw new Error("Resident sleep/wake owner did not exit");
+        await delay(50);
+      }
+      await run(configPath); // exactly the normal launcher start and native child custody
+      if (process.exitCode || residentOwnerLive(root)) return;
+      const sleeping = readWakeJson<{ request?: unknown }>(residentSleepingPath(root));
+      const request = readWakeJson<unknown>(residentWakeRequestPath(root));
+      // The host's close checkpoint covered all older nudges. Only a delivery racing
+      // its final sleep boundary starts another generation; never keep an idle host warm.
+      if (!sleeping || JSON.stringify(sleeping.request) === JSON.stringify(request)) return;
+    }
+  } finally { fs.closeSync(fd); }
+}
+
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isMain) {
   const configPath = parseConfigPath(process.argv);
-  try { await supervise(configPath); }
+  try { await (process.argv.includes("--wake") ? superviseWake(configPath) : supervise(configPath)); }
   catch (error) { writeFailure(path.dirname(configPath), error); process.exitCode = 1; }
 }

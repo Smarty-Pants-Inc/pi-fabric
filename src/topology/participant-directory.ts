@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
@@ -271,6 +272,23 @@ const remoteHostValid = (value: unknown): boolean =>
 
 const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   keys.every((key) => value[key] === undefined || typeof value[key] === "string");
+
+let ownProcessIdentity: { pid: number; host: string; startTime?: string } | undefined;
+/** This process's identity, read once: stable for the process's life. */
+const ownMainProcess = (): { pid: number; host: string; startTime?: string } => {
+  if (!ownProcessIdentity) {
+    // Linux /proc/<pid>/stat field 22 (start ticks), after comm; the same value residency's processStartTime reads.
+    let startTime: string | undefined;
+    if (process.platform === "linux") {
+      try {
+        const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+        startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      } catch { /* unknown: the record carries no start time */ }
+    }
+    ownProcessIdentity = { pid: process.pid, host: os.hostname(), ...(startTime ? { startTime } : {}) };
+  }
+  return ownProcessIdentity;
+};
 
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
@@ -1501,6 +1519,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: main.updatedAt,
       pendingMessages: main.pendingMessages,
       controlProtocol: "v1",
+      mainProcess: ownMainProcess(),
     };
   }
 

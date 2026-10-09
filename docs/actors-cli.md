@@ -6,8 +6,27 @@ Run on the resident's machine, as its OS user, from any Fabric session or shell:
 fabric-actors stop --resident <directory-or-prefix> --actor <id-or-name> --dry-run
 # After the manual check below, use the exact rootId printed by dry-run:
 fabric-actors stop --resident <directory-or-prefix> --actor <id-or-name> --confirm-dead-root <rootId>
-fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --confirm-dead-root <rootId>
+fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --confirm-dead-root <rootId> \
+  --main-stopped --evidence-file <herdr-and-ps-check.txt>
 ```
+
+## Remove: `--main-stopped` is an operator attestation (smarty-dev#7817)
+
+`remove` also needs `--main-stopped` with `--evidence <text>` or `--evidence-file <path>` (text, capped at
+64 KiB). **`--main-stopped` is an OPERATOR ATTESTATION, not a machine proof.** Chief-of-staff accepted it on
+2026-10-09 for the operator of the dead Main's own fleet, or Light for the #7231 waves. The automatic proof is
+**smarty-dev#7956**. The evidence (the Herdr pane/agent listing and the process check for that Main's session) is
+kept as `operatorAttestation`, with the operator (`$USER`, `PI_FABRIC_AGENT_NAME` or session id), the root id and
+the time. The tool adds its own observation at removal time (`toolEvidence`): every root participant record
+(pid, host, release, last seen), a `/proc/<pid>` check of each pid on this host with its start time against
+the record, the owner lease state, and the time. The record is archived as `<id>.operator.json` (in
+`SHA256SUMS`, beside the actor's tar and registry row) and, offline, kept in the removal record.
+
+The attestation never overrides an observation: a live root lease (other than the resident's own heartbeat),
+a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When
+the resident host itself is dead, `remove` runs offline under its `host.lock` fence (dead holders, a claimable
+flock, no waiter), re-checking before each destructive step. Where file ownership cannot be proven
+(no `getuid`, Windows) remove refuses (smarty-dev#7858).
 
 A bare directory prefix searches `$PI_FABRIC_MESH_ROOT/residency`; alternatively
 pass `--mesh-root`. Without either, the default is

@@ -307,6 +307,14 @@ const digest = (value: string): string =>
 export const residentHostId = (rootId: string): string =>
   `resident:${digest(rootId).slice(0, 24)}`;
 
+/** The resident's project and session actor registry roots (shared by the host and the offline remove). */
+export const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
+  config.sessionActorRoot
+    ? { project: config.actorRoot, session: config.sessionActorRoot }
+    : config.mesh.actorScope === "session"
+      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+
 export const isResidentHostId = (id: string): boolean => /^resident:[0-9a-f]{24}$/.test(id);
 
 export const residentRoot = (meshRoot: string, rootId: string): string =>
@@ -559,6 +567,8 @@ export interface ResidentOperatorActorCommand {
   id: string;
   dryRun?: boolean;
   confirmDeadRoot?: string;
+  /** remove: the operator's audited assertion that the root's Main process is gone (smarty-dev#7817). */
+  mainStoppedAudit?: unknown;
   requestId: string;
   rootId: string;
   createdAt: number;

@@ -141,7 +141,7 @@ export class ResidentActorClient {
 
   /** Same-user operator control; the resident executor requires root confirmation and vetoes live leases. */
   async operatorActor(action: "stop" | "remove", id: string,
-    options: { dryRun?: boolean; confirmDeadRoot?: string } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: unknown } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "operatorActor",
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
@@ -160,9 +160,14 @@ export class ResidentActorClient {
     registerResidentCancellation(signal, this.#residencyDir, command);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
+    let responseWatcher: fs.FSWatcher | undefined;
     try {
       writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
       const deadline = Date.now() + this.commandTimeoutMs;
+      // Event-driven: a write in the responses directory wakes the wait at once. ponytail: the short
+      // timed re-check stays as the fallback for a missed watch event (fs.watch is best effort).
+      let wake: (() => void) | undefined;
+      try { responseWatcher = fs.watch(this.#responsesPath, { persistent: false }, () => wake?.()); } catch { /* polled */ }
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Resident host actor request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
@@ -186,7 +191,8 @@ export class ResidentActorClient {
         }
         const owner = readJson<{ pid?: number }>(this.#ownerPath);
         if (!owner?.pid) throw new Error("Root resident host exited during actor request");
-        await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
+        await new Promise<void>(resolve => { wake = resolve; void sleepUnlessAborted(STATUS_POLL_MS, signal).then(resolve, resolve); });
+        wake = undefined;
       }
       const note = residentHostStateNote(this.#residencyDir);
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
@@ -205,6 +211,6 @@ export class ResidentActorClient {
       }
       if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
-    }
+    } finally { responseWatcher?.close(); }
   }
 }

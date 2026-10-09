@@ -17,6 +17,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 beforeEach(() => installInProcessResidentFence());
+// ponytail: actor removal refuses where file ownership cannot be proven (no process.getuid, i.e. Windows);
+// Windows owner proof is smarty-dev#7858. Tests that complete a removal skip there.
+const ownershipProvable = typeof process.getuid === "function";
 const waitFor = (predicate: () => boolean) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 15_000, interval: 30 });
 const fixture = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-operator-"));
@@ -35,15 +38,18 @@ const fixture = async () => {
   const host = new ResidentHost(config, () => {});
   try { await host.start(); } catch (error) { await host.close(); throw error; }
   const confirm = ["--confirm-dead-root", config.rootId];
+  const mainStopped = ["--main-stopped", "--evidence", "herdr agent list / ps: no Main for this session"];
   const cli = async (action: "stop" | "remove", actor: string, flags: string[] = [], resident = config.residencyRoot) => {
     let out = "", err = "";
+    // smarty-dev#7817: a confirmed remove also carries the operator's audited --main-stopped assertion.
+    if (action === "remove" && flags.includes(config.rootId)) flags = [...flags, ...mainStopped];
     const code = await main([action, "--resident", resident, "--actor", actor, "--mesh-root", meshRoot, ...flags],
       { out: text => { out += text; }, err: text => { err += text; } });
     return { code, out, err };
   };
   const create = (name: string) => host.actors.create({ name, instructions: "Run", model: "fixture/visible",
     residency: "durable", transport: "process", extensions: false });
-  return { root, host, config, cli, create, confirm, close: async () => {
+  return { mainStopped, root, host, config, cli, create, confirm, close: async () => {
     for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true);
     await host.close(); fs.rmSync(root, { recursive: true, force: true });
   } };
@@ -51,7 +57,7 @@ const fixture = async () => {
 
 // These are native-platform tests: no /proc census, platform mocks or skips.
 describe("same-user resident actor operator", () => {
-  it("confirmed CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
+  it.skipIf(!ownershipProvable)("confirmed CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
     const f = await fixture();
     try {
       const victim = await f.create("victim"), survivor = await f.create("survivor");
@@ -83,7 +89,7 @@ describe("same-user resident actor operator", () => {
     } finally { await f.close(); }
   }, 40_000);
 
-  it("remove an in-flight actor uses terminal drain, normal registry revocation and presence cleanup", async () => {
+  it.skipIf(!ownershipProvable)("remove an in-flight actor uses terminal drain, normal registry revocation and presence cleanup", async () => {
     const f = await fixture();
     try {
       const victim = await f.create("remove-running"), survivor = await f.create("other");
@@ -179,7 +185,7 @@ describe("same-user resident actor operator", () => {
     } finally { await directory.close(); await f.close(); }
   }, 30_000);
 
-  it.each(["directory", "symlink"] as const)("a same-name CWD %s never redirects packaged stop/remove to another valid resident", async kind => {
+  it.skipIf(!ownershipProvable).each(["directory", "symlink"] as const)("a same-name CWD %s never redirects packaged stop/remove to another valid resident", async kind => {
     const f = await fixture();
     let other: Awaited<ReturnType<typeof fixture>> | undefined;
     const run = promisify(execFile);
@@ -195,7 +201,7 @@ describe("same-user resident actor operator", () => {
       }
       for (const action of ["stop", "remove"] as const) {
         const result = await run(process.execPath, [path.resolve("bin/fabric-actors"), action,
-          "--resident", selector, "--actor", target.name, ...f.confirm], {
+          "--resident", selector, "--actor", target.name, ...f.confirm, ...(action === "remove" ? f.mainStopped : [])], {
           cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
         });
         expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
@@ -215,6 +221,7 @@ describe("same-user resident actor operator", () => {
   }, 40_000);
 
   it.each(["stop", "remove"] as const)("%s requires missing/mismatched/matching exact root confirmation", async action => {
+    if (action === "remove" && !ownershipProvable) return; // smarty-dev#7858
     const f = await fixture();
     try {
       const actor = await f.create("confirm-target");
@@ -255,6 +262,7 @@ describe("same-user resident actor operator", () => {
   }, 30_000);
 
   it.each(["stop", "remove"] as const)("%s rechecks the current lease immediately before actor commit", async action => {
+    if (action === "remove" && !ownershipProvable) return; // smarty-dev#7858
     const f = await fixture();
     try {
       const actor = await f.create("lease-race"), stop = f.host.actors.stop.bind(f.host.actors);
@@ -300,7 +308,7 @@ describe("same-user resident actor operator", () => {
     } finally { await f.close(); }
   }, 30_000);
 
-  it("packaged bin requires confirmation, supports dry-run and normal removal, and exits cleanly for unknown ids", async () => {
+  it.skipIf(!ownershipProvable)("packaged bin requires confirmation, supports dry-run and normal removal, and exits cleanly for unknown ids", async () => {
     const f = await fixture(), run = promisify(execFile);
     const argv = (action: string, id: string) => [path.resolve("bin/fabric-actors"), action,
       "--resident", f.config.residencyRoot, "--actor", id, "--mesh-root", f.config.meshRoot];
@@ -309,7 +317,7 @@ describe("same-user resident actor operator", () => {
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
       const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run"]);
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
-      const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
+      const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm, ...f.mainStopped]);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
       await f.host.participants.refresh();
       expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();

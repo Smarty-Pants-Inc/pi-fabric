@@ -876,6 +876,30 @@ if (reviewer) await agents.setCoalesceKey({ id: reviewer.id, coalesceKey: "paylo
 
 Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setCoalesceKey` to clear it.
 
+#### Minimum interval for settlement observations
+
+For a supervisor that should not wake on every rapid settlement, pass an optional minimum interval with leading and trailing admission to `agents.create`:
+
+```ts
+const supervisor = await agents.create({
+  name: "settlement-supervisor",
+  instructions: "Review meaningful progress; otherwise remain silent.",
+  events: ["agent_settled", "tool_error"],
+  responseMode: "directive",
+  activation: { minIntervalMs: 30_000 },
+});
+```
+
+`activation.minIntervalMs` is a non-negative safe integer in milliseconds. Omit `activation` (the default), or use `0`, to keep today's behavior. It applies **only to host `agent_settled` observations**, independently for each actor and source agent session. The first event is admitted immediately. Events from that same source inside the interval are held before queueing: only the latest payload and images are retained. A one-shot timer admits that latest event once at the original window end, even if no further settlement arrives. Replacements do not slide the deadline. An event at or after the boundary is admitted immediately and replaces any still-pending trailing event from that source. Each admission starts the next minimum interval. "Immediately" means admitted without an interval timer; normal actor serialization, capability waits and queue limits still apply.
+
+Source identity comes from the real host envelope's `session.id`, not `signal.payload.source` (which denotes a user/extension input origin). Older envelopes without a session ID use the trusted local root identity, or the authenticated sending root for a durable-owner relay. Both local and relayed events share the owner's gate. A different source session has its own window. Other host event kinds, mesh events (even those whose kind is `agent_settled`), and direct `ask`/`tell` messages are unaffected.
+
+This is not queue coalescing or sliding trailing-edge debounce. `coalesce: true` still replaces only queued host events of the same kind; `coalesceKey` still groups queued mesh subjects. Those existing options apply after interval admission, including trailing delivery. `activationFilter` remains a skip-only predicate filter; an event it filters on arrival does not arm the interval. Suppressed events are not activation-filter skips and do not increment `filteredCount`; the retained event is checked against the current filter again when its timer fires.
+
+The configuration is returned in actor status and definitions and survives global template export/import and registry reloads. Same-process registry object reloads retain interval state. For persistent actors, the latest pending trailing payload, images and original deadline are saved in the actor's existing lineage queue snapshot, not its definition or template. Restart restores that pending delivery after the host's existing queue-resume readiness boundary: it re-arms the remaining interval, or admits an overdue event once without requiring another settlement. Sources with no pending delivery start a fresh leading window after restart. Normal queue persistence and admission rules still apply.
+
+Stop, removal, redefinition and a user halt cancel pending trailing work so it cannot return on restart. Manager close cancels all live timers and prevents delivery from the closed manager; for persistent actors it suspends pending delivery in the queue snapshot for the next manager, as it does already-admitted queue items. A timer rechecks current actor ownership and lifecycle before admission. Configure the interval at creation (or in the template before import).
+
 #### Activation filter
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.

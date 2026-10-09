@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { normalizeAgentRequires } from "./input-validation.js";
+import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -1086,9 +1087,15 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
+    const needs = normalizeAgentCapabilityTokens(request.needs);
     const requires = normalizeAgentRequires(request.requires);
-    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}), ...(requires !== undefined ? { requires } : {}) };
+    // Session transports are disabled until they can retain execution custody.
+    // Refuse input declarations explicitly rather than silently skipping preflight.
+    const transport = request.transport ?? this.config.transport;
+    if (requires?.length && transport !== "auto" && transport !== "process") {
+      throw new AgentInputError("requires", `Agent requires cannot be honoured by disabled transport ${transport}; use process; no worker started`);
+    }
+    request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {

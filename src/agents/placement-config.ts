@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { AgentInputError } from "../host-compatibility.js";
+import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 
 export interface AgentPlacementConfig {
   /** Host-only shell-free argv templates. No placement is enabled when absent. */
@@ -42,8 +42,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid agents.placement");
   const input = value as Record<string, unknown>;
   if (input.default !== undefined && input.default !== "local" && input.default !== "remote") throw new Error("Invalid agents.placement.default");
-  const capabilities = input.capabilities ?? [];
-  if (!Array.isArray(capabilities) || !capabilities.every(entry => typeof entry === "string" && !!entry.trim())) throw new Error("Invalid agents.placement.capabilities");
+  const capabilities = normalizeAgentCapabilityTokens(input.capabilities ?? [], "agents.placement.capabilities")!;
   if (capabilities.includes("local")) throw new AgentInputError("agents.placement.capabilities", 'Invalid agents.placement.capabilities: "local" is a reserved need, never a launcher capability');
   if ((input.resultDirectory === undefined) === (input.resultCommand === undefined)) throw new Error("agents.placement requires exactly one of resultDirectory or resultCommand");
   if (input.resultDirectory !== undefined && (typeof input.resultDirectory !== "string" || !path.isAbsolute(input.resultDirectory))) throw new Error("agents.placement.resultDirectory must be absolute");
@@ -62,7 +61,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
     .some(entry => typeof entry === "string" && entry.includes("{sshAlias}"));
   if (usesAlias && !Object.keys(sshAliases ?? {}).length) throw new Error("agents.placement {sshAlias} requires sshAliases mapping");
   return {
-    command, default: input.default ?? "local", capabilities: [...new Set(capabilities as string[])],
+    command, default: input.default ?? "local", capabilities,
     ...(sshAliases ? { sshAliases } : {}),
     ...(input.resultDirectory !== undefined ? { resultDirectory: template(input.resultDirectory, "resultDirectory") } : {}),
     ...(input.resultCommand !== undefined ? { resultCommand: argv(input.resultCommand, "resultCommand") } : {}),

@@ -15,6 +15,7 @@ import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
+import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 
 const regularFile = (file: string): boolean => {
@@ -72,10 +73,12 @@ export class ProcessTransport implements AgentTransportAdapter {
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     // Snapshot once before any await: existing handles retain their original policy.
     const requires = normalizeAgentRequires(request.requires);
-    request = { ...request, ...(requires !== undefined ? { requires } : {}) };
+    const needs = normalizeAgentCapabilityTokens(request.needs);
+    request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
     if (placement) {
-      const unmet = (request.needs ?? []).filter(need => !placement.capabilities.includes(need));
+      const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
+      const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;

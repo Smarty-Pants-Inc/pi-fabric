@@ -8,6 +8,10 @@ import { AgentManager } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { AgentInputError } from "../src/agents/input-validation.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { TmuxTransport } from "../src/agents/transports/tmux-transport.js";
+import { ScreenTransport } from "../src/agents/transports/screen-transport.js";
+import { LocaltermTransport } from "../src/agents/transports/localterm-transport.js";
+import { HerdrTransport } from "../src/agents/transports/herdr-transport.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
@@ -77,34 +81,40 @@ describe("host process task placement", () => {
       expect(() => normalizeFabricConfig({agents:{placement:{...f.raw,...change}}})).toThrow();
     }
   });
-  it("refuses reserved local as a launcher capability with a typed error", () => {
+  it.each(["local", "LOCAL", " local ", "local,compute", "compute LOCAL"])("refuses reserved %s as a launcher capability with a typed error", capability => {
     const f = fixture();
-    const invalid = () => normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["compute", "local"] } } });
+    const invalid = () => normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["compute", capability] } } });
     expect(invalid).toThrow(AgentInputError);
     try { invalid(); } catch (error) {
       expect(error).toMatchObject({ code: "FABRIC_AGENT_INPUT_ERROR", field: "agents.placement.capabilities", launchOutcome: "unlaunched" });
     }
   });
-  it.each(["spawn", "run"] as const)("pins %s with needs local to Main even if remote policy claims local", async method => {
+  it.each((["spawn", "run"] as const).flatMap(method => ["local", "LOCAL", " local ", "local,compute", "compute LOCAL"].map(need => ({ method, need }))))("pins $method with needs $need to Main even if remote policy claims local", async ({ method, need }) => {
     const f = fixture();
     // Defensive against a programmatically supplied or previously accepted policy.
-    f.config.placement.capabilities = ["local", "compute"];
-    const request = { task: "must stay here", transport: "process" as const, needs: ["compute", "local"] };
+    f.config.placement.capabilities = ["compute", need];
+    const request = { task: "must stay here", transport: "process" as const, needs: ["compute", need] };
     const result = method === "run" ? await f.manager.run(request) : await f.manager.wait((await f.manager.spawn(request)).id);
     expect(result).toMatchObject({ text: "LOCAL", transport: "process" });
     const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(events.filter(event => event.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "reserved need: local pins to the Main host", needs: request.needs })]);
+    expect(events.filter(event => event.type.startsWith("placement."))).toEqual([expect.objectContaining({ type: "placement.local", reason: "reserved need: local pins to the Main host", needs: ["compute", "local"] })]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each(["spawn", "run"] as const)("passes repeated literal target-only inputs through %s before the prompt separator", async method => {
     const f = fixture(true);
-    const requires = [path.join(f.root, "target-only", "first file"), path.join(f.root, "target-only", "{host} ' ; $(literal)\nsecond")];
+    const requires = [path.join(f.root, "target-only", "first file"), path.join(f.root, "target-only", "{host} ' ; $(literal) second")];
     expect(requires.every(file => !fs.existsSync(file))).toBe(true);
     const request = { task: "inputs", transport: "process" as const, requires, model: "test/model", thinking: "high" as const };
     const result = method === "run" ? await f.manager.run(request) : await f.manager.wait((await f.manager.spawn(request)).id);
     expect(result).toMatchObject({ status: "completed", text: "REMOTE: inputs" });
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"))).toEqual(["--host", "auto", "--minutes", "1", "--cwd", f.root, "--model", "test/model", "--thinking", "high", "--require", requires[0], "--require", requires[1], "--", "inputs"]);
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "poll-argv.json"), "utf8"))).toEqual([]);
+  });
+  it("matches canonicalized compound capabilities and needs", async () => {
+    const f = fixture();
+    f.config.placement.capabilities = [" COMPUTE, CORPUS "];
+    expect(await f.manager.run({ task: "canonical", needs: ["compute corpus", "COMPUTE"] })).toMatchObject({ status: "completed", text: "REMOTE: canonical" });
+    expect(normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: [" COMPUTE, CORPUS ", "compute"] } } }).agents.placement?.capabilities).toEqual(["compute", "corpus"]);
   });
   it("snapshots required paths before asynchronous spawn preparation", async () => {
     const f = fixture();
@@ -146,6 +156,25 @@ describe("host process task placement", () => {
     const f = fixture(); const start = vi.spyOn(processUtils, "spawnDetached");
     await expect(f.manager[method]({ task: "invalid", requires: ["relative/path"] })).rejects.toBeInstanceOf(AgentInputError);
     expect(start).not.toHaveBeenCalled(); expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each([TmuxTransport, ScreenTransport, LocaltermTransport, HerdrTransport])("rejects requires with a typed error for unsupported local %s", async Transport => {
+    const f = fixture();
+    const adapter = new Transport();
+    const start = vi.spyOn(Transport.prototype, "launch");
+    const file = path.join(f.root, "existing-input"); fs.writeFileSync(file, "fixture");
+    for (const method of ["spawn", "run"] as const) {
+      for (const requires of [[f.root, path.join(f.root, "missing-input")], [file, f.root]]) {
+        const refused = f.manager[method]({ task: "must not launch", transport: adapter.kind, requires });
+        await expect(refused).rejects.toMatchObject({ code: "FABRIC_AGENT_INPUT_ERROR", field: "requires", launchOutcome: "unlaunched" });
+        await expect(refused).rejects.toThrow(`disabled transport ${adapter.kind}`);
+      }
+    }
+    // The configured default is subject to the same admission check.
+    f.config.transport = adapter.kind;
+    await expect(f.manager.spawn({ task: "configured transport", requires: [file] })).rejects.toBeInstanceOf(AgentInputError);
+    expect(start).not.toHaveBeenCalled();
+    expect(f.manager.list()).toEqual([]);
+    expect(fs.existsSync(f.results)).toBe(false);
   });
   it("does not allow a workspace to override host placement", () => {
     const f=fixture(); fs.mkdirSync(path.join(f.root,".pi"));

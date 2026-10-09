@@ -13,8 +13,8 @@ import type { FabricActionDescriptor } from "../protocol.js";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; reserved local always pins to the Main host, and any unmet need stays local and is audited." },
-  requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Absolute selected-host input paths, each at most 4096 UTF-8 bytes and without NUL. Local spawns check existence before starting; remote launches preflight via repeated --require PATH arguments." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities, trimmed, lowercased and split on commas/whitespace; canonical local always pins to the Main host, and any unmet need stays local and is audited." },
+  requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Literal absolute selected-host input paths, each at most 4096 UTF-8 bytes, without dot/dot-dot segments, line breaks or control characters. Local process spawns check existence before starting; unsupported transports refuse requires with AgentInputError; remote launches preflight via repeated --require PATH arguments." },
   runner: {
     type: "string",
     enum: ["pi", "claude", "veda"],

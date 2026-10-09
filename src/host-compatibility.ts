@@ -19,6 +19,19 @@ export class AgentInputError extends Error {
   }
 }
 
+/** Needs and launcher guarantees share the same canonical token vocabulary. */
+export const normalizeAgentCapabilityTokens = (value: unknown, field = "needs"): string[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new AgentInputError(field, `Invalid agent ${field}: expected capability strings`);
+  const tokens: string[] = [];
+  for (const [index, entry] of value.entries()) {
+    const parts = typeof entry === "string" ? entry.trim().toLowerCase().split(/[,\s]+/u).filter(Boolean) : [];
+    if (!parts.length) throw new AgentInputError(field, `Invalid agent ${field}[${index}]: expected nonempty capability tokens`);
+    tokens.push(...parts);
+  }
+  return [...new Set(tokens)];
+};
+
 /** Trusted host policy for every Fabric participant model selection. */
 export interface FabricModelPolicy {
   deniedModels?: readonly string[];

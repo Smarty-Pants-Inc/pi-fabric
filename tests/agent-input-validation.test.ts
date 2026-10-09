@@ -32,6 +32,17 @@ describe("agent input declarations", () => {
     ["relative", ["relative/path"]],
     ["empty", [""]],
     ["NUL", [absolute + "\0"]],
+    ["dot segment", [root + "a/./input"]],
+    ["dot-dot segment", [root + "a/../input"]],
+    ["Windows dot segment", [root + "a\\.\\input"]],
+    ["Windows dot-dot segment", [root + "a\\..\\input"]],
+    ["newline", [absolute + "\nnext"]],
+    ["CR", [absolute + "\rnext"]],
+    ["tab", [absolute + "\tnext"]],
+    ["DEL", [absolute + "\x7f"]],
+    ["C1 control", [absolute + "\u0085"]],
+    ["Unicode line separator", [absolute + "\u2028next"]],
+    ["Unicode paragraph separator", [absolute + "\u2029next"]],
     ["too many", Array(65).fill(absolute)],
     ["sparse", new Array(1)],
     ["ASCII bytes", [root + "x".repeat(4097)]],
@@ -42,6 +53,29 @@ describe("agent input declarations", () => {
     try { invalid(); } catch (error) {
       expect(error).toMatchObject({ name: "AgentInputError", code: "FABRIC_AGENT_INPUT_ERROR", field: "requires", launchOutcome: "unlaunched" });
     }
+  });
+
+  it.each([
+    ["relative", "relative", "absolute path"],
+    ["dot", root + "a/./input", '"." or ".." path segments'],
+    ["dot-dot", root + "a/../input", '"." or ".." path segments'],
+    ["line break", absolute + "\nnext", "line breaks or control characters"],
+    ["control", absolute + "\x01", "line breaks or control characters"],
+    ["size", root + "x".repeat(4097), "4096 UTF-8 bytes"],
+  ])("names the entry and violated rule for %s", (_label, entry, rule) => {
+    try {
+      normalizeAgentRequires([absolute, entry]);
+      expect.fail("invalid entry accepted");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentInputError);
+      expect((error as Error).message).toContain("requires[1]");
+      expect((error as Error).message).toContain(rule);
+    }
+  });
+
+  it("preserves valid literal punctuation and dot-containing names without normalization", () => {
+    const requires = [root + "a/.hidden/input..txt", root + "space and , punctuation/{host};$(literal)"];
+    expect(normalizeAgentRequires(requires)).toEqual(requires);
   });
 
   it("accepts the exact count and UTF-8 byte boundaries", () => {
@@ -67,6 +101,15 @@ describe("agent input declarations", () => {
     const result = typeCheckFabricCode('await agents.spawn({ task: "x", needs: ["local"], requires: ["/absolute/input"] }); await agents.run({ task: "x", requires: [] });', GUEST_TYPE_DECLARATIONS, true);
     expect(result.errors).toEqual([]);
     expect(result.javascript).toBeDefined();
+  });
+
+  it("canonicalizes and snapshots compound needs at the public boundary", () => {
+    const needs = [" COMPUTE, CoRpUs ", "compute"];
+    const normalized = normalizeAgentRunRequest({ task: "x", needs }, defaults);
+    needs[0] = "remote";
+    expect(normalized.needs).toEqual(["compute", "corpus"]);
+    expect(normalizeAgentServiceRequest({ task: "x", needs: ["LOCAL,compute"] }).needs).toEqual(["local", "compute"]);
+    expect(() => normalizeAgentRunRequest({ task: "x", needs: [" , "] }, defaults)).toThrow(AgentInputError);
   });
 
   it("forwards hosted requests without checking existence on the caller", () => {

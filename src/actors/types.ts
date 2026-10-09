@@ -221,6 +221,8 @@ export interface FabricActorRequest {
   /**
    * A dotted path into a mesh event's data, such as "payload.number". A queued event of the
    * same topic with the same value there is replaced by the newer one, in its queue place.
+   * Persistent durable actors also discard repeats of their last 256 completed subjects;
+   * completion history is scoped by path, topic and scalar type and survives restart.
    */
   coalesceKey?: string;
   /**

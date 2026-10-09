@@ -255,6 +255,8 @@ const PRESENCE_RETRY_MS = 5_000;
 export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
+/** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
+const PROCESSED_KEY_MEMORY = 256;
 const warnedActivationFilters = new Set<string>();
 // smarty-dev#1579: an unreadable stored filter never drops or rewrites its actor. It is kept as
 // stored (and written back unchanged) but not applied, so every event is delivered.
@@ -539,6 +541,8 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Independent of registry objects: ownership/reload may replace them during a drain.
+  readonly #processedKeys = new Map<string, Set<string>>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
@@ -2376,6 +2380,7 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
+      this.#processedKeys.delete(actor.id);
       this.#emitChange();
     }
     return this.#finishCleanup(cleanup);
@@ -2886,6 +2891,15 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        // A retry may have queued while its first activation was in flight, or arrived
+        // through a predecessor's queue. Recheck at execution, not only at ingress.
+        if (this.#hasProcessedKey(actor, item.source, item.payload)) {
+          this.#persistQueue(actor.id, true);
+          this.#replayDeadLetters(actor);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
         // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
         // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
         // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
@@ -3250,7 +3264,7 @@ export class ActorManager {
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
-          this.#finishInFlight(actor.id, item, handoffConsumed);
+          this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
           // Status coalescing can make the idle boundary visible before the next
           // monitor poll. Reconcile native live receipts before exposing that
           // boundary or admitting a mailbox activation, not via incidental save I/O.
@@ -3818,7 +3832,10 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
-          this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
+          if (this.#hasProcessedKey(actor, `mesh:${event.topic}`, event)) {
+            // Do not advance the mesh cursor past a memory-only completion fence.
+            if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+          } else this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -3832,6 +3849,33 @@ export class ActorManager {
       }
     }
     return full ? false : handedOn ? true : "ignored";
+  }
+
+  #processedMeshKey(actor: ManagedActor, source: string, payload: unknown): string | undefined {
+    if (!this.#persistent || actor.residency !== "durable" || !actor.coalesceKey || !source.startsWith("mesh:")) return undefined;
+    const event = payload as { topic?: unknown; data?: unknown } | undefined;
+    if (typeof event?.topic !== "string") return undefined;
+    const key = meshCoalesceValue(event.data, actor.coalesceKey);
+    // Include the configured path as well as topic and scalar type, so changing
+    // the subscription does not inherit another subject's completion history.
+    return key === undefined ? undefined : JSON.stringify(["mesh", actor.coalesceKey, event.topic, key]);
+  }
+
+  #hasProcessedKey(actor: ManagedActor, source: string, payload: unknown): boolean {
+    const key = this.#processedMeshKey(actor, source, payload);
+    return key !== undefined && (this.#processedKeys.get(actor.id)?.has(key) ?? false);
+  }
+
+  #rememberProcessedKey(actor: ManagedActor, item: ActorQueueItem): boolean {
+    if (item.resolve || item.reject) return false;
+    const key = this.#processedMeshKey(actor, item.source, item.payload);
+    if (key === undefined) return false;
+    const keys = this.#processedKeys.get(actor.id) ?? new Set<string>();
+    if (keys.has(key)) return false; // A repeat never refreshes retention order.
+    keys.add(key);
+    if (keys.size > PROCESSED_KEY_MEMORY) keys.delete(keys.values().next().value!);
+    this.#processedKeys.set(actor.id, keys);
+    return true;
   }
 
   #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
@@ -3964,8 +4008,12 @@ export class ActorManager {
         const entry = entries[taken]!;
         if (!held.has(entry.event.id)) {
           held.add(entry.event.id);
-          this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
-          added++;
+          if (this.#hasProcessedKey(actor, entry.source, entry.event)) {
+            if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+          } else {
+            this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+            added++;
+          }
         }
         taken++;
       }
@@ -4944,8 +4992,10 @@ export class ActorManager {
       });
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
+    const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
     try {
-      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
+      // An empty queue still holds the completion fence after its cursor passed.
+      if (items.length === 0 && processedKeys.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
         try {
@@ -4971,6 +5021,7 @@ export class ActorManager {
       // What validWhile reads, so it judges the items the same way after a restart.
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+          ...(processedKeys.length ? { processedKeys } : {}),
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
           ...(cleanHandover ? { cleanHandover: true } : {}),
         }, { durable });
@@ -4984,11 +5035,14 @@ export class ActorManager {
     return true;
   }
 
-  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
+  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean, completed: boolean): void {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
     const actor = this.#actors.get(actorId);
     const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
+    // Completed inference is terminal even if ownership or delivery failed afterwards.
+    // Preparation failures, interrupted workers and parked retries are never processed.
+    const processed = actor !== undefined && !stillPending && completed && this.#rememberProcessedKey(actor, item);
     const context = item.handoffContext ?? [];
     delete item.handoffContext;
     const deferred = this.#deferredHandoffs.get(actorId) ?? [];
@@ -5007,7 +5061,7 @@ export class ActorManager {
       for (const id of consumedIds) pending.add(id);
       this.#pendingHandoffConsumption.set(actorId, pending);
       this.#flushHandoffConsumption(actor);
-    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+    } else this.#persistQueue(actorId, processed || item.source === "child-completion" || context.length > 0);
   }
 
   #flushHandoffConsumption(actor: ManagedActor): void {
@@ -5059,9 +5113,18 @@ export class ActorManager {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
+      processedKeys?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (actor.residency === "durable" && Array.isArray(saved.processedKeys)) {
+      // Predecessor history precedes locally completed work; never let an old
+      // handoff evict a newer local completion. Legacy snapshots have no history.
+      const incoming = saved.processedKeys.slice(-PROCESSED_KEY_MEMORY).filter((key): key is string => typeof key === "string");
+      const keys = new Set([...incoming, ...(this.#processedKeys.get(actor.id) ?? [])]);
+      while (keys.size > PROCESSED_KEY_MEMORY) keys.delete(keys.values().next().value!);
+      if (keys.size) this.#processedKeys.set(actor.id, keys);
+    }
     const counter = (value: unknown): number =>
       typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
     actor.latestActivationSequence = Math.max(actor.latestActivationSequence, counter(saved.latestActivationSequence));
@@ -5150,6 +5213,7 @@ export class ActorManager {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
         continue;
       }
+      if (this.#hasProcessedKey(actor, item.source, item.payload)) continue;
       // A cursor replay of the same mesh event must not queue it a second time, nor may a
       // predecessor's copy of an event this manager already took.
       const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null

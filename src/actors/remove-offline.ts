@@ -165,6 +165,9 @@ const claimFence = async (directory: string): Promise<number> => {
   } catch (error) { fs.closeSync(fd); throw error; }
 };
 
+/** Test seam only: runs after each completed removal step, before the next liveness check. */
+export const offlineRemovalHooks: { afterStep?: (step: "revoke" | "bindings" | "tree") => void | Promise<void> } = {};
+
 export interface OfflineRemoveResult {
   offline: true;
   dryRun: boolean;
@@ -192,11 +195,11 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     }
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
-    const evidence = readResidentOperatorEvidence(config, mesh);
+    const evidence = readResidentOperatorEvidence(config, mesh, undefined, { offline: true });
     assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, dryRun);
     const check = (): void => {
       recheck();
-      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!), options.confirmDeadRoot);
+      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!, undefined, { offline: true }), options.confirmDeadRoot);
     };
     // Exact id/name within this root's durable actors only, as the live operator path.
     const matches: Array<{ store: ActorRegistryStore; root: string; row: Row }> = [];
@@ -250,9 +253,19 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     });
     if (store.snapshot().actors.some(actor => actor.id === id)) throw new Error(`Fabric actor ${id}: registry revocation did not commit`);
     // 4. Cleanup, then the record goes. A failure keeps the record for the next owner start.
+    // The full liveness check (lease and root participant) runs again, under host.lock, right before
+    // each destructive step. ponytail: a Main publishes under the mesh state and participant-file locks,
+    // which this offline process does not hold across a tree removal; the remaining window is one step,
+    // and it is safe because a Main appearing there stops the next step and the removal record stays.
     try {
+      await offlineRemovalHooks.afterStep?.("revoke");
+      check();
       await new ActorBindingStore(config.sessionId, root).delete(id);
+      await offlineRemovalHooks.afterStep?.("bindings");
+      check();
       removePinnedActorTree(tree);
+      await offlineRemovalHooks.afterStep?.("tree");
+      check();
       await mesh.delete({ key: presenceKey });
       fs.rmSync(marker, { force: true });
       return { offline: true, dryRun, actor: summary, operatorEvidence: evidence, archive, cleaned: true };

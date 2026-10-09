@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { participantFilePresent, readParticipantFile } from "../topology/participant-files.js";
@@ -28,7 +29,7 @@ const refuse = (evidence: ResidentOperatorEvidence, reason: string): never => {
 
 /** Report lease facts only. An absent/expired lease never proves that Main is dead. */
 export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
-  resident?: ResidentLeaseWriter): ResidentOperatorEvidence {
+  resident?: ResidentLeaseWriter, options: MainAbsenceOptions = {}): ResidentOperatorEvidence {
   const evidence: ResidentOperatorEvidence = { rootId: config.rootId, mainSessionId: config.sessionId,
     lastLeaseTime: null, leaseExpiresAt: null, liveLease: false, operatorCheck };
   // smarty-dev#7817: only a live lease proven to be the resident's own heartbeat (its exact writer
@@ -74,10 +75,16 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
   // A resident-renewed lease is set aside only on a positive proof that no Main serves the root
   // (smarty-dev#7817). Absent within the grace, unreadable, invalid or any doubt is unknown: refuse.
   if (!mainLive && evidence.residentRenewedLease) {
-    const verdict = mainDeadProof(config, mesh, rootLease!, selfWindow);
+    const verdict = mainDeadProof(config, mesh, rootLease, selfWindow, options);
     evidence.mainLiveness = verdict;
-    if (verdict !== "dead: stale root participant, owner lease expired" && verdict !== "dead: no root participant after the grace") mainLive = true;
+    if (!verdict.startsWith("dead:")) mainLive = true;
     if (mainLive) evidence.liveLease = true;
+  } else if (!mainLive && options.offline) {
+    // Offline (dead resident): no live lease. A Main that is starting may publish its participant
+    // first; any fresh, reloading or doubtful root participant is a live Main (smarty-dev#7817).
+    const verdict = mainDeadProof(config, mesh, rootLease, 0, options);
+    evidence.mainLiveness = verdict;
+    if (!verdict.startsWith("dead:")) { mainLive = true; evidence.liveLease = true; }
   }
   if (!mainLive && evidence.liveLease) evidence.liveLease = false;
   if (mainLive) delete evidence.residentRenewedLease;
@@ -88,24 +95,53 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
  * restarted Main publishes within it. Twice that, and never less than the lease window, is the grace. */
 export const MAIN_PUBLISH_GRACE_MS = 2 * STATE_LEASE_RENEW_MS;
 
-/** Positive dead proof of the root's Main for a resident-renewed lease; any other answer is unknown. */
-function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">, rootLease: FabricHostLease, window: number): string {
+export interface MainAbsenceOptions {
+  /** Durable record of when the root participant was first seen absent (live executor only). */
+  absenceFile?: string;
+  /** Record a first absence (a dry run only reads). */
+  recordAbsence?: boolean;
+  /** The resident is dead: an absent participant with no live lease is no Main. */
+  offline?: boolean;
+}
+
+interface MainAbsence { format: 1; rootId: string; absentSince: number; lease: string }
+
+/** Positive dead proof of the root's Main; any other answer is unknown or live. */
+function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">, rootLease: FabricHostLease | undefined,
+  window: number, options: MainAbsenceOptions): string {
   const now = Date.now();
   const grace = Math.max(MAIN_PUBLISH_GRACE_MS, window);
   const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
+  const resetAbsence = (): void => {
+    if (options.absenceFile && options.recordAbsence) fs.rmSync(options.absenceFile, { force: true });
+  };
   let entries: MeshStateEntry[];
   try {
     const file = readParticipantFile(config.meshRoot, key);
-    if (!file && participantFilePresent(config.meshRoot, key)) return "unknown: root participant record is unreadable";
+    if (!file && participantFilePresent(config.meshRoot, key)) { resetAbsence(); return "unknown: root participant record is unreadable"; }
     entries = [file, mesh.get(key, { fresh: true })].filter((entry): entry is MeshStateEntry => entry !== undefined);
-  } catch (error) { return `unknown: root participant record is unreadable (${error instanceof Error ? error.message : String(error)})`; }
+  } catch (error) { resetAbsence(); return `unknown: root participant record is unreadable (${error instanceof Error ? error.message : String(error)})`; }
   if (!entries.length) {
-    // (b) A restarted Main publishes its record within the grace; this incarnation has run longer.
-    // The live executor re-reads this before every mutation, after its registry and fence checks.
-    if (rootLease.startedAt === undefined || !Number.isFinite(rootLease.startedAt)) return "unknown: resident incarnation start is unrecorded";
-    if (now - rootLease.startedAt <= grace) return `unknown: no root participant yet, resident started ${Math.round((now - rootLease.startedAt) / 1000)} s ago (grace ${grace / 1000} s)`;
-    return "dead: no root participant after the grace";
+    if (options.offline) return "dead: no root participant and no live lease";
+    // (b) Absence itself must hold for the whole grace, observed durably: a restarting Main has no
+    // record for a moment, whatever the lease age. A lease incarnation change restarts the window.
+    if (!options.absenceFile) return "unknown: root participant absence is not established";
+    const lease = JSON.stringify([rootLease?.startedAt ?? null, rootLease?.writer?.pid ?? null, rootLease?.writer?.host ?? null, rootLease?.writer?.startedAt ?? null]);
+    let seen: MainAbsence | undefined;
+    try { seen = JSON.parse(fs.readFileSync(options.absenceFile, "utf8")) as MainAbsence; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown: root participant absence record is unreadable"; }
+    if (!seen || seen.format !== 1 || seen.rootId !== config.rootId || seen.lease !== lease ||
+        !Number.isFinite(seen.absentSince) || seen.absentSince > now) {
+      seen = { format: 1, rootId: config.rootId, absentSince: now, lease };
+      if (options.recordAbsence) writeJsonAtomic(options.absenceFile, seen, { durable: true });
+    }
+    if (now - seen.absentSince < grace) {
+      return `unknown: root participant absence not yet established (absent since ${new Date(seen.absentSince).toISOString()}); retry after ${new Date(seen.absentSince + grace).toISOString()}`;
+    }
+    return "dead: no root participant for the whole grace";
   }
+  // Any participant observation restarts the absence window.
+  resetAbsence();
   for (const entry of entries) {
     // (a) Readable, valid, not reloading, stale, and its owner's lease expired.
     const value = entry.value as { id?: unknown; rootId?: unknown; ownerHostId?: unknown; status?: unknown } | null;
@@ -115,7 +151,7 @@ function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
     if (now - entry.updatedAt <= grace) return "live: root participant published within the grace";
     // The root lease itself is the resident's heartbeat; the Main's own liveness is its session in it.
     const ownerUntil = value.ownerHostId === config.rootId
-      ? rootLease.session?.expiresAt
+      ? rootLease?.session?.expiresAt
       : readHostLeaseCurrent(config.meshRoot, value.ownerHostId)?.expiresAt;
     if (value.ownerHostId !== config.rootId && ownerUntil === undefined) return "unknown: participant owner lease is unreadable";
     if (ownerUntil !== undefined && ownerUntil >= now) return "live: participant owner lease is live";

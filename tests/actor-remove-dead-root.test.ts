@@ -7,7 +7,9 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { main } from "../src/actors-cli.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import { meshProcessStartedAt } from "../src/mesh/store.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { offlineRemovalHooks } from "../src/actors/remove-offline.js";
+import { MeshStore, meshProcessStartedAt } from "../src/mesh/store.js";
 import { MAIN_PUBLISH_GRACE_MS } from "../src/residency/operator-safety.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -73,9 +75,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
   const grace = MAIN_PUBLISH_GRACE_MS;
 
   it.each([
-    ["no participant, resident incarnation younger than the grace", grace / 2, undefined, "unknown: no root participant yet"],
     ["a participant record fresher than the grace", 2 * grace, grace / 2, "live: root participant published within the grace"],
-    ["no participant, resident incarnation older than the grace", 2 * grace, undefined, undefined],
     ["a stale participant whose owner lease expired", 2 * grace, 2 * grace, undefined],
   ] as const)("case 1: a resident-renewed lease with %s", async (_name, incarnationAgeMs, participantAgeMs, refusal) => {
     const f = await fixture();
@@ -95,6 +95,46 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       await f.host.actors.removalSettled(actor.id);
       expect(f.registered(actor.id)).toBe(false);
       expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining(["SHA256SUMS", `${actor.id}.registry.json`]));
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 1: no participant during a Main restart refuses until absence holds for the whole grace; a reappearing participant resets it", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("restarting");
+      selfLease(f, 2 * grace); // the resident outlived the grace long ago; that alone proves nothing
+      const absence = path.join(f.config.residencyRoot, "main-absence.json");
+      const participantFile = path.join(f.config.meshRoot, "participants", createHash("sha256").update(f.config.rootId).digest("hex") + ".json");
+      const refusedWith = async (text: string) => {
+        const result = await f.cli(actor.id);
+        expect(result.code).toBe(1); expect(result.err).toContain(text);
+        expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
+      };
+      // First attempt: absence is only now observed, and recorded.
+      await refusedWith("absence not yet established");
+      const first = JSON.parse(fs.readFileSync(absence, "utf8"));
+      expect(Date.now() - first.absentSince).toBeLessThan(60_000);
+      // The restarted Main publishes: absence resets.
+      f.mainParticipant(Date.now());
+      await refusedWith("live: root participant published within the grace");
+      expect(fs.existsSync(absence)).toBe(false);
+      // It vanishes again: a new window starts, still short of the grace.
+      fs.unlinkSync(participantFile);
+      await refusedWith("absence not yet established");
+      // A dry run reads only.
+      const recorded = fs.readFileSync(absence, "utf8");
+      expect((await f.cli(actor.id, ["--dry-run"])).code).toBe(0);
+      expect(fs.readFileSync(absence, "utf8")).toBe(recorded);
+      // A lease incarnation change restarts the window too.
+      fs.writeFileSync(absence, JSON.stringify({ ...JSON.parse(recorded), absentSince: Date.now() - grace - 1_000, lease: "other" }));
+      await refusedWith("absence not yet established");
+      // Only an absence held for the full grace, same lease incarnation, proceeds.
+      const current = JSON.parse(fs.readFileSync(absence, "utf8"));
+      fs.writeFileSync(absence, JSON.stringify({ ...current, absentSince: Date.now() - grace - 1_000 }));
+      const removed = await f.cli(actor.id);
+      expect(removed).toMatchObject({ code: 0, err: "" });
+      await f.host.actors.removalSettled(actor.id);
+      expect(f.registered(actor.id)).toBe(false);
     } finally { await f.close(); }
   }, 40_000);
 
@@ -155,6 +195,32 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
       expect(fs.readFileSync(outside, "utf8")).toBe("keep");
       expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it.each(["revoke", "bindings", "tree"] as const)("case 2: a Main going live after the %s step aborts the next destructive step and keeps the marker", async step => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("racing");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      await f.killResident();
+      const bindings = vi.spyOn(ActorBindingStore.prototype, "delete");
+      const presence = vi.spyOn(MeshStore.prototype, "delete");
+      offlineRemovalHooks.afterStep = done => {
+        if (done !== step) return;
+        writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+          startedAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+      };
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.out)).toMatchObject({ cleaned: false, pending: expect.stringContaining("live root lease") });
+      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
+      expect(bindings).toHaveBeenCalledTimes(step === "revoke" ? 0 : 1);
+      expect(fs.existsSync(actorDir)).toBe(step !== "tree");
+      expect(presence).not.toHaveBeenCalled();
+      bindings.mockRestore(); presence.mockRestore();
     } finally { await f.close(); }
   }, 40_000);
 

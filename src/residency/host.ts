@@ -1534,9 +1534,11 @@ export class ResidentHost {
         }
         // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
         const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
-        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self);
+        // A root participant's absence must hold for the whole grace, recorded here (smarty-dev#7817).
+        const absence = { absenceFile: path.join(this.config.residencyRoot, "main-absence.json"), recordAbsence: command.dryRun !== true };
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, absence);
         const check = () => assertResidentOperatorConfirmed(
-          readResidentOperatorEvidence(this.config, this.mesh, self), command.confirmDeadRoot);
+          readResidentOperatorEvidence(this.config, this.mesh, self, absence), command.confirmDeadRoot);
         assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&

@@ -3838,7 +3838,8 @@ export class ActorManager {
     const options = actor.records;
     if (!options) { this.#records.delete(actor.id); return; }
     const existing = this.#records.get(actor.id);
-    if (existing?.options.topic === options.topic && existing.options.maxEntries === options.maxEntries) return;
+    if (existing?.options.topic === options.topic && existing.options.maxEntries === options.maxEntries &&
+      existing.options.maxAgeMs === options.maxAgeMs) return;
     const records = new ActorRecords(options);
     records.replay(this.mesh);
     this.#records.set(actor.id, records);
@@ -3849,6 +3850,7 @@ export class ActorManager {
     item: ActorQueueItem,
   ): Promise<{ valid: boolean; reason?: string }> {
     if (!actor.validWhile) return { valid: true };
+    const now = Date.now();
     try {
       return await evaluateActorValidWhile(actor.validWhile, {
         activation: structuredClone(item.activation),
@@ -3857,10 +3859,10 @@ export class ActorManager {
           mainRevision: this.#mainRevision,
           taskRevision: this.#taskRevision,
           idle: this.#mainIdle,
-          now: Date.now(),
+          now,
         },
         ...(item.wakeText ? { wakeText: structuredClone(item.wakeText) } : {}),
-      }, this.#records.get(actor.id)?.snapshot());
+      }, this.#records.get(actor.id)?.snapshot(now));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       actor.lastError = `validWhile: ${message}`;

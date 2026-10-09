@@ -680,8 +680,8 @@ type FabricActorActivation =
   | { readonly kind: "hostEvent"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly event: FabricActorHostEvent; readonly mainRevision: number; readonly taskRevision: number; readonly signal?: FabricActorHostSignal }
   | { readonly kind: "direct"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number }
   | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string; readonly data?: any };
-interface FabricActorRecordsOptions { topic: string; maxEntries?: number }
-interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string }
+interface FabricActorRecordsOptions { topic: string; maxEntries?: number; maxAgeMs?: number }
+interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string; readonly fresh: boolean }
 interface FabricActorRecordsView { readonly get: (key: string) => Readonly<FabricActorRecord> | undefined }
 interface FabricActorValidityFacts {
   readonly activation: Readonly<FabricActorActivation>;
@@ -756,7 +756,7 @@ interface FabricActorRequestBase {
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
-  /** Bounded host projection; default 512 entries, cap 4096. */
+  /** Bounded host projection; default 512 entries, cap 4096, maxAgeMs default 6 h. Unknown is undefined. */
   records?: FabricActorRecordsOptions;
   residency?: FabricParticipantResidency;
 }

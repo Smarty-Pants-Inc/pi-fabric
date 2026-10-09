@@ -18,8 +18,8 @@ const gates: Array<() => void> = [];
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const predicate = { version: 1 as const, source: `({ activation, current }) => {
   if (activation.kind !== "mesh") return true;
-  const state = current.records.get(activation.data.key)?.state;
-  return !["held", "waited", "answered"].includes(state);
+  const record = current.records.get(activation.data.key);
+  return record?.fresh !== true || !["held", "waited", "answered"].includes(record.state);
 }` };
 const facts: FabricActorValidityFacts = {
   activation: { kind: "direct", id: "a", source: "direct", sequence: 1, createdAt: 1 },
@@ -75,10 +75,12 @@ afterEach(async () => {
 
 describe("actor records projection", () => {
   it("defaults to 512, caps at 4096, and validates options", () => {
-    expect(normalizeActorRecords({ topic: "org.records" })).toEqual({ topic: "org.records", maxEntries: 512 });
+    expect(normalizeActorRecords({ topic: "org.records" })).toEqual({ topic: "org.records", maxEntries: 512, maxAgeMs: 21_600_000 });
+    expect(normalizeActorRecords({ topic: "org.records", maxAgeMs: 1 })?.maxAgeMs).toBe(1);
     expect(normalizeActorRecords({ topic: "org.records", maxEntries: 10_000 })?.maxEntries).toBe(4096);
     for (const value of [null, [], { topic: 1 }, { topic: "bad topic" }, { topic: "org.records", maxEntries: 0 },
-      { topic: "org.records", maxEntries: 1.5 }, { topic: "org.records", maxEntries: "1" }]) {
+      { topic: "org.records", maxEntries: 1.5 }, { topic: "org.records", maxEntries: "1" },
+      ...[0, -1, 1.5, "1", null, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(maxAgeMs => ({ topic: "org.records", maxAgeMs }))]) {
       expect(() => normalizeActorRecords(value)).toThrow(/records/);
     }
   });
@@ -86,7 +88,7 @@ describe("actor records projection", () => {
   it("ignores malformed events and other topics, keeps last sequence, and evicts least-recently-written keys", () => {
     const records = new ActorRecords({ topic: "org.records", maxEntries: 2 });
     records.accept(event(1, { key: "", state: "open" }));
-    expect(records.snapshot()[0]?.[0]).toBe("");
+    expect(records.snapshot(1_010)[0]?.[0]).toBe("");
     records.accept(event(2, { key: "a", state: "open" }));
     records.accept(event(3, { key: "b", state: "held" }));
     records.accept(event(4, { key: "a", state: "answered" }));
@@ -96,9 +98,9 @@ describe("actor records projection", () => {
     }
     records.accept(event(5, { key: "c", state: "waited" }, "other.records"));
     records.accept(event(5, { key: "c", state: "waited" }));
-    expect(records.snapshot()).toEqual([
-      ["a", { state: "answered", at: new Date(1_004).toISOString() }],
-      ["c", { state: "waited", at: new Date(1_005).toISOString() }],
+    expect(records.snapshot(1_010)).toEqual([
+      ["a", { state: "answered", at: new Date(1_004).toISOString(), fresh: true }],
+      ["c", { state: "waited", at: new Date(1_005).toISOString(), fresh: true }],
     ]);
   });
 
@@ -106,8 +108,8 @@ describe("actor records projection", () => {
     const records = new ActorRecords({ topic: "org.records" });
     const capped = new ActorRecords({ topic: "org.records", maxEntries: 50_000 });
     for (let i = 1; i <= 4_100; i++) { records.accept(event(i, { key: String(i), state: "open" })); capped.accept(event(i, { key: String(i), state: "open" })); }
-    expect(records.snapshot()).toHaveLength(512);
-    expect(capped.snapshot()).toHaveLength(4096);
+    expect(records.snapshot(10_000)).toHaveLength(512);
+    expect(capped.snapshot(10_000)).toHaveLength(4096);
     const { mesh, publish } = setup();
     for (let i = 0; i < 23; i++) await publish("org.records", { key: String(i), state: "answered" });
     const replayed = new ActorRecords({ topic: "org.records", maxEntries: 2 });
@@ -118,16 +120,65 @@ describe("actor records projection", () => {
     expect(empty.snapshot()).toEqual([]);
   });
 
+  it("expires exactly at maxAgeMs, not one millisecond earlier, and never resurrects expired records", () => {
+    const records = new ActorRecords({ topic: "org.records", maxAgeMs: 100 });
+    records.accept(event(1, { key: "item", state: "answered" }));
+    expect(records.snapshot(1_100)[0]?.[1].fresh).toBe(true);
+    expect(records.snapshot(1_101)).toEqual([]);
+    expect(records.snapshot(1_100)).toEqual([]);
+    records.accept({ ...event(2, { key: "item", state: "open" }), createdAt: 1_102 });
+    expect(records.snapshot(1_102)[0]?.[1]).toMatchObject({ state: "open", fresh: true });
+  });
+
+  it("uses event age rather than acceptance time and expires at the default six-hour boundary", () => {
+    const records = new ActorRecords({ topic: "org.records" });
+    records.accept(event(1, { key: "item", state: "held" }));
+    expect(records.snapshot(1_001 + 21_600_000 - 1)).toHaveLength(1);
+    expect(records.snapshot(1_001 + 21_600_000)).toEqual([]);
+  });
+
+  it.each(["time", "sequence", "future"])("makes an unverifiable %s update unknown instead of retaining terminal state", kind => {
+    const records = new ActorRecords({ topic: "org.records" });
+    records.accept(event(1, { key: "item", state: "answered" }));
+    expect(records.snapshot(1_010)).toHaveLength(1);
+    const update = event(2, { key: "item", state: "open" });
+    if (kind === "time") Reflect.deleteProperty(update, "createdAt");
+    if (kind === "sequence") Reflect.deleteProperty(update, "sequence");
+    if (kind === "future") update.createdAt = 2_000;
+    records.accept(update);
+    expect(records.snapshot(1_010)).toEqual([]);
+  });
+
+  it("clears old values on missing replay and rejects delayed events from before that replay window", () => {
+    const records = new ActorRecords({ topic: "org.records" });
+    records.accept(event(1, { key: "item", state: "answered" }));
+    records.replay({ latestSequence: () => 5, maxReadEvents: 10 });
+    records.accept(event(2, { key: "item", state: "answered" }));
+    expect(records.snapshot(1_010)).toEqual([]);
+    records.accept(event(6, { key: "item", state: "open" }));
+    expect(records.snapshot(1_010)[0]?.[1].state).toBe("open");
+  });
+
+  it("does not reuse a value absent from a retained replay window", () => {
+    const records = new ActorRecords({ topic: "org.records" });
+    records.accept(event(1, { key: "item", state: "answered" }));
+    records.replay({ latestSequence: () => 10, maxReadEvents: 10,
+      read: ({ after } = {}) => after === 0 ? [event(8, { key: "other", state: "held" })] : [] });
+    records.accept(event(7, { key: "item", state: "answered" }));
+    expect(records.snapshot(1_010).map(([key]) => key)).toEqual(["other"]);
+  });
+
   it("exposes only a frozen get function and frozen state/ISO values without changing existing facts", async () => {
     const source = { version: 1 as const, source: `({ current }) => {
       const record = current.records.get("__proto__");
       return Object.isFrozen(current) && Object.isFrozen(current.records) && Object.isFrozen(current.records.get)
         && Object.isFrozen(record) && Object.keys(current.records).join() === "get"
-        && record.state === "held" && record.at === "1970-01-01T00:00:01.000Z"
+        && record.state === "held" && record.at === "1970-01-01T00:00:01.000Z" && record.fresh === true
+        && Object.keys(record).sort().join() === "at,fresh,state"
         && current.records.get("missing") === undefined && current.records.set === undefined
         && Reflect.set(record, "state", "open") === false && current.mainRevision === 2;
     }` };
-    await expect(evaluateActorValidWhile(source, facts, [["__proto__", { state: "held", at: "1970-01-01T00:00:01.000Z" }]]))
+    await expect(evaluateActorValidWhile(source, facts, [["__proto__", { state: "held", at: "1970-01-01T00:00:01.000Z", fresh: true }]]))
       .resolves.toEqual({ valid: true });
   });
 });
@@ -166,6 +217,44 @@ describe("records-backed actor validity", () => {
     expect(stale[0]).toMatchObject({ action: "silent", reason: "validWhile returned false" });
     expect(stale[0]).not.toHaveProperty("runId");
     expect(deliveries).toEqual(["done", "done"]);
+  });
+
+  it.each(["held", "waited", "answered"])("runs valid queued work when its cached %s record expires without a newer state", async state => {
+    const { actors, worker, publish } = setup();
+    const { run, release } = blockFirstRun(worker);
+    const actor = await actors.create({ name: "org", instructions: "Work.", topics: ["org.work"], coalesce: false,
+      records: { topic: "org.records" }, validWhile: predicate });
+    await publish("org.work", { key: "blocker" });
+    await waitFor(() => run.mock.calls.length === 1);
+    await publish("org.work", { key: "item" });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    const terminal = await publish("org.records", { key: "item", state });
+    await publish("org.work", { key: "sentinel" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(terminal.createdAt + 21_600_000);
+    try {
+      release();
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(run).toHaveBeenCalledTimes(3);
+      expect(actors.messages(actor.id).some(message => message.stale)).toBe(false);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(["empty", "unavailable"])("runs unknown work when replay is %s", async kind => {
+    const { actors, worker, mesh, publish } = setup();
+    const run = vi.spyOn(worker, "run").mockImplementation(async request => completed(request));
+    await publish("org.records", { key: "item", state: "answered" });
+    const read = mesh.read;
+    if (kind === "empty") mesh.read = () => [];
+    else Reflect.set(mesh, "read", undefined);
+    let actor;
+    try {
+      actor = await actors.create({ name: "org", instructions: "Work.", topics: ["org.work"],
+        records: { topic: "org.records" }, validWhile: predicate });
+    } finally { mesh.read = read; }
+    await publish("org.work", { key: "item" });
+    await waitFor(() => run.mock.calls.length === 1 && actors.status(actor.id).status === "idle");
+    expect(actors.messages(actor.id).some(message => message.stale)).toBe(false);
   });
 
   it.each(["unrelated", "malformed", "other-topic"])("runs queued work after an %s records event", async kind => {
@@ -222,7 +311,7 @@ describe("records-backed actor validity", () => {
     const actor = await actors.create({ name: "timed-org", instructions: "Work.", events: ["agent_settled"],
       activation: { minIntervalMs: 1_000 }, delivery: "steer", triggerTurn: false, coalesce: false,
       records: { topic: "org.records" },
-      validWhile: { version: 1, source: '({ current }) => current.records.get("item")?.state !== "answered"' } });
+      validWhile: { version: 1, source: '({ current }) => { const record = current.records.get("item"); return record?.fresh !== true || record.state !== "answered"; }' } });
     const settled = { event: "agent_settled", session: { id: "source-a" }, signal: { idle: true } };
     expect(actors.dispatchHostEvent("agent_settled", settled)).toBe(1);
     await waitFor(() => run.mock.calls.length === 1 && actors.status(actor.id).status === "idle");
@@ -247,7 +336,7 @@ describe("records-backed actor validity", () => {
     await actors.close();
     const restored = createManager();
     expect(restored.status(actor.id)).toMatchObject({
-      records: { topic: "org.records", maxEntries: 2 }, activation: { minIntervalMs: 1_000 }, events: ["agent_settled"],
+      records: { topic: "org.records", maxEntries: 2, maxAgeMs: 21_600_000 }, activation: { minIntervalMs: 1_000 }, events: ["agent_settled"],
     });
     await publish("org.work", { key: "item" });
     await waitFor(() => restored.messages(actor.id).some(message => message.stale));

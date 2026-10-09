@@ -66,7 +66,7 @@ describe("GlobalActorRegistry", () => {
   it("lists and reloads a guarded template with validWhile as serialized source", () => {
     const { agentDir, registry } = setup();
     const validWhile = { version: 1 as const, source: "({ activation }) => activation.kind !== \"mesh\"" };
-    const records = { topic: "org.records.v1", maxEntries: 32 };
+    const records = { topic: "org.records.v1", maxEntries: 32, maxAgeMs: 1_234 };
     const activation = { minIntervalMs: 1_000 };
     const created = registry.create({ ...baseRequest, validWhile, records, activation });
     expect(registry.update(created.id, { instructions: "Still guarded." })).toMatchObject({ records, activation });

@@ -201,10 +201,11 @@ export class ResidentHost {
   #failure: unknown;
   #released = false;
   /**
-   * Last act while this host still owns the root, just before it releases
-   * owner.json (smarty-dev#7770). `failure` is the startup error, if any.
+   * Last act just before this host releases owner.json (smarty-dev#7770).
+   * `failure` is the startup error, if any. `owned` is false when the root's
+   * fence or owner.json no longer proves this host: it may then write nothing there.
    */
-  beforeRelease: ((failure: unknown) => void) | undefined;
+  beforeRelease: ((failure: unknown, owned: boolean) => void) | undefined;
   readonly #lockPath: string;
   readonly #errorPath: string;
   readonly #requestsPath: string;
@@ -1774,10 +1775,30 @@ export class ResidentHost {
     } catch (error) { this.#releaseLock(error); throw error; }
   }
 
+  /**
+   * True only while this host provably owns its root: host.lock at its path is
+   * still the inode this host locked (the establishment check), and owner.json
+   * names this host (the owner fence check) or, before this host published it,
+   * names no live process (a dead predecessor's record; startup diagnostics such
+   * as a watchdog-custody refusal still need error.json). A replaced lock or a
+   * live other generation's owner.json means the root is not ours to write.
+   */
+  #holdsRoot(): boolean {
+    if (this.#lockFd === undefined) return false;
+    try {
+      const locked = fs.fstatSync(this.#lockFd, { bigint: true });
+      const current = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (current.dev !== locked.dev || current.ino !== locked.ino) return false;
+    } catch { return false; }
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (owner?.token === this.#token) return owner.pid === process.pid;
+    return !owner || !residentProcessAlive(owner.pid, owner.processStartTime);
+  }
+
   #releaseLock(failure = this.#failure): void {
     if (this.#lockFd === undefined) return;
     if (!this.#released && !(failure instanceof ResidentHostAlreadyRunning)) {
-      try { this.beforeRelease?.(failure); } catch { /* diagnostics never block release */ }
+      try { this.beforeRelease?.(failure, this.#holdsRoot()); } catch { /* diagnostics never block release */ }
     }
     this.#released = true;
     // Remove our publication while holding the claim. POSIX never unlinks its
@@ -1836,12 +1857,15 @@ export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | 
  */
 export const reportResidentExit = (residencyRoot: string, reason: ResidentExitReason,
   constants: Partial<typeof fs.constants> = fs.constants): void => {
-  const { O_WRONLY = 0, O_APPEND = 0, O_CREAT = 0, O_NOFOLLOW } = constants;
-  // Without O_NOFOLLOW a planted symlink would redirect the write: fail closed.
-  if (O_NOFOLLOW === undefined) return;
+  const { O_WRONLY = 0, O_APPEND = 0, O_CREAT = 0, O_NOFOLLOW, O_NONBLOCK } = constants;
+  // Without O_NOFOLLOW a planted symlink would redirect the write; without
+  // O_NONBLOCK a planted FIFO with no reader would block the open: fail closed.
+  if (O_NOFOLLOW === undefined || O_NONBLOCK === undefined) return;
   let fd: number | undefined;
   try {
-    fd = fs.openSync(path.join(residencyRoot, "launcher.log"), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600);
+    // A FIFO without a reader fails at once (ENXIO); one with a reader is
+    // rejected by the regular-file check. A regular file ignores O_NONBLOCK.
+    fd = fs.openSync(path.join(residencyRoot, "launcher.log"), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.uid !== process.getuid?.()) return;
     if (stat.mode & 0o177) fs.fchmodSync(fd, 0o600);
@@ -1879,8 +1903,15 @@ const runResidentHost = async (
   created(host);
   // Every path reports while this host still owns the root: close releases
   // owner.json last, and nothing may write under the root after that (smarty-dev#1882).
-  host.beforeRelease = (failure) => {
-    reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error");
+  host.beforeRelease = (failure, owned) => {
+    const exitReason = failure === undefined ? reason ?? "error" : "error";
+    if (!owned) {
+      // No proven fence: the root may be another generation's. stderr only.
+      const detail = failure === undefined ? "" : `: ${errorMessage(failure)}`;
+      try { process.stderr.write(`Fabric resident host exit (${exitReason}) without a proven root fence${detail}\n`); } catch { /* best effort */ }
+      return;
+    }
+    reportResidentExit(config.residencyRoot, exitReason);
     if (failure !== undefined) writeResidentError(config.residencyRoot, failure);
   };
   await host.start();

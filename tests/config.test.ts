@@ -34,28 +34,6 @@ afterEach(() => {
   }
 });
 
-describe("host-only interrupt authority (#7452)", () => {
-  it("defaults closed and rejects malformed whole lists", () => {
-    expect(DEFAULT_FABRIC_CONFIG.agents.interruptFrom).toEqual([]);
-    expect(normalizeFabricConfig({}).agents.interruptFrom).toEqual([]);
-    expect(normalizeFabricConfig({ agents: { interruptFrom: [" session:owner ", "lead", "lead"] } }).agents.interruptFrom).toEqual(["session:owner", "lead"]);
-    for (const interruptFrom of ["lead", ["lead", 1], [""], Array(513).fill("lead")]) {
-      expect(normalizeFabricConfig({ agents: { interruptFrom } }).agents.interruptFrom).toEqual([]);
-    }
-  });
-  it.each([true, false])("workspace cannot add or replace interrupt authority (trusted=%s)", projectTrusted => {
-    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
-    fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { interruptFrom: ["session:host"] } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { interruptFrom: ["session:workspace"] } }));
-    for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }), loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
-      expect(config.agents.interruptFrom).toEqual(["session:host"]);
-    }
-    fs.unlinkSync(path.join(agentDir, "fabric.json"));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.interruptFrom).toEqual([]);
-  });
-});
-
 describe("host-only explicit model exceptions (#3134)", () => {
   it("defaults to Astra and supports an empty rollback or normalized override", () => {
     expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);

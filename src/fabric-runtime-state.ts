@@ -663,7 +663,6 @@ export class FabricRuntimeState {
       context.mode !== "print" && context.mode !== "json",
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
       {
-        interruptFrom: () => this.config.agents.interruptFrom,
         isSupervisor: (sender, rootId) => {
           if (sender.kind !== "actor") return false;
           try {

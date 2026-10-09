@@ -254,7 +254,6 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "timeoutMs": 86400000,
     "extensions": true,
     "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    "interruptFrom": [],
     "retainRuns": false,
     "notifyOnComplete": true,
     "budgetUsd": 0,

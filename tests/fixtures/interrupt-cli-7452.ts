@@ -36,7 +36,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", event => {
     if (event.text.startsWith("WORK ")) {
       working = true;
-      const command = `echo $$ > '${root}/bash-pid'; printf entered > '${root}/entered'; sleep 30; printf completed > '${root}/completed'`;
+      const command = `echo $$ > '${root}/bash-pid'; printf entered > '${root}/entered'; while ! test -f '${root}/release'; do sleep 0.01; done; printf completed > '${root}/completed'`;
       const tool = event.text.slice(5) === "fabric_exec"
         ? fauxToolCall("fabric_exec", { code: "return await pi.bash({ command: π.command, timeout: 30 });", payloads: { command } })
         : fauxToolCall("bash", { command, timeout: 30 });

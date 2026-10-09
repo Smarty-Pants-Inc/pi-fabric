@@ -516,9 +516,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       const verified = request.verification === "mesh" || request.verification === "bridge";
       const session = (id: string): string => id.startsWith("session:") ? id.slice(8) : id;
       const ownRoot = sender.kind === "main" && session(sender.id) === session(this.id);
-      const allowlisted = sender.kind === "main" && (this.interruptAuthority.interruptFrom?.() ?? []).some(entry =>
-        session(entry) === session(sender.id) || entry === sender.name);
-      if (!verified || !(ownRoot || allowlisted || this.interruptAuthority.isSupervisor?.(sender, this.id) === true)) {
+      if (!verified || !(ownRoot || this.interruptAuthority.isSupervisor?.(sender, this.id) === true)) {
         throw new FabricInterruptNotAuthorizedError(sender.id, this.id);
       }
     }

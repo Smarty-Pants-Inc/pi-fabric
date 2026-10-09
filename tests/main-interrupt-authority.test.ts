@@ -12,6 +12,8 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 const owner: MeshIdentity = { id: "session:owner", name: "owner", kind: "main" };
 const peer: MeshIdentity = { id: "session:peer", name: "peer", kind: "main" };
+const supervisor = { id: "supervisor-actor", rootId: owner.id, supervisorFor: owner.id, status: "running" };
+const supervisorSender: MeshIdentity = { id: supervisor.id, name: "supervisor", kind: "actor" };
 const roots: string[] = [];
 const closers: Array<() => void> = [];
 afterEach(() => {
@@ -19,7 +21,7 @@ afterEach(() => {
   vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-const setup = (allow: string[] = [], supervisor?: { id: string; rootId: string; supervisorFor?: string; status: string }) => {
+const setup = (supervisor?: { id: string; rootId: string; supervisorFor?: string; status: string }) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-interrupt-authority-")); roots.push(root);
   const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => void>>();
   const state = { idle: false, aborted: false };
@@ -34,7 +36,6 @@ const setup = (allow: string[] = [], supervisor?: { id: string; rootId: string; 
     sessionManager: { getSessionFile: () => undefined, getBranch: () => [] },
   } as unknown as ExtensionContext;
   const main = new MainAgentController(pi, owner.id, true, root, "owner", true, undefined, {
-    interruptFrom: () => allow,
     isSupervisor: (sender, rootId) => isMainInterruptSupervisor(sender, rootId, supervisor),
   });
   main.attachFollowUpDrain(ctx, 120_000, path.join(root, "journal.json"));
@@ -65,19 +66,17 @@ describe("interrupt-specific receiver authority (#7452)", () => {
     await f.router.routeMessage(owner.id, "ordinary", undefined, "steer");
     expect(f.sent).toHaveBeenCalledTimes(1); expect(f.abort).not.toHaveBeenCalled();
   });
-  it.each([peer.id, "peer", "peer-main"])("admits only a verified host-allowlisted Main/session (%s)", entry => {
-    const sender = entry === "peer-main" ? { ...peer, name: "peer-main" } : peer;
-    const f = setup([entry]); f.interrupt(sender); expect(f.abort).toHaveBeenCalledTimes(1);
-  });
   it("own root interrupts but an unverified identity or same-name actor cannot", () => {
-    const f = setup(["owner", "peer"]);
+    const f = setup();
     for (const from of [owner, peer]) expect(() => f.main.deliverAgent({ from, delivery: "steer", priority: "interrupt", message: "unverified" }))
       .toThrow(expect.objectContaining({ code: "FABRIC_INTERRUPT_NOT_AUTHORIZED" }));
-    expect(() => f.interrupt({ ...peer, kind: "actor" })).toThrow(expect.objectContaining({ code: "FABRIC_INTERRUPT_NOT_AUTHORIZED" }));
+    for (const from of [peer, { ...peer, name: owner.name }, { ...peer, name: owner.name, kind: "actor" as const }]) {
+      expect(() => f.interrupt(from)).toThrow(expect.objectContaining({ code: "FABRIC_INTERRUPT_NOT_AUTHORIZED" }));
+    }
     f.interrupt(owner); expect(f.abort).toHaveBeenCalledTimes(1);
   });
   it("uses the bridge-verified sender, not a forged identity or name in data", async () => {
-    const f = setup([owner.id]);
+    const f = setup();
     const command = { commandId: "bridge", targetId: owner.id, operation: "steer", message: "HOLD", priority: "interrupt", data: { from: owner, supervisorFor: owner.id } } as any;
     expect(await f.router.acceptControl(command, peer, undefined, "bridge"))
       .toMatchObject({ accepted: false, errorCode: "FABRIC_INTERRUPT_NOT_AUTHORIZED" });
@@ -88,7 +87,7 @@ describe("interrupt-specific receiver authority (#7452)", () => {
   it("requires an immutable native supervisor binding to the exact current root", () => {
     const actor = { id: "supervisor-actor", rootId: owner.id, supervisorFor: owner.id, status: "running" };
     const sender: MeshIdentity = { id: actor.id, name: "irrelevant", kind: "actor" };
-    const f = setup([], actor); f.interrupt(sender); expect(f.abort).toHaveBeenCalledTimes(1);
+    const f = setup(actor); f.interrupt(sender); expect(f.abort).toHaveBeenCalledTimes(1);
     for (const invalid of [undefined, { id: actor.id, rootId: actor.rootId, status: actor.status }, { ...actor, rootId: peer.id }, { ...actor, id: "another" }, { ...actor, status: "stopped" }, { ...actor, removal: {} }]) {
       expect(isMainInterruptSupervisor(sender, owner.id, invalid)).toBe(false);
     }
@@ -114,10 +113,10 @@ describe("interrupt-specific receiver authority (#7452)", () => {
 
 describe("typed interrupt cooldown over mesh (#7452)", () => {
   it("returns FABRIC_INTERRUPT_RATE_LIMITED through the verified owner ACK", async () => {
-    const f = setup([peer.id]);
+    const f = setup(supervisor);
     const mesh = new MeshStore(path.join(f.root, "mesh"), 64 * 1024, 100);
     const receiver = new FabricControlPlane(mesh, owner, { enabled: true, hostId: owner.id, pollMs: 5 });
-    const sender = new FabricControlPlane(mesh, peer, { enabled: true, hostId: peer.id, pollMs: 5 });
+    const sender = new FabricControlPlane(mesh, supervisorSender, { enabled: true, hostId: supervisor.id, pollMs: 5 });
     closers.push(() => receiver.close(), () => sender.close());
     receiver.start((command, from, signal) => f.router.acceptControl(command, from, signal, "mesh"));
     sender.start(() => ({ accepted: false }));
@@ -138,14 +137,14 @@ describe("typed interrupt cooldown over mesh (#7452)", () => {
 describe("interrupt budget and monotonic sender cooldown (#7452)", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   it("allows one abort per turn including its interrupted restart; another sender becomes ordinary", () => {
-    const f = setup([peer.id]); f.interrupt();
-    const excess = f.interrupt(peer, "second"); expect(excess.reason).toContain("ordinary steer");
+    const f = setup(supervisor); f.interrupt();
+    const excess = f.interrupt(supervisorSender, "second"); expect(excess.reason).toContain("ordinary steer");
     expect(f.abort).toHaveBeenCalledTimes(1);
     f.settle(); f.start(); // HOLD continuation, not a fresh turn budget.
-    f.interrupt(peer, "third"); expect(f.abort).toHaveBeenCalledTimes(1);
+    f.interrupt(supervisorSender, "third"); expect(f.abort).toHaveBeenCalledTimes(1);
     expect(f.sent.mock.calls.at(-1)?.[1]).toMatchObject({ deliverAs: "steer" });
     f.settle(); f.start(); // Independently started next turn.
-    f.interrupt(peer, "fourth"); expect(f.abort).toHaveBeenCalledTimes(2);
+    f.interrupt(supervisorSender, "fourth"); expect(f.abort).toHaveBeenCalledTimes(2);
   });
   it("rejects repeat sender until exactly 60 seconds across successive turns, without downgrade", () => {
     const f = setup(); f.interrupt(); f.settle(); f.start();
@@ -159,11 +158,11 @@ describe("interrupt budget and monotonic sender cooldown (#7452)", () => {
     f.settle(); f.start(); f.interrupt(); expect(f.abort).toHaveBeenCalledTimes(2);
   });
   it("does not consume another sender's budget or reject an idempotent retry", () => {
-    const f = setup([peer.id]); const first = f.interrupt(owner, "HOLD", "durable");
+    const f = setup(supervisor); const first = f.interrupt(owner, "HOLD", "durable");
     expect(f.interrupt(owner, "HOLD", "durable")).toMatchObject({ messageId: first.messageId, duplicate: true });
     expect(() => f.interrupt(owner, "again")).toThrow(expect.objectContaining({ code: "FABRIC_INTERRUPT_RATE_LIMITED" }));
-    f.interrupt(peer); f.settle(); f.start(); f.settle(); f.start();
-    f.interrupt(peer); expect(f.abort).toHaveBeenCalledTimes(2);
+    f.interrupt(supervisorSender); f.settle(); f.start(); f.settle(); f.start();
+    f.interrupt(supervisorSender); expect(f.abort).toHaveBeenCalledTimes(2);
   });
   it("ordinary steer remains admissible during cooldown", () => {
     const f = setup(); f.interrupt(); f.settle(); f.start();

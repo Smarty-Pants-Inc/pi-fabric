@@ -40,10 +40,9 @@ aborted tool. Older held followUps stay behind the HOLD. If Main is idle or has
 no active tool call, this is an ordinary steer. Omit priority to keep the
 existing tool-boundary queue. Only `"interrupt"` is valid; followUp, non-Main
 participants and legacy control routes reject it. Interrupt has narrower authority than
-ordinary steer: the verified sender must be this Main's own root session, its
-owner-created supervisor bound to that root, or a Main/session listed in host-only
-`agents.interruptFrom` (session ids or exact Main names; default `[]`). Workspace
-configuration cannot grant this authority. An unauthorized request fails with
+ordinary steer: the verified sender must be this Main's own root session or its
+owner-created supervisor bound to that root. Configuration cannot grant this
+authority. An unauthorized request fails with
 `FABRIC_INTERRUPT_NOT_AUTHORIZED` and is not delivered, even as an ordinary steer.
 Bridge admission checks the bridge-verified identity, never identities in message data.
 

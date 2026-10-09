@@ -26,8 +26,6 @@ export const isMainInterruptSupervisor = (sender: MeshIdentity, rootId: string, 
   actor.supervisorFor === rootId && actor.status !== "stopped" && !actor.removal;
 
 export interface FabricInterruptAuthority {
-  /** Host configuration only. Names are matched only for verified Main identities. */
-  interruptFrom?: () => readonly string[];
   /** Native owner-minted registry binding, not mesh presence or request.data. */
   isSupervisor?: (sender: MeshIdentity, rootId: string) => boolean;
 }

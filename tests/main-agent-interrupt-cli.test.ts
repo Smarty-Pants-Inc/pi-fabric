@@ -9,19 +9,18 @@ const repo = fileURLToPath(new URL("../", import.meta.url));
 type Event = Parameters<Parameters<RpcClient["onEvent"]>[0]>[0];
 // Explicit compiled real-host probe; no agent spawning or external model/credentials.
 describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI === "1")("compiled fabric_exec interrupt-priority send (#7452)", () => {
-  it.each(["bash", "fabric_exec"] as const)("preempts receiver %s through agents.send over the real mesh and starts HOLD next", async tool => {
+  it.each(["bash", "fabric_exec"] as const)("refuses non-lineage agents.send without aborting receiver %s or downgrading", async tool => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-interrupt-cli-"));
     const clients: RpcClient[] = [];
     const events: Record<string, Event[]> = { receiver: [], sender: [] };
     let run: Promise<void> | undefined;
-    const make = (name: string, interruptFrom: string[] = []) => {
+    const make = (name: string) => {
       const cwd = path.join(root, name);
       const agentDir = path.join(cwd, "agent");
       fs.mkdirSync(agentDir, { recursive: true });
       fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false } }));
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { kernel: "typescript" }, fullCodeMode: name === "receiver" && tool === "fabric_exec",
         mesh: { enabled: true, announce: true, followUpFlushMs: 10 },
-        agents: { interruptFrom },
         mcp: { enabled: false }, jev: { enabled: false }, memory: { enabled: false },
         compaction: { engine: "pi" }, entropy: { compile: false }, speculation: { enabled: false },
       }));
@@ -43,8 +42,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
       const sender = make("sender");
       await sender.start();
       await wait(() => exists("sender", "ready.json"));
-      const senderReady = JSON.parse(fs.readFileSync(path.join(root, "sender", "ready.json"), "utf8"));
-      const receiver = make("receiver", [senderReady.id]);
+      const receiver = make("receiver");
       await receiver.start();
       await wait(() => exists("receiver", "ready.json"));
       const ready = JSON.parse(fs.readFileSync(path.join(root, "receiver", "ready.json"), "utf8"));
@@ -53,29 +51,38 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
       await wait(() => exists("receiver", "entered"));
       // RPC prompt acknowledges admission, not completion. Join sender settlement so
       // cleanup cannot cancel agents.send before its owner acknowledgement arrives.
-      await sender.promptAndWait(`SEND ${JSON.stringify({ id: ready.id, message: "HOLD: do not start the change", priority: "interrupt" })}`, undefined, 15_000);
-      await wait(() => events.receiver!.filter(event => event.type === "agent_end").length === 2);
-      await run;
-      await wait(() => exists("receiver", "abort.json"));
-      const aborted = JSON.parse(fs.readFileSync(path.join(root, "receiver", "abort.json"), "utf8"));
-      expect(aborted.exited).toBe(true);
-      expect(aborted.nativeAbortToProcessExitMs).toBeLessThan(1000);
+      await sender.promptAndWait(`SEND ${JSON.stringify({ id: ready.id, message: "forbidden HOLD", priority: "interrupt" })}`, undefined, 15_000);
+      const refusal = events.sender!.find(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec")!;
+      expect((refusal as { isError: boolean }).isError).toBe(true);
+      expect(JSON.stringify(refusal)).toContain("FABRIC_INTERRUPT_NOT_AUTHORIZED");
+      expect(exists("receiver", "abort.json")).toBe(false);
       expect(exists("receiver", "completed")).toBe(false);
+      expect(events.receiver!.filter(event => event.type === "tool_execution_end")).toHaveLength(0);
+      expect((await receiver.getMessages()).filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message")).toHaveLength(0);
+      await sender.promptAndWait(`SEND ${JSON.stringify({ id: ready.id, message: "ordinary peer correction" })}`, undefined, 15_000);
+      expect(exists("receiver", "abort.json")).toBe(false);
+      fs.writeFileSync(path.join(root, "receiver", "release"), "1");
+      await run;
+      await wait(() => events.receiver!.some(event => event.type === "agent_end"));
+      expect(exists("receiver", "completed")).toBe(true);
+      expect(exists("receiver", "abort.json")).toBe(false);
       const messages = await receiver.getMessages();
       const hold = messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
       expect(hold).toHaveLength(1);
-      expect(JSON.stringify(hold[0])).toContain("HOLD: do not start the change");
+      expect(JSON.stringify(hold[0])).toContain("ordinary peer correction");
+      expect(JSON.stringify(messages)).not.toContain("forbidden HOLD");
       expect(events.receiver!.filter(event => event.type === "tool_execution_start" && event.toolName === tool)).toHaveLength(1);
       const ended = events.receiver!.find(event => event.type === "tool_execution_end" && event.toolName === tool)!;
-      expect((ended as { isError: boolean }).isError).toBe(true);
-      expect(events.receiver!.filter(event => event.type === "agent_start")).toHaveLength(2);
+      expect((ended as { isError: boolean }).isError).toBe(false);
+      expect(events.receiver!.filter(event => event.type === "agent_start")).toHaveLength(1);
       const context = fs.readFileSync(path.join(root, "receiver", "provider-context.jsonl"), "utf8");
-      expect(context).toContain("HOLD: do not start the change");
-      expect(JSON.parse(context.trim().split("\n").at(-1)!).at(-1).role).toBe("user");
+      expect(context).toContain("ordinary peer correction");
+      expect(context).not.toContain("forbidden HOLD");
       const persisted = fs.readFileSync(ready.sessionFile, "utf8");
-      expect(persisted).toContain("HOLD: do not start the change");
+      expect(persisted).toContain("ordinary peer correction");
+      expect(persisted).not.toContain("forbidden HOLD");
       await wait(() => events.sender!.some(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec"));
-      const ack = events.sender!.find(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec")!;
+      const ack = events.sender!.filter(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec").at(-1)!;
       expect(JSON.stringify(ack)).toContain('"acknowledged":true');
       expect(JSON.stringify(ack)).toContain('"ref":"agents.send"');
     } finally {

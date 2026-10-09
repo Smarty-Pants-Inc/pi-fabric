@@ -182,8 +182,6 @@ export interface FabricAgentConfig {
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
-  /** Host-only: session ids or Main names allowed to interrupt. Default closed. */
-  interruptFrom: string[];
   /** Host-only explicit-selection exception policy; [] disables the reason gate. */
   modelPolicy: { requireReason: string[] };
   deniedModelReplacement?: string;
@@ -567,7 +565,6 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     deniedModels: [],
-    interruptFrom: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
@@ -1167,7 +1164,6 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     agents: {
       enabled: booleanValue(agents.enabled, DEFAULT_FABRIC_CONFIG.agents.enabled),
-      interruptFrom: deadRootExemptList(agents.interruptFrom) ?? [],
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
@@ -1750,7 +1746,6 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.modelPolicy;
       delete agents.deniedModels;
-      delete agents.interruptFrom; // Host-only: workspace peers cannot grant abort authority.
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
       delete agents.wakeText;

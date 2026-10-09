@@ -701,7 +701,10 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve
 if (isMain) {
   const configPath = parseConfigPath(process.argv);
   try {
-    if (process.platform === "win32" && !process.argv.includes("--wake")) await supervise(configPath);
+    // Explicit/client starts retain the ordinary kernel-fenced startup protocol
+    // (including an already-admitted watchdog challenger). Only delivery nudges
+    // own wake.lock; suppressing a normal challenger bypassed its custody test.
+    if (!process.argv.includes("--wake")) await supervise(configPath);
     else {
       const result = await superviseWake(configPath, supervise, { wakeOnly: process.argv.includes("--wake") });
       if (result && process.connected && process.send) process.send({ event: "resident-wake-pending", root: result.root, reason: result.reason }, () => {});

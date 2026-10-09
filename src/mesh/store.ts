@@ -9,6 +9,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-f
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError } from "./event-log.js";
@@ -277,7 +278,12 @@ export class MeshStore {
     this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
     this.#state = createStateBackend(context, options);
-    this.#events = new EventLog(context, options);
+    this.#events = new EventLog(context, options, event => {
+      if (!fs.existsSync(path.join(this.root, "residency"))) return;
+      const subscriptions = event.topic === "fabric.participant.lifecycle"
+        ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
+      indexResidentDeliveries(this.root, event, subscriptions);
+    });
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     // Best effort: the writer census is advisory, never a gate (smarty-dev#6982), so a failed
     // record changes nothing here; the census reports the writer's evidence as unknown instead.

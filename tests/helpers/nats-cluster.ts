@@ -4,9 +4,15 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { connect } from "nats";
+import { findExecutable } from "../../src/agents/transports/process-utils.js";
 
-export const natsServerBinary = process.env.NATS_SERVER ?? path.resolve(".lane/nats/nats-server-v2.14.7-linux-amd64/nats-server");
+export const natsServerBinary = process.env.NATS_SERVER ?? findExecutable("nats-server")
+  ?? path.resolve(".lane/nats/nats-server-v2.14.7-linux-amd64/nats-server");
 export const natsAvailable = fs.existsSync(natsServerBinary);
+if (process.env.NATS_SERVER_REQUIRED === "1" && !natsAvailable) {
+  throw new Error(`NATS_SERVER_REQUIRED=1 but nats-server binary is missing: ${natsServerBinary}`);
+}
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const freePort = async (): Promise<number> => {
   const server = net.createServer();
@@ -74,7 +80,20 @@ export async function startNatsCluster(size: 1 | 3 = 1, label = "integration"): 
           return response.ok && (size === 1 || Boolean(json.meta_cluster?.leader));
         } catch { return false; }
       }));
-      if (responses.every(Boolean)) return;
+      if (responses.every(Boolean)) {
+        // A monitor can report the elected leader before its API routes are ready.
+        const apiReady = await Promise.all(ports.map(async port => {
+          let nc;
+          try {
+            nc = await connect({ servers: `nats://127.0.0.1:${port}`, timeout: 500, reconnect: false });
+            const manager = await nc.jetstreamManager({ timeout: 500 });
+            await manager.streams.list().next();
+            return true;
+          } catch { return false; }
+          finally { await nc?.close(); }
+        }));
+        if (apiReady.every(Boolean)) return;
+      }
       await pause(100);
     }
     throw new Error(`NATS cluster not ready in 30 s; logs: ${logs}`);

@@ -132,8 +132,13 @@ await log.close();
 The lane contains the inherited official `nats-server v2.14.7` Linux amd64 release under
 `.lane/nats/` (ignored), checked against its official SHA256SUMS before reuse. `nats@2.29.3` is a
 branch-only dependency in `package.json` / `bun.lock`. No global client/server install or service.
-Tests find that lane binary or explicit `NATS_SERVER`; without it, only transport integration tests
-skip and file conformance remains available. All fixtures bind loopback, choose ports dynamically,
+Tests find an explicit `NATS_SERVER`, then `nats-server` on PATH, then that lane binary. Without it,
+transport integration tests skip and file conformance remains available for optional local runs.
+Set `NATS_SERVER_REQUIRED=1` to fail instead of skipping when the binary is missing. The Ubuntu CI
+job downloads the official v2.14.7 Linux amd64 release, verifies its release SHA256SUMS and pinned
+archive digest `e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2`, adds it to PATH,
+and always runs all three suites below with the server required, independently of affected-test
+selection. Windows does not install the Linux binary. All fixtures bind loopback, choose ports dynamically,
 write configs/data under TMPDIR, keep server logs under TASK_OUT when supplied, and stop/wait children.
 
 ```sh

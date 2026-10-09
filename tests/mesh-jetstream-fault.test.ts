@@ -69,7 +69,10 @@ describe.skipIf(!natsAvailable)("JetStream R3 event-log fault", () => {
         }
       };
       for (const [i, event] of baselinePending.entries()) expect(await retry(event)).toEqual(baseline[i]);
-      expect(await reader.checkpoint()).toBe(baseline[0]!.sequence);
+      // Stream and consumer Raft groups elect independently; wait for the
+      // consumer API/checkpoint to recover, without weakening the saved ACK assertion.
+      await expect.poll(() => reader.checkpoint(), { timeout: 30_000, interval: 100 })
+        .toBe(baseline[0]!.sequence);
       expect(await reader.next(5000)).toEqual(baseline[1]);
       await reader.ack(baseline[1]!);
       await reader.close();

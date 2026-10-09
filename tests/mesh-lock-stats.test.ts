@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
+  createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
@@ -478,5 +478,42 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(main(["--mesh", root, "--minutes", "2"], { stdout: (text: string) => { out += text; }, now: (MINUTE0 + 2) * 60_000 })).toBe(0);
     expect(out).toContain("a\\u001b[2Jb\\u000ac-9");
     expect(out).not.toContain("\u001b");
+  });
+
+  it("skips files modified before the window before the cap, and caps the stalest (smarty-dev#7826)", () => {
+    const root = temp();
+    const directory = path.join(root, "lock-stats");
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    const old = (now - (LOCK_STATS_RETAIN_MINUTES + 5) * 60_000) / 1000;
+    for (let pid = 1; pid <= 5_000; pid++) {
+      fixture(root, "aaa-dead", pid, [{ minute: MINUTE0 - 90, classes: { publish: bucket({ n: 1 }) } }]);
+      fs.utimesSync(path.join(directory, `aaa-dead-${pid}.json`), old, old);
+    }
+    fixture(root, "zzz-bridge", 7, [{ minute: MINUTE0 + 1, classes: { publish: bucket({ n: 3, holdMs: 30 }) } }]);
+    const problems: string[] = [];
+    expect(readLockStats(root, problems, { minutes: 2, now }).map(file => file.host)).toEqual(["zzz-bridge"]);
+    expect(problems).toEqual([]);
+    let out = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: () => {}, now };
+    expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
+    expect(out).toContain("3 acquisitions");
+    // The boundary is the summary window's first minute (MINUTE0 with --minutes 2 at MINUTE0 + 2):
+    // a file last written just before it is skipped; one written at its start is read.
+    fixture(root, "edge-before", 8, [{ minute: MINUTE0 - 1, classes: { publish: bucket({ n: 1 }) } }]);
+    fixture(root, "edge-at", 9, [{ minute: MINUTE0, classes: { publish: bucket({ n: 1 }) } }]);
+    fs.utimesSync(path.join(directory, "edge-before-8.json"), (MINUTE0 * 60_000 - 1) / 1000, (MINUTE0 * 60_000 - 1) / 1000);
+    fs.utimesSync(path.join(directory, "edge-at-9.json"), MINUTE0 * 60, MINUTE0 * 60);
+    expect(readLockStats(root, [], { minutes: 2, now }).map(file => file.host).sort()).toEqual(["edge-at", "zzz-bridge"]);
+    fs.unlinkSync(path.join(directory, "edge-before-8.json"));
+    fs.unlinkSync(path.join(directory, "edge-at-9.json"));
+    // Still over the cap inside the window: the newest are read and the cut is reported.
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, []);
+    const newer = Date.now() / 1000 + 3_600;
+    fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), newer, newer);
+    const capped: string[] = [];
+    const files = readLockStats(root, capped, { minutes: 2, now });
+    expect(files).toHaveLength(LOCK_STATS_MAX_FILES);
+    expect(files[0]!.host).toBe("zzz-bridge");
+    expect(capped).toEqual([`${directory}: ${LOCK_STATS_MAX_FILES + 1} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`]);
   });
 });

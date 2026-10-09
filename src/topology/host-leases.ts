@@ -102,6 +102,8 @@ export interface FabricHostLease {
   expiresAt: number;
   /** Incarnation fence; absent on pre-lease-capability writers. */
   startedAt?: number;
+  /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
+  reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
   /** Writer census metadata, absent on leases from pre-census releases. */
@@ -174,12 +176,14 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       typeof value.identityId !== "string" ||
       typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
       typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt) ||
-      (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt)))
+      (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt))) ||
+      (value.reloadUntil !== undefined && (typeof value.reloadUntil !== "number" || !Number.isFinite(value.reloadUntil)))
     ) return undefined;
     return {
       id: value.id, rootId: value.rootId, identityId: value.identityId,
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
+      ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };

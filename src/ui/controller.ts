@@ -1,4 +1,5 @@
 import path from "node:path";
+import { watchUiFiles } from "./watch-files.js";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import * as piConversationHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -72,6 +73,9 @@ export class FabricUiController {
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
   #shellUnsubscribe: (() => void) | undefined;
+  #meshUnsubscribe: (() => void) | undefined;
+  #inputUnsubscribe: (() => void) | undefined;
+  #paneVisible = true;
   #tasksOpen = false;
   #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
   #closeTasks: (() => void) | undefined;
@@ -121,7 +125,18 @@ export class FabricUiController {
     if (this.state.config.mesh.enabled) {
       this.#events = this.state.mesh.read({ limit: this.state.config.ui.eventHistory });
       this.#meshOffset = this.state.mesh.latestOffset();
+      if (typeof this.state.mesh.root === "string") {
+        const epoch = this.#epoch;
+        this.#meshUnsubscribe = watchUiFiles(this.state.mesh.root,
+          ["state.read-signal.json", "events.jsonl", "generation"],
+          () => this.#runBackground(epoch, () => this.#scheduleRefresh()));
+      }
     }
+    const inputEpoch = this.#epoch;
+    this.#inputUnsubscribe = context.ui.onTerminalInput?.(() => {
+      this.#runBackground(inputEpoch, () => this.#scheduleRefresh());
+      return undefined; // Observe input; never consume or transform it.
+    });
     this.#activityUnsubscribe = this.state.activity.subscribe(() => this.#scheduleRefresh());
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
     this.#agentUnsubscribe = this.state.agents.subscribeUi(() => this.#scheduleRefresh());
@@ -139,6 +154,10 @@ export class FabricUiController {
     this.#tasksOpen = false;
     this.#shellUnsubscribe?.();
     this.#shellUnsubscribe = undefined;
+    this.#meshUnsubscribe?.();
+    this.#meshUnsubscribe = undefined;
+    this.#inputUnsubscribe?.();
+    this.#inputUnsubscribe = undefined;
     this.#closeConversation?.();
     this.#closeConversation = undefined;
     this.#conversationView?.dispose();
@@ -192,6 +211,28 @@ export class FabricUiController {
     this.#hostStreaming = streaming;
     this.#refresh();
     this.#schedulePoll(true);
+  }
+
+  /**
+   * Host pane-visibility hook. Pi exposes terminal input and overlay handles, but no terminal
+   * pane visibility subscription. Embedders must call this on hide/show; keyboard focus is
+   * deliberately not visibility (a visible dashboard can lose focus to a picker).
+   */
+  setPaneVisible(visible: boolean): void {
+    if (visible === this.#paneVisible) return;
+    this.#paneVisible = visible;
+    if (this.#timer) clearTimeout(this.#timer);
+    if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
+    this.#timer = undefined;
+    this.#scheduledRefresh = undefined;
+    if (!visible) {
+      this.#suspendConversationReader();
+      return;
+    }
+    this.#runBackground(this.#epoch, () => {
+      this.#refresh(); // Consume all changes accumulated while hidden, exactly once.
+      this.#schedulePoll();
+    });
   }
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
@@ -669,7 +710,7 @@ export class FabricUiController {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    if (this.#timer || !this.#context || !this.state.initialized) return;
+    if (this.#timer || !this.#paneVisible || !this.#context || !this.state.initialized) return;
     const localActive =
       this.#snapshot.main.status === "running" ||
       this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
@@ -683,28 +724,46 @@ export class FabricUiController {
     const remoteActive =
       this.#snapshot.peers.length > 0 ||
       this.#snapshot.agents.some((agent) => agent.local === false && isActiveStatus(agent.status));
-    if (!this.ownsInput && !localActive && !remoteActive) return;
-    // Remote records change at most once per owner heartbeat, and on a shared mesh some peer is
-    // always present, so polling them at refreshMs kept every idle Pi rebuilding the snapshot
-    // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
-    const pollDelay = this.ownsInput || localActive
-      ? this.state.config.ui.refreshMs
-      : Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
-    // Wake at the fixed cache deadline too: a recently warmed cache must not add a second
-    // 5 s UI poll window after the store's 5 s reuse window (smarty-dev#4383).
-    const remaining = this.state.config.mesh.enabled ? this.state.mesh.readCacheRemainingMs : 0;
-    const delay = remaining > 0 ? Math.min(pollDelay, remaining) : pollDelay;
+    if (!this.ownsInput && !localActive && !remoteActive && !this.state.config.mesh.enabled) return;
+    // Events own prompt updates. This slow fallback covers missed filesystem notifications,
+    // file-only topology/lease changes and elapsed clocks, never the old 500 ms UI loop.
+    // A warm store cache must not shorten the fallback floor (smarty-dev#7403).
+    const delay = Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
     const epoch = this.#epoch;
     this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
       this.#timer = undefined;
-      this.#refresh(false);
+      if (this.#needsFallbackRefresh()) this.#refresh(false);
       this.#schedulePoll();
     }), delay);
     this.#timer.unref();
   }
 
+  /** A fallback wake is not a refresh when an idle dashboard has no changed inputs. */
+  #needsFallbackRefresh(): boolean {
+    const snapshot = this.#snapshot;
+    if (this.#conversationOpen || snapshot.main.status === "running" ||
+      snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000 ||
+        snapshot.now - job.finishedAt < 30000) || // one final refresh removes the expired shell widget
+      snapshot.runs.some(run => run.status === "running") ||
+      snapshot.agents.some(agent => agent.local !== false && isActiveStatus(agent.status)) ||
+      snapshot.actors.some(actor => isActiveStatus(actor.status) ||
+        Boolean(actor.worker && isActiveStatus(actor.worker.status)))) return true;
+    const meshEnabled = this.state.config.mesh.enabled;
+    const root = meshEnabled && typeof this.state.mesh.root === "string" ? this.state.mesh.root : undefined;
+    const remote = JSON.stringify([
+      meshEnabled ? this.state.mesh.latestOffset() : this.#meshOffset,
+      meshEnabled ? this.state.mesh.stateStamp?.() : undefined,
+      root ? participantFilesStamp(root) : undefined,
+      root ? hostLeasesStamp(root) : undefined,
+      this.state.globalActors.stamp?.(),
+    ]);
+    return remote !== this.#builtRemote ||
+      ((meshEnabled || snapshot.peers.length > 0 || snapshot.agents.some(agent => agent.local === false)) &&
+        Date.now() - this.#builtAt >= REMOTE_MAX_AGE_MS);
+  }
+
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#context || !this.state.initialized) return;
+    if (this.#scheduledRefresh || !this.#paneVisible || !this.#context || !this.state.initialized) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
@@ -721,7 +780,7 @@ export class FabricUiController {
 
   /** Both poll and coalesced refresh own their faults; a queued old tick cannot rearm. */
   #runBackground(epoch: number, callback: () => void): void {
-    if (epoch !== this.#epoch || !this.#context || !this.state.initialized) return;
+    if (epoch !== this.#epoch || !this.#paneVisible || !this.#context || !this.state.initialized) return;
     try {
       callback();
     } catch (error) {
@@ -777,9 +836,9 @@ export class FabricUiController {
   }
 
   #refresh(force = true): void {
-    this.#lastRefreshAt = performance.now();
     const context = this.#context;
-    if (!context || !this.state.initialized) return;
+    if (!this.#paneVisible || !context || !this.state.initialized) return;
+    this.#lastRefreshAt = performance.now();
     try {
       this.#pollMesh();
       const revision =
@@ -805,8 +864,8 @@ export class FabricUiController {
       }
       // smarty-dev#1043: a poll gathered every input (the whole participant list, actors, the
       // mesh, the global registry) and deep-compared it twice a second while any local work was
-      // active: about 11% of a busy Main. Local changes already refresh through their own
-      // events, so a poll now rebuilds the snapshot only when a cheap stamp moved: Main's own
+      // active: about 11% of a busy Main. Events now own prompt updates and the slow fallback
+      // only runs when an input/clock needs it. It rebuilds when a cheap stamp moved: Main's own
       // state or the activity revision at once, remote state and mesh events at most every
       // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
       // dashboard or conversation view stays live. The rest of the refresh runs either way.

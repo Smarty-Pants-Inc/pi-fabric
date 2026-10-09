@@ -98,8 +98,8 @@ describe("background shell UI", () => {
     const widget = new FabricWidget(theme, () => h.controller.snapshot(), 5);
     expect(widget.render(80).join("\n")).toContain("/fabric tasks");
     expect(widget.render(80).join("\n")).toContain("Watch CI");
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(widget.render(80).join("\n")).toContain("3s");
+    await vi.advanceTimersByTimeAsync(5000); // elapsed clock uses the >=5s UI fallback
+    expect(widget.render(80).join("\n")).toContain("5s");
     await job.finish(0);
     await vi.advanceTimersByTimeAsync(31000);
     expect(shouldShowFabricWidget(h.controller.snapshot(), "auto")).toBe(false);

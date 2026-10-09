@@ -425,11 +425,11 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
-  /** Owned tree-empty notification: cgroup.events populated-0 for an admitted
-   * scope, otherwise a birth-checked census at native close or the single
-   * post-close deadline (at least 60 seconds later) reaching empty.
-   * Native close and execution custody must still be joined; failed observation
-   * rejects instead of authorizing collection or a replacement worker. */
+  /** Scoped-only tree-empty notification: cgroup.events populated-0 for an
+   * admitted scope, plus retained execution custody at native close or the
+   * single post-close deadline (at least 60 seconds later). Unscoped workers
+   * omit this receipt and retain the unchanged legacy liveness contract.
+   * Failed observation rejects, never authorizes collection or replacement. */
   treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;

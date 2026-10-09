@@ -49,12 +49,13 @@ async function nativeWorker(run: (handle: AgentTransportHandle, child: ChildProc
   finally { await handle.stop(); await handle.waitForClose?.(); }
 }
 
-describe("native process event liveness", () => {
+describe("unscoped legacy process liveness", () => {
   it("arms no recurring liveness timer for an active process transport", async () => {
     const interval = vi.spyOn(globalThis, "setInterval");
     const timeout = vi.spyOn(globalThis, "setTimeout");
     await nativeWorker(async handle => {
-      expect(handle.liveness).toBe("events");
+      expect(handle.liveness).toBeUndefined();
+      expect(handle.treeClosed).toBeUndefined();
       expect(handle.livenessPollIntervalMs).toBeUndefined();
       expect(interval).not.toHaveBeenCalled();
       expect(timeout).not.toHaveBeenCalled();
@@ -76,7 +77,7 @@ describe("native process event liveness", () => {
   });
 });
 
-async function unscopedTree(termGraceMs = 7_000, scoped = false) {
+async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1") {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
   const workerPath = path.join(directory, "worker.mjs");
@@ -86,7 +87,7 @@ async function unscopedTree(termGraceMs = 7_000, scoped = false) {
   let primaryAlive = true;
   let descendantAlive = true;
   let scopeEvents: string | undefined;
-  let populated = "1";
+  let populated = initialPopulated;
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
   if (scoped) vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
     const listener = args.at(-1);
@@ -148,9 +149,9 @@ async function unscopedTree(termGraceMs = 7_000, scoped = false) {
   };
 }
 
-describe.skipIf(process.platform !== "linux")("unscoped bounded tree census", () => {
+describe.skipIf(process.platform !== "linux")("scoped bounded execution custody", () => {
   it.each(["clean", "unconfirmed"] as const)("takes only close and deadline censuses (%s)", async outcome => {
-    const f = await unscopedTree();
+    const f = await fixtureTree(7_000, true, "0");
     let settled = false;
     const receipt = f.handle.treeClosed!.then(() => { settled = true; return undefined; }, error => { settled = true; return error as unknown; });
     await f.close();
@@ -194,7 +195,7 @@ describe.skipIf(process.platform !== "linux")("unscoped bounded tree census", ()
   });
 
   it("delivers the real transport deadline as a typed manager result and joins descendant cleanup", async () => {
-    const f = await unscopedTree();
+    const f = await fixtureTree(7_000, true, "0");
     const directory = root();
     const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
     vi.spyOn(fs, "watch").mockReturnValue(watcher);
@@ -225,42 +226,25 @@ describe.skipIf(process.platform !== "linux")("unscoped bounded tree census", ()
     await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track|unresolved|exit is unconfirmed/);
   });
 
-  it.each(["clean", "unconfirmed"] as const)("uses only two portable POSIX snapshots (%s)", async outcome => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
-    let parentPresent = true;
-    let descendantPresent = true;
-    const ps = vi.spyOn(childProcess, "execFile").mockImplementation(((...args: unknown[]) => {
-      const callback = args.at(-1) as (error: null, stdout: string, stderr: string) => void;
-      const query = new EventEmitter() as ChildProcess;
-      queueMicrotask(() => {
-        callback(null, `${parentPresent ? "700000001 1 700000001 S\n" : ""}${descendantPresent ? "700000002 1 700000001 S\n" : ""}`, "");
-        query.emit("close", 0, null);
-      });
-      return query;
-    }) as typeof childProcess.execFile);
-    const f = await unscopedTree();
-    ps.mockClear();
-    const receipt = f.handle.treeClosed!.then(() => undefined, error => error as unknown);
-    parentPresent = false;
+  it("leaves unscoped close on main's census path with no new receipt or deadline", async () => {
+    const f = await fixtureTree();
+    expect(f.handle.treeClosed).toBeUndefined();
     await f.close();
-    expect(ps).toHaveBeenCalledOnce();
-    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
-    expect(await f.handle.isAlive()).toBe(true);
-    await vi.advanceTimersByTimeAsync(59_999);
-    expect(ps).toHaveBeenCalledOnce();
-    if (outcome === "clean") descendantPresent = false;
-    await vi.advanceTimersByTimeAsync(1);
-    const result = await receipt;
-    expect(ps).toHaveBeenCalledTimes(2);
+    expect(f.scans()).toBe(0); // main performs no census just for native close
+    expect(f.timeout).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
-    if (outcome === "clean") expect(result).toBeUndefined();
-    else expect(result).toMatchObject({ code: "PROCESS_TREE_CUSTODY_UNCONFIRMED", descendants: 1 });
-    await vi.advanceTimersByTimeAsync(300_000);
-    expect(ps).toHaveBeenCalledTimes(2);
+    expect(await f.handle.isAlive()).toBe(true);
+    expect(f.scans()).toBe(1); // main's explicit checked liveness query
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(f.scans()).toBe(1);
+    expect(f.timeout).not.toHaveBeenCalled();
+    f.depart();
+    expect(await f.handle.isAlive()).toBe(false);
+    expect(f.handle.lostContact()).toBeUndefined();
   });
 
   it("preserves a larger existing TERM/KILL grace budget without repeating", async () => {
-    const f = await unscopedTree(90_000);
+    const f = await fixtureTree(90_000, true, "0");
     await f.close();
     expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([92_000]);
     await vi.advanceTimersByTimeAsync(91_999);
@@ -275,7 +259,7 @@ describe.skipIf(process.platform !== "linux")("unscoped bounded tree census", ()
 
 describe.skipIf(process.platform !== "linux")("scoped tree-empty event delivery", () => {
   it("waits passively for populated-0 and does not arm a census deadline for a live scope", async () => {
-    const f = await unscopedTree(7_000, true);
+    const f = await fixtureTree(7_000, true);
     let settled = false;
     void f.handle.treeClosed!.then(() => { settled = true; });
     await f.close();
@@ -293,8 +277,8 @@ describe.skipIf(process.platform !== "linux")("scoped tree-empty event delivery"
   });
 });
 
-describe.skipIf(process.platform !== "linux")("native descendant tree-empty delivery", () => {
-  it("settles a real unscoped process at the single deadline census after its descendant exits", async () => {
+describe.skipIf(process.platform !== "linux")("unscoped native descendant legacy delivery", () => {
+  it("keeps the legacy cadence and settles a real unscoped descendant without a PR deadline", async () => {
     const directory = root();
     const workerPath = path.join(directory, "descendant-worker.mjs");
     const descendant = `const fs = require("node:fs");
@@ -345,22 +329,18 @@ describe.skipIf(process.platform !== "linux")("native descendant tree-empty deli
       const closedAt = Date.now();
       expect(await transport.isAlive()).toBe(true);
       expect(manager.status(handle.id).status).toBe("running");
-      let treeEmpty = false;
-      void transport.treeClosed?.then(() => { treeEmpty = true; });
-      await vi.advanceTimersByTimeAsync(59_000);
-      expect(treeEmpty).toBe(false);
+      expect(transport.liveness).toBeUndefined();
+      expect(transport.treeClosed).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(manager.status(handle.id).status).toBe("running");
       expect(stop).not.toHaveBeenCalled();
       fs.writeFileSync(path.join(directory, "exit-descendant"), "");
       await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "descendant-exited"))).toBe(true), { timeout: 500 });
-      expect(treeEmpty).toBe(false); // descendant exit is not a polling wake
-      expect(manager.status(handle.id).status).toBe("running");
-      await vi.advanceTimersByTimeAsync(60_000 - (Date.now() - closedAt));
+      await vi.advanceTimersByTimeAsync(3_000);
       const result = await manager.wait(handle.id);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("exited without a result");
-      expect(Date.now() - closedAt).toBe(60_000);
-      expect(transport.treeClosed).toBeDefined();
-      expect(treeEmpty).toBe(true);
+      expect(Date.now() - closedAt).toBeLessThan(60_000);
       expect(await transport.isAlive()).toBe(false);
       expect(stop).not.toHaveBeenCalled();
     } finally {
@@ -378,7 +358,7 @@ const statusRecord = (id: string, task: string): AgentRunRecord => ({
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 });
 
-function monitored(relaunchable = false) {
+function monitored(relaunchable = false, scoped = true) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
   const close = deferred();
@@ -389,7 +369,8 @@ function monitored(relaunchable = false) {
   const read = vi.fn(async () => alive);
   const stop = vi.fn(async () => { alive = false; close.resolve(); tree.resolve(); });
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValue({
-    kind: "process", liveness: "events", closed: close.promise, treeClosed: tree.promise,
+    kind: "process", closed: close.promise,
+    ...(scoped ? { liveness: "events" as const, treeClosed: tree.promise } : {}),
     isAlive: read, stop, relaunchable,
   });
   const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1_000, budgetUsd: 0, sessionExport: false }, {
@@ -398,6 +379,25 @@ function monitored(relaunchable = false) {
   managers.push(manager);
   return { manager, close, tree, watcher, read, stop, launch, die: () => { alive = false; } };
 }
+
+describe("unscoped manager legacy dispatch", () => {
+  it("retains main's 250ms checked cadence and creates no filesystem watcher", async () => {
+    const f = monitored(false, false);
+    const handle = await f.manager.spawn({ task: "legacy cadence", transport: "process" });
+    expect(fs.watch).not.toHaveBeenCalled();
+    expect(f.read).toHaveBeenCalledOnce();
+    f.read.mockClear();
+    await vi.advanceTimersByTimeAsync(249);
+    expect(f.read).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.read).toHaveBeenCalledOnce();
+    f.die(); f.close.resolve();
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect((await f.manager.wait(handle.id)).status).toBe("failed");
+    expect(fs.watch).not.toHaveBeenCalled();
+  });
+});
 
 describe("manager event-only process monitoring", () => {
   it("joins cleanup and settles typed unconfirmed custody at its one-shot deadline", async () => {

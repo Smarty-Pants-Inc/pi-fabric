@@ -30,8 +30,9 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 ### Native process liveness
 
-Local process workers use captured child `exit`/`close` events, not a 1 s
-liveness poll or a periodic manager wake. When the scope owner supplies a
+Only cgroup-scoped local process workers (`agents.processSlice` configured)
+use the event-driven custody path: captured child `exit`/`close` events, not
+a recurring liveness poll or periodic manager wake. When the scope owner supplies a
 `treeClosed` receipt from `cgroup.events` `populated 0`, the same monitor also
 subscribes to that receipt. Neither notification alone authorizes collection:
 native-close and process-tree custody obligations still have to be joined.
@@ -42,7 +43,16 @@ fails with `errorCode: "PROCESS_LIVENESS_WATCH_FAILED"`, retaining unconfirmed
 worker files and admission. A possibly live worker is never retried. Status
 and lifecycle files are observed separately by filesystem events (including
 atomic status-file renames), so progress does not require a liveness query.
-External/placed process adapters keep their existing checked-query contract.
+At a populated-0 event, separately retained execution groups receive an initial
+birth-checked census and, if needed, one final census at least 60 seconds later
+(or the larger existing TERM/KILL grace). A nonempty/uncertain result is typed
+`errorCode: "PROCESS_TREE_CUSTODY_UNCONFIRMED"`; it retains custody and joins
+cleanup, never silently treating uncertainty as exit.
+
+**Unscoped compatibility cut:** when `agents.processSlice` is unset (or scope
+launch falls back), workers retain main's existing liveness, retry, and exit-join
+path byte-for-byte. This PR adds no watcher, polling cadence, or timer to that
+path. External/placed process adapters also retain their checked-query contract.
 
 ### Opt-in process task placement
 

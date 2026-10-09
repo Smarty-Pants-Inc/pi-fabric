@@ -4,6 +4,21 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+export interface PhysicalHostIdentity { machineId: string; bootId: string }
+export const validBootId = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+/** Hostnames and mesh hostIds are labels, never evidence that a PID is local.
+ * Missing/unreadable kernel identity fails closed (including non-Linux hosts). */
+export const readPhysicalHostIdentity = (): PhysicalHostIdentity | undefined => {
+  try {
+    const machineId = fs.readFileSync("/etc/machine-id", "utf8").trim().toLowerCase();
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().toLowerCase();
+    return /^[0-9a-f]{32}$/.test(machineId) && validBootId(bootId) ? { machineId, bootId } : undefined;
+  } catch { return undefined; }
+};
+
+
 const DARWIN_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 
 /** Only identities from this platform's native reader are comparable; unknown stays live. */
@@ -113,6 +128,8 @@ export interface AtomicWriteOptions {
   // of times with linear backoff before surfacing the error.
   renameRetries?: number;
   renameRetryDelayMs?: number;
+  /** External ownership CAS after staging, immediately before EACH rename attempt. A throw leaves the target untouched. */
+  beforeRename?: () => void;
 }
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);
@@ -162,6 +179,7 @@ export const renameAtomic = (
   const attempts = Math.max(1, options?.renameRetries ?? 8);
   const delay = options?.renameRetryDelayMs ?? 25;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    options?.beforeRename?.(); // Validation errors are not transient rename failures.
     try {
       fs.renameSync(source, target);
       return;

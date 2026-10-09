@@ -53,6 +53,8 @@ export interface ParticipantFileLockOptions {
   /** No native holder read or ordinary key wait: registry custody and the
    * independent zero-wait renewal lane both require this prepared mode. */
   registryFenced?: boolean;
+  /** Runs the actual synchronous decision/write under the publisher's lease custody. */
+  withCommitFence?: <T>(operation: () => T) => Promise<T>;
 }
 
 export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
@@ -220,7 +222,7 @@ const withKeyLock = async <T>(
       await new Promise(resolve => setTimeout(resolve, 5));
     }
   }
-  try { return operation(); }
+  try { return options.withCommitFence ? await options.withCommitFence(operation) : operation(); }
   finally { receipt.release(); }
 };
 

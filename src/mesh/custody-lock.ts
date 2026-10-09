@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation } from "../core/atomic-write.js";
+import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, validBootId } from "../core/atomic-write.js";
 
 /**
  * File custody lock (smarty-dev#6477 L5). `exclusive()` users that only guard files beside the
@@ -44,14 +44,19 @@ const processAlive = (pid: number): boolean => {
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Holds the custody lock of a mesh root until the returned release is called. */
-export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS): Promise<() => void> => {
+export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS,
+  options: { hostQualified?: boolean; ownIncarnation?: string | undefined } = {}): Promise<() => void> => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
-  const started = await ownProcessIncarnation().catch(() => undefined);
-  const record = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
+  const started = Object.hasOwn(options, "ownIncarnation") ? options.ownIncarnation
+    : await ownProcessIncarnation().catch(() => undefined);
+  const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
+  const record = options.hostQualified
+    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${physical?.machineId ?? ""}\n${physical?.bootId ?? ""}\n`
+    : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
   const readOwner = (): string | undefined => {
     try { return fs.readFileSync(ownerPath, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -80,7 +85,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
-    if (await clearDeadCustodyLock(lock, readOwner, deadline, started)) continue;
+    if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified)) continue;
     if (Date.now() >= deadline) {
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
       const pid = owner?.split("\n")[1];
@@ -105,7 +110,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
 // second recoverer cannot rename a successor onto the same nonempty fence.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
-  ownStart: string | undefined): Promise<boolean> => {
+  ownStart: string | undefined, hostQualified = false): Promise<boolean> => {
   try {
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
@@ -113,10 +118,16 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
     const fields = owner.split("\n");
     const [token, pidText, createdText, recordedStart] = fields;
+    // A host-lease commit gate is never recovered by a foreign/unknown PID. It has no
+    // age-steal path: a paused commit holds its fence until resume; death is proven locally.
+    const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
+    if (hostQualified && (!physical || fields.length !== 7 || fields[4] !== physical.machineId ||
+      !validBootId(fields[5]))) return false;
+    const previousBoot = hostQualified && fields[5] !== physical!.bootId;
     const pid = Number(pidText);
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
-      (fields.length !== 4 && fields.length !== 5)) return false;
-    if (processAlive(pid)) {
+      (fields.length !== 4 && fields.length !== 5 && !(hostQualified && fields.length === 7))) return false;
+    if (!previousBoot && processAlive(pid)) {
       if (!validProcessIncarnation(recordedStart)) return false;
       // Our own pid with another incarnation is a dead predecessor; with ours, a live caller.
       const remaining = deadline - Date.now();

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
@@ -23,6 +23,8 @@ import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICI
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
+  hostLeasePath,
+  hostLeasePredecessor,
   hostLiveness,
   LIVENESS_POLICY_KEY,
   readHostLease,
@@ -32,11 +34,18 @@ import {
   waitForHostLeaseRenewal,
   type RoutingLeaseWaitOptions,
   readHostLeases,
-  removeHostLease,
+  removeOwnedHostLease,
+  FabricHostLeaseSupersededError,
+  sameHostLeaseOwner,
+  assertHostLeaseOwner,
+  commitHostLeaseUnderCustody,
+  withOwnedHostLease,
+  type FabricHostLease,
   STATE_LEASE_RENEW_MS,
-  writeHostLease,
+  renewHostLease,
   meshWriterLeaseRecord,
 } from "./host-leases.js";
+import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -325,6 +334,7 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
     (value.identity.kind !== "main" &&
       value.identity.kind !== "agent" &&
       value.identity.kind !== "actor") ||
+    (value.incarnationToken !== undefined && (typeof value.incarnationToken !== "string" || value.incarnationToken.length === 0)) ||
     typeof value.startedAt !== "number" ||
     typeof value.updatedAt !== "number" ||
     typeof value.expiresAt !== "number"
@@ -538,7 +548,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
-  readonly #startedAt = Date.now();
+  #startedAt = Date.now();
+  #incarnationToken = randomUUID();
+  #leasePredecessor: FabricHostLease | undefined;
   readonly #ownIncarnation: Promise<string | undefined>;
   #ownIncarnationValue: string | undefined;
   #prepareFileLocks = false;
@@ -554,6 +566,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
+  #leaseAbort = new AbortController();
+  #leaseClaimed = false;
+  #prepareLeaseLock = true;
+  #superseded: FabricHostLeaseSupersededError | undefined;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
@@ -593,6 +609,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
+    this.#leasePredecessor = options.enabled ? hostLeasePredecessor(mesh.root, options.hostId) : undefined;
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
     this.#ownIncarnation = options.withPublicationFence
@@ -620,7 +637,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async start(): Promise<void> {
+    this.#assertLeaseActive();
     if (this.#timer) return;
+    if (this.#closed) {
+      this.#leaseAbort = new AbortController();
+      this.#startedAt = Date.now();
+      this.#incarnationToken = randomUUID();
+      this.#leasePredecessor = this.options.enabled ? hostLeasePredecessor(this.mesh.root, this.options.hostId) : undefined;
+      this.#leaseClaimed = false;
+      this.#prepareLeaseLock = true;
+    }
     // Restarting this directory is activation too, even if its last local view held a root.
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
@@ -638,12 +664,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;
         // shared-lock-only waits still lapse and confirmation still needs its lock.
-        try {
-          if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) this.#renewFileLease();
-        } catch (error) {
-          this.#refreshError = error;
-          this.#routingReadAt = 0;
-          this.#backgroundRefresh.failure(error);
+        if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) {
+          void this.#renewFileLease().catch(error => {
+            this.#refreshError = this.#superseded ?? error;
+            this.#routingReadAt = 0;
+            this.#backgroundRefresh.failure(error);
+          });
           return;
         }
         if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
@@ -658,7 +684,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed || isMeshLockTimeout(this.#refreshError)) return;
+    if (this.#closed || this.#superseded || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -683,6 +709,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** Actor mutations publish changes, not a full heartbeat or a lock-outage retry. */
   async refreshPresence(): Promise<void> {
+    this.#assertLeaseActive();
     if (isMeshLockTimeout(this.#refreshError)) return;
     // A setter may finish saving after an in-flight heartbeat selected its source.
     // Wait for that round, then flush the pending revision under a fresh registry
@@ -704,6 +731,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** A heartbeat: publishes the records and renews this host's lease. */
   async refresh(): Promise<void> {
     if (this.#closed) return;
+    this.#assertLeaseActive();
     // Independent file renewal must not delay shared admission or let an
     // in-flight change failure disappear before a heartbeat joins its receipt.
     const renewing = this.#renewActors();
@@ -712,7 +740,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshing) {
       // A key waiter is still a live host. Do not turn this into a mesh-lock bypass:
       // confirmation remains gated on the shared write; shared-lock-only waits still lapse.
-      if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) this.#renewFileLease();
+      if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) await this.#renewFileLease();
       if (this.#refreshingFull) return join(this.#refreshing);
       // A change-only refresh may skip its write; renew the lease right after it.
       return join(this.#refreshing.catch(error => {
@@ -724,6 +752,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async #runRefresh(full: boolean): Promise<void> {
     if (this.#closed) return;
+    this.#assertLeaseActive();
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -735,6 +764,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
       if (this.#closed) return false;
+      if (this.options.enabled && this.#prepareLeaseLock) {
+        await withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
+          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue });
+        this.#prepareLeaseLock = false;
+        if (this.#closed) return false;
+      }
       if (this.#prepareFileLocks) {
         await prepareParticipantFileLocks(this.mesh);
         this.#prepareFileLocks = false;
@@ -759,7 +794,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     let lockTimedOut = false;
     try {
       const committed = await operation;
-      if (!committed) return;
+      if (!committed || this.#closed) return;
+      this.#assertLeaseActive();
+      // Fence delayed post-commit/confirmation continuations against a successor.
+      if (this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) await this.#renewFileLease();
       // An unchanged change-refresh proves nothing about the lock. Only a committed
       // write/confirmWritable acquisition ends the background path's lock outage.
       if (this.options.enabled) this.#backgroundRefresh.success();
@@ -770,7 +808,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#leaseConfirmed = true;
       // Only a reload successor withheld its own lease before the host commit.
       if (this.#keptReloadLease && this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) {
-        try { this.#renewFileLease(); } catch { /* the next heartbeat renews it */ }
+        await this.#renewFileLease();
       }
       this.#refreshError = undefined;
       this.#cancelPublicationRetry();
@@ -789,13 +827,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // live process retains its ownership/incarnation and renews only that file lease.
       // Do not advance confirmedAt, clear the outage, admit an unregistered host, or let
       // canConsumeMesh treat this as a successful commit. Peers still use #484's grace.
-      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing) {
-        try { this.#renewFileLease(); } catch { /* Preserve the prior lease on file failure too. */ }
+      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing && !(error instanceof HostLeaseLockBusyError)) {
+        try { await this.#renewFileLease(); } catch (renewError) {
+          if (renewError instanceof FabricHostLeaseSupersededError) error = renewError;
+        }
       }
+      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      error = this.#superseded ?? error;
       this.#refreshError = error;
       this.#routingReadAt = 0;
       if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
       lockTimedOut = isMeshLockTimeout(error);
+      if (error instanceof HostLeaseLockBusyError) this.#cancelPublicationRetry();
       if (lockTimedOut) {
         // A change timer may predate this heartbeat and still be waiting to run.
         // Cancel it too: pending state rides one host-level recovery, not actor retries.
@@ -823,7 +866,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #schedulePublicationRetry(): void {
     if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
-      !isMeshLockTimeout(this.#refreshError) || this.#publicationRetryTimer || this.#publicationRetrying) return;
+      !isMeshLockTimeout(this.#refreshError) || this.#refreshError instanceof HostLeaseLockBusyError ||
+      this.#publicationRetryTimer || this.#publicationRetrying) return;
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
     const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
@@ -1199,7 +1243,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const snapshot = readHostLeaseSnapshot(this.mesh.root, owner.id);
     const lease = snapshot?.lease;
     const matching = lease && lease.rootId === owner.rootId && lease.identityId === owner.identity.id &&
-      (lease.startedAt === undefined || lease.startedAt === owner.startedAt);
+      (owner.incarnationToken !== undefined ? lease.incarnationToken === owner.incarnationToken :
+        (lease.startedAt === undefined || lease.startedAt === owner.startedAt));
     const expiresAt = hostLeaseExpiry(matching ? new Map([[owner.id, lease]]) : new Map(), owner);
     if (expiresAt >= now) return true;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
@@ -1221,7 +1266,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const currentOwner = currentOwnerEntry ? hostFromEntry(currentOwnerEntry) : undefined;
     return !!refreshed && refreshed.ownerHostId === owner.id && refreshed.ownerIdentityId === owner.identity.id &&
       refreshed.rootId === participant.rootId && !refreshed.remoteHost &&
-      !["stopping", "reloading"].includes(refreshed.status) && currentOwner?.startedAt === owner.startedAt &&
+      !["stopping", "reloading"].includes(refreshed.status) && currentOwner !== undefined &&
+      (owner.incarnationToken !== undefined ? currentOwner.incarnationToken === owner.incarnationToken : currentOwner.startedAt === owner.startedAt) &&
       currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
   }
 
@@ -1512,6 +1558,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
     this.#deadHostSweepAt = now;
     void this.#notifications.enqueue(() => reapDeadHostRecords(this.mesh, this.options.identity, {
+      withCommitFence: operation => this.#withLeaseFence(operation),
       ownHostId: this.options.hostId,
       now,
       ...(reap?.deadAfterMs !== undefined ? { deadAfterMs: reap.deadAfterMs } : {}),
@@ -1520,6 +1567,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async quiesce(reason?: string): Promise<void> {
     if (this.#closed || this.#quiescing) return;
+    this.#assertLeaseActive();
     this.#quiescing = true;
     this.#cancelPublicationRetry();
     await this.#publicationRetrying;
@@ -1535,7 +1583,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // goes on regardless (shutdown swallows this), so keep the Main addressable: renew its
       // own lease file, which needs no mesh lock, and let close() keep the root and lease.
       if (this.#reloadUntil !== undefined && this.options.enabled) {
-        try { this.#renewFileLease(); } catch { /* close() still keeps the last lease */ }
+        try { await this.#renewFileLease(); } catch (renewError) {
+          if (renewError instanceof FabricHostLeaseSupersededError) throw renewError;
+        }
         this.#reloadPublished = true;
       }
       throw error;
@@ -1548,27 +1598,34 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
       this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
-    if (closure) await this.mesh.delete({ key: closure.key, ifVersion: closure.version });
+    // Runtime construction invokes resumption before start(). Claim this new host before
+    // invalidating the proof; the deletion is an owned mutation and must keep its fence.
+    if (closure && !this.#leaseClaimed) await this.#renewFileLease();
+    if (closure) await this.#withLeaseFence(() => this.mesh.delete({ key: closure.key, ifVersion: closure.version }));
   }
 
   /** Explicit terminal session operation. Disposing/replacing a runtime is NOT lineage closure. */
   async closeLineage(): Promise<void> {
-    await this.close();
-    if (!this.options.enabled || this.#reloadPublished) return;
+    if (this.#closed) return;
+    if (!this.options.enabled || this.#reloadPublished || this.#superseded) { await this.close(); return; }
+    await this.quiesce().catch(() => undefined); // Drain publication before certifying terminal closure.
+    if (this.#superseded) { await this.close(); return; }
     // Only the creating Main may certify its terminal close, never a resident/child host.
     if (this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
       this.options.identity.kind === "main" && this.#localRecords.get(this.options.rootId)?.kind === "root") {
-      await this.mesh.put({
+      await this.#withLeaseFence(() => this.mesh.put({
         key: keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), identity: this.options.identity,
         value: { format: 1, rootId: this.options.rootId, ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id, closedAt: Date.now() },
-      }).catch(() => undefined);
+      })).catch(() => undefined);
     }
+    await this.close();
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#leaseAbort.abort();
     this.#cancelPublicationRetry();
     await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
@@ -1576,33 +1633,49 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
-    await this.#actorRenewing;
+    await this.#actorRenewing?.catch(() => undefined);
     await this.#refreshing?.catch(() => undefined);
     await this.#notifications.close();
-    if (!this.options.enabled) return;
+    if (!this.options.enabled || this.#superseded || !this.#leaseClaimed) return;
+    const leaseOwner = this.#leaseOwner();
+    const ownsLease = (): boolean => {
+      const current = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+      return current !== undefined && sameHostLeaseOwner(current, leaseOwner);
+    };
+    if (!ownsLease()) {
+      try { assertHostLeaseOwner(this.mesh.root, leaseOwner); }
+      catch (error) { if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error); }
+      return;
+    }
     const own = (entry: MeshStateEntry): boolean => {
+      if (!ownsLease()) return false;
       const participant = participantFromEntry(entry);
       return participant !== undefined && isLocal(participant, this.options.hostId) &&
         !(this.#reloadPublished && participant.kind === "root" && participant.id === this.options.rootId);
     };
-    await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
-      .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own, this.#fileLockOptions())));
-    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(own);
-    await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
+    for (const entry of readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)) {
+      await removeParticipantFileIf(this.mesh, entry.key, own, this.#fileLockOptions()).catch(() => undefined);
+    }
+    const ops: MeshBatchOperation[] = this.mesh.listAll(PARTICIPANT_PREFIX).filter(own)
+      .map(entry => ({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" }));
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey) {
       const legacy = this.mesh.get(legacySessionKey);
-      if (legacy?.updatedBy.id === this.options.identity.id) {
-        await this.mesh.delete({ key: legacy.key, ifVersion: legacy.version }).catch(() => undefined);
+      if (legacy?.updatedBy.id === this.options.identity.id && ownsLease()) {
+        ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
       }
     }
-    // A reload leaves only its root and fixed host lease; the next session_start replaces both.
-    if (this.#reloadPublished) return;
-    removeHostLease(this.mesh.root, this.options.hostId);
+    // Shared cleanup commits while the current UUID still owns the file lease.
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
-    if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
-      await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
+    if (!this.#reloadPublished && hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined &&
+      hostFromEntry(hostEntry)?.incarnationToken === this.#incarnationToken &&
+      hostFromEntry(hostEntry)?.identity.id === this.options.identity.id) {
+      ops.push({ kind: "delete", key: hostEntry.key, ifVersion: hostEntry.version, onConflict: "skip" });
     }
+    await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+      prepare: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); return []; } })).catch(() => undefined);
+    // A reload leaves only its root and fixed host lease; the next session_start replaces both.
+    if (!this.#reloadPublished && !this.#superseded) await removeOwnedHostLease(this.mesh, leaseOwner).catch(() => false);
   }
 
   // Return the actual shared commit/acquisition time, not the completion time
@@ -1611,6 +1684,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Claim before capturing a publication generation, but reselect ALL sources
     // afterwards: neither a label's mesh write nor an awaited claim may leave
     // actor ownership observations selected against an older generation.
+    if (this.options.enabled && !this.#leaseClaimed) await this.#renewFileLease();
     if (this.options.enabled && !this.#claimedPeerLabel && !this.#localRecords.get(this.options.rootId)?.label) {
       for (const source of this.#sources) {
         const root = source().find(record => record.kind === "root" && record.id === this.options.rootId);
@@ -1703,6 +1777,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       livenessLeaseFiles: 1,
       livenessHostId: this.options.hostId,
       livenessStartedAt: this.#startedAt,
+      livenessIncarnationToken: this.#incarnationToken,
       name: rootPeerName(root.name, root.label, root.sessionId),
       ...(root.label ? { label: root.label } : {}),
       kind: "peer",
@@ -1857,7 +1932,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       for (const [id, record] of desired) this.#localRecords.set(id, record);
       // Renew before ANY per-key cleanup/write/copy, including migration and retry copies.
       // Heartbeat calls keep renewing while #retryFile is waiting on a contended key.
-      if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+      if (!this.#quiescing || this.#reloadUntil !== undefined) await this.#renewFileLease();
       for (const entry of fileEntries) {
         const participant = ownParticipant(entry);
         if (participant && !desired.has(participant.id)) {
@@ -1933,7 +2008,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
             host.remoteHost === undefined &&
             host.rootId === this.options.rootId &&
             JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
-            host.startedAt === this.#startedAt;
+            host.incarnationToken === this.#incarnationToken;
           if (!hostValid) return { skip: false, host: true, session: false };
           if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
           const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
@@ -1957,7 +2032,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
             let acquiredAt = this.#confirmWithoutLock() ?? 0;
             if (acquiredAt === 0) await this.mesh.confirmWritable(at => { acquiredAt = at; touchConfirmWitness(this.mesh.root); });
             // Re-check after the lock: the threshold may have elapsed while confirming.
-            decision = decideRenewal(this.#renewFileLease());
+            decision = decideRenewal(await this.#renewFileLease());
             if (decision.skip) {
               await publishDeferredFiles();
               return acquiredAt;
@@ -1976,9 +2051,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // outruns its own lease must not publish an already-expired lease, which
       // would make peers — and this host's own list() — read the records it just
       // wrote as stale.
+      const priorHost = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { snapshot });
       if (renewHost) ops.push({
         kind: "put",
         key: keyFor(HOST_PREFIX, this.options.hostId),
+        ...(priorHost ? { ifVersion: priorHost.version } : {}),
+        onConflict: latest => {
+          const owner = latest && hostFromEntry(latest);
+          if (owner?.identity.id === this.options.identity.id && owner.incarnationToken === this.#incarnationToken) return "abort";
+          throw new FabricHostLeaseSupersededError(this.options.hostId, this.options.identity.id, this.#startedAt);
+        },
         value: (leaseAt: number): FabricHostRecord => ({
           format: 1,
           livenessLeaseFiles: 1,
@@ -1986,17 +2068,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
           rootId: this.options.rootId,
           identity: this.options.identity,
           startedAt: this.#startedAt,
+          incarnationToken: this.#incarnationToken,
           updatedAt: leaseAt,
           expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
         }),
       });
       let committedAt = 0;
-      const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
+      const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+        prepare: view => {
+          assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
+          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
+        },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
         // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
-        commitOutbox: () => { committedAt = Date.now(); publication?.committed(); } });
+        commitOutbox: () => {
+          if (this.#keptReloadLease) {
+            // Retained reload authority is checked under the SAME gate as this COMMIT.
+            // Rotate only after success, before any post-commit file copy or gate release.
+            commitHostLeaseUnderCustody(this.mesh.root, this.#fileLease(Date.now()),
+              { claim: true, expected: this.#leasePredecessor });
+            this.#leaseClaimed = true; this.#keptReloadLease = false;
+          }
+          committedAt = Date.now(); publication?.committed();
+        } }));
       if (!filesOnly) this.#recordsWrittenAt = Date.now();
       await publishDeferredFiles();
       // Each record the shared state committed goes to its file too, for runtimes that read files.
@@ -2020,12 +2115,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async #retryFile<T>(operation: () => Promise<T>): Promise<T | undefined> {
     this.#fileWork += 1;
     try {
-      if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+      if (!this.#quiescing || this.#reloadUntil !== undefined) await this.#renewFileLease();
       return await operation();
     } catch (error) {
       // A busy shared mesh is not a single-key fault. Abort this fenced round,
       // rather than multiplying acquisition attempts while retaining registries.
-      if (isMeshLockTimeout(error)) throw error;
+      if (isMeshLockTimeout(error) || error instanceof FabricHostLeaseSupersededError) throw error;
       return undefined; /* retry this key on the next refresh */
     }
     finally {
@@ -2033,7 +2128,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Renew between keys too: already-resolved promises can monopolize microtasks,
       // and the dual-write copies run AFTER the shared host commit. This file-only
       // renewal does not advance confirmedAt or certify shared writability.
-      if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+      if (!this.#quiescing || this.#reloadUntil !== undefined) await this.#renewFileLease();
     }
   }
 
@@ -2082,9 +2177,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const records = owned.filter(record => record.status !== "stopped" ||
       startedAt - (this.#stoppedRenewedAt.get(record.id) ?? -Infinity) >= STOPPED_ACTOR_RENEW_MS);
     const work = (async () => {
-      this.#renewFileLease();
+      await this.#renewFileLease();
       for (const record of records) {
-        if (this.#closed || this.#quiescing) return;
+        if (this.#closed || this.#quiescing || this.#superseded) return;
         if (record.status === "stopped") this.#stoppedRenewedAt.set(record.id, startedAt);
         const key = keyFor(PARTICIPANT_PREFIX, record.id);
         try {
@@ -2095,8 +2190,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
               participant.rootId !== record.rootId || participant.actorOwnershipToken !== record.actorOwnershipToken ||
               !this.options.actorRenewalAllowed!(record)) return undefined;
             return { ...current, version: current.version + 1, updatedAt: Date.now() };
-          }, { ownIncarnation: this.#ownIncarnationValue, registryFenced: true }), 0);
+          }, { ...this.#fileLockOptions(), ownIncarnation: this.#ownIncarnationValue, registryFenced: true }), 0);
         } catch (error) {
+          if (error instanceof FabricHostLeaseSupersededError) throw error;
           if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
           // One busy key never stops siblings. Native recovery, when needed,
           // happens in the ordinary preparation lane outside every registry.
@@ -2131,7 +2227,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const evidence = Math.min(latest, now);
     if (evidence <= this.#refreshedAt || now - evidence > this.#heartbeatMs) return undefined;
     try { this.mesh.stateToken({ fresh: true }); } catch { return undefined; }
-    return this.#witnessHolds(latest, evidence, Date.now()) ? evidence : undefined;
+    const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+    return lease && sameHostLeaseOwner(lease, this.#leaseOwner()) && this.#witnessHolds(latest, evidence, Date.now()) ? evidence : undefined;
   }
 
   /** The lock-free confirmation conditions at `at`, a clock reading taken after the fresh read. */
@@ -2144,7 +2241,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** smarty-dev#6729 gate 1: a listing pairs a root with its owner's shared host record, extended
    * only by a lease file of the same incarnation (hostLiveness). Until this incarnation's first
    * shared commit stamps its own host record, that record is still the predecessor's; replacing
-   * the predecessor's live reload lease file with this incarnation's (new startedAt) dropped the
+   * the predecessor's live reload lease file with this incarnation's (new incarnation token) dropped the
    * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
    * Its reloadUntil still bounds the listing if this release never commits.
    * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
@@ -2158,29 +2255,51 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#leaseConfirmed || this.options.identity.kind !== "main" || this.options.hostId !== this.options.rootId) return false;
     const entry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true });
     const host = entry && hostFromEntry(entry);
-    if (!host || host.remoteHost !== undefined || host.startedAt === this.#startedAt ||
+    if (!host || host.remoteHost !== undefined || host.incarnationToken === this.#incarnationToken ||
       host.rootId !== this.options.rootId || host.identity.id !== this.options.identity.id) return false;
     const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
-    return lease !== undefined && lease.rootId === this.options.rootId &&
+    return lease !== undefined && lease.incarnationToken !== undefined && lease.rootId === this.options.rootId &&
       lease.identityId === this.options.identity.id && lease.startedAt !== undefined &&
-      lease.startedAt === host.startedAt && lease.startedAt < this.#startedAt && lease.expiresAt > at &&
+      (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken : lease.startedAt === host.startedAt) &&
+      (this.#leasePredecessor?.incarnationToken !== undefined ? sameHostLeaseOwner(lease, this.#leasePredecessor) :
+        lease.incarnationToken === undefined && lease.startedAt === this.#leasePredecessor?.startedAt) && lease.expiresAt > at &&
       (lease.reloadUntil === lease.expiresAt ||
         // Older releases extended the fixed Main session TTL without an explicit reload marker.
         (lease.reloadUntil === undefined && lease.session?.expiresAt === lease.expiresAt &&
           lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS));
   }
 
-  #renewFileLease(): number {
-    const leaseAt = Date.now();
-    if (this.#keepsPredecessorReloadLease(leaseAt)) {
-      this.#keptReloadLease = true;
-      return leaseAt;
-    }
+  #assertLeaseActive(): void {
+    if (this.#superseded) throw this.#superseded;
+  }
+
+  #markSuperseded(error: FabricHostLeaseSupersededError): void {
+    this.#superseded = error;
+    this.#leaseAbort.abort();
+    this.#refreshError = error;
+    this.#leaseConfirmed = false;
+    this.#routingReadAt = 0;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    this.#refreshAgain = false;
+    this.#cancelPublicationRetry();
+  }
+
+  #leaseOwner(): FabricHostLease {
+    return { id: this.options.hostId, rootId: this.options.rootId, identityId: this.options.identity.id,
+      incarnationToken: this.#incarnationToken, startedAt: this.#startedAt, updatedAt: 0, expiresAt: 0 };
+  }
+
+  #fileLease(leaseAt: number): FabricHostLease {
     const root = this.#localRecords.get(this.options.rootId);
-    writeHostLease(this.mesh.root, {
+    return {
       id: this.options.hostId,
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
+      incarnationToken: this.#incarnationToken,
       startedAt: this.#startedAt,
       // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).
       writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend, meshProcessStartedAt),
@@ -2195,7 +2314,31 @@ export class ParticipantDirectory implements FabricParticipantSource {
       } : {}),
       updatedAt: leaseAt,
       expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
-    });
+    };
+  }
+
+  #leaseFenceOwner(): FabricHostLease {
+    return this.#keptReloadLease && !this.#leaseClaimed && this.#leasePredecessor?.incarnationToken
+      ? this.#leasePredecessor : this.#leaseOwner();
+  }
+
+  async #renewFileLease(): Promise<number> {
+    this.#assertLeaseActive();
+    if (this.#closed) return Date.now();
+    const leaseAt = Date.now();
+    if (this.#keepsPredecessorReloadLease(leaseAt)) {
+      this.#keptReloadLease = true;
+      return leaseAt;
+    }
+    try { await renewHostLease(this.mesh, this.#fileLease(leaseAt),
+      { claim: !this.#leaseClaimed, expected: this.#leasePredecessor, signal: this.#leaseAbort.signal,
+        ownIncarnation: this.#ownIncarnationValue });
+    } catch (error) {
+      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      if (error instanceof HostLeaseLockBusyError) this.#prepareLeaseLock = true;
+      throw error;
+    }
+    this.#leaseClaimed = true;
     this.#keptReloadLease = false;
     return leaseAt;
   }
@@ -2237,9 +2380,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
       lease.rootId === participant.rootId && effectiveLiveness(undefined, lease).expiresAt >= now;
   }
 
+  async #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
+    this.#assertLeaseActive();
+    try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
+      { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
+    catch (error) {
+      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;
+      throw error;
+    }
+  }
+
   #fileLockOptions(): ParticipantFileLockOptions {
-    return this.options.withPublicationFence
-      ? { ownIncarnation: this.#ownIncarnationValue, registryFenced: true } : {};
+    return { withCommitFence: operation => this.#withLeaseFence(operation),
+      ...(this.options.withPublicationFence
+        ? { ownIncarnation: this.#ownIncarnationValue, registryFenced: true } : {}) };
   }
 
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
@@ -2296,12 +2451,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
           ? entry.value.next
           : 0;
       try {
-        await this.mesh.put({
+        await this.#withLeaseFence(() => this.mesh.put({
           key: PEER_SEQ_KEY,
           value: { format: 1, next: current + 1 },
           identity: this.options.identity,
           ifVersion: entry?.version ?? 0,
-        });
+        }));
         return current + 1;
       } catch (error) {
         // Only lost CAS races retry; offline/auth failures propagate.

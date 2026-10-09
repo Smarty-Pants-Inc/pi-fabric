@@ -107,7 +107,8 @@ export interface MeshCommitEffects {
  * 5. Every operation applies with put()/delete() semantics and verified compare-and-swap:
  *    `ifVersion` mismatch with `onConflict: "abort"` (the default) throws `MeshBatchConflictError`
  *    and nothing is written; `"skip"` leaves that key. A thrown callback rolls everything back.
- * 6. COMMIT. A failed commit runs no callback below.
+ * 6. `beforeCommit()` validates external ownership synchronously at the durable commit boundary.
+ *    A throw rolls back all operations and runs no callback below. Then COMMIT.
  * 7. `afterCommit(view)` (legacy, synchronous, no store writers): file backend: under the `.lock`
  *    right after the commit (also for a write-free batch). sqlite backend: a write-free batch runs
  *    it inside its own write-free transaction on the exact snapshot; a changing batch runs it
@@ -123,6 +124,8 @@ export interface StateBackendBatchInput {
   ops: MeshBatchOperation[];
   prepare?: (view: MeshBatchView, fileRead?: unknown) => MeshBatchOperation[];
   afterCommit?: (view: MeshBatchView) => void;
+  /** Final external CAS, after operations and before the durable commit; a throw rolls back. */
+  beforeCommit?: () => void;
   /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
   lockClass?: "bridge";
   /** R11: file reads before the transaction, re-checked by stamp inside it. */
@@ -599,7 +602,7 @@ export class SqliteStateBackend implements StateBackend {
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
     for (const op of input.ops) validateMeshStateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
@@ -616,6 +619,7 @@ export class SqliteStateBackend implements StateBackend {
           identity: input.identity, ops: input.ops,
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
+          ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;

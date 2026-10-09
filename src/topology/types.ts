@@ -92,6 +92,8 @@ export interface FabricHostRecord {
   id: string;
   rootId: string;
   identity: MeshIdentity;
+  /** UUID fence for token-capable host incarnations; start time is metadata. */
+  incarnationToken?: string;
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

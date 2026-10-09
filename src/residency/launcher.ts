@@ -9,7 +9,7 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath } from "./wake.js";
+import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
@@ -475,6 +475,18 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
           continue;
         }
         observe(attempt);
+        const sleepingOwner = readOwner();
+        if (!plan && sleepingOwner?.pid === attempt.child.pid && residentOwnerSleeping(root)) {
+          // This launcher spawned the closing owner. Its native exit notification, not
+          // a 50ms PID/exit recheck, owns sleep completion. One deadline bounds failure.
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const deadline = setTimeout(() => reject(new Error("Resident sleeping child did not exit")), 90_000);
+              void attempt.native.exit.then(() => { clearTimeout(deadline); resolve(); });
+            });
+          } catch (error) { await stopAttempt(attempt); throw error; }
+          break;
+        }
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(root));
         if (!plan && !handoverActive(state)) {
           await recoverIfWedged(attempt);
@@ -613,35 +625,60 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   }
 }
 
-/** Event-owned launcher: contenders exit, and no process survives an idle host. */
-export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = supervise): Promise<void> {
+/** Event-owned launcher: one child owner, no process survives an idle host. */
+export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = supervise,
+  options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void> {
   const root = path.dirname(configPath);
-  let fd: number;
+  let fd: number | undefined;
   try { fd = await lockFile(path.join(root, "wake.lock"), 0, process.platform === "linux"); }
   catch (error) { if (error instanceof FileLockBusy) return; throw error; }
   try {
-    for (;;) {
-      const deadline = Date.now() + 90_000;
-      // A delivery can arrive after the closing gate. Wait for the owner, not a grace timer.
-      while (residentOwnerLive(root)) {
-        if (!residentOwnerSleeping(root)) return;
-        if (Date.now() >= deadline) throw new Error("Resident sleep/wake owner did not exit");
-        await delay(50);
-      }
-      await run(configPath); // exactly the normal launcher start and native child custody
-      if (process.exitCode || residentOwnerLive(root)) return;
-      const sleeping = readWakeJson<{ request?: unknown }>(residentSleepingPath(root));
-      const request = readWakeJson<unknown>(residentWakeRequestPath(root));
-      // The host's close checkpoint covered all older nudges. Only a delivery racing
-      // its final sleep boundary starts another generation; never keep an idle host warm.
-      if (!sleeping || JSON.stringify(sleeping.request) === JSON.stringify(request)) return;
+    // All native starts take lifetime custody here. The launcher that spawned a closing
+    // owner joins its ChildProcess 'exit' via supervise/watchResidentChild, not PID polling.
+    // This notification wait is only for a pre-upgrade/external closing owner.
+    if (residentOwnerLive(root)) {
+      if (!residentOwnerSleeping(root)) return;
+      await waitResidentChange(root, () => !residentOwnerLive(root), 90_000, "Resident sleep/wake owner did not release");
     }
-  } finally { fs.closeSync(fd); }
+    if (options.wakeOnly) {
+      const intent = await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
+      try {
+        const sleeping = readWakeJson<{ request?: unknown }>(residentSleepingPath(root));
+        const request = readWakeJson<unknown>(residentWakeRequestPath(root));
+        if (sleeping && JSON.stringify(sleeping.request) === JSON.stringify(request)) {
+          // A delayed contender may find its nudge already covered. Its no-op startup
+          // must release lifetime custody under intent too, just like the final check.
+          await options.beforeFinalRelease?.();
+          fs.closeSync(fd); fd = undefined;
+          return;
+        }
+      } finally { fs.closeSync(intent); }
+    }
+    for (;;) {
+      await run(configPath); // normal launch and its owned native child exit receipt
+      const intent = await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
+      try {
+        const sleeping = readWakeJson<{ request?: unknown }>(residentSleepingPath(root));
+        const request = readWakeJson<unknown>(residentWakeRequestPath(root));
+        if (process.exitCode || residentOwnerLive(root) || !sleeping || JSON.stringify(sleeping.request) === JSON.stringify(request)) {
+          // Deterministic test seam: a commit can happen right here, after equality was
+          // observed. Its request writer cannot pass intent until lifetime custody is gone.
+          await options.beforeFinalRelease?.();
+          fs.closeSync(fd); fd = undefined;
+          return;
+        }
+      } finally { fs.closeSync(intent); }
+      // Only a delivery crossing the host's final close boundary needs a successor.
+    }
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isMain) {
   const configPath = parseConfigPath(process.argv);
-  try { await (process.argv.includes("--wake") ? superviseWake(configPath) : supervise(configPath)); }
+  try {
+    if (process.platform === "win32" && !process.argv.includes("--wake")) await supervise(configPath);
+    else await superviseWake(configPath, supervise, { wakeOnly: process.argv.includes("--wake") });
+  }
   catch (error) { writeFailure(path.dirname(configPath), error); process.exitCode = 1; }
 }

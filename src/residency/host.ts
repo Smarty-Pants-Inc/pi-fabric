@@ -1160,7 +1160,14 @@ export class ResidentHost {
   #writeWakeRoutes(): void {
     const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
       actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
-        .map(actor => ({ id: actor.id, name: actor.name, topics: actor.topics })) };
+        .map(actor => {
+          // Preserve the host's actual published owner/capability/ACK advertisement for
+          // dormant command admission after close withdraws its live directory records.
+          const participant = this.participants.get(actor.id) ??
+            readWakeJson<ResidentWakeRoutes>(path.join(this.config.residencyRoot, "wake-routes.json"))?.actors
+              .find(entry => entry.id === actor.id)?.participant;
+          return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}) };
+        }) };
     const serialized = JSON.stringify(routes);
     if (serialized === this.#wakeRoutesJson) return;
     writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });

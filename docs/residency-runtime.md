@@ -83,18 +83,36 @@ cursors survive; `owner.json` and the live processes do not.
 log durability barrier. Topic/address matches, direct control targets, and
 lifecycle subscriptions select a retained residency configuration. A durable
 `wake-request.json` nudge starts the existing launcher with `--wake`; the nudge
-is not another inbox. One POSIX `wake.lock` serializes these launchers. A nudge
-racing `sleeping.json` waits for the closing owner before launching a successor.
-The sleep receipt covers earlier nudges, so the launcher exits too unless a new
-delivery crossed the final close boundary. There is no polling hostd. The live
-client watchdog explicitly ignores dormant definitions.
+is not another inbox. One POSIX `wake.lock` serializes all native starts, including
+the initial launcher. A short `wake-intent.lock` serializes durable request writes
+with the launcher's final request/sleep snapshot **and release of `wake.lock`**.
+A commit after that snapshot cannot write its nudge until lifetime custody is
+released, so its launcher cannot lose the wake by finding a departing lock holder.
+The child-owning launcher joins the native `ChildProcess` exit receipt. An external
+pre-upgrade closing owner and explicit readiness waits use `fs.watch` with one
+bounded failure deadline, not periodic sleep/recheck loops. The sleep receipt
+covers earlier nudges, so no launcher remains warm after clean sleep. There is no
+polling hostd. The live client watchdog explicitly ignores dormant definitions.
 
-Direct steer/followUp to a dormant registry definition first wakes and waits for
-the ordinary owner/readiness publication, then uses the existing lease-validated,
-durable command and ACK path. Wake does not grant ownership, invent a participant,
-or bypass stale-owner/bridge admission. An unacknowledged preflight is not an
-accepted delivery. Once a command is committed, its target also uses the same
-commit-before-wake hook as topic traffic.
+Wake failures are isolated per residency root. A spawn failure leaves its durable
+request intact; `wake-failure.json` also retains the delivery reference if writing
+intent fails. The next committed delivery retries pending/failed intent even when
+its own topic is unrelated, and an explicit launcher start drains the archived
+backlog normally. No periodic retry service is added. If storage cannot persist
+either intent nor the failure receipt, the already-committed archive remains the
+authority; this is reported, not represented as a successful wake.
+
+Direct steer/followUp/ask never wakes during preflight. `wake-routes.json` retains
+the host's actually published participant advertisement for dormant admission,
+bound to the exact registry root, actor ownership token and resident host. This
+is retained routing authority, not a live lease. Directory availability, owner,
+capability, binding and ACK/control-channel checks run before command publication;
+the existing control plane also checks its admission state before committing.
+Only the admitted durable command's post-commit hook wakes the owner. Rejected
+pre-publication requests write no wake request and start no host. The waking host
+revalidates ownership/binding and uses the existing claim, outcome and ACK path;
+no direct preflight or fabricated ACK constitutes accepted delivery. Older route
+snapshots without a published advertisement cannot grant dormant direct admission.
 
 Before sleeping an actor-bearing host, residency ensures the existing file event
 archive is enabled under the mesh publication lock. It preserves an operator-selected

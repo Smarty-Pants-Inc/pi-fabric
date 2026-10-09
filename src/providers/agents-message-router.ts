@@ -348,7 +348,6 @@ export class AgentMessageRouter {
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
-    if (!provenLocal) await this.#wakeActorDefinition(id);
     let result: FabricAgentMessageResult;
     try {
       result = provenLocal
@@ -792,27 +791,25 @@ export class AgentMessageRouter {
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
   async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    await this.#wakeActorDefinition(id);
     return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id);
-  }
-
-  async #wakeActorDefinition(id: string): Promise<void> {
-    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
-    if (!meshRoot || id.trim().startsWith("session:") || this.mainAgent.matches(id)) return;
-    let actor: FabricActorInfo | undefined;
-    try { actor = this.actorManager.status(id); } catch { return; }
-    // Failed is a public routing overlay: its persisted runtime may still be dormant.
-    // An explicit repair/probe must be able to wake it without changing failure filtering.
-    if (!["dormant", "failed", "failing-preparation"].includes(actor.status) || this.actorManager.owns?.(actor.id)) return;
-    const { wakeDormantActor } = await import("../residency/wake.js");
-    await wakeDormantActor(meshRoot, actor.id);
   }
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
-    // A dormant definition intentionally has no live participant. Wake before the
-    // usual lease resolution, then revalidate the newly published owner normally.
-    await this.#wakeActorDefinition(id);
+    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
+    const definition = this.resolveActorTarget(id, false);
+    if (meshRoot && definition.actor?.residency === "durable" &&
+        ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
+        !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {
+      const { dormantActorRoute } = await import("../residency/wake.js");
+      const retained = dormantActorRoute(meshRoot, definition.actor);
+      // No wake effect here. The ordinary caller checks capability/binding/control;
+      // control then admits and commits a command. ONLY its post-commit hook wakes.
+      if (retained) {
+        if (!this.control) throw new Error(`Fabric actor owner ${retained.ownerHostId} has no acknowledged control channel`);
+        return { actor: definition.actor, participant: retained };
+      }
+    }
     const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&

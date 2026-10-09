@@ -81,7 +81,7 @@ const outcome = async <T>(run: () => Promise<T>): Promise<unknown> => {
 };
 
 describe("SqliteStateStore", () => {
-  it.skipIf(process.platform === "win32")("binds the connection to the validated state.db: a swap between the check and the open fails closed (smarty-dev#7784)", async () => {
+  it.skipIf(process.platform !== "linux")("binds the connection to the validated state.db before any SQL: a swap put back before the check still fails closed, with other connections open (smarty-dev#7784)", async () => {
     const root = tempRoot("pin");
     const other = tempRoot("pin-other");
     for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
@@ -90,16 +90,27 @@ describe("SqliteStateStore", () => {
       store.close();
     }
     const db = path.join(root, "state.db");
-    // The swap lands after assertPrivateStateFiles validated the file and before SQLite opens it.
-    const swapping = (file: string): SqliteConnection => {
-      fs.renameSync(db, `${db}.aside`);
-      fs.symlinkSync(path.join(other, "state.db"), db);
-      return openNodeSqlite(file);
-    };
-    await expect(open(root, { open: swapping })).rejects.toThrow(/refuses .*state\.db: (it was replaced while opening|the connection did not open the validated file)/);
-    fs.unlinkSync(db);
-    fs.renameSync(`${db}.aside`, db);
+    // Other connections in this process hold the real file (and the foreign one) open throughout.
+    const held = [await open(root), openNodeSqlite(db), openNodeSqlite(path.join(other, "state.db"))];
+    let sql = 0;
+    // An ABA swap after assertPrivateStateFiles: state.db is replaced while SQLite opens it, then put back before
+    // openPinned looks, so the path names the validated inode again.
+    for (const swap of ["symlink", "rename"] as const) {
+      const swapping = (file: string): SqliteConnection => {
+        fs.renameSync(db, `${db}.aside`);
+        if (swap === "symlink") fs.symlinkSync(path.join(other, "state.db"), db);
+        else fs.copyFileSync(path.join(other, "state.db"), db);
+        const connection = openNodeSqlite(file);
+        fs.renameSync(`${db}.aside`, db); // put back: replaces the link or the copy
+        const prepare = connection.prepare.bind(connection);
+        connection.prepare = ((text: string) => { sql++; return prepare(text); }) as typeof connection.prepare;
+        return connection;
+      };
+      await expect(open(root, { open: swapping }), swap).rejects.toThrow(/refuses .*state\.db: the connection('s own descriptor on it is ambiguous \(0 new, [1-9]\d* other\)| opened a different file)/);
+      expect(sql, swap).toBe(0); // rejected before any statement ran on the swapped connection
+    }
     expect((await open(root)).get("who/am")?.value).toBe("mine");
+    for (const connection of held) connection.close();
   });
 
   it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {

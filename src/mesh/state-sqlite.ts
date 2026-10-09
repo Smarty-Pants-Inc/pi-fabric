@@ -773,8 +773,8 @@ export class SqliteStateStore {
     // succeeds no connection in this process can have the file open, so closing drops no lock.
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
-    const db = openPinned(file, options.open ?? openNodeSqlite);
+    const validated = assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -823,8 +823,8 @@ export class SqliteStateStore {
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    assertPrivateStateFiles(file);
-    const db = openPinned(file, options.open ?? openNodeSqlite);
+    const validated = assertPrivateStateFiles(file);
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -1696,9 +1696,9 @@ export const checkpointFlagRaised = (root: string): boolean => {
  * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits here, so only the
  * type and symlink checks apply.
  */
-export const assertPrivatePath = (file: string, kind: "directory" | "file"): void => {
+export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-  if (!stat) return;
+  if (!stat) return undefined;
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   const uid = posix ? process.getuid!() : undefined;
   const why = stat.isSymbolicLink() ? "is a symbolic link"
@@ -1710,6 +1710,7 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): voi
       ? `is group or other readable (mode ${(stat.mode & 0o777).toString(8)}) and could not be made 0600`
     : undefined;
   if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
+  return stat;
 };
 
 // chmod 0600 the very file that was checked: O_NOFOLLOW never follows a swapped-in link, and dev/ino must match.
@@ -1726,39 +1727,45 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
 };
 
 /**
- * smarty-dev#7784 (security-gap; pi-fabric#730 CODE c6085070307): bind the SQLite connection to the state.db that
- * assertPrivateStateFiles validated. node:sqlite has no fd API and opens the file lazily, so: record the validated
- * dev/ino, snapshot /proc/self/fd, open, force the open with a first read, then require a NEW descriptor on exactly
- * that inode and the path still naming it. Any mismatch closes the connection and fails closed. Without /proc
- * (macOS, Windows) only the post-open lstat compare applies.
+ * smarty-dev#7784 (security-gap; pi-fabric#730 CODE c6085070307, pi-fabric#733 CODE c6085492681): bind the SQLite
+ * connection to the very state.db that assertPrivateStateFiles validated (its lstat is the baseline, not a later one).
+ * node:sqlite has no fd API, but SQLite's unix VFS opens the main file inside the constructor, on a descriptor of its
+ * own even when another connection has the file open. So, before any SQL: snapshot /proc/self/fd, open, and require
+ * exactly one NEW descriptor whose link names this state.db, on the validated dev/ino, with the path still naming it
+ * (or SQLite's own reuse of a parked descriptor on that inode, see below).
+ * A swap (a link to another mesh's database, or a renamed-in file, even one put back at once) gives that descriptor
+ * another link or identity: zero or several candidates, or a mismatch, closes the connection and fails closed, as
+ * does Linux without /proc/self/fd. Other platforms keep only the post-open lstat compare (residual on #7784).
  */
-const openPinned = (file: string, open: SqliteOpener): SqliteConnection => {
+const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): SqliteConnection => {
   const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: ${why}`);
-  const validated = fs.lstatSync(file, { throwIfNoEntry: false });
-  if (!validated?.isFile()) throw refuse("it is not a regular file");
-  const procFds = process.platform === "linux" ? fdSnapshot() : undefined;
+  const linux = process.platform === "linux";
+  const name = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  const before = linux ? fdSnapshot() : undefined;
+  if (linux && before === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
   const db = open(file);
   try {
-    db.prepare("SELECT count(*) AS n FROM sqlite_master").get(); // the first read opens the main file
+    if (before !== undefined) {
+      const after = fdSnapshot();
+      if (after === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
+      const link = (fd: string) => { try { return fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { return undefined; } };
+      const target = `${validated.dev}:${validated.ino}`;
+      const added = [...after].filter(([fd, identity]) => before.get(fd) !== identity);
+      const mains = added.filter(([fd]) => [name, `${name} (deleted)`].includes(link(fd) ?? ""));
+      if (mains.length > 1) throw refuse(`the connection's own descriptor on it is ambiguous (${mains.length} new)`);
+      if (mains.length === 1 && mains[0]![1] !== target) throw refuse("the connection opened a different file than the one checked");
+      // ponytail: zero new is SQLite's unix VFS taking back a descriptor it parked for this inode when an earlier
+      // connection here closed under another one's POSIX lock (findReusableFd; it matches the inode it stat()s at
+      // open). Accepted only when NO regular descriptor appeared at all (a swapped-in file or link would have opened
+      // one) and a parked descriptor of this name is on the validated inode. Residual on #7784: a swap onto another
+      // database that this same process had open and parked.
+      if (mains.length === 0 && (added.length > 0 ||
+          ![...before].some(([fd, identity]) => identity === target && link(fd) === name))) {
+        throw refuse(`the connection's own descriptor on it is ambiguous (0 new, ${added.length} other)`);
+      }
+    }
     const now = fs.lstatSync(file, { throwIfNoEntry: false });
     if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
-    if (procFds !== undefined) {
-      const target = `${validated.dev}:${validated.ino}`;
-      const after = [...(fdSnapshot() ?? new Map<string, string>())];
-      // The first read may also open the -wal/-shm siblings: they are not the main file.
-      const real = fs.realpathSync(file);
-      const sibling = (fd: string) => {
-        try { return /-(wal|shm|journal)$/.test(fs.readlinkSync(`/proc/self/fd/${fd}`)) && fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${real}-`); }
-        catch { return false; }
-      };
-      const added = after.filter(([fd, identity]) => procFds.get(fd) !== identity && !sibling(fd));
-      // A new descriptor on the validated inode; or none at all, when SQLite's unix VFS reused a descriptor it kept
-      // for that inode from an earlier connection in this process (it reuses only for the inode it stat()s at
-      // open, so a swapped path would have opened a new descriptor, and that one is refused).
-      const opened = added.some(([, identity]) => identity === target) ||
-        (added.length === 0 && after.some(([, identity]) => identity === target));
-      if (!opened) throw refuse("the connection did not open the validated file");
-    }
     return db;
   } catch (error) {
     try { db.close(); } catch { /* best effort */ }
@@ -1766,8 +1773,8 @@ const openPinned = (file: string, open: SqliteOpener): SqliteConnection => {
   }
 };
 
-// fd -> "dev:ino" of each open regular file. Keyed by identity, not number: the listing's own directory fd is
-// closed again at once, so SQLite may get that very number.
+// fd -> "dev:ino" of each open regular file. Compared by identity as well as number: the listing's own directory fd
+// is closed again at once, so SQLite may get that very number.
 const fdSnapshot = (): Map<string, string> | undefined => {
   let names: string[];
   try { names = fs.readdirSync("/proc/self/fd"); } catch { return undefined; }
@@ -1779,9 +1786,13 @@ const fdSnapshot = (): Map<string, string> | undefined => {
   return identities;
 };
 
-const assertPrivateStateFiles = (file: string): void => {
+// The validated lstat of state.db is returned: openPinned binds the connection to it.
+const assertPrivateStateFiles = (file: string): fs.Stats => {
   assertPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
-  for (const name of [file, `${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
+  for (const name of [`${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
+  const stat = assertPrivatePath(file, "file");
+  if (!stat?.isFile()) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it is not a regular file`);
+  return stat;
 };
 
 // The owner's release: check the token, then unlink (pi-fabric#694 P2, smarty-dev#6477). Nothing is moved aside.

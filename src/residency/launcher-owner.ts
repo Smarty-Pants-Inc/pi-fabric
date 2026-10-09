@@ -6,14 +6,21 @@ export interface ObservedProcessTree { processes: Map<number, OwnedProcess>; }
 /** Why a resident host exited; it writes this as its last stderr line (smarty-dev#7770). */
 export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";
 export const RESIDENT_EXIT_MARKER = "pi-fabric-resident-exit ";
-/** The last reason a host reported in its captured output, if any. */
-export function reportedExitReason(output: string): string | undefined {
-  const at = output.lastIndexOf(RESIDENT_EXIT_MARKER);
-  if (at < 0) return undefined;
-  try {
-    const reason = (JSON.parse(output.slice(at + RESIDENT_EXIT_MARKER.length).split("\n", 1)[0]!) as { reason?: unknown }).reason;
-    return typeof reason === "string" ? reason.slice(0, 64) : undefined;
-  } catch { return undefined; }
+const EXIT_MARKER_LINE = /^pi-fabric-resident-exit \{"reason":"(idle-exit|handover-release|stopped|error)"\}$/;
+/**
+ * Line reader for ONE stream (the host's stderr): only a complete, anchored
+ * marker line yields a reason from the fixed enum. Partial lines carry over.
+ */
+export function exitMarkerReader(): (chunk: string) => ResidentExitReason | undefined {
+  let partial = "";
+  return (chunk) => {
+    const lines = `${partial}${chunk}`.split("\n");
+    // A marker line is short; never buffer an unbounded partial line.
+    partial = lines.pop()!.slice(-256);
+    let reason: ResidentExitReason | undefined;
+    for (const line of lines) reason = (EXIT_MARKER_LINE.exec(line.replace(/\r$/, ""))?.[1] as ResidentExitReason | undefined) ?? reason;
+    return reason;
+  };
 }
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 function processRows(): OwnedProcess[] {

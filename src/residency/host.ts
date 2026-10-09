@@ -199,6 +199,13 @@ export class ResidentHost {
   #lockFd: number | undefined;
   #exclusiveCreateLock = false;
   readonly #ownerPath: string;
+  #failure: unknown;
+  #released = false;
+  /**
+   * Last act while this host still owns the root, just before it releases
+   * owner.json (smarty-dev#7770). `failure` is the startup error, if any.
+   */
+  beforeRelease: ((failure: unknown) => void) | undefined;
   readonly #lockPath: string;
   readonly #errorPath: string;
   readonly #requestsPath: string;
@@ -710,10 +717,14 @@ export class ResidentHost {
         void this.#retryDeliveries();
       }
     } catch (error) {
+      this.#failure ??= error;
       await this.close();
       throw error;
     }
   }
+
+  /** True once this host began to release its root: it then writes nothing there (smarty-dev#1882). */
+  get released(): boolean { return this.#released; }
 
   /**
    * smarty-dev#6477 W1: with mesh.stateBackend=shadow (the effective backend, after the env override
@@ -1719,7 +1730,7 @@ export class ResidentHost {
     this.#exclusiveCreateLock = true;
     try {
       fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
-    } catch (error) { this.#releaseLock(); throw error; }
+    } catch (error) { this.#releaseLock(error); throw error; }
   }
 
   /** Called only while holding the immutable first-claim establishment guard. */
@@ -1761,11 +1772,15 @@ export class ResidentHost {
       }
       fs.ftruncateSync(this.#lockFd, 0);
       fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
-    } catch (error) { this.#releaseLock(); throw error; }
+    } catch (error) { this.#releaseLock(error); throw error; }
   }
 
-  #releaseLock(): void {
+  #releaseLock(failure = this.#failure): void {
     if (this.#lockFd === undefined) return;
+    if (!this.#released && !(failure instanceof ResidentHostAlreadyRunning)) {
+      try { this.beforeRelease?.(failure); } catch { /* diagnostics never block release */ }
+    }
+    this.#released = true;
     // Remove our publication while holding the claim. POSIX never unlinks its
     // immutable kernel-fence inode; Windows removes only its token-owned claim.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
@@ -1816,23 +1831,46 @@ const reportResidentExit = (reason: ResidentExitReason): void => {
   try { process.stderr.write(`${RESIDENT_EXIT_MARKER}${JSON.stringify({ reason })}\n`); } catch { /* best effort */ }
 };
 
+const writeResidentError = (residencyRoot: string, error: unknown): void => {
+  reportResidentExit("error");
+  try {
+    atomicWrite(path.join(residencyRoot, "error.json"), {
+      error: errorMessage(error),
+      occurredAt: Date.now(),
+      launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
+      launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
+    });
+  } catch {
+    // Startup diagnostics are best-effort.
+  }
+};
+
 const runResidentHost = async (
   config: ResidentHostConfig,
-  signal?: AbortSignal,
-  modelRegistry?: PiModelRegistryView,
+  signal: AbortSignal | undefined,
+  modelRegistry: PiModelRegistryView | undefined,
+  created: (host: ResidentHost) => void,
 ): Promise<void> => {
   let finishIdle: ((reason: ResidentExitReason) => void) | undefined;
   const idle = new Promise<ResidentExitReason>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, (reason = "idle-exit") => finishIdle?.(reason), modelRegistry, residentHostLaunchContext(config));
+  let reason: ResidentExitReason | undefined;
+  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry, residentHostLaunchContext(config));
+  created(host);
+  // Every path reports while this host still owns the root: close releases
+  // owner.json last, and nothing may write under the root after that (smarty-dev#1882).
+  host.beforeRelease = (failure) => {
+    if (failure !== undefined) writeResidentError(config.residencyRoot, failure);
+    else reportResidentExit(reason ?? "error");
+  };
   await host.start();
   if (signal?.aborted) {
-    reportResidentExit("stopped");
+    reason = "stopped";
     await host.close();
     return;
   }
-  const reason = await Promise.race([
+  reason = await Promise.race([
     idle,
     new Promise<ResidentExitReason>((resolve) => {
       const finish = (): void => resolve("stopped");
@@ -1841,9 +1879,6 @@ const runResidentHost = async (
       process.once("SIGINT", finish);
     }),
   ]);
-  // Report while this host still owns the root: its close releases owner.json
-  // last, and nothing may write under the root after that (smarty-dev#1882).
-  reportResidentExit(reason);
   await host.close();
 };
 
@@ -1853,23 +1888,15 @@ export const runResidentHostFromConfigPath = async (
   modelRegistry?: PiModelRegistryView,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
+  let host: ResidentHost | undefined;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
-    await runResidentHost(config, signal, modelRegistry);
+    await runResidentHost(config, signal, modelRegistry, (created) => { host = created; });
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
-    reportResidentExit("error");
-    const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);
-    try {
-      atomicWrite(path.join(residencyRoot, "error.json"), {
-        error: errorMessage(error),
-        occurredAt: Date.now(),
-        launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
-        launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
-      });
-    } catch {
-      // Startup diagnostics are best-effort.
-    }
+    // After the release the root may belong to the next generation: write
+    // nothing, not even error.json. A startup failure wrote it before release.
+    if (!host?.released) writeResidentError(config?.residencyRoot ?? path.dirname(configPath), error);
     throw error;
   }
 };

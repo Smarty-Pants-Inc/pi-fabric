@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { observeResidentOwner, reportedExitReason, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
+import { observeResidentOwner, exitMarkerReader, type ResidentExitReason, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -61,6 +61,8 @@ interface Attempt {
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
+  /** The exit reason the host reported on stderr (smarty-dev#7770). */
+  reported?: ResidentExitReason;
 }
 const numberSetting = (value: number | undefined, fallback: number, minimum = 0): number =>
   Number.isFinite(value) ? Math.max(minimum, value!) : fallback;
@@ -300,32 +302,46 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
+    const native = watchResidentChild(child);
+    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native,
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
-    void attempt.native.exit.then(async ({ code, signal }) => {
-      // #2010/#1882: after a clean owned exit (idle exit or release) this directory
-      // may already belong to the next generation. Do not make a late diagnostic
-      // mutation there; the host's reported reason was logged while it still owned it.
-      if (attempt.seenOwner && code === 0 && !signal) return;
+    void native.exit.then(async ({ code, signal }) => {
       // `exit` can precede the last stderr chunk; `close` follows drained stdio.
       // Bounded: a leaked grandchild may hold the pipes open.
       if (![child.stdout, child.stderr].every(stream => !stream || stream.closed)) await new Promise<void>(resolve => {
         const timer = setTimeout(resolve, 1_000);
         child.once("close", () => { clearTimeout(timer); resolve(); });
       });
-      const reason = signal ? "signal" : reportedExitReason(attempt.stderr) ?? (code === 0 ? "unreported" : "error");
-      trace("child-exit", { pid: child.pid, code, signal, reason, kind, seenOwner: attempt.seenOwner });
-    });
+      const exit = { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner };
+      if (attempt.seenOwner && code === 0 && !signal) {
+        // A reported clean exit was logged on receipt, while the host still owned the root.
+        if (attempt.reported) return;
+        // #2010/#1882: after a clean owned release the root may already belong to
+        // the next generation, and this launcher holds no lock that stops one:
+        // handover.lock custody is never retained while assertAutomaticReleaseRecovery
+        // refuses every release. So never write the root here.
+        // ponytail: the launcher's stderr is its only other sink. The client spawns
+        // it with stdio ignored, so this reaches only a launcher run by hand or a
+        // test; a new journal is not worth it for a host that skipped its report.
+        try { process.stderr.write(`${JSON.stringify({ event: "child-exit", at: Date.now(), root, ...exit, reason: "unknown" })}\n`); } catch { /* best effort */ }
+        return;
+      }
+      trace("child-exit", { ...exit, reason: signal ? "signal" : attempt.reported ?? (code === 0 ? "unknown" : "error") });
+    }, () => undefined);
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
       if (child.pid && birth) attempt.processes.set(child.pid, { pid: child.pid, processStartTime: birth, ppid: process.pid, state: "S" });
     });
+    const readMarker = exitMarkerReader();
     for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: Buffer) => {
       attempt.stderr = `${attempt.stderr}${chunk}`.slice(-4_000);
-      // The host reports why it exits before it releases the root (smarty-dev#7770).
-      const reported = stream === child.stderr ? reportedExitReason(chunk.toString()) : undefined;
-      if (reported) trace("child-exit-reported", { pid: child.pid, reason: reported, kind });
+      // The host reports why it exits, on stderr only, before it releases the root (smarty-dev#7770).
+      const reported = stream === child.stderr ? readMarker(chunk.toString()) : undefined;
+      if (reported && !attempt.reported) {
+        attempt.reported = reported;
+        trace("child-exit-reported", { pid: child.pid, reason: reported, kind });
+      }
       try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
     });
     trace("child-spawned", { pid: child.pid, entry: launchEntry, configPath: snapshot, digest: spec?.digest, transaction: plan?.id, kind });

@@ -84,7 +84,12 @@ try {
   await deadline(Promise.all([...nodes.map(node => node.ready), metadataLeader]), 60_000);
   fs.writeFileSync(path.join(output, "cluster-topology.json"), JSON.stringify({ hostname: os.hostname(), nodes: ports.slice(0, 3), replicas: 3,
     sync_interval: "always", faultDomain: "ONE HOST: local R3 functional conformance only; NOT three-host production durability proof" }, null, 2) + "\n");
-  await run("bunx", ["vitest", "run", "tests/mesh-state-async-contract.test.ts", "tests/mesh-state-async-multiprocess.test.ts", "tests/mesh-state-nats-kv-live.test.ts"], "conformance-r3.log");
+  console.log("R3 ready: running four dedicated live-NATS cases");
+  await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-nats-kv-live.test.ts"], "live-r3.log");
+  console.log("Live cases passed: running complete targeted state conformance (including five formerly skipped NATS cases)");
+  await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-async-contract.test.ts", "tests/mesh-state-async-multiprocess.test.ts",
+    "tests/mesh-state-nats-kv.test.ts", "tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts"], "conformance-r3.log");
+  console.log("Conformance passed: measuring file/SQLite/NATS get/put/CAS at 1 KiB and 100 KiB");
   await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-1024.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "1024" });
   await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-102400.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "102400" });
   console.log("PASS: official binary verified; local R3 conformance and latency artifacts retained");

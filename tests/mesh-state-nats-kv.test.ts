@@ -163,6 +163,44 @@ describe("NATS KV single-key adapter (mock protocol, NOT real R3 evidence)", () 
     await expect(store.put({ ...request, ifVersion: first.version })).rejects.toBeInstanceOf(MeshBatchConflictError);
     expect((await store.get(request.key))?.value).toBe(2);
   });
+  it.each([10071, 10164])("normalizes sequence API error %s for virgin and positive CAS", async code => {
+    const store = await open();
+    broker.put.mockRejectedValueOnce(conflict(code));
+    await expect(store.put({ ...request, ifVersion: 0 })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    const entry = await store.put(request);
+    broker.update.mockRejectedValueOnce(conflict(code));
+    await expect(store.compareAndSwap({ ...request, ifVersion: entry.version })).rejects.toMatchObject({
+      key: request.key, expected: entry.version, found: entry.version,
+    });
+    expect(broker.update).toHaveBeenCalledOnce();
+  });
+  it.each([10071, 10164])("does not retry an explicit conditional delete conflict %s", async code => {
+    const store = await open(); const entry = await store.put(request);
+    broker.publish.mockRejectedValueOnce(conflict(code));
+    await expect(store.delete({ key: request.key, ifVersion: entry.version })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    expect(broker.publish).toHaveBeenCalledOnce();
+    expect((await store.get(request.key))?.version).toBe(entry.version);
+  });
+  it.each([10071, 10164])("retries an unconditional delete sequence conflict %s", async code => {
+    const store = await open(); await store.put(request);
+    broker.publish.mockRejectedValueOnce(conflict(code));
+    expect(await store.delete({ key: request.key })).toEqual({ deleted: true, version: 2 });
+    expect(broker.publish).toHaveBeenCalledTimes(2);
+  });
+  it.each([10071, 10164])("bounds unconditional delete conflict %s retries at eight", async code => {
+    const store = await open(); await store.put(request);
+    broker.publish.mockRejectedValue(conflict(code));
+    await expect(store.delete({ key: request.key })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    expect(broker.publish).toHaveBeenCalledTimes(8);
+  });
+  it("propagates unrelated numeric API errors unchanged for put and delete", async () => {
+    const store = await open(); const entry = await store.put(request); const error = conflict(10077);
+    broker.update.mockRejectedValueOnce(error);
+    await expect(store.put({ ...request, ifVersion: entry.version })).rejects.toBe(error);
+    broker.publish.mockRejectedValueOnce(error);
+    await expect(store.delete({ key: request.key })).rejects.toBe(error);
+    expect(broker.publish).toHaveBeenCalledOnce();
+  });
   it("retains tombstone fencing, exact delete PubAck, and never auto-resurrects version 0", async () => {
     const store = await open();
     const entry = await store.put({ ...request, ifVersion: 0 });

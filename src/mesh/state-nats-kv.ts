@@ -81,6 +81,13 @@ export interface NatsKvStateWatchOptions {
 interface Envelope { format: 1; value: unknown; updatedAt: number; updatedBy: MeshStateEntry["updatedBy"] }
 const errorNumber = (error: unknown): number | undefined =>
   (error as { api_error?: { err_code?: number } } | null)?.api_error?.err_code;
+// 10071 is the traditional expected-sequence failure; 2.14.7 can return 10164
+// ("wrong last sequence") for a conflicting publish under concurrent proposals.
+// Classify only these numeric API errors, never generic 400/network/capacity failures.
+const isSequenceConflict = (error: unknown): boolean => {
+  const code = errorNumber(error);
+  return code === 10071 || code === 10164;
+};
 const positiveLimit = (value: number, name: string): number => {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
   return value;
@@ -179,7 +186,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
     return revision;
   }
   async #conflict(error: unknown, key: string, expected: number): Promise<never> {
-    if (errorNumber(error) !== 10071) throw error;
+    if (!isSequenceConflict(error)) throw error;
     throw new MeshBatchConflictError(key, expected, await this.version(key));
   }
   async put(input: StateBackendPutInput): Promise<MeshStateEntry> {
@@ -223,7 +230,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
         validateRevision(ack.seq);
         return { deleted: true, version: ack.seq };
       } catch (error) {
-        if (errorNumber(error) !== 10071) throw error;
+        if (!isSequenceConflict(error)) throw error;
         if (input.ifVersion !== undefined || attempt === 7) return this.#conflict(error, input.key, input.ifVersion ?? found);
       }
     }

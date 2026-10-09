@@ -26,6 +26,8 @@ const stats = (samples: number[]) => {
 const samples: Record<string, Record<string, number[]>> = {};
 try {
   stores.push(await openAsyncMeshStateStore(path.join(root, "file"), { backend: "file" }));
+  // Fail closed if SQLite is unavailable: the selector verifies the actual backend kind.
+  stores.push(await openAsyncMeshStateStore(path.join(root, "sqlite"), { backend: "sqlite" }));
   if (servers) stores.push(await openAsyncMeshStateStore(path.join(root, "nats"),
     { backend: "nats-kv", nats: { servers: servers.split(","), experimentalNatsKv: true } }));
   for (const store of stores) {
@@ -36,8 +38,10 @@ try {
   }
   for (const operation of ["get", "put", "cas"] as const) {
     for (let n = -warmup; n < iterations; n++) {
-      // Alternate backend order every iteration to avoid always measuring one under warmer load.
-      for (const store of n % 2 ? stores.slice().reverse() : stores) {
+      // Rotate and reverse to balance first/middle/last positions for all three backends.
+      const start = ((n % stores.length) + stores.length) % stores.length;
+      const order = [...stores.slice(start), ...stores.slice(0, start)];
+      for (const store of Math.abs(n) % 2 ? order.reverse() : order) {
         // CAS timing is the CAS publish only: its necessary pre-read is measured separately by GET.
         const version = operation === "cas" ? (await store.get(key))!.version : undefined;
         const begin = performance.now();
@@ -51,9 +55,9 @@ try {
   const numbers = Object.fromEntries(stores.map(store => [store.kind, Object.fromEntries(Object.entries(samples[store.kind]!).map(([operation, values]) => [operation, stats(values)]))]));
   const result = { status: servers ? "MEASURED" : "PARTIAL_NATS_BLOCKED", hostname: os.hostname(), runtime: process.version,
     iterations, warmup, seededKeys: seedKeys + 2, mutationPayloadTextBytes: valueBytes,
-    method: "sequential client calls, alternating backends/order; GET uses each backend's normal authority read path; CAS pre-read excluded; default file atomic rename (no fsync claim)",
+    method: "sequential client calls, rotating and reversing file/SQLite/NATS order; identical seeded values and mutations; GET uses each backend's normal authority read path; CAS pre-read excluded; file atomic rename (no fsync claim); SQLite WAL synchronous=NORMAL (no sync() per mutation; not durability-equivalent to NATS sync-always)",
     nats: servers ? { replicas: 3, sync_interval: "always (runner config; operator must attest when run standalone)" }
-      : { status: "BLOCKED", reason: "No authorized official nats-server 2.14.7+ binary plus SHA256SUMS; no NATS latency fabricated" },
+      : { status: "BLOCKED", reason: "FABRIC_NATS_TEST_SERVERS is unset; no NATS latency fabricated" },
     numbers, rawSamplesMs: samples };
   fs.writeFileSync(path.join(output, `latency-${valueBytes}.json`), JSON.stringify(result, null, 2) + "\n");
   console.log(JSON.stringify({ ...result, rawSamplesMs: undefined }, null, 2));

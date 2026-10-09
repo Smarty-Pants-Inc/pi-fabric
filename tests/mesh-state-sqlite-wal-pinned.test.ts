@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MeshStateWalCapError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
-import type { MeshIdentity } from "../src/mesh/store.js";
+import { resolveMeshStateSource, rollbackMeshState } from "../src/mesh/backend-migration.js";
+import { MeshStateRetiredError, MeshStateWalCapError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#6477 security pass P1 (comment 6075855599): show the WAL bound under readers that never let go.
 // Case A pins one read transaction across the 64 MiB emergency threshold; Case B runs constant short readers.
@@ -58,6 +59,183 @@ afterEach(() => {
   for (const database of databases.splice(0)) try { database.close(); } catch { /* closed */ }
   for (const store of sqlite.splice(0)) try { store.close(); } catch { /* closed */ }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// pi-fabric#694 P1 1 and 2: a small cap so each case runs in seconds. One commit of `pad` is ~70-100 KiB of WAL.
+const SMALL_CAP = 4 * MiB;
+type Outcome = { ok: true } | { ok: false; code?: string; message?: string };
+const attempt = async (write: () => Promise<unknown>): Promise<Outcome> => {
+  try { await write(); return { ok: true }; }
+  catch (error) { return { ok: false, code: (error as { code?: string }).code, message: (error as Error).message }; }
+};
+const pin = (root: string): Database => {
+  const reader = raw(root);
+  reader.exec("BEGIN");
+  reader.prepare("SELECT count(*) AS n FROM kv").get(); // takes the read mark: the snapshot stays pinned
+  return reader;
+};
+
+// A SqliteStateStore in a second process (production default open: an imported root), driven over stdin.
+const STORE_CHILD = `
+import { createJiti } from "jiti";
+import readline from "node:readline";
+import { pathToFileURL } from "node:url";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { SqliteStateStore } = await jiti.import("./src/mesh/state-sqlite.ts");
+const [root, cap] = process.argv.slice(-2);
+const store = await SqliteStateStore.open(root, 8 * 1024 * 1024, 1000, { walHardCapBytes: Number(cap) });
+const identity = { id: "child", name: "child", kind: "agent" };
+process.stdout.write("ready\\n");
+for await (const line of readline.createInterface({ input: process.stdin })) {
+  const [key, n, pad] = JSON.parse(line);
+  try { await store.put({ key, value: { n, pad }, identity }); process.stdout.write(JSON.stringify({ ok: true }) + "\\n"); }
+  catch (error) { process.stdout.write(JSON.stringify({ ok: false, code: error.code, message: error.message }) + "\\n"); }
+}
+store.close();
+`;
+const startStoreChild = async (root: string, cap: number): Promise<{ put: (key: string, n: number) => Promise<Outcome>; stop: () => void }> => {
+  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", STORE_CHILD, root, String(cap)],
+    { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
+  children.push(child);
+  let buffer = "";
+  let stderr = "";
+  const waiting: Array<(line: string) => void> = [];
+  const lines: string[] = [];
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString();
+    for (let at = buffer.indexOf("\n"); at >= 0; at = buffer.indexOf("\n")) {
+      const line = buffer.slice(0, at);
+      buffer = buffer.slice(at + 1);
+      const next = waiting.shift();
+      if (next) next(line); else lines.push(line);
+    }
+  });
+  const next = (): Promise<string> => new Promise((resolve, reject) => {
+    const queued = lines.shift();
+    if (queued !== undefined) { resolve(queued); return; }
+    const timer = setTimeout(() => reject(new Error(`store child silent: ${stderr}`)), 30_000);
+    waiting.push((line) => { clearTimeout(timer); resolve(line); });
+  });
+  expect(await next()).toBe("ready");
+  return {
+    put: async (key, n) => { child.stdin.write(`${JSON.stringify([key, n, pad])}\n`); return JSON.parse(await next()) as Outcome; },
+    stop: () => { child.stdin.end(); },
+  };
+};
+
+describe("SQLite WAL hard cap admission across stores and the rollback path (pi-fabric#694 P1 1 and 2)", () => {
+  it("rejects a walHardCapBytes that is not a finite number above 0 at open, before any side effect", async () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const root = tempRoot("badcap");
+      await expect(openStore(root, { walHardCapBytes: bad })).rejects.toThrow(TypeError);
+      expect(() => SqliteStateStore.openSync(root, 8 * MiB, 1_000, { initialize: "create", walHardCapBytes: bad })).toThrow(TypeError);
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    }
+  });
+
+  it("multi-store boundary: after the first refusal every store refuses, a child process included; the WAL stays within one commit per store", async () => {
+    const root = tempRoot("multi");
+    const a = await openStore(root, { walHardCapBytes: SMALL_CAP });
+    const b = await openStore(root, { walHardCapBytes: SMALL_CAP });
+    for (let i = 0; i < KEYS; i += 1) await a.put({ key: `k${i}`, value: { n: i, pad }, identity });
+    const child = await startStoreChild(root, SMALL_CAP);
+    const writers: Array<(n: number) => Promise<Outcome>> = [
+      (n) => attempt(() => a.put({ key: `k${n % KEYS}`, value: { n, pad }, identity })),
+      (n) => attempt(() => b.put({ key: `k${n % KEYS}`, value: { n, pad }, identity })),
+      (n) => child.put(`k${n % KEYS}`, n),
+    ];
+    pin(root);
+
+    let n = 0;
+    let maxCommit = 0;
+    let maxWal = walBytes(root);
+    let first: { writer: number; outcome: Outcome } | undefined;
+    let admittedOverCap = 0; // writes that committed although the shared WAL was already above the cap before them
+    const began = performance.now();
+    while (!first && performance.now() - began < 50_000) {
+      const writer = n % writers.length;
+      const before = walBytes(root);
+      const outcome = await writers[writer]!(n);
+      const after = walBytes(root);
+      maxWal = Math.max(maxWal, after);
+      if (outcome.ok) {
+        maxCommit = Math.max(maxCommit, after - before);
+        if (before > SMALL_CAP) admittedOverCap += 1;
+      } else first = { writer, outcome };
+      n += 1;
+    }
+    expect(first?.outcome).toMatchObject({ ok: false, code: "FABRIC_MESH_STATE_WAL_CAP" });
+    const walAtRefusal = walBytes(root);
+    expect(walAtRefusal).toBeGreaterThan(SMALL_CAP);
+    // Admission reads the shared WAL: the first write by ANY store after the crossing is refused (the old
+    // per-store latch let each store that had not committed past the cap yet write once more).
+    expect(admittedOverCap).toBe(0);
+    // Every store, the in-process ones and the child, refuses from now on, and nothing lands.
+    for (let round = 0; round < 3; round += 1) {
+      for (const [index, write] of writers.entries()) {
+        const outcome = await write(n++);
+        expect(outcome, `writer ${index} round ${round}`).toMatchObject({ ok: false, code: "FABRIC_MESH_STATE_WAL_CAP" });
+        maxWal = Math.max(maxWal, walBytes(root));
+      }
+    }
+    expect(walBytes(root)).toBe(walAtRefusal);
+    expect(maxCommit).toBeGreaterThan(0);
+    expect(maxWal).toBeLessThanOrEqual(SMALL_CAP + writers.length * maxCommit);
+    child.stop();
+  }, 90_000);
+
+  it("restart: a NEW store over an already over-cap WAL refuses its first write (no unguarded write)", async () => {
+    const root = tempRoot("restart");
+    const first = await openStore(root, { walHardCapBytes: SMALL_CAP });
+    for (let i = 0; i < KEYS; i += 1) await first.put({ key: `k${i}`, value: { n: i, pad }, identity });
+    pin(root);
+    let n = KEYS;
+    let refused: Outcome = { ok: true };
+    const began = performance.now();
+    while (refused.ok && performance.now() - began < 50_000) refused = await attempt(() => first.put({ key: `k${n % KEYS}`, value: { n: n++, pad }, identity }));
+    expect(refused).toMatchObject({ ok: false, code: "FABRIC_MESH_STATE_WAL_CAP" });
+    first.close();
+    const wal = walBytes(root);
+    expect(wal).toBeGreaterThan(SMALL_CAP);
+
+    const restarted = await openStore(root, { walHardCapBytes: SMALL_CAP });
+    expect(await attempt(() => restarted.put({ key: "after-restart", value: { pad }, identity })))
+      .toMatchObject({ ok: false, code: "FABRIC_MESH_STATE_WAL_CAP" });
+    expect(walBytes(root)).toBe(wal);
+    expect(restarted.get("after-restart")).toBeUndefined();
+  }, 90_000);
+
+  it("rollback while capped: the operator rollback (fabric-mesh-backend rollback) succeeds with the reader still pinned", async () => {
+    const root = tempRoot("rollback");
+    const store = await openStore(root, { walHardCapBytes: SMALL_CAP });
+    const last = new Map<string, number>();
+    let n = 0;
+    for (; n < KEYS; n += 1) { await store.put({ key: `k${n}`, value: { n, pad }, identity }); last.set(`k${n}`, n); }
+    const reader = pin(root);
+    let refused: Outcome = { ok: true };
+    const began = performance.now();
+    while (performance.now() - began < 50_000) {
+      const key = `k${n % KEYS}`;
+      refused = await attempt(() => store.put({ key, value: { n, pad }, identity }));
+      if (!refused.ok) break;
+      last.set(key, n);
+      n += 1;
+    }
+    expect(refused).toMatchObject({ ok: false, code: "FABRIC_MESH_STATE_WAL_CAP" });
+    expect(walBytes(root)).toBeGreaterThan(SMALL_CAP);
+
+    // The real rollback path (mesh-backend-cli `rollback` calls rollbackMeshState), still pinned and capped.
+    const rolled = await rollbackMeshState(root);
+    expect(rolled).toMatchObject({ backend: "file" });
+    expect(resolveMeshStateSource(root).source).toBe("file");
+    const files = new MeshStore(root, 8 * MiB, 1_000);
+    for (const [key, value] of last) expect((files.get(key, { fresh: true })?.value as { n: number }).n).toBe(value); // every committed key
+    reader.exec("COMMIT"); // release the reader
+    await expect(store.put({ key: "late", value: 1, identity })).rejects.toThrow(MeshStateRetiredError); // the old store fails closed
+    await files.put({ key: "file/after", value: 1, identity });
+    expect(files.get("file/after", { fresh: true })?.value).toBe(1);
+  }, 90_000);
 });
 
 describe("SQLite WAL bound under pinned and constant readers (smarty-dev#6477 P1)", () => {

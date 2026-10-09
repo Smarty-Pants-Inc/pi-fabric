@@ -21,6 +21,8 @@ import {
   StoreBridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
+import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
@@ -970,6 +972,37 @@ describe("mesh bridge", () => {
     await running;
     expect(Date.now() - started).toBeLessThan(500);
     expect(calls).toBe(before);
+  });
+
+  it("retries a WAL-cap refusal on the next cycle, logs it once with the reader report, and never stops (pi-fabric#694 P1 2)", async () => {
+    let calls = 0;
+    const { bridge, logs } = setup(undefined, {
+      stopMs: 100,
+      local: (store, peer) => {
+        const side = new StoreBridgeSide(store, peer);
+        const original = side.latestCursor.bind(side);
+        side.latestCursor = async (...args: Parameters<typeof original>) => {
+          calls += 1;
+          if (calls <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024, "pid 4242 (pinner)");
+          return original(...args);
+        };
+        return side;
+      },
+    });
+    let failure: unknown;
+    const running = bridge.run().catch((error: unknown) => { failure = error; });
+    try {
+      await waitFor(() => calls >= 4); // three refusals retried on later cycles, then the start pass reads the cursor
+      const capLogs = logs.filter((line) => line.includes("mesh state WAL cap; retrying"));
+      expect(capLogs).toHaveLength(1); // three refusals within a minute: one line
+      expect(capLogs[0]).toContain("WAL readers: pid 4242 (pinner)");
+      expect(isMeshRetryableBusy(new MeshStateWalCapError(2, 1))).toBe(true);
+      expect(failure).toBeUndefined();
+    } finally {
+      await bridge.stop();
+      await running;
+    }
+    expect(failure).toBeUndefined();
   });
 
   it.each([new Error("Timed out waiting for the Fabric mesh lock"), Object.assign(new Error("unauthorized"), { code: "DENIED" })])(

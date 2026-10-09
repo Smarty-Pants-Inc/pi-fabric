@@ -178,7 +178,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     const viaCli = open(touched, { stateBackend: "sqlite" });
     await viaCli.put({ key: "b", value: 1, identity });
     expect(viaCli.listAll("").map((entry) => entry.key)).toEqual(["b"]);
-  });
+  }, 60_000); // four fenced imports (fsync at synchronous=FULL): 19 s once on a host at load 21
 
   it("refuses state.db without the marker, and the marker without state.db", async () => {
     // An old release's fence: backend=sqlite at epoch 1 over a fresh root, without any import.

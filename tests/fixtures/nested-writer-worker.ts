@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentManager } from "../../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../../src/config.js";
+import { processStartTime } from "../../src/residency/process-identity.js";
 
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i]!.slice(2), process.argv[i + 1]!);
@@ -36,7 +37,22 @@ const manager = new AgentManager(args.get("cwd")!, { ...DEFAULT_FABRIC_CONFIG.ag
   runRoot: args.get("run-root")!, workerPath: fileURLToPath(import.meta.url),
   fabricExtensionPath: args.get("fabric-extension")!,
 });
+// Transfer custody over the same private native channel as the real worker.
+// Event-only monitoring no longer samples a live primary to discover descendants.
+if (process.send) await new Promise<void>(resolve => {
+  const admitted = (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message) || message.type !== "fabric-execution-custody-ack") return;
+    process.off("message", admitted);
+    process.channel?.unref?.();
+    resolve();
+  };
+  process.on("message", admitted);
+  process.send!({ type: "fabric-execution-custody" });
+});
 const child = await manager.spawn({ task: `NESTED_WRITER ${JSON.stringify({ release })}`, transport: "process", extensions: false });
+if (process.send) await new Promise<void>((resolve, reject) => {
+  process.send!({ type: "fabric-execution-started", pid: Number(child.sessionId), started: processStartTime(Number(child.sessionId)) }, error => error ? reject(error) : resolve());
+});
 const childStatus = path.join(manager.runDirectory(child.id)!, "status.json");
 const deadline = Date.now() + 30_000;
 while (!fs.existsSync(childStatus)) {

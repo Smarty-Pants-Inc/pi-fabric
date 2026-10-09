@@ -11,6 +11,7 @@ import type { FabricRegistryInvocationContext } from "../src/core/action-registr
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
+import { captureProcessCloseReceipts } from "./helpers/process-receipts.js";
 import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const workerPath = path.resolve("dist/worker.js");
@@ -27,6 +28,7 @@ afterEach(async () => {
 
 async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false, jev?: { credentialCommand: string[] }, approvalModel?: string) {
   expect(fs.existsSync(workerPath), "Build the real worker before running these regressions").toBe(true);
+  const receipts = captureProcessCloseReceipts();
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(cwd);
   const runRoot = path.join(cwd, FABRIC_RUN_ROOT_PREFIX + "followups");
   const agentDir = path.join(cwd, "agent");
@@ -70,6 +72,9 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
     const handle = await runtime.registry.invoke("agents.spawn", { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: pin.model, pinThinking: pin.effort, protected: false, transport: "process" }, { ...invocation, signal }) as { id: string; routeDecision: { reasonCode: string; model: string; effort: string } };
     const result = await runtime.registry.invoke("agents.join", { id: handle.id }, { ...invocation, nestedToolCallId: "followups-join" }) as { id: string; status: string; admittedModel: string; admittedThinking: string };
     expect(result).toMatchObject({ status: "completed", admittedModel: pin.model, admittedThinking: pin.effort });
+    // Windows may return the logical result before native close. Artifact
+    // collection fixtures require the captured close, not a polling allowance.
+    await receipts.wait(handle.id);
     const rows = fs.readFileSync(path.join(agentDir, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ type: "outcome", decisionId: rows[0].decisionId, status: "completed" });

@@ -95,13 +95,15 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "execution.json"))}, JSON.stri
 process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`);
     const realLaunch = ProcessTransport.prototype.launch;
     let launches = 0;
+    let notifyLost!: () => void;
+    const lostReceipt = new Promise<void>(resolve => { notifyLost = resolve; });
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       launches++;
       const handle = await realLaunch.call(this, request);
       const pid = Number(handle.sessionId);
       fs.writeFileSync(path.join(root, "worker.json"), JSON.stringify({ pid, started: processStartTime(pid) }));
       return { ...handle,
-        ...(mode === "actor-lost-contact" ? { isAlive: async () => false, lostContact: () => "injected lost contact" } : {}),
+        ...(mode === "actor-lost-contact" ? { closed: lostReceipt, isAlive: async () => false, lostContact: () => "injected lost contact" } : {}),
         stop: async () => { throw new Error("injected execution exit unconfirmed"); } };
     });
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, timeoutMs: 30000, retainRuns: false }, {
@@ -114,6 +116,9 @@ process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1
       const runDirectory = manager.runDirectory(handle.id)!;
       const statusFile = path.join(runDirectory, "status.json");
       const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      // A query override cannot wake an event adapter. Publish the simulated
+      // contact-loss receipt only after its real native execution is admitted.
+      if (mode === "actor-lost-contact") notifyLost();
       if (mode === "terminal") {
         process.kill(readBirth(path.join(root, "worker.json")).pid, "SIGKILL");
         // Replay the reviewed worker's pre-fix crash publication. The parent's

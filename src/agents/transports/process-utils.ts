@@ -558,7 +558,7 @@ export const spawnDetached = async (
       }
       // A populated-zero scope can retain separately grouped execution too.
       // Give those obligations the same ONE final observation, never a loop.
-      censusTimer = setTimeout(() => {
+      censusTimer = setTimeout(function finalTreeCensus() {
         censusTimer = undefined;
         censusDeadlineReached = true;
         void observeTree(true);

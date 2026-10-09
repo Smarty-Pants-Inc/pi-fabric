@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, expect, it, vi } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { captureTreeCensusDeadline } from "./helpers/process-receipts.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -46,7 +47,7 @@ const installLegacyPrimaryExitReceipt = () => {
   vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
     const handle = await launch.call(this, request);
     const primaryAlive = () => processAlive(Number(handle.sessionId));
-    return { ...handle, isAlive: async () => primaryAlive(), stop: async () => {
+    return { ...handle, treeClosed: handle.closed!, isAlive: async () => primaryAlive(), stop: async () => {
       if (primaryAlive()) await handle.stop();
     } };
   });
@@ -198,6 +199,7 @@ it.skipIf(process.platform === "win32").each([
   ["project", true, "unknown"], ["session", true, "unknown"],
 ] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {
   if (restart) installLegacyPrimaryExitReceipt();
+  const census = captureTreeCensusDeadline();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -342,17 +344,33 @@ it.skipIf(process.platform === "win32").each([
 
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
+    if (!restart) {
+      // Native primary close sampled the live descendant once. Its later exit
+      // is not a polling wake: deliver exactly the scheduled final census.
+      expect(settled).toBe(false);
+      await waitFor(() => census.pending() > 0);
+      expect(census.fire()).toBe(1);
+    }
     await waitFor(() => settled && host.actors.inFlightCount() === 0);
     expect(await settlement).toMatchObject({ status: "failed" });
     expect((restart ? host.actors.status(actor.id) : await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
     // Explicitly finish a fresh offline proof; idle snapshots may conservatively
     // retain an exited descendant until the next 60-second refresh.
-    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
+    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 100 }).has(actor.id)).toBe(false);
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
-    await waitFor(() => scans > before && !fs.existsSync(decisionPath));
+    let attempted = before;
+    await waitFor(() => {
+      if (scans <= before) return false;
+      if (!fs.existsSync(decisionPath)) return true;
+      // A conservative first-sample veto must get a fresh retention deadline,
+      // as in the public-stop case above. Advance only the collector clock;
+      // never bypass writer/tree custody or alter a real worker's lifetime.
+      if (scans > attempted) { attempted = scans; scanTime = (scanTime ?? 0) + 60_001; }
+      return false;
+    });
     due.mockReturnValue(false);
     expect(fs.existsSync(ackPath)).toBe(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
@@ -374,7 +392,9 @@ it.skipIf(process.platform === "win32").each([
       const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
       await waitFor(() => !processAlive(child.pid));
     }
+    census.fire(); // join any legacy transport census after the real child exit
     await control?.close(); await client?.close(); await host.close(); await participants.close();
+    census.restore();
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }

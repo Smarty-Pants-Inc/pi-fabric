@@ -244,14 +244,21 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
     const f = await fixture();
     const launch = ProcessTransport.prototype.launch;
     const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    let notifyLost!: () => void;
+    const lostReceipt = new Promise<void>(resolve => { notifyLost = resolve; });
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       const handle = await launch.call(this, request); handles.push(handle);
-      return { ...handle, relaunchable: false, isAlive: async () => lost ? false : handle.isAlive(), lostContact: () => lost ? "unreachable pane may still run" : undefined };
+      return { ...handle, closed: lostReceipt, relaunchable: false, isAlive: async () => lost ? false : handle.isAlive(), lostContact: () => lost ? "unreachable pane may still run" : undefined };
     });
     let lost = true;
     const stop = vi.spyOn(f.host.agents, "stop");
     try {
-      const result = await f.host.agents.run({ task: "HANG until stopped", transport: "process" });
+      const handle = await f.host.agents.spawn({ task: "HANG_WITH_PROGRESS until stopped", transport: "process" });
+      await until(() => { const record = f.host.agents.status(handle.id); return "turns" in record && record.turns > 0; });
+      // The injected loss needs an event receipt; a live worker cannot produce
+      // a native close merely because its isAlive query was overridden.
+      notifyLost();
+      const result = await f.host.agents.wait(handle.id);
       expect(result.status).toBe("failed");
       expect(await handles[0]!.isAlive()).toBe(true);
       await f.client.reconcileRelease();

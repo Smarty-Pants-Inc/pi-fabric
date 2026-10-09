@@ -21,6 +21,7 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { captureProcessCloseReceipts } from "./helpers/process-receipts.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -252,6 +253,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
 
 describe("AgentManager", () => {
   it.each(["pending", "empty", "outcome", "live", "link", "unknown"] as const)("R-1 active-manager expiry applies the terminal-tree gate (%s)", async (contents) => {
+    const receipts = captureProcessCloseReceipts();
     let sweep: (() => void) | undefined;
     const interval = globalThis.setInterval;
     const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
@@ -274,6 +276,8 @@ describe("AgentManager", () => {
     let clock: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const result = await manager.run({ task: "expiry content gate", transport: "process" });
+      await receipts.wait(result.id);
+      await vi.waitFor(() => expect(manager.retentionReferences({ refresh: true, budgetMs: 100 }).has(result.id)).toBe(false));
       const run = manager.runDirectory(result.id)!;
       roots.push(path.dirname(run));
       const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
@@ -291,6 +295,8 @@ describe("AgentManager", () => {
       if (contents === "unknown") fs.writeFileSync(path.join(run, "diagnostic.txt"), "preserve unknown content");
       // A later empty run proves that the entire requested sweep has run, including vetoes.
       const control = await manager.run({ task: "empty expiry control", transport: "process" });
+      await receipts.wait(control.id);
+      await vi.waitFor(() => expect(manager.retentionReferences({ refresh: true, budgetMs: 100 }).has(control.id)).toBe(false));
       const controlRun = manager.runDirectory(control.id)!;
       fs.mkdirSync(path.join(controlRun, "deliveries"));
       expect(sweep).toBeTypeOf("function");

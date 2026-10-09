@@ -39,7 +39,7 @@ native-close and process-tree custody obligations still have to be joined.
 Each execution has one deadline safety read to catch a missed notification.
 A failed event watcher is never replaced with polling: at the deadline the run
 fails with `errorCode: "PROCESS_LIVENESS_WATCH_FAILED"`, retaining unconfirmed
-worker files and admission rather than retrying a possibly live worker. Status
+worker files and admission. A possibly live worker is never retried. Status
 and lifecycle files are observed separately by filesystem events (including
 atomic status-file renames), so progress does not require a liveness query.
 External/placed process adapters keep their existing checked-query contract.

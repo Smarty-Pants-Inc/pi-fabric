@@ -1862,7 +1862,9 @@ export class AgentManager {
               "arrives as a completion message after this turn: end the turn now.",
           ));
         }, timeoutMs);
-        timer.unref?.();
+        // This finite foreground observation owns its deadline. Detached worker,
+        // filesystem and custody watchers may all be unreferenced during startup.
+        // Releasing the deadline early can exit Node with the wait still pending.
       }
     });
     return Promise.race([managed.result!, bound]).finally(() => {

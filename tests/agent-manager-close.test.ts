@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { captureProcessCloseReceipts } from "./helpers/process-receipts.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
 import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
@@ -164,8 +165,12 @@ describe("AgentManager close storage", () => {
   });
 
   it("retains closed managed run artifacts by default", async () => {
+    const receipts = captureProcessCloseReceipts();
     const { manager, root } = setup(true);
-    await manager.run({ task: "hello", runner: "pi", extensions: false });
+    const run = await manager.run({ task: "hello", runner: "pi", extensions: false });
+    // A terminal Windows result may precede native close. This storage test
+    // closes an exited run; it must not race into forced tree-helper custody.
+    await receipts.wait(run.id);
     await manager.close();
     expect(fs.existsSync(root)).toBe(true);
     expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });

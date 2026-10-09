@@ -550,7 +550,12 @@ export class ResidentHost {
           try {
             await this.participants.refreshPresence();
           } finally {
-            this.#scheduleIdleCheck();
+            try {
+              this.#scheduleIdleCheck();
+            } catch (error) {
+              // Scheduling must not replace the original presence rejection.
+              console.warn(`[pi-fabric] resident idle check scheduling failed: ${String(error)}`);
+            }
           }
         }, schedule: () => this.participants.scheduleRefresh() },
         persistent: true,

@@ -257,6 +257,38 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { if (update) { fail?.(); await update; } vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it.each(["rejection", "abort"] as const)("preserves a presence refresh %s when idle-check scheduling throws", async outcome => {
+    const { root, config, host } = fixture();
+    const error = Object.assign(new Error(`original presence ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error" });
+    const schedulerError = new Error("idle-check scheduler failure");
+    let fail: (() => void) | undefined;
+    let update: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const get = host.participants.get.bind(host.participants);
+      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+        ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : get(id, ...rest));
+      const checks = vi.spyOn(host.actors, "hasDormantIdleActor");
+      const actor = await host.actors.create({ name: `scheduler-error-${outcome}`, instructions: "supervise", events: ["agent_settled"], residency: "durable" });
+      const pending = new Promise<void>((_resolve, reject) => { fail = () => reject(error); });
+      const refresh = vi.spyOn(host.participants, "refreshPresence").mockImplementationOnce(() => pending);
+      checks.mockClear();
+      update = host.actors.setInstructions(actor.id, "supervise despite presence failure");
+      // Drain the mutation's idle check before failing only the refresh's finalizer.
+      await until(() => refresh.mock.calls.length === 1 && checks.mock.calls.some(([protectedIds]) => protectedIds?.has(actor.id)));
+      const schedule = vi.spyOn(globalThis, "queueMicrotask").mockImplementationOnce(() => { throw schedulerError; });
+      fail!();
+      await update;
+      expect(schedule).toHaveBeenCalledTimes(1);
+      // The host reports B once, while the actor manager still receives and reports A.
+      expect(warn.mock.calls).toEqual([
+        [`[pi-fabric] resident idle check scheduling failed: ${String(schedulerError)}`],
+        [`[pi-fabric] host actor presence: ${error.message}`],
+      ]);
+    } finally { if (update) { fail?.(); await update; } vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["no-op", "failure"] as const)("does not retry a %s dormancy commit without a new event", async outcome => {
     const { root, host } = fixture();
     try {

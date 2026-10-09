@@ -106,6 +106,12 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   };
   const shutdown = new AbortController();
   const signalListeners = new Map(["SIGTERM", "SIGINT"].map((name) => [name, new Set(process.listeners(name))]));
+  let residentParticipants: ParticipantDirectory | undefined;
+  const start = ParticipantDirectory.prototype.start;
+  const captureStart = vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(function (this: ParticipantDirectory) {
+    if (this.options.hostId === residentHostId(config.rootId)) residentParticipants = this;
+    return start.call(this);
+  });
   const host = runResidentHostFromConfigPath(configPath, shutdown.signal, registry);
   let startupFailure: unknown;
   void host.catch(error => { startupFailure = error; });
@@ -123,6 +129,8 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
     throw error; // Report the startup cause, not an unrelated eight-second exchange timeout.
   }
+  captureStart.mockRestore();
+  if (!residentParticipants) throw new Error("Missing native resident participant directory");
   const client = new ResidencyClient({
     config, mesh, participants, commandTimeoutMs,
     mainAgent: { id: rootId, local: true, matches: (id) => id === rootId, info: () => { throw new Error("unused"); },
@@ -131,7 +139,7 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const nested = new ResidentActorClient(meshRoot, rootId, 500);
   const model = beforeCommit ? "test/slow" : "test/visible";
   return {
-    root, residencyRoot, config, participants, client, nested, entered, release, model,
+    root, residencyRoot, config, participants, residentParticipants, client, nested, entered, release, model,
     close: async () => {
       release.resolve();
       shutdown.abort();
@@ -634,11 +642,18 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
 
   it.each(["main spawn", "nested create"] as const)("%s reports unknown rather than rejection if atomic abandonment cannot be established", async (kind) => {
     const state = await harness(false);
-    vi.spyOn(fs, "linkSync").mockImplementation(() => { throw Object.assign(new Error("fence unavailable"), { code: "EPERM" }); });
+    const link = fs.linkSync.bind(fs);
+    const unavailable = vi.fn(() => { throw Object.assign(new Error("fence unavailable"), { code: "EPERM" }); });
+    vi.spyOn(fs, "linkSync").mockImplementation((source, target) => {
+      // Fault only the abandonment/commit fence, not independent lease admission.
+      if (path.dirname(String(target)) === path.join(state.residencyRoot, "decisions")) unavailable();
+      else link(source, target);
+    });
     try {
       const error = await send(state, kind, new AbortController().signal).catch((error: Error) => error);
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: expect.any(String) });
       expect((error as Error).message).toContain("fence unavailable");
+      expect(unavailable).toHaveBeenCalled();
       expect(entries(state.residencyRoot, "agents")).toEqual([]);
       expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
     } finally { vi.restoreAllMocks(); await state.close(); }
@@ -998,7 +1013,14 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       const reconciliationClock = originalDecisions.length ? vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000) : undefined;
       // A resumed Main must renew its real root lease at the advanced clock before
       // authorized public stop, not rely on the old pre-expiry directory presence.
-      if (reconciliationClock) await state.participants.refresh();
+      if (reconciliationClock) {
+        // The in-process clock jumps 24 h for request retention. Renew BOTH real
+        // live owners before Main's ordinary 6 h reaper runs: otherwise this
+        // fixture deletes the resident lease and (correctly) supersedes it.
+        // Never recreate a removed lease or waive the missing-owned-lease fence.
+        await state.residentParticipants.refresh();
+        await state.participants.refresh();
+      }
       // Reconcile live entities before assertions that deliberately fail on the old head.
       for (const decision of ending === "collected expiry" ? [] : decisions) {
         await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));

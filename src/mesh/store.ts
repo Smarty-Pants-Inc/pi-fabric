@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { withMeshCustody } from "./custody-lock.js";
+import { onMeshLockAdmission } from "./lock-queue.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
@@ -433,8 +434,13 @@ export class MeshStore {
 
   // The lock (mesh-lock.ts).
 
-  withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
-    return this.#lock.withTryLock(operation, timeoutMs);
+  /** Passive release/admission wake; no ticket, acquisition, or periodic retry. */
+  onLockAdmission(wake: () => void): () => void {
+    return onMeshLockAdmission(this.root, wake);
+  }
+
+  withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0, signal?: AbortSignal): Promise<T> {
+    return this.#lock.withTryLock(operation, timeoutMs, signal);
   }
 
   /** Runs a synchronous operation under mesh custody without writing shared state. */

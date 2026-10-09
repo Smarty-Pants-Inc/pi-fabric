@@ -48,6 +48,7 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { readHostLeaseCurrent, removeHostLeaseIf, prepareHostLeasePublishLock, hostLeasePublishLockPath, waitForHostLeasePublication } from "../topology/host-leases.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -605,6 +606,26 @@ export class ResidentHost {
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
+      // Activation is not renewal. Winning the native host fence proves the old
+      // resident no longer owns this address, even when its last file TTL is live.
+      // Retire only that exact same-lineage lease under state custody before the
+      // new directory starts; all later renewals remain strictly incarnation-fenced.
+      await prepareHostLeasePublishLock(this.mesh, this.hostId);
+      // Rare native takeover uses release-event admission, never a sleep loop.
+      // Wait outside state/registry custody, then capture the exact predecessor.
+      if (fs.existsSync(hostLeasePublishLockPath(this.mesh.root, this.hostId))) {
+        await waitForHostLeasePublication(this.mesh.root, this.hostId, AbortSignal.timeout(10_000));
+      }
+      const predecessor = readHostLeaseCurrent(this.mesh.root, this.hostId);
+      if (predecessor?.rootId === this.config.rootId && predecessor.identityId === this.identity.id) {
+        await withStateFence(this.mesh, this.identity, () => {
+          if (this.#closed || this.#lockFd === undefined) throw new Error(HOST_CLOSING_RETRY);
+          removeHostLeaseIf(this.mesh.root, this.hostId, lease =>
+            lease.rootId === predecessor.rootId && lease.identityId === predecessor.identityId &&
+            lease.startedAt === predecessor.startedAt && lease.updatedAt === predecessor.updatedAt &&
+            lease.expiresAt === predecessor.expiresAt);
+        });
+      }
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });

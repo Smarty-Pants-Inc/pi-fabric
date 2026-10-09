@@ -13,6 +13,36 @@ export function meshLockQueueDirectory(root: string): string {
 }
 
 const TICKET = /^\d{24}-\d+-[a-f0-9-]+$/;
+
+/** The same native release/receipt events used by FIFO waiters, but no ticket or
+ * periodic probe. A timed-out publisher keeps only this passive wake subscription. */
+export const onMeshLockAdmission = (root: string, wake: () => void): (() => void) => {
+  const watchers: fs.FSWatcher[] = [];
+  let closed = false;
+  const open = (directory: string, event: (name: string | null) => void): void => {
+    try {
+      const watcher = fs.watch(directory, { persistent: false }, (kind, name) => {
+        if (!closed && kind === "rename") event(name === null ? null : String(name));
+      });
+      watcher.on("error", () => watcher.close());
+      watchers.push(watcher);
+    } catch { /* R-no-polling's once-per-minute heartbeat fallback remains. */ }
+  };
+  open(root, name => {
+    if ((name === null || name === ".lock" || name.startsWith(".lock.released.")) &&
+      !fs.existsSync(path.join(root, ".lock"))) wake();
+  });
+  try {
+    const queue = meshLockQueueDirectory(root);
+    // Our cancelled receipt is NOT an admission event. Only receipts already
+    // belonging to other waiters when we subscribed can hand admission to us.
+    const predecessors = new Set(fs.readdirSync(queue).filter(name => TICKET.test(name) && Number(name.split("-")[1]) !== process.pid));
+    open(queue, name => {
+      if (name !== null && predecessors.has(name) && !fs.existsSync(path.join(queue, name))) { predecessors.delete(name); wake(); }
+    });
+  } catch { /* A queue not created yet contributes no event. */ }
+  return () => { closed = true; for (const watcher of watchers) watcher.close(); };
+};
 // Budgets below this are short try-acquires (registry-fenced publication); they keep the
 // unconditional 80% fallback rather than waiting behind a long queue they cannot clear.
 const GATED_BUDGET_MS = 2000;

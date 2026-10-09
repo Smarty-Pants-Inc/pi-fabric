@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, prepareHostLeasePublishLock, prepareHostLeasePublishLocks, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
@@ -516,6 +516,10 @@ export class StoreBridgeSide implements BridgeSide {
   async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
+    // Recover crashed per-lease publishers outside state custody. Live holders
+    // stay protected; a busy effect remains in the existing outbox for replay.
+    await Promise.all([prepareHostLeasePublishLocks(this.store),
+      ...presence.hosts.map(item => prepareHostLeasePublishLock(this.store, item.record.id))]);
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
     // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
     // root of such a spoke on every pass (smarty-dev#6477). Never later than now. A non-finite

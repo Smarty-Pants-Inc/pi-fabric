@@ -116,7 +116,7 @@ export class MeshLock {
   readonly #ownIncarnation: Promise<string | undefined> | undefined;
   #ownIncarnationReady = false;
   #ownStartTime: string | undefined;
-  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
+  readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number; deadline: number; signal?: AbortSignal | undefined }>();
   readonly #lockTimeoutMs: number;
   readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
@@ -149,7 +149,7 @@ export class MeshLock {
   get lockProtocol(): MeshLockProtocol { return this.#lockProtocol; }
   get lockTimeoutMs(): number { return this.#lockTimeoutMs; }
   get writeAbortSignal(): AbortSignal | undefined { return this.#writeAbortSignal; }
-  get tryLockScope(): AsyncLocalStorage<{ active: boolean; timeoutMs: number }> { return this.#tryLockScope; }
+  get tryLockScope(): AsyncLocalStorage<{ active: boolean; timeoutMs: number; deadline: number; signal?: AbortSignal | undefined }> { return this.#tryLockScope; }
   get ownIncarnation(): Promise<string | undefined> | undefined { return this.#ownIncarnation; }
   get ownIncarnationReady(): boolean { return this.#ownIncarnationReady; }
 
@@ -158,11 +158,16 @@ export class MeshLock {
    * but a busy mesh throws its typed timeout after a short try so the caller can
    * release registry fences and retry the whole step. This acquires NO lock itself.
    * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
-  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
+  async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0, signal?: AbortSignal): Promise<T> {
     // Nested helpers retain the surrounding try budget and its lifetime.
     const inherited = this.#tryLockScope.getStore();
-    if (inherited?.active) return operation();
-    const scope = { active: true, timeoutMs: Math.max(0, timeoutMs) };
+    if (inherited?.active && !signal) return operation();
+    const budget = inherited?.active ? inherited.timeoutMs : Math.max(0, timeoutMs);
+    const scope = { active: true, timeoutMs: budget,
+      deadline: inherited?.active ? inherited.deadline : performance.now() + budget,
+      signal: signal && inherited?.active && inherited.signal ? AbortSignal.any([signal, inherited.signal])
+        : signal ?? (inherited?.active ? inherited.signal : undefined) };
+    scope.signal?.throwIfAborted();
     return this.#tryLockScope.run(scope, async () => {
       try { return await operation(); }
       finally { scope.active = false; }
@@ -195,11 +200,15 @@ export class MeshLock {
     let lockHeldAt = -1;
     let holdMs = -1;
     let failedWaitMs = -1;
-    this.#writeAbortSignal?.throwIfAborted();
+    // Cancellation belongs to this async operation, never to unrelated store callers.
+    const scope = this.#tryLockScope.getStore();
+    const signal = scope?.active && scope.signal
+      ? this.#writeAbortSignal ? AbortSignal.any([scope.signal, this.#writeAbortSignal]) : scope.signal
+      : this.#writeAbortSignal;
+    signal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
     // Async-local scope leaves concurrent ordinary callers on their own budget.
-    const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
@@ -211,7 +220,9 @@ export class MeshLock {
     const startTime = this.#lockProtocol === 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const duration = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const deadline = performance.now() + duration;
+    const remaining = (): number => Math.min(deadline, scope?.active ? scope.deadline : Infinity) - performance.now();
     const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
@@ -227,7 +238,7 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
+    const ticket = new MeshLockTicket(this.root, token, Math.max(0, remaining()));
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -236,11 +247,11 @@ export class MeshLock {
       let lastAttemptAt = Date.now();
       let retryAttempt = 0;
       while (true) {
-        this.#writeAbortSignal?.throwIfAborted();
+        signal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          if (remaining() <= 0) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          await ticket.wait(Math.min(20, Math.max(0, remaining())), signal);
           continue;
         }
         const attemptAt = Date.now();
@@ -302,19 +313,19 @@ export class MeshLock {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath, deadline)) continue;
-          if (Date.now() >= deadline) {
+          if (await this.#clearStaleLock(ownerPath, Date.now() + Math.max(0, remaining()))) continue;
+          if (remaining() <= 0) {
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, remaining())), signal);
+          else await delay(retryDelayMs(retryAttempt++, 20, 250, remaining()), signal);
         }
       }
       if (lockStats) lockHeldAt = performance.now();
       try {
-        this.#writeAbortSignal?.throwIfAborted();
+        signal?.throwIfAborted();
         return acrossAwait ? await operation() : operation();
       } catch (error) {
         // A failed write (a version conflict above all) means this store's view is behind: the

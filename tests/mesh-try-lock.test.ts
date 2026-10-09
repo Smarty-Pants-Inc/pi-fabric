@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const fixture = (lockProtocol: 1 | 2) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-try-scope-")); roots.push(root);
@@ -68,5 +68,36 @@ describe("mesh try-lock async scope", () => {
     finally { release(); await escaped; await unlock; }
     await expect(mesh.withTryLock(() => mesh.withTryLock(() => mesh.confirmWritable()))).resolves.toBeUndefined();
     expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(false);
+  });
+
+  it("cancels only the scoped waiter, leaving a concurrent ordinary writer live", async () => {
+    const { mesh, release } = fixture(1);
+    const abort = new AbortController(), reason = new Error("admission retired");
+    const ordinary = mesh.put({ key: "ordinary", value: 1, identity });
+    const cancelled = expect(mesh.withTryLock(() => mesh.confirmWritable(), 2_000, abort.signal)).rejects.toBe(reason);
+    try {
+      await pause(20); abort.abort(reason); await cancelled;
+      expect(mesh.get("ordinary")).toBeUndefined();
+      expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(true);
+      release(); await ordinary;
+      expect(mesh.get("ordinary")?.value).toBe(1);
+      await mesh.withTryLock(() => mesh.confirmWritable(), 100);
+    } finally { release(); await ordinary; }
+  });
+
+  it("bounds acquisition by monotonic elapsed time despite a backwards wall-clock step", async () => {
+    const { mesh, release } = fixture(1);
+    vi.useFakeTimers();
+    const start = performance.now();
+    let spent = 0;
+    const failed = expect(mesh.withTryLock(() => mesh.confirmWritable(), 1_000)
+      .finally(() => { spent = performance.now() - start; })).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    try {
+      await vi.advanceTimersByTimeAsync(100);
+      vi.setSystemTime(Date.now() - 60_000);
+      await vi.advanceTimersByTimeAsync(900); await failed;
+      expect(spent).toBe(1_000);
+      expect(fs.existsSync(path.join(mesh.root, ".lock"))).toBe(true);
+    } finally { release(); }
   });
 });

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
-import { type FabricHostLease, hostEntryLiveness, readHostLeases, removeHostLease } from "./host-leases.js";
+import { type FabricHostLease, hostEntryLiveness, readHostLeases, prepareHostLeasePublishLock, removeHostLeaseIf } from "./host-leases.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
@@ -213,7 +213,13 @@ export const reapDeadHostRecords = async (
     const leases = readHostLeases(mesh.root);
     for (const hostId of new Set(found.map((item) => item.hostId))) {
       const lease = leases.get(hostId);
-      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
+      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) {
+        await prepareHostLeasePublishLock({ root: mesh.root, custody: operation => mesh.custody(operation) }, hostId);
+        try { removeHostLeaseIf(mesh.root, hostId, current =>
+          current.rootId === lease.rootId && current.identityId === lease.identityId && current.startedAt === lease.startedAt &&
+          effectiveLiveness(undefined, current).expiresAt <= cutoff); }
+        catch { /* A busy/new owner is kept for the next sweep. */ }
+      }
     }
   }
   return removed;

@@ -550,12 +550,13 @@ describe("ParticipantDirectory host leases", () => {
     await new MeshStore(meshRoot, 64 * 1024, 1_000).put({
       key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner"),
     });
-    let peerStatus: "idle" | "running" = "idle";
+    let peerStatus: "idle" | "running" = "idle", peerLive = true;
     const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
       // A non-main peer: a main also writes a legacy session entry with a fixed 15 s lease.
       const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
       const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 }), {
         enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
+        live: () => name !== "peer" || peerLive,
       });
       directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), ...(name === "peer" ? { status: peerStatus } : {}) }]);
       directories.push(directory);
@@ -572,6 +573,9 @@ describe("ParticipantDirectory host leases", () => {
     try {
       peerStatus = "running";
       void peer.refresh().catch(() => undefined);                 // renews its file, then blocks
+      // A legacy/stopped owner supplies no independent renewal. A current live
+      // owner now keeps its file lease through shared contention (#7176).
+      peerLive = false;
       let result: PeerSettleResult | undefined;
       void awaitPeerSettle({
         poll: () => reader.peers(),
@@ -1467,8 +1471,7 @@ describe("ParticipantDirectory", () => {
 
     it("defers change refreshes during a lock outage and preserves backoff until real heartbeat recovery", async () => {
       vi.useFakeTimers();
-      // Exercise near-ceiling full-jitter draws: the fixed 200 ms tick below
-      // must not consume the second outage's doubled backoff before checking it.
+      // No admission callback: exactly one short try at the existing heartbeat.
       vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
@@ -1493,7 +1496,7 @@ describe("ParticipantDirectory", () => {
         const tick = async () => {
           heartbeat();
           const result = runs.mock.results.at(-1)!.value;
-          await vi.advanceTimersByTimeAsync(200); // acquisition times out after 100 ms
+          await vi.advanceTimersByTimeAsync(100); // one existing short try, no timer retry loop
           return await result;
         };
         const hold = () => {
@@ -1752,11 +1755,13 @@ describe("ParticipantDirectory", () => {
     const meshRoot = path.join(root, "mesh");
     // The peer's identity is not "main": a main also writes a legacy session entry, whose fixed
     // 15 s lease (the production host lease) would outlive these scaled leases.
+    let peerLive = true;
     const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
       const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
       const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
+        live: () => name !== "peer" || peerLive,
       });
       directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
       directories.push(directory);
@@ -1766,6 +1771,8 @@ describe("ParticipantDirectory", () => {
     return {
       reader: make("reader", reader),
       peer: make("peer", peer),
+      pausePeer: () => { peerLive = false; },
+      resumePeer: () => { peerLive = true; },
       hold: () => {
         fs.mkdirSync(lockPath, { mode: 0o700 });
         fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
@@ -1776,11 +1783,12 @@ describe("ParticipantDirectory", () => {
   const seesPeer = (directory: ParticipantDirectory) => directory.peers().some((peer) => peer.id === "session:peer");
 
   it("never settles a peer that lapsed behind a stalled lock, and reports it before the lock timeout", async () => {
-    const { reader, peer, hold, release } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
+    const { reader, peer, hold, release, pausePeer, resumePeer } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
     await Promise.all([reader.start(), peer.start()]);
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(Date.now() - reader.confirmedAt()).toBeLessThan(40), { timeout: 5_000, interval: 5 });
     hold();                                                    // right after the reader's last commit
+    pausePeer(); // model an owner with no independent file renewal, not a current live heartbeat
     const started = Date.now();
     let result: PeerSettleResult | undefined;
     void awaitPeerSettle({
@@ -1813,7 +1821,7 @@ describe("ParticipantDirectory", () => {
     expect(reader.writeStalled()?.message).toMatch(/^Fabric mesh is write-stalled: 1 peer lease lapsed/);
     await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
     expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
-    release();
+    release(); resumePeer();
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(reader.writeStalled()).toBeUndefined(), { timeout: 5_000, interval: 20 });
   }, 20_000);

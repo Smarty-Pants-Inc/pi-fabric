@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#6729 (release gate 1): through an autoReload pin change, a Main's lease must not
@@ -97,7 +97,7 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
   // smarty-dev#6729 re-soak of 61dc81be: hub Mains' host lease FILE was missing for 80-116 s.
   // Under fleet lock load quiesce("reload")'s shared write timed out; the shutdown swallows that
   // and closes, and close() then took the non-reload path and deleted the host lease and root.
-  it.each([false, true])("a reload whose quiesce write times out keeps the lease file and root (files-only policy: %s)", async (filesOnly) => {
+  it.each([[false, false], [true, false], [false, true], [true, true]])("a reload whose quiesce write times out keeps the lease file and root (files-only policy: %s, legacy lease: %s)", async (filesOnly, legacyLease) => {
     const f = await fixture(filesOnly);
     const old = f.release();
     await old.start();
@@ -120,6 +120,11 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
     if (!filesOnly) expect(quiesceError).toBeInstanceOf(MeshLockTimeoutError);
     await old.close();
     lockBusy = false;
+    if (legacyLease) {
+      // BASE 13d1bbef carries the exact bounded host/session grace, but no marker.
+      const { reloadUntil: _marker, ...lease } = readHostLeases(f.meshRoot).get(identity.id)!;
+      writeHostLease(f.meshRoot, lease);
+    }
 
     for (let elapsed = 0; elapsed <= 90_000; elapsed += 5_000) {
       const lease = readHostLeases(f.meshRoot).get(identity.id);
@@ -135,6 +140,19 @@ describe("Main lease through a slow autoReload (smarty-dev#6729)", () => {
     expect(f.seen()).toMatchObject({ status: "idle", stale: false });
     expect(readHostLeases(f.meshRoot).get(identity.id)!.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
   }, 60_000);
+
+  it.each([false, true])("activation cannot claim an ordinary predecessor lease, even with a long host TTL (long host: %s)", async longHost => {
+    const f = await fixture(false), old = f.release();
+    await old.start();
+    const lease = readHostLeases(f.meshRoot).get(identity.id)!;
+    if (longHost) writeHostLease(f.meshRoot, { ...lease, expiresAt: Date.now() + MAIN_RELOAD_LEASE_MS });
+    const before = readHostLeases(f.meshRoot).get(identity.id)!;
+    f.advance(1_000);
+    const fresh = f.release();
+    await expect(fresh.start()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toEqual(before);
+    expect(fresh.canConsumeMesh()).toBe(false); expect(f.seen()).toMatchObject({ stale: false });
+  });
 
   it.each([false, true])("a Main that dies mid-reload lapses once the bounded grace ends (files-only policy: %s)", async (filesOnly) => {
     // Long enough for a minute-plus reload on a loaded host, short enough to bound a dead Main.

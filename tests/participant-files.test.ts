@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { processIncarnation } from "../src/core/atomic-write.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { ParticipantDirectory, ParticipantLeaseSupersededError } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY, readHostLease, removeHostLease } from "../src/topology/host-leases.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import * as participantFiles from "../src/topology/participant-files.js";
@@ -612,13 +612,13 @@ describe("participant files", () => {
         })
         .mockImplementationOnce(async () => { throw new Error("copy failed"); });
       const a = directory(root, "a", () => [actor("session:a")]);
-      await a.start();
+      await expect(a.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
       expect(stateOwner(root)).toBe("session:b");
       expect(owner(root)).not.toBe("session:a");                 // A's delayed copy was dropped
       const c = directory(root, "c", () => []);
       await c.start();
       expect(c.get(shared, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: "session:b", stale: false });
-      await a.refresh();
+      await expect(a.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
       expect(stateOwner(root)).toBe("session:b");                // A never takes K back from live B
       await b!.refresh();
       expect(owner(root)).toBe("session:b");                     // B's copy is made again

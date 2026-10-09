@@ -13,60 +13,96 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const timeout = () => new MeshLockTimeoutError(" held by test", 1, 0);
-const setup = async (wait: () => Promise<void>) => {
+const setup = async (wait: (signal: AbortSignal) => Promise<void>) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "publication-retry-")); roots.push(root);
   const mesh = new MeshStore(root, 65_536, 100);
   let blocked = false, inFence = false;
   const fence = vi.fn();
   const publicationFence = async <T>(publish: () => Promise<T>): Promise<T> => {
-    fence();
-    inFence = true;
+    fence(); inFence = true;
     try { if (blocked) throw timeout(); return await publish(); }
     finally { inFence = false; }
   };
-  const admission = vi.fn(async () => { expect(inFence).toBe(false); await wait(); });
+  const admission = vi.fn(async (signal?: AbortSignal) => { expect(inFence).toBe(false); await wait(signal!); });
   const identity = { id: "resident", name: "resident", kind: "agent" as const };
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: "root", identity,
+    preparePublicationFence: () => () => true,
     withPublicationFence: publicationFence, waitForPublicationRetry: admission, reapDeadHosts: false });
-  directories.push(directory); await directory.start();
-  vi.useFakeTimers(); vi.spyOn(console, "warn").mockImplementation(() => {});
+  directories.push(directory);
+  vi.useFakeTimers(); await directory.start();
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   return { directory, fence, admission, block: (value: boolean) => { blocked = value; } };
 };
 
-it("uses one off-heartbeat jittered retry lane capped at 2 s, and admits only a fresh commit", async () => {
-  let tries = 0;
-  const s = await setup(async () => { if (++tries < 4) throw timeout(); s.block(false); });
-  vi.spyOn(Math, "random").mockReturnValue(0.999);
+it("requeues one host on event admission without timer backoff or duplicate mutation retries", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await setup(() => gate);
+  const timers = vi.spyOn(globalThis, "setTimeout");
   s.block(true); const prior = s.directory.confirmedAt();
-  await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+  await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(s.admission).toHaveBeenCalledOnce();
+  expect(timers).toHaveBeenCalledOnce(); // only admission-budget cancellation
+  expect(timers.mock.calls[0]![1]).toBe(13_000);
   for (let actor = 0; actor < 40; actor++) {
-    s.directory.scheduleRefresh(); await s.directory.refreshPresence(); expect(s.directory.canConsumeMesh()).toBe(false);
+    s.directory.scheduleRefresh(); await s.directory.refreshPresence();
+    expect(s.directory.canConsumeMesh()).toBe(false);
   }
-  await vi.advanceTimersByTimeAsync(748); expect(s.admission).not.toHaveBeenCalled();
-  await vi.advanceTimersByTimeAsync(1); expect(s.admission).toHaveBeenCalledOnce();
-  expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
-  await vi.advanceTimersByTimeAsync(1_498); expect(s.admission).toHaveBeenCalledTimes(2);
-  await vi.advanceTimersByTimeAsync(1_998); expect(s.admission).toHaveBeenCalledTimes(3);
-  // Cross the natural 5 s heartbeat: it must not duplicate the active recovery lane.
-  await vi.advanceTimersByTimeAsync(1_998); expect(s.admission).toHaveBeenCalledTimes(4);
-  expect(s.fence).toHaveBeenCalledTimes(3); // initial, failed try, one fresh recovery commit
+  await vi.advanceTimersByTimeAsync(5_000); // existing heartbeat cannot duplicate the FIFO ticket
+  expect(s.admission).toHaveBeenCalledOnce(); expect(timers).toHaveBeenCalledOnce();
+  expect(s.directory.confirmedAt()).toBe(prior);
+  s.block(false); release(); await vi.advanceTimersByTimeAsync(0);
+  expect(s.fence).toHaveBeenCalledTimes(3); // initial, short try, fresh recovery
   expect(s.directory.confirmedAt()).toBeGreaterThan(prior); expect(s.directory.canConsumeMesh()).toBe(true);
 });
 
-it.each(["close", "quiesce"] as const)("%s drains the outside-custody wait and cancels its retry timer", async operation => {
+it("a timed-out admission retries only at a regular heartbeat at least 60 s later", async () => {
+  const s = await setup(async () => { throw timeout(); });
+  const timers = vi.spyOn(globalThis, "setTimeout");
+  s.block(true);
+  await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(s.admission).toHaveBeenCalledOnce(); expect(timers).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(59_999);
+  expect(s.admission).toHaveBeenCalledOnce(); expect(s.fence).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(s.admission).toHaveBeenCalledTimes(2); expect(timers).toHaveBeenCalledTimes(2);
+  expect(s.fence).toHaveBeenCalledTimes(2); // no repeated short tries while admission is unavailable
+});
+
+it("keeps the background admission budget monotonic through wall-clock rollback and independent renewal", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await setup(() => gate);
+  const timers = vi.spyOn(globalThis, "setTimeout");
+  s.block(true);
+  await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+  await vi.advanceTimersByTimeAsync(0);
+  const signal = s.admission.mock.calls[0]![0]!;
+  await vi.advanceTimersByTimeAsync(5_000);
+  vi.setSystemTime(Date.now() - 60_000);
+  await vi.advanceTimersByTimeAsync(7_999); expect(signal.aborted).toBe(false);
+  await vi.advanceTimersByTimeAsync(1); expect(signal.aborted).toBe(true);
+  expect(timers).toHaveBeenCalledOnce(); expect(s.admission).toHaveBeenCalledOnce();
+  s.block(false); release(); await vi.advanceTimersByTimeAsync(0);
+  expect(s.directory.canConsumeMesh()).toBe(false); // late admission is no commit
+});
+
+it.each(["close", "quiesce"] as const)("%s promptly aborts outside-custody event admission", async operation => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const s = await setup(() => gate);
   try {
-    vi.spyOn(Math, "random").mockReturnValue(0);
     s.block(true);
-    await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    await vi.advanceTimersByTimeAsync(50); expect(s.admission).toHaveBeenCalledOnce();
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    await vi.advanceTimersByTimeAsync(0); expect(s.admission).toHaveBeenCalledOnce();
+    const signal = s.admission.mock.calls[0]![0]!;
+    s.block(false);
     let finished = false;
     const stopping = s.directory[operation]().then(() => { finished = true; });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(finished).toBe(false); expect(s.admission).toHaveBeenCalledOnce();
-    s.block(false); release(); await stopping;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(true); expect(signal.aborted).toBe(true); await stopping;
     const fences = s.fence.mock.calls.length;
     await vi.advanceTimersByTimeAsync(750);
     expect(s.admission).toHaveBeenCalledOnce(); expect(s.fence).toHaveBeenCalledTimes(fences);

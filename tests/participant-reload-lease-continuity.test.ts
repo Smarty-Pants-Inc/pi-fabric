@@ -274,12 +274,70 @@ describe("root Main stays in the directory listing through a reload under lock l
     const next = await reimport();
     const fresh = directoryFrom(next, f.meshRoot, f.options);
     expect((await fresh.start().then(() => undefined, (error: unknown) => error) as { code?: string })?.code)
-      .toBe("FABRIC_MESH_LOCK_TIMEOUT");
-    // Ordinary/unpaired evidence cannot withhold the new incarnation's liveness file.
-    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(predecessor.startedAt);
+      .toBe(kind === "ordinary heartbeat" ? "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" : "FABRIC_MESH_LOCK_TIMEOUT");
+    // No mismatch authorizes renewal. Ordinary evidence refuses activation;
+    // an explicit but unpaired reload must first acquire state custody to claim.
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toEqual(predecessor);
+    expect(fresh.canConsumeMesh()).toBe(false);
     f.releaseLock();
-    await fresh.refresh();
-    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    if (kind === "ordinary heartbeat") {
+      await expect(fresh.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+      await fresh.close();
+      expect(readHostLeases(f.meshRoot).get(identity.id)).toEqual(predecessor);
+    } else {
+      await fresh.refresh();
+      expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(predecessor.startedAt);
+      expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
+    }
+  }, 30_000);
+
+  it.each([false, true])("a successor fences a pending reload handoff before its first host commit (identity changes: %s)", async identityChanges => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    f.advance(1_000);
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    await fresh.start().catch(() => undefined);
+    const predecessor = readHostLeases(f.meshRoot).get(identity.id)!;
+    expect(f.sample()).toMatchObject({ root: true });
+    const successor = { ...predecessor, startedAt: Date.now() + 1,
+      ...(identityChanges ? { identityId: "successor" } : {}) };
+    writeHostLease(f.meshRoot, successor);
+    f.releaseLock();
+    await expect(fresh.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+    expect(fresh.canConsumeMesh()).toBe(false);
+    await fresh.closeLineage();
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toEqual(successor);
+    expect(fresh.mesh.listAll("topology/lineage-closures/")).toEqual([]);
+  }, 30_000);
+
+  it("a successor arriving at the first host commit fences lease takeover before post-commit copies", async () => {
+    const f = fixture();
+    const old = directoryFrom({ MeshStore, ParticipantDirectory }, f.meshRoot, f.options);
+    await old.start();
+    f.holdLock();
+    await old.quiesce("reload").catch(() => undefined);
+    await old.close();
+    f.advance(1_000);
+    const next = await reimport();
+    const fresh = directoryFrom(next, f.meshRoot, f.options);
+    await fresh.start().catch(() => undefined);
+    const predecessor = readHostLeases(f.meshRoot).get(identity.id)!;
+    const successor = { ...predecessor, startedAt: Date.now() + 1 };
+    const prior = fresh.confirmedAt();
+    const batch = fresh.mesh.writeBatch.bind(fresh.mesh);
+    vi.spyOn(fresh.mesh, "writeBatch").mockImplementation(args => batch({ ...args,
+      afterCommit: view => { writeHostLease(f.meshRoot, successor); args.afterCommit?.(view); } }));
+    f.releaseLock();
+    await expect(fresh.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+    expect(fresh.confirmedAt()).toBe(prior);
+    expect(fresh.canConsumeMesh()).toBe(false);
+    await fresh.closeLineage();
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toEqual(successor);
   }, 30_000);
 
   it("takes over the reload lease as soon as its own host record commits, before post-commit file work", async () => {
@@ -397,11 +455,16 @@ describe("root Main stays in the directory listing through a reload under lock l
     f.advance(kept.expiresAt - Date.now() - 5_000);
     await fresh.refresh().catch(() => undefined);
     expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
-    // Expired: no longer kept, and the stalled release no longer lists the Main.
+    // Expired: no longer kept alive, and the stalled release no longer lists
+    // the Main. Claiming the expired predecessor still requires state custody.
     f.advance(10_000);
     await fresh.refresh().catch(() => undefined);
-    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(kept.startedAt);
+    expect(readHostLeases(f.meshRoot).get(identity.id)).toMatchObject({ startedAt: kept.startedAt, expiresAt: kept.expiresAt });
     expect(f.sample()).toMatchObject({ root: false });
+    expect(fresh.canConsumeMesh()).toBe(false);
     f.releaseLock();
+    await fresh.refresh();
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(kept.startedAt);
+    expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });
   }, 30_000);
 });

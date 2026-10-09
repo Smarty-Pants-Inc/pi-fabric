@@ -22,6 +22,8 @@ export interface FabricParticipantRecord {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  /** Exact publishing directory incarnation, independent of an actor/session start. */
+  ownerStartedAt?: number;
   parentId?: string;
   name: string;
   /**

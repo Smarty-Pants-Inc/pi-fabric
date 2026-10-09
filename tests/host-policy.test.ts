@@ -77,32 +77,76 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     for (const directory of [policyDirectory, agentDir, cwd]) fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("fails safe when missing: Landlock stays enforced and agent relaxations are ignored", () => {
+  it("keeps the default baseline when missing and ignores agent relaxations", () => {
     writeAgent({ executor: { landlock: { mode: "off", disabled: true } }, agents: {
       processSlice: "legacy.slice", deniedModels: [], modelPolicy: { requireReason: [] },
     } });
     for (let i = 0; i < 3; i++) {
       const loaded = load();
-      expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
+      expect(loaded.executor.landlock).toEqual({ mode: "off", disabled: false });
       expect(loaded.agents.processSlice).toBeUndefined();
       expect(loaded.agents.deniedModels).toEqual([]);
       expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
       expect(config.readHostLandlockDisabled(agentDir)).toBe(false);
-      expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "enforce", disabled: false });
+      expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
     }
     expect(warn.mock.calls.filter(call => String(call[0]).includes("is missing"))).toHaveLength(1);
     expect(String(warn.mock.calls.find(call => String(call[0]).includes("is missing"))?.[0])).toContain(HOST_POLICY_PATH);
   });
 
-  it.each(["off", "permissive", "warn", "audit"])("ignores agent mode %s with missing or provisioned root policy", mode => {
-    writeAgent({ executor: { landlock: { mode } } });
-    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+  describe.each(["agent", "project"] as const)("%s Landlock tightening", scope => {
+    it.each(([undefined, "off", "enforce"] as const).flatMap(rootMode =>
+      ["enforce", "off", "permissive", "warn", "audit", "unknown", null].map(mode => ({ rootMode, mode })),
+    ))("root=$rootMode, writable mode=$mode", ({ rootMode, mode }) => {
+      if (rootMode !== undefined) {
+        simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: rootMode } } });
+      }
+      const document = { executor: { landlock: { mode, disabled: true } } };
+      if (scope === "agent") writeAgent(document);
+      else fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify(document));
+      const expected = { mode: mode === "enforce" ? "enforce" : rootMode ?? "off", disabled: false };
+      for (const loaded of [load(), config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project")]) {
+        expect(loaded.executor.landlock).toEqual(expected);
+        expect(config.liveLandlockSettings(loaded.executor.landlock, agentDir)).toEqual(expected);
+      }
+    });
+  });
+
+  it("preserves the built-in baseline with no files and with an empty valid root policy", () => {
+    expect(fs.existsSync(HOST_POLICY_PATH)).toBe(false);
+    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
+    expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "off", disabled: false });
     simulateRootOwnership(); writePolicy({});
+    expect(load().executor.landlock).toEqual({ mode: "off", disabled: false });
+    expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "off", disabled: false });
+  });
+
+  it.each([true, false])("ignores agent disabled=%s without a root policy or mode setting", disabled => {
+    writeAgent({ executor: { landlock: { disabled } } });
+    expect(load().executor.landlock).toEqual({ mode: "off", disabled: false });
+    expect(config.readHostLandlockDisabled(agentDir)).toBe(false);
+    expect(config.liveLandlockSettings({ mode: "off", disabled }, agentDir)).toEqual({ mode: "off", disabled: false });
+  });
+
+  it("does not let a project off value undo agent enforcement", () => {
+    writeAgent({ executor: { landlock: { mode: "enforce" } } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "off" } } }));
     expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 
-  it("enforces without either a root policy or an agent configuration file", () => {
+  it("keeps default mode off with invalid policy, but preserves agent enforcement", () => {
+    simulateRootOwnership(); fs.writeFileSync(HOST_POLICY_PATH, "{broken");
+    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
+    expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
     expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "enforce", disabled: false });
+  });
+
+  it("ignores invalid root Landlock fields rather than changing product defaults", () => {
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: "permissive", disabled: "true" } } });
+    expect(load().executor.landlock).toEqual({ mode: "off", disabled: false });
+    expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "off", disabled: false });
   });
 
   it("keeps tightening agent settings without a root policy", () => {
@@ -179,6 +223,9 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
       expect(config.liveLandlockSettings({ mode: "enforce", disabled: true }, agentDir).disabled).toBe(false);
     }
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
+    expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
     expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
     expect(warn.mock.calls.some(call => String(call[0]).includes("is missing"))).toBe(false);
   });
@@ -196,6 +243,8 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(loaded).toEqual({ mode: "off", disabled: false });
     expect(config.liveLandlockSettings(loaded, agentDir)).toEqual(loaded);
     writePolicy({});
+    expect(config.liveLandlockSettings(loaded, agentDir)).toEqual({ mode: "off", disabled: false });
+    writePolicy({ executor: { landlock: { mode: "enforce" } } });
     expect(config.liveLandlockSettings(loaded, agentDir)).toEqual({ mode: "enforce", disabled: false });
     writePolicy({ executor: { landlock: { mode: "off" } } });
     writeAgent({ executor: { landlock: { mode: "enforce" } } });
@@ -253,11 +302,12 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
   });
 
   it.skipIf(process.platform !== "linux").each([
-    { mode: "enforce", disabled: true },
-    { mode: "off" },
-    { mode: "permissive" },
-  ])("enforces real Bash with missing root policy and agent %j; only a verified root flip disables it", async landlock => {
+    { landlock: { mode: "enforce", disabled: true }, rootEnforce: false },
+    { landlock: { mode: "off" }, rootEnforce: true },
+    { landlock: { mode: "permissive" }, rootEnforce: true },
+  ])("enforces opted-in real Bash (%j); only a verified root flip disables it", async ({ landlock, rootEnforce }) => {
     simulateRootOwnership();
+    if (rootEnforce) writePolicy({ executor: { landlock: { mode: "enforce" } } });
     writeAgent({ executor: { landlock } });
     const loaded = load().executor.landlock;
     const tmpdir = path.join(agentDir, "private-tmp"); fs.mkdirSync(tmpdir, { mode: 0o700 });

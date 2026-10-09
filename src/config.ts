@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { readHostPolicy, warnAgentLandlockDisabled } from "./host-policy.js";
+import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
@@ -1722,6 +1722,17 @@ export const writeJsonAtomic = (
   }
 };
 
+// Root policy overlays product defaults; absence never opts a host into confinement.
+const hostLandlockBaseline = (policy: HostPolicy): LandlockSettings => {
+  const defaults = DEFAULT_FABRIC_CONFIG.executor.landlock;
+  if (policy.status !== "valid") return { ...defaults };
+  const landlock = objectValue(objectValue(policy.document.executor).landlock);
+  return {
+    mode: landlock.mode === "off" || landlock.mode === "enforce" ? landlock.mode : defaults.mode,
+    disabled: typeof landlock.disabled === "boolean" ? landlock.disabled : defaults.disabled,
+  };
+};
+
 const resolveFabricConfig = (
   options: {
     cwd: string;
@@ -1733,21 +1744,12 @@ const resolveFabricConfig = (
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
   const policy = readHostPolicy();
   const rootPolicyValid = policy.status === "valid";
-  if (!rootPolicyValid) {
-    // No valid root policy means no trusted source can authorize a weaker
-    // Landlock mode, including when the agent file is absent.
-    merged = mergeObjects(merged, { executor: { landlock: { mode: "enforce", disabled: false } } });
-  }
   if (rootPolicyValid) {
     // Whitelist authority keys: root policy is not a third general settings layer.
     const agents = objectValue(policy.document.agents);
     const requireReason = objectValue(agents.modelPolicy).requireReason;
-    const rootLandlock = objectValue(objectValue(policy.document.executor).landlock);
-    const rootMode = rootLandlock.mode === "off" || rootLandlock.mode === "enforce"
-      ? rootLandlock.mode : "enforce";
-    const disabled = rootLandlock.disabled;
     merged = mergeObjects(merged, {
-      executor: { landlock: { mode: rootMode, disabled: disabled === true } },
+      executor: { landlock: hostLandlockBaseline(policy) },
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
@@ -1771,15 +1773,9 @@ const resolveFabricConfig = (
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
       if (landlock.disabled === true && rootPolicyValid) warnAgentLandlockDisabled();
-      // Landlock mode is authority-relaxing when it is anything other than
-      // enforce. Without a valid root policy, fail safe and force enforcement;
-      // with one, agent off/permissive values are still ignored. Agent enforce
-      // remains a tightening and is therefore retained.
-      if (!rootPolicyValid) {
-        landlock.mode = "enforce";
-      } else if (landlock.mode !== "enforce") {
-        delete landlock.mode;
-      }
+      // Agent settings may only tighten the root/default baseline. Ignore
+      // off/unknown modes even when no root policy is provisioned.
+      if (landlock.mode !== "enforce") delete landlock.mode;
       delete landlock.disabled;
       executor.landlock = landlock;
       document.executor = executor;
@@ -1875,24 +1871,17 @@ export const loadFabricConfig = (options: {
 // session context exists (smarty-dev#459). Project configuration needs the trust decision
 // that only bootstrap has, so it is left out here.
 /** Live root-owned kill switch. No valid policy fails closed. */
-export const readHostLandlockDisabled = (_agentDir: string): boolean => {
-  const policy = readHostPolicy();
-  if (policy.status === "valid") {
-    return objectValue(objectValue(policy.document.executor).landlock).disabled === true;
-  }
-  return false;
-};
+export const readHostLandlockDisabled = (_agentDir: string): boolean =>
+  hostLandlockBaseline(readHostPolicy()).disabled;
 
 /** Session settings with the live host kill switch applied (F2: no cached value). */
 export const liveLandlockSettings = (settings: LandlockSettings, _agentDir: string): LandlockSettings => {
-  const policy = readHostPolicy();
-  if (policy.status !== "valid") return { mode: "enforce", disabled: false };
-  const landlock = objectValue(objectValue(policy.document.executor).landlock);
+  const baseline = hostLandlockBaseline(readHostPolicy());
   return {
-    // A cached mode-off grant is usable only while the same authority still
-    // allows it. Retain cached enforce as a tightening over root mode-off.
-    mode: settings.mode === "off" && landlock.mode === "off" ? "off" : "enforce",
-    disabled: landlock.disabled === true,
+    // Preserve session tightening and honor a newly enforced root baseline,
+    // without turning missing/invalid policy into a fleet-wide mode change.
+    mode: settings.mode === "enforce" ? "enforce" : baseline.mode,
+    disabled: baseline.disabled,
   };
 };
 

@@ -10,6 +10,7 @@ import {
   effectiveToolCaptureConfig,
   loadFabricConfig,
   loadFabricConfigForScope,
+  loadGlobalFabricConfig,
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
@@ -122,6 +123,17 @@ it("normalizes the reader-only idle coalescing window", () => {
 });
 
 describe("Fabric configuration", () => {
+  it("golden: no files preserve main's built-in executor.landlock default across all loaders", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(DEFAULT_FABRIC_CONFIG.executor.landlock).toEqual({ mode: "off", disabled: false });
+    for (const loaded of [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+      loadFabricConfigForScope(options, "global"), loadFabricConfigForScope(options, "project")]) {
+      expect(loaded.executor.landlock).toEqual(DEFAULT_FABRIC_CONFIG.executor.landlock);
+    }
+    expect(fs.readdirSync(agentDir)).toEqual([]);
+    expect(fs.readdirSync(cwd)).toEqual([]);
+  });
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
     expect(normalizeFabricConfig({}).selfReloadConcurrency).toBe(6);

@@ -186,11 +186,18 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     write(path.join(root, "state.db"), "");
     write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
     fs.chmodSync(path.join(root, MESH_RETENTION_APPROVAL), 0o600);
+    // An unswitched mesh too (no marker): --apply refuses, a dry run still previews.
+    const { root: plain } = make();
+    const before = snapshot(plain);
     const getuid = process.getuid;
     Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
     try {
-      const result = await sweepMeshRetention(root, { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 });
-      expect(result.skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+      for (const where of [root, plain]) {
+        const result = await sweepMeshRetention(where, { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 });
+        expect(result.changes, where).toEqual([]);
+        expect(result.skipped, where).toEqual([{ path: where, reason: expect.stringMatching(/ownership cannot be proven/) }]);
+      }
+      expect(snapshot(plain)).toEqual(before);
     } finally { Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }); }
   });
 

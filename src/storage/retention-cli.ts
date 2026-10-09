@@ -46,6 +46,9 @@ export const MESH_RETENTION_APPROVAL = ".mesh-retention-approved.json";
 // swapped-in link or foreign file never supplies an epoch. Where ownership cannot be proven (no getuid: Windows),
 // no approval is ever valid, so a switched mesh deletes nothing there (fail closed).
 const applyRefusal = (meshRoot: string): string | undefined => {
+  // Ownership of the mesh's files cannot be proven without a uid (Windows): --apply never deletes there (a dry run
+  // still previews), whatever the marker says.
+  if (typeof process.getuid !== "function") return "file ownership cannot be proven on this platform; --apply deletes nothing";
   if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
   const moved = readMeshStateMovedMarker(meshRoot);
   if (moved === undefined) return undefined;

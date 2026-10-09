@@ -760,7 +760,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ? Math.min(heldLease.expiresAt, heldLease.session?.expiresAt ?? Infinity) - startedAt - 2_000 : 0;
     // Short configured TTLs have no retry margin and retain their one-attempt
     // policy. Once a positive budget is granted, preparation must spend it too.
-    const retryDeadline = retryBudgetMs > 0 ? performance.now() + retryBudgetMs : undefined;
+    // Prepared registry publishers already have one host-level recovery lane:
+    // surface the first short-try failure, release mutation callers, then wait
+    // outside custody and reselect under a fresh generation fence. Inline retries
+    // would hide that failure and make actor mutations join a long admission wait.
+    const retryDeadline = retryBudgetMs > 0 && !this.options.preparePublicationFence
+      ? performance.now() + retryBudgetMs : undefined;
     // Include preparation in #refreshing so a cold heartbeat coalesces and close
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
@@ -943,8 +948,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       // The failed fence has fully unwound. A FIFO mesh ticket can now wait without
       // occupying either actor registry; admission is not itself a heartbeat receipt.
-      this.#assertCurrentLease();
-      await this.#waitForPublicationAdmission(2_000);
+      const lease = this.#assertCurrentLease();
+      // Retain one FIFO ticket through periodic holds, not a new ticket every 2 s.
+      // Freeze the admitted lease's remaining margin; independent renewals cannot
+      // slide this wait, and close/supersession still abort its native ticket.
+      const budgetMs = lease
+        ? Math.min(lease.expiresAt, lease.session?.expiresAt ?? Infinity) - Date.now() - 2_000 : 2_000;
+      if (budgetMs <= 0) throw new MeshLockTimeoutError(" before participant admission", 0, 0);
+      await this.#waitForPublicationAdmission(budgetMs);
       if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
       this.#assertCurrentLease();
       // Release mesh BEFORE taking registries. Re-select every actor under fresh

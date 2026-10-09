@@ -14,7 +14,7 @@ import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
 import { residentDeliveryPrefix, residentRoot } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
-import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeaseCurrent } from "../src/topology/host-leases.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -1234,12 +1234,21 @@ describe("resident host ownership", () => {
     try {
       await new Promise<void>((resolve, reject) => { child.stdout!.once("data", () => resolve()); child.once("error", reject); child.once("exit", () => reject(new Error("fixture died before ready"))); });
       const inode = fs.statSync(lock).ino;
+      const predecessor = readHostLeaseCurrent(config.meshRoot, successor.hostId)!;
+      expect(predecessor.expiresAt).toBeGreaterThan(Date.now());
       // Diagnostic content lies: only the OS fence must reject this contender.
       fs.rmSync(path.join(config.residencyRoot, "owner.json"));
       fs.writeFileSync(lock, JSON.stringify({ pid: -1, token: "corrupt-diagnostic" }));
       await expect(successor.start()).rejects.toThrow(/already running/);
+      expect(readHostLeaseCurrent(config.meshRoot, successor.hostId)!.startedAt).toBe(predecessor.startedAt);
       child.kill("SIGKILL"); await done;
+      // Recovery must use native activation custody, not wait for the old TTL.
+      expect(predecessor.expiresAt).toBeGreaterThan(Date.now());
       await successor.start();
+      const current = readHostLeaseCurrent(config.meshRoot, successor.hostId)!;
+      expect(current.startedAt).not.toBe(predecessor.startedAt);
+      expect(current.identityId).toBe(successor.identity.id);
+      expect(current.rootId).toBe(config.rootId);
       expect(fs.statSync(lock).ino).toBe(inode);
     } finally { child.kill("SIGKILL"); await done; await successor.close(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 20_000);

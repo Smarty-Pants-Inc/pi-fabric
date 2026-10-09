@@ -53,6 +53,7 @@ export class RecordsService {
       ...(relayClient ? { alarm: (lag: ConsumerLag) => this.#consumerAlarm(lag) } : {}),
       lagMs: config.consumerLagSeconds * 1000,
       intervalMs: config.watchdogMs,
+      periodicObservationOnly: true,
       signal: this.#life.signal,
     });
   }

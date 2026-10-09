@@ -38,6 +38,41 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it("arms no fast recurring idle timer and takes no actor poll for five minutes", async () => {
+    const s = setup();
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    const interval = vi.spyOn(globalThis, "setInterval"), timeout = vi.spyOn(globalThis, "setTimeout");
+    s.monitor.start(); await flush();
+    expect(interval.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+    expect(timeout).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(s.beforePoll).toHaveBeenCalledOnce(); expect(s.mesh.tail).toHaveBeenCalledOnce();
+    expect(s.onEvent).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("retries a blocked work event only on queue-space, never a tick or unrelated mesh heartbeat", async () => {
+    const s = setup();
+    const event = { id: "blocked", sequence: 1, topic: "fleet.work.test", createdAt: Date.now() } as MeshEvent;
+    s.mesh.tail.mockImplementation(offset => offset < 20 ? { events: [event], nextOffset: 20, cursors: [20] } : { events: [], nextOffset: 20 });
+    s.onEvent.mockReturnValue(false);
+    s.monitor.start(); await flush();
+    expect(s.onEvent).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(s.onEvent).toHaveBeenCalledOnce();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as (event: string, filename: string) => void;
+    notify("change", "state.json"); await flush();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(s.onEvent).toHaveBeenCalledOnce();
+    s.onEvent.mockReturnValue(true);
+    s.monitor.notifyQueueSpace(); await flush();
+    expect(s.onEvent).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).last.id).toBe("blocked");
+    s.monitor.notifyQueueSpace(); await flush();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(s.onEvent).toHaveBeenCalledTimes(2);
+    s.monitor.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.skipIf(process.platform === "win32").each([250, 1_600])("leads watch bursts and retains one trailing poll per max(1 s, actorPollMs=%i) window", async actorPollMs => {
     const s = setup();
     s.monitor.config.actorPollMs = actorPollMs;
@@ -96,7 +131,7 @@ describe("ActorMeshMonitor", () => {
     }
   });
 
-  it("uses native watch with bounded unchanged safety checks on Windows", async () => {
+  it("uses native watch with non-waking attachment safety checks on Windows", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
@@ -106,6 +141,8 @@ describe("ActorMeshMonitor", () => {
       expect(s.mesh.tail).toHaveBeenCalledOnce();
       fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
       await vi.advanceTimersByTimeAsync(1);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(1); // A missed append is not admitted by safety.
+      s.monitor.schedule(); await flush();
       expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     } finally { Object.defineProperty(process, "platform", platform); }
   });
@@ -162,6 +199,8 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
     fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
     await vi.advanceTimersByTimeAsync(1);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count);
+    s.monitor.schedule(); await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     s.monitor.schedule();
     s.monitor.close();
@@ -285,7 +324,7 @@ describe("ActorMeshMonitor", () => {
     expect(reads).toBe(1);
   });
 
-  it("uses polling when watch creation fails and ignores malformed cursors", async () => {
+  it("repairs watch attachment without polling work when creation fails and ignores malformed cursors", async () => {
     const s = setup('{"format":2,"cursor":3}');
     vi.mocked(fs.watch).mockImplementation(() => { throw new Error("unsupported"); });
     s.monitor.start();
@@ -296,6 +335,8 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
     fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
     await vi.advanceTimersByTimeAsync(1);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(1);
+    s.monitor.schedule(); await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(1);
   });
@@ -667,8 +708,9 @@ describe("ActorManager idle checkpoints", () => {
       }
       expect(s.cursor().last).toEqual({ sequence: events[9]!.sequence, id: events[9]!.id });
       const count = writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath).length;
-      await s.poll();
-      await s.poll();
+      // Blocked pages do not reread on file churn; only actual queue-space retries.
+      s.notify(); await vi.advanceTimersByTimeAsync(1_000);
+      s.notify(); await vi.advanceTimersByTimeAsync(1_000);
       expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(count);
       expect(s.run).toHaveBeenCalledOnce();
       s.release();

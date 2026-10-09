@@ -112,6 +112,7 @@ describe("LifecycleBroker", () => {
     await new Promise(resolve => setTimeout(resolve, 80));
     expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
     leased = true;
+    broker.resume(); // The recovered lease is an explicit readiness event, not elapsed time.
     await waitFor(() => broker.list()[0]?.afterSequence === mesh.latestSequence());
     expect(deliver).toHaveBeenCalledOnce();
   });
@@ -139,6 +140,7 @@ describe("LifecycleBroker", () => {
     expect(broker.list()).toHaveLength(1);
     expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
     waiting.mockRestore(); leased = true;
+    broker.resume(); // Receipt retry belongs to the recovered custody event.
     await waitFor(() => once ? broker.list().length === 0 : broker.list()[0]?.afterSequence === mesh.latestSequence());
     expect(deliver).toHaveBeenCalledOnce();
   });

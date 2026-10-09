@@ -49,11 +49,10 @@ export class LifecycleBroker {
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
-  #retryTimer: NodeJS.Timeout | undefined;
-  #stamp: string | undefined;
   #running = false;
+  #failedStamp: string | undefined;
+  #deliveryFailed = false;
   #dirty = false;
-  #retryNeeded = false;
   #polling: Promise<void> | undefined;
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
@@ -81,8 +80,8 @@ export class LifecycleBroker {
     this.#timer = setInterval(() => {
       if (this.#closed || this.#paused) return;
       this.#attachWatcher(true);
-      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-      if (stamp === undefined || stamp !== this.#stamp) this.#schedulePoll();
+      // Reviewed R-no-polling exception: repair attachment only, never deliver.
+
     }, Math.max(IDLE_SAFETY_MS, this.#pollMs));
     this.#timer.unref();
     this.#schedulePoll();
@@ -196,8 +195,6 @@ export class LifecycleBroker {
 
   pause(): void {
     this.#paused = true;
-    if (this.#retryTimer) clearTimeout(this.#retryTimer);
-    this.#retryTimer = undefined;
   }
   resume(): void { if (!this.#closed) { this.#paused = false; this.#schedulePoll(); } }
   async checkpointForRelease(): Promise<void> {
@@ -214,8 +211,6 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
-    if (this.#retryTimer) clearTimeout(this.#retryTimer);
-    this.#retryTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -259,6 +254,10 @@ export class LifecycleBroker {
           if (!OBSERVED_FILES.includes(file)) return;
           if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
         }
+        // A failed receipt put can itself produce a native notification.
+        // Do not turn those same failed bytes into a self-sustaining drain.
+        const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+        if (stamp !== undefined && stamp === this.#failedStamp) return;
         this.#schedulePoll();
       });
       if (!watcher) return;
@@ -274,43 +273,36 @@ export class LifecycleBroker {
   #schedulePoll(): void {
     if (this.#closed || this.#paused || !this.options.enabled) return;
     this.#dirty = true;
-    if (this.#pollScheduled || this.#running || this.#retryTimer) return;
+    if (this.#pollScheduled || this.#running) return;
     this.#pollScheduled = true;
+    this.#backgroundPoll.success(); // Only a real event/explicit resume owns this attempt.
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed || this.#paused) return;
       this.#running = true;
       this.#dirty = false;
+      this.#deliveryFailed = false;
       void this.#backgroundPoll.run(() => this.#poll()).then(result => {
         this.#running = false;
         if (this.#closed || this.#paused) return;
-        if (result !== "done" || this.#retryNeeded || this.#delivered.size) this.#retry();
-        else if (this.#dirty) this.#schedulePoll();
+        if (result !== "done" || this.#deliveryFailed) {
+          this.#failedStamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+        } else this.#failedStamp = undefined;
+        if (result === "done" && !this.#deliveryFailed && this.#dirty) this.#schedulePoll();
+        // Unread work/receipts wait for an event, never a periodic delivery retry.
       });
     });
-  }
-
-  #retry(): void {
-    if (this.#closed || this.#paused || this.#retryTimer) return;
-    this.#retryTimer = setTimeout(() => {
-      this.#retryTimer = undefined;
-      this.#schedulePoll();
-    }, this.#backgroundPoll.waitMs || this.#pollMs);
-    this.#retryTimer.unref();
   }
 
   async #poll(): Promise<void> {
     if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
-    this.#retryNeeded = false;
-    this.#stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
     const operation = this.#drain();
     this.#polling = operation;
     try {
       await operation;
     } finally {
-      if (this.options.canConsumeMesh?.() === false) this.#retryNeeded = true;
       if (this.#polling === operation) this.#polling = undefined;
     }
   }
@@ -326,7 +318,7 @@ export class LifecycleBroker {
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
-        await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        await this.#confirmDelivered(subscription.id);
         continue;
       }
       // Only the target's host drains a subscription. Pass over other hosts' targets (from
@@ -338,7 +330,6 @@ export class LifecycleBroker {
       if (latestSequence <= this.#cursor(subscription)) continue;
       const target = this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) {
-        if (!target || target.local) this.#retryNeeded = true; // Known local unread work, not idle admission.
         continue;
       }
       await this.#drainSubscription(entry, subscription);
@@ -415,8 +406,8 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          this.#retryNeeded = true;
-          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
+          this.#deliveryFailed = true;
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id));
           return;
         }
         cursor = lifecycle.sequence;
@@ -428,7 +419,7 @@ export class LifecycleBroker {
         this.#delivered.set(subscription.id, { entry, subscription: delivered });
         // Preserve the delivery receipt, not the cursor, across lease loss.
         if (this.options.canConsumeMesh?.() === false) return;
-        const confirmed = await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        const confirmed = await this.#confirmDelivered(subscription.id);
         if (subscription.once || !confirmed) return;
         entry = confirmed; subscription = delivered;
       }
@@ -449,7 +440,7 @@ export class LifecycleBroker {
         if (events.length < this.#maxReadEvents) return;
         continue;
       }
-      const next = await this.#replace(entry, updated).catch(rethrowMeshLockTimeout);
+      const next = await this.#replace(entry, updated);
       if (!next) return;
       this.#unsaved.delete(subscription.id);
       entry = next;

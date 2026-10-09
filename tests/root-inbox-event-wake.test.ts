@@ -58,6 +58,22 @@ const mockWatch = () => {
 };
 
 describe("root mesh event wake observation", () => {
+  it("takes no idle wake for five minutes, even with missed work and a configured fast safety interval", async () => {
+    vi.useFakeTimers();
+    const mock = mockWatch(), interval = vi.spyOn(globalThis, "setInterval");
+    const wake = vi.fn().mockResolvedValue(undefined);
+    const observer = watched(wake, 1);
+    await observer.request();
+    expect(interval.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+    fs.writeFileSync(path.join(observer.root, "events.jsonl"), "suppressed notification\n");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+    mock.notify("events.jsonl"); await observer.request();
+    expect(wake).toHaveBeenCalledTimes(2);
+    observer.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("watches only events, coalesces bursts, and retains a notification during an awaited drain", async () => {
     vi.useFakeTimers();
     const mock = mockWatch();
@@ -92,7 +108,7 @@ describe("root mesh event wake observation", () => {
     await vi.advanceTimersByTimeAsync(59_999);
     expect(wake).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(wake).toHaveBeenCalledTimes(2);
+    expect(wake).toHaveBeenCalledTimes(1); // Attachment repair never requests work.
     old.close();
     const successorWake = vi.fn().mockResolvedValue(undefined);
     const successor = watched(successorWake);
@@ -317,6 +333,11 @@ describe("root inbox known-work one-shot deadlines", () => {
     expect(h.delivered).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(h.delivered).toEqual(["young"]);
+    expect(vi.getTimerCount()).toBe(1); // The known item's deadline was cleared.
+    const calls = h.wake.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(h.wake).toHaveBeenCalledTimes(calls);
+    expect(h.delivered).toEqual(["young"]);
   });
 
   it("matures actual cooldown before the next safety tick without further publication", async () => {
@@ -429,9 +450,9 @@ describe("root inbox foreign-head grace deadlines", () => {
     expect(h.delivered).toEqual([]);
     expect(h.read).toHaveBeenCalledTimes(2);
     expect(readdir).not.toHaveBeenCalled(); expect(readFile).not.toHaveBeenCalled();
-    expect(h.wake).toHaveBeenCalledTimes(3); // Start, notification, safety.
+    expect(h.wake).toHaveBeenCalledTimes(2); // Start and notification; safety is non-waking.
     await vi.advanceTimersByTimeAsync(1); // t=75s, not next safety at t=120s.
-    expect(h.wake).toHaveBeenCalledTimes(4);
+    expect(h.wake).toHaveBeenCalledTimes(3);
     expect(h.delivered).toEqual(["older backlog"]);
     expect(h.mesh.get(h.box.key)?.value).toMatchObject({ after: 0, pending: { through: 2 } });
   });
@@ -442,7 +463,7 @@ describe("root inbox foreign-head grace deadlines", () => {
     expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(h.delivered).toEqual([]);
-    expect(h.wake).toHaveBeenCalledTimes(3); // No head-maturity wake.
+    expect(h.wake).toHaveBeenCalledTimes(2); // Neither safety nor foreign head wakes.
   });
 
   it("does not fetch another page to discover own backlog behind a foreign head", async () => {

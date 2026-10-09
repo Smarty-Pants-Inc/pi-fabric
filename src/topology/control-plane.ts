@@ -958,7 +958,8 @@ export class FabricControlPlane {
   #wake(): void {
     if (this.#closed || this.#paused || !this.options.enabled) return;
     this.#dirty = true;
-    if (!this.#running) this.#schedulePoll(this.#backgroundPoll.waitMs);
+    this.#backgroundPoll.success(); // A genuine event is this retry's admission.
+    if (!this.#running) this.#schedulePoll(0);
   }
 
   #schedulePoll(waitMs: number): void {
@@ -968,9 +969,10 @@ export class FabricControlPlane {
       if (this.#timer !== timer || this.#closed || this.#paused) return;
       this.#timer = undefined;
       this.#attachWatcher(waitMs >= IDLE_SAFETY_MS);
-      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-      const active = this.#retryNeeded || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size;
-      if (!this.#dirty && !active && stamp !== undefined && stamp === this.#stamp) {
+      // Reviewed R-no-polling exception: this minute timeout reattaches only.
+      // Pending commands already own exact acceptance/handler deadlines;
+      // never retry delivery or discover missed commands from a safety tick.
+      if (waitMs >= IDLE_SAFETY_MS) {
         this.#schedulePoll(IDLE_SAFETY_MS);
         return;
       }
@@ -980,8 +982,7 @@ export class FabricControlPlane {
         this.#running = false;
         if (this.#closed || this.#paused) return;
         if (result !== "done") this.#retryNeeded = true;
-        const retry = result !== "done" || this.#retryNeeded || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size;
-        this.#schedulePoll(this.#backgroundPoll.waitMs || (this.#dirty ? 0 : retry ? this.#pollMs : IDLE_SAFETY_MS));
+        this.#schedulePoll(this.#dirty ? 0 : IDLE_SAFETY_MS);
       });
     }, waitMs);
     this.#timer = timer;
@@ -1218,12 +1219,19 @@ export class FabricControlPlane {
     const command = commandFromEvent(owned.event)!;
     const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS);
     owned.running = true;
+    let failed = false;
     const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
       .catch(error => {
+        failed = true;
         if (detachedControlOperation(command.operation) && isLockTimeout(error)) this.#backgroundPoll.failure(error);
         throw error;
       })
-      .finally(() => { owned.running = false; this.#wake(); });
+      .finally(() => {
+        owned.running = false;
+        // A failed write is not a new event: retain it for a real receipt/file
+        // change, rather than recursively re-admitting the same command.
+        if (!failed) this.#wake();
+      });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);

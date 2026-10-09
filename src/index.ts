@@ -474,7 +474,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // uses the already active mesh only; records remain optional and are not opened here.
     inboxWake.context = context;
     if (hostQueuesTriggeredBehindPreflight(pi) && state.config.mesh.enabled && state.mainAgentInfo(context).local) {
-      const observer = new RootInboxEventWake(state.mesh.root, () => wakeIdleMain(), inboxWakeMs());
+      const observer = new RootInboxEventWake(state.mesh.root, (knownDeadline) => wakeIdleMain(knownDeadline), inboxWakeMs());
       inboxWake.observer = observer;
       observer.start();
     }
@@ -647,7 +647,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.requested = false;
     inboxWake.context = undefined;
   };
-  const wakeIdleMain = async (): Promise<void> => {
+  const wakeIdleMain = async (knownInboxDeadline = false): Promise<void> => {
     const context = inboxWake.context;
     const observer = inboxWake.observer;
     observer?.cancelKnownDeadline();
@@ -678,14 +678,20 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         deliverRootInbox(pi, inbox.events);
         return;
       }
-      // Records: the same gate, re-checked after the read (F21).
+      // An inbox item's one-shot is authority to check inbox work only, never
+      // an opportunity to deliver unrelated records whose notification was lost.
+      if (knownInboxDeadline) {
+        if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWakeDueAt);
+        return;
+      }
+      // Records: the same gate, re-checked after an actual event (F21).
       if (!idle()) return;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (!idle()) return;
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
       else if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWakeDueAt);
     } catch {
-      // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
+      // A stale context or mesh error: only the next event or explicit turn retries.
     } finally {
       inboxWake.reading = false;
       if (inboxWake.requested) {
@@ -820,6 +826,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await settle(event, context);
     } finally {
       inboxWake.settling = false;
+      // Error settlement is a concrete receipt event. Work whose notification
+      // arrived while Main was busy gets one gated reconciliation now, not a tick.
+      if (inboxWake.armed && settledOutcome(event, context) === "error") void inboxWake.observer?.request();
     }
   });
   const settle = async (event: unknown, context: ExtensionContext): Promise<void> => {

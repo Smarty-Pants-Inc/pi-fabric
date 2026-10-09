@@ -63,6 +63,44 @@ const immediate = setImmediate;
 const settled = async () => { for (let i = 0; i < 30; i++) await new Promise<void>(resolve => immediate(resolve)); };
 
 describe("ResidencyClient event-driven idle", () => {
+  it("arms no recurring fast idle timer and never discovers a missed completion during five idle minutes", async () => {
+    const h = fixture(), events = fakeWatches();
+    vi.useFakeTimers();
+    const interval = vi.spyOn(globalThis, "setInterval"), drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drain.mock.results[0]!.value; await settled();
+    expect(interval.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+    expect(vi.getTimerCount()).toBe(1);
+    saveCompletion(h.meshRoot, h.recipient, h.result(1));
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(drain).toHaveBeenCalledOnce();
+    expect(h.complete).not.toHaveBeenCalled(); expect(h.deliverAgent).not.toHaveBeenCalled();
+    events.fire(h.meshRoot, "agent-completions", "rename"); await settled();
+    await drain.mock.results.at(-1)!.value; await settled();
+    expect(h.complete).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(h.complete).toHaveBeenCalledOnce();
+    await h.client.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retains a failed admitted completion without timer retries, then retries its file event once", async () => {
+    const h = fixture(), events = fakeWatches();
+    saveCompletion(h.meshRoot, h.recipient, h.result(1));
+    h.complete.mockImplementationOnce(() => { throw new Error("inbox full"); });
+    vi.useFakeTimers();
+    const drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drain.mock.results[0]!.value; await settled();
+    expect(h.complete).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(h.complete).toHaveBeenCalledOnce();
+    const filename = `${createHash("sha256").update(h.result(1).id).digest("hex")}.json`;
+    events.fire(path.join(h.meshRoot, "agent-completions"), filename); await settled();
+    await drain.mock.results.at(-1)!.value; await settled();
+    expect(h.complete).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(h.complete).toHaveBeenCalledTimes(2);
+    await h.client.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("subscribes before discovery, stays quiet through heartbeats, and closes all observation resources", async () => {
     const h = fixture(), events = fakeWatches();
     for (let i = 1; i <= 40; i++) saveCompletion(h.meshRoot, { ...h.recipient, rootId: "session:other", sessionId: "other" }, h.result(i));
@@ -238,7 +276,7 @@ describe("ResidencyClient event-driven idle", () => {
   });
 
   it.each(["foreign-writer", "CAS-refusal"])("revalidates an acknowledgment wake against %s before source retirement", async mode => {
-    const h = fixture(); fakeWatches(); const own = await seedLegacy(h);
+    const h = fixture(), events = fakeWatches(); const own = await seedLegacy(h);
     h.client.start(); await vi.waitFor(() => expect(h.complete).toHaveBeenCalledOnce()); await settled();
     const original = h.mesh.get(own.key, { fresh: true })!;
     const remove = vi.spyOn(h.mesh, "delete");
@@ -250,7 +288,11 @@ describe("ResidencyClient event-driven idle", () => {
     if (mode === "foreign-writer") expect(remove).not.toHaveBeenCalled();
     else {
       expect(remove).toHaveBeenCalledWith({ key: own.key, ifVersion: original.version });
-      await vi.waitFor(() => expect(h.mesh.get(own.key, { fresh: true })).toBeUndefined(), { timeout: 6_000 });
+      vi.useFakeTimers();
+      await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+      expect(h.mesh.get(own.key, { fresh: true })).toBeDefined(); // No retry tick.
+      events.fire(h.meshRoot, "state.json"); await settled();
+      expect(h.mesh.get(own.key, { fresh: true })).toBeUndefined();
     }
     expect(h.complete).toHaveBeenCalledOnce();
   });
@@ -270,7 +312,7 @@ describe("ResidencyClient event-driven idle", () => {
     await h.client.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("does not read unchanged files/state at the 60s safety boundary, and watcher failure recovers by that boundary", async () => {
+  it("repairs watch attachment at the non-waking safety boundary, but never discovers missed work there", async () => {
     const h = fixture(), events = fakeWatches();
     await h.mesh.put({ key: "topology/heartbeats/other", identity: { id: "other", name: "other", kind: "main" }, value: { at: 1 } });
     vi.useFakeTimers();
@@ -285,8 +327,12 @@ describe("ResidencyClient event-driven idle", () => {
     expect(syncRead.mock.calls.some(([file]) => String(file) === path.join(h.meshRoot, "state.json"))).toBe(false);
     const active = events.watches.find(watch => watch.dir === h.meshRoot)!; active.watcher.emit("error", new Error("lost watch")); await settled();
     saveCompletion(h.meshRoot, h.recipient, h.result(1)); // Deliberately omit its event.
-    await vi.advanceTimersByTimeAsync(60_000); await settled();
-    await vi.waitFor(() => expect(h.complete).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(h.complete).not.toHaveBeenCalled();
+    expect(drain).toHaveBeenCalledTimes(2); // Startup and the real watcher error only.
+    events.fire(path.join(h.meshRoot, "agent-completions"), null); await settled();
+    await drain.mock.results.at(-1)!.value; await settled();
+    expect(h.complete).toHaveBeenCalledOnce();
     await h.client.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });

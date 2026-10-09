@@ -132,17 +132,19 @@ export class RootInboxEventWake {
   #deadline: ReturnType<typeof setTimeout> | undefined;
   #running: Promise<void> | undefined;
   #requested = false;
+  #eventRequested = false;
   #closed = false;
 
-  constructor(readonly root: string, readonly wake: () => Promise<void>, readonly safetyMs = 60_000) {}
+  constructor(readonly root: string, readonly wake: (knownDeadline: boolean) => Promise<void>, readonly safetyMs = 60_000) {}
 
   start(): void {
     if (this.#closed || this.#timer) return;
     this.#watch();
     this.#timer = setInterval(() => {
-      this.#watch(); // Check the physical root and retry at the existing safety cadence.
-      void this.request();
-    }, this.safetyMs);
+      // Reviewed R-no-polling exception: reattach the physical watch only.
+      // Never discover inbox/records work or request a Main turn from a tick.
+      this.#watch();
+    }, Math.max(60_000, this.safetyMs));
     this.#timer.unref();
     // Subscribe before reconciling: publication between activation and this read is retained.
     void this.request();
@@ -155,7 +157,7 @@ export class RootInboxEventWake {
     if (this.#closed || !Number.isFinite(delay) || delay <= 0) return;
     this.#deadline = setTimeout(() => {
       this.#deadline = undefined;
-      void this.request();
+      void this.request(true);
     }, Math.min(delay, 2_147_483_647));
     this.#deadline.unref();
   }
@@ -165,15 +167,18 @@ export class RootInboxEventWake {
     this.#deadline = undefined;
   }
 
-  request(): Promise<void> {
+  request(knownDeadline = false): Promise<void> {
     this.cancelKnownDeadline();
     if (this.#closed) return Promise.resolve();
     this.#requested = true;
+    this.#eventRequested ||= !knownDeadline;
     if (this.#running) return this.#running;
     const task = Promise.resolve().then(async () => {
       while (this.#requested && !this.#closed) {
         this.#requested = false;
-        try { await this.wake(); } catch { /* The safety wake/turn retries durable work. */ }
+        const deadlineOnly = !this.#eventRequested;
+        this.#eventRequested = false;
+        try { await this.wake(deadlineOnly); } catch { /* The next event or explicit turn retries durable work. */ }
       }
     });
     this.#running = task;

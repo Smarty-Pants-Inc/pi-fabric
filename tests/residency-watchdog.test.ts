@@ -85,8 +85,8 @@ describe("resident watchdog", () => {
   });
 
   it("keeps watchdog restart independent of mesh delivery outage backoff", async () => {
-    // Pin retry jitter; the 1 s delivery floor dominates these early retry delays.
-    // Watchdog recovery retains its independent original cadence.
+    // Delivery retries are event-only. Host custody recovery is independent
+    // and must not acquire a completion-drain timer during the mesh outage.
     const random = vi.spyOn(Math, "random").mockReturnValue(0.999999);
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
@@ -111,17 +111,22 @@ describe("resident watchdog", () => {
       await vi.advanceTimersByTimeAsync(949);
       expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
-      expect(polls()).toBe(2);
+      expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(polls()).toBe(3);
+      expect(polls()).toBe(1);
       expect(warn).toHaveBeenCalledOnce();
       // Keep the canonical selector genuinely unavailable through the next known-work recovery.
       await vi.advanceTimersByTimeAsync(3_050);
       expect(start).toHaveBeenCalledTimes(2);
-      expect(polls()).toBeGreaterThan(3);
+      expect(polls()).toBe(1);
       const failedPolls = polls();
       read.mockImplementation(select);
       await vi.advanceTimersByTimeAsync(10_000);
+      expect(polls()).toBe(failedPolls);
+      // A real file change, not elapsed backoff, owns the recovery attempt.
+      const call = vi.mocked(fs.watch).mock.calls.find(([dir]) => String(dir) === config.meshRoot)!;
+      const notify = call.at(-1) as (event: string, filename: string) => void;
+      notify("change", "state.json"); await vi.advanceTimersByTimeAsync(0);
       expect(polls()).toBeGreaterThan(failedPolls);
       expect(read.mock.results.some((result, index) =>
         read.mock.calls[index]?.[0] === "residency/deliveries/" && result.type === "return" && Array.isArray(result.value))).toBe(true);

@@ -696,6 +696,7 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
+      watchDirectories: [this.#actorRoot],
       canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
@@ -2883,8 +2884,8 @@ export class ActorManager {
         }
         const item = actor.queue.shift();
         this.#refill(actor);
-        // A freed slot lets a catch-up that a full queue deferred continue at once.
-        this.#meshMonitor.schedule();
+        // Queue-space is the event that retries a blocked mesh page, not a tick.
+        this.#meshMonitor.notifyQueueSpace();
         if (!item) break;
         // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
         // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this

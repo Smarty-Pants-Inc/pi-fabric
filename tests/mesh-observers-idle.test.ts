@@ -173,7 +173,7 @@ describe("event-driven mesh observers", () => {
     expect(beforePoll).toHaveBeenCalledOnce(); expect(tail).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(59_999);
     expect(beforePoll).toHaveBeenCalledOnce(); expect(tail).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(1);
-    await vi.advanceTimersByTimeAsync(1); expect(beforePoll).toHaveBeenCalledTimes(2); expect(tail).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); expect(beforePoll).toHaveBeenCalledOnce(); expect(tail).not.toHaveBeenCalled();
     actor.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -197,7 +197,8 @@ describe("event-driven mesh observers", () => {
     const broker = await lifecycle(mesh, deliver); broker.start(); await flush();
     await publish(mesh); // Intentionally omit notification.
     await vi.advanceTimersByTimeAsync(59_999); expect(deliver).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1); await flush(); expect(deliver).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await flush(); expect(deliver).not.toHaveBeenCalled();
+    watches[0]!.notify("change", "events.jsonl"); await flush(); expect(deliver).toHaveBeenCalledOnce();
     const lists = vi.spyOn(mesh, "listAll");
     watches[0]!.emitter.emit("error", new Error("lost watch")); await flush(); lists.mockClear();
     await vi.advanceTimersByTimeAsync(59_999); expect(lists).not.toHaveBeenCalled();
@@ -222,7 +223,7 @@ describe("event-driven mesh observers", () => {
     await vi.advanceTimersByTimeAsync(120_000); expect(lists).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("does not let its own visible-but-unconfirmed lifecycle writes bypass the receipt retry cadence", async () => {
+  it("retries unconfirmed lifecycle receipts on file events without redelivery or a retry tick", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store(); const deliver = vi.fn();
     const broker = await lifecycle(mesh, deliver); broker.start(); await flush();
     const put = mesh.put.bind(mesh);
@@ -230,8 +231,9 @@ describe("event-driven mesh observers", () => {
     await publish(mesh); watches[0]!.notify("change", "events.jsonl"); await flush();
     expect(deliver).toHaveBeenCalledOnce(); expect(writes).toHaveBeenCalledOnce();
     watches[0]!.notify("rename", "state.json"); await flush();
-    await vi.advanceTimersByTimeAsync(19); expect(writes).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(1); expect(writes).toHaveBeenCalledTimes(2); expect(deliver).toHaveBeenCalledOnce();
+    expect(writes).toHaveBeenCalledTimes(2); expect(deliver).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); expect(writes).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenCalledOnce();
     broker.pause(); writes.mockRestore(); await broker.checkpointForRelease();
   });
 
@@ -242,7 +244,9 @@ describe("event-driven mesh observers", () => {
     await mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
       data: { version: 1, commandId: "missed", targetId: "target", operation: "steer", replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
     await vi.advanceTimersByTimeAsync(59_999); expect(handler).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1); expect(handler).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1); expect(handler).not.toHaveBeenCalled();
+    watches[0]!.notify("change", "events.jsonl"); await vi.advanceTimersByTimeAsync(0);
+    expect(handler).toHaveBeenCalledOnce();
     control.pause(); const tail = vi.spyOn(mesh, "tail"); watches[0]!.notify("change", null);
     watches[0]!.emitter.emit("error", new Error("paused")); await vi.advanceTimersByTimeAsync(120_000);
     expect(tail).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
@@ -259,7 +263,8 @@ describe("event-driven mesh observers", () => {
     const actor = new ActorMeshMonitor({ root: mesh.root, latestOffset: () => 0, tail },
       { enabled: true, actorPollMs: 20, maxReadEvents: 100 }, { beforePoll: () => true, onEvent });
     closers.push(() => actor.close()); actor.start(); await flush(); expect(onEvent).toHaveBeenCalledOnce();
-    full = false; await vi.advanceTimersByTimeAsync(20); expect(onEvent).toHaveBeenCalledTimes(2);
+    full = false; await vi.advanceTimersByTimeAsync(5 * 60_000); expect(onEvent).toHaveBeenCalledOnce();
+    actor.notifyQueueSpace(); await flush(); expect(onEvent).toHaveBeenCalledTimes(2);
     tail.mockReturnValue({ events: [], nextOffset: 10 }); actor.close();
     await vi.advanceTimersByTimeAsync(120_000); expect(onEvent).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });

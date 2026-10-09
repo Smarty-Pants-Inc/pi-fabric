@@ -54,7 +54,7 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
 // A live-name journal derives its recipient even when pending() finds no results.
 // That metadata must not invoke lastKnown's fresh full-fleet scan every idle poll.
 describe("ResidencyClient completion recipient metadata", () => {
-  it("keeps empty delivery scans idle until 60 s safety or a native wake, and closes observation resources", async () => {
+  it("keeps empty delivery scans idle through non-waking safety checks until a native event, and closes observation resources", async () => {
     vi.useFakeTimers();
     const { client, meshRoot, watches } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
     const reads = vi.spyOn(client.options.mesh, "listAllShared");
@@ -69,18 +69,18 @@ describe("ResidencyClient completion recipient metadata", () => {
       expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
       await drain.mock.results.at(-1)!.value;
-      expect(polls()).toBe(2);
+      expect(polls()).toBe(1);
       const native = watches.find(watch => watch.dir === meshRoot && !watch.watcher.close.mock.calls.length);
       expect(native).toBeDefined();
       native!.callback("change", "state.json");
       await vi.advanceTimersByTimeAsync(0);
-      expect(polls()).toBe(3);
+      expect(polls()).toBe(2);
       await client.close();
       expect(watches.length).toBeGreaterThan(0);
       expect(watches.every(watch => watch.watcher.close.mock.calls.length > 0)).toBe(true);
       native!.callback("change", "state.json");
       await vi.advanceTimersByTimeAsync(120_000);
-      expect(polls()).toBe(3);
+      expect(polls()).toBe(2);
       expect(vi.getTimerCount()).toBe(0);
     } finally { await client.close(); }
   });

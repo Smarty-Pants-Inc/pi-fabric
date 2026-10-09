@@ -63,10 +63,10 @@ export class ActorMeshMonitor {
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
-  #retryTimer: NodeJS.Timeout | undefined;
-  #stamp: string | undefined;
   #eventStamp: string | undefined;
   #retryNeeded = false;
+  #blocked = false;
+  #retryBlocked = false;
   #watchTimer: NodeJS.Timeout | undefined;
   #lastWatchAt = Number.NEGATIVE_INFINITY;
   #watchPending = false;
@@ -98,6 +98,8 @@ export class ActorMeshMonitor {
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
+      /** Exact host-owned registry roots (including non-default actor roots). */
+      watchDirectories?: readonly string[];
       /**
        * On resume from a saved cursor, deliver only events newer than this many ms, so a
        * restart replays the gap it missed and not a long downtime (#37's replay storm).
@@ -153,8 +155,6 @@ export class ActorMeshMonitor {
     this.#timer = undefined;
     if (this.#watchTimer) clearTimeout(this.#watchTimer);
     this.#watchTimer = undefined;
-    if (this.#retryTimer) clearTimeout(this.#retryTimer);
-    this.#retryTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -162,12 +162,19 @@ export class ActorMeshMonitor {
     if (this.#started) this.#persistCursor(true);
   }
 
-  schedule(readTail = true): void {
+  /** A dequeue is the admission for retrying a previously blocked page. */
+  notifyQueueSpace(): void {
+    if (this.#retryNeeded) this.schedule();
+  }
+
+  schedule(readTail = true, retryBlocked = true): void {
     if (this.#closed || !this.config.enabled) return;
+    this.#retryBlocked ||= retryBlocked;
     this.#tailRequested ||= readTail;
     this.#dirty = true;
     if (this.#scheduled || this.#running) return;
     this.#scheduled = true;
+    this.#backgroundPoll.success(); // The event, not elapsed backoff, owns this attempt.
     queueMicrotask(() => {
       this.#scheduled = false;
       if (this.#closed) return;
@@ -175,8 +182,10 @@ export class ActorMeshMonitor {
       this.#dirty = false;
       void this.#backgroundPoll.run(() => this.#poll()).then(result => {
         this.#running = false;
-        if (result !== "done" || this.#retryNeeded) this.#retry();
-        else if (this.#dirty) this.schedule(false);
+        if (this.#dirty) this.schedule(false, false);
+        // A blocked page stays at its safe cursor until queue-space or a
+        // genuine mesh/ownership notification. Never retry it on a timer.
+        if (result !== "done") this.#retryNeeded = true;
       });
     });
   }
@@ -199,14 +208,14 @@ export class ActorMeshMonitor {
     if (this.#watchTimer) clearTimeout(this.#watchTimer);
     this.#watchPending = false;
     this.#watchTailPending = false;
-    this.schedule(false);
+    this.schedule(false, false);
     this.#watchTimer = setTimeout(() => {
       this.#watchTimer = undefined;
       if (this.#watchPending) {
         this.#watchPending = false;
         const readTail = this.#watchTailPending;
         this.#watchTailPending = false;
-        this.schedule(readTail);
+        this.schedule(readTail, false);
       }
     }, Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
     this.#watchTimer.unref();
@@ -216,22 +225,25 @@ export class ActorMeshMonitor {
     if (this.#closed || this.#watcher !== watcher) return;
     watcher.close();
     this.#watcher = undefined;
-    this.schedule();
+    // Watch loss is not queue-space or delivery admission.
   }
 
   #attachWatcher(reconcile = false): void {
     if (this.#closed) return;
     // These changes are not necessarily mesh appends. Notifications only request
     // the existing manager-owned registry/completion/ownership checks.
-    for (const directory of OBSERVED_DIRECTORIES) {
-      const watchedPath = path.join(this.mesh.root, directory);
+    const directories = new Set([...OBSERVED_DIRECTORIES.map(dir => path.join(this.mesh.root, dir)),
+      ...(this.callbacks.watchDirectories ?? [])]);
+    for (const directory of directories) {
+      const watchedPath = directory;
       const previous = this.#directoryWatchers.get(directory);
       if (previous && reconcile && !meshObserverWatchCurrent(previous, watchedPath)) {
         this.#directoryWatchers.delete(directory); previous.close();
       }
       if (this.#directoryWatchers.has(directory)) continue;
       try {
-        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: directory === "actors" }, (_event, filename) => {
+        const recursive = directory === path.join(this.mesh.root, "actors") || this.callbacks.watchDirectories?.includes(directory);
+        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: Boolean(recursive) }, (_event, filename) => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           if (filename !== null && path.basename(filename.toString()) === "mesh-cursor.json") return;
           this.#scheduleBackground(false);
@@ -240,7 +252,7 @@ export class ActorMeshMonitor {
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          watcher.close(); this.#directoryWatchers.delete(directory); this.schedule(false);
+          watcher.close(); this.#directoryWatchers.delete(directory); // Attachment safety only.
         });
       } catch { /* Platforms without recursive watches retain bounded reconciliation. */ }
     }
@@ -269,22 +281,10 @@ export class ActorMeshMonitor {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = setInterval(() => {
       this.#attachWatcher(true);
-      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-      if (stamp === undefined || stamp !== this.#stamp) this.schedule(false);
-      else if (!this.#closed) void this.#backgroundPoll.run(() => this.callbacks.beforePoll()).then(result => {
-        if (result !== "done") this.#retry();
-      }); // Time-based ownership/filter expiry, without rereading the unchanged tail.
+      // Reviewed R-no-polling exception: watcher attachment repair only.
+      // Even a changed stamp cannot acquire delivery authority on a safety tick.
     }, delay);
     this.#timer.unref();
-  }
-
-  #retry(): void {
-    if (this.#closed || this.#retryTimer) return;
-    this.#retryTimer = setTimeout(() => {
-      this.#retryTimer = undefined;
-      this.schedule();
-    }, this.#backgroundPoll.waitMs || Math.max(20, this.config.actorPollMs));
-    this.#retryTimer.unref();
   }
 
   async #poll(): Promise<void> {
@@ -292,7 +292,9 @@ export class ActorMeshMonitor {
     const readTail = this.#tailRequested;
     this.#tailRequested = false;
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
-    this.#stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+    const retryBlocked = this.#retryBlocked;
+    this.#retryBlocked = false;
+    if (this.#blocked && !retryBlocked) return;
     const eventStamp = meshObserverStamp(this.mesh.root, ["events.jsonl", "generation"]);
     if (!readTail && eventStamp !== undefined && eventStamp === this.#eventStamp && !this.#retryNeeded && this.#archiveAfter === undefined && !this.#catchingUp) return;
     this.#eventStamp = eventStamp;
@@ -362,6 +364,7 @@ export class ActorMeshMonitor {
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
         if (accepted === false && (catchingUp || isWork(event))) {
+          this.#blocked = true;
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
@@ -375,6 +378,7 @@ export class ActorMeshMonitor {
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor(handedOn);
       this.#retryNeeded = false;
+      this.#blocked = false;
       if (!catchingUp && tail.events.length === this.config.maxReadEvents) setImmediate(() => this.schedule());
       // Yield to the event loop between catch-up pages, so timers such as the lease
       // heartbeat keep running through a long backlog.
@@ -411,6 +415,7 @@ export class ActorMeshMonitor {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
         if (accepted === false) {
+          this.#blocked = true;
           this.#writeCursor(handedOn);
           return false;
         }

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import * as piConversationHost from "@earendil-works/pi-coding-agent";
@@ -16,11 +17,9 @@ import type {
 import type { FabricState } from "../fabric-state.js";
 import type { FabricThinking } from "../thinking.js";
 import type { MeshEvent } from "../mesh/store.js";
-import { participantFilesCachedStamp, participantFilesStamp, readParticipantFiles } from "../topology/participant-files.js";
-import { hostLeasesStamp } from "../topology/host-leases.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
-import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
+import { createDashboardSnapshot } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
@@ -28,11 +27,7 @@ import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
-// The participant heartbeat (src/topology/participant-directory.ts); kept local so the startup
-// graph does not load the topology module.
-const REMOTE_REFRESH_MS = 5_000;
-// A poll with no changed input still rebuilds this often: a peer's lease lapses with time alone.
-const REMOTE_MAX_AGE_MS = 15_000;
+const DASHBOARD_REFRESH_MS = 1_000;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
   const now = Date.now();
@@ -67,7 +62,7 @@ export class FabricUiController {
   #snapshot: FabricDashboardSnapshot = emptySnapshot();
   #events: MeshEvent[] = [];
   #meshOffset = 0;
-  #timer: NodeJS.Timeout | undefined;
+  #meshUnsubscribe: (() => void) | undefined;
   #activityUnsubscribe: (() => void) | undefined;
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
@@ -77,6 +72,8 @@ export class FabricUiController {
   #closeTasks: (() => void) | undefined;
   #scheduledRefresh: NodeJS.Timeout | undefined;
   #widgetTui: TUI | undefined;
+  #conversationWatchKey: string | undefined;
+  #conversationWatches: fs.FSWatcher[] = [];
   #dashboardTui: TUI | undefined;
   #widgetMounted = false;
   #widget: FabricWidget | undefined;
@@ -92,8 +89,8 @@ export class FabricUiController {
   #epoch = 0;
   #activityRevision: number | undefined;
   // Tracks whether #activityRuns was last fetched with full payloads. The
-  // dashboard needs args/result/preview to render call detail; the periodic
-  // refresh instead pulls payload-free summaries so streaming runs stop
+  // dashboard needs args/result/preview to render call detail; widget event
+  // refreshes instead pull payload-free summaries so streaming runs stop
   // paying a deep clone of up to 1,000 bounded call payloads per tick.
   #activityRunsDetailed = true;
   #activityRuns: FabricActivityRun[] = [];
@@ -101,12 +98,7 @@ export class FabricUiController {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
-  readonly #snapshotCache = new FabricDashboardSnapshotCache();
   #refreshGeneration = 0;
-  // What the last snapshot was built from, as cheap stamps (smarty-dev#1043).
-  #builtLocal: string | undefined;
-  #builtRemote: string | undefined;
-  #builtAt = 0;
 
   constructor(
     readonly state: FabricState,
@@ -122,12 +114,14 @@ export class FabricUiController {
       this.#events = this.state.mesh.read({ limit: this.state.config.ui.eventHistory });
       this.#meshOffset = this.state.mesh.latestOffset();
     }
+    this.#meshUnsubscribe = this.state.actors.subscribeMesh?.(() => {
+      if (this.#dashboardTui || this.#conversationTui || this.#widgetTui) this.#scheduleRefresh();
+    });
     this.#activityUnsubscribe = this.state.activity.subscribe(() => this.#scheduleRefresh());
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
     this.#agentUnsubscribe = this.state.agents.subscribeUi(() => this.#scheduleRefresh());
     this.#shellUnsubscribe = this.state.shellJobs?.subscribe(() => this.#scheduleRefresh());
     this.#refresh();
-    this.#schedulePoll();
   }
 
   stop(): void {
@@ -144,12 +138,13 @@ export class FabricUiController {
     this.#conversationView?.dispose();
     this.#conversationView = undefined;
     this.#conversationTui = undefined;
+    this.#clearConversationWatches();
     this.#conversationOpen = false;
     this.#conversationState?.clear();
     this.#conversationState = undefined;
-    if (this.#timer) clearTimeout(this.#timer);
     if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
-    this.#timer = undefined;
+    this.#meshUnsubscribe?.();
+    this.#meshUnsubscribe = undefined;
     this.#scheduledRefresh = undefined;
     this.#widget = undefined;
     this.#activityUnsubscribe?.();
@@ -180,18 +175,14 @@ export class FabricUiController {
     for (const reader of this.#conversationReaders.values()) reader.clear();
     this.#conversationReaders.clear();
     this.#activeConversationReader = undefined;
-    this.#snapshotCache.clear();
-    this.#builtLocal = undefined;
-    this.#builtRemote = undefined;
-    this.#builtAt = 0;
   }
 
   /** Host lifecycle boundaries are independent of child/activity revisions. */
   setHostStreaming(streaming: boolean): void {
     if (!this.#context || !this.state.config.ui.enabled || this.#context.mode !== "tui") return;
     this.#hostStreaming = streaming;
-    this.#refresh();
-    this.#schedulePoll(true);
+    if (this.#dashboardOpen) this.#scheduleRefresh();
+    else this.#refresh();
   }
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
@@ -349,7 +340,6 @@ export class FabricUiController {
           throw new Error(target?.readOnlyReason ?? `Participant ${id} cannot receive ${action}`);
         }
       };
-      this.#schedulePoll(true);
       await context.ui.custom<void>((tui, theme, keybindings, done) => {
         if (epoch !== this.#epoch) {
           done(undefined);
@@ -369,7 +359,12 @@ export class FabricUiController {
           rendererOptions: this.conversationRenderers,
           queueEvents: this.state.pi?.events,
           ...(this.codePreviewSettings ? { codePreviewSettings: this.codePreviewSettings } : {}),
-          transcript: (id, followLatest) => readerFor(id).read(source(id), followLatest),
+          transcript: (id, followLatest) => {
+            const reader = readerFor(id);
+            const currentSource = source(id);
+            this.#watchConversationSource(currentSource);
+            return reader.read(currentSource, followLatest);
+          },
           loadOlder: (id) => {
             const reader = readerFor(id);
             const before = reader.read(source(id), false);
@@ -419,7 +414,6 @@ export class FabricUiController {
         this.#conversationTui = undefined;
         this.#closeConversation = undefined;
         this.#conversationOpen = false;
-        this.#schedulePoll(true);
       }
     }
   }
@@ -439,6 +433,7 @@ export class FabricUiController {
     // must be true before this refresh so the first dashboard frame renders
     // from full activity runs rather than stripped summaries.
     this.#dashboardOpen = true;
+    this.#cancelRefresh();
     const epoch = this.#epoch;
     const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
@@ -600,13 +595,13 @@ export class FabricUiController {
         context.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
     };
-    this.#schedulePoll(true);
     let conversationTarget: string | undefined;
     try {
       await context.ui.custom<void>(
         (tui, theme, keybindings, done) => {
           if (!current()) { done(undefined); return { render: () => [], invalidate() {} }; }
           this.#dashboardTui = tui;
+          this.#refresh();
           return new FabricDashboard(tui, theme, () => this.#snapshot, () => done(undefined), {
             modelSource,
             keybindings,
@@ -661,8 +656,8 @@ export class FabricUiController {
       if (epoch === this.#epoch) {
         this.#dashboardOpen = false;
         this.#dashboardTui = undefined;
+        this.#cancelRefresh();
         this.#refresh();
-        this.#schedulePoll(true);
       }
     }
     if (conversationTarget && epoch === this.#epoch) {
@@ -674,64 +669,35 @@ export class FabricUiController {
     return structuredClone(this.#snapshot);
   }
 
-  #schedulePoll(reset = false): void {
-    if (reset && this.#timer) {
-      clearTimeout(this.#timer);
-      this.#timer = undefined;
-    }
-    if (this.#timer || !this.#context || !this.state.initialized) return;
-    const localActive =
-      this.#snapshot.main.status === "running" ||
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
-      this.#snapshot.runs.some((run) => run.status === "running") ||
-      this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
-      this.#snapshot.actors.some(
-        (actor) =>
-          isActiveStatus(actor.status) ||
-          Boolean(actor.worker && isActiveStatus(actor.worker.status)),
-      );
-    const remoteActive =
-      this.#snapshot.peers.length > 0 ||
-      this.#snapshot.agents.some((agent) => agent.local === false && isActiveStatus(agent.status));
-    if (!this.ownsInput && !localActive && !remoteActive) return;
-    // Remote records change at most once per owner heartbeat, and on a shared mesh some peer is
-    // always present, so polling them at refreshMs kept every idle Pi rebuilding the snapshot
-    // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
-    const pollDelay = this.ownsInput || localActive
-      ? this.state.config.ui.refreshMs
-      : Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
-    // Wake at the fixed cache deadline too: a recently warmed cache must not add a second
-    // 5 s UI poll window after the store's 5 s reuse window (smarty-dev#4383).
-    const remaining = this.state.config.mesh.enabled ? this.state.mesh.readCacheRemainingMs : 0;
-    const delay = remaining > 0 ? Math.min(pollDelay, remaining) : pollDelay;
-    const epoch = this.#epoch;
-    this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
-      this.#timer = undefined;
-      this.#refresh(false);
-      this.#schedulePoll();
-    }), delay);
-    this.#timer.unref();
+  #cancelRefresh(): void {
+    if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
+    this.#scheduledRefresh = undefined;
   }
 
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#context || !this.state.initialized) return;
+    if (this.#scheduledRefresh || !this.#context || this.#context.mode !== "tui" || !this.state.initialized) return;
+    // No consumer exists when every Fabric surface is explicitly hidden.
+    if (!this.#dashboardTui && !this.#conversationTui && this.state.config.ui.widget === "hidden") return;
+    // Model discovery can mark the dashboard open before a TUI is attached.
+    if (this.#dashboardOpen && !this.#dashboardTui) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
-      Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs) - elapsed,
+      (this.#dashboardOpen ? Math.max(DASHBOARD_REFRESH_MS, this.state.config.ui.refreshMs)
+        : Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs)) - elapsed,
     );
     const epoch = this.#epoch;
-    this.#scheduledRefresh = setTimeout(() => this.#runBackground(epoch, () => {
+    this.#scheduledRefresh = setTimeout(() => {
+      if (epoch !== this.#epoch) return;
       this.#scheduledRefresh = undefined;
-      this.#refresh();
-      this.#schedulePoll(true);
-    }), delay);
+      this.#runBackground(epoch, () => this.#refresh());
+    }, delay);
     this.#scheduledRefresh.unref();
   }
 
-  /** Both poll and coalesced refresh own their faults; a queued old tick cannot rearm. */
+  /** Coalesced event refreshes own their faults; a queued old epoch cannot rearm. */
   #runBackground(epoch: number, callback: () => void): void {
-    if (epoch !== this.#epoch || !this.#context || !this.state.initialized) return;
+    if (epoch !== this.#epoch || !this.#context || this.#context.mode !== "tui" || !this.state.initialized) return;
     try {
       callback();
     } catch (error) {
@@ -778,6 +744,7 @@ export class FabricUiController {
   }
 
   #suspendConversationReader(): void {
+    this.#clearConversationWatches();
     if (!this.#activeConversationReader) return;
     const reader = this.#conversationReaders.get(this.#activeConversationReader);
     // Readers retain lightweight loaded-range bookmarks. Never clear as a
@@ -786,7 +753,43 @@ export class FabricUiController {
     this.#activeConversationReader = undefined;
   }
 
-  #refresh(force = true): void {
+  #clearConversationWatches(): void {
+    for (const watcher of this.#conversationWatches) watcher.close();
+    this.#conversationWatches = [];
+    this.#conversationWatchKey = undefined;
+  }
+
+  /** Observe only the visible transcript's files; log growth need not emit a manager revision. */
+  #watchConversationSource(source: NativeConversationSource): void {
+    if (!this.#conversationTui) return;
+    const files = [...new Set([source.sessionFile, source.eventsFile, source.logFile].filter(
+      (file): file is string => typeof file === "string",
+    ))];
+    const key = JSON.stringify(files);
+    if (key === this.#conversationWatchKey) return;
+    this.#clearConversationWatches();
+    const directories = new Map<string, Set<string>>();
+    for (const file of files) {
+      const directory = path.dirname(file);
+      const names = directories.get(directory) ?? new Set<string>();
+      names.add(path.basename(file));
+      directories.set(directory, names);
+    }
+    const epoch = this.#epoch;
+    for (const [directory, names] of directories) {
+      try {
+        const watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
+          if (epoch === this.#epoch && this.#conversationTui &&
+              (filename === null || names.has(filename.toString()))) this.#scheduleRefresh();
+        });
+        watcher.on("error", () => { watcher.close(); this.#conversationWatchKey = undefined; });
+        this.#conversationWatches.push(watcher);
+      } catch { /* Missing/unavailable files keep the reader's fallback; later events retry. */ }
+    }
+    if (this.#conversationWatches.length === directories.size) this.#conversationWatchKey = key;
+  }
+
+  #refresh(): void {
     this.#lastRefreshAt = performance.now();
     const context = this.#context;
     if (!context || !this.state.initialized) return;
@@ -813,73 +816,19 @@ export class FabricUiController {
         this.#activityRevision = revision;
         this.#activityRunsDetailed = detailed;
       }
-      // smarty-dev#1043: a poll gathered every input (the whole participant list, actors, the
-      // mesh, the global registry) and deep-compared it twice a second while any local work was
-      // active: about 11% of a busy Main. Local changes already refresh through their own
-      // events, so a poll now rebuilds the snapshot only when a cheap stamp moved: Main's own
-      // state or the activity revision at once, remote state and mesh events at most every
-      // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
-      // dashboard or conversation view stays live. The rest of the refresh runs either way.
-      const now = Date.now();
       const main = { ...this.state.mainAgentInfo(context) };
       // agent_end can precede isIdle() becoming true. Its explicit boundary
       // releases the host reservation immediately; idle is a fallback boundary.
       if (this.#hostStreaming !== undefined) {
         main.status = this.#hostStreaming && context.isIdle?.() !== true ? "running" : "idle";
       }
-      const local = JSON.stringify([revision, main.status, main.model, main.thinking, main.pendingMessages,
-        this.state.widgetDismissedAt]);
-      // Participant records live in files of their own too (smarty-dev#2004); a change to one
-      // moves the directory's stamp, not the shared state's. As for the state, the built stamp is
-      // the one of the listing the snapshot consumed (review/astra F3 on #142).
-      const participantsRoot = this.state.config.mesh.enabled && typeof this.state.mesh.root === "string"
-        ? this.state.mesh.root : undefined;
-      // Lease-only renewal/re-acquisition also changes topology, without moving state.json.
-      // Keep the pre-build stamp: a lease replaced during snapshot construction must leave
-      // the gate open, not falsely mark a newer file as already consumed.
-      const leasesStamp = participantsRoot ? hostLeasesStamp(participantsRoot) : undefined;
-      const remoteOf = (meshStamp: string | undefined, participantsStamp: string | undefined): string =>
-        JSON.stringify([this.#meshOffset, meshStamp, participantsStamp, leasesStamp, this.state.globalActors.stamp?.()]);
-      const remote = remoteOf(
-        this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined,
-        participantsRoot ? participantFilesStamp(participantsRoot) : undefined,
-      );
-      const unchanged =
-        !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
-        local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
-        (remote === this.#builtRemote || (
-          this.state.mesh.readCacheRemainingMs !== 0 && now - this.#builtAt < Math.min(REMOTE_REFRESH_MS,
-            this.state.config.mesh.enabled ? (this.state.mesh.backgroundReadCacheMs ?? this.state.mesh.readCacheMs) ?? REMOTE_REFRESH_MS : REMOTE_REFRESH_MS)
-        ));
-      if (unchanged) {
-        this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
-      } else {
-        // A changed file is a dirty hint, not a reason for an idle observer to bypass the
-        // store's bounded reuse window (smarty-dev#4383). Active/pending Main demand still
-        // revalidates now. Record the stamp actually consumed, never the disk's newer stamp.
-        const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
-        const readActive = main.status === "running" || main.pendingMessages;
-        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(readActive, readActive);
-        if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot, {
-          maxAgeMs: readActive ? 0 : (this.state.mesh.backgroundReadCacheMs ?? this.state.mesh.readCacheMs),
-        });
-        this.#builtLocal = local;
-        this.#builtAt = now;
-        if (force || this.#dashboardOpen) this.#snapshotCache.clear();
-        this.#refreshGeneration++;
-        this.#snapshot = createDashboardSnapshot(
-          this.state,
-          this.#events,
-          context,
-          this.#activityRuns,
-          this.#dashboardOpen ? undefined : this.#snapshotCache,
-          this.#activityView !== undefined,
-        );
-        this.#builtRemote = remoteOf(
-          this.state.config.mesh.enabled ? this.state.mesh.cachedStateStamp?.() : undefined,
-          participantsRoot ? participantFilesCachedStamp(participantsRoot) : undefined,
-        );
+      if (this.state.config.mesh.enabled && (this.#dashboardOpen || main.status === "running" || main.pendingMessages)) {
+        this.state.mesh.cachedStateStamp?.(true, true);
       }
+      this.#refreshGeneration++;
+      this.#snapshot = createDashboardSnapshot(
+        this.state, this.#events, context, this.#activityRuns, undefined, this.#activityView !== undefined,
+      );
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }

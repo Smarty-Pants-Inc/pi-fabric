@@ -42,6 +42,13 @@ const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
 // A WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP) can last until the operator rolls back: log it at most once a minute.
 const WAL_CAP_LOG_MS = 60_000;
+// A capped WAL stays capped until a reader lets go or the operator rolls back: back off 1 s doubling to 30 s,
+// never the 100 ms lock-retry cadence that would hammer a stuck WAL (pi-fabric#694 P1 2).
+const WAL_CAP_RETRY_MIN_MS = 1_000;
+const WAL_CAP_RETRY_MAX_MS = 30_000;
+/** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
+export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
+  previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -934,6 +941,8 @@ export interface MeshBridgeOptions {
   presenceMs?: number;
   /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
   stopMs?: number;
+  /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
+  walCapRetryMinMs?: number;
   log?: (message: string) => void;
 }
 
@@ -1360,6 +1369,7 @@ export class MeshBridge {
     let retryMs = LOCK_RETRY_MIN_MS;
     let reportedTimeout = false;
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
+    let walCapDelay: number | undefined;
     while (!this.#stopped) {
       const pass = started ? this.step() : this.start();
       // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
@@ -1368,6 +1378,7 @@ export class MeshBridge {
       try {
         await pass;
         reportedTimeout = false;
+        walCapDelay = undefined;
         if (!started) {
           started = true;
           retryMs = LOCK_RETRY_MIN_MS;
@@ -1383,6 +1394,8 @@ export class MeshBridge {
         delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (isMeshStateWalCap(error)) {
+          walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+          delay = walCapDelay;
           const now = Date.now();
           if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
             this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);

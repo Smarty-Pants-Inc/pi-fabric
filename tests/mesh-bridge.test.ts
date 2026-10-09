@@ -19,6 +19,7 @@ import {
   RemoteBridgeSide,
   serveBridgeAgent,
   StoreBridgeSide,
+  walCapRetryDelay,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
@@ -92,6 +93,7 @@ interface SetupOptions {
   agent?: (far: MeshStore) => StoreBridgeSide;
   pollMs?: number;
   presenceMs?: number;
+  walCapRetryMinMs?: number;
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -128,6 +130,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     ...(options.pollMs ? { pollMs: options.pollMs } : {}),
     ...(options.stopMs ? { stopMs: options.stopMs } : {}),
     log: (message) => logs.push(message),
+    ...(options.walCapRetryMinMs === undefined ? {} : { walCapRetryMinMs: options.walCapRetryMinMs }),
   });
   return { hub, far, remote, bridge, logs, gate };
 };
@@ -976,13 +979,16 @@ describe("mesh bridge", () => {
 
   it("retries a WAL-cap refusal on the next cycle, logs it once with the reader report, and never stops (pi-fabric#694 P1 2)", async () => {
     let calls = 0;
+    const at: number[] = [];
     const { bridge, logs } = setup(undefined, {
       stopMs: 100,
+      walCapRetryMinMs: 40,
       local: (store, peer) => {
         const side = new StoreBridgeSide(store, peer);
         const original = side.latestCursor.bind(side);
         side.latestCursor = async (...args: Parameters<typeof original>) => {
           calls += 1;
+          at.push(Date.now());
           if (calls <= 3) throw new MeshStateWalCapError(9 * 1024 * 1024, 8 * 1024 * 1024, "pid 4242 (pinner)");
           return original(...args);
         };
@@ -997,12 +1003,23 @@ describe("mesh bridge", () => {
       expect(capLogs).toHaveLength(1); // three refusals within a minute: one line
       expect(capLogs[0]).toContain("WAL readers: pid 4242 (pinner)");
       expect(isMeshRetryableBusy(new MeshStateWalCapError(2, 1))).toBe(true);
+      // Backed off, never a tight loop: waits of 40, 80, 160 ms between the four calls.
+      expect(capLogs[0]).toContain("retrying in 40 ms");
+      expect(at[1]! - at[0]!).toBeGreaterThanOrEqual(35);
+      expect(at[3]! - at[2]!).toBeGreaterThanOrEqual(150);
       expect(failure).toBeUndefined();
     } finally {
       await bridge.stop();
       await running;
     }
     expect(failure).toBeUndefined();
+  });
+
+  it("backs a WAL-cap refusal off 1 s doubling to 30 s (pi-fabric#694 P1 2)", () => {
+    const seq: number[] = [];
+    let d: number | undefined;
+    for (let i = 0; i < 8; i += 1) { d = walCapRetryDelay(d); seq.push(d); }
+    expect(seq).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
   });
 
   it.each([new Error("Timed out waiting for the Fabric mesh lock"), Object.assign(new Error("unauthorized"), { code: "DENIED" })])(

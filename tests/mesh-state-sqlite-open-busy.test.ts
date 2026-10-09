@@ -346,11 +346,57 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     store.close();
   });
 
-  it("refuses a root directory that others can write", async () => {
+  it("no state file is ever wider than 0600, even under umask 0, and a fresh root is 0700 (SEC: the creation window)", async () => {
+    const parent = tempRoot("creation-window");
+    fs.chmodSync(parent, 0o755);
+    const root = path.join(parent, "mesh");
+    const seen: Array<[string, number]> = [];
+    const previous = process.umask(0); // worst case: SQLite's default 0644 would show as 0644 here
+    // Watch the parent first (the root does not exist yet), then the root as soon as it does.
+    const observe = (dir: string) => (_event: string, name: string | Buffer | null) => {
+      if (!name) return;
+      const st = fs.statSync(path.join(dir, String(name)), { throwIfNoEntry: false });
+      if (st) seen.push([String(name), st.mode & 0o777]);
+    };
+    const watchers = [fs.watch(parent, observe(parent))];
+    let store: SqliteStateStore | undefined;
+    try {
+      // Create the root through the store, then watch inside it for -wal/-shm creation by the first writes.
+      store = await openStore(root);
+      watchers.push(fs.watch(root, observe(root)));
+      for (let i = 0; i < 20; i += 1) await store.put({ key: `k${i}`, value: { i }, identity: { id: "t", name: "t" } } as never).catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      for (const w of watchers) w.close();
+      process.umask(previous);
+    }
+    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    for (const name of ["state.db", "state.db-wal", "state.db-shm"]) {
+      const st = fs.statSync(path.join(root, name), { throwIfNoEntry: false });
+      if (st) expect([name, st.mode & 0o777]).toEqual([name, 0o600]);
+    }
+    for (const [name, mode] of seen) {
+      if (name === "mesh") expect([name, mode]).toEqual([name, 0o700]);
+      else if (name.startsWith("state.db")) expect([name, mode & 0o077]).toEqual([name, 0]);
+    }
+    store?.close();
+  });
+
+  it("tightens an owned 0755 root to 0700 and refuses a symlinked root", async () => {
+    const root = await prepared("root-0755");
+    fs.chmodSync(root, 0o755);
+    (await openStore(root)).close();
+    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    const link = `${root}-link`;
+    fs.symlinkSync(root, link);
+    expect(await refused(link)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/symbolic link/) });
+  });
+
+  it("makes an owned root that others can write 0700 before opening", async () => {
     const root = await prepared("root-mode");
     fs.chmodSync(root, 0o777);
-    try { expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/group or other writable/) }); }
-    finally { fs.chmodSync(root, 0o700); }
+    (await openStore(root)).close();
+    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
   });
 
   it("refuses a symlinked state.db and a symlinked -wal, never following them", async () => {

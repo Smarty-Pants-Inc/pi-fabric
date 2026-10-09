@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { kernelFenceAvailable } from "../src/residency/file-lock.js";
 
 vi.mock("../src/residency/file-lock.js", async (original) => ({
   ...await original<typeof import("../src/residency/file-lock.js")>(), kernelFenceAvailable: vi.fn(() => true),
 }));
-afterEach(() => vi.mocked(kernelFenceAvailable).mockReturnValue(true));
+afterEach(() => { vi.restoreAllMocks(); vi.mocked(kernelFenceAvailable).mockReturnValue(true); });
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
@@ -25,6 +26,10 @@ const fixture = () => {
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 50 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
+  // These fixtures exercise clock deadlines, not OS callback scheduling.
+  vi.spyOn(fs, "watch").mockImplementation((() => Object.assign(new EventEmitter(), {
+    close: vi.fn(), unref: vi.fn(),
+  })) as unknown as typeof fs.watch);
   const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
   const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
     mainAgent: { local: true } as FabricMainAgentTarget });
@@ -89,30 +94,44 @@ describe("resident watchdog", () => {
       { id: "a", rootId: config.rootId, residency: "durable", status: "idle" },
     ] }));
     const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
-    const read = vi.spyOn(client.options.mesh, "listAll").mockImplementation(() => {
-      throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+    const select = client.options.mesh.listAllShared.bind(client.options.mesh);
+    const read = vi.spyOn(client.options.mesh, "listAllShared").mockImplementation((prefix, options) => {
+      if (prefix === "residency/deliveries/") throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+      return select(prefix, options);
     });
+    const polls = () => read.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.useFakeTimers();
     try {
       client.start();
       await vi.advanceTimersByTimeAsync(50);
       expect(start).toHaveBeenCalledOnce();
-      expect(read).toHaveBeenCalledOnce();
+      expect(polls()).toBe(1);
+      expect(read.mock.results.find((_, index) => read.mock.calls[index]?.[0] === "residency/deliveries/")?.type).toBe("throw");
       await vi.advanceTimersByTimeAsync(949);
-      expect(read).toHaveBeenCalledOnce();
+      expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
-      expect(read).toHaveBeenCalledTimes(2);
+      expect(polls()).toBe(2);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(read).toHaveBeenCalledTimes(3);
+      expect(polls()).toBe(3);
       expect(warn).toHaveBeenCalledOnce();
-      read.mockReturnValue([]);
+      // Keep the canonical selector genuinely unavailable through the next known-work recovery.
+      await vi.advanceTimersByTimeAsync(3_050);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(polls()).toBeGreaterThan(3);
+      const failedPolls = polls();
+      read.mockImplementation(select);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(polls()).toBeGreaterThan(failedPolls);
+      expect(read.mock.results.some((result, index) =>
+        read.mock.calls[index]?.[0] === "residency/deliveries/" && result.type === "return" && Array.isArray(result.value))).toBe(true);
+      expect(warn).toHaveBeenCalledOnce();
+      const recoveredPolls = polls();
       await vi.advanceTimersByTimeAsync(1_000);
-      // Successor completion reconciliation also scans claims after a successful delivery pass.
-      // Count delivery polls, not that separate scan, to keep the backoff assertion unchanged.
-      expect(read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/"))).toHaveLength(4);
-      expect(warn).toHaveBeenCalledOnce();
+      expect(polls()).toBe(recoveredPolls);
       await client.close();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(polls()).toBe(recoveredPolls);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       await client.close();

@@ -1,5 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -89,6 +89,7 @@ const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
 const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
+const IDLE_SAFETY_MS = 60_000;
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 const delay = (ms: number): Promise<void> =>
@@ -173,8 +174,32 @@ export class ResidencyClient {
   readonly #hostPath: string;
   readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
+  #retryTimer: NodeJS.Timeout | undefined;
   #watchdogTimer: NodeJS.Timeout | undefined;
+  #watchdogPass: Promise<void> | undefined;
+  #watchdogRequested = false;
+  readonly #watchers = new Map<string, { watcher: fs.FSWatcher; identity: string }>();
+  #meshDirty = true;
+  #journalDirty = true;
+  #safetyDirty = false;
+  #retryDirty = false;
+  #policyDirty = false;
+  #retryMesh = false;
+  #retrySafety = false;
+  #scheduled = false;
+  readonly #deliveryEntries = new Map<string, string>();
+  readonly #pendingDeliveries = new Set<string>();
+  // Authenticated own completions suppressed by policy are not retry work.
+  readonly #quietDeliveries = new Set<string>();
+  // Authenticated completion hints only; acknowledgment wakes exact fresh keys.
+  readonly #completionDeliveries = new Map<string, Set<string>>();
+  readonly #receiptDeliveries = new Set<string>();
+  readonly #claimEntries = new Map<string, string>();
+  readonly #workFiles = new Map<string, { stamp: string; value: unknown }>();
+  #outboxStamp: string | undefined;
+  #outboxFiles: string[] = [];
   #modelGuidanceJson: string | undefined;
+  #notificationPolicy: boolean | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
   readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
@@ -207,6 +232,9 @@ export class ResidencyClient {
           // A refused Windows rename must leave both fences available for retry.
           this.acknowledgeCompletion(result.id);
           delivered();
+          // Journal-only/adopted outcomes can lack own resident metadata. The
+          // trusted delivered callback returns only after its receipt is written.
+          this.#wakeCompletionDeliveries(`${createHash("sha256").update(result.id).digest("hex")}.json`);
         };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
@@ -223,16 +251,19 @@ export class ResidencyClient {
   start(): void {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
-    this.#deliveryTimer = setInterval(
-      () => { void this.#backgroundDelivery.run(() => this.#drainDeliveries()); },
-      Math.max(1_000, this.options.config.mesh.actorPollMs),
-    );
+    // Subscribe before discovery: a write during an awaited drain owns a trailing pass.
+    this.#refreshWatchers();
+    this.#deliveryTimer = setInterval(() => {
+      this.#refreshWatchers();
+      this.#meshDirty = true;
+      this.#journalDirty = true;
+      this.#safetyDirty = true;
+      this.#requestDrain();
+    }, IDLE_SAFETY_MS);
     this.#deliveryTimer.unref();
-    // File-only recovery stays independent of the state-reading delivery cadence/backoff.
-    this.#watchdogTimer = setInterval(() => { void this.#watchdog().catch(() => undefined); },
-      Math.max(20, this.options.config.mesh.actorPollMs));
-    this.#watchdogTimer.unref();
-    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
+    // File-only recovery is independent of mesh errors and retry backoff.
+    this.#scheduleWatchdog(Math.max(20, this.options.config.mesh.actorPollMs));
+    this.#requestDrain();
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
@@ -252,11 +283,16 @@ export class ResidencyClient {
     this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
-    if (this.#watchdogTimer) clearInterval(this.#watchdogTimer);
+    if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
     this.#watchdogTimer = undefined;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
+    for (const { watcher } of this.#watchers.values()) watcher.close();
+    this.#watchers.clear();
     // Await the owned pass itself, not a timer polling its state. Real async file
     // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
     await this.#deliveryPass?.catch(() => undefined);
+    await this.#watchdogPass?.catch(() => undefined);
     await this.#startingHost?.catch(() => undefined);
     // A failed verification retains its owned handle so close can retry, or surface
     // the cleanup failure instead of silently reporting an aborted start as settled.
@@ -264,6 +300,13 @@ export class ResidencyClient {
   }
 
   syncPiModels(): void {
+    const notify = this.options.config.agents.notifyOnComplete;
+    if (notify !== this.#notificationPolicy) {
+      this.#policyDirty ||= notify && this.#notificationPolicy === false && this.#quietDeliveries.size > 0;
+      this.#notificationPolicy = notify;
+      this.#journalDirty = true;
+      if (this.#deliveryTimer) this.#requestDrain();
+    }
     this.#refreshPiModels();
     if (fs.existsSync(this.options.config.residencyRoot)) {
       atomicWrite(this.#configPath, this.options.config);
@@ -583,6 +626,8 @@ export class ResidencyClient {
     // deliberate prelaunch refusal, not a transient storage failure to retry.
     if (!result.logFile && !admittedRecipient && typeof this.#completions.recipientSource === "function") return;
     this.#completions.save(result, admittedRecipient);
+    this.#journalDirty = true;
+    if (this.#deliveryTimer) this.#requestDrain();
   }
 
   hasAgent(id: string): boolean {
@@ -671,7 +716,10 @@ export class ResidencyClient {
     const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
     // Journal-only ordinary outcomes have no durable metadata, but their wait still
     // retracts an already admitted completion from this session's inbox.
-    if (metadata || journalConsumed) this.options.onResultConsumed?.(id);
+    if (metadata || journalConsumed) {
+      this.#wakeCompletionDeliveries(`${createHash("sha256").update(id).digest("hex")}.json`);
+      this.options.onResultConsumed?.(id);
+    }
   }
 
   async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult | CompletionSummary> {
@@ -1033,6 +1081,24 @@ export class ResidencyClient {
     return owner;
   }
 
+  #scheduleWatchdog(delayMs: number): void {
+    if (this.#closed || !this.#deliveryTimer) return;
+    if (this.#watchdogPass) { this.#watchdogRequested = true; return; }
+    if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
+    this.#watchdogTimer = setTimeout(() => {
+      this.#watchdogTimer = undefined;
+      if (this.#watchdogPass || this.#closed) return;
+      this.#watchdogPass = this.#watchdog().catch(() => undefined).finally(() => {
+        this.#watchdogPass = undefined;
+        const requested = this.#watchdogRequested;
+        this.#watchdogRequested = false;
+        this.#scheduleWatchdog(requested || this.#watchdogWork || this.#startingHost
+          ? Math.max(20, this.#nextWatchdogAt - Date.now()) : IDLE_SAFETY_MS);
+      });
+    }, delayMs);
+    this.#watchdogTimer.unref();
+  }
+
   async #watchdog(): Promise<void> {
     const now = Date.now();
     if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
@@ -1057,13 +1123,30 @@ export class ResidencyClient {
     }
   }
 
+  #physicalStamp(target: string): string {
+    try {
+      const stat = fs.statSync(target, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  }
+
+  #workJson<T>(file: string): T | undefined {
+    const stamp = this.#physicalStamp(file);
+    const cached = this.#workFiles.get(file);
+    if (stamp !== "unknown" && cached?.stamp === stamp) return cached.value as T | undefined;
+    const value = readJson<T>(file);
+    if (stamp !== "unknown" && this.#physicalStamp(file) === stamp) this.#workFiles.set(file, { stamp, value });
+    else this.#workFiles.delete(file);
+    return value;
+  }
+
   #durableWork(): string | undefined {
     const work: string[] = [];
     const config = this.options.config;
     const actorRoots = [config.actorRoot, config.sessionActorRoot ??
       (config.mesh.actorScope === "session" ? path.dirname(config.actorRoot) : path.join(config.actorRoot, config.sessionId))];
     for (const root of actorRoots) {
-      const registry = readJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
+      const registry = this.#workJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
       for (const actor of registry?.actors ?? []) {
         if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") {
           work.push(`actor:${root}:${actor.id}:${actor.status}`);
@@ -1074,10 +1157,16 @@ export class ResidencyClient {
     // client owns recovery even with no durable actors; the fenced host replays
     // the stable envelope id, not the completed agent.
     const outbox = path.join(config.residencyRoot, "delivery-outbox");
-    let entries: string[];
-    try { entries = fs.readdirSync(outbox); } catch { entries = []; }
-    for (const entry of entries.filter(entry => entry.endsWith(".json"))) {
-      const record = readJson<ResidentDeliveryRecord>(path.join(outbox, entry));
+    const stamp = this.#physicalStamp(outbox);
+    if (stamp === "unknown" || stamp !== this.#outboxStamp) {
+      try { this.#outboxFiles = fs.readdirSync(outbox).filter(entry => entry.endsWith(".json")); }
+      catch { this.#outboxFiles = []; }
+      this.#outboxStamp = stamp;
+      const present = new Set(this.#outboxFiles.map(entry => path.join(outbox, entry)));
+      for (const file of this.#workFiles.keys()) if (path.dirname(file) === outbox && !present.has(file)) this.#workFiles.delete(file);
+    }
+    for (const entry of this.#outboxFiles) {
+      const record = this.#workJson<ResidentDeliveryRecord>(path.join(outbox, entry));
       if (record?.format === RESIDENT_HOST_FORMAT && typeof record.id === "string" && `${record.id}.json` === entry &&
         typeof record.rootId === "string" && typeof record.message === "string" && typeof record.triggerTurn === "boolean" &&
         (record.delivery === "steer" || record.delivery === "followUp") && record.from && typeof record.from.id === "string") {
@@ -1102,43 +1191,231 @@ export class ResidencyClient {
   }
 
   /** Import authenticated legacy resident envelopes too: upgrading must not strand B72 work. */
-  async #adoptCompletion(entry: MeshStateEntry): Promise<void> {
+  async #adoptCompletion(entry: MeshStateEntry): Promise<boolean> {
     const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
     if (!value || value.format !== RESIDENT_HOST_FORMAT || typeof value.rootId !== "string" ||
       !value.from || value.from.kind !== "agent" || !AGENT_ID_PATTERN.test(value.from.id) ||
       entry.updatedBy.id !== residentHostId(value.rootId) ||
-      !entry.key.startsWith(residentDeliveryPrefix(value.rootId))) return;
+      !entry.key.startsWith(residentDeliveryPrefix(value.rootId))) return false;
     const id = value.agentCompletionId ?? value.from.id;
-    if (id !== value.from.id) return;
+    if (id !== value.from.id) return false;
     if (completionConsumed(this.options.config.meshRoot, id)) {
-      await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
-      return;
+      const removed = await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+      if (!removed.deleted) return true;
+      this.#forgetCompletionDelivery(entry.key);
+      return false;
     }
     const root = residentRoot(this.options.config.meshRoot, value.rootId);
     const config = readJson<ResidentHostConfig>(path.join(root, "config.json"));
     if (!config || config.rootId !== value.rootId || path.resolve(config.residencyRoot) !== root ||
       typeof config.projectRoot !== "string" || typeof config.cwd !== "string" ||
-      !samePath(config.projectRoot, this.options.config.projectRoot)) return;
+      !samePath(config.projectRoot, this.options.config.projectRoot)) return false;
     if (legacyCompletionConsumed(this.options.config.meshRoot, value.rootId, id)) {
       consumeCompletion(this.options.config.meshRoot, id, config.sessionId);
-      return;
+      return false;
     }
     const result = readJson<AgentRunResult>(residentResultPath(root, id)) ??
       readJson<AgentRunResult>(path.join(root, "runs", id, "status.json"));
-    if (!result || result.id !== id || !terminal(result.status)) return;
+    if (!result || result.id !== id || !terminal(result.status)) return true;
     const admitted = completionRecipientFromRun(this.options.config.meshRoot, path.join(root, "runs", id));
     saveCompletion(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
+    this.#rememberCompletionDelivery(id, entry.key);
+    return false;
+  }
+
+  #rememberCompletionDelivery(id: string, deliveryKey: string): void {
+    const filename = `${createHash("sha256").update(id).digest("hex")}.json`;
+    let keys = this.#completionDeliveries.get(filename);
+    if (!keys) this.#completionDeliveries.set(filename, keys = new Set());
+    keys.add(deliveryKey);
+  }
+
+  #wakeCompletionDeliveries(filename: string): void {
+    for (const key of this.#completionDeliveries.get(filename) ?? []) this.#receiptDeliveries.add(key);
+    if (this.#receiptDeliveries.size) this.#requestDrain();
+  }
+
+  #forgetCompletionDelivery(deliveryKey: string): void {
+    for (const [filename, keys] of this.#completionDeliveries) {
+      keys.delete(deliveryKey);
+      if (!keys.size) this.#completionDeliveries.delete(filename);
+    }
+  }
+
+  #watchDirectories(): string[] {
+    const config = this.options.config;
+    const journal = path.join(config.meshRoot, "agent-completions");
+    const actors = config.sessionActorRoot ??
+      (config.mesh.actorScope === "session" ? path.dirname(config.actorRoot) : path.join(config.actorRoot, config.sessionId));
+    return [config.meshRoot, journal, path.join(journal, "attempts"), path.join(journal, "receipts"),
+      config.residencyRoot, path.join(config.residencyRoot, "delivery-outbox"), config.actorRoot, actors];
+  }
+
+  #refreshWatchers(): void {
+    if (this.#closed) return;
+    const needed = new Set<string>();
+    for (const target of this.#watchDirectories()) {
+      // Parent observation survives atomic directory replacement. Missing paths are
+      // observed from their nearest existing ancestor, without recursive-watch assumptions.
+      for (const start of [target, path.dirname(target)]) {
+        let dir = start;
+        while (!fs.existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+        needed.add(dir);
+      }
+    }
+    for (const [dir, value] of this.#watchers) {
+      const identity = this.#watchIdentity(dir);
+      if (!needed.has(dir) || identity !== value.identity) { value.watcher.close(); this.#watchers.delete(dir); }
+    }
+    for (const dir of needed) {
+      if (this.#watchers.has(dir)) continue;
+      try {
+        const watcher = fs.watch(dir, (event, filename) => {
+          if (this.#closed) return;
+          this.#fileChanged(dir, filename === null ? null : String(filename));
+          const target = filename === null ? dir : path.join(dir, String(filename));
+          if (filename === null || (event === "rename" && this.#watchDirectories().some(source =>
+            source === target || source.startsWith(`${target}${path.sep}`)))) this.#refreshWatchers();
+        });
+        watcher.unref();
+        watcher.on("error", () => {
+          watcher.close();
+          if (this.#watchers.get(dir)?.watcher === watcher) this.#watchers.delete(dir);
+          if (!this.#closed) this.#fileChanged(dir, null);
+          // Failed attachment retries at the safety boundary, never a fast idle poll.
+        });
+        this.#watchers.set(dir, { watcher, identity: this.#watchIdentity(dir) });
+      } catch { /* Safety discovery still works when native observation is unavailable. */ }
+    }
+  }
+
+  #watchIdentity(dir: string): string {
+    try { const stat = fs.statSync(dir, { bigint: true }); return `${stat.dev}:${stat.ino}`; }
+    catch { return "unknown"; }
+  }
+
+  #fileChanged(dir: string, filename: string | null): void {
+    const config = this.options.config;
+    const target = filename === null ? dir : path.join(dir, filename);
+    const affects = (source: string): boolean => source === target || source.startsWith(`${target}${path.sep}`) ||
+      (filename === null && (target === source || target.startsWith(`${source}${path.sep}`)));
+    if (filename === null || ["state.json", "state.read-journal.jsonl", "state.read-signal.json"].some(file => affects(path.join(config.meshRoot, file)))) {
+      this.#meshDirty = true;
+    }
+    const journal = path.join(config.meshRoot, "agent-completions");
+    for (const [kind, source] of [["envelopes", journal], ["attempts", path.join(journal, "attempts")],
+      ["receipts", path.join(journal, "receipts")]] as const) {
+      if (dir === source && filename !== null) {
+        if (/^[a-f0-9]{64}\.json$/.test(filename)) {
+          this.#completions.changed(kind, filename);
+          this.#journalDirty = true;
+          if (kind === "receipts") this.#wakeCompletionDeliveries(filename);
+        }
+      } else if (affects(source)) {
+        this.#completions.changed(kind, null);
+        this.#journalDirty = true;
+      }
+    }
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    const actorDirs = this.#watchDirectories().slice(-2);
+    if (filename === null || affects(config.residencyRoot) || dir === config.residencyRoot || dir === outbox ||
+        actorDirs.some(source => affects(source) || target === path.join(source, "actors.json"))) {
+      if (filename === null) this.#workFiles.clear();
+      else this.#workFiles.delete(target);
+      if (affects(outbox) || dir === outbox) this.#outboxStamp = undefined;
+      this.#scheduleWatchdog(Math.max(0, this.#nextWatchdogAt - Date.now()));
+    }
+    if (this.#meshDirty || this.#journalDirty) this.#requestDrain();
+  }
+
+  #requestDrain(): void {
+    if (this.#closed || this.#scheduled || this.#deliveryPass) return;
+    this.#scheduled = true;
+    void Promise.resolve().then(() => {
+      this.#scheduled = false;
+      if (this.#closed) return;
+      void this.#backgroundDelivery.run(() => this.#drainDeliveries()).then(result => {
+        if (this.#closed) return;
+        if (result !== "done") this.#scheduleRetry();
+        else if (this.#meshDirty || this.#journalDirty || this.#safetyDirty || this.#retryDirty || this.#policyDirty || this.#receiptDeliveries.size) this.#requestDrain();
+      });
+    });
+  }
+
+  #scheduleRetry(): void {
+    if (this.#closed || this.#retryTimer) return;
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#retryDirty = true;
+      this.#journalDirty = true;
+      this.#meshDirty ||= this.#retryMesh;
+      this.#safetyDirty ||= this.#retrySafety;
+      this.#retryMesh = this.#retrySafety = false;
+      this.#requestDrain();
+    }, Math.max(this.#backgroundDelivery.waitMs,
+      this.#completions.hasPendingChanges || this.#pendingDeliveries.size ? WATCHDOG_INTERVAL_MS : 1_000));
+    this.#retryTimer.unref();
   }
 
   #drainDeliveries(): Promise<void> {
     if (this.#deliveryPass) return this.#deliveryPass;
     if (this.#closed || !this.options.mainAgent.local) return Promise.resolve();
-    return this.#deliveryPass = this.#drainDeliveryPass().finally(() => { this.#deliveryPass = undefined; });
+    return this.#deliveryPass = this.#drainDeliveryPass().finally(() => {
+      this.#deliveryPass = undefined;
+      if (this.#completions.hasPendingChanges || this.#pendingDeliveries.size || this.#completionFault) this.#scheduleRetry();
+    });
+  }
+
+  #selectionChanges(prefix: string, previous: Map<string, string>, commit = true): MeshStateEntry[] {
+    // These selectors validate canonical mesh generations/journal signals. Raw
+    // sidecar JSON and watcher filenames are never routing or write authority.
+    const entries = this.options.mesh.listAllShared(prefix, { fresh: true });
+    const present = new Set<string>();
+    const changed: MeshStateEntry[] = [];
+    for (const entry of entries) {
+      present.add(entry.key);
+      const signature = JSON.stringify(entry); // Include bytes, not copied version labels.
+      if (previous.get(entry.key) !== signature) changed.push(entry);
+      if (commit) previous.set(entry.key, signature);
+    }
+    for (const key of previous.keys()) if (!present.has(key)) previous.delete(key);
+    return changed;
   }
 
   async #drainDeliveryPass(): Promise<void> {
+    const meshDirty = this.#meshDirty;
+    const journalDirty = this.#journalDirty;
+    const safety = this.#safetyDirty;
+    const retryPending = this.#retryDirty;
+    const policyWake = this.#policyDirty;
+    const receiptKeys = [...this.#receiptDeliveries];
+    this.#receiptDeliveries.clear();
+    this.#meshDirty = this.#journalDirty = this.#safetyDirty = this.#retryDirty = this.#policyDirty = false;
     try {
-      const entries = this.options.mesh.listAll("residency/deliveries/");
+      const entries = meshDirty ? this.#selectionChanges("residency/deliveries/", this.#deliveryEntries, false) : [];
+      if (retryPending || safety) for (const key of this.#pendingDeliveries) {
+        if (entries.some(entry => entry.key === key)) continue;
+        const entry = this.options.mesh.get(key, { fresh: true });
+        if (entry) entries.push(entry);
+        else this.#pendingDeliveries.delete(key);
+      }
+      // Re-read only known OWN quiet keys on enable. Keys are hints, never
+      // authority: #deliver rechecks the fresh host/root/metadata/receipt fences.
+      if (policyWake) for (const key of this.#quietDeliveries) {
+        if (entries.some(entry => entry.key === key)) continue;
+        const entry = this.options.mesh.get(key, { fresh: true });
+        if (entry) entries.push(entry);
+        else this.#quietDeliveries.delete(key);
+      }
+      // A cached delivery signature is unchanged by inbox consumption. Only a
+      // known acknowledgment hint bypasses it, never watcher bytes as authority.
+      for (const key of receiptKeys) {
+        if (entries.some(entry => entry.key === key)) continue;
+        const entry = this.options.mesh.get(key, { fresh: true });
+        if (entry) entries.push(entry);
+        else this.#forgetCompletionDelivery(key);
+      }
+      const claims = meshDirty ? this.#selectionChanges("residency/completion-claims/", this.#claimEntries) : [];
       let fault: unknown;
       for (const entry of entries) {
         try {
@@ -1147,19 +1424,32 @@ export class ResidencyClient {
           const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
           const ownerActorRecord = value?.format === RESIDENT_HOST_FORMAT && value.from?.kind === "actor" &&
             entry.updatedBy.id === this.hostId;
-          if (entry.key.startsWith(this.#deliveryPrefix) || ownerActorRecord) await this.#deliver(entry);
-          else await this.#adoptCompletion(entry);
+          const pending = entry.key.startsWith(this.#deliveryPrefix) || ownerActorRecord
+            ? await this.#deliver(entry) : await this.#adoptCompletion(entry);
+          if (pending) this.#pendingDeliveries.add(entry.key);
+          else this.#pendingDeliveries.delete(entry.key);
+          if (pending || this.options.config.agents.notifyOnComplete) this.#quietDeliveries.delete(entry.key);
+          this.#deliveryEntries.set(entry.key, JSON.stringify(entry));
         } catch (error) {
           // The record remains durable. Back off a locked mesh; retain ordinary failed senders
           // without blocking the other entries in this pass.
+          this.#deliveryEntries.delete(entry.key); // Retry only retained known work.
+          if (receiptKeys.includes(entry.key)) this.#pendingDeliveries.add(entry.key);
           if (isMeshLockTimeout(error)) throw error;
           fault ??= error;
         }
       }
-      await this.#completions.drain(this.options.config.agents.notifyOnComplete);
+      if (journalDirty || claims.length) await this.#completions.drainChanged(this.options.config.agents.notifyOnComplete,
+        { safety, retryPending, claims });
       if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;
     } catch (error) {
+      // Retry known failed work on a bounded deadline, not a discarded dirty event
+      // or a fast whole-directory scan. File watchdog recovery has a separate pass.
+      for (const key of receiptKeys) this.#pendingDeliveries.add(key);
+      this.#retryMesh ||= meshDirty || policyWake;
+      this.#retrySafety ||= safety;
+      this.#scheduleRetry();
       if (isMeshLockTimeout(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
       if (diagnostic !== this.#completionFault) console.warn(diagnostic);
@@ -1167,8 +1457,8 @@ export class ResidencyClient {
     }
   }
 
-  async #deliver(entry: MeshStateEntry): Promise<void> {
-    if (typeof entry.value !== "object" || entry.value === null || Array.isArray(entry.value)) return;
+  async #deliver(entry: MeshStateEntry): Promise<boolean> {
+    if (typeof entry.value !== "object" || entry.value === null || Array.isArray(entry.value)) return false;
     const value = entry.value as Partial<ResidentDeliveryRecord>;
     if (
       value.format !== RESIDENT_HOST_FORMAT ||
@@ -1185,7 +1475,7 @@ export class ResidencyClient {
       // producing root returns; a foreign Main never consumes it.
       entry.updatedBy.id !== this.hostId
     ) {
-      return;
+      return false;
     }
     const data = value.data as Partial<AgentRunResult> | undefined;
     // Also recognize envelopes written by an older resident host.
@@ -1195,16 +1485,27 @@ export class ResidencyClient {
       const metadata = this.#metadata(completionId);
       if (metadata?.completionConsumedAt) this.#completions.acknowledge(completionId);
       if (metadata?.completionConsumedAt || completionConsumed(this.options.config.meshRoot, completionId)) {
-        await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
-        return;
+        const removed = await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+        if (!removed.deleted) return true;
+        this.#forgetCompletionDelivery(entry.key);
+        return false;
       }
-      // No result/notifications disabled is not a receipt. Keep the source pending, never drop it.
-      if (!metadata || !this.options.config.agents.notifyOnComplete) return;
+      // Neither missing metadata nor disabled notifications is a receipt.
+      if (!metadata) return true;
+      this.#rememberCompletionDelivery(completionId, entry.key);
+      if (!this.options.config.agents.notifyOnComplete) {
+        this.#quietDeliveries.add(entry.key);
+        return false; // Retain for policy wake, without scheduling idle retries.
+      }
       // One logical completion key across resident envelopes and the session inbox. Keep
       // the source until Main consumes it, not just until its in-memory inbox accepts it.
       const result = this.statusAgent(completionId);
-      if (terminal(result.status) && "startedAt" in result) this.#completions.save(result as AgentRunResult);
-      return;
+      if (terminal(result.status) && "startedAt" in result) {
+        this.#completions.save(result as AgentRunResult);
+        this.#journalDirty = true;
+        return false;
+      }
+      return true;
     }
     // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
     // listed it through the 2 s read cache before the delete). The record stays the durable copy
@@ -1226,5 +1527,6 @@ export class ResidencyClient {
       deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
     });
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+    return false;
   }
 }

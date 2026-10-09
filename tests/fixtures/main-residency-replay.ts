@@ -70,6 +70,10 @@ if (phase === "prepare" && mode === "consumed") {
   const client = new ResidencyClient({ config, mesh, participants: {} as never, mainAgent: main });
   try {
     client.start();
+    await waitFor(() => attempts.length >= 1 || attempts.some((attempt) => attempt.acknowledged));
+    // A barrier failure retains the source but does not own an idle retry tick.
+    // Exercise a second refusal through the public explicit recovery boundary.
+    client.retryDeliveries();
     await waitFor(() => attempts.length >= 2 || attempts.some((attempt) => attempt.acknowledged));
     const refused = { sourceSurvives: !!mesh.get(key), acknowledgments: attempts.filter((a) => a.acknowledged).length, deletes: deletes.length };
     assert.ok(refused.sourceSurvives, "failed replay must retain resident source");
@@ -82,6 +86,7 @@ if (phase === "prepare" && mode === "consumed") {
     } else {
       events.length = 0;
       fail = false;
+      client.retryDeliveries(); // Repair admission, not elapsed time, owns replay.
       await waitFor(() => !mesh.get(key));
       assert.equal(attempts.filter((a) => a.acknowledged).length, 1);
       assert.equal(deletes.length, 1);

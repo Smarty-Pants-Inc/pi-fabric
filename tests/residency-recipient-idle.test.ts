@@ -74,7 +74,11 @@ describe("ResidencyClient completion recipient metadata", () => {
       expect(native).toBeDefined();
       native!.callback("change", "state.json");
       await vi.advanceTimersByTimeAsync(0);
-      expect(polls()).toBe(2);
+      expect(polls()).toBe(1); // Generic state/heartbeat commits are not work.
+      fs.mkdirSync(path.join(meshRoot, "residency-notifications"));
+      native!.callback("rename", "residency-notifications");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(polls()).toBe(2); // A new work namespace owns bounded discovery.
       await client.close();
       expect(watches.length).toBeGreaterThan(0);
       expect(watches.every(watch => watch.watcher.close.mock.calls.length > 0)).toBe(true);

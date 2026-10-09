@@ -123,10 +123,9 @@ describe("resident watchdog", () => {
       read.mockImplementation(select);
       await vi.advanceTimersByTimeAsync(10_000);
       expect(polls()).toBe(failedPolls);
-      // A real file change, not elapsed backoff, owns the recovery attempt.
-      const call = vi.mocked(fs.watch).mock.calls.find(([dir]) => String(dir) === config.meshRoot)!;
-      const notify = call.at(-1) as (event: string, filename: string) => void;
-      notify("change", "state.json"); await vi.advanceTimersByTimeAsync(0);
+      // Storage repair alone is not a work event. Explicit operator recovery
+      // owns this attempt without reinstating generic state/heartbeat scans.
+      client.retryDeliveries(); await vi.advanceTimersByTimeAsync(0);
       expect(polls()).toBeGreaterThan(failedPolls);
       expect(read.mock.results.some((result, index) =>
         read.mock.calls[index]?.[0] === "residency/deliveries/" && result.type === "return" && Array.isArray(result.value))).toBe(true);

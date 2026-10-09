@@ -94,7 +94,7 @@ export class ActorMeshMonitor {
     readonly callbacks: {
       cursorPath?: string | undefined;
       /** Exact host-owned registry roots (including non-default actor roots). */
-      watchDirectories?: readonly string[];
+      watchDirectories?: readonly string[] | (() => readonly string[]);
       /**
        * On resume from a saved cursor, deliver only events newer than this many ms, so a
        * restart replays the gap it missed and not a long downtime (#37's replay storm).
@@ -209,8 +209,12 @@ export class ActorMeshMonitor {
     if (this.#closed) return;
     // These changes are not necessarily mesh appends. Notifications only request
     // the existing manager-owned registry/completion/ownership checks.
+    const extra = this.callbacks.watchDirectories;
     const directories = new Set([...OBSERVED_DIRECTORIES.map(dir => path.join(this.mesh.root, dir)),
-      ...(this.callbacks.watchDirectories ?? [])]);
+      ...(typeof extra === "function" ? extra() : extra ?? [])]);
+    for (const [directory, watcher] of this.#directoryWatchers) {
+      if (!directories.has(directory)) { watcher.close(); this.#directoryWatchers.delete(directory); }
+    }
     for (const directory of directories) {
       const watchedPath = directory;
       const previous = this.#directoryWatchers.get(directory);
@@ -219,8 +223,9 @@ export class ActorMeshMonitor {
       }
       if (this.#directoryWatchers.has(directory)) continue;
       try {
-        const recursive = directory === path.join(this.mesh.root, "actors") || this.callbacks.watchDirectories?.includes(directory);
-        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: Boolean(recursive) }, (event, filename) => {
+        // Observe only live manager-owned directories. Native recursive fs.watch
+        // synchronously enumerates archived runs even before the first poll.
+        const watcher = meshObserverWatch(watchedPath, { persistent: false }, (event, filename) => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           if (filename !== null && ["mesh-cursor.json", ".claim.lock"].includes(path.basename(filename.toString()))) return;
           if (filename === null || (event === "rename" && !path.extname(filename.toString()))) {
@@ -295,6 +300,9 @@ export class ActorMeshMonitor {
       this.#needsPoll = true;
       return;
     }
+    // Registry admission may add/remove actors. Attach their exact live result
+    // directories before returning, never walk archived runs to discover them.
+    this.#attachWatcher(true);
     if (this.#blocked && !explicit) return;
     if (!explicit && unchanged) {
       // Ignored-only progress can still owe its ten-second checkpoint, even

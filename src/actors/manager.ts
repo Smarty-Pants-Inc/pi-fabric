@@ -745,7 +745,10 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
-      watchDirectories: [this.#actorRoot],
+      watchDirectories: () => [this.#actorRoot, ...[...this.#actors.values()].flatMap(actor => {
+        const directory = path.dirname(actor.sessionFile);
+        return [directory, path.join(directory, "child-completions")];
+      })],
       canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {

@@ -48,7 +48,7 @@ const records = (root: string): Record<string, string> => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else found[path.relative(root, full)] = fs.readFileSync(full, "utf8");
+      else found[path.relative(root, full).split(path.sep).join("/")] = fs.readFileSync(full, "utf8"); // "/" on Windows too (smarty-dev#7630)
     }
   };
   walk(root);

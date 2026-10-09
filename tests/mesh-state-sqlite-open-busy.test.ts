@@ -184,7 +184,7 @@ describe("synchronous busy retries stay inside their wall-clock budget (PR #691 
     expectRetryableBusy(error);
     expect(attempts).toBeGreaterThan(1); // it does retry
     // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms (+ timer slack).
-    expect(ms).toBeLessThan(15 + 10);
+    expect(ms).toBeLessThan(15 + (process.platform === "win32" ? 25 : 10)); // Windows timer ~15.6 ms (smarty-dev#7630)
   });
 
   it("a busy first open under an exclusive hold blocks for <= ~40 ms, busy-handler waits included", async () => {

@@ -67,7 +67,8 @@ const freezeRegistryValue = <T>(value: T): T => {
 // Keep at most 64 normalized paths, least recently read first. Managers also
 // release their path on close; ad-hoc store readers remain bounded by this LRU.
 const REGISTRY_READ_CACHE_LIMIT = 64;
-const registryReadCache = new Map<string, { generation: string; value: unknown }>();
+const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
+const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
 
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
@@ -450,6 +451,7 @@ export class ActorRegistryStore {
     try { fd = fs.openSync(this.#registryPath, "r"); }
     catch (error) { this.releaseReadCache(); throw error; }
     try {
+      const readTimeMs = Date.now();
       const stat = fs.fstatSync(fd, { bigint: true });
       const generation = stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
         ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
@@ -457,13 +459,17 @@ export class ActorRegistryStore {
       const cached = registryReadCache.get(this.#registryPath);
       // Delete/reinsert promotes both unchanged and replaced generations.
       registryReadCache.delete(this.#registryPath);
-      if (generation !== undefined && cached?.generation === generation) {
+      // Coarse timestamps can hide same-size in-place writes within a 2 s quantum.
+      // Prove the bytes against their original read-start time, not the current
+      // clock: a racy entry must be re-read once settled, never merely age into a hit.
+      if (generation !== undefined && cached?.generation === generation &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
         registryReadCache.set(this.#registryPath, cached);
         return cached.value;
       }
       const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
       if (generation !== undefined) {
-        registryReadCache.set(this.#registryPath, { generation, value });
+        registryReadCache.set(this.#registryPath, { generation, readTimeMs, value });
         if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
           registryReadCache.delete(registryReadCache.keys().next().value!);
         }

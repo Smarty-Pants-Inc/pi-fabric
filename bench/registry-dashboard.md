@@ -51,3 +51,28 @@ The acceptance thresholds apply to perf-lead's installed profile on the same
 Pis: registry re-read <0.05 core and dashboard poll <0.1 core while hidden. If
 that installed re-profile exceeds either threshold, fabric-v2 pins back to the
 previous release; local seeded improvement alone cannot authorize acceptance.
+
+## Round 3: coarse-timestamp racy-file guard
+
+On `intel1`, Node `v24.19.0`, the unmodified committed harness ran for 60 seconds
+on `a80fb963` and then the racy-safe candidate, sequentially with other checks
+idle. Both runs used the same shape above, 240 list rounds, 8,405 registry-read
+calls and five writes. No fixture timestamp aging was added to the benchmark.
+
+| Metric | `a80fb963` | Racy-safe candidate |
+| --- | ---: | ---: |
+| Registry envelope parses (includes writer parses) | 15 | 376 |
+| Conservative decoded-cache hit-rate lower bound | 99.82% | 95.53% |
+| Registry-read CPU (ms) | 50.891 | 178.363 |
+| Registry-read CPU (cores) | 0.000848 | 0.002973 |
+| Overall process CPU (cores) | 0.135856 | 0.138355 |
+| Hidden UI snapshot-input reads | 0 | 0 |
+
+The conservative hit-rate bound is `1 - registryParses / registryReadCalls`;
+writer parses make it an underestimate, not a direct instrumented hit counter.
+The guard deliberately decodes fresh files again during their two-second racy
+window. Mature files still hit, and the registry-read slice uses under 6% of the
+0.05-core gate (about 16.8× below it). Overall process CPU includes projections
+and must not be compared with the hidden-dashboard poll gate. Zero hidden
+snapshot reads is behavioral evidence, not an installed-Pi CPU measurement.
+The installed-candidate owner gate above remains required.

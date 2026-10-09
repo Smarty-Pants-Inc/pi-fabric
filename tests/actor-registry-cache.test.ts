@@ -13,6 +13,9 @@ const setup = () => {
   const file = path.join(root, "actors.json");
   const value = { format: 1, actors: [{ id: "actor", extra: { values: [1, 2] } }] };
   fs.writeFileSync(file, JSON.stringify(value));
+  // Hit/LRU/invalidation assertions need a proven, non-racy generation.
+  const old = new Date(Date.now() - 5_000);
+  fs.utimesSync(file, old, old);
   const fd = fs.openSync(file, "r");
   let cacheable: boolean;
   try {
@@ -84,6 +87,84 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(() => view.actors.push({ id: "bad", extra: { values: [] } })).toThrow(TypeError);
     expect(() => { view.actors[0]!.extra.values[0] = 99; }).toThrow(TypeError);
     expect(store.read()).toEqual(value);
+  });
+
+  it.each([1_000, 2_000])("re-reads same-size in-place updates within a coarse %i ms timestamp quantum", quantumMs => {
+    const { file, value, store } = setup();
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    const bytes = JSON.stringify(replacement);
+    expect(bytes).toHaveLength(JSON.stringify(value).length);
+    const quantumStartMs = 1_700_000_000_000;
+    let now = quantumStartMs + 100, writtenAt = now;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) => {
+      const stampNs = BigInt(Math.floor(writtenAt / quantumMs) * quantumMs) * 1_000_000n;
+      return Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: stampNs, ctimeNs: stampNs,
+      });
+    }) as typeof fs.fstatSync);
+    const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+    const before = store.read();
+    expect(before).toEqual(value);
+    now += 100; writtenAt = now;
+    fs.writeFileSync(file, bytes); // Same inode, size, mtime and ctime quantum.
+    const after = store.read();
+    expect(after).toEqual(replacement);
+    expect(after).not.toBe(before);
+    expect(Object.isFrozen(after)).toBe(true);
+    expect(parse).toHaveBeenCalledTimes(2);
+    expect(disk).toHaveBeenCalledTimes(2);
+    fs.writeFileSync(file, "!".repeat(bytes.length)); // Same-size malformed collision must re-validate.
+    expect(() => store.read()).toThrow(SyntaxError);
+    fs.writeFileSync(file, bytes);
+    const racy = store.read();
+    expect(racy).toEqual(replacement);
+    now = quantumStartMs + 3_000;
+    const mature = store.read(); // Time alone cannot prove the previously racy cached bytes.
+    expect(mature).toEqual(replacement);
+    expect(mature).not.toBe(racy);
+    expect(parse).toHaveBeenCalledTimes(5);
+    expect(disk).toHaveBeenCalledTimes(5);
+    expect(store.read()).toBe(mature); // Re-read after the racy window proves this generation.
+    expect(parse).toHaveBeenCalledTimes(5);
+    expect(disk).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([1_000, 2_000])("hits an untouched coarse %i ms generation older than two seconds", quantumMs => {
+    const { value, store } = setup();
+    const now = 1_700_000_004_001;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const stampNs = BigInt(Math.floor((now - 2_001) / quantumMs) * quantumMs) * 1_000_000n;
+    const nativeFstat = fs.fstatSync.bind(fs);
+    const fstat = vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: stampNs, ctimeNs: stampNs,
+      })) as typeof fs.fstatSync);
+    const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+    const first = store.read();
+    expect(first).toEqual(value);
+    for (let i = 1; i < 100; i++) expect(store.read()).toBe(first);
+    expect(fstat).toHaveBeenCalledTimes(100);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(disk).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([-500, 0, 1_999, 2_000])("re-reads a generation whose mtime is %i ms before its read (including future and boundary)", ageMs => {
+    const { store } = setup();
+    const mtimeMs = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(mtimeMs + ageMs);
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: BigInt(mtimeMs) * 1_000_000n,
+      })) as typeof fs.fstatSync);
+    const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+    const first = store.read(), second = store.read();
+    expect(second).toEqual(first);
+    expect(second).not.toBe(first);
+    expect(parse).toHaveBeenCalledTimes(2);
+    expect(disk).toHaveBeenCalledTimes(2);
   });
 
   it("detects a new inode even with identical size and mtime, then in-place mtime and size changes", () => {

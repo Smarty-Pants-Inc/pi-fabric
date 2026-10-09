@@ -15,6 +15,9 @@ describe("ActorManager registry-cache lifecycle (#7791)", () => {
     fs.mkdirSync(actorRoot);
     const file = path.join(actorRoot, "actors.json");
     fs.writeFileSync(file, '{"format":1,"actors":[]}');
+    // A racy generation would miss even without close-time eviction.
+    const old = new Date(Date.now() - 5_000);
+    fs.utimesSync(file, old, old);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
     const identity = { id: "session:cache-lifecycle", name: "main", kind: "main" as const, sessionId: "cache-lifecycle" };
     const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, {

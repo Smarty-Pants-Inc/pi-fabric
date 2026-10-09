@@ -20,13 +20,13 @@ const live = (pid: number): boolean => {
     return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
   } catch { return false; }
 };
-const fixture = (stubborn: boolean) => {
+const fixture = (stubborn: boolean, rootStubborn = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-finishing-"));
   roots.push(root);
   const pidFile = path.join(root, "pid");
   const release = path.join(root, "release");
   const settle = path.join(root, "settle");
-  vi.stubEnv("FAKE_PI_BEHAVIOR", stubborn ? "finishing-child-stubborn" : "finishing-child");
+  vi.stubEnv("FAKE_PI_BEHAVIOR", rootStubborn ? "finishing-root-stubborn" : stubborn ? "finishing-child-stubborn" : "finishing-child");
   vi.stubEnv("FAKE_PI_FINISHING_PID", pidFile);
   vi.stubEnv("FAKE_PI_FINISHING_RELEASE", release);
   vi.stubEnv("FAKE_PI_FINISHING_SETTLE", settle);
@@ -70,6 +70,21 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync(workerPath))("nat
       await Promise.all([wait, join]);
     }
   }, 20_000);
+
+  it("counts a refusing native Pi root as an owned descendant when closeChild escalates", async () => {
+    const f = fixture(true, true);
+    fs.writeFileSync(f.settle, "native completion");
+    const handle = await f.manager.spawn({ task: "native final then refusing Pi root", transport: "process" });
+    try {
+      await vi.waitFor(() => expect(f.manager.status(handle.id).status).toBe("finishing"), { timeout: 5_000 });
+      const pid = Number(fs.readFileSync(f.pidFile, "utf8"));
+      expect(live(pid)).toBe(true);
+      const result = await f.manager.wait(handle.id);
+      expect(result).toMatchObject({ status: "completed", text: "QUIESCENT" });
+      expect(live(pid)).toBe(false);
+      expect(result.warnings).toContain("finished with forced cleanup of 1 descendants");
+    } finally { await f.manager.stop(handle.id); }
+  }, 25_000);
 
   it("preserves a native final result beyond the inference deadline while forcibly cleaning a refusing descendant", async () => {
     const f = fixture(true);

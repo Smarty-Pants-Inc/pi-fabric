@@ -77,7 +77,8 @@ export const executionGroup = (child: ChildProcess) => {
         throw new Error(`Execution group ${pid} leader exited; birth-safe cleanup unavailable`);
       }
       if (process.platform === "linux") {
-        for (const value of members()) if (value.pid !== pid) forcedDescendants.add(`${value.pid}:${value.started}`);
+        // The execution root itself is a descendant of the transport worker.
+        for (const value of members()) forcedDescendants.add(`${value.pid}:${value.started}`);
       }
       try { process.kill(-pid, signal); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }

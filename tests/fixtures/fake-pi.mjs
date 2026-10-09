@@ -80,6 +80,20 @@ const terminated = () => {
 };
 
 switch (behavior) {
+  case "finishing-root-stubborn": {
+    process.on("SIGTERM", () => {});
+    fs.writeFileSync(process.env.FAKE_PI_FINISHING_PID, String(process.pid));
+    setInterval(() => {}, 1_000); // retain the native Pi root after EOF
+    emit({ type: "agent_start" });
+    emit({ type: "message_end", message: { role: "assistant", content: "QUIESCENT", stopReason: "stop" } });
+    const boundary = setInterval(() => {
+      if (!fs.existsSync(process.env.FAKE_PI_FINISHING_SETTLE)) return;
+      clearInterval(boundary);
+      emit({ type: "agent_end", willRetry: false });
+      emit({ type: "agent_settled", outcome: "completed" });
+    }, 10);
+    break;
+  }
   case "finishing-child":
   case "finishing-child-stubborn": {
     const pidFile = process.env.FAKE_PI_FINISHING_PID;

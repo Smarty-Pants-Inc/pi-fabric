@@ -50,7 +50,7 @@ if (["partial", "legacy", "fallback", "raw-cut", "normal", "reply", "error-exit-
 }
 if (mode === "reply" && process.env.PI_FABRIC_REPLY_FILE) fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify({ ok: true }));
 emit({ type: "message_start", message: { role: "assistant", content: [] } });
-if (!["fallback", "no-output", "no-text"].includes(mode)) {
+if (!["fallback", "no-output", "no-text", "later-tool-start-no-text"].includes(mode)) {
   if (mode === "legacy") {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "FINAL: completed" } });
     await snapshot("partialText", "FINAL: completed");
@@ -63,8 +63,8 @@ if (!["fallback", "no-output", "no-text"].includes(mode)) {
   }
   await snapshot("partialText", final);
 }
-if (["later-tool-start", "later-tool-delta", "later-tool-end"].includes(mode)) {
-  emit({ type: "message_update", assistantMessageEvent: { type: mode === "later-tool-start" ? "toolcall_start" : mode === "later-tool-end" ? "toolcall_end" : "toolcall_delta", contentIndex: 1, delta: "not report text" } });
+if (["later-tool-start", "later-tool-start-no-text", "later-tool-delta", "later-tool-end"].includes(mode)) {
+  emit({ type: "message_update", assistantMessageEvent: { type: mode.startsWith("later-tool-start") ? "toolcall_start" : mode === "later-tool-end" ? "toolcall_end" : "toolcall_delta", contentIndex: 1, delta: "not report text" } });
 } else if (mode === "later-tool-snapshot") {
   emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: final }, { type: "toolCall", id: "unresolved-work", name: "fabric_exec", arguments: {} }] } });
 } else if (mode === "later-tool-use") {

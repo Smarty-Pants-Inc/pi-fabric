@@ -71,8 +71,9 @@ const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
 const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
 // The racy-file age proof compares filesystem mtime with the client's clock.
 // Linux local filesystems share that clock; remote/unknown filesystems do not.
-// Probe lazily once per normalized directory while retained. Keep verdicts bounded
-// too, and drop them on release so a removed/recreated root is checked again.
+// Probe the file itself: a remote file bind mount can sit under a local directory.
+// Key verdicts by descriptor dev/ino so remounts and replacements are rechecked.
+// Keep verdicts bounded too, and drop a path's retained identities on release.
 const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
   0xEF53, // ext2/3/4
   0x58465342, // XFS
@@ -82,16 +83,17 @@ const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
   0xF2F52010, // f2fs
   0x2FC12FC1, // ZFS
 ]);
-const registryLocalClockCache = new Map<string, boolean>();
-const registryHasLocalClock = (directory: string): boolean => {
+const registryLocalClockCache = new Map<string, { filePath: string; local: boolean }>();
+const registryHasLocalClock = (filePath: string, stat: fs.BigIntStats): boolean => {
   // Other platforms' statfs type values are not comparable to Linux magic values.
-  if (process.platform !== "linux") return false;
-  const known = registryLocalClockCache.get(directory);
-  if (known !== undefined) return known;
+  if (process.platform !== "linux" || stat.ino <= 0n) return false;
+  const identity = `${stat.dev}:${stat.ino}`;
+  const known = registryLocalClockCache.get(identity);
+  if (known !== undefined) return known.local;
   let local = false;
-  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(directory).type); }
+  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(filePath).type); }
   catch { /* An unavailable filesystem identity cannot prove a host-local clock. */ }
-  registryLocalClockCache.set(directory, local);
+  registryLocalClockCache.set(identity, { filePath, local });
   if (registryLocalClockCache.size > REGISTRY_READ_CACHE_LIMIT) {
     registryLocalClockCache.delete(registryLocalClockCache.keys().next().value!);
   }
@@ -119,7 +121,6 @@ export interface ActorRegistryMutation<T> {
 /** Disk protocol shared by registry merges and fenced lineage adoption. */
 export class ActorRegistryStore {
   readonly #registryPath: string;
-  readonly #registryDirectory: string;
   readonly #actorRoot: string;
   readonly #writer: AtomicFileWriter;
   readonly #payloads: ActorRegistryPayloads;
@@ -136,7 +137,6 @@ export class ActorRegistryStore {
     this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
     this.#registryPath = path.resolve(actorRoot, "actors.json");
-    this.#registryDirectory = path.dirname(this.#registryPath);
     this.#writer = new AtomicFileWriter(this.#registryPath);
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
@@ -472,7 +472,9 @@ export class ActorRegistryStore {
   /** Release shared decoded state when its manager closes or its root is removed. */
   releaseReadCache(): void {
     registryReadCache.delete(this.#registryPath);
-    registryLocalClockCache.delete(this.#registryDirectory);
+    for (const [identity, verdict] of registryLocalClockCache) {
+      if (verdict.filePath === this.#registryPath) registryLocalClockCache.delete(identity);
+    }
     this.#snapshot = undefined;
   }
 
@@ -484,7 +486,7 @@ export class ActorRegistryStore {
     try {
       const readTimeMs = Date.now();
       const stat = fs.fstatSync(fd, { bigint: true });
-      const generation = registryHasLocalClock(this.#registryDirectory) &&
+      const generation = registryHasLocalClock(this.#registryPath, stat) &&
         stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
         ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
         : undefined;

@@ -285,11 +285,18 @@ export const isSqliteBusy = (error: unknown): boolean => {
 };
 const sqliteBusy = isSqliteBusy;
 
+/** `MeshStateWalCapError` (state-sqlite.ts) by its code: a write refused while a pinned reader holds the WAL above the cap. */
+export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
+export const isMeshStateWalCap = (error: unknown): boolean =>
+  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+
 /**
- * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, or a
- * raw SQLite busy error that escaped a path without its own mapping. Never fatal for a long-lived loop.
+ * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
+ * raw SQLite busy error that escaped a path without its own mapping, or a WAL-cap refusal
+ * (`FABRIC_MESH_STATE_WAL_CAP`, pi-fabric#694 P1 2: the operator rolls back; writes resume once the reader
+ * lets go). Never fatal for a long-lived loop.
  */
-export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error);
+export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
 
 /** Wraps a raw SQLite busy error as the retryable `MeshStateBusyError` (a `MeshLockTimeoutError`). */
 export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1, waitedMs = 0, where = "read"): MeshStateBusyError => {

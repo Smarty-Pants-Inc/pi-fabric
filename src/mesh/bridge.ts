@@ -12,7 +12,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { isMeshRetryableBusy, isMeshStateBusy } from "./state-backend.js";
+import { isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -40,6 +40,8 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
+// A WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP) can last until the operator rolls back: log it at most once a minute.
+const WAL_CAP_LOG_MS = 60_000;
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -1357,6 +1359,7 @@ export class MeshBridge {
     let started = false;
     let retryMs = LOCK_RETRY_MIN_MS;
     let reportedTimeout = false;
+    let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     while (!this.#stopped) {
       const pass = started ? this.step() : this.start();
       // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
@@ -1374,11 +1377,18 @@ export class MeshBridge {
         delay = this.options.pollMs ?? DEFAULT_POLL_MS;
       } catch (error) {
         if (this.#stopped) return;
-        // smarty-dev#6477: a raw SQLite busy is contention too, never a reason to stop the bridge.
+        // smarty-dev#6477: a raw SQLite busy is contention too, never a reason to stop the bridge; so is a
+        // WAL-cap refusal (pi-fabric#694 P1 2), logged with its reader report at most once a minute.
         if (!isMeshRetryableBusy(error)) throw error;
         delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        if (!reportedTimeout) {
+        if (isMeshStateWalCap(error)) {
+          const now = Date.now();
+          if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
+            this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);
+            walCapLoggedAt = now;
+          }
+        } else if (!reportedTimeout) {
           this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
           reportedTimeout = true;
         }

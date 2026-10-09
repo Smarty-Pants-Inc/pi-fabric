@@ -71,7 +71,9 @@ const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
 const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
 // The racy-file age proof compares filesystem mtime with the client's clock.
 // Linux local filesystems share that clock; remote/unknown filesystems do not.
-// Probe the file itself: a remote file bind mount can sit under a local directory.
+// Probe the opened file: a remote file bind mount can sit under a local directory.
+// Node has no fstatfs; /proc/self/fd resolves the descriptor's backing filesystem.
+// Overlayfs is not proof that its backing layers share the host clock.
 // Key verdicts by descriptor dev/ino so remounts and replacements are rechecked.
 // Keep verdicts bounded too, and drop a path's retained identities on release.
 const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
@@ -79,19 +81,18 @@ const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
   0x58465342, // XFS
   0x9123683E, // btrfs
   0x01021994, // tmpfs
-  0x794C7630, // overlayfs
   0xF2F52010, // f2fs
   0x2FC12FC1, // ZFS
 ]);
 const registryLocalClockCache = new Map<string, { filePath: string; local: boolean }>();
-const registryHasLocalClock = (filePath: string, stat: fs.BigIntStats): boolean => {
+const registryHasLocalClock = (filePath: string, fd: number, stat: fs.BigIntStats): boolean => {
   // Other platforms' statfs type values are not comparable to Linux magic values.
   if (process.platform !== "linux" || stat.ino <= 0n) return false;
   const identity = `${stat.dev}:${stat.ino}`;
   const known = registryLocalClockCache.get(identity);
   if (known !== undefined) return known.local;
   let local = false;
-  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(filePath).type); }
+  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(`/proc/self/fd/${fd}`).type); }
   catch { /* An unavailable filesystem identity cannot prove a host-local clock. */ }
   registryLocalClockCache.set(identity, { filePath, local });
   if (registryLocalClockCache.size > REGISTRY_READ_CACHE_LIMIT) {
@@ -486,7 +487,7 @@ export class ActorRegistryStore {
     try {
       const readTimeMs = Date.now();
       const stat = fs.fstatSync(fd, { bigint: true });
-      const generation = registryHasLocalClock(this.#registryPath, stat) &&
+      const generation = registryHasLocalClock(this.#registryPath, fd, stat) &&
         stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
         ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
         : undefined;

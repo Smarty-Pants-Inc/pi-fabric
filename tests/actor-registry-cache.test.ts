@@ -8,7 +8,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 
 const roots: string[] = [];
 const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-const localFilesystemTypes = [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x794C7630, 0xF2F52010, 0x2FC12FC1];
+const localFilesystemTypes = [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0xF2F52010, 0x2FC12FC1];
 const mockFilesystemType = (type: number, platform = "linux") => {
   Object.defineProperty(process, "platform", { ...nativePlatform, value: platform });
   return vi.spyOn(fs, "statfsSync").mockReturnValue({ type } as fs.StatsFs);
@@ -26,7 +26,7 @@ const setup = () => {
   let cacheable: boolean;
   try {
     const stat = fs.fstatSync(fd, { bigint: true });
-    cacheable = process.platform === "linux" && localFilesystemTypes.includes(fs.statfsSync(file).type) &&
+    cacheable = process.platform === "linux" && localFilesystemTypes.includes(fs.statfsSync(`/proc/self/fd/${fd}`).type) &&
       stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n;
   } finally { fs.closeSync(fd); }
   return { root, file, value, cacheable, store: new ActorRegistryStore(root) };
@@ -41,9 +41,9 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore cached read (#7791)", () => {
-  it.each(localFilesystemTypes)("shares mature cache hits on Linux local filesystem type %i with one file probe", type => {
+  it.each(localFilesystemTypes)("shares mature cache hits on Linux local filesystem type %i with one descriptor probe", type => {
     const statfs = mockFilesystemType(type);
-    const { root, file, value, store } = setup();
+    const { root, value, store } = setup();
     statfs.mockClear(); // Exclude the fixture's native-cacheability check.
     const alias = new ActorRegistryStore(path.join(root, "."));
     const nativeFstat = fs.fstatSync.bind(fs);
@@ -57,14 +57,15 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     for (let i = 1; i < 100; i++) expect((i % 2 ? alias : store).read()).toBe(first);
     expect(parse).toHaveBeenCalledTimes(1);
     expect(disk).toHaveBeenCalledTimes(1);
-    expect(statfs).toHaveBeenCalledExactlyOnceWith(path.resolve(file));
+    expect(statfs).toHaveBeenCalledExactlyOnceWith(`/proc/self/fd/${vi.mocked(fs.fstatSync).mock.calls[0]![0]}`);
   });
 
   it("re-reads an NFS registry file bind-mounted under a local directory", () => {
     const statfs = mockFilesystemType(0xEF53);
     const { root, file, value, store } = setup();
     statfs.mockImplementation((name => ({
-      type: String(name) === file ? 0x6969 : 0xEF53,
+      // Directory/pathname probes are not proof of the open file's filesystem.
+      type: String(name).startsWith("/proc/self/fd/") ? 0x6969 : 0xEF53,
     } as fs.StatsFs)) as typeof fs.statfsSync);
     expect(fs.statfsSync(root).type).toBe(0xEF53);
     statfs.mockClear();
@@ -83,12 +84,13 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(store.read()).toEqual(replacement);
     expect(parse).toHaveBeenCalledTimes(3);
     expect(disk).toHaveBeenCalledTimes(3);
-    expect(statfs).toHaveBeenCalledExactlyOnceWith(path.resolve(file));
+    expect(statfs).toHaveBeenCalledExactlyOnceWith(`/proc/self/fd/${vi.mocked(fs.fstatSync).mock.calls[0]![0]}`);
   });
 
   it.each([
     ["NFS", 0x6969, "linux"], ["SMB", 0x517B, "linux"],
     ["CIFS", 0xFF534D42, "linux"], ["FUSE", 0x65735546, "linux"],
+    ["overlayfs with unproven backing layers", 0x794C7630, "linux"],
     ["unknown", 0, "linux"], ["unavailable", 0, "linux"],
     ["Windows magic collision", 0xEF53, "win32"], ["macOS magic collision", 0xEF53, "darwin"],
   ] as const)("always re-reads %s despite negative server-clock skew and identical metadata", (name, type, platform) => {
@@ -125,7 +127,7 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(parse).toHaveBeenCalledTimes(6);
     expect(disk).toHaveBeenCalledTimes(6);
     expect(statfs).toHaveBeenCalledTimes(platform === "linux" ? 1 : 0);
-    if (platform === "linux") expect(statfs).toHaveBeenCalledWith(path.resolve(file));
+    if (platform === "linux") expect(statfs).toHaveBeenCalledWith(`/proc/self/fd/${vi.mocked(fs.fstatSync).mock.calls[0]![0]}`);
   });
 
   it.each(["dev", "ino"] as const)("re-probes the file when descriptor %s changes", field => {
@@ -140,7 +142,7 @@ describe("ActorRegistryStore cached read (#7791)", () => {
       })) as typeof fs.fstatSync);
     const before = store.read();
     expect(store.read()).toBe(before);
-    expect(statfs).toHaveBeenCalledExactlyOnceWith(path.resolve(file));
+    expect(statfs).toHaveBeenCalledExactlyOnceWith(`/proc/self/fd/${vi.mocked(fs.fstatSync).mock.calls[0]![0]}`);
     identity = 2n; // The verdict must use this descriptor, not a separate path stat.
     statfs.mockReturnValue({ type: 0x6969 } as fs.StatsFs);
     const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
@@ -151,7 +153,9 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(after).not.toBe(before);
     expect(store.read()).not.toBe(after);
     expect(statfs).toHaveBeenCalledTimes(2);
-    expect(statfs.mock.calls.every(([name]) => String(name) === path.resolve(file))).toBe(true);
+    expect(statfs.mock.calls.map(([name]) => String(name))).toEqual(
+      [0, 2].map(i => `/proc/self/fd/${fstat.mock.calls[i]![0]}`),
+    );
     expect(fstat).toHaveBeenCalledTimes(4);
   });
 

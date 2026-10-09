@@ -171,7 +171,8 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** realarmedAt: last published repeat alarm (smarty-dev#7782); persisted, so a restart or new owner keeps the cap. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number; realarmedAt?: number };
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
@@ -542,8 +543,8 @@ export class ActorManager {
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
-  /** Last repeat activation-block alarm per actor; in memory, so a restart may re-alarm once. */
-  readonly #blockRealarmAt = new Map<string, number>();
+  /** Actors with a repeat activation-block alarm being published: one publish per actor at a time. */
+  readonly #blockRealarmInFlight = new Set<string>();
   readonly #delivered = new Set<string>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
@@ -3112,7 +3113,6 @@ export class ActorManager {
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
           delete actor.activationBlocked;
-          this.#blockRealarmAt.delete(actor.id);
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
@@ -3335,6 +3335,7 @@ export class ActorManager {
     actor.activationBlocked = {
       reason, code, since: previous?.code === code ? previous.since : Date.now(),
       count: previous?.code === code ? previous.count + 1 : 1,
+      ...(previous?.code === code && previous.realarmedAt !== undefined ? { realarmedAt: previous.realarmedAt } : {}),
     };
     actor.updatedAt = Date.now();
     void this.#publishPresence(actor).catch(() => undefined);
@@ -4060,16 +4061,25 @@ export class ActorManager {
   #realarmBlockedActivation(actor: ManagedActor, now: number): void {
     const blocked = actor.activationBlocked;
     if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
-    const last = this.#blockRealarmAt.get(actor.id);
-    // An entry older than the block's start belongs to an earlier, cleared block.
-    if (last !== undefined && last >= blocked.since && now - last < ACTOR_BLOCK_REALARM_EVERY_MS) return;
-    this.#blockRealarmAt.set(actor.id, now);
-    void this.#publishNotification({
+    if (blocked.realarmedAt !== undefined && now - blocked.realarmedAt < ACTOR_BLOCK_REALARM_EVERY_MS) return;
+    if (this.#blockRealarmInFlight.has(actor.id)) return;
+    this.#blockRealarmInFlight.add(actor.id);
+    // ponytail: publish directly, like the ops.owner alarm: #publishNotification resolves after
+    // a first attempt even when that attempt failed and was dropped, so it cannot gate the stamp.
+    void this.mesh.publish({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
       data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
         since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
         pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since },
-    }).catch(() => undefined);
+    }).then(() => {
+      // Stamp only a published alarm, on the same block this owner still holds; the
+      // durable registry save carries it to a restarted or next owner. A rejection
+      // leaves the stamp unchanged, so the next sweep retries.
+      if (this.#closing || this.#actors.get(actor.id) !== actor || actor.activationBlocked !== blocked ||
+        !this.#canManageCached(actor.id)) return;
+      blocked.realarmedAt = now;
+      this.#scheduleRegistrySave(true);
+    }, () => undefined).finally(() => this.#blockRealarmInFlight.delete(actor.id));
   }
 
   #startRetentionSweep(): void {
@@ -4083,7 +4093,6 @@ export class ActorManager {
     // A microtask is not a yield: let RPC/input run before touching archives,
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
-    for (const id of this.#blockRealarmAt.keys()) if (!this.#actors.get(id)?.activationBlocked) this.#blockRealarmAt.delete(id);
     const actors = [...this.#actors.values()];
     // NTFS metadata/deletion can make eight actors (72 expired runs in the
     // startup fixture) monopolize a turn. Keep each run's work unchanged,
@@ -4852,7 +4861,8 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
+          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count,
+            ...(typeof record.activationBlocked.realarmedAt === "number" ? { realarmedAt: record.activationBlocked.realarmedAt } : {}) } }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"

@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -19,6 +19,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 
@@ -202,6 +203,200 @@ describe("ActorManager idle observer versus canonical authority (#4383)", () => 
       }
     } finally { start.mockRestore(); schedule.mockRestore(); read.mockRestore(); }
   }, 30_000);
+});
+
+describe("ActorManager bound registry metadata (#7682)", () => {
+  const row = (root: string, id: string) => {
+    const registry = JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8"));
+    return registry.actors.find((actor: { id: string }) => actor.id === id);
+  };
+
+  it("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
+    const state = setup(true);
+    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "project policy", thinking: "medium" as const };
+    const actor = await state.actors.create({ name: "rollback-defaults", instructions: "Observe.", ...defaults });
+    await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+      binding: { model: "provider/foreign", modelReason: "one run only", thinking: "low" },
+    });
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    // The pre-#741 writer rebuilt rows from these known fields. It did not
+    // preserve unknown fields, including projectDefaults or resolvedBinding.
+    const oldFields = new Set([
+      "id", "name", "rootId", "adoptedAt", "adoptedFrom", "project", "instructions", "status",
+      "events", "topics", "delivery", "responseMode", "triggerTurn", "coalesce", "residency", "runner",
+      "kernel", "pythonRuntime", "runnerSessionId", "model", "modelReason", "thinking", "routeClass",
+      "protected", "tools", "transport", "timeoutMs", "nice", "bashTimeoutSeconds", "extensions",
+      "inferenceContext", "coalesceKey", "activationFilter", "filterSkipped", "activationFilterExpiresAt",
+      "filteredCount", "lastFilteredAt", "requirements", "capabilityDigest", "activationBlocked",
+      "failureStreak", "validWhile", "sessionFile", "messages", "messageHistory", "createdAt",
+      "updatedAt", "lastRunId", "removal", "presenceError",
+    ]);
+    const store = new ActorRegistryStore(path.join(state.root, "actors"));
+    registry.actors = registry.actors.map((source: Record<string, unknown>) => Object.fromEntries(
+      Object.entries({ ...source, instructions: store.instructions(source) }).filter(([key]) => oldFields.has(key)),
+    ));
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project", ...defaults });
+    expect(restored.resolveBinding(actor.id)).toEqual(defaults);
+    // An old save may lose knowledge of the last run, never the defaults.
+    expect(restored.listOwned(true)[0]?.model).toBeUndefined();
+  });
+
+  it.each([false, true])("round 2 keeps legacy shared views unknown with project defaults=%s and reader overlays", async hasDefaults => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "legacy-reader", instructions: "Observe.",
+      ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
+    });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].projectDefaults;
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    for (const sessionId of ["reader-a", "reader-b"]) {
+      const bindings = new ActorBindingStore(sessionId, path.join(state.root, "actors"));
+      await bindings.setModel(actor.id, `provider/${sessionId}`);
+      await bindings.setThinking(actor.id, "high");
+      const reader = new ActorManager(sessionId, { ...state.identity, id: `session:${sessionId}`, sessionId },
+        state.mesh, state.meshConfig, state.agents, () => {}, {
+          actorRoot: path.join(state.root, "actors"), persistent: true, canManageActor: () => true,
+        });
+      actorManagers.push(reader);
+      const before = fs.readFileSync(file, "utf8");
+      expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
+      const shared = reader.listOwned(true)[0]!;
+      expect(shared.model).toBeUndefined();
+      expect(shared.thinking).toBeUndefined();
+      expect(shared.binding).toBeUndefined();
+      const member = actorParticipantRecord(shared, `session:${sessionId}`, "host", `session:${sessionId}`, `session:${sessionId}`);
+      expect(member.model).toBeUndefined();
+      expect(member.thinking).toBeUndefined();
+      expect(fs.readFileSync(file, "utf8")).toBe(before);
+      // A binding-only presence publication also must not stamp the overlay
+      // into either shared presence or the registry.
+      await reader.setModel(actor.id, `provider/${sessionId}-new`);
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
+      expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+      expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
+      expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
+      await reader.close();
+    }
+  });
+
+  it("round 2 never derives missing project defaults from a persisted known binding", async () => {
+    const state = setup(true, undefined, undefined, undefined, {}, { model: "provider/config", thinking: "high" });
+    const actor = await state.actors.create({ name: "binding-without-default", instructions: "Observe." });
+    await state.actors.close();
+    const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.listOwned(true)[0]).toMatchObject({ model: "provider/config", thinking: "high" });
+    expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project" });
+    expect(restored.resolveBinding(actor.id)).toEqual({});
+  });
+
+  it("records a known configuration binding at create without pinning project defaults", async () => {
+    const state = setup(true, undefined, undefined, {
+      resolvePiModel: model => model === "luna" ? "cliproxyapi/gpt-6-luna" : model,
+    }, {}, { model: "luna", thinking: "xhigh" });
+    const actor = await state.actors.create({ name: "known-binding", instructions: "Observe." });
+    expect(row(state.root, actor.id)).toMatchObject({
+      resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" },
+    });
+    expect(row(state.root, actor.id).model).toBeUndefined();
+    expect(row(state.root, actor.id).thinking).toBeUndefined();
+    expect(row(state.root, actor.id).projectDefaults).toBeUndefined();
+    expect(state.actors.status(actor.id).projectDefaults?.model).toBeUndefined();
+    expect(state.actors.resolveBinding(actor.id)).toEqual({});
+    await state.actors.stop(actor.id);
+    const recreated = await state.actors.create({ name: "known-binding", instructions: "Observe.", model: "provider/new", thinking: "low" });
+    expect(recreated.id).not.toBe(actor.id);
+    expect(row(state.root, recreated.id)).toMatchObject({ model: "provider/new", thinking: "low" });
+  });
+
+  it("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+    await state.actors.setThinking(actor.id, "xhigh");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+    const publish = vi.spyOn(state.mesh, "publish");
+    const runOnce = async (message: string) => {
+      saves.mockClear(); publish.mockClear();
+      await state.actors.ask(actor.id, message);
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      return { saves: saves.mock.calls.length, events: publish.mock.calls.length };
+    };
+    try {
+      const changed = await runOnce("first");
+      expect(row(state.root, actor.id)).toMatchObject({ model: "anthropic/claude-opus-5-5", thinking: "medium",
+        resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" } });
+      expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+      const unchanged = await runOnce("unchanged");
+      // The first run may also initialize lifecycle state; a stable binding must
+      // never add a write or notification compared with a changed binding.
+      expect(unchanged.saves).toBeLessThanOrEqual(changed.saves);
+      expect(unchanged.events).toBe(changed.events);
+      saves.mockClear(); publish.mockClear();
+      const unchangedBytes = fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8");
+      for (let i = 0; i < 20; i++) state.actors.listOwned(true);
+      await new Promise(resolve => setTimeout(resolve, 80));
+      expect(saves).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8")).toBe(unchangedBytes);
+      await state.actors.ask(actor.id, "foreign pin", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      expect(row(state.root, actor.id)).toMatchObject({ model: "anthropic/claude-opus-5-5", thinking: "medium",
+        resolvedBinding: { model: "provider/foreign", thinking: "low" } });
+      const participant = actorParticipantRecord(state.actors.listOwned(true)[0]!, state.identity.id, "host", state.identity.id, state.identity.id);
+      expect(participant).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+      await state.actors.close();
+      const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true,
+      });
+      actorManagers.push(restored);
+      expect(restored.listOwned(true)[0]).toMatchObject({ model: "provider/foreign", thinking: "low",
+        projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+      expect(restored.resolveBinding(actor.id)).toEqual({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    } finally { saves.mockRestore(); publish.mockRestore(); }
+  });
+
+  it("records the post-admission model rather than a pre-launch selector", async () => {
+    const state = setup(true, undefined, undefined, {
+      preparePiModel: async model => model === "provider/selector" ? "cliproxyapi/gpt-6-luna" : model,
+    });
+    const actor = await state.actors.create({ name: "admitted-binding", instructions: "Observe.", model: "provider/selector" });
+    await state.actors.ask(actor.id, "first");
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    expect(row(state.root, actor.id)).toMatchObject({ model: "provider/selector",
+      resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: state.agents.config.thinking } });
+    expect(state.actors.status(actor.id).projectDefaults?.model).toBe("provider/selector");
+    // Do not republish the pre-admission selector on every run: an unchanged
+    // canonical binding must not be flipped back to the selector while preparing.
+    const advertised: Array<string | undefined> = [];
+    const unsubscribe = state.actors.subscribe(() => advertised.push(state.actors.listOwned(true)[0]?.model));
+    try {
+      await state.actors.ask(actor.id, "same selector, same admitted model");
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      expect(advertised.length).toBeGreaterThan(0);
+      expect(advertised.every(model => model === "cliproxyapi/gpt-6-luna")).toBe(true);
+      expect(row(state.root, actor.id).resolvedBinding.model).toBe("cliproxyapi/gpt-6-luna");
+    } finally { unsubscribe(); }
+  });
 });
 
 describe("ActorManager idle registry writes (#4383)", () => {
@@ -3010,6 +3205,246 @@ describe("ActorManager", () => {
     expect(notices()).toHaveLength(2);
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
+
+  // smarty-dev#7782: a block that persists for days alarmed only once.
+  it("re-alarms an actor that stays activation-blocked, at most once per interval, and not after it clears", async () => {
+    const s = setup();
+    await s.actors.close();
+    const actors = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors-realarm"), persistent: false, retentionSweepMs: 20,
+    });
+    actorManagers.push(actors);
+    const REALARM_AFTER_MS = 2 * 60 * 60 * 1000, REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    const blocked = await actors.create({ name: "stuck", instructions: "Respond.", responseMode: "directive" });
+    const cleared = await actors.create({ name: "cleared", instructions: "Respond.", responseMode: "directive" });
+    for (const id of [blocked.id, cleared.id]) {
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(id, "FAIL_DIRECTIVE").catch(() => undefined);
+    }
+    await actors.ask(cleared.id, "all good");
+    expect(actors.status(cleared.id).activationBlocked).toBeUndefined();
+    const repeats = (id: string) => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 50 })
+      .filter((event) => (event.data as { actorId?: string; repeat?: boolean }).actorId === id && (event.data as { repeat?: boolean }).repeat);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
+    await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 50 }).length === 2);
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(0);           // younger than the window
+    skew = REALARM_AFTER_MS + 1_000;
+    await waitFor(() => repeats(blocked.id).length === 1);
+    expect(repeats(blocked.id)[0]!.data).toMatchObject({ actorId: blocked.id, repeat: true,
+      code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER, pendingEffects: "reconcile-required",
+      blockedForMs: expect.any(Number) });
+    expect(repeats(blocked.id)[0]!.kind).toBe("actor-activation-blocked");
+    expect((repeats(blocked.id)[0]!.data as { blockedForMs: number }).blockedForMs).toBeGreaterThanOrEqual(REALARM_AFTER_MS);
+    skew += REALARM_EVERY_MS - 60_000;
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(1);           // none again within the interval
+    skew += 120_000;
+    await waitFor(() => repeats(blocked.id).length === 2);
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(2);
+    expect(repeats(cleared.id)).toHaveLength(0);           // a cleared actor never re-alarms
+  }, 60_000);
+
+  describe("shared re-alarm claim (smarty-dev#7782 review c6085914061, c6086965366)", () => {
+    const HOUR = 60 * 60 * 1000;
+    const fakeClock = () => {
+      const realNow = Date.now.bind(Date);
+      const clock = { skew: 0 };
+      vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
+      return clock;
+    };
+    const repeats = (mesh: MeshStore, id: string) => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 100 })
+      .filter((event) => (event.data as { actorId?: string }).actorId === id && (event.data as { repeat?: boolean }).repeat);
+    const claim = (mesh: MeshStore, id: string) => mesh.get(actorRealarmKey(id))?.value as { since: number; slot: number; owner: string } | undefined;
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
+    const block = async (manager: ActorManager) => {
+      const actor = await manager.create({ name: "stuck", instructions: "Respond.", responseMode: "directive" });
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+        await manager.ask(actor.id, "FAIL_DIRECTIVE").catch(() => undefined);
+        await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
+      }
+      expect(manager.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      return actor;
+    };
+    const persistentManager = (s: ReturnType<typeof setup>, name = "test", extra: Record<string, unknown> = {}) => {
+      const identity: MeshIdentity = name === "test" ? s.identity : { id: `session:${name}`, name: "main", kind: "main", sessionId: name };
+      const manager = new ActorManager(name, identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true, retentionSweepMs: 20, ...extra,
+      });
+      actorManagers.push(manager);
+      return manager;
+    };
+    /** Holds every repeat-alarm publish until release(); counts the attempts. */
+    const gatePublish = (mesh: MeshStore) => {
+      const publish = mesh.publish.bind(mesh);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const state = { calls: 0, release: () => release() };
+      vi.spyOn(mesh, "publish").mockImplementation(async (request) => {
+        if ((request.data as { repeat?: boolean } | undefined)?.repeat) { state.calls++; await gate; }
+        return publish(request);
+      });
+      return state;
+    };
+    const startOwned = async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const owns: Record<string, boolean> = { a: true };
+      const a = persistentManager(s, "a", { canManageActor: () => owns.a });
+      const actor = await block(a);
+      return { s, clock, owns, a, actor };
+    };
+
+    it("(a)+(g) a restarted manager does not re-alarm the claimed slot, and the next slot alarms", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      let manager = persistentManager(s);
+      const actor = await block(manager);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlocked!.since, owner: s.identity.id });
+      await manager.close();
+      manager = persistentManager(s);
+      clock.skew += 6 * HOUR - 60_000;
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);    // its sweeps do not re-alarm slot 0
+      clock.skew += 120_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 1 });
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(2);
+    }, 60_000);
+
+    it("(b) a new owner does not re-alarm the claimed slot", async () => {
+      const { s, clock, owns, a, actor } = await startOwned();
+      owns.b = false;
+      const b = persistentManager(s, "b", { canManageActor: () => owns.b });
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      owns.a = false; owns.b = true;
+      a.listOwned(); b.listOwned();
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      clock.skew += 6 * HOUR - 60_000;
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+      clock.skew += 120_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(repeats(s.mesh, actor.id).at(-1)!.from).toMatchObject({ id: "session:b" });
+    }, 60_000);
+
+    it("(c)+(h) a rejected publish releases the claim, and the next sweep retries and claims", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const manager = persistentManager(s);
+      const actor = await block(manager);
+      const publish = s.mesh.publish.bind(s.mesh);
+      let rejected = 0;
+      let claimAtRetry: unknown = "unset";
+      vi.spyOn(s.mesh, "publish").mockImplementation(async (request) => {
+        if ((request.data as { repeat?: boolean } | undefined)?.repeat && rejected++ === 0) {
+          // Released only after this rejection: read the claim at the retry instead.
+          throw new Error("mesh down");
+        }
+        return publish(request);
+      });
+      const del = s.mesh.delete.bind(s.mesh);
+      vi.spyOn(s.mesh, "delete").mockImplementation(async (input) => {
+        const result = await del(input);
+        if (input.key === actorRealarmKey(actor.id)) claimAtRetry = claim(s.mesh, actor.id);
+        return result;
+      });
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      expect(rejected).toBe(2);
+      expect(claimAtRetry).toBeUndefined();                  // the rejection released the claim
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0 });
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+    }, 60_000);
+
+    it("(d) sweeps that overlap a slow publish publish once", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const manager = persistentManager(s);
+      const actor = await block(manager);
+      const gated = gatePublish(s.mesh);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => gated.calls === 1);
+      await settle();                                        // ~a dozen 20 ms sweeps
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      await settle();
+      expect(gated.calls).toBe(1);
+    }, 60_000);
+
+    it("(e) a handoff while the old owner's publish is pending publishes once", async () => {
+      const { s, clock, owns, a, actor } = await startOwned();
+      owns.b = false;
+      const b = persistentManager(s, "b", { canManageActor: () => owns.b });
+      const gated = gatePublish(s.mesh);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => gated.calls === 1);
+      owns.a = false; owns.b = true;                         // A's publish is still pending
+      a.listOwned(); b.listOwned();
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      await settle();
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      await settle();
+      expect(gated.calls).toBe(1);
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+    }, 60_000);
+
+    it("(f)+(g) a restart before any save does not re-alarm the slot; the next slot does", async () => {
+      const { s, clock, owns, actor } = await startOwned();
+      const gated = gatePublish(s.mesh);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => gated.calls === 1);
+      // A dies mid-publish: never closed, nothing saved after the claim. Its restart takes over.
+      owns.a = false;
+      const restarted = persistentManager(s, "a", { canManageActor: () => true });
+      expect(restarted.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      await settle();
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      clock.skew += 6 * HOUR;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(gated.calls).toBe(2);
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(2);
+    }, 60_000);
+
+    it("clears the claim when the block clears, and a new block episode claims and alarms again", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const manager = persistentManager(s);
+      const actor = await block(manager);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => claim(s.mesh, actor.id) !== undefined && repeats(s.mesh, actor.id).length === 1);
+      await manager.ask(actor.id, "all good");
+      await waitFor(() => claim(s.mesh, actor.id) === undefined);
+      expect(manager.status(actor.id).activationBlocked).toBeUndefined();
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+        await manager.ask(actor.id, "FAIL_DIRECTIVE").catch(() => undefined);
+        await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
+      }
+      const since = manager.status(actor.id).activationBlocked!.since;
+      clock.skew += 2 * HOUR + 1_000;                        // over the deleted claim's tombstone
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ since, slot: 0 });
+    }, 60_000);
+  });
 
   it("5256 excludes a failed streak from routing presence across restart and flags pending effects until a successful probe", async () => {
     const s = setup(true);

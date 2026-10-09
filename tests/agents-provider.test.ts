@@ -4347,6 +4347,71 @@ describe("AgentsProvider retained run authorization", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
+  it.each([false, true])("round 2 members leaves a legacy binding unknown with project defaults=%s (#7682)", async hasDefaults => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "legacy-member", instructions: "Observe.",
+      ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
+    });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].projectDefaults;
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const reader = new ActorManager("test", state.identity, state.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(reader);
+    await reader.setModel(actor.id, "provider/reader-overlay");
+    await reader.setThinking(actor.id, "high");
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => reader.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, reader, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      const members = await provider.invoke("members", { kinds: ["actor"] }, context) as FabricParticipantInfo[];
+      expect(members).toHaveLength(1);
+      expect(members[0]?.id).toBe(actor.id);
+      expect(members[0]?.model).toBeUndefined();
+      expect(members[0]?.thinking).toBeUndefined();
+      expect(reader.status(actor.id)).toMatchObject({ model: "provider/reader-overlay", thinking: "high" });
+    } finally { await directory.close(); }
+  });
+
+  it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => state.actors.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+      await state.actors.setThinking(actor.id, "xhigh");
+      await state.actors.ask(actor.id, "first run");
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" }),
+      ]);
+      await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "provider/foreign", thinking: "low" }),
+      ]);
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna",
+        projectDefaults: { model: "anthropic/claude-opus-5-5" } });
+    } finally { await directory.close(); }
+  });
+
   it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
     const { provider, actors } = setup();
     const actor = await actors.create(createRequest as FabricActorRequest);
@@ -4826,7 +4891,8 @@ describe("AgentsProvider shared actor definitions", () => {
       fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };
     expect(registry.actors).toContainEqual(
-      expect.objectContaining({ id: actor.id, model: "provider/project-default" }),
+      expect.objectContaining({ id: actor.id, model: "provider/project-default", thinking: "medium",
+        resolvedBinding: { model: "provider/model-b", thinking: "medium" } }),
     );
   });
 

@@ -3,6 +3,8 @@
 
 Uses only Python stdlib. Counts producer custom_message.details.wakeCause and
 actual custom pi-fabric.wake-cause.data separately (never double-counts them).
+Raw-user ambiguous/unattributed diagnostics are counted separately, never as
+Fabric wakes. They include human input and do not assert an originating party.
 The optional >=2min idle view classifies native user requests as user, even if
 text contains Fabric headers/JSON. It is diagnostic, not the fresh-turn counter.
 """
@@ -37,8 +39,24 @@ def cause_record(value):
     return value
 
 
+def diagnostic_record(value):
+    if not isinstance(value, dict) or value.get("cause") not in ("ambiguous", "unattributed"):
+        raise ValueError("invalid raw-user wake diagnostic")
+    if any(field in value for field in ("from", "principal", "provenance")):
+        raise ValueError("raw-user diagnostic must not claim an origin or authority")
+    if value["cause"] == "ambiguous":
+        candidates = value.get("candidates")
+        if value.get("basis") != "unconfirmed-raw-input-attempts" or not isinstance(candidates, list) or len(candidates) < 2:
+            raise ValueError("ambiguous diagnostic requires unconfirmed attempt candidates")
+        for candidate in candidates:
+            cause_record(candidate)
+    elif "candidates" in value:
+        raise ValueError("unattributed diagnostic must not carry candidate origin claims")
+    return value
+
+
 def read_session(filename, idle_ms):
-    producers, wakes, idle_requests = [], [], []
+    producers, wakes, diagnostics, idle_requests = [], [], [], []
     last_assistant = None
     with pathlib.Path(filename).open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -53,6 +71,8 @@ def read_session(filename, idle_ms):
                                       "record": cause_record(details["wakeCause"])})
                 if entry.get("type") == "custom" and entry.get("customType") == "pi-fabric.wake-cause":
                     wakes.append({"entryId": entry.get("id"), "at": at, "record": cause_record(entry.get("data"))})
+                if entry.get("type") == "custom" and entry.get("customType") == "pi-fabric.wake-diagnostic":
+                    diagnostics.append({"entryId": entry.get("id"), "at": at, "record": diagnostic_record(entry.get("data"))})
                 message = entry.get("message") or {}
                 if entry.get("type") == "message" and message.get("role") == "assistant":
                     last_assistant = at
@@ -73,7 +93,9 @@ def read_session(filename, idle_ms):
     count = lambda rows: dict(sorted(collections.Counter(row["record"]["cause"] for row in rows).items()))
     return {"session": str(filename), "producerCount": len(producers), "producerCauseCounts": count(producers),
             "freshTurnCount": len(wakes), "freshTurnCauseCounts": count(wakes), "freshTurns": wakes,
-            "producerMessages": producers, "idleThresholdMs": idle_ms, "requestsAfterIdle": idle_requests,
+            "producerMessages": producers, "rawUserDiagnosticCount": len(diagnostics),
+            "rawUserDiagnosticCounts": count(diagnostics), "rawUserDiagnostics": diagnostics,
+            "idleThresholdMs": idle_ms, "requestsAfterIdle": idle_requests,
             "requestsAfterIdleCounts": dict(sorted(collections.Counter(row["cause"] for row in idle_requests).items())),
             "freshTurnsWithoutMatchingProducer": [row for row in wakes if not any(row["record"] == item["record"] for item in producers)]}
 

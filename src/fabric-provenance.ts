@@ -13,6 +13,7 @@ export {
   fabricWakeCause,
   fabricWakeMessage,
   type FabricWakeCause,
+  type FabricWakeDiagnostic,
   type FabricPrincipal,
   type FabricPrincipalAuthorityCheck,
   fabricHostIdentity,

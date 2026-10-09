@@ -332,9 +332,10 @@ export const sendFabricUserMessage = (
   const state = wakeCaptures.get(pi);
   const sender = state ? (typeof from === "function" ? from() : from) : undefined;
   if (state && sender) {
-    const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n");
-    state.pending.push({ text, cause: fabricWakeCause(sender, via === "steer" ? "steer" : via === "actor" ? "actor" : "followUp") });
-    if (state.pending.length > 128) state.pending.shift();
+    // Attempts explain ambiguity, never establish admission identity. Native input hooks
+    // may handle these requests before our observer; there is no completion receipt.
+    state.attempts.push(fabricWakeCause(sender, via === "steer" ? "steer" : via === "actor" ? "actor" : "followUp"));
+    if (state.attempts.length > 128) state.attempts.shift();
   }
   const deliveryOptions = verification === "mesh" || verification === "bridge"
     ? fabricProvenanceOptions(pi, options, () =>
@@ -368,13 +369,19 @@ export const copyFabricWakeCause = (value: unknown): FabricWakeCause | undefined
     typeof wake.key === "string" ? wake.key : undefined);
 };
 
+/** Raw-user diagnostics make NO origin claim; candidates are unconfirmed send attempts. */
+export type FabricWakeDiagnostic = { cause: "unattributed" } | {
+  cause: "ambiguous";
+  candidates: FabricWakeCause[];
+  basis: "unconfirmed-raw-input-attempts";
+};
+
 interface WakeCapture {
   identity: MeshIdentity;
   cause?: FabricWakeCause | undefined;
-  user: boolean;
   recorded: boolean;
-  input?: { text: string; cause: FabricWakeCause } | undefined;
-  pending: Array<{ text: string; cause: FabricWakeCause }>;
+  diagnostic?: FabricWakeDiagnostic | undefined;
+  attempts: FabricWakeCause[];
 }
 const wakeCaptures = new WeakMap<ExtensionAPI, WakeCapture>();
 const isWakeInbox = (type: string): boolean => type.includes("inbox") || type.includes("completion") ||
@@ -393,54 +400,51 @@ export const fabricWakeMessage = (
     isWakeInbox(message.customType) ? "inbox" : "host-event") } };
 };
 
-/** One native custom entry per inference boundary with newly admitted Fabric input, not per send attempt. */
+/** Exact origins and raw-user uncertainty use separate native entries, once per admission boundary. */
 export const registerFabricWakeCapture = (pi: ExtensionAPI): void => {
   if (wakeCaptures.has(pi)) return;
-  const state: WakeCapture = { identity: wakeHost(pi), user: false, recorded: false, pending: [] };
+  const state: WakeCapture = { identity: wakeHost(pi), recorded: false, attempts: [] };
   wakeCaptures.set(pi, state);
-  const reset = (): void => { state.cause = undefined; state.user = false; state.recorded = false; };
+  const reset = (): void => { state.cause = undefined; state.diagnostic = undefined; state.recorded = false; };
+  const clear = (): void => { reset(); state.attempts = []; };
   pi.on("session_start", (_event, context) => {
-    reset(); state.pending = []; state.input = undefined;
+    clear();
     state.identity = fabricHostIdentity(context.sessionManager.getSessionId());
   });
-  pi.on("session_before_switch", () => { reset(); state.pending = []; state.input = undefined; });
-  pi.on("session_tree", () => { reset(); state.pending = []; state.input = undefined; });
-  pi.on("session_shutdown", () => { reset(); state.pending = []; state.input = undefined; });
+  pi.on("session_before_switch", clear);
+  pi.on("session_tree", clear);
+  pi.on("session_shutdown", clear);
   pi.on("agent_settled", (event, context) => {
-    if (context.signal?.aborted || (event as { outcome?: string }).outcome === "aborted") {
-      reset(); state.pending = []; state.input = undefined;
-    }
+    if (context.signal?.aborted || (event as { outcome?: string }).outcome === "aborted") clear();
   });
   pi.on("turn_start", reset);
-  pi.on("input", event => {
-    state.input = undefined;
-    // Equal human text must never consume an extension's queued attribution.
-    if (event.source !== "extension") return;
-    const index = state.pending.findIndex(item => item.text === event.text);
-    if (index >= 0) state.input = state.pending.splice(index, 1)[0];
-  });
   pi.on("message_start", event => {
     if (event.message.role === "custom") {
       const details = event.message.details as { wakeCause?: unknown } | undefined;
       const cause = copyFabricWakeCause(details?.wakeCause);
-      if (cause) { state.cause = cause; state.user = false; }
+      if (cause) { state.cause = cause; state.diagnostic = undefined; }
     } else if (event.message.role === "user") {
-      const content = event.message.content;
-      const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n");
+      // Only a host-owned admission receipt is exact. Even equal text observed in
+      // input preflight is not identity: queued inputs and handled commands break it.
       const receipt = (event.message as { provenance?: FabricTurnProvenance }).provenance;
-      const admitted = copyFabricProvenance(receipt);
-      const input = state.input;
-      const queued = input?.text === text ? input?.cause : undefined;
-      state.input = undefined;
-      state.cause = queued ?? (admitted ? fabricWakeCause(admitted.sender,
-        admitted.via === "steer" ? "steer" : admitted.via === "actor" ? "actor" : "followUp") : undefined);
-      state.user = !state.cause;
+      const admitted = fabricProvenanceSupported(pi) ? copyFabricProvenance(receipt) : undefined;
+      state.cause = admitted ? fabricWakeCause(admitted.sender,
+        admitted.via === "steer" ? "steer" : admitted.via === "actor" ? "actor" : "followUp") : undefined;
+      if (state.cause) state.diagnostic = undefined;
+      else if (state.diagnostic?.cause !== "ambiguous") {
+        state.diagnostic = state.attempts.length > 1
+          ? { cause: "ambiguous", candidates: state.attempts.map(candidate => fabricWakeCause(candidate.from, candidate.cause)),
+            basis: "unconfirmed-raw-input-attempts" }
+          : { cause: "unattributed" };
+      }
+      state.attempts = [];
     }
   });
   pi.on("context", () => {
-    if (state.recorded || state.user || !state.cause) return;
+    if (state.recorded || (!state.cause && !state.diagnostic)) return;
     state.recorded = true;
-    pi.appendEntry("pi-fabric.wake-cause", state.cause);
+    if (state.cause) pi.appendEntry("pi-fabric.wake-cause", state.cause);
+    else pi.appendEntry("pi-fabric.wake-diagnostic", state.diagnostic);
   });
 };
 

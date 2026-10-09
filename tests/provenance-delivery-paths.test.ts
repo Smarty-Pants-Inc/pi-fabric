@@ -16,7 +16,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import type { MeshEvent, MeshIdentity } from "../src/mesh/store.js";
 import type { FabricLifecycleEvent, FabricLifecycleSubscription } from "../src/lifecycle/types.js";
-import { sendFabricMessage, sendFabricUserMessage } from "../src/fabric-provenance.js";
+import { registerFabricWakeCapture, sendFabricMessage, sendFabricUserMessage } from "../src/fabric-provenance.js";
 
 const host: MeshIdentity = { id: "session:host", name: "main", kind: "main" };
 const provenance = (sender: MeshIdentity, via: string) => ({ v: 1, channel: "fabric", sender: {
@@ -24,7 +24,7 @@ const provenance = (sender: MeshIdentity, via: string) => ({ v: 1, channel: "fab
 }, via });
 const recording = (turnProvenance = true) => {
   const fake = { ...(turnProvenance ? { hostCapabilities: { turnProvenance: 1 } } : {}),
-    sendMessage: vi.fn(), sendUserMessage: vi.fn(), on: vi.fn(() => () => {}) };
+    sendMessage: vi.fn(), sendUserMessage: vi.fn(), appendEntry: vi.fn(), on: vi.fn(() => () => {}) };
   return { fake, pi: fake as unknown as ExtensionAPI };
 };
 const actorOutput = (delivery: "steer" | "followUp" | "nextTurn", triggerTurn: boolean, source = "host") => ({
@@ -226,6 +226,69 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
       await client.close(); warning.mockRestore(); main.closeFollowUpDrain();
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it.each([false, true])("capture leaves native user arguments/cardinality/bytes/images unchanged (capable=%s)", capable => {
+    const { fake, pi } = recording(capable);
+    registerFabricWakeCapture(pi);
+    const content: Parameters<ExtensionAPI["sendUserMessage"]>[0] = [
+      { type: "text", text: "literal <message> & /template $1\nno envelope" },
+      { type: "image", data: "AAEC/w==", mimeType: "image/png" },
+    ];
+    const options = { deliverAs: "followUp" as const, expandPromptTemplates: true };
+    const snapshot = JSON.stringify(content);
+    sendFabricUserMessage(pi, content, host, "followUp", options);
+    sendFabricUserMessage(pi, "/fabric-release-reload auto", host, "followUp");
+    expect(fake.sendUserMessage.mock.calls).toEqual([[content, options], ["/fabric-release-reload auto"]]);
+    expect(fake.sendUserMessage.mock.calls[0]![0]).toBe(content);
+    expect(fake.sendUserMessage.mock.calls[0]![1]).toBe(options);
+    expect(JSON.stringify(content)).toBe(snapshot);
+    expect(fake.sendMessage).not.toHaveBeenCalled(); // No carrier, XML wrapper, or custom delivery.
+    expect(fake.appendEntry).not.toHaveBeenCalled(); // Attempts alone are not admissions.
+  });
+
+  it.each([false, true])("verified native user calls add only supported provenance, never carriers (capable=%s)", capable => {
+    const { fake, pi } = recording(capable);
+    registerFabricWakeCapture(pi);
+    const sender = vi.fn(() => host);
+    const options = { deliverAs: "steer" as const, expandPromptTemplates: false };
+    sendFabricUserMessage(pi, "/literal-template args", sender, "steer", options, "mesh");
+    sendFabricUserMessage(pi, "one argument on legacy", host, "followUp", undefined, "mesh");
+    expect(sender).toHaveBeenCalledTimes(1); // Same snapshot for attempt and provenance.
+    expect(fake.sendUserMessage.mock.calls).toEqual(capable ? [
+      ["/literal-template args", { ...options, provenance: provenance(host, "steer") }],
+      ["one argument on legacy", { provenance: provenance(host, "followUp") }],
+    ] : [["/literal-template args", options], ["one argument on legacy"]]);
+    expect(options).toEqual({ deliverAs: "steer", expandPromptTemplates: false });
+    if (!capable) expect(fake.sendUserMessage.mock.calls[0]![1]).toBe(options);
+    expect(fake.sendMessage).not.toHaveBeenCalled();
+    expect(fake.appendEntry).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false, true])("prompt-template expansion %s is delegated once to the native API", expandPromptTemplates => {
+    const { fake, pi } = recording(false);
+    registerFabricWakeCapture(pi);
+    const content = "/native-template alpha \"quoted\"\n<raw>&";
+    const options = expandPromptTemplates === undefined ? undefined : { expandPromptTemplates };
+    // This double represents the native expansion port. Fabric must not expand,
+    // reject, wrap, or swap the template into a custom-message API itself.
+    const nativeTemplatePort = vi.fn();
+    fake.sendUserMessage.mockImplementation(nativeTemplatePort);
+    expect(() => sendFabricUserMessage(pi, content, host, "followUp", options)).not.toThrow();
+    expect(nativeTemplatePort.mock.calls).toEqual(options === undefined ? [[content]] : [[content, options]]);
+    expect(fake.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["input guard", "compaction", "native template failure"])("%s errors remain the native error with no retry or alternate API", reason => {
+    const { fake, pi } = recording(false);
+    registerFabricWakeCapture(pi);
+    const nativeError = new Error(reason);
+    fake.sendUserMessage.mockImplementation(() => { throw nativeError; });
+    const options = { expandPromptTemplates: true };
+    expect(() => sendFabricUserMessage(pi, "/template unchanged", host, "followUp", options)).toThrow(nativeError);
+    expect(fake.sendUserMessage.mock.calls).toEqual([["/template unchanged", options]]);
+    expect(fake.sendMessage).not.toHaveBeenCalled();
+    expect(fake.appendEntry).not.toHaveBeenCalled();
   });
 
   it("the legacy user-message adapter preserves a one-argument call and explicit template expansion", () => {

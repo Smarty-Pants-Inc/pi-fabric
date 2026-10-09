@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { assertMeshStateReadable, MeshStore } from "./mesh/store.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
 import type { FabricParticipantInfo, FabricParticipantKind } from "./topology/types.js";
@@ -129,7 +130,10 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   }
   const id = `participants-cli:${process.pid}:${Date.now()}`;
   // An identity no participant has: this reader is not a host, so every entry lists local: false.
-  const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS);
+  // A root switched to SQLite (state.json is the moved marker) is read from state.db, whatever this
+  // process's configured backend is (smarty-dev#6477: the probe failed on every release after the switch).
+  const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS,
+    readMeshStateMovedMarker(root) === undefined ? {} : { stateBackend: "sqlite" });
   const directory = new ParticipantDirectory(store, {
     enabled: true,
     hostId: id,

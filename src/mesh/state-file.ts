@@ -8,7 +8,7 @@ import childProcess from "node:child_process";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, type MeshStateMovedMarker } from "./backend-fence.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
@@ -326,6 +326,9 @@ const statStamp = (filePath: string): string | undefined => {
  * runtime MeshStore stays tolerant; readers that must not report false absence call this first.
  */
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
+  // After the SQLite switch state.json is the moved marker and state.db is the state: a SQLite store reads it
+  // and a file store's reads fail closed on the marker (smarty-dev#6477), so the marker is not damage here.
+  if (readMeshStateMovedMarker(root) !== undefined) return;
   const file = path.resolve(root, "state.json");
   const identity = stateReadIdentity(file, maxBytes);
   const shared = processReadSnapshots.get(file)?.deref();

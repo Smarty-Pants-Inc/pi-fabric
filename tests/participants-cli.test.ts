@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
 import { main, resolveMeshRoot } from "../src/participants-cli.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -80,6 +81,27 @@ describe("fabric-participants", () => {
 
     expect(JSON.parse((await run(["--mesh", root, "--kind", "actor"])).out)).toEqual([]);
     expect(fs.readdirSync(root).map((name) => [name, fs.statSync(path.join(root, name)).mtimeMs])).toEqual(before);
+  });
+
+  it("reads a root switched to SQLite (state.json is the moved marker) in any configured mode (smarty-dev#6477)", async () => {
+    const root = scratch();
+    const store = new MeshStore(root, 64 * 1024, 1_000);
+    const live = await addRoot(store, "live");
+    await importMeshState(root);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toContain('"movedTo":"state.db"');
+    const previous = process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    try {
+      for (const mode of [undefined, "file", "sqlite"]) {
+        if (mode === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+        else process.env.PI_FABRIC_MESH_STATE_BACKEND = mode;
+        const result = await run(["--json", "--mesh", root, "--kind", "root"]);
+        expect(result, `mode ${String(mode)}`).toMatchObject({ code: 0, err: "" });
+        expect(ids(result.out)).toEqual([live]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+      else process.env.PI_FABRIC_MESH_STATE_BACKEND = previous;
+    }
   });
 
   it("prints [] for an empty mesh and exits 2 with a named error for a missing one", async () => {

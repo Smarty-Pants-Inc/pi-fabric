@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
+import { renameAtomic, syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
@@ -49,6 +49,7 @@ const sameRecipient = (a: CompletionRecipient, b: CompletionRecipient): boolean 
 const key = (id: string): string => createHash("sha256").update(id).digest("hex");
 const directory = (meshRoot: string): string => path.join(meshRoot, "agent-completions");
 const envelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), `${key(id)}.json`);
+const archivedEnvelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "archive", `${key(id)}.json`);
 const candidatePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "attempts", `${key(id)}.json`);
 const receiptPath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "receipts", `${key(id)}.json`);
 const claimPrefix = "residency/completion-claims/";
@@ -107,20 +108,24 @@ async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
 }
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
 interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
-const fingerprint = (stat: fs.Stats): string => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
-// Plain scans only read receipts. Every destructive cleanup confirms the full namespace
-// afresh: an unchanged endpoint inode is not evidence that its parent entries are durable.
-const confirmReceipt = async (file: string, value: CompletionReceipt): Promise<void> => {
-  const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || JSON.stringify(JSON.parse(await handle.readFile("utf8"))) !== JSON.stringify(value)) {
-      throw new Error(`Completion file changed before durability confirmation at ${file}`);
-    }
-    await handle.sync();
-    await syncPathNamespaceAsync(file, stat);
-    if (fingerprint(await handle.stat()) !== fingerprint(stat)) throw new Error(`Completion file changed during confirmation at ${file}`);
-  } finally { await handle.close(); }
+// Only callers that have written a durable receipt or validated an existing replay
+// fence may archive. Receipt-then-rename preserves crash-left sources for recovery;
+// rename keeps the body/inode intact and stays on the journal's filesystem. The
+// receipt is the replay fence, so archive maintenance owes no file fsync/rewrite.
+const archiveCompletion = (source: string): void => {
+  if (!fs.existsSync(source)) return;
+  const archive = path.join(path.dirname(source), "archive");
+  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+  try { renameAtomic(source, path.join(archive, path.basename(source))); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  recipientCache.delete(source);
+};
+const archiveCompletionAsync = async (source: string): Promise<void> => {
+  const archive = path.join(path.dirname(source), "archive");
+  await fs.promises.mkdir(archive, { recursive: true, mode: 0o700 });
+  try { await fs.promises.rename(source, path.join(archive, path.basename(source))); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  recipientCache.delete(source);
 };
 // Journal writers put the address before the result. Read only that bounded prefix,
 // including old pretty-printed envelopes; never parse a foreign result body.
@@ -271,6 +276,8 @@ export const consumeCompletion = (meshRoot: string, id: string, sessionId: strin
   const receipt = readReceipt(file, id);
   if (receipt) syncCompletionFile(file, receipt);
   else writeJsonAtomic(file, { id, sessionId, consumedAt: Date.now() }, { durable: true });
+  // A failed receipt barrier must never move an unconsumed source out of discovery.
+  archiveCompletion(envelopePath(meshRoot, id));
 };
 /** Stable run id fences committed outcomes. Settlement supersedes an uncommitted attempt. */
 export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient, result: AgentRunResult): void => {
@@ -381,7 +388,9 @@ const promoteOrphanSync = (meshRoot: string, projectRoot: string, project: strin
 };
 const savedCompletion = (meshRoot: string, projectRoot: string, id: string): CompletionEnvelope | undefined => {
   promoteOrphans(meshRoot, projectRoot);
-  const file = envelopePath(meshRoot, id);
+  const live = envelopePath(meshRoot, id);
+  // Targeted status/wait survives restart without ever scanning archived history.
+  const file = fs.existsSync(live) ? live : archivedEnvelopePath(meshRoot, id);
   const recipient = readRecipient(file);
   if (!recipient || canonical(recipient.projectRoot) !== canonical(projectRoot)) return undefined;
   const value = read<CompletionEnvelope>(file);
@@ -418,7 +427,10 @@ const pendingCompletionAsync = async (meshRoot: string, projectRoot: string, pro
   if (consumed?.has(file)) return [];
   const recipient = await readRecipientAsync(target, true);
   if (!recipient || !await accepts(recipient) || await canonicalAsync(recipient.projectRoot) !== project) return [];
-  if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) return [];
+  if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) {
+    await archiveCompletionAsync(target);
+    return [];
+  }
   const value = await readAsync<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
     typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
@@ -439,7 +451,10 @@ const pendingCompletion = (meshRoot: string, projectRoot: string, project: strin
   if (consumed?.has(file)) return [];
   const recipient = readRecipient(target);
   if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
-  if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
+  if (readReceipt(path.join(directory(meshRoot), "receipts", file))) {
+    archiveCompletion(target);
+    return [];
+  }
   const value = read<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
     typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
@@ -483,17 +498,17 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
   // A monotonic local suppression fence, not a cached durability confirmation.
-  // Destructive claim retirement continues to reopen/sync its exact receipt.
+  // Valid receipts suppress replay; archived history is never part of idle scans.
   readonly #suppressed = new Set<string>();
   #rememberConsumed(id: string): void {
     this.#suppressed.add(`${key(id)}.json`);
     if (this.#suppressed.size > 1024) this.#suppressed.delete(this.#suppressed.values().next().value!);
   }
 
-  // Explicit cleanup is logically final for this client even while durable retirement
-  // is delayed/refused. Keep the receipt and envelope for crash-safe drain retries.
+  // Explicit cleanup is logically final even while claim retirement is delayed/refused.
+  // The receipt and archived envelope retain evidence for crash-safe drain retries.
   readonly #forgotten = new Set<string>();
-  // Preserve same-session wait/status after unlink without retaining an unbounded disk journal.
+  // Small same-session hot cache; restarted queries read a single archived body by id.
   readonly #consumed = new Map<string, CompletionEnvelope>();
   #remember(envelope: CompletionEnvelope): void {
     if (this.#forgotten.has(envelope.result.id)) return;
@@ -580,7 +595,8 @@ export class CompletionJournal {
     }
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
       sameRecipient(address, recipient);
-    // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
+    // Bound crash-left cleanup. Receipts are durable before archive admission;
+    // recovery reads them without fsyncing or rewriting unchanged history.
     let pruned = 0;
     const project = await canonicalAsync(recipient.projectRoot);
     for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
@@ -588,7 +604,7 @@ export class CompletionJournal {
       let address = await readRecipientAsync(target, true);
       if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
       // Reuse only rejects unchanged foreign entries. Cleanup authority always reopens
-      // the exact address, then confirms the exact receipt and full namespace below.
+      // the exact address and validates the receipt below.
       address = await readRecipientAsync(target);
       if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
       const fence = path.join(directory(this.meshRoot), "receipts", file);
@@ -602,15 +618,15 @@ export class CompletionJournal {
         await this.#retireClaim(receipt.id, claim);
         if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
       } else {
-        await confirmReceipt(fence, receipt);
-        fs.rmSync(target, { force: true });
+        if (path.dirname(target) === directory(this.meshRoot)) await archiveCompletionAsync(target);
+        else await fs.promises.rm(target, { force: true });
       }
       if (++pruned === 128) break;
     }
     // The inbox already owns enqueued notices until its durable carrier confirms
     // them. Avoid reopening their legacy metadata during every idle pass: on
     // Windows that reader can contend with a synchronous acknowledgment rename.
-    // Receipt confirmation/claim cleanup above is deliberately NOT suppressed.
+    // Crash-left archiving/claim cleanup above is deliberately NOT suppressed.
     const suppressed = new Set(this.#suppressed);
     for (const id of this.#enqueued) suppressed.add(`${key(id)}.json`);
     const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, suppressed);
@@ -658,24 +674,25 @@ export class CompletionJournal {
     const file = receiptPath(this.meshRoot, id);
     const receipt = await readReceiptAsync(file, id);
     if (!receipt) return false;
-    // One fresh confirmation authorizes this consumed outcome's cleanup batch.
-    // Do not retire its claim and then owe a second barrier before body unlink:
-    // that barrier could fail after the claim was already lost.
+    // A validated replay fence suppresses this outcome. Receipt durability belongs
+    // to consumeCompletion, not a repeated idle-drain fsync of unchanged files.
     const recipient = this.recipient;
-    await confirmReceipt(file, receipt);
     const targets: string[] = [];
     for (const target of [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)]) {
       const address = await readRecipientAsync(target);
       if (address && await canonicalAsync(address.projectRoot) === await canonicalAsync(recipient.projectRoot) &&
         sameRecipient(address, recipient)) targets.push(target);
     }
-    // Keep the exact-addressed envelope until the
-    // versioned deletion commits; a failed/interrupted delete is retried by drain.
+    // Consumption already retains the envelope in archive. A failed/interrupted
+    // versioned deletion is still retried by its exact owner, never a foreign Main.
     if (snapshot) {
       try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); }
       catch { return false; }
     }
-    for (const target of targets) fs.rmSync(target, { force: true });
+    for (const target of targets) {
+      if (target === envelopePath(this.meshRoot, id)) await archiveCompletionAsync(target);
+      else await fs.promises.rm(target, { force: true });
+    }
     return true;
   }
   #canRead(envelope: CompletionEnvelope): boolean {

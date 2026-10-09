@@ -1,0 +1,96 @@
+// No download/auth plumbing: all three inputs must already be local, verified official release files.
+// Usage: bun scripts/run-nats-kv-conformance.ts /abs/nats-server /abs/release.tar.gz /abs/SHA256SUMS
+import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { isSupportedNatsKvServer } from "../src/mesh/state-nats-kv.ts";
+
+const [binary, archive, sums] = process.argv.slice(2);
+const output = process.env.FABRIC_NATS_EVIDENCE_DIR ?? process.env.TASK_OUT;
+if (!output) throw new Error("Set TASK_OUT or FABRIC_NATS_EVIDENCE_DIR");
+for (const input of [binary, archive, sums]) if (!input || !path.isAbsolute(input) || !fs.existsSync(input)) throw new Error(`BLOCKED: missing absolute local input ${input ?? "(unspecified)"}`);
+const hash = (data: Uint8Array | string) => createHash("sha256").update(data).digest("hex");
+const officialSums = fs.readFileSync(sums!, "utf8");
+const name = path.basename(archive!);
+const line = officialSums.split(/\r?\n/).find(line => line.trim().split(/\s+/).slice(1).join(" ").replace(/^\*/, "") === name);
+if (!line || !/^[a-fA-F0-9]{64}\s/.test(line)) throw new Error(`Official SHA256SUMS has no entry for ${name}`);
+const expected = line.split(/\s+/)[0]!.toLowerCase();
+const actual = hash(fs.readFileSync(archive!));
+if (actual !== expected) throw new Error("Official archive SHA256 mismatch");
+const members = execFileSync("tar", ["-tf", archive!], { encoding: "utf8" }).trim().split("\n").filter(member => member.endsWith("/nats-server"));
+if (members.length !== 1) throw new Error("Official archive must contain exactly one nats-server executable");
+const archiveBinary = execFileSync("tar", ["-xOf", archive!, members[0]!], { maxBuffer: 128 * 1024 * 1024 });
+const binarySha = hash(fs.readFileSync(binary!));
+if (hash(archiveBinary) !== binarySha) throw new Error("Lane binary is not the checksum-verified official archive binary");
+const versionOutput = execFileSync(binary!, ["-v"], { encoding: "utf8" }).trim();
+const version = /v(\d+\.\d+\.\d+)(?:$|\s)/.exec(versionOutput)?.[1] ?? "";
+if (!isSupportedNatsKvServer(version)) throw new Error(`nats-server 2.14.7+ required: ${versionOutput}`);
+fs.mkdirSync(output, { recursive: true });
+fs.writeFileSync(path.join(output, "nats-server-SHA256SUMS.official"), officialSums);
+fs.writeFileSync(path.join(output, "official-release-verification.json"), JSON.stringify({ binary, archive, sums, expected, actual, binarySha, versionOutput }, null, 2) + "\n");
+
+const deadline = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Cluster deadline spent")), ms); })]); }
+  finally { clearTimeout(timer); }
+};
+const port = async () => {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const value = (server.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return value;
+};
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-u2-r3-"));
+const ports = await Promise.all(Array.from({ length: 9 }, port));
+if (new Set(ports).size !== 9) throw new Error("Ephemeral ports collided; retry runner with a new allocation");
+const nodes: Array<{ child: ReturnType<typeof spawn>; done: Promise<void>; ready: Promise<void> }> = [];
+let leaderReady!: () => void;
+const metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
+const env = { ...process.env, FABRIC_NATS_TEST_SERVERS: ports.slice(0, 3).map(p => `nats://127.0.0.1:${p}`).join(","), FABRIC_NATS_EVIDENCE_DIR: output };
+const run = async (command: string, args: string[], name: string, extra: Record<string, string> = {}) => {
+  const log = fs.createWriteStream(path.join(output, name));
+  const child = spawn(command, args, { cwd: process.cwd(), env: { ...env, ...extra }, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout!.pipe(log, { end: false }); child.stderr!.pipe(log, { end: false });
+  try {
+    await new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", code => code === 0 ? resolve() : reject(new Error(`${name} exit ${code}`))); });
+  } finally { await new Promise<void>(resolve => log.end(resolve)); }
+};
+try {
+  for (let n = 0; n < 3; n++) {
+    const config = `server_name: "fabric-u2-${n}"\nhost: "127.0.0.1"\nport: ${ports[n]}\nhttp: "127.0.0.1:${ports[n + 3]}"\nmax_payload: 2097152\njetstream {\n store_dir: ${JSON.stringify(path.join(scratch, `node-${n}`))}\n max_memory_store: 67108864\n max_file_store: 1073741824\n sync_interval: always\n}\ncluster {\n name: "fabric-u2"\n host: "127.0.0.1"\n port: ${ports[n + 6]}\n routes: [${ports.slice(6).filter((_, i) => i !== n).map(p => `"nats://127.0.0.1:${p}"`).join(",")} ]\n}\n`;
+    const configPath = path.join(output, `nats-node-${n}.conf`); fs.writeFileSync(configPath, config);
+    execFileSync(binary!, ["-t", "-c", configPath], { stdio: "pipe" });
+    const log = fs.createWriteStream(path.join(output, `nats-node-${n}.log`));
+    const child = spawn(binary!, ["-c", configPath], { stdio: ["ignore", "pipe", "pipe"] });
+    let ready!: () => void, failed!: (error: Error) => void;
+    const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; }); started.catch(() => undefined);
+    let tail = "";
+    const consume = (data: Buffer) => {
+      log.write(data); tail = (tail + data.toString()).slice(-8_192);
+      if (/Server is ready/.test(tail)) ready();
+      if (/JetStream cluster new metadata leader/.test(tail)) leaderReady();
+    };
+    child.stdout!.on("data", consume); child.stderr!.on("data", consume);
+    const done = new Promise<void>((resolve, reject) => {
+      child.once("error", error => { failed(error); log.end(); reject(error); });
+      child.once("close", code => { failed(new Error(`Node ${n} exited ${code} before ready`)); log.end(resolve); });
+    }); done.catch(() => undefined);
+    nodes.push({ child, done, ready: started });
+  }
+  await deadline(Promise.all([...nodes.map(node => node.ready), metadataLeader]), 60_000);
+  fs.writeFileSync(path.join(output, "cluster-topology.json"), JSON.stringify({ hostname: os.hostname(), nodes: ports.slice(0, 3), replicas: 3,
+    sync_interval: "always", faultDomain: "ONE HOST: local R3 functional conformance only; NOT three-host production durability proof" }, null, 2) + "\n");
+  await run("bunx", ["vitest", "run", "tests/mesh-state-async-contract.test.ts", "tests/mesh-state-async-multiprocess.test.ts", "tests/mesh-state-nats-kv-live.test.ts"], "conformance-r3.log");
+  await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-1024.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "1024" });
+  await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-102400.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "102400" });
+  console.log("PASS: official binary verified; local R3 conformance and latency artifacts retained");
+} finally {
+  for (const node of nodes) if (node.child.exitCode === null) node.child.kill("SIGTERM");
+  const kill = setTimeout(() => { for (const node of nodes) if (node.child.exitCode === null) node.child.kill("SIGKILL"); }, 10_000);
+  try { await Promise.allSettled(nodes.map(node => node.done)); } finally { clearTimeout(kill); }
+  fs.rmSync(scratch, { recursive: true, force: true });
+}

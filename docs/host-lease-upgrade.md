@@ -42,7 +42,7 @@ The snapshot is capped at 4096 processes, 1 MiB per observation, 32 MiB total an
 A fresh legacy predecessor is checked before its single expiry/deadline wake and rechecked
 under custody before the lease write (at most two snapshots per gated operation); TTL waiting never admits an old
 process. There is no process killing, pin mutation, scan retry loop or polling. Non-Linux/unavailable census
-or physical host identity is unknown and refuses rather than silently bypassing the gate.
+or physical host identity is unknown and refuses; it does not silently bypass the gate.
 
 ### Residual security gap: old code introduced after admission is still unfenced
 

@@ -15,6 +15,8 @@ export interface HostLeaseLockOptions {
   ownIncarnation?: string | undefined;
   /** Publication/registry custody must never wait or recover another lock. */
   timeoutMs?: number;
+  /** Optional bounded wait for the per-host custody gate during startup preparation. */
+  custodyTimeoutMs?: number;
   /** Remote recovery is permitted only after this incarnation's lease deadline. */
   lease?: { incarnationToken: string; expiresAt: number };
 }
@@ -136,7 +138,7 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
             fs.rmSync(aside, { recursive: true, force: true });
           }
         }
-      }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {});
+      }, options.custodyTimeoutMs ?? 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {});
     } catch (error) {
       if (enteredCustody || !isMeshLockTimeout(error)) throw error;
     }

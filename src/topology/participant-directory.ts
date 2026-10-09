@@ -768,7 +768,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#closed) return false;
       if (this.options.enabled && this.#prepareLeaseLock) {
         await withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
-          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue });
+          { timeoutMs: 1_000, custodyTimeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue });
         this.#prepareLeaseLock = false;
         if (this.#closed) return false;
       }
@@ -1600,6 +1600,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
       this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
+    // Runtime construction invokes resumption before start(). Claim this new host before
+    // invalidating the proof; the deletion is an owned mutation and must keep its fence.
+    if (closure && !this.#leaseClaimed) await this.#renewFileLease();
     if (closure) await this.#withLeaseFence(() => this.mesh.delete({ key: closure.key, ifVersion: closure.version }));
   }
 

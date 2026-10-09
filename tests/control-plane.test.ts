@@ -17,6 +17,8 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
+// Synthetic owner snapshot for tests that inject wire ACKs instead of running an owner.
+const fixtureOwnerIncarnation = "fixture:owner";
 
 const identity = (id: string): MeshIdentity => ({
   id,
@@ -52,6 +54,20 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it.each(["steer", "followUp", "ask", "stop"] as const)("refuses epochless %s before publishing even to an older accepting owner", async operation => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sender-incarnation-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    const publish = vi.spyOn(sender.mesh, "publish");
+    // An older owner would accept an epochless command. No command may reach that owner.
+    const request = operation === "ask"
+      ? sender.requestResult("host:older", "actor:target", operation, { message: "unsafe", data: { ownerIncarnation: "payload-forgery" } })
+      : sender.request("host:older", "actor:target", operation, { message: "unsafe" });
+    await expect(request).rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError",
+      code: "FABRIC_CONTROL_INCARNATION_REQUIRED", targetId: "actor:target",
+      message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+    expect(publish).not.toHaveBeenCalled();
+    expect(sender.mesh.read({ topic: "fabric.control.command" })).toEqual([]);
+  });
   it.each([false, true])("only sheds an optional warning, not delivery fields or an oversized core (oversized=%s)", async oversized => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-advisory-budget-")); roots.push(root);
     const meshRoot = path.join(root, "mesh");
@@ -95,7 +111,7 @@ describe("FabricControlPlane", () => {
       { ...valid, targetId: "agent:other" }, { ...valid, targetId: "x".repeat(201) },
       { ...valid, targetId: 42 }, valid, { ...valid, privateData: "must not leak" }];
     for (const [index, warning] of variants.entries()) {
-      const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "later" });
+      const outcome = sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "later" });
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(index + 1));
       const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
       await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
@@ -107,7 +123,7 @@ describe("FabricControlPlane", () => {
     // A matching target still has to satisfy the bound; mismatch alone must not cover this check.
     for (const length of [200, 201]) {
       const targetId = "x".repeat(length);
-      const outcome = sender.request("host:owner", targetId, "followUp", { message: "later" });
+      const outcome = sender.request("host:owner", targetId, "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "later" });
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + length - 199));
       const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
       await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
@@ -124,7 +140,7 @@ describe("FabricControlPlane", () => {
     const sender = new FabricControlPlane(new MeshStore(path.join(root, "mesh"), 65536, 1000), identity("session:sender"), { enabled: true, hostId: "session:sender" });
     planes.push(sender);
     const controller = new AbortController();
-    const observed = sender.requestResult("session:owner", "actor:target", "ask", {}, "session:owner", { signal: controller.signal }).catch(error => error);
+    const observed = sender.requestResult("session:owner", "actor:target", "ask", { ownerIncarnation: fixtureOwnerIncarnation }, "session:owner", { signal: controller.signal }).catch(error => error);
     await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1));
     const lock = path.join(sender.mesh.root, ".lock");
     fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, "owner"), `cancel-test\n${process.pid}\n${Date.now()}\n`);
@@ -241,7 +257,7 @@ describe("FabricControlPlane", () => {
       const ack = async (commandId: string, remoteHost = "forge", from = "identity:owner", targetId = "agent:target") => {
         await sender.mesh.publish({
           topic: "fabric.control.ack", kind: "accepted", from: identity(from), to: "host:sender",
-          data: { version: 1, commandId, targetId, accepted: true, messageId: "delivered", result: "done", bridge: { from: remoteHost } },
+          data: { version: 1, commandId, targetId, ownerIncarnation: fixtureOwnerIncarnation, accepted: true, messageId: "delivered", result: "done", bridge: { from: remoteHost } },
         });
       };
       const once = async (cancels: number) => {
@@ -260,7 +276,7 @@ describe("FabricControlPlane", () => {
 
     it("observes a dynamic lapse after a live send, publishes once and cancels once", async () => {
       const f = await setup();
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner"));
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       const { error } = await outcome;
@@ -281,7 +297,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       const oldExpiry = Date.now() + 200;
       f.setLease({ remoteHost: "forge", expiresAt: oldExpiry });
-      const outcome = f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner");
+      const outcome = f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner");
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 60_000 });
       const { commandId } = await f.command();
       await new Promise((resolve) => setTimeout(resolve, Math.max(1, oldExpiry - Date.now() + 60)));
@@ -294,7 +310,7 @@ describe("FabricControlPlane", () => {
     it("names a healthy bridge with a lost ACK without claiming link death or retry safety", async () => {
       const f = await setup(100);
       vi.useFakeTimers();
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner"));
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       await vi.advanceTimersByTimeAsync(45_000);
       const { error } = await outcome;
       await f.sender.close();
@@ -309,7 +325,7 @@ describe("FabricControlPlane", () => {
     it("does not trust wrong bridge, identity or target ACKs while watching a lease", async () => {
       const f = await setup();
       let settled = false;
-      const outcome = f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner")
+      const outcome = f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner")
         .finally(() => { settled = true; });
       const { commandId } = await f.command();
       await f.ack(commandId, "other");
@@ -333,7 +349,7 @@ describe("FabricControlPlane", () => {
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
         return event;
       });
-      const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask", {}, "identity:owner", { signal: controller.signal }));
+      const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner", { signal: controller.signal }));
       await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       if (winner === "lapse") f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       if (winner === "abort") controller.abort();
@@ -361,7 +377,7 @@ describe("FabricControlPlane", () => {
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
         return event;
       });
-      const outcome = f.sender.requestResult("host:owner", "agent:target", "ask", {}, "identity:owner", { signal: controller.signal });
+      const outcome = f.sender.requestResult("host:owner", "agent:target", "ask", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner", { signal: controller.signal });
       try {
         const { commandId } = await f.command();
         await f.ack(commandId);
@@ -384,7 +400,7 @@ describe("FabricControlPlane", () => {
         if (input.topic === "fabric.control.command" && input.kind === "cancel") await gate;
         return publish(input);
       });
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner"));
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       try {
@@ -412,7 +428,7 @@ describe("FabricControlPlane", () => {
         return event;
       });
       const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask",
-        { message: "private", data: { destinationRemoteHost: "ryzen2" } }, "identity:owner",
+        { ownerIncarnation: fixtureOwnerIncarnation, message: "private", data: { destinationRemoteHost: "ryzen2" } }, "identity:owner",
         { signal: controller.signal, routedRemoteHost }));
       await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       try {
@@ -434,7 +450,7 @@ describe("FabricControlPlane", () => {
     it("refuses a known native routing snapshot when fresh admission finds a mirror", async () => {
       const f = await setup();
       const publish = vi.spyOn(f.sender.mesh, "publish");
-      await expect(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner",
+      await expect(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner",
         { routedRemoteHost: null })).rejects.toThrow("Fabric native routing is unavailable for agent:target; the routed owner changed; this attempt was not published.");
       expect(publish).not.toHaveBeenCalled();
     });
@@ -442,7 +458,7 @@ describe("FabricControlPlane", () => {
     it("never retries a known native send into a newly mirrored owner", async () => {
       const f = await setup();
       f.setLease(undefined);
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner",
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner",
         { routedRemoteHost: null }));
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
@@ -461,7 +477,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       f.setLease(undefined);
       let settled = false;
-      const outcome = f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner",
+      const outcome = f.sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner",
         { routedRemoteHost: null }).finally(() => { settled = true; });
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
@@ -518,7 +534,7 @@ describe("FabricControlPlane", () => {
       expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })[0]!.data)
         .not.toHaveProperty("destinationRemoteHost");
       const publish = vi.spyOn(sender.mesh, "publish");
-      await expect(sender.request("host:owner", "agent:target", "steer", {}, "host:owner",
+      await expect(sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: owner.incarnation }, "host:owner",
         { routedRemoteHost: "forge" })).rejects.toThrow("Fabric mesh bridge routing to remote host forge is unavailable");
       expect(publish).not.toHaveBeenCalled();
     });
@@ -526,7 +542,7 @@ describe("FabricControlPlane", () => {
     it("never adopts an unvalidated replacement link label", async () => {
       const f = await setup();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner"));
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       f.setLease({ remoteHost: "forged-label", expiresAt: Date.now() + 60_000 });
       const { error } = await outcome;
       expect(error?.message).toContain("remote host forge");
@@ -579,7 +595,7 @@ describe("FabricControlPlane", () => {
         await sender.mesh.publish({
           topic: "fabric.control.ack", kind: "accepted", from: identity("identity:owner"), to: "host:sender",
           data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: true,
-            messageId: "original", result: "done", ...(remoteHost ? { bridge: { from: remoteHost } } : {}) },
+            messageId: "original", result: "done", ownerIncarnation: fixtureOwnerIncarnation, ...(remoteHost ? { bridge: { from: remoteHost } } : {}) },
         });
         await vi.advanceTimersByTimeAsync(20);
       };
@@ -603,7 +619,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       try {
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
-        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
         // Messages retain their existing single notRun retry; stop never retries.
         const attempts = operation === "stop" ? 1 : 2;
         vi.spyOn(Math, "random").mockReturnValue(0.5);
@@ -636,7 +652,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
       try {
-        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
         await vi.advanceTimersByTimeAsync(0);
         const command = f.commands()[0]!.data as FabricControlCommand;
         await f.sender.mesh.publish({
@@ -653,7 +669,7 @@ describe("FabricControlPlane", () => {
         expect(error?.message).toBe("Fabric control plane closed");
         await vi.advanceTimersByTimeAsync(100_000);
         expect(f.commands()).toHaveLength(1);
-        await expect(f.sender.request("host:owner", "agent:target", operation)).rejects.toThrow("Fabric control plane closed");
+        await expect(f.sender.request("host:owner", "agent:target", operation, { ownerIncarnation: fixtureOwnerIncarnation })).rejects.toThrow("Fabric control plane closed");
       } finally {
         random.mockRestore();
         await f.dispose();
@@ -663,7 +679,7 @@ describe("FabricControlPlane", () => {
     it.each([[1, 30_000], [60_000, 60_000]])("uses configured bridge window %i, floored to %i ms", async (configured, expected) => {
       const f = await setup(false, true, true, configured);
       try {
-        const outcome = f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner");
+        const outcome = f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner");
         await vi.advanceTimersByTimeAsync(0);
         const cmd = f.commands()[0]!.data as FabricControlCommand;
         expect(cmd.deadlineAt! - cmd.requestedAt).toBe(expected);
@@ -676,7 +692,7 @@ describe("FabricControlPlane", () => {
       const f = await setup(true);
       try {
         let settled = false;
-        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"))
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"))
           .then((value) => { settled = true; return value; });
         f.failReads(); // Still-live 15 s captured lease; no lapse evidence and no readable directory.
         await vi.advanceTimersByTimeAsync(44_999);
@@ -711,7 +727,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       try {
         let settled = false;
-        const outcome = f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner")
+        const outcome = f.sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner")
           .finally(() => { settled = true; });
         await vi.advanceTimersByTimeAsync(8_000);
         f.setLease({ remoteHost: "replacement", expiresAt: Date.now() + 60_000 });
@@ -730,7 +746,7 @@ describe("FabricControlPlane", () => {
       const f = await setup();
       try {
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
-        const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner"));
+        const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
         await vi.advanceTimersByTimeAsync(44_000);
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 60_000 });
         await vi.advanceTimersByTimeAsync(1_000);
@@ -745,7 +761,7 @@ describe("FabricControlPlane", () => {
       const f = await setup(true);
       const controller = new AbortController();
       try {
-        const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner", { signal: controller.signal }));
+        const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner", { signal: controller.signal }));
         await vi.advanceTimersByTimeAsync(100);
         if (winner === "abort") controller.abort();
         if (winner === "close") await f.sender.close();
@@ -771,8 +787,8 @@ describe("FabricControlPlane", () => {
       try {
         let settled = false;
         const request = mode === "ask" || mode === "result-message"
-          ? f.sender.requestResult("host:owner", "agent:target", mode === "ask" ? "ask" : "steer", {}, "identity:owner", { timeoutMs: 60_000 })
-          : f.sender.request("host:owner", "agent:target", mode === "stop" ? "stop" : "steer", {}, "identity:owner");
+          ? f.sender.requestResult("host:owner", "agent:target", mode === "ask" ? "ask" : "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner", { timeoutMs: 60_000 })
+          : f.sender.request("host:owner", "agent:target", mode === "stop" ? "stop" : "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner");
         const outcome = request.finally(() => { settled = true; });
         // Renew same-origin lease for long result operations; no global lease cutoff.
         f.setLease(mirrored ? { remoteHost: "forge", expiresAt: Date.now() + 120_000 } : undefined);
@@ -812,7 +828,7 @@ describe("FabricControlPlane", () => {
       const participantKey = keyFor("topology/participants/");
       const participant: FabricParticipantRecord = {
         format: 1, id: ownerId, kind: "root", rootId: ownerId,
-        ownerHostId: ownerId, ownerIdentityId: ownerId, name: "main", status: "idle",
+        ownerHostId: ownerId, ownerIdentityId: ownerId, ownerIncarnation: fixtureOwnerIncarnation, name: "main", status: "idle",
         runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
         cwd: "/tmp/project", sessionId: ownerId, startedAt: 1, updatedAt: 2,
         pendingMessages: false, controlProtocol: "v1",
@@ -869,7 +885,7 @@ describe("FabricControlPlane", () => {
     ] as const)("rejects %s ACK origin %s with notRun without retry or native downgrade", async (metadata, stamp) => {
       const f = await setup();
       let settled = false;
-      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp")
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp", { ownerIncarnation: fixtureOwnerIncarnation })
         .finally(() => { settled = true; });
       const { commandId } = await f.command();
       await f.withdraw();
@@ -893,7 +909,7 @@ describe("FabricControlPlane", () => {
 
     it.each([undefined, "forge"] as const)("does not adopt a replacement on bounded retry with routing snapshot %s", async (routedRemoteHost) => {
       const f = await setup();
-      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp", {}, f.ownerId,
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, f.ownerId,
         routedRemoteHost === undefined ? {} : { routedRemoteHost }).then(() => undefined, (error: Error) => error);
       const { commandId } = await f.command();
       await f.withdraw();
@@ -909,7 +925,7 @@ describe("FabricControlPlane", () => {
 
     it("keeps the original destination on a healthy mirrored notRun retry", async () => {
       const f = await setup();
-      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp");
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp", { ownerIncarnation: fixtureOwnerIncarnation });
       const { commandId } = await f.command();
       await f.ack(commandId, "forge", false);
       await vi.waitFor(() => expect(f.commands()).toHaveLength(2));
@@ -922,7 +938,7 @@ describe("FabricControlPlane", () => {
 
     it("accepts the original Forge ACK committed before withdrawal but consumed after it", async () => {
       const f = await setup();
-      const outcome = f.sender.request(f.ownerId, f.ownerId, "steer");
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "steer", { ownerIncarnation: fixtureOwnerIncarnation });
       const { commandId } = await f.command();
       // Hold the sender's actual log drain, not ACK publication or directory reads.
       const tail = vi.spyOn(f.sender.mesh, "tail").mockImplementation((offset) => ({ events: [], nextOffset: offset }));
@@ -941,7 +957,7 @@ describe("FabricControlPlane", () => {
 
     it("does not revive a settled mirrored request when its original ACK arrives", async () => {
       const f = await setup();
-      const outcome = f.sender.request(f.ownerId, f.ownerId, "steer").then(
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "steer", { ownerIncarnation: fixtureOwnerIncarnation }).then(
         () => undefined, (error: Error) => error,
       );
       const { commandId } = await f.command();
@@ -1968,7 +1984,7 @@ describe("FabricControlPlane", () => {
     sender.start(() => ({ accepted: false }));
     const started = Date.now();
     // No receiver runs, so nobody claimed it: smarty-dev#6729 makes that a definite non-delivery.
-    const error = await sender.request("host:receiver", "agent:target", "steer", { message: "nobody home" })
+    const error = await sender.request("host:receiver", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation, message: "nobody home" })
       .then(() => undefined, (failure: Error) => failure);
     expect(error?.message).toContain("Timed out waiting for the remote Fabric owner to acknowledge agent:target");
     expect(error?.message).toContain("not delivered, nothing was queued");
@@ -2138,7 +2154,7 @@ describe("FabricControlPlane", () => {
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline
       sender.start(() => ({ accepted: false }));
-      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "once" }));
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "once" }));
       let commandId = "";
       await vi.waitFor(() => {
         commandId = (store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string }).commandId;
@@ -2197,7 +2213,7 @@ describe("FabricControlPlane", () => {
       const sender = plane(meshRoot, "host:sender");
       sender.start(() => ({ accepted: false }));
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
-      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "old" }));
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "old" }));
       let command: { commandId: string } | undefined;
       await vi.waitFor(() => {
         command = store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string };

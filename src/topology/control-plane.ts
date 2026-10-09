@@ -33,6 +33,26 @@ export class FabricControlStaleIncarnationError extends Error {
     this.name = "FabricControlStaleIncarnationError";
   }
 }
+/** Pre-publication refusal: an older target cannot safely admit fenced control. */
+export class FabricControlIncarnationRequiredError extends Error {
+  readonly code = "FABRIC_CONTROL_INCARNATION_REQUIRED";
+  constructor(readonly targetId: string) {
+    super(`Fabric target ${targetId}: target must run a Fabric release with incarnation fencing; this attempt was not published.`);
+    this.name = "FabricControlIncarnationRequiredError";
+  }
+}
+
+/** Capture only the directory's target epoch; message/data and sender epochs are not authority. */
+export const controlOwnerIncarnation = (participant: {
+  id: string;
+  ownerIncarnation?: string | undefined;
+  controlProtocol?: "v1" | "legacy" | undefined;
+}): string => {
+  if (!isIncarnation(participant.ownerIncarnation) || participant.controlProtocol === "legacy") {
+    throw new FabricControlIncarnationRequiredError(participant.id);
+  }
+  return participant.ownerIncarnation;
+};
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // The sender keeps waiting this long past the command deadline. The owner admits a
@@ -569,7 +589,8 @@ export class FabricControlPlane {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
     if (!ownerHostId.trim()) throw new Error("Remote participant has no execution owner");
-    if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
+    if (input.ownerIncarnation === undefined) throw new FabricControlIncarnationRequiredError(targetId);
+    if (!isIncarnation(input.ownerIncarnation)) {
       throw new Error("Invalid Fabric owner incarnation");
     }
     // Freeze the resolved activation AND request origin before any publication/lock wait.
@@ -691,7 +712,7 @@ export class FabricControlPlane {
           targetId,
           operation,
           replyTo: this.options.hostId,
-          ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
+          ownerIncarnation,
           ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),

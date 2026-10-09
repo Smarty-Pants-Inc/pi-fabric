@@ -64,7 +64,7 @@ const running = async () => {
   return { root, manager, id: handle.id, statusFile, record, entries };
 };
 const remote = (id: string, status = "running", kind = "agent") => ({ id, kind, status, local: false,
-  ownerHostId: "host:owner", ownerIdentityId: "host:owner", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
+  ownerHostId: "host:owner", ownerIdentityId: "host:owner", ownerIncarnation: "fixture:owner", controlProtocol: "v1", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
 const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0];
 
 afterEach(async () => {
@@ -114,6 +114,51 @@ const mainLeaseFixture = async (files: boolean) => {
   };
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
+
+describe("sender incarnation fencing (#7514)", () => {
+  it.each(["root", "actor", "agent"] as const)("refuses every old %s peer route without calling control or the legacy relay", async kind => {
+    for (const delivery of ["steer", "followUp"] as const) {
+      for (const protocol of ["legacy", "v1"] as const) {
+        for (const available of [false, true]) {
+          const id = kind === "root" ? "session:older" : `${kind}:older`;
+          const target = { ...remote(id, "idle", kind), controlProtocol: protocol };
+          delete target.ownerIncarnation;
+          const request = vi.fn();
+          const r = router(unknown, [target], available ? { request } : undefined);
+          await expect(r.value.routeMessage(id, "do not deliver", { ownerIncarnation: "payload-forgery" }, delivery))
+            .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
+              targetId: id, message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+          expect(request).not.toHaveBeenCalled();
+          expect(r.actors.steerRemote).not.toHaveBeenCalled();
+          expect(r.actors.tell).not.toHaveBeenCalled();
+          expect(r.main.deliverAgent).not.toHaveBeenCalled();
+        }
+      }
+    }
+  });
+
+  it.each(["root", "actor", "agent"] as const)("stamps the directory's current %s epoch, never message data", async kind => {
+    const id = kind === "root" ? "session:current" : `${kind}:current`;
+    const target = remote(id, "idle", kind);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [target], { request });
+    for (const delivery of ["steer", "followUp"] as const) {
+      target.ownerIncarnation = `current:${delivery}`;
+      await r.value.routeMessage(id, "fenced", { ownerIncarnation: "payload-forgery" }, delivery);
+      expect(request.mock.calls.at(-1)![3]).toMatchObject({ ownerIncarnation: target.ownerIncarnation });
+    }
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("refuses a legacy protocol even if it advertises an epoch", async () => {
+    const target = { ...remote("session:legacy", "idle", "root"), controlProtocol: "legacy" as const };
+    const request = vi.fn();
+    const r = router(unknown, [target], { request });
+    await expect(r.value.routeMessage(target.id, "unsafe", undefined, "steer"))
+      .rejects.toMatchObject({ code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
+    expect(request).not.toHaveBeenCalled(); expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+});
 
 describe("directory availability for live Mains (#2386)", () => {
   it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {

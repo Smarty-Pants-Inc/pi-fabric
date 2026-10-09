@@ -785,7 +785,7 @@ describe("ActorManager across a session reload", () => {
     });
     const asker = plane({ id: "session:asker", name: "main", kind: "main", sessionId: "asker" });
     asker.start(() => ({ accepted: false }));
-    const asked = asker.request("session:owner", actor.id, "ask", { message: "HANG_WITH_PROGRESS job" }).catch(() => undefined);
+    const asked = asker.request("session:owner", actor.id, "ask", { message: "HANG_WITH_PROGRESS job", ownerIncarnation: control.incarnation }).catch(() => undefined);
     await waitFor(() => manager.status(actor.id).status === "running", 10_000);
     await new Promise((resolve) => setTimeout(resolve, 300));   // the worker has reported progress
 

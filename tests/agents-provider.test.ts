@@ -2334,6 +2334,36 @@ describe("AgentsProvider runner support", () => {
     expect(status).not.toHaveBeenCalled();
   });
 
+  it.each(["legacy", "v1"] as const)("remote ask refuses an epochless %s peer before result publication", async controlProtocol => {
+    const id = "actor:older";
+    const member = { format: 1, id, kind: "actor", rootId: "session:older", ownerHostId: "host:older", ownerIdentityId: "session:older",
+      name: "old actor", status: "idle", runner: "pi", transport: "host", capabilities: ["ask"],
+      startedAt: 1, updatedAt: 2, controlProtocol, local: false, stale: false } as FabricParticipantInfo;
+    const requestResult = vi.fn();
+    const request = vi.fn();
+    const { provider, actors } = setup([], [member], { request, requestResult } as unknown as FabricControlPlane);
+    const legacy = vi.spyOn(actors, "steerRemote");
+    await expect(provider.invoke("ask", { id, message: "unsafe", data: { ownerIncarnation: "payload-forgery" } }, context))
+      .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
+        targetId: id, message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+    expect(requestResult).not.toHaveBeenCalled(); expect(request).not.toHaveBeenCalled(); expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("remote ask stamps the target's current directory epoch, not caller data", async () => {
+    const id = "actor:fenced";
+    const member = { format: 1, id, kind: "actor", rootId: "session:owner", ownerHostId: "host:owner", ownerIdentityId: "session:owner",
+      ownerIncarnation: "current:ask-1", name: "fenced actor", status: "idle", runner: "pi", transport: "host", capabilities: ["ask"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false } as FabricParticipantInfo;
+    const requestResult = vi.fn().mockResolvedValue({ id: "reply", text: "done" });
+    const { provider } = setup([], [member], { requestResult } as unknown as FabricControlPlane);
+    for (const epoch of ["current:ask-1", "current:ask-2"]) {
+      member.ownerIncarnation = epoch;
+      await expect(provider.invoke("ask", { id, message: "fenced", data: { ownerIncarnation: "payload-forgery" } }, context))
+        .resolves.toMatchObject({ id: "reply" });
+      expect(requestResult.mock.calls.at(-1)![3]).toMatchObject({ ownerIncarnation: epoch });
+    }
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;

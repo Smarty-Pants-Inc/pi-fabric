@@ -50,8 +50,8 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
   const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
     const argv = template.map(entry => render(entry, values));
-    // The fleet launcher calls these --input, not --require. Keep paths literal and
-    // insert before the prompt separator so they cannot become task text.
+    // The fleet launcher's current repeatable preflight flag is --require.
+    // Keep paths literal and before the prompt separator, never as task text.
     const separator = argv.indexOf("--");
     argv.splice(separator < 0 ? argv.length : separator, 0, ...extraArguments);
     return executeFile(argv[0]!, argv.slice(1), { cwd: request.cwd, env: environment, timeoutMs: Math.max(1, limit), ...(signal ? { signal } : {}), killSignal: "SIGKILL" });
@@ -148,7 +148,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   assertTransportLaunchAllowed(request);
   try {
     let output: string;
-    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--input", file]))).stdout; }
+    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]))).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
       debt = `Placement launch outcome unknown: ${String(error)}`;

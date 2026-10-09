@@ -103,7 +103,7 @@ describe("host process task placement", () => {
     const request = { task: "inputs", transport: "process" as const, requires, model: "test/model", thinking: "high" as const };
     const result = method === "run" ? await f.manager.run(request) : await f.manager.wait((await f.manager.spawn(request)).id);
     expect(result).toMatchObject({ status: "completed", text: "REMOTE: inputs" });
-    expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"))).toEqual(["--host", "auto", "--minutes", "1", "--cwd", f.root, "--model", "test/model", "--thinking", "high", "--input", requires[0], "--input", requires[1], "--", "inputs"]);
+    expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"))).toEqual(["--host", "auto", "--minutes", "1", "--cwd", f.root, "--model", "test/model", "--thinking", "high", "--require", requires[0], "--require", requires[1], "--", "inputs"]);
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "poll-argv.json"), "utf8"))).toEqual([]);
   });
   it("snapshots required paths before asynchronous spawn preparation", async () => {
@@ -115,7 +115,7 @@ describe("host process task placement", () => {
     const h = await pending;
     expect((await f.manager.wait(h.id)).text).toBe("REMOTE: snapshot");
     const argv = JSON.parse(fs.readFileSync(path.join(f.results, h.id, "argv.json"), "utf8"));
-    expect(argv.slice(argv.indexOf("--input"), argv.indexOf("--"))).toEqual(["--input", original]);
+    expect(argv.slice(argv.indexOf("--require"), argv.indexOf("--"))).toEqual(["--require", original]);
   });
   it.each(["absent", "default-local", "needs-local", "unmet-need", "unsupported"] as const)("refuses missing inputs before a %s local worker starts", async policy => {
     const f = fixture();

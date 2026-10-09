@@ -17,6 +17,8 @@ export interface ResidentOperatorEvidence {
   residentRenewedLease?: true;
   /** With --main-stopped: the tool's own snapshot of the root's participants, their pids and the owner lease. */
   toolEvidence?: MainToolEvidence;
+  /** A real live root lease refuses as such; other refusals name their participant/identity reason. */
+  liveRootLease?: true;
   /** With --main-stopped: what the root participant shows. */
   mainLiveness?: string;
   operatorCheck: string;
@@ -46,7 +48,7 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
     evidence.leaseExpiresAt = Math.max(evidence.leaseExpiresAt ?? expiresAt, expiresAt);
     if (expiresAt < Date.now()) return;
     evidence.liveLease = true;
-    if (self) evidence.residentRenewedLease = true; else mainLive = true;
+    if (self) evidence.residentRenewedLease = true; else { mainLive = true; evidence.liveRootLease = true; }
   };
   const file = hostLeasePath(config.meshRoot, config.rootId);
   let present = false;
@@ -84,7 +86,7 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
     evidence.toolEvidence = snapshot;
     if (!verdict.startsWith("stale:")) mainLive = true;
   }
-  if (!options.mainStopped && evidence.residentRenewedLease) mainLive = true;
+  if (!options.mainStopped && evidence.residentRenewedLease) { mainLive = true; evidence.liveRootLease = true; }
   evidence.liveLease = mainLive;
   if (mainLive) delete evidence.residentRenewedLease;
   return evidence;
@@ -230,6 +232,13 @@ export function assertResidentOperatorConfirmed(evidence: ResidentOperatorEviden
     ? "Missing --confirm-dead-root: operator confirmation is required"
     : "Mismatched --confirm-dead-root: value must equal the selected resident's root id exactly");
   if (!dryRun && mainStopped === false) refuse(evidence, MAIN_STOPPED_REQUIRED);
-  if (!dryRun && evidence.liveLease) refuse(evidence, "Main has a live root lease; confirmation cannot override a live owner lease" +
+  if (dryRun || !evidence.liveLease) return;
+  if (!evidence.liveRootLease && evidence.mainLiveness?.startsWith("unknown:")) {
+    refuse(evidence, `Main identity cannot be verified: ${evidence.mainLiveness.slice("unknown: ".length)}; refusing (smarty-dev#7956)`);
+  }
+  if (!evidence.liveRootLease && evidence.mainLiveness?.startsWith("live:")) {
+    refuse(evidence, `Main is live: ${evidence.mainLiveness.slice("live: ".length)}; confirmation cannot override it`);
+  }
+  refuse(evidence, "Main has a live root lease; confirmation cannot override a live owner lease" +
     (evidence.mainLiveness ? ` (${evidence.mainLiveness})` : ""));
 }

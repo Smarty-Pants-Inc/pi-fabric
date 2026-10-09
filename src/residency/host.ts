@@ -1533,6 +1533,13 @@ export class ResidentHost {
             (command.mainStoppedAudit !== undefined && !validMainStoppedAudit(command.mainStoppedAudit, this.config.rootId))) {
           throw new Error("Invalid resident operator actor request");
         }
+        // Input errors first, on every platform: resolve the actor before any liveness or identity check.
+        // Exact id/name within this executor's root only; never resolve via the caller's root.
+        const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
+          actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
+        if (candidates.length !== 1) throw new Error(candidates.length
+          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
+        const actor = candidates[0]!;
         // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
         const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
         // The live path needs no startup claim: this running host holds host.lock for its whole life, so no
@@ -1545,12 +1552,6 @@ export class ResidentHost {
         const check = () => assertResidentOperatorConfirmed(
           readResidentOperatorEvidence(this.config, this.mesh, self, options), command.confirmDeadRoot, false, mainStopped);
         assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true, mainStopped);
-        // Exact id/name within this executor's root only; never resolve via the caller's root.
-        const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
-          actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
-        if (candidates.length !== 1) throw new Error(candidates.length
-          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
-        const actor = candidates[0]!;
         if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {

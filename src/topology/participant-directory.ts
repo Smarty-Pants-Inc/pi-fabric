@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
@@ -2011,7 +2012,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
       let committedAt = 0;
       const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
+        prepare: view => {
+          this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
+          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
+        },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
         // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
@@ -2078,6 +2082,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (participant?.kind === "actor" && this.options.actorRenewalAllowed &&
         !this.options.actorRenewalAllowed(participant)) return undefined;
       if (this.#renewalAhead(current, committed)) return undefined;
+      if (participant) this.#assertRootPublishable(participant);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }, this.#fileLockOptions()));
@@ -2262,13 +2267,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
+  /** Under the same key lock or state transaction as the write: a root Main never publishes its root
+   * participant while an operator actor removal fences that root (smarty-dev#7817). */
+  #assertRootPublishable(record: FabricParticipantRecord | undefined): true {
+    if (record?.kind === "root" && record.id === this.options.rootId && mainPublicationFenced(this.mesh.root, record.id)) {
+      throw new MainPublicationFencedError(record.id);
+    }
+    return true;
+  }
+
   #writeFile(
     record: FabricParticipantRecord,
     allowed: (current: MeshStateEntry | undefined) => boolean,
     durable = false,
   ): Promise<boolean> {
     const key = keyFor(PARTICIPANT_PREFIX, record.id);
-    return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
+    return writeParticipantFileIf(this.mesh, key, (current) => this.#assertRootPublishable(record) && allowed(current) ? {
       key,
       value: record,
       version: (current?.version ?? 0) + 1,

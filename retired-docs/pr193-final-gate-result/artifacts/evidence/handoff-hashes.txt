@@ -1,0 +1,6 @@
+6949635e842d83eeca604381e33fe5dd4c3677f7bee15c405fb3e121fecb45a6  /srv/scratch/paul/tasks/direct/laneb-2184-pr193-final-gate-r3-2034/artifacts/evidence/dist.sha256
+0a9911d29835c8e8f9d5611d8d8370321ad70e56bb4abe89800a643bae76d234  /srv/scratch/paul/tasks/direct/laneb-2184-pr193-final-gate-r3-2034/artifacts/evidence/source-start.sha256
+0a9911d29835c8e8f9d5611d8d8370321ad70e56bb4abe89800a643bae76d234  /srv/scratch/paul/tasks/direct/laneb-2184-pr193-final-gate-r3-2034/artifacts/evidence/source-end.sha256
+e8f1f3d2965068e83acbcc864d058796f2f0df7052c9fe1171eb48773e517f6a  dist/ui/conversation-native-reader.js
+32716eb82861960a752466aa259023629fdc02d62b53d36d6e177576d575c31b  dist/ui/conversation-native-reader.js.map
+dff123a679237a8589c640996b84cad04fb4e1a5567effef244b97516c8eefe1  src/ui/conversation-native-reader.ts

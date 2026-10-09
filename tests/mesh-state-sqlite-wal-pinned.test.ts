@@ -63,7 +63,7 @@ afterEach(() => {
 
 // pi-fabric#694 P1 1 and 2: a small cap so each case runs in seconds. One commit of `pad` is ~70-100 KiB of WAL.
 const SMALL_CAP = 4 * MiB;
-type Outcome = { ok: true } | { ok: false; code?: string; message?: string };
+type Outcome = { ok: true } | { ok: false; code?: string | undefined; message?: string };
 const attempt = async (write: () => Promise<unknown>): Promise<Outcome> => {
   try { await write(); return { ok: true }; }
   catch (error) { return { ok: false, code: (error as { code?: string }).code, message: (error as Error).message }; }

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomInt } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -41,9 +42,10 @@ export class NatsLeaseCluster {
   jsm!: JetStreamManager;
   store!: NatsKvLeaseStore;
   readonly bucket: string;
-  constructor(readonly label: string, readonly maxLeaseMs = 5_000) {
+  constructor(readonly label: string, readonly maxLeaseMs = 10_000) {
     this.bucket = `U2_${label.replace(/[^a-zA-Z0-9_]/g, "_")}_${process.pid}`;
   }
+  get monitoringUrls(): string[] { return this.nodes.map(n => `http://127.0.0.1:${n.monitorPort}/varz`); }
   get servers(): string[] { return this.nodes.map(n => `nats://127.0.0.1:${n.clientPort}`); }
   async connection(): Promise<NatsConnection> {
     const nc = await connect({ servers: this.servers, timeout: 2_000,
@@ -55,7 +57,16 @@ export class NatsLeaseCluster {
     if (!existsSync(binary)) throw new Error(`Missing verified NATS binary: ${binary}`);
     // Reserve all ports together, release immediately before spawning this isolated cluster.
     const reservations = await Promise.all(Array.from({ length: 9 }, async () => {
-      const server = net.createServer(); server.listen(0, "127.0.0.1"); await once(server, "listening");
+      // Stay below Linux's ephemeral client-port range: route/client connections
+      // can otherwise steal a released listen(0) port during parallel cluster startup.
+      let server: net.Server | undefined;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const candidate = net.createServer();
+        candidate.listen(randomInt(10_000, 30_000), "127.0.0.1");
+        try { await once(candidate, "listening"); server = candidate; break; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error; }
+      }
+      if (!server) throw new Error("Cannot reserve an isolated test port");
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Cannot reserve local port");
       return { server, port: address.port };
@@ -99,7 +110,7 @@ export class NatsLeaseCluster {
         try {
           this.jsm = await jetstreamManager(this.nc, { timeout: 5_000 });
           this.store = await NatsKvLeaseStore.open(this.nc, { bucket: this.bucket,
-            maxLeaseMs: this.maxLeaseMs, timeoutMs: 5_000 });
+            maxLeaseMs: this.maxLeaseMs, timeoutMs: 5_000, monitoringUrls: this.monitoringUrls });
           break;
         } catch (error) {
           if (Date.now() >= admissionDeadline ||

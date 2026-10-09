@@ -5,7 +5,7 @@ import { NatsKvLeaseStore, newLeaseIncarnation } from "../../src/topology/nats-k
 // The parent kills this process with SIGKILL before acquire can return a handle.
 const [servers, bucket, id, phase] = process.argv.slice(2) as [string, string, string, string];
 const nc = await connect({ servers: servers.split(",") });
-const store = await NatsKvLeaseStore.open(nc, { bucket, maxLeaseMs: 5_000 });
+const store = await NatsKvLeaseStore.open(nc, { bucket, maxLeaseMs: 10_000, syncAlwaysAttested: true });
 const kv = (store as unknown as { kv: KV }).kv;
 const create = kv.create.bind(kv);
 kv.create = async (...args) => {
@@ -17,5 +17,5 @@ kv.create = async (...args) => {
 };
 const now = Date.now();
 await store.acquire({ id, rootId: "crash-root", identityId: "crash-owner", startedAt: now,
-  updatedAt: now, expiresAt: now + 400 }, newLeaseIncarnation());
+  updatedAt: now, expiresAt: now + 5_000 }, newLeaseIncarnation());
 throw new Error("Crash seam unexpectedly returned ownership");

@@ -1,11 +1,15 @@
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { KV } from "@nats-io/kv";
+import type { JetStreamClient } from "@nats-io/jetstream";
 import type { FabricHostLease } from "../src/topology/host-leases.js";
 import { LeaseLostError, NatsKvLeaseStore, newLeaseIncarnation, type LeaseSnapshot } from "../src/topology/nats-kv-leases.js";
 import { artifactDirectory, deferred, hasNatsLeaseServer, NatsLeaseCluster, sleep } from "./helpers/nats-lease-cluster.js";
+
+import { FencedLeaseResource } from "./helpers/nats-lease-resource.js";
 
 interface Interval { owner: string; start: number; end: number; revisions: number[] }
 interface Event { atMs: number; kind: string; owner?: string; revision?: number; detail?: string }
@@ -15,15 +19,80 @@ const makeLease = (id: string, identityId: string, ttl: number, startedAt: numbe
 };
 
 describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, always sync; requires local binary)", () => {
-  const cluster = new NatsLeaseCluster("fault", 5_000);
-  beforeAll(async () => { await cluster.start(); }, 40_000);
-  afterAll(async () => { await cluster.close(); }, 15_000);
+  const cluster = new NatsLeaseCluster("fault", 10_000);
+  // The protected resource has independent transport/leadership. Lease-leader
+  // loss must not turn the observer into the same failed lease client.
+  const protectedCluster = new NatsLeaseCluster("protected", 10_000);
+  const resources: FencedLeaseResource[] = [];
+  let killResource: FencedLeaseResource, pausedResource: FencedLeaseResource;
+  beforeAll(async () => {
+    await Promise.all([cluster.start(), protectedCluster.start()]);
+    killResource = await FencedLeaseResource.open(protectedCluster, "KILL"); resources.push(killResource);
+    pausedResource = await FencedLeaseResource.open(protectedCluster, "PAUSED"); resources.push(pausedResource);
+  }, 40_000);
+  afterAll(async () => {
+    try { await Promise.all(resources.map(resource => resource.close())); }
+    finally { await Promise.all([cluster.close(), protectedCluster.close()]); }
+  }, 15_000);
 
-  it("kills actual KV leader during competing renewals: max overlapping owners = 0", async () => {
+  it("SIGSTOP across expiry then SIGCONT: stale owner cannot land a write after successor", async () => {
+    // Run this before leader-kill, so only the OWNER is paused, not admission metadata.
+    const resource = pausedResource;
+    const child = spawn("bun", [resolve("tests/helpers/nats-lease-paused.ts"), cluster.servers.join(","),
+      cluster.bucket, "paused-lease", resource.subject, protectedCluster.servers.join(",")], { stdio: ["ignore", "pipe", "pipe"] });
+    const exited = once(child, "exit");
+    let stdout = "", stderr = "", stopped = false;
+    child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
+    try {
+      const old = await new Promise<LeaseSnapshot>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Paused child not ready: ${stderr}`)), 10_000);
+        child.stdout!.on("data", chunk => {
+          stdout += chunk.toString();
+          const ready = stdout.match(/PAUSE_READY (.+)\n/);
+          if (ready) { clearTimeout(timer); resolve(JSON.parse(ready[1]!)); }
+        });
+        child.once("error", error => { clearTimeout(timer); reject(error); });
+        child.once("exit", () => { clearTimeout(timer); reject(new Error(`Paused child exited early: ${stderr}`)); });
+      });
+      expect(child.kill("SIGSTOP")).toBe(true); stopped = true;
+      await sleep(20); // OS signal delivery only, NOT expiry/acquisition polling.
+      expect(readFileSync(`/proc/${child.pid}/status`, "utf8")).toMatch(/State:\s+T/);
+      await resource.waitObserved("paused-A-first");
+      // The lease watcher, not a client expiry timer, drives the successor.
+      const successor = await cluster.store.acquireWaiting(() => makeLease("paused-lease", "paused-B", 5_000,
+        old.lease.startedAt!), newLeaseIncarnation(), { waitMs: 12_000 });
+      expect(successor.revision).toBeGreaterThan(old.revision);
+      expect((await resource.write(successor, "paused-B", "paused-B-first")).accepted).toBe(true);
+      expect(child.kill("SIGCONT")).toBe(true); stopped = false;
+      const [code, signal] = await exited;
+      expect({ code, signal, stderr }).toEqual({ code: 0, signal: null, stderr: "" });
+      expect(stdout).toContain('STALE_WRITE {"accepted":false');
+      expect((await resource.write(successor, "paused-B", "paused-B-after-stale-attempt")).accepted).toBe(true);
+      expect(resource.violations).toEqual([]);
+      expect(resource.observed.map(w => w.owner)).toEqual(["paused-A", "paused-B", "paused-B"]);
+      expect(resource.rejected.map(w => w.writeId)).toEqual(["paused-A-stale-after-successor"]);
+      const result = { scenario: "SIGSTOP owner across server TTL expiry; successor accepted write; SIGCONT stale write rejected",
+        physicalHosts: 1, syncInterval: "always", pausedPid: child.pid,
+        predecessorFence: old.revision, successorFence: successor.revision,
+        protectedWrites: resource.observed, rejectedWrites: resource.rejected, fenceViolations: resource.violations,
+        stdout, stderr, exitCode: code };
+      writeFileSync(join(artifactDirectory(), "paused-owner.json"), JSON.stringify(result, null, 2) + "\n");
+      console.log(`PAUSED_OWNER ${JSON.stringify(result)}`);
+      expect(await cluster.store.release(successor)).toBe(true);
+    } finally {
+      if (stopped) child.kill("SIGCONT");
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+      writeFileSync(join(artifactDirectory(), "paused-owner-process.log"), stdout + stderr);
+    }
+  }, 25_000);
+
+  it("kills actual KV leader during renewals; independent protected writes remain fenced", async () => {
+    const resource = killResource;
     const ncA = await cluster.connection(), ncB = await cluster.connection();
-    const a = await NatsKvLeaseStore.open(ncA, { bucket: cluster.bucket, maxLeaseMs: 5_000, timeoutMs: 400 });
-    const b = await NatsKvLeaseStore.open(ncB, { bucket: cluster.bucket, maxLeaseMs: 5_000, timeoutMs: 400 });
-    const id = "fault-lease", ttl = 1_000, start = performance.now();
+    const a = await NatsKvLeaseStore.open(ncA, { bucket: cluster.bucket, maxLeaseMs: 10_000, timeoutMs: 400, monitoringUrls: cluster.monitoringUrls });
+    const b = await NatsKvLeaseStore.open(ncB, { bucket: cluster.bucket, maxLeaseMs: 10_000, timeoutMs: 400, monitoringUrls: cluster.monitoringUrls });
+    const id = "fault-lease", ttl = 5_000, start = performance.now();
     const events: Event[] = [], intervals: Interval[] = [];
     const at = (): number => performance.now() - start;
     const log = (event: Omit<Event, "atMs">): void => { events.push({ atMs: at(), ...event }); };
@@ -31,6 +100,7 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
     const startedA = Date.now(), startedB = startedA; // Deliberately equal start milliseconds.
     let handleA = (await a.acquire(makeLease(id, "A", ttl, startedA), incarnationA))!;
     expect(handleA).toBeDefined();
+    expect((await resource.write(handleA, "A", "A-first")).accepted).toBe(true);
     // Conservative intervals are client authority, NOT a sampled KV value. This catches
     // a successor acknowledged while a predecessor still believes its own lease is valid.
     const endFor = (handle: LeaseSnapshot): number => at() + Math.max(0, handle.lease.expiresAt - Date.now());
@@ -39,8 +109,8 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
     const renewalInFlight = deferred(), resumeRenewal = deferred();
     let activeA = true, attemptsA = 0, successesA = 0, errorsA = 0, renewalPausedAtKill = false;
     let attemptsB = 0, errorsB = 0, successesB = 0;
-    const kv = (a as unknown as { kv: KV }).kv, update = kv.update.bind(kv);
-    kv.update = async (...args) => {
+    const js = (a as unknown as { js: JetStreamClient }).js, publish = js.publish.bind(js);
+    js.publish = async (...args) => {
       if (attemptsA === 3) {
         // Pin loss between the third renewal's real leader read and its CAS publish.
         // No synthetic publish failure: resume calls the real client against the failed cluster.
@@ -48,7 +118,7 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
         log({ kind: "renew-in-flight-before-leader-kill", owner: "A", revision: handleA.revision });
         renewalInFlight.resolve(); await resumeRenewal.promise;
       }
-      return update(...args);
+      return publish(...args);
     };
     const renewA = (async () => {
       for (let i = 0; i < 40 && activeA; i++) {
@@ -57,6 +127,7 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
         try {
           handleA = await a.renew(handleA, makeLease(id, "A", ttl, startedA));
           successesA++; intervalA.end = endFor(handleA); intervalA.revisions.push(handleA.revision);
+          expect((await resource.write(handleA, "A", `A-renew-${successesA}`)).accepted).toBe(true);
           log({ kind: "renewed", owner: "A", revision: handleA.revision });
         } catch (error) {
           errorsA++; activeA = false;
@@ -88,6 +159,8 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
       const intervalB = { owner: "B", start: at(), end: endFor(handleB), revisions: [handleB.revision] };
       intervals.push(intervalB); log({ kind: "acquired", owner: "B", revision: handleB.revision });
       expect(handleB.revision).toBeGreaterThan(intervalA.revisions.at(-1)!);
+      expect((await resource.write(handleB, "B", "B-first")).accepted).toBe(true);
+      expect((await resource.write(handleA, "A", "A-stale-after-B")).accepted).toBe(false);
       await expect(a.renew(handleA, makeLease(id, "A", ttl, startedA))).rejects.toBeInstanceOf(LeaseLostError);
       expect(await a.release(handleA)).toBe(false);
       log({ kind: "stale-owner-renew-and-close-fenced", owner: "A", revision: handleA.revision });
@@ -95,6 +168,7 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
         await sleep(40);
         handleB = await b.renew(handleB, makeLease(id, "B", ttl, startedB));
         successesB++; intervalB.end = endFor(handleB); intervalB.revisions.push(handleB.revision);
+        expect((await resource.write(handleB, "B", `B-renew-${successesB}`)).accepted).toBe(true);
         log({ kind: "renewed", owner: "B", revision: handleB.revision });
       }
       intervalB.end = Math.min(intervalB.end, at());
@@ -113,7 +187,7 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
     } finally {
       resumeRenewal.resolve();
       await Promise.allSettled([renewA, outcomeB]);
-      kv.update = update;
+      js.publish = publish;
     }
     await renewA;
     const errorB = await outcomeB;
@@ -131,7 +205,8 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
       replicas: info.config.num_replicas, physicalHosts: 1, syncInterval: "always",
       renewalPausedAtKill, attemptsA, successesA, errorsA, attemptsB, errorsB, successesB,
       maxConcurrentOwners, maxOverlappingOwners,
-      measurement: "Sweep of every acknowledged client authority endpoint; predecessor retains old deadline after failure; release ends authority; not sampled KV reads",
+      measurement: "Independent protected-resource KV watch verifies every accepted fence in stream order; authority interval sweep is supplemental only",
+      protectedWrites: resource.observed, rejectedWrites: resource.rejected, fenceViolations: resource.violations,
       intervals, events };
     writeFileSync(join(artifactDirectory(), "fault.json"), JSON.stringify(result, null, 2) + "\n");
     console.log(`FAULT ${JSON.stringify(result)}`);
@@ -139,6 +214,9 @@ describe.skipIf(!hasNatsLeaseServer())("NatsKvLeaseStore leader-kill fault (R3, 
     expect(renewalPausedAtKill).toBe(true);
     expect(successesB).toBe(10); expect(successesA).toBeGreaterThanOrEqual(2); expect(attemptsA).toBeGreaterThanOrEqual(3);
     expect(maxOverlappingOwners).toBe(0); expect(intervals).toHaveLength(2);
+    expect(resource.violations).toEqual([]);
+    expect(resource.observed.filter(w => w.owner === "B")).toHaveLength(11);
+    expect(resource.rejected.some(w => w.writeId === "A-stale-after-B")).toBe(true);
     expect(await b.read(id)).toBeUndefined();
   }, 30_000);
 });

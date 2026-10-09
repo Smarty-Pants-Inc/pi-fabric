@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { NatsConnection } from "@nats-io/transport-node";
-import { jetstream, JetStreamApiCodes, JetStreamApiError, StorageType } from "@nats-io/jetstream";
+import { jetstream, JetStreamApiCodes, JetStreamApiError, StorageType, type JetStreamClient } from "@nats-io/jetstream";
 import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
 import type { FabricHostLease } from "./host-leases.js";
 
@@ -44,13 +44,29 @@ const sameOwner = (a: LeaseSnapshot, b: LeaseSnapshot): boolean => a.incarnation
   a.lease.id === b.lease.id && a.lease.rootId === b.lease.rootId &&
   a.lease.identityId === b.lease.identityId && a.lease.startedAt === b.lease.startedAt;
 
-export class NatsKvLeaseStore implements HostLeaseStore {
-  private constructor(private readonly kv: KV, readonly maxLeaseMs: number) {}
+export interface NatsKvLeaseStoreOptions {
+  bucket: string;
+  maxLeaseMs: number;
+  timeoutMs?: number;
+  /** Trusted host-only /varz endpoints for every eligible R3 member, never lease payload/config. */
+  monitoringUrls?: readonly string[];
+  /** Host-only operator attestation: ALL eligible R3 members use sync_interval: always.
+   * Required when monitoring cannot verify it; never overrides an observed unsafe config. */
+  syncAlwaysAttested?: true;
+}
+interface SyncReport {
+  server_id?: string;
+  server_name?: string;
+  jetstream?: { config?: { sync_always?: boolean; sync_interval?: number | string } };
+}
 
-  /** Provision/open an R3 file bucket. Deployment MUST set sync_interval: always on all servers. */
-  static async open(nc: NatsConnection, options: {
-    bucket: string; maxLeaseMs: number; timeoutMs?: number;
-  }): Promise<NatsKvLeaseStore> {
+export class NatsKvLeaseStore implements HostLeaseStore {
+  private constructor(private readonly kv: KV, private readonly js: JetStreamClient,
+    private readonly bucket: string, readonly maxLeaseMs: number,
+    readonly durability: "verified-monitoring" | "operator-attested") {}
+
+  /** Provision/open only after fail-closed, all-member durability admission. */
+  static async open(nc: NatsConnection, options: NatsKvLeaseStoreOptions): Promise<NatsKvLeaseStore> {
     const version = (nc.info?.version ?? "").split(".").map(Number);
     const [major = 0, minor = 0, patch = 0] = version;
     if (!(major > 2 || (major === 2 && (minor > 14 || (minor === 14 && patch >= 7))))) {
@@ -59,7 +75,43 @@ export class NatsKvLeaseStore implements HostLeaseStore {
     if (!Number.isSafeInteger(options.maxLeaseMs) || options.maxLeaseMs < 1) {
       throw new Error("maxLeaseMs must be a positive integer");
     }
-    const kv = await new Kvm(jetstream(nc, { timeout: options.timeoutMs ?? 2_000 })).create(options.bucket, {
+    const js = jetstream(nc, { timeout: options.timeoutMs ?? 2_000 });
+    // Server INFO and JetStream account info expose availability/limits, NOT disk sync.
+    // Do not infer durability from R3, a successful PubAck, or account API level.
+    const manager = await js.jetstreamManager();
+    await manager.getAccountInfo();
+    const reports = await Promise.all((options.monitoringUrls ?? []).map(async endpoint => {
+      const url = new URL(endpoint);
+      if (url.pathname !== "/varz" || url.username || url.password ||
+        !(url.protocol === "https:" || (url.protocol === "http:" &&
+          ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) {
+        throw new Error("Durability monitoring requires trusted HTTPS /varz (HTTP only on loopback)");
+      }
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(options.timeoutMs ?? 2_000), redirect: "error" });
+        if (!response.ok) return undefined;
+        const report: unknown = await response.json();
+        return report && typeof report === "object" && !Array.isArray(report) ? report as SyncReport : undefined;
+      } catch { return undefined; } // Unverifiable requires explicit host-only attestation below.
+    }));
+    const verified = reports.filter((r): r is SyncReport => r !== undefined);
+    for (const report of verified) {
+      const sync = report.jetstream?.config;
+      // v2.14.7 reports a numeric periodic interval EVEN when sync_always is true.
+      if (sync && (sync.sync_always === false || (sync.sync_always !== true &&
+        sync.sync_interval !== undefined && sync.sync_interval !== "always"))) {
+        throw new Error(`Unsafe JetStream durability on ${report.server_name ?? "unknown"}: require sync_interval: always`);
+      }
+    }
+    const always = verified.filter(r => typeof r.server_id === "string" && r.server_id.length > 0 &&
+      typeof r.server_name === "string" && r.server_name.length > 0 &&
+      (r.jetstream?.config?.sync_always === true || r.jetstream?.config?.sync_interval === "always"));
+    const preverified = always.length >= 3 && new Set(always.map(r => r.server_id)).size >= 3 &&
+      always.some(r => r.server_id === nc.info?.server_id);
+    if (!preverified && options.syncAlwaysAttested !== true) {
+      throw new Error("Cannot verify all-member sync_interval: always; require host-only syncAlwaysAttested: true");
+    }
+    const kv = await new Kvm(js).create(options.bucket, {
       replicas: 3, storage: StorageType.File, history: 1,
       // Leader API reads, never follower/direct reads, including create's tombstone check.
       allow_direct: false, ttl: options.maxLeaseMs, markerTTL: options.maxLeaseMs,
@@ -71,7 +123,15 @@ export class NatsKvLeaseStore implements HostLeaseStore {
       status.markerTTL !== options.maxLeaseMs || config.mirror || config.sources?.length) {
       throw new Error("Existing lease bucket violates R3/file/TTL/leader-read requirements");
     }
-    return new NatsKvLeaseStore(kv, options.maxLeaseMs);
+    const members = [status.streamInfo.cluster?.leader,
+      ...(status.streamInfo.cluster?.replicas?.map(r => r.name) ?? [])];
+    const covered = preverified && members.length === 3 && members.every(name =>
+      name && always.some(r => r.server_name === name));
+    if (!covered && options.syncAlwaysAttested !== true) {
+      throw new Error("Cannot verify sync_interval: always for every placed R3 member; require host-only syncAlwaysAttested: true");
+    }
+    return new NatsKvLeaseStore(kv, js, options.bucket, options.maxLeaseMs,
+      covered ? "verified-monitoring" : "operator-attested");
   }
 
   #validate(lease: FabricHostLease, incarnation: string): void {
@@ -97,6 +157,13 @@ export class NatsKvLeaseStore implements HostLeaseStore {
     if (lease.updatedAt > Date.now()) throw new Error("Cannot publish a future-dated lease");
     return JSON.stringify({ format: 1, lease, incarnation } satisfies StoredLease);
   }
+  #ttl(lease: FabricHostLease): string {
+    const remaining = lease.expiresAt - Date.now();
+    if (remaining <= 0) throw new LeaseLostError("Cannot publish an expired lease");
+    // Server message TTL is stored in whole seconds. Round UP: a subsecond
+    // remainder must never delete the key before the acknowledged logical deadline.
+    return `${Math.ceil(remaining / 1_000)}s`; // Relative to publication, not updatedAt.
+  }
   async #entry(id: string): Promise<KvEntry | undefined> {
     try { return await this.kv.get(keyFor(id)) ?? undefined; }
     catch (error) { if (missing(error)) return undefined; throw error; }
@@ -115,7 +182,7 @@ export class NatsKvLeaseStore implements HostLeaseStore {
     if (current && current.lease.expiresAt > Date.now()) return undefined;
     try {
       if (current) await this.kv.delete(key, { previousSeq: current.revision });
-      const revision = await this.kv.create(key, value);
+      const revision = await this.kv.create(key, value, this.#ttl(lease));
       const result = { lease: JSON.parse(value).lease as FabricHostLease, incarnation, revision };
       this.#live(result); // Late/ambiguous acknowledgements never grant expired ownership.
       return result;
@@ -138,7 +205,12 @@ export class NatsKvLeaseStore implements HostLeaseStore {
       throw new LeaseLostError("Lease replaced before renewal");
     }
     try {
-      const revision = await this.kv.update(keyFor(lease.id), value, expected.revision);
+      // KV.update has no PUT TTL option in NATS.js 3.4. Use the public JetStream
+      // publisher with the same subject-level CAS, refreshing the server expiry.
+      const ack = await this.js.publish(`$KV.${this.bucket}.${keyFor(lease.id)}`, value, {
+        expect: { lastSubjectSequence: expected.revision }, ttl: this.#ttl(lease), retries: 1,
+      });
+      const revision = ack.seq;
       // The predecessor's authority must not lapse while waiting for a publish acknowledgement.
       this.#live(expected);
       const result = { lease: JSON.parse(value).lease as FabricHostLease, incarnation: expected.incarnation, revision };
@@ -186,52 +258,47 @@ export class NatsKvLeaseStore implements HostLeaseStore {
     options.signal?.throwIfAborted();
     const first = makeLease(), id = first.id;
     const deadline = performance.now() + options.waitMs;
-    const watch = await this.kv.watch({ key: keyFor(id), ignoreDeletes: false });
-    let notify: (() => void) | undefined, pending = false, watchError: unknown;
-    let expiry: ReturnType<typeof setTimeout> | undefined;
+    // Exactly ONE failure deadline for this call; watch events never re-arm it.
+    let failure: unknown;
+    let notify: (() => void) | undefined, pending = false;
     const wake = (): void => { pending = true; notify?.(); };
-    const pump = (async () => {
-      try {
-        for await (const entry of watch) {
-          if (expiry) clearTimeout(expiry);
-          const current = this.#decode(entry);
-          if (current) expiry = setTimeout(wake, Math.max(0, current.lease.expiresAt - Date.now()));
-          wake(); // Treat entries only as hints: the next acquire rereads the leader.
-        }
-        watchError = new Error("Lease watcher ended"); wake();
-      } catch (error) { watchError = error; wake(); }
-    })();
+    const fail = (error: unknown): void => { failure = error; wake(); };
+    const timer = setTimeout(() => fail(new LeaseWaitTimeoutError(`Lease ${id} wait timed out`)), options.waitMs);
+    const abort = (): void => fail(options.signal?.reason ?? new Error("Lease wait aborted"));
+    options.signal?.addEventListener("abort", abort, { once: true });
+    let watch: Awaited<ReturnType<KV["watch"]>> | undefined;
+    let pump: Promise<void> | undefined;
     try {
+      options.signal?.throwIfAborted();
+      watch = await this.kv.watch({ key: keyFor(id), ignoreDeletes: false });
+      pump = (async () => {
+        try {
+          for await (const _entry of watch!) {
+            // PUT, DEL, PURGE and server TTL delete markers are hints only.
+            // No logical-expiry timer: ownership always comes from a fresh leader CAS.
+            wake();
+          }
+          fail(new Error("Lease watcher ended"));
+        } catch (error) { fail(error); }
+      })();
       for (;;) {
         options.signal?.throwIfAborted();
-        if (watchError) throw watchError;
+        if (failure) throw failure;
         const lease = makeLease();
         if (lease.id !== id) throw new Error("Waiting lease key changed");
         const acquired = await this.acquire(lease, incarnation);
         if (acquired) return acquired;
+        if (failure) throw failure;
         if (performance.now() >= deadline) throw new LeaseWaitTimeoutError(`Lease ${id} remained owned`);
         if (pending) { pending = false; continue; }
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        let abort: (() => void) | undefined;
-        try {
-          await new Promise<void>((resolve, reject) => {
-            notify = resolve;
-            timer = setTimeout(() => reject(new LeaseWaitTimeoutError(`Lease ${id} wait timed out`)),
-              Math.max(0, deadline - performance.now()));
-            abort = () => reject(options.signal?.reason ?? new Error("Lease wait aborted"));
-            options.signal?.addEventListener("abort", abort, { once: true });
-            if (options.signal?.aborted) abort();
-          });
-        } finally {
-          if (timer) clearTimeout(timer);
-          if (abort) options.signal?.removeEventListener("abort", abort);
-          notify = undefined;
-        }
+        await new Promise<void>(resolve => { notify = resolve; });
+        notify = undefined;
         pending = false;
       }
     } finally {
-      if (expiry) clearTimeout(expiry);
-      watch.stop();
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      watch?.stop();
       await pump;
     }
   }

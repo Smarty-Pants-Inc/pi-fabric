@@ -6,13 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { readHostLeaseCurrent } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLeaseCurrent } from "../src/topology/host-leases.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const directories: ParticipantDirectory[] = [], stores: MeshStore[] = [], roots: string[] = [];
 afterEach(async () => {
   await Promise.all(directories.splice(0).map(directory => directory.close()));
   for (const store of stores.splice(0)) store.closeState();
-  vi.useRealTimers(); vi.restoreAllMocks();
+  // Restore timer spies before returning to real timers: the reverse order
+  // reinstalls the spied fake setTimeout in the following real-timer test.
+  vi.restoreAllMocks(); vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const hostId = "7313-host";
@@ -37,6 +40,76 @@ const setup = async (stateBackend: "file" | "sqlite") => {
 };
 
 describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-dev#7313)", stateBackend => {
+  it("a contended startup makes one custody attempt and no timer retries", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lease-startup-contention-")); roots.push(root);
+    const mesh = new MeshStore(root, 65_536, 100, { stateBackend }); stores.push(mesh);
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: "7313-root",
+      identity: { id: "7313-owner", name: "owner", kind: "agent" }, reapDeadHosts: false,
+      live: () => false, heartbeatMs: 100 });
+    directories.push(directory);
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = mesh.leaseCustody(hostLeasePath(root, hostId), async () => { entered(); await gate; });
+    await waiting;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = vi.spyOn(globalThis, "setTimeout"), attempts = vi.spyOn(mesh, "leaseCustody");
+    try {
+      await expect(directory.start()).rejects.toMatchObject({ busyCode: "FABRIC_HOST_LEASE_LOCK_BUSY" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(directory.canConsumeMesh()).toBe(false);
+      expect(attempts).toHaveBeenCalledOnce(); // <= 2, even across the preparation budget
+      expect(timers).not.toHaveBeenCalled();
+    } finally { release(); await holder; }
+
+  });
+
+  it("drains independent actor renewal before preparing its own contended custody gate", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lease-preparation-order-")); roots.push(root);
+    const mesh = new MeshStore(root, 65_536, 100, { stateBackend }); stores.push(mesh);
+    const identity = { id: "7313-owner", name: "owner", kind: "agent" as const };
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: "7313-root", identity,
+      reapDeadHosts: false, live: () => false, renewActorParticipants: true, actorRenewalAllowed: () => true });
+    directories.push(directory);
+    const actor: FabricParticipantRecord = { format: 1, id: "7313-actor", rootId: "7313-root", kind: "actor",
+      name: "actor", status: "idle", ownerHostId: hostId, ownerIdentityId: identity.id, actorOwnershipToken: "lineage",
+      runner: "pi", transport: "process", capabilities: ["fabric"], controlProtocol: "v1",
+      startedAt: Date.now(), updatedAt: Date.now() };
+    directory.registerSource(() => [actor]);
+    await directory.start();
+    const file = hostLeasePath(root, hostId);
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = mesh.leaseCustody(file, async () => { entered(); await gate; });
+    await waiting;
+    try { await expect(directory.refresh()).rejects.toMatchObject({ busyCode: "FABRIC_HOST_LEASE_LOCK_BUSY" }); }
+    finally { release(); await holder; }
+
+    // The failed renewal requests preparation. Pause the next independent renewal
+    // while it owns REAL custody; preparation must not attempt that same gate yet.
+    let renewing!: () => void, resume!: () => void;
+    const renewalEntered = new Promise<void>(resolve => { renewing = resolve; });
+    const paused = new Promise<void>(resolve => { resume = resolve; });
+    const original = mesh.leaseCustody.bind(mesh);
+    const attempts = vi.spyOn(mesh, "leaseCustody").mockImplementationOnce((file, operation, timeout, options) =>
+      original(file, async () => { renewing(); await paused; return operation(); }, timeout, options));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const pending = directory.refresh().then(() => undefined, (error: unknown) => error);
+    try {
+      await renewalEntered;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(attempts).toHaveBeenCalledOnce();
+      expect(timers).not.toHaveBeenCalled();
+      resume();
+      expect(await pending).toBeUndefined();
+      expect(directory.canConsumeMesh()).toBe(true);
+    } finally { resume(); await pending; }
+
+  });
+
   it.each(["7313-owner", "7313-other"])("rejects a superseded explicit heartbeat (successor identity %s)", async identity => {
     const s = await setup(stateBackend);
     const successor = await s.make(identity);

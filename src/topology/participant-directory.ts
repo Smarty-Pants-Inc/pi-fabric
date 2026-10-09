@@ -765,6 +765,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const operation = this.#ownIncarnation.then(async () => {
       if (this.#closed) return false;
       if (this.options.enabled && this.#prepareLeaseLock) {
+        // Main's file renewal was synchronous. Its now-async actor renewal starts
+        // before publication: drain it before preparing the same host's gate, or
+        // every heartbeat can collide with its own renewal and never recover.
+        await this.#actorRenewing;
+        if (this.#closed) return false;
         await withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
           { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue });
         this.#prepareLeaseLock = false;

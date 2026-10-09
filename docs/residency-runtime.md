@@ -83,8 +83,10 @@ cursors survive; `owner.json` and the live processes do not.
 log durability barrier. Topic/address matches, direct control targets, and
 lifecycle subscriptions select a retained residency configuration. A durable
 `wake-request.json` nudge starts the existing launcher with `--wake`; the nudge
-is not another inbox. One POSIX `wake.lock` serializes all native starts, including
-the initial launcher. A short `wake-intent.lock` serializes durable request writes
+is not another inbox. One POSIX `wake.lock` serializes delivery-triggered native
+wake starts. Explicit/client starts retain the ordinary kernel-fenced startup
+protocol, including an already-admitted watchdog challenger; they are not silently
+suppressed by `wake.lock`. A short `wake-intent.lock` serializes durable request writes
 with the launcher's final request/sleep snapshot **and release of `wake.lock`**.
 A commit after that snapshot cannot write its nudge until lifetime custody is
 released, so its launcher cannot lose the wake by finding a departing lock holder.

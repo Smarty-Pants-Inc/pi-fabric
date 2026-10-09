@@ -313,10 +313,27 @@ export const spawnDetached = async (
   const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
   const scopeUnit = scopeRoot ? `${path.basename(scopeRoot)}.scope` : undefined;
+  const markerIdentity = `admitted ${scopeUnit}`;
+  const markerIsAdmitted = (): boolean => {
+    if (!marker) return false;
+    let fd: number | undefined;
+    try {
+      // A filename notification is only a wakeup. Authenticate the actual
+      // marker, including its launch identity, on every admission check.
+      const stat = fs.lstatSync(marker);
+      if (!stat.isFile() || stat.uid !== process.getuid?.()) return false;
+      fd = fs.openSync(marker, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.uid !== stat.uid || opened.dev !== stat.dev || opened.ino !== stat.ino
+        || opened.size !== Buffer.byteLength(markerIdentity)) return false;
+      return fs.readFileSync(fd, "utf8") === markerIdentity;
+    } catch { return false; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+  };
   const child = spawn(scope?.executable ?? runtime, scope ? [
     "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", `--unit=${scopeUnit}`, "--",
-    "/bin/sh", "-c", 'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125; printf admitted > "$1" || exit 125; shift; exec "$@"',
-    "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
+    "/bin/sh", "-c", 'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125; printf "admitted %s" "$2" > "$1" || exit 125; shift 2; exec "$@"',
+    "fabric-scope", marker!, scopeUnit!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
     ...(environment ? { env: environment } : {}),
@@ -580,8 +597,9 @@ export const spawnDetached = async (
     } catch (error) { unconfirmed(`Owned scope observation failed: ${String(error)}`); finishTree(error); }
     finally { observingTree = false; }
   };
-  const armTreeObservation = async (): Promise<void> => {
-    if (!posix || treeObservationReady || !scopeUnit || !marker || !scope) return;
+  const armTreeObservation = async (): Promise<boolean> => {
+    if (treeObservationReady) return true;
+    if (!posix || !scopeUnit || !marker || !scope) return false;
     // A unified entry in a hybrid hierarchy is not a v2-only receipt. The
     // admitted shim alone is also insufficient: verify the captured live PID.
     const unifiedPath = (text: string): string => {
@@ -625,11 +643,13 @@ export const spawnDetached = async (
       if (armError !== undefined) throw armError;
       if (!ownedDirectory() || unifiedPath(fs.readFileSync(`/proc/${pid}/cgroup`, "utf8")) !== cgroup
         || linuxGroupMember(pid)?.started !== birth.started) throw new Error("Scope identity changed during watcher admission");
+      scopeIsEmpty(); // Revalidate after the asynchronous arm boundary, before publishing any receipt.
       treeClosed = new Promise<void>((resolve, reject) => { resolveTree = resolve; rejectTree = reject; });
       // Preserve failures for the subscriber without an admission-gap rejection.
       void treeClosed.catch(() => undefined);
       treeObservationReady = true;
-      changed();
+      void observeTree();
+      return true;
     } catch {
       // Scope launch is not replayed. This SAME worker keeps legacy checked
       // monitoring, with no treeClosed receipt and no event census deadline.
@@ -638,8 +658,8 @@ export const spawnDetached = async (
       if (scopeEventsFd !== undefined) fs.closeSync(scopeEventsFd);
       scopeEventsFd = undefined;
       scopeEvents = undefined;
+      return false;
     }
-    void observeTree();
   };
   void closed.then(() => { nativeClosed = true; void observeTree(); });
 
@@ -749,6 +769,9 @@ export const spawnDetached = async (
     },
   };
   if (scope && marker) {
+    // Only a verified arm may publish event custody. Validation failure keeps
+    // this same worker on checked legacy monitoring, without replay or receipt.
+    const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
     try {
       const admitted = await (async (): Promise<boolean> => {
         let watcher: fs.FSWatcher | undefined;
@@ -766,12 +789,12 @@ export const spawnDetached = async (
             // Subscribe to the DIRECTORY before checking once: the shim may
             // create the marker either side of the watcher's admission race.
             watcher = fs.watch(path.dirname(marker), { persistent: false }, (_event, filename) => {
-              if (filename?.toString() === path.basename(marker)) finish(true);
+              if (filename?.toString() === path.basename(marker) && markerIsAdmitted()) finish(true);
             });
             watcher.once("error", ended);
             child.once("close", ended);
             authority?.signal?.addEventListener("abort", ended, { once: true });
-            if (fs.existsSync(marker)) finish(true);
+            if (markerIsAdmitted()) finish(true);
             else if (nativeClosed || authority?.signal?.aborted) finish(false);
             else if (!settled) deadline = setTimeout(ended, 5_000);
           });
@@ -786,12 +809,12 @@ export const spawnDetached = async (
           authority?.signal?.removeEventListener("abort", ended);
         }
       })();
-      if (admitted) { await armTreeObservation(); return { ...handle, ...(treeClosed ? { treeClosed } : {}) }; }
+      if (admitted) return await admittedHandle();
       if (!nativeClosed) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
-      if (fs.existsSync(marker)) { await armTreeObservation(); return { ...handle, ...(treeClosed ? { treeClosed } : {}) }; } // admitted during teardown: never replay
+      if (markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }

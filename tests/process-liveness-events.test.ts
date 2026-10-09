@@ -74,7 +74,8 @@ describe("unscoped legacy process liveness", () => {
   });
 });
 
-type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean };
+type MarkerFailure = "symlink" | "unowned" | "directory" | "mismatched" | "empty";
+type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean; markerFailure?: MarkerFailure; teardownMarker?: "valid" | MarkerFailure };
 async function fixtureAdmission(options: AdmissionOptions = {}) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
@@ -91,6 +92,19 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
     child.emit("exit", 0); child.emit("close", 0);
   };
   let marker = "";
+  let markerIdentity = "";
+  let markerFailure: MarkerFailure | undefined;
+  const writeMarker = (failure?: MarkerFailure): void => {
+    markerFailure = failure;
+    fs.rmSync(marker, { recursive: true, force: true });
+    if (failure === "directory") { fs.mkdirSync(marker); return; }
+    const content = failure === "empty" ? "" : failure === "mismatched" ? `${markerIdentity.slice(0, -1)}!` : markerIdentity;
+    if (failure === "symlink") {
+      const target = path.join(path.dirname(marker), "other-marker");
+      fs.writeFileSync(target, content);
+      fs.symlinkSync(target, marker);
+    } else fs.writeFileSync(marker, content);
+  };
   const nativeRead = fs.readFileSync.bind(fs);
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, readOptions?: unknown) => {
     const child = children.find(child => String(file) === `/proc/${child.pid}/stat`);
@@ -111,13 +125,19 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
   }) as typeof fs.readdirSync);
   vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
     const child = children.find(child => child.pid === Math.abs(pid));
-    if (signal === "SIGTERM" || signal === "SIGKILL") { order.push("stop"); close(child); }
+    if (signal === "SIGTERM" || signal === "SIGKILL") {
+      order.push("stop");
+      if (options.teardownMarker) writeMarker(options.teardownMarker === "valid" ? undefined : options.teardownMarker);
+      close(child);
+    }
     return true;
   });
   vi.mocked(spawn).mockClear();
   vi.mocked(spawn).mockImplementationOnce((_command, args) => {
-    marker = args![args!.indexOf("fabric-scope") + 1]!;
-    if (options.present) fs.writeFileSync(marker, "admitted");
+    const markerIndex = args!.indexOf("fabric-scope") + 1;
+    marker = args![markerIndex]!;
+    markerIdentity = `admitted ${args![markerIndex + 1]}`;
+    if (options.present) writeMarker(options.markerFailure);
     return children[0] as unknown as ChildProcess;
   }).mockImplementationOnce(() => children[1] as unknown as ChildProcess);
   let armed!: () => void;
@@ -129,16 +149,16 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
     if (typeof listener === "function") watcher.on("change", listener);
     armed();
     if (options.armFailure) throw new Error("directory watcher unavailable");
-    if (options.race) fs.writeFileSync(marker, "admitted");
+    if (options.race) writeMarker(options.markerFailure);
     return watcher;
   });
-  const nativeExists = fs.existsSync.bind(fs);
-  const exists = vi.spyOn(fs, "existsSync").mockImplementation(file => {
-    if (String(file) === marker) order.push("exists");
-    return nativeExists(file);
-  });
-  const stat = vi.spyOn(fs, "statSync");
-  const lstat = vi.spyOn(fs, "lstatSync");
+  const nativeLstat = fs.lstatSync.bind(fs);
+  const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+    if (String(file) === marker) order.push("check");
+    const stat = nativeLstat(file, options as never);
+    if (String(file) === marker && markerFailure === "unowned") stat.uid = process.getuid!() + 1;
+    return stat;
+  }) as typeof fs.lstatSync);
   const interval = vi.spyOn(globalThis, "setInterval");
   const timeout = vi.spyOn(globalThis, "setTimeout");
   const warn = vi.fn();
@@ -148,9 +168,9 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
   await arming;
   return {
     launch, watcher, watch, controller, removeAbort, order, interval, timeout, warn, children,
-    markerChecks: () => exists.mock.calls.filter(([file]) => String(file) === marker).length,
-    markerStats: () => [...stat.mock.calls, ...lstat.mock.calls].filter(([file]) => String(file) === marker).length,
-    admit: (filename: string | Buffer = "admitted") => { fs.writeFileSync(marker, "admitted"); watcher.emit("change", "rename", filename); },
+    markerChecks: () => lstat.mock.calls.filter(([file]) => String(file) === marker).length,
+    writeMarker,
+    admit: (filename: string | Buffer = "admitted", failure?: MarkerFailure) => { writeMarker(failure); watcher.emit("change", "rename", filename); },
     close,
     finish: () => { for (const child of children) close(child); },
   };
@@ -163,13 +183,13 @@ function expectAdmissionCleaned(f: Awaited<ReturnType<typeof fixtureAdmission>>,
   if (armed) expect(f.removeAbort).toHaveBeenCalledWith("abort", expect.any(Function));
   expect(vi.getTimerCount()).toBe(0);
   expect(f.interval).not.toHaveBeenCalled();
-  expect(f.markerStats()).toBe(0);
+  expect(f.markerChecks()).toBeGreaterThan(0); // admission checks authenticate the marker, never just its name
 }
 
 describe.skipIf(process.platform !== "linux")("event-driven scope admission marker", () => {
   it.each(["admitted", Buffer.from("admitted")])("resolves on a matching directory event without polling (%s)", async filename => {
     const f = await fixtureAdmission();
-    expect(f.order).toEqual(["watch", "exists"]);
+    expect(f.order).toEqual(["watch", "check"]);
     expect(f.watch).toHaveBeenCalledOnce();
     expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([5_000]);
     expect(vi.getTimerCount()).toBe(1);
@@ -183,8 +203,60 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[0]!.pid);
     expect(spawn).toHaveBeenCalledOnce();
-    expect(f.markerChecks()).toBe(1);
+    expect(f.markerChecks()).toBe(2); // initial check plus authenticating the matching event
     expect(f.warn).not.toHaveBeenCalled();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it("ignores rename-away and other-file events even when their filename resembles admission", async () => {
+    const f = await fixtureAdmission();
+    f.watcher.emit("change", "rename", "admitted"); // rename/delete notification without a marker
+    await tick();
+    expect(f.markerChecks()).toBe(2);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce();
+    f.writeMarker();
+    f.watcher.emit("change", "rename", "other-file"); // authentic marker is not a matching event
+    await tick();
+    expect(f.markerChecks()).toBe(2);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    f.watcher.emit("change", "rename", Buffer.from("admitted"));
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(f.markerChecks()).toBe(3);
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it.each((["symlink", "unowned", "directory", "mismatched", "empty"] as const).flatMap(failure =>
+    [true, false].map(present => ({ failure, present }))))("keeps waiting for $failure marker (initial=$present)", async ({ failure, present }) => {
+    const f = await fixtureAdmission({ present, markerFailure: failure });
+    if (!present) f.admit("admitted", failure);
+    await tick();
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1);
+    if (present) { f.watcher.emit("change", "rename", "admitted"); await tick(); }
+    expect(f.markerChecks()).toBe(2);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    f.admit(); // a subsequent authentic marker admits this launch
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(f.markerChecks()).toBe(3);
+    expect(handle.treeClosed).toBeUndefined(); // fixture deliberately has no verifiable cgroup receipt
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it.each(["valid", "symlink", "unowned", "mismatched"] as const)("authenticates a %s marker arriving during teardown without replaying admission", async teardownMarker => {
+    const f = await fixtureAdmission({ teardownMarker });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[teardownMarker === "valid" ? 0 : 1]!.pid);
+    expect(spawn).toHaveBeenCalledTimes(teardownMarker === "valid" ? 1 : 2);
+    expect(f.markerChecks()).toBe(2);
+    expect(handle.treeClosed).toBeUndefined();
     expectAdmissionCleaned(f);
     f.finish();
   });
@@ -192,7 +264,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
   it.each([{ present: true }, { race: true }])("checks once after arming and immediately accepts a present/racing marker: %j", async options => {
     const f = await fixtureAdmission(options);
     const handle = await f.launch;
-    expect(f.order).toEqual(["watch", "exists", "watch-close"]);
+    expect(f.order).toEqual(["watch", "check", "watch-close"]);
     expect(handle.pid).toBe(f.children[0]!.pid);
     expect(f.markerChecks()).toBe(1);
     expect(f.timeout).not.toHaveBeenCalled();
@@ -257,7 +329,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
   });
 });
 
-type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async";
+type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async" | "identity-during-arm" | "read-after-arm";
 async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
@@ -304,8 +376,12 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     return nativeRead(file, options as never);
   }) as typeof fs.readFileSync);
   const nativeLstat = fs.lstatSync.bind(fs);
+  let directoryChecks = 0;
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
-    if (String(file) === scopeDirectory) return { uid: process.getuid!() + (failure === "unowned" ? 1 : 0), isDirectory: () => true };
+    if (String(file) === scopeDirectory) {
+      const unowned = failure === "unowned" || (failure === "identity-during-arm" && ++directoryChecks > 1);
+      return { uid: process.getuid!() + (unowned ? 1 : 0), isDirectory: () => true };
+    }
     return nativeLstat(file, options as never);
   }) as typeof fs.lstatSync);
   const nativeStatfs = fs.statfsSync.bind(fs);
@@ -321,10 +397,11 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     return eventsFd;
   });
   const nativeReadSync = fs.readSync.bind(fs);
+  let eventReads = 0;
   const readEvents = vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
     if (args[0] !== eventsFd) return (nativeReadSync as (...values: unknown[]) => number)(...args);
     order.push("read");
-    if (failure === "read") throw new Error("events unreadable");
+    if (failure === "read" || (failure === "read-after-arm" && ++eventReads > 1)) throw new Error("events unreadable");
     const text = `populated ${populated}\nfrozen 0\n`;
     (args[1] as Buffer).write(text);
     return Buffer.byteLength(text);
@@ -353,7 +430,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
       liveCgroup = failure === "v1-only" ? `1:name=systemd:${cgroup}\n`
         : failure === "hybrid" ? `0::${cgroup}\n1:cpu:/legacy\n` : `0::${cgroup}\n`;
       fs.writeFileSync(`${marker}.cgroup`, failure === "mismatched-receipt" ? "0::/foreign/fixture.slice/foreign.scope\n" : liveCgroup);
-      fs.writeFileSync(marker, "admitted");
+      fs.writeFileSync(marker, `admitted ${unit}`);
       scopeDirectory = `/sys/fs/cgroup${cgroup}`;
       scopeEvents = `${scopeDirectory}/cgroup.events`;
     }
@@ -383,11 +460,13 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
 }
 
 describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admission", () => {
-  it.each(["missing", "mismatched", "mismatched-receipt", "wrong-slice", "v1-only", "hybrid", "unowned", "open", "read", "watcher-arm", "watcher-arm-async"] as const)("falls back to legacy monitoring for %s", async failure => {
+  it.each(["missing", "mismatched", "mismatched-receipt", "wrong-slice", "v1-only", "hybrid", "unowned", "open", "read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"] as const)("falls back to legacy monitoring for %s", async failure => {
     const f = await fixtureTree(7_000, true, "1", failure, true);
     expect(f.transport?.liveness).toBeUndefined();
     expect(f.handle.treeClosed).toBeUndefined();
-    expect(spawn).toHaveBeenCalled();
+    expect(f.transport).not.toHaveProperty("liveness");
+    expect(f.handle).not.toHaveProperty("treeClosed");
+    expect(spawn).toHaveBeenCalledOnce(); // receipt failure must not replay the admitted worker
     expect(vi.mocked(spawn).mock.calls.filter(([command]) => String(command).endsWith("systemd-run"))).toHaveLength(1);
     await f.close();
     expect(f.scans()).toBe(0); // no automatic event census on native close
@@ -401,7 +480,7 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     expect(await f.handle.isAlive()).toBe(false);
     expect(f.handle.lostContact()).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
-    if (["read", "watcher-arm", "watcher-arm-async"].includes(failure)) expect(f.closeEvents.mock.calls.filter(([fd]) => fd === 700_000_010)).toHaveLength(1);
+    if (["read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"].includes(failure)) expect(f.closeEvents.mock.calls.filter(([fd]) => fd === 700_000_010)).toHaveLength(1);
   });
 
   it("publishes event custody only after opening, arming and validating our owned v2 scope", async () => {

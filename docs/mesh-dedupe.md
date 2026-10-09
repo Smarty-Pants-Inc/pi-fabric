@@ -63,7 +63,13 @@ not exactly-once arbitrary consumer or external side effects.
 
 ## Locked protocol
 
-All steps hold the existing mesh lock:
+Admission, append, recovery, and compaction hold the existing mesh lock. Without
+an archive, the live-file barrier runs after unlock; receipt installation then
+reacquires the lock and compare-and-sets the intent identity (`dedupeKey`,
+`eventId`, `reservedSequence`). An already settled, evicted, or replaced intent
+makes that finalizer a no-op. Single and batch publication await this finalizer.
+Receipt durability and pending-file cleanup remain inside that CAS lock hold,
+so a delayed finalizer cannot resurrect an evicted receipt outside the cap.
 
 1. Read `event-receipts/<hash>.json`. A valid receipt is authoritative; confirm
    its file/namespace barriers, finish any pending-file cleanup, and return it.
@@ -92,7 +98,8 @@ All steps hold the existing mesh lock:
    Same-boot pending cleanup remains deferred until settlement, so it cannot
    cut back the exact archive-only reservation being retried.
 3. Neither file means **new**, not "search history". Repair the live tail and
-   finish ordinary archive recovery, reserve a sequence, and install a durable
+   finish ordinary archive recovery, check the hard receipt/intent capacity (evict
+   non-protected receipts if necessary), then reserve a sequence and install a durable
    negative sequence sidecar in the archive. Create
    `{ dedupeKey, reservedSequence, eventId, liveOffset, archiveDir? }` atomically
    with file/namespace fsync **before** either event append.
@@ -115,11 +122,14 @@ Tail repair only removes incomplete appends. An abandoned sequence is not reused
 
 Normal new-key publish work is independent of event-history size. The ordinary
 fixed-size tail/sequence/archive-append metadata reads still happen. No
-`MeshStore.read`, `MeshArchive.readAfter`, full live-log read, or receipt-directory
-enumeration is used to decide whether a new key has already published. Actual
-compaction enumerates the receipt directory to find pending files, and reboot
-recovery/archive catch-up/day sealing have their existing non-constant work;
-these maintenance operations are not claimed to be O(1).
+`MeshStore.read`, `MeshArchive.readAfter`, or full live-log read is used to decide
+whether a new key has already published. New-key admission now enumerates the
+receipt/intent directory once under the lock to enforce hard capacity across
+writers; its work depends on the bounded dedupe population, not event history.
+Below capacity it reads no receipt payloads. At capacity it reads/sorts only
+non-protected settled receipts for eviction. Actual compaction enumerates the
+directory to settle pending files; reboot recovery/archive catch-up/day sealing
+retain their existing non-constant work. These operations are not claimed O(1).
 
 ## Recovery decision table (round-five F1)
 
@@ -151,29 +161,46 @@ Host-owned `MeshStoreOptions` (also accepted by `EventLogOptions`) configure:
 - `dedupeReceiptTtlMs`: **7 days** by default (`604800000` ms), covering the
   forwarder restart-duplicate window of smarty-dev#7892. Age is measured from the
   receipt event's persisted `createdAt`, not file mtime or recovery time.
-- `maxDedupeReceipts`: **100,000** by default. If the directory is over this cap,
-  evict the oldest publications first, even if they are younger than the TTL.
-  Equal publication times are ordered by sequence, then receipt filename.
+- `maxDedupeReceipts`: **100,000** by default, a **hard capacity on distinct
+  receipt plus pending-intent keys**, not just settled receipts. A key with both
+  files consumes one slot, and a same-key retry consumes no additional slot.
 
-Both options must be positive safe integers. Both bounds are enforced under the
-mesh lock during the **existing byte-triggered event-log compaction pass**; no
-new timer, receipt-directory scan on ordinary publication, or history lookup is
-added. Compaction first settles all pending intents, then expires receipts at or
-beyond their TTL and evicts oldest remaining receipts until the count cap is met.
-Unresolved pending intents and their receipts are never evicted; failed settlement
-blocks compaction and pruning. Protected receipts may exceed the cap rather than
-lose recovery evidence. Receipt removals are namespace-synced before compaction
-completes. Receipts younger than the TTL remain untouched when below the cap.
+Both options must be positive safe integers. Before a **new dedupe-keyed** event
+reserves a sequence, creates an intent, or appends live/archive bytes, admission
+checks capacity **under the mesh lock**. If a new slot would exceed the cap,
+remove expired non-protected receipts first, then the oldest remaining settled
+receipts (including younger-than-TTL receipts) until there is room. Equal
+publication times are ordered by sequence, then receipt filename. Removals are
+namespace-synced before admitting the new event. Pending intents and any receipt
+with the same key are protected and never evicted to make room.
 
-**Expiry is maintenance-driven, not a wall-clock timer:** a receipt remains
-authoritative until a compaction pass removes it. Receipts created between passes
-can temporarily exceed the count cap. Once TTL expiry or count eviction removes
-a receipt, that key is **NEW** on its next publication: it gets a new event ID and
+If protected pending intents fill the capacity and eviction cannot make room,
+reject the new keyed publication with exported `MeshDedupeStoreFullError`, code
+`FABRIC_MESH_DEDUPE_STORE_FULL`, `retryable: true`, without a new intent, sequence
+reservation, or event append. Resolve/retry the existing intents (or repair
+unavailable durability/archive evidence) before retrying new keys. A failed
+byte-triggered compaction cannot admit additional keyed appends past capacity.
+Unkeyed publication has no dedupe-capacity admission check and retains its
+existing compaction/error behavior. Batches use the same per-event admission
+check and retain their bounded-prefix contract. Cooperating writers must share
+these host-owned limits; older writers are not retroactively constrained. Any
+inherited over-cap protected population is preserved, but admits no new keys.
+
+The **existing byte-triggered compaction pass** still first settles all pending
+intents, then expires receipts at or beyond their TTL and prunes count pressure.
+Failed settlement blocks compaction/pruning, not protection. After settlement,
+those receipts are eligible for eviction and new keyed publications can resume.
+No maintenance timer or event-history lookup is added.
+
+**Expiry is maintenance-driven, not a wall-clock timer:** below capacity, a
+receipt remains authoritative until compaction removes it. At admission pressure,
+expiry/count eviction may remove it before byte-triggered compaction. Once
+removed, that key is **NEW** on its next publication: it gets a new event ID and
 sequence, even if the original event still exists in the live log or archive.
-There is no historical search or receipt resurrection from archived events.
-Choose limits large enough for the producer's uncertain-reply/restart retry
-window; count pressure can shorten that window below seven days. Durable intent
-recovery is not subject to these retention limits while unresolved.
+There is no historical search or stale-finalizer receipt resurrection. Choose
+limits large enough for the producer's uncertain-reply/restart retry window;
+count pressure can shorten it below seven days. Durable intent recovery remains
+protected while unresolved, without allowing fresh keyed events past the cap.
 
 ## Consumer and rollout contract
 
@@ -225,7 +252,8 @@ original inbox carrier again.
 ## Acceptance and evidence
 
 - New key: spy on `MeshArchive.readAfter`, `MeshStore.read`, the full live-log
-  read, and receipt-directory enumeration: zero history reads/scans.
+  read: zero history reads/scans. New-key admission performs one bounded
+  receipt/intent directory enumeration for capacity, not historical dedupe lookup.
 - Crash after intent/before append: restart, abandon the reservation, publish
   one event, and repeat the retry; with and without the archive.
 - Crash after append/before receipt: restart, recover exactly the original id
@@ -260,6 +288,15 @@ original inbox carrier again.
 - Consumer replay: a different event id with the same dedupe key does not
   re-deliver after recipient reload, including a new maintenance sender; unrelated
   publication keys remain deliverable.
+- Fill hard capacity with unresolved intents, force byte-triggered settlement
+  failure, and reject repeated distinct keyed publications with the typed full
+  error and identical live bytes/sequence. Same-key retry recovers the original;
+  settlement plus compaction lets new keyed publication resume, with/without archive.
+- An intent and receipt for one protected key count once; admission evicts only
+  non-protected settled receipts. Unkeyed publication still bypasses capacity.
+- Delay a no-archive finalizer at its live barrier; another store compacts,
+  settles, and expires its receipt. Releasing the finalizer does not resurrect it
+  or overwrite/remove a new intent that has since reused the same key.
 - The legacy no-intent residual is an explicit regression test, not silently
   treated as exact recovery.
 
@@ -272,5 +309,5 @@ nice -n 19 bun scripts/benchmark-mesh-dedupe.ts
 It seeds both live and archived history with 10,000 vs 200,000 events, interleaves
 25 measured new-key publishes per case, measures **owner publication to lock
 release** (not acquisition wait), and checks that metadata read work is identical
-and history reads/receipt-directory scans are zero. Timing is evidence, not a
-flaky millisecond CI assertion.
+and history reads are zero, with one bounded capacity enumeration per new key.
+Timing is evidence, not a flaky millisecond CI assertion.

@@ -62,7 +62,7 @@ describe("publishBatch hold (smarty-dev#6729)", () => {
     for (const line of lines) expect(JSON.stringify(JSON.parse(line))).toBe(line);
   });
 
-  it("resolves only after its after-release barrier; nothing on the live log or a receipt is synced under the lock", async () => {
+  it("resolves after the off-lock live barrier and locked receipt identity checks", async () => {
     const mesh = store();
     unbounded();
     let resolved = false;
@@ -83,14 +83,14 @@ describe("publishBatch hold (smarty-dev#6729)", () => {
     // Every event is in the image the barrier made durable before the batch resolved.
     for (const event of published) expect(image).toContain(`"id":"${event.id}"`);
     if (process.platform === "linux") {
-      // Under the lock only each keyed event's intent fence (its file and namespace chain).
-      expect(syncs.filter(entry => entry.held && /[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(entry.file))).toEqual([]);
+      // Intent fences and receipt CAS barriers hold the lock; the shared live barrier does not.
+      expect(syncs.filter(entry => entry.held && /[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(entry.file))).toHaveLength(3);
       expect(syncs.filter(entry => entry.held && entry.file.endsWith("/events.jsonl"))).toEqual([]);
       expect(syncs.some(entry => entry.held && /\.pending\.json\.\d+\..+\.tmp$/.test(entry.file))).toBe(true);
     }
   });
 
-  it("writes keyed receipts after release, in commit order, and dedupes a key repeated in one batch", async () => {
+  it("writes keyed receipts under CAS locks after the live barrier, once per key in commit order", async () => {
     const mesh = store();
     unbounded();
     const order: string[] = [];
@@ -108,11 +108,12 @@ describe("publishBatch hold (smarty-dev#6729)", () => {
     const inputs = [...mixed("order"), { topic: "mesh.batch", from, text: "order-repeat", dedupeKey: "order-k1" }];
     const published = await mesh.publishBatch(inputs);
     const hash = (key: string, suffix: string) => createHash("sha256").update(key).digest("hex") + suffix;
-    // Intents are the crash fence under the lock; the barrier, then the receipts, follow release.
+    // Intent fences precede append; the off-lock barrier precedes each locked receipt CAS.
+    // The repeated key finalizer sees a settled intent and must not rewrite its receipt.
     expect(order).toEqual([
       `held:${hash("order-k1", ".pending.json")}`, `held:${hash("order-k2", ".pending.json")}`, `held:${hash("order-k3", ".pending.json")}`,
       "released:barrier",
-      `released:${hash("order-k1", ".json")}`, `released:${hash("order-k2", ".json")}`, `released:${hash("order-k3", ".json")}`, `released:${hash("order-k1", ".json")}`,
+      `held:${hash("order-k1", ".json")}`, `held:${hash("order-k2", ".json")}`, `held:${hash("order-k3", ".json")}`,
     ]);
     // The repeated key returns the first event and appends nothing.
     expect(published).toHaveLength(6);

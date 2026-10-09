@@ -126,7 +126,7 @@ interface AfterUnlock {
   finish?: (() => Promise<void> | void) | undefined;
   /** Set with `finish` when `finish` is the live barrier followed by this receipt step: a batch
    * runs one barrier for all its events, then each receipt step in order (smarty-dev#6729). */
-  receipt?: (() => void) | undefined;
+  receipt?: (() => Promise<void> | void) | undefined;
 }
 
 // One live-log barrier per root, shared by every confirmation queued before it STARTS. A
@@ -141,12 +141,22 @@ export class MeshDedupeRecoveryError extends Error {
   }
 }
 
+/** New keyed publication cannot fit without losing protected recovery evidence. */
+export class MeshDedupeStoreFullError extends Error {
+  readonly code = "FABRIC_MESH_DEDUPE_STORE_FULL";
+  readonly retryable = true;
+  constructor(readonly maxDedupeReceipts: number) {
+    super(`Mesh dedupe store is full (${maxDedupeReceipts} keys); settle pending intents before publishing a new key`);
+    this.name = "MeshDedupeStoreFullError";
+  }
+}
+
 export interface EventLogOptions {
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
-  /** Receipt lifetime from publication; enforced at event-log compaction. Default 7 days. */
+  /** Receipt lifetime from publication; enforced at compaction/capacity pressure. Default 7 days. */
   dedupeReceiptTtlMs?: number;
-  /** Compaction evicts oldest receipts above this cap; unresolved intents are protected. Default 100,000. */
+  /** Hard cap on receipt/intent keys; protected pending intents can refuse new keys. Default 100,000. */
   maxDedupeReceipts?: number;
 }
 
@@ -233,20 +243,36 @@ export class EventLog {
     return barrier;
   }
 
-  /** After release: a no-archive keyed event's live barrier, then its durable receipt, then
-   * the intent's removal. Until the receipt is durable the intent stays, so a crash (or a
-   * concurrent same-key writer, or compaction) recovers exactly as from a death after the
-   * live append; a second writer can only install the identical receipt. */
+  /** The live barrier stays after release. Receipt installation/removal reacquires .lock
+   * and compares the intent identity: compaction or a retry may already have settled and
+   * evicted it, or a new publication may now own this same key. Never resurrect a receipt. */
   #finishLiveReceipt(after: AfterUnlock, event: MeshEvent, intentPath: string, receiptPath: string): void {
-    const receipt = (): void => {
+    const finalizeReceipt = (): void => {
+      let intent: MeshDedupeIntent;
+      try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
+          intent.reservedSequence !== event.sequence) return;
       writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-      if (fs.existsSync(intentPath)) this.#removeDedupeIntent(intentPath);
+      this.#removeDedupeIntent(intentPath);
     };
+    const receipt = (): Promise<void> => this.#lock.withLock(finalizeReceipt, undefined, "publish");
     after.receipt = receipt;
     after.finish = async () => {
       await this.#confirmEventsAfterRelease();
-      receipt();
+      await receipt();
     };
+  }
+
+  /** A receipt-confirmation finalizer must not unlink a newer same-key reservation either. */
+  #cleanupReceiptIntent(event: MeshEvent, intentPath: string): Promise<void> {
+    return this.#lock.withLock(() => {
+      let intent: MeshDedupeIntent;
+      try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      if (intent.dedupeKey === event.dedupeKey && intent.eventId === event.id &&
+          intent.reservedSequence === event.sequence) this.#removeDedupeIntent(intentPath);
+    }, undefined, "publish");
   }
 
   #readDedupeReceipt(dedupeKey: string, confirm = true): MeshEvent | undefined {
@@ -307,14 +333,13 @@ export class EventLog {
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
     const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
     if (prior && after) {
-      // The original publisher installed the receipt after our first lookup missed (it writes
-      // it after release). Confirm it and unlink the intent after release too: no fsync and
-      // no namespace barrier under the lock, as on the no-archive off-lock path.
+      // The receipt became visible after the first lookup (including a legacy off-lock
+      // writer). This confirmation-only path does not install a new receipt.
       const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
       after.receipt = undefined;
-      after.finish = () => {
+      after.finish = async () => {
         this.#confirmEventFile(receiptPath);
-        if (fs.existsSync(file)) this.#removeDedupeIntent(file);
+        await this.#cleanupReceiptIntent(prior, file);
       };
       return prior;
     }
@@ -365,7 +390,8 @@ export class EventLog {
     }
     if (event && !prior && live && !archive && after) {
       // No-archive recovery of a dead publisher's live append: nothing durable is written
-      // under the lock. The intent stays until the receipt is durable (after release).
+      // under this append lock. The intent stays through the off-lock live barrier;
+      // receipt installation later reacquires the lock for an identity CAS.
       this.#finishLiveReceipt(after, event, file, this.#dedupePath(intent.dedupeKey, ".json"));
       return event;
     }
@@ -472,9 +498,9 @@ export class EventLog {
           // A single publish confirms the visible receipt and unlinks after release.
           if (after) {
             after.receipt = undefined;
-            after.finish = () => {
+            after.finish = async () => {
               this.#confirmEventFile(receiptPath!);
-              if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+              await this.#cleanupReceiptIntent(prior, intentPath!);
             };
           } else if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
           return prior;
@@ -539,6 +565,11 @@ export class EventLog {
         if (bytes > this.maxEventBytes) {
           throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
         }
+        // One slot per key, including unresolved intents. Admission must fail closed BEFORE
+        // reserving a sequence or appending (failed compaction cannot grow pending files).
+        if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
+          throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
+        }
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.
@@ -579,7 +610,8 @@ export class EventLog {
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
       if (receiptPath && after && !archive) {
         // No-archive keyed publish (single or batch): the durable intent (above) is the crash
-        // fence; the live barrier, receipt and unlink run after release, before it resolves.
+        // fence; after release the live barrier runs, then receipt/unlink reacquire .lock
+        // for an identity CAS. Both finish before publication resolves.
         this.#finishLiveReceipt(after, event, intentPath!, receiptPath);
       } else if (receiptPath) {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
@@ -624,9 +656,9 @@ export class EventLog {
    * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
    * Events retain publish's append/archive/receipt protocol. Under the lock only the appends
    * (and a keyed event's intent fence, or an archive-coupled receipt) run; one live-log barrier
-   * and then each no-archive keyed receipt, in order, run after release and before the batch
-   * resolves (smarty-dev#6729). A failed suffix is retried by the caller after checkpointing
-   * the returned committed prefix.
+   * runs after release, then each no-archive receipt reacquires .lock for its intent CAS,
+   * in order, before the batch resolves (smarty-dev#6729). A failed suffix is retried by
+   * the caller after checkpointing the returned committed prefix.
    */
   async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
@@ -689,7 +721,7 @@ export class EventLog {
   async #finishBatch(committed: AfterUnlock[]): Promise<void> {
     await this.#confirmEventsAfterRelease();
     for (const after of committed) {
-      if (after.receipt) after.receipt();
+      if (after.receipt) await after.receipt();
       else await after.finish?.();
     }
   }
@@ -1188,15 +1220,21 @@ export class EventLog {
     };
   }
 
-  /** Maintenance only: receipt age is the durable publication time, not a recovery's mtime. */
-  #pruneDedupeReceipts(): void {
+  /** Under .lock: reserve capacity before append, or expire receipts during compaction.
+   * One key consumes one slot even while both receipt and pending intent are present. */
+  #pruneDedupeReceipts(reserve = 0): number {
     const directory = path.join(this.root, "event-receipts");
     let names: string[];
     try { names = fs.readdirSync(directory); }
-    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    catch (error) { if (errorCode(error) === "ENOENT") return 0; throw error; }
     const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
       .map(name => name.slice(0, -".pending.json".length)));
     const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    let count = new Set([...pending, ...receipts.map(name => name.slice(0, -".json".length))]).size;
+    const initialCount = count;
+    const limit = this.#maxDedupeReceipts - reserve;
+    // TTL remains maintenance-driven below capacity; no receipt payload reads are needed.
+    if (reserve && count <= limit) return count;
     const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
       const file = path.join(directory, name);
       const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
@@ -1209,17 +1247,17 @@ export class EventLog {
     });
     candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     const now = Date.now();
-    let count = receipts.length;
     try {
       for (const receipt of candidates) {
-        if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= this.#maxDedupeReceipts) break;
+        if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
         fs.rmSync(receipt.file, { force: true });
         count--;
       }
     } finally {
       // Persist removals once per pass, including any completed before a later unlink failed.
-      if (count < receipts.length) syncPathNamespace(directory);
+      if (count < initialCount) syncPathNamespace(directory);
     }
+    return count;
   }
 
   #compactEventLog(): void {

@@ -6,8 +6,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 
-// smarty-dev#6477 E1: the fsyncs of no-archive publish and recovery run after `.lock` is
-// released, and a publish still resolves only once its bytes are durable. Compaction stays under
+// smarty-dev#6477 E1: the live-log fsync of no-archive publish/recovery runs after `.lock`
+// is released. Receipt installation reacquires it for an intent-identity CAS (PR #755 round 3).
+// A publish still resolves only once its bytes are durable. Compaction stays under
 // the lock as on main (off-lock compaction: smarty-dev#7002). Adapted from pi-fabric#550's
 // tests/mesh-fsync-holds.test.ts.
 
@@ -84,7 +85,7 @@ const strandIntent = async (mesh: MeshStore, dedupeKey: string) => {
 
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
-describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
+describe("off-lock live barriers and locked receipt CAS (smarty-dev#6477 E1)", () => {
   it("publish: a durable unkeyed append fsyncs the live log only after release, before it resolves", async () => {
     const mesh = store();
     const image = durableImage(mesh.root);
@@ -123,13 +124,14 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(mesh.read().map(event => event.sequence)).toEqual([1, 2, 3, 4]);
   });
 
-  it("publish: a fresh no-archive keyed append keeps only its intent fence under the lock", async () => {
+  it("publish: a fresh no-archive keyed append keeps the live barrier off-lock and finalizes its receipt under CAS", async () => {
     const mesh = store();
     const watcher = watchBarriers(mesh.root);
     const packet = { topic: "mesh.fsync", from, dedupeKey: "fresh", text: "once" };
     const event = await mesh.publish(packet);
-    // The intent's durability precedes the live append (crash fence, held); nothing after it is held.
-    expect(watcher.syncs.filter(sync => sync.held && sync.afterAppend)).toEqual([]);
+    // The intent fence precedes append; the later receipt CAS holds the lock, not the live fsync.
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.syncs.some(sync => sync.held && sync.afterAppend)).toBe(true);
     expect(watcher.syncs.some(sync => sync.live && !sync.held)).toBe(true);
     expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey, ".pending.json"))).toBe(false);
     expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(event);
@@ -140,7 +142,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(mesh.read()).toEqual([event]);
   });
 
-  it("recovery: a same-key retry settles a committed live append with every barrier after release", async () => {
+  it("recovery: a same-key retry uses the off-lock live barrier and a locked receipt CAS", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "failed-live", text: "once" };
     const sync = fs.fsyncSync.bind(fs);
@@ -156,7 +158,8 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const committed = mesh.read()[0]!;
     const watcher = watchBarriers(mesh.root);
     expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
-    expect(watcher.held()).toEqual([]);
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.held().length).toBeGreaterThan(0);
     expect(watcher.syncs.some(sync => sync.live)).toBe(true);
     expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
     expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey, ".pending.json"))).toBe(false);
@@ -216,7 +219,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(rebooted.read()).toEqual([returned, after]);
   });
 
-  it.skipIf(process.platform !== "linux")("no publish or recovery path fsyncs or syncs a directory while .lock exists, except a fresh intent's fence before its append", async () => {
+  it.skipIf(process.platform !== "linux")("publish/recovery holds barriers only for fresh intent fences or receipt identity CAS, never the live log", async () => {
     const mesh = store();
     const root = mesh.root;
     const lockOwner = path.join(root, ".lock", "owner");
@@ -225,7 +228,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     // (its file and namespace chain, from #preparePublish), in a hold before its live append.
     let hold = "", appendedInHold = false;
     const enter = () => { const now = holdOf(); if (now !== hold) { hold = now; appendedInHold = false; } };
-    const held: Array<{ path: string; fence: boolean; via: string }> = [];
+    const held: Array<{ path: string; fence: boolean; cas: boolean; via: string }> = [];
     const record = (fd: number) => {
       if (!fs.existsSync(path.join(root, ".lock"))) return;
       enter();
@@ -242,7 +245,8 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
       const writer = frames.findIndex(line => line.startsWith("at writeFileAtomic "));
       const fence = !appendedInHold && writer >= 0 && /^at (?:\S*src\/mesh\/event-log\.ts:\d+:\d+|append \(\S*src\/mesh\/event-log\.ts:\d+:\d+\))$/.test(frames[writer + 1] ?? "") &&
         !/settleDedupeIntent|removeDedupeIntent|finishLiveReceipt/.test(stack);
-      held.push({ path: fdPath(fd), fence, via });
+      const cas = !appendedInHold && /finalizeReceipt|cleanupReceiptIntent/.test(stack);
+      held.push({ path: fdPath(fd), fence, cas, via });
     };
     const append = fs.appendFileSync.bind(fs);
     vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
@@ -284,12 +288,14 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const last = await mesh.publish({ topic: "mesh.fsync", from, durable: true, text: "after torn" });
     expect(mesh.read({ limit: 100 }).at(-1)).toEqual(last);
     expect(await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "retried", text: "retried" })).toEqual(retried);
-    // Every barrier held by `.lock` is a fresh intent's fence (fresh, stranded's original, retried); nothing else.
-    expect(held.filter(sync => !sync.fence)).toEqual([]);
+    // Only intent fences and receipt CAS hold barriers; the live barrier always follows release.
+    expect(held.filter(sync => !sync.fence && !sync.cas)).toEqual([]);
+    expect(held.filter(sync => sync.path === events(root))).toEqual([]);
     expect(held.some(sync => sync.fence)).toBe(true);
+    expect(held.some(sync => sync.cas)).toBe(true);
   });
 
-  it.skipIf(process.platform !== "linux")("power cut: a keyed publish cut before its off-lock receipt is durable recovers exactly once from the durable image and its intent", async () => {
+  it.skipIf(process.platform !== "linux")("power cut: a keyed publish cut during its locked receipt CAS recovers exactly once from the durable image and intent", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "power-cut", text: "once" };
     await mesh.publish({ topic: "mesh.fsync", from, text: "before", durable: true });
@@ -301,9 +307,9 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
       const file = fdPath(fd);
       if (held()) heldSyncs.push(file);
-      // Power fails as the off-lock receipt stage is about to become durable: the live barrier
+      // Power fails as the locked receipt CAS stage is about to become durable: the live barrier
       // has run, the receipt has not, the intent is still there.
-      if (!cut && !held() && /\/event-receipts\/[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(file)) {
+      if (!cut && held() && /\/event-receipts\/[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(file)) {
         cut = true;
         throw new Error("power cut");
       }
@@ -313,8 +319,9 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     await expect(mesh.publish(packet)).rejects.toThrow("power cut");
     vi.restoreAllMocks();
     expect(cut).toBe(true);
-    // Under the lock only the intent fence: neither the live log nor the receipt was fsynced there.
-    expect(heldSyncs.filter(file => file.endsWith("/events.jsonl") || /[a-f0-9]{64}\.json\./.test(file))).toEqual([]);
+    // The live barrier already ran off-lock; receipt CAS runs under the lock and may fail safely.
+    expect(heldSyncs.filter(file => file.endsWith("/events.jsonl"))).toEqual([]);
+    expect(heldSyncs.some(file => /[a-f0-9]{64}\.json\./.test(file))).toBe(true);
     const committed = mesh.read().find(event => event.dedupeKey === packet.dedupeKey)!;
     // Only the fsynced image survives, plus a torn prefix; the unsynced receipt stage is gone.
     expect(image.get().toString("utf8")).toContain(`"id":"${committed.id}"`);
@@ -331,7 +338,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(rebooted.read().filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([committed]);
   });
 
-  it("recovery: a receipt the original publisher installs after the first lookup is confirmed and its intent unlinked after release", async () => {
+  it("recovery: a late receipt is confirmed off-lock and its intent is cleaned up under an identity CAS", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "late-receipt", text: "once" };
     const sync = fs.fsyncSync.bind(fs);
@@ -362,9 +369,10 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const watcher = watchBarriers(mesh.root, fd => { if (sameFile(fd, receiptPath) && !held()) receiptSynced = true; });
     expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
     expect(installed).toBe(true);
-    // No fsync (receipt, live log or namespace directory) while `.lock` is held ...
-    expect(watcher.held()).toEqual([]);
-    // ... yet the receipt is confirmed and the intent removed before the retry resolves.
+    // Receipt confirmation stays off-lock; the matched intent unlink holds the CAS lock.
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.held().length).toBeGreaterThan(0);
+    // The receipt is confirmed and the original intent removed before retry resolves.
     expect(receiptSynced).toBe(true);
     expect(fs.existsSync(intentPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);

@@ -11,7 +11,7 @@ import { ActionRegistry, type FabricRegistryInvocationContext } from "../src/cor
 import { FabricExecutionService } from "../src/execution-service.js";
 import { withFabricHostCaller } from "../src/fabric-provenance.js";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshDedupeStoreFullError, MeshStore, type MeshEvent, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshHostPublishError, MeshProvider } from "../src/providers/mesh-provider.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -33,7 +33,7 @@ const invocation = (): FabricRegistryInvocationContext => ({
 const batch = () => ["one", "two", "three"].map(text => ({
   topic: "github.delivery", text, kind: "delivery", dedupeKey: `store/route/${text}/topic`, data: { text },
 }));
-const harness = async (backend: "file" | "sqlite", archived = false, existingRoot?: string, policyShim = false) => {
+const harness = async (backend: "file" | "sqlite", archived = false, existingRoot?: string, policyShim = false, storeOptions: MeshStoreOptions = {}) => {
   const root = existingRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "mesh-host-publish-"));
   if (!existingRoot) roots.push(root);
   if (archived) {
@@ -41,7 +41,7 @@ const harness = async (backend: "file" | "sqlite", archived = false, existingRoo
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir }));
   }
-  const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
+  const store = new MeshStore(root, 64 * 1024, 100, { ...storeOptions, stateBackend: backend });
   expect(store.stateBackend).toBe(backend); // A SQLite fallback must not silently satisfy the test.
   await store.put({ key: "fixture/backend", value: backend, identity });
   if (backend === "sqlite") expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
@@ -158,6 +158,35 @@ describe.each(["file", "sqlite"] as const)("trusted host mesh publication (%s ba
     fault.mockRestore();
     expect(await host.call("mesh.publishBatch", { events: batch() })).toEqual(committed);
     expect(h.store.read()).toEqual(committed);
+  });
+
+  it.each([false, true])("propagates typed capacity refusal for single/batch host calls without appending (archive=%s)", async archived => {
+    const h = await harness(backend, archived, undefined, false, { maxDedupeReceipts: 1 });
+    const host = await h.publisher();
+    const rename = fs.renameSync.bind(fs);
+    const fault = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (String(target).startsWith(path.join(h.root, "event-receipts") + path.sep) &&
+          String(target).endsWith(".json") && !String(target).endsWith(".pending.json")) {
+        throw new Error("receipt unavailable");
+      }
+      rename(source, target);
+    });
+    await expect(host.call("mesh.publish", batch()[0]!)).rejects.toThrow("receipt unavailable");
+    const original = h.store.read()[0]!;
+    const before = fs.readFileSync(path.join(h.root, "events.jsonl"));
+    await expect(host.call("mesh.publish", batch()[1]!)).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+    await expect(host.call("mesh.publishBatch", { events: [batch()[1]!] })).rejects.toMatchObject({
+      name: "MeshDedupeStoreFullError", code: "FABRIC_MESH_DEDUPE_STORE_FULL", retryable: true,
+    });
+    expect(fs.readFileSync(path.join(h.root, "events.jsonl"))).toEqual(before);
+    expect(h.store.latestSequence()).toBe(original.sequence);
+    expect(fs.readdirSync(path.join(h.root, "event-receipts")).filter(name => name.endsWith(".pending.json"))).toHaveLength(1);
+    fault.mockRestore();
+    expect(await host.call("mesh.publishBatch", { events: [batch()[0]!] })).toEqual([original]);
+    expect(await host.call("mesh.publish", batch()[0]!)).toEqual(original);
+    const next = await host.call("mesh.publish", batch()[1]!) as MeshEvent;
+    expect(next.sequence).toBe(original.sequence + 1);
+    expect(fs.readdirSync(path.join(h.root, "event-receipts")).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(1);
   });
 
   it("scopes keys to stable component ids without prefix collisions", async () => {

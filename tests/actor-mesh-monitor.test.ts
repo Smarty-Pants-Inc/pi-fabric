@@ -96,14 +96,15 @@ describe("ActorMeshMonitor", () => {
     }
   });
 
-  it("preserves main's actorPollMs cadence on the Windows polling path", async () => {
+  it("uses native watch with bounded unchanged safety checks on Windows", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
       const s = setup(); s.monitor.start(); await flush();
-      expect(fs.watch).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(49);
+      expect(fs.watch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(s.mesh.tail).toHaveBeenCalledOnce();
+      fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
       await vi.advanceTimersByTimeAsync(1);
       expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     } finally { Object.defineProperty(process, "platform", platform); }
@@ -157,8 +158,9 @@ describe("ActorMeshMonitor", () => {
     await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(49);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
+    fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     s.monitor.schedule();
@@ -168,7 +170,7 @@ describe("ActorMeshMonitor", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     expect(vi.getTimerCount()).toBe(0);
-    expect(s.watcher.close).toHaveBeenCalledOnce();
+    expect(s.watcher.close).toHaveBeenCalledTimes(2); // safety reattached the test watcher
   });
 
   it("resumes from a saved cursor but skips events older than the replay window", async () => {
@@ -290,8 +292,9 @@ describe("ActorMeshMonitor", () => {
     s.monitor.start();
     await flush();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
-    await vi.advanceTimersByTimeAsync(49);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
+    fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(1);

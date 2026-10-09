@@ -1,4 +1,11 @@
 import { randomUUID } from "node:crypto";
+import fs, { type FSWatcher } from "node:fs";
+import path from "node:path";
+import { meshObserverStamp } from "../actors/mesh-monitor.js";
+
+const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
+const OBSERVED_DIRECTORIES = ["participants", "host-leases"];
+const IDLE_SAFETY_MS = 60_000;
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
@@ -40,6 +47,13 @@ export class LifecycleBroker {
   readonly #pollMs: number;
   readonly #maxReadEvents: number;
   #timer: NodeJS.Timeout | undefined;
+  #watcher: FSWatcher | undefined;
+  readonly #directoryWatchers = new Map<string, FSWatcher>();
+  #retryTimer: NodeJS.Timeout | undefined;
+  #stamp: string | undefined;
+  #running = false;
+  #dirty = false;
+  #retryNeeded = false;
   #polling: Promise<void> | undefined;
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
@@ -62,9 +76,14 @@ export class LifecycleBroker {
   }
 
   start(): void {
-    if (!this.options.enabled || this.#timer) return;
-    this.#closed = false;
-    this.#timer = setInterval(() => this.#schedulePoll(), this.#pollMs);
+    if (!this.options.enabled || this.#timer || this.#closed) return;
+    this.#attachWatcher();
+    this.#timer = setInterval(() => {
+      if (this.#closed || this.#paused) return;
+      this.#attachWatcher();
+      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+      if (stamp === undefined || stamp !== this.#stamp) this.#schedulePoll();
+    }, Math.max(IDLE_SAFETY_MS, this.#pollMs));
     this.#timer.unref();
     this.#schedulePoll();
   }
@@ -175,8 +194,12 @@ export class LifecycleBroker {
     return { removed: result.deleted };
   }
 
-  pause(): void { this.#paused = true; }
-  resume(): void { this.#paused = false; this.#schedulePoll(); }
+  pause(): void {
+    this.#paused = true;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
+  }
+  resume(): void { if (!this.#closed) { this.#paused = false; this.#schedulePoll(); } }
   async checkpointForRelease(): Promise<void> {
     if (!this.#paused) throw new Error("Lifecycle release gate is not paused");
     await this.#backgroundPublish.checkpointForRelease();
@@ -191,33 +214,89 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
+    this.#watcher?.close();
+    this.#watcher = undefined;
+    for (const watcher of this.#directoryWatchers.values()) watcher.close();
+    this.#directoryWatchers.clear();
     await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
   }
 
+  #attachWatcher(): void {
+    if (this.#closed || this.#paused) return;
+    for (const directory of OBSERVED_DIRECTORIES) {
+      if (this.#directoryWatchers.has(directory) || !fs.existsSync(path.join(this.mesh.root, directory))) continue;
+      try {
+        const watcher = fs.watch(path.join(this.mesh.root, directory), { persistent: false }, () => this.#schedulePoll());
+        this.#directoryWatchers.set(directory, watcher);
+        watcher.on("error", () => {
+          if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
+          watcher.close(); this.#directoryWatchers.delete(directory); this.#schedulePoll();
+        });
+      } catch { /* The safety witness also retries directory attachment. */ }
+    }
+    if (this.#watcher) return;
+    try {
+      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        if (filename !== null) {
+          const file = path.basename(filename.toString());
+          if (!OBSERVED_FILES.includes(file)) return;
+          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher();
+        }
+        this.#schedulePoll();
+      });
+      this.#watcher = watcher;
+      watcher.on("error", () => {
+        if (this.#watcher !== watcher || this.#closed) return;
+        watcher.close(); this.#watcher = undefined;
+        this.#schedulePoll();
+      });
+    } catch { /* The fixed-file safety witness covers unavailable watches. */ }
+  }
+
   #schedulePoll(): void {
-    if (
-      this.#pollScheduled ||
-      this.#closed ||
-      !this.options.enabled
-    ) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
+    this.#dirty = true;
+    if (this.#pollScheduled || this.#running || this.#retryTimer) return;
     this.#pollScheduled = true;
     queueMicrotask(() => {
       this.#pollScheduled = false;
-      if (this.#closed) return;
-      void this.#backgroundPoll.run(() => this.#poll());
+      if (this.#closed || this.#paused) return;
+      this.#running = true;
+      this.#dirty = false;
+      void this.#backgroundPoll.run(() => this.#poll()).then(result => {
+        this.#running = false;
+        if (this.#closed || this.#paused) return;
+        if (result !== "done" || this.#retryNeeded || this.#delivered.size) this.#retry();
+        else if (this.#dirty) this.#schedulePoll();
+      });
     });
   }
 
+  #retry(): void {
+    if (this.#closed || this.#paused || this.#retryTimer) return;
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#schedulePoll();
+    }, this.#backgroundPoll.waitMs || this.#pollMs);
+    this.#retryTimer.unref();
+  }
+
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
+    if (this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
+    this.#retryNeeded = false;
+    this.#stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
     const operation = this.#drain();
     this.#polling = operation;
     try {
       await operation;
     } finally {
+      if (this.options.canConsumeMesh?.() === false) this.#retryNeeded = true;
       if (this.#polling === operation) this.#polling = undefined;
     }
   }
@@ -244,7 +323,10 @@ export class LifecycleBroker {
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
       const target = this.participants.get(subscription.to);
-      if (!target || target.stale || !target.local) continue;
+      if (!target || target.stale || !target.local) {
+        if (!target || target.local) this.#retryNeeded = true; // Known local unread work, not idle admission.
+        continue;
+      }
       await this.#drainSubscription(entry, subscription);
     }
     for (const id of this.#unsaved.keys()) if (!listed.has(id)) this.#unsaved.delete(id);
@@ -319,6 +401,7 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
+          this.#retryNeeded = true;
           await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
           return;
         }

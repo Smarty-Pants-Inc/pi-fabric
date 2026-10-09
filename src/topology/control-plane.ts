@@ -4,6 +4,11 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import fs, { type FSWatcher } from "node:fs";
+import { meshObserverStamp } from "../actors/mesh-monitor.js";
+
+const OBSERVED_FILES = ["events.jsonl", "generation"];
+const IDLE_SAFETY_MS = 60_000;
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
@@ -353,6 +358,12 @@ export class FabricControlPlane {
   #offset: number;
   #lastSequence: number;
   #timer: NodeJS.Timeout | undefined;
+  #watcher: FSWatcher | undefined;
+  #stamp: string | undefined;
+  #dirty = false;
+  #running = false;
+  #retryNeeded = false;
+  #started = false;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
@@ -400,10 +411,11 @@ export class FabricControlPlane {
 
   start(handler: FabricControlHandler): void {
     this.#handler = handler;
-    if (!this.options.enabled || this.#timer) return;
-    this.#closed = false;
+    if (!this.options.enabled || this.#started || this.#closed) return;
+    this.#started = true;
     this.#paused = false;
-    this.#schedulePoll(this.#pollMs);
+    this.#attachWatcher();
+    this.#wake();
   }
 
   async request(
@@ -648,6 +660,7 @@ export class FabricControlPlane {
         }),
       }).then(() => {
         pendingRequest!.commandPublished = true;
+        this.#wake();
         // Other requests retain their commit-time ACK window. Never overwrite a mirrored
         // message's admission timer, or revive a request already settled while publishing.
         if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
@@ -860,8 +873,8 @@ export class FabricControlPlane {
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
-    this.#schedulePoll(this.#pollMs);
-    void this.#backgroundPoll.run(() => this.#poll(), false);
+    this.#attachWatcher();
+    this.#wake();
   }
 
   /** Join through outcome and ACK publication, not merely the host admission counter. */
@@ -882,6 +895,8 @@ export class FabricControlPlane {
     for (const cancel of this.#resendWaits) cancel();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#watcher?.close();
+    this.#watcher = undefined;
     await this.#polling?.catch(() => undefined);
     if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#sharedClaims.clear();
@@ -899,8 +914,11 @@ export class FabricControlPlane {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
+    if (this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
+    this.#retryNeeded = false;
+    this.#stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
     const operation = this.#drain();
     this.#polling = operation;
     try {
@@ -908,19 +926,56 @@ export class FabricControlPlane {
       if (!this.#ownedCommands.size && !this.#sharedClaims.size) this.#backgroundPoll.success();
     } catch (error) {
       if (!(error instanceof MeshConsumptionPausedError)) throw error;
+      this.#retryNeeded = true;
     } finally {
+      if (this.options.canConsumeMesh?.() === false) this.#retryNeeded = true;
       if (this.#polling === operation) this.#polling = undefined;
     }
   }
 
+  #attachWatcher(): void {
+    if (this.#closed || this.#paused || this.#watcher) return;
+    try {
+      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        if (filename !== null && !OBSERVED_FILES.includes(path.basename(filename.toString()))) return;
+        this.#wake();
+      });
+      this.#watcher = watcher;
+      watcher.on("error", () => {
+        if (this.#watcher !== watcher || this.#closed) return;
+        watcher.close(); this.#watcher = undefined;
+        this.#wake();
+      });
+    } catch { /* Reattach at the safety deadline; no fast idle fallback. */ }
+  }
+
+  #wake(): void {
+    if (this.#closed || this.#paused || !this.options.enabled) return;
+    this.#dirty = true;
+    if (!this.#running) this.#schedulePoll(this.#backgroundPoll.waitMs);
+  }
+
   #schedulePoll(waitMs: number): void {
+    if (this.#closed || this.#paused) return;
+    if (this.#timer) clearTimeout(this.#timer);
     const timer = setTimeout(() => {
-      void this.#backgroundPoll.run(() => this.#poll(), false).finally(() => {
-        // A pause/close/resume can replace the timer while a drain is in flight.
-        // Only this captured generation may schedule its next randomized wake.
-        if (this.#timer === timer && !this.#closed && !this.#paused) {
-          this.#schedulePoll(this.#backgroundPoll.waitMs || this.#pollMs);
-        }
+      if (this.#timer !== timer || this.#closed || this.#paused) return;
+      this.#timer = undefined;
+      this.#attachWatcher();
+      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+      const active = this.#retryNeeded || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size;
+      if (!this.#dirty && !active && stamp !== undefined && stamp === this.#stamp) {
+        this.#schedulePoll(IDLE_SAFETY_MS);
+        return;
+      }
+      this.#dirty = false;
+      this.#running = true;
+      void this.#backgroundPoll.run(() => this.#poll(), false).then(result => {
+        this.#running = false;
+        if (this.#closed || this.#paused) return;
+        if (result !== "done") this.#retryNeeded = true;
+        const retry = result !== "done" || this.#retryNeeded || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size;
+        this.#schedulePoll(this.#backgroundPoll.waitMs || (this.#dirty ? 0 : retry ? this.#pollMs : IDLE_SAFETY_MS));
       });
     }, waitMs);
     this.#timer = timer;
@@ -1162,7 +1217,7 @@ export class FabricControlPlane {
         if (detachedControlOperation(command.operation) && isLockTimeout(error)) this.#backgroundPoll.failure(error);
         throw error;
       })
-      .finally(() => { owned.running = false; });
+      .finally(() => { owned.running = false; this.#wake(); });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);

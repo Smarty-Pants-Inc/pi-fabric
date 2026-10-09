@@ -1,0 +1,66 @@
+# Async store seam — U2 (held, opt-in)
+
+Refs smarty-dev#6477; continues #716's design in [nats-kv-state.md](../nats-kv-state.md). No GitHub was contacted. Main inspected at `efa1c0c925305212368f8a804933cc96a84356fc`; its existing `src/` files are byte-identical to this branch (the branch only adds experimental NATS modules/exports).
+
+## Decision: (a), async authority, migrated by capability
+
+Use the existing `AsyncMeshStateStore` and `openAsyncMeshStateStore({backend: "nats-kv", nats: {experimentalNatsKv: true, ...}})` selector. Await reads **end to end** in an audited single-key caller: the mesh provider's `shared/` namespace. `MeshProvider.withStateBackend` is an explicit asynchronous factory, not an environment/runtime-config switch. The ordinary constructor is unchanged. `shared/` has no host-coordination consumers on inspected main. All other namespaces, typed StateStore/schema operations, events, participants, UI and custody stay with the supplied legacy MeshStore. Cross-namespace lists merge sorted detached results; they are not cross-backend snapshots. NATS errors never fall back to file.
+
+This is the least-code correct seam, **not a whole-runtime NATS cutover**. The async interface intentionally has no atomic multi-key batch, snapshot token, synchronous stamp, shared object identity or synchronous write fence. Unsupported capabilities remain unavailable by type, not simulated by sequential KV puts. File/SQLite implementations/interfaces are unmodified; fabric-store owns SQLite. Existing `mesh.stateBackend`, its environment override and file default are untouched. NATS is never selected at startup/by default; no fleet setting changes.
+
+### Cost and alternatives
+
+A TypeScript-symbol census finds **278** relevant main state method/property references: **216** outside the four store implementations, including **154** consuming the synchronous surface (transaction-view reads, cache properties and close included). Unrelated Map/SQLite-statement methods are excluded. There are **15** external `writeBatch` sites; migration needs transaction design, not just `await`. Exact annotated inventory: retained `main-store-call-sites.txt`. This bounded implementation migrates the mesh provider's two async-capable read sites, routes its already-async put/delete, and owns awaited shutdown. Full (a) migration also propagates promises through the families below and their callers/tests; `prepare`, delete conditions, outbox effects and event-append fencing must be redesigned or kept transactional. Costs: one leader RPC/get, one RPC/scanned key, explicit errors/deadlines and awaited teardown.
+
+(b) A write-through/watch cache is rejected: sync `fresh` reads cease being leader authority; cross-host batch replication can partially commit. #708 leases alone do not fence protected writes: the resource must persist/enforce the lease token on **every** write, and checking a lease before a separate KV put has a TOCTOU gap. Correct replication needs durable intents/cursors, provisional-vs-acknowledged versions, conflict/offline policy and downstream fencing. The local #708 lease design explicitly keeps that integration held. More code, weaker semantics.
+
+(c) `Atomics.wait`/worker bridge is rejected: bounded blocking still stalls Pi's event loop and cannot create multi-key atomicity, snapshots or distributed synchronous custody. It adds uncertain-commit and shutdown failure modes without fixing authority.
+
+## Synchronous results on main (file:line)
+
+Contract: `src/mesh/state-backend.ts:190-224`; facade: `src/mesh/store.ts:368-431`. File reads/tokens: `src/mesh/state-file.ts:652-686`; fence/batch: `src/mesh/state-file.ts:1087,1148-1270`. SQLite reads/batch/fence: `src/mesh/state-sqlite.ts:513-540,638-692,726`; adapter tokens/fence: `src/mesh/state-backend.ts:392-426,484-495`. Read only, never edited.
+
+Combine each file with each line in its cell (`file:line`). Every external synchronous-surface reference is listed; duplicate references on a line collapse. An async enclosing function still dereferences a sync result today. Transaction-view reads are included: naively awaiting them breaks callback custody.
+
+| File / family | Lines requiring synchronous results |
+| --- | --- |
+| `src/actors/manager.ts` | 1015, 4304, 4543, 4544 |
+| `src/actors/presence-reaper.ts` | 41, 45, 58 |
+| `src/agents/completion-journal.ts` | 563, 599, 603, 621, 655 |
+| `src/fabric-runtime-state.ts` | 1823, 1953 |
+| `src/lifecycle/broker.ts` | 159, 172, 226, 389, 409 |
+| `src/mesh/backend-migration.ts` | 567 |
+| `src/mesh/bridge.ts` | 223, 309, 362, 413, 433, 434, 450, 456, 495, 504, 549, 550, 632 |
+| `src/mesh/commit-outbox.ts` | 141, 188, 195, 207, 213, 249 |
+| `src/mesh/state-projector.ts` | 571, 716 |
+| `src/providers/mesh-provider.ts` | 263, 275 |
+| `src/residency/client.ts` | 1141 |
+| `src/residency/host.ts` | 777 |
+| `src/residency/operator-safety.ts` | 41 |
+| `src/schema/controller.ts` | 109, 254, 321, 515, 542, 562, 793, 797 |
+| `src/state/store.ts` | 531, 572, 605, 811, 840, 851, 1086, 1117, 1130, 1181, 1223, 1265 |
+| `src/topology/control-plane.ts` | 758, 999, 1046, 1069, 1079, 1306, 1316, 1345, 1350 |
+| `src/topology/host-reaper.ts` | 55, 63, 87, 90, 114, 115, 118, 131, 205 |
+| `src/topology/host-record-compaction.ts` | 32 |
+| `src/topology/participant-directory.ts` | 974, 975, 977, 980, 981, 984, 995, 1127, 1143, 1147, 1155, 1220, 1236, 1255, 1262, 1264, 1296, 1298, 1299, 1308, 1309, 1310, 1411, 1415, 1550, 1590, 1594, 1602, 1680, 1686, 1687, 1695, 1721, 1741, 1751, 1759, 1797, 1903, 1930, 1939, 2051, 2130, 2156, 2203, 2208, 2227, 2287, 2319, 2325, 2326, 2342 |
+| `src/topology/publication-generation.ts` | 47 |
+| `src/topology/root-inbox.ts` | 354 |
+| `src/topology/stall-alarms.ts` | 108, 114, 116, 125 |
+| `src/ui/controller.ts` | 695, 834, 841, 842, 852, 854, 869 |
+| `src/ui/snapshot.ts` | 125 |
+
+`ParticipantDirectory.get/list`, ActorManager indexes, `StateStore.getHead/get`, schema workspace/hypothesis lookup, operator-safety evidence and UI snapshots return synchronously. The bridge fence at `src/mesh/bridge.ts:413` surrounds ownership checks/event append; awaiting KV under local custody is not a substitute. Outbox/reaper callbacks need one transactional view. None is silently redirected to NATS.
+
+## Consistency, fencing and failures
+
+- Completed put/delete returns its PubAck revision. Subsequent awaited get uses leader `STREAM.MSG.GET` (`allow_direct: false`); read-your-writes holds absent an intervening writer. No local cache or optimistic success.
+- Server expected-last-subject-sequence CAS gives one winner among stale writers. Revisions include retained tombstones, are bucket/root/key scoped, and are not exact per-key counters or #708 lease tokens. This seam provides **single-key CAS fencing**, not host-owner/lease fencing or multi-key custody.
+- `shared/` routing is host-controlled. Existing local `shared/` values are neither migrated nor fallback: migrate separately before opt-in. Remote values cannot shadow host/private namespaces; non-shared keys retain original backend/guards.
+- Disconnect/capacity/timeout errors propagate. Unknown acknowledgements grant no authority; mutations are not automatically replayed. Reconnect re-establishes transport/server eligibility; storage restart retains old fences. Provider close awaits only its owned async handle, never caller-owned MeshStore.
+- R3/file/history=1, no TTL/purge/delete; `sync_interval: always` on every member is a deployment prerequisite. One-host loopback R3 is functional evidence, **not** three-host/power-loss qualification. Bucket-destruction/restore-epoch and TLS/ACL/three-host gates remain held.
+
+## Acceptance / reproduction
+
+Caller-staged official `nats-server-v2.14.7-linux-amd64.tar.gz` / `SHA256SUMS`: verify archive SHA256 **before extraction/use**, verify executable against the archive member and require exact `v2.14.7` for this task. Extract only beneath `$TMPDIR`. Runner owns only loopback listeners, uses always-sync R3, retains logs/configs/check evidence under `$TASK_OUT`, and stops/waits children in `finally`.
+
+Evidence required: async get/null/list/namespace/error/shutdown regressions; real read-your-writes/concurrent CAS; disconnect/same-client reconnect/persisted reopen; shared async single-key conformance/eight-process writers; unchanged legacy batch conformance; typecheck/fresh build. Retained ledger/result records exact outcomes. No push, GitHub, credentials, services or fleet backend mutation.

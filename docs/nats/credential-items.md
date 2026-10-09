@@ -9,7 +9,7 @@ by this task. Local guides are `smarty-dev/docs/credentials.md` and
 vault (`zpbhoj6yfzevtfaxjswevq66m4`), not a new vault or secret loader.
 
 One canonical item per credential, no omnibus bundle. Titles follow
-`NATS — <purpose> (<scope>)`. Tags: `service/nats`, `use/tls`, `org/smarty-pants`,
+`NATS — <purpose> (<scope>)`. Tags: `service/nats`, `use/service`, `org/smarty`,
 and `host/<host>` for host material. Notes record consumer, SAN/EKU, scope,
 expiration, rotation owner, issue and approved delivery boundary.
 

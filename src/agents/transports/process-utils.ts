@@ -1,10 +1,11 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type SpawnOptions } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
+import { cgroupCustody, executionCgroups, executionIdentity, linuxGroupMember, type ScopePin, type CgroupCustody, type LinuxGroupMember } from "../../process-cgroup.js";
+import { spawnScopedExecution, releaseScopedChild } from "../../worker/scope-spawn.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -255,17 +256,6 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
-type LinuxGroupMember = { pid: number; parent: number; group: number; started: string; state: string };
-const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    return { pid, parent: Number(fields[1]), group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
-    throw error; // Unknown identity is not permission to signal or to report exit.
-  }
-};
 const linuxProcesses = (): LinuxGroupMember[] =>
   fs.readdirSync("/proc").flatMap((entry) => {
     if (!/^\d+$/.test(entry)) return [];
@@ -282,7 +272,7 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-  scope?: { executable: string; slice: string; warn: (reason: string) => void },
+  scope?: { executable: string; slice: string; warn: (reason: string) => void; legacy?: boolean },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
@@ -293,28 +283,21 @@ export const spawnDetached = async (
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
-  // Scope admission execs in place: the captured PID and custody IPC stay owned.
-  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
-  const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
-  const child = spawn(scope?.executable ?? runtime, scope ? [
-    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
-    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
-    "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
-  ] : [workerPath, ...workerArguments], {
+  const options: SpawnOptions = {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
-  });
+  };
+  const child = scope ? await spawnScopedExecution((binary, args, opts) => spawn(binary, [...args], opts),
+    runtime, [workerPath, ...workerArguments], options, true,
+    { ...scope, prefix: "worker", authorize: () => assertTransportLaunchAllowed(authority), ...(authority?.signal ? { signal: authority.signal } : {}) })
+    : spawn(runtime, [workerPath, ...workerArguments], options);
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
   if (!child.pid) {
     await new Promise<void>(resolve => child.once("close", () => resolve()));
-    if (!scope) throw spawnError ?? new Error("Failed to launch Fabric worker process");
-    fs.rmSync(scopeRoot!, { recursive: true, force: true });
-    assertTransportLaunchAllowed(authority);
-    scope.warn(spawnError?.message ?? "systemd-run did not launch");
-    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+    throw spawnError ?? new Error("Failed to launch Fabric worker process");
   }
   const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
@@ -329,6 +312,17 @@ export const spawnDetached = async (
     lost = reason;
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
+  const primaryScope = executionCgroups.get(child);
+  let executionBoundaryConfirmed = false;
+  const scopes = new Map<string, CgroupCustody>();
+  if (primaryScope) scopes.set(primaryScope.directory, primaryScope);
+  const scopesAlive = (): boolean => {
+    // Observe every pin, even while the worker's primary scope is still live,
+    // so completed provider attempts close their retained directory descriptors.
+    let alive = false;
+    for (const scope of scopes.values()) if (!scope.exited()) alive = true;
+    return alive || (executionPending && !executionBoundaryConfirmed);
+  };
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
   // native unref above is still valid; optional channel APIs are not custody.
@@ -339,7 +333,8 @@ export const spawnDetached = async (
     if (message.type === "fabric-execution-custody") {
       // The real worker cannot spawn execution until we acknowledge custody.
       executionPending = true;
-      if (child.connected) child.send({ type: "fabric-execution-custody-ack" }, () => undefined);
+      executionBoundaryConfirmed = false;
+      if (child.connected) child.send({ type: "fabric-execution-custody-ack", ...(primaryScope ? { cgroupCustody: true } : {}) }, () => undefined);
     } else if (message.type === "fabric-execution-started" && "pid" in message &&
       Number.isSafeInteger(message.pid) && Number(message.pid) > 0 && "started" in message && typeof message.started === "string") {
       // This private native channel belongs to our worker. Retain its reported
@@ -348,6 +343,35 @@ export const spawnDetached = async (
       if (process.platform === "linux") {
         owned.set(Number(message.pid), message.started);
         groups.add(Number(message.pid));
+        executionBoundaryConfirmed = false;
+        // The private channel transfers the scope pin carried by the worker's
+        // spawn result, not an admission marker. Pin the very same inode/owner
+        // and verify the still-gated launcher before granting the release ACK.
+        if (primaryScope && "cgroup" in message && typeof message.cgroup === "string" &&
+          /^\/sys\/fs\/cgroup\/.+\/fabric-execution-[0-9a-f-]+[.]scope$/.test(message.cgroup) &&
+          "pin" in message && message.pin && typeof message.pin === "object") {
+          try {
+            const pin = message.pin as ScopePin;
+            if (![pin.dev, pin.ino, pin.uid].every(Number.isSafeInteger)) throw new Error("Invalid scope pin");
+            const current = executionIdentity(Number(message.pid));
+            if (!current || current.started !== message.started) throw new Error("Execution launcher birth changed");
+            const receipt = cgroupCustody(message.cgroup, current, pin);
+            try { receipt.verify(current); }
+            catch (error) { receipt.dispose(); throw error; }
+            scopes.set(message.cgroup, receipt);
+            executionBoundaryConfirmed = true;
+          } catch (error) { unconfirmed(`Execution scope custody unconfirmed: ${String(error)}`); }
+        } else if (primaryScope) {
+          // Older workers can inherit the worker scope. Its exact retained path,
+          // never a newly sampled sibling path, is the only compatible boundary.
+          try {
+            const current = executionIdentity(Number(message.pid));
+            if (current?.started === message.started) { primaryScope.verify(current); executionBoundaryConfirmed = true; }
+          } catch { /* retain unknown execution debt */ }
+        }
+        if (executionBoundaryConfirmed && child.connected) {
+          child.send({ type: "fabric-execution-started-ack", pid: message.pid, started: message.started }, () => undefined);
+        }
       }
     } else if (message.type === "fabric-execution-settled") executionPending = false;
   });
@@ -392,6 +416,9 @@ export const spawnDetached = async (
   let stopped = false;
   let stopFailed = false;
   const members = (): LinuxGroupMember[] => {
+    if (primaryScope) return [...scopes.values()].flatMap(scope => scope.members().flatMap(pid => {
+      const value = linuxGroupMember(pid); return value && !["Z", "X"].includes(value.state) ? [value] : [];
+    }));
     const snapshot = linuxProcesses().filter((member) => !exited || member.pid !== pid);
     // Retain detached execution groups BEFORE their custodian can die/reparent
     // them. An edge is admitted only while its parent's birth still matches.
@@ -433,6 +460,36 @@ export const spawnDetached = async (
   };
   const stop = async (): Promise<void> => {
     if (stopped) return;
+    if (primaryScope) {
+      const settled = (): boolean => !scopesAlive() && exited;
+      const wait = async (ms: number): Promise<boolean> => {
+        let expired = false;
+        const timer = setTimeout(() => { expired = true; }, ms);
+        try {
+          do { if (settled()) return true; await stopDelay(); } while (!expired);
+          return settled();
+        } finally { clearTimeout(timer); }
+      };
+      // Captured native IPC can request cooperative worker stop without any
+      // numeric PID/PGID signal authority. Channel failure retains the same
+      // grace deadline and atomic KILL obligation. Execution TERM is skipped.
+      if (!exited && child.connected) {
+        try { child.send({ type: "fabric-stop" }, () => undefined); }
+        catch { /* best effort; never replace a lost channel with numeric TERM */ }
+      }
+      if (!exited) await primaryScope.signal("SIGTERM");
+      else for (const scope of scopes.values()) await scope.signal("SIGTERM");
+      if (await wait(termGraceMs)) return;
+      // Kernel membership includes setsid and unsampled double-fork children.
+      for (const scope of scopes.values()) if (scope !== primaryScope) await scope.signal("SIGKILL");
+      await primaryScope.signal("SIGKILL");
+      if (!(await wait(STOP_KILL_MS))) {
+        const reason = `Fabric worker ${pid} did not confirm scope/native exit after bounded SIGTERM/SIGKILL cleanup`;
+        if (tracksExecution) { unconfirmed(reason); return; }
+        throw new Error(reason);
+      }
+      return;
+    }
     // Capture group identities BEFORE TERM, while the owned leader still pins it.
     // A leader can exit before its refusing child. Retain that child's birth, not
     // just a group number, and never adopt a recycled group with no owned member.
@@ -510,9 +567,9 @@ export const spawnDetached = async (
       stopFailed = false;
       const pending = (async () => {
         // Retain the PR's observed detached descendants before TERM can reparent them.
-        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
+        if (!primaryScope && ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         if (process.platform !== "win32") {
-          if (process.platform === "linux" && !birth) {
+          if (process.platform === "linux" && !primaryScope && !birth) {
             // A captured native handle can lag /proc absence. Bound its close
             // without adopting a new birth or an unowned surviving group. In
             // particular, an unreadable birth is NOT this absent-worker case.
@@ -560,7 +617,7 @@ export const spawnDetached = async (
           ]);
           // Sampling cleanup supplements, but never replaces, the confirmed-exit
           // custody and birth-checked group drain above. Native-close debt stays latched.
-          if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
+          if (!primaryScope && ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
         } finally { clearTimeout(force); clearTimeout(deadline); }
       })();
@@ -570,6 +627,7 @@ export const spawnDetached = async (
       return pending;
     },
     async isAlive() {
+      if (primaryScope) return scopesAlive();
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
       if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
@@ -587,23 +645,7 @@ export const spawnDetached = async (
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
     },
   };
-  if (scope && marker) {
-    let nativeClosed = false;
-    void closed.then(() => { nativeClosed = true; });
-    const admissionDeadline = Date.now() + 5_000;
-    try {
-      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
-        await new Promise<void>(resolve => setTimeout(resolve, 10));
-      }
-      if (fs.existsSync(marker)) return handle;
-      if (!nativeClosed) await handle.stop();
-      if (handle.lostContact()) throw new Error(handle.lostContact());
-      if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
-      assertTransportLaunchAllowed(authority);
-      if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
-      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
-      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
-    } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
-  }
+  try { assertTransportLaunchAllowed(authority); releaseScopedChild(child); }
+  catch (error) { await handle.stop(); throw error; }
   return handle;
 };

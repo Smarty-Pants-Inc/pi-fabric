@@ -166,10 +166,12 @@ setTimeout(() => process.exit(0), 700);`);
     // is the worker contract used by session transports (tmux/screen/etc.).
     let session: AgentTransportHandle | undefined;
     let sentinel: AgentTransportHandle | undefined;
-    const socket = path.join(root, "t.sock");
+    // Unix socket paths are limited to 108 bytes; private fleet TMPDIRs can
+    // exceed that before the fixture suffix. Resolve a short name in our cwd.
+    const socket = "t.sock";
     const execute = processUtils.executeFile;
     const isolatedExecute = (command: string, args: string[], options?: Parameters<typeof execute>[2]) =>
-      execute(command, command === "tmux" ? ["-f", "/dev/null", "-S", socket, ...args] : args, options);
+      execute(command, command === "tmux" ? ["-f", "/dev/null", "-S", socket, ...args] : args, command === "tmux" ? { ...options, cwd: root } : options);
     const query = transport === "tmux" ? vi.spyOn(processUtils, "executeFile").mockImplementation(isolatedExecute) : undefined;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
       // Give the worker its real run deadline before the manager's fallback

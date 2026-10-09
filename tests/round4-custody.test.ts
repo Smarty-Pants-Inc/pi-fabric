@@ -273,5 +273,5 @@ describe("round 4 execution custody", () => {
       await manager.close().catch(() => undefined);
       fs.rmSync(root, { recursive: true, force: true });
     }
-  }, 20000);
+  }, 35000); // three refusing workers each retain the 7s cgroup grace
 });

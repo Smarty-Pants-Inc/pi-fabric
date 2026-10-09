@@ -61,7 +61,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
-    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice ?? "app.slice (default)"}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {
@@ -112,8 +112,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
     }
-    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
-    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+    const executable = process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    if (process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -148,7 +148,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         workerArguments,
       ),
-      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+      executable ? { executable, slice: this.processSlice ?? "app.slice", warn: this.#warnScope, legacy: this.processSlice !== undefined } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );

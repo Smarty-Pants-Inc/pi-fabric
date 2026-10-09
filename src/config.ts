@@ -175,7 +175,7 @@ export interface FabricAgentConfig {
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
-  /** Host-only Linux user scope slice; unset launches workers directly. */
+  /** Host-only Linux worker slice; capable cgroup-v2 hosts default to app.slice. */
   processSlice?: string;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;

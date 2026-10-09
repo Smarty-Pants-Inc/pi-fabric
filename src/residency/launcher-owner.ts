@@ -13,14 +13,50 @@ const EXIT_MARKER_LINE = /^pi-fabric-resident-exit \{"reason":"(idle-exit|handov
  */
 export function exitMarkerReader(): (chunk: string) => ResidentExitReason | undefined {
   let partial = "";
+  // An overlong line is dropped up to its newline: a kept suffix could forge a marker.
+  let skipping = false;
   return (chunk) => {
-    const lines = `${partial}${chunk}`.split("\n");
-    // A marker line is short; never buffer an unbounded partial line.
-    partial = lines.pop()!.slice(-256);
+    const parts = chunk.split("\n");
+    const tail = parts.pop()!;
     let reason: ResidentExitReason | undefined;
-    for (const line of lines) reason = (EXIT_MARKER_LINE.exec(line.replace(/\r$/, ""))?.[1] as ResidentExitReason | undefined) ?? reason;
+    for (const part of parts) {
+      if (!skipping) reason = (EXIT_MARKER_LINE.exec(`${partial}${part}`.replace(/\r$/, ""))?.[1] as ResidentExitReason | undefined) ?? reason;
+      partial = ""; skipping = false;
+    }
+    if (!skipping) {
+      partial += tail;
+      // A marker line is short; never buffer an unbounded partial line.
+      if (partial.length > 256) { partial = ""; skipping = true; }
+    }
     return reason;
   };
+}
+/**
+ * Adopts the launcher's exit channel (PI_FABRIC_EXIT_FD) before anything can
+ * spawn: the inherited fd is not close-on-exec, so a grandchild (an agent's
+ * bash tool) could otherwise write a marker to it (smarty-dev#7770). POSIX
+ * re-opens it through /dev/fd (Node opens with O_CLOEXEC) and closes the
+ * inherited fd. When that fails, only a kernel-proven close-on-exec fd is
+ * kept; otherwise there is no channel and the launcher logs 'unknown'.
+ */
+export function adoptExitChannel(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const value = env.PI_FABRIC_EXIT_FD;
+  delete env.PI_FABRIC_EXIT_FD;
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const inherited = Number(value);
+  // ponytail: Windows passes no handle a child did not ask for; keep the fd as is.
+  if (process.platform === "win32") return inherited;
+  try {
+    const fd = fs.openSync(`/dev/fd/${inherited}`, "w");
+    fs.closeSync(inherited);
+    return fd;
+  } catch { /* Linux refuses to re-open a socket (ENXIO); libuv's stdio pipe is a socketpair. */ }
+  // Keep the inherited fd only when the kernel shows it is already close-on-exec
+  // (Node starts its inherited stdio that way); never trust an inheritable one.
+  try { if (Number.parseInt(/^flags:\s+([0-7]+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${inherited}`, "utf8"))?.[1] ?? "", 8) & 0o2000000) return inherited; }
+  catch { /* No fdinfo: not provably close-on-exec. */ }
+  try { fs.closeSync(inherited); } catch { /* already closed */ }
+  return undefined;
 }
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 function processRows(): OwnedProcess[] {

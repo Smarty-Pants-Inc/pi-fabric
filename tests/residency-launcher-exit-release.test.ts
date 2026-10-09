@@ -22,11 +22,9 @@ const snapshot = (directory: string, files = new Map<string, string>()): Map<str
   }
   return files;
 };
-const previousConfigEnv = process.env.PI_FABRIC_RESIDENT_CONFIG;
 afterEach(() => {
   vi.restoreAllMocks();
-  if (previousConfigEnv === undefined) delete process.env.PI_FABRIC_RESIDENT_CONFIG;
-  else process.env.PI_FABRIC_RESIDENT_CONFIG = previousConfigEnv;
+  delete process.env.PI_FABRIC_EXIT_FD;
 });
 
 // smarty-dev#7770 / #1882: the exit marker (which the launcher logs into
@@ -48,15 +46,16 @@ it("a failure from close() after the release writes no marker, no error.json, no
   fs.mkdirSync(residencyRoot, { recursive: true, mode: 0o700 });
   const configPath = path.join(residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
-  process.env.PI_FABRIC_RESIDENT_CONFIG = configPath;
+  // The launcher's exit channel, here a file outside the snapshotted mesh/.
+  const channel = fs.openSync(path.join(root, "exit-channel"), "w");
+  process.env.PI_FABRIC_EXIT_FD = String(channel);
   const ownerPath = path.join(residencyRoot, "owner.json");
   const markers: Array<{ line: string; owned: boolean }> = [];
-  const write = process.stderr.write.bind(process.stderr);
-  vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
-    const line = String(chunk);
-    if (line.startsWith("pi-fabric-resident-exit ")) markers.push({ line, owned: fs.existsSync(ownerPath) });
-    return write(chunk, ...rest);
-  }) as typeof process.stderr.write);
+  const writeSync = fs.writeSync;
+  vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, data: string, ...rest: never[]) => {
+    if (String(data).startsWith("pi-fabric-resident-exit ")) markers.push({ line: String(data), owned: fs.existsSync(ownerPath) });
+    return writeSync(fd, data, ...rest);
+  }) as typeof fs.writeSync);
   // The release is the last step of close(); this failure surfaces after it.
   vi.spyOn(AgentManager.prototype, "close").mockRejectedValue(new Error("injected teardown failure"));
   let released: Map<string, string> | undefined;
@@ -77,6 +76,11 @@ it("a failure from close() after the release writes no marker, no error.json, no
     expect(fs.existsSync(path.join(residencyRoot, "error.json"))).toBe(false);
     // One marker, written while the host still owned the root.
     expect(markers).toEqual([{ line: 'pi-fabric-resident-exit {"reason":"stopped"}\n', owned: true }]);
+    expect(fs.readFileSync(path.join(root, "exit-channel"), "utf8")).toBe('pi-fabric-resident-exit {"reason":"stopped"}\n');
+    // The host adopted the channel (and closed this fd): never close it here,
+    // its number may already be reused in this process.
+    // Workers the host spawns never inherit the channel's address.
+    expect(process.env.PI_FABRIC_EXIT_FD).toBeUndefined();
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });

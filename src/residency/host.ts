@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
-import { RESIDENT_EXIT_MARKER, type ResidentExitReason } from "./launcher-owner.js";
+import { RESIDENT_EXIT_MARKER, adoptExitChannel, type ResidentExitReason } from "./launcher-owner.js";
 import { randomUUID } from "node:crypto";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -1824,11 +1824,12 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
 
+/** The launcher's dedicated exit-reason pipe (PI_FABRIC_EXIT_FD); stderr never carries the marker. */
+let exitFd: number | undefined;
 /** Tells the launcher why this host exits; it names the reason in launcher.log (smarty-dev#7770). */
 const reportResidentExit = (reason: ResidentExitReason): void => {
-  // Only a launcher-spawned host has a launcher reading its stderr.
-  if (!process.env.PI_FABRIC_RESIDENT_CONFIG) return;
-  try { process.stderr.write(`${RESIDENT_EXIT_MARKER}${JSON.stringify({ reason })}\n`); } catch { /* best effort */ }
+  if (exitFd === undefined) return;
+  try { fs.writeSync(exitFd, `${RESIDENT_EXIT_MARKER}${JSON.stringify({ reason })}\n`); } catch { /* best effort */ }
 };
 
 const writeResidentError = (residencyRoot: string, error: unknown): void => {
@@ -1889,6 +1890,8 @@ export const runResidentHostFromConfigPath = async (
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
   let host: ResidentHost | undefined;
+  // Before any worker spawns: none may inherit the channel or its address.
+  if (process.env.PI_FABRIC_EXIT_FD) exitFd = adoptExitChannel();
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
     await runResidentHost(config, signal, modelRegistry, (created) => { host = created; });

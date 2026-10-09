@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
+import type { Readable } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner, exitMarkerReader, type ResidentExitReason, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
@@ -241,6 +242,36 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     catch { /* Audit failure is never permission to abandon recovery. */ }
   };
   const readOwner = (): ResidentHostOwner | undefined => readHandoverJson<ResidentHostOwner>(ownerPath);
+  /**
+   * #2010/smarty-dev#7770: after its child exits, a launcher may write the root
+   * only under the fence a host takes to own it, held non-blocking just for the
+   * append. If a next generation holds it, the line goes to stderr only.
+   */
+  const traceUnderFence = async (event: string, extra: Record<string, unknown>): Promise<void> => {
+    const hostLock = path.join(root, "host.lock");
+    const fds: number[] = [];
+    let fenced = false;
+    try {
+      if (process.platform === "win32") {
+        // The Windows host's exclusive-create claim; ours is removed at once.
+        fds.push(fs.openSync(hostLock, "wx", 0o600));
+      } else {
+        // A host establishes host.lock under this lock, then flocks host.lock for life.
+        // Never create host.lock: a foreign inode would block the next host's startup.
+        fds.push(await lockFile(path.join(root, "host-fence-establish.lock"), 0, process.platform === "linux"));
+        if (fs.existsSync(hostLock)) fds.push(await lockFile(hostLock, 0, process.platform === "linux"));
+      }
+      fenced = true;
+      trace(event, extra);
+    } catch { /* Busy or unavailable: a next generation may own the root. */ }
+    finally {
+      for (const fd of fds) { try { fs.closeSync(fd); } catch { /* closed */ } }
+      if (process.platform === "win32" && fds.length) { try { fs.rmSync(hostLock, { force: true }); } catch { /* best effort */ } }
+    }
+    if (!fenced) {
+      try { process.stderr.write(`${JSON.stringify({ event, at: Date.now(), root, fenced: false, ...extra })}\n`); } catch { /* best effort */ }
+    }
+  };
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   trace("launcher-started", { pid: process.pid, processStartTime: processStartTime(process.pid), configPath, platform: process.platform });
   try { assertNoWatchdogCustody(root); }
@@ -291,10 +322,12 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
     const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
-      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
+      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe", "pipe"],
       env: { ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
+        // The host's exit-reason channel; ordinary stderr cannot forge it (smarty-dev#7770).
+        PI_FABRIC_EXIT_FD: "3",
         PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
         // Per-attempt argument, never shared config another client may rewrite.
         PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
@@ -306,43 +339,35 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native,
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
+    const exitChannel = child.stdio?.[3] as Readable | null | undefined;
     void native.exit.then(async ({ code, signal }) => {
-      // `exit` can precede the last stderr chunk; `close` follows drained stdio.
+      // `exit` can precede the last chunk; `close` follows drained stdio.
       // Bounded: a leaked grandchild may hold the pipes open.
-      if (![child.stdout, child.stderr].every(stream => !stream || stream.closed)) await new Promise<void>(resolve => {
+      if (![child.stdout, child.stderr, exitChannel].every(stream => !stream || stream.closed)) await new Promise<void>(resolve => {
         const timer = setTimeout(resolve, 1_000);
         child.once("close", () => { clearTimeout(timer); resolve(); });
       });
-      const exit = { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner };
-      if (attempt.seenOwner && code === 0 && !signal) {
-        // A reported clean exit was logged on receipt, while the host still owned the root.
-        if (attempt.reported) return;
-        // #2010/#1882: after a clean owned release the root may already belong to
-        // the next generation, and this launcher holds no lock that stops one:
-        // handover.lock custody is never retained while assertAutomaticReleaseRecovery
-        // refuses every release. So never write the root here.
-        // ponytail: the launcher's stderr is its only other sink. The client spawns
-        // it with stdio ignored, so this reaches only a launcher run by hand or a
-        // test; a new journal is not worth it for a host that skipped its report.
-        try { process.stderr.write(`${JSON.stringify({ event: "child-exit", at: Date.now(), root, ...exit, reason: "unknown" })}\n`); } catch { /* best effort */ }
-        return;
-      }
-      trace("child-exit", { ...exit, reason: signal ? "signal" : attempt.reported ?? (code === 0 ? "unknown" : "error") });
+      // A reported clean exit was logged on receipt, while the host still owned the root.
+      if (attempt.seenOwner && code === 0 && !signal && attempt.reported) return;
+      await traceUnderFence("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner,
+        reason: signal ? "signal" : attempt.reported ?? (code === 0 ? "unknown" : "error") });
     }, () => undefined);
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
       if (child.pid && birth) attempt.processes.set(child.pid, { pid: child.pid, processStartTime: birth, ppid: process.pid, state: "S" });
     });
-    const readMarker = exitMarkerReader();
     for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: Buffer) => {
       attempt.stderr = `${attempt.stderr}${chunk}`.slice(-4_000);
-      // The host reports why it exits, on stderr only, before it releases the root (smarty-dev#7770).
-      const reported = stream === child.stderr ? readMarker(chunk.toString()) : undefined;
+      try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
+    });
+    // The host reports why it exits on fd 3 only, before it releases the root (smarty-dev#7770).
+    const readMarker = exitMarkerReader();
+    exitChannel?.on("data", (chunk: Buffer) => {
+      const reported = readMarker(chunk.toString("latin1"));
       if (reported && !attempt.reported) {
         attempt.reported = reported;
         trace("child-exit-reported", { pid: child.pid, reason: reported, kind });
       }
-      try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
     });
     trace("child-spawned", { pid: child.pid, entry: launchEntry, configPath: snapshot, digest: spec?.digest, transaction: plan?.id, kind });
     current = attempt;

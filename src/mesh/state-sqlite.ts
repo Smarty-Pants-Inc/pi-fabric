@@ -767,16 +767,9 @@ export class SqliteStateStore {
 
   static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
     initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
-    ensurePrivateRoot(root);
     const file = path.join(root, "state.db");
-    // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
-    // succeeds no connection in this process can have the file open, so closing drops no lock.
-    const db = withOwnerOnlyUmask(() => {
-      try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-      assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
-      return (options.open ?? openNodeSqlite)(file);
-    });
+    // The one root and file gate (openPrivateStateDb): 0700 root on a pinned fd, 0600 state.db, -wal/-shm inherit it.
+    const db = openPrivateStateDb(root, true, options.open ?? openNodeSqlite);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -821,14 +814,8 @@ export class SqliteStateStore {
 
   static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
     initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
-    ensurePrivateRoot(root);
     const file = path.join(root, "state.db");
-    const db = withOwnerOnlyUmask(() => {
-      try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-      assertPrivateStateFiles(file);
-      return (options.open ?? openNodeSqlite)(file);
-    });
+    const db = openPrivateStateDb(root, true, options.open ?? openNodeSqlite);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -1730,40 +1717,103 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
 };
 
 /**
- * Fail-closed root gate (pi-fabric#694 SEC, smarty-dev#6477: the creation window). The root is created 0700; an
- * existing root is used only if it is ALREADY 0700-or-narrower, a directory, and owned by this uid, verified on
- * an O_NOFOLLOW|O_DIRECTORY fd whose dev/ino match the name's lstat. A wider, foreign or symlinked root is refused
- * (FABRIC_MESH_STATE_UNSUPPORTED), never repaired: whatever opened it while it was wide may still hold an fd.
- * Windows: type and symlink checks only.
+ * The ONE gate for every SQLite open or create of mesh state (SqliteStateStore and the backend-migration FenceDb:
+ * import, cutover, rollback, status). pi-fabric#694 SEC/CODE rounds 7-8, smarty-dev#6477; refuse, never repair.
+ *
+ * 1. Ancestors (StrictModes): every directory above the root (its real path) must be owned by this uid or root,
+ *    and not writable by other, nor by group, unless sticky; a group-writable ancestor is allowed only when its
+ *    group is private (no member but this user: `privateGroup`). Nobody else can then rename or replace the root.
+ * 2. Root: `mkdir` 0700 when creating; then opened O_NOFOLLOW|O_DIRECTORY and checked ON THAT FD: a directory,
+ *    the same dev/ino as the name's lstat, owned by this uid, mode exactly 0700.
+ * 3. Files: state.db is created `wx` 0600 under umask 077 (SQLite gives -wal/-shm state.db's mode); an existing
+ *    state.db, -wal or -shm must be a regular file of ours, owner-only (assertPrivatePath).
+ * 4. The root fd stays open across SQLite's open by path; after it, the root's name must still resolve to the
+ *    pinned dev/ino, and the files are checked again. Otherwise the connection is closed and the open refused.
+ * Windows: the symlink and type checks only.
  */
-export const ensurePrivateRoot = (root: string): void => {
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+export const openPrivateStateDb = <T extends { close(): void }>(root: string, create: boolean, open: (file: string) => T): T => {
   const refuse = (why: string): never => {
-    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: it ${why} (fix: chmod 700 ${root}, owned by this user)`);
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: ${why} (fix: chmod 700 ${root}, owned by this user, in a directory nobody else can write)`);
   };
+  const file = path.join(root, "state.db");
+  const posix = process.platform !== "win32" && typeof process.getuid === "function";
+  if (create) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const named = fs.lstatSync(root);
-  if (named.isSymbolicLink()) refuse("is a symbolic link");
-  if (process.platform === "win32" || typeof process.getuid !== "function") {
-    if (!named.isDirectory()) refuse("is not a directory");
-    return;
-  }
+  if (named.isSymbolicLink()) refuse("it is a symbolic link");
+  if (!named.isDirectory()) refuse("it is not a directory");
+  if (!posix) return withOwnerOnlyUmask(() => createAndOpen(file, create, open));
+  const uid = process.getuid!();
+  const unsafe = unsafeAncestor(path.dirname(path.resolve(root)), uid);
+  if (unsafe) refuse(`its ancestor ${unsafe}`);
   let fd: number | undefined;
   try {
     try { fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_DIRECTORY ?? 0)); }
-    catch { return refuse("cannot be opened as a directory without following links"); }
-    const opened = fs.fstatSync(fd);
-    if (!opened.isDirectory()) refuse("is not a directory");
-    if (opened.dev !== named.dev || opened.ino !== named.ino) refuse("changed while it was checked");
-    if (opened.uid !== process.getuid()) refuse(`is owned by uid ${opened.uid}, not this process's uid ${process.getuid()}`);
-    if ((opened.mode & 0o777) !== 0o700) refuse(`has mode ${(opened.mode & 0o777).toString(8)}; it must be exactly 0700`);
+    catch { refuse("it cannot be opened as a directory without following links"); }
+    const pinned = fs.fstatSync(fd!);
+    if (!pinned.isDirectory()) refuse("it is not a directory");
+    if (pinned.dev !== named.dev || pinned.ino !== named.ino) refuse("it changed while it was checked");
+    if (pinned.uid !== uid) refuse(`it is owned by uid ${pinned.uid}, not this process's uid ${uid}`);
+    if ((pinned.mode & 0o777) !== 0o700) refuse(`it has mode ${(pinned.mode & 0o777).toString(8)}; it must be exactly 0700`);
+    const db = withOwnerOnlyUmask(() => createAndOpen(file, create, open));
+    try {
+      const after = fs.lstatSync(root, { throwIfNoEntry: false });
+      if (!after || after.isSymbolicLink() || after.dev !== pinned.dev || after.ino !== pinned.ino) refuse("it was replaced while SQLite opened it");
+      assertPrivateStateFiles(file);
+    } catch (error) {
+      try { db.close(); } catch { /* refusing anyway */ }
+      throw error;
+    }
+    return db;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
+const createAndOpen = <T>(file: string, create: boolean, open: (file: string) => T): T => {
+  if (create) {
+    // O_EXCL: when this succeeds no connection in this process can have the file open, so closing drops no lock.
+    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+  assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
+  return open(file);
+};
+
+/** The first ancestor (walking up the real path) another local user could use to replace what is below it. */
+const unsafeAncestor = (start: string, uid: number): string | undefined => {
+  let dir = fs.realpathSync(start);
+  for (;;) {
+    const stat = fs.statSync(dir);
+    const sticky = (stat.mode & 0o1000) !== 0;
+    if (stat.uid !== uid && stat.uid !== 0) return `${dir} is owned by uid ${stat.uid}`;
+    if ((stat.mode & 0o002) !== 0 && !sticky) return `${dir} is writable by other (mode ${(stat.mode & 0o7777).toString(8)})`;
+    if ((stat.mode & 0o020) !== 0 && !sticky && !privateGroup(stat.gid, uid))
+      return `${dir} is writable by group ${stat.gid}, which has members besides this user (mode ${(stat.mode & 0o7777).toString(8)})`;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+};
+
+/**
+ * A group is private when nobody but `uid` can act as it: no account other than `uid` has it as primary group
+ * and its member list names nobody else. An unreadable /etc/group or /etc/passwd counts as not private.
+ * ponytail: the local files, not NSS; a directory-service group is refused (fail closed), never trusted.
+ */
+export const privateGroup = (gid: number, uid: number, files = { group: "/etc/group", passwd: "/etc/passwd" }): boolean => {
+  try {
+    const passwd = fs.readFileSync(files.passwd, "utf8").split("\n").map((line) => line.split(":")).filter((f) => f.length >= 4);
+    const self = passwd.find((f) => Number(f[2]) === uid)?.[0];
+    if (self === undefined) return false;
+    if (passwd.some((f) => Number(f[3]) === gid && Number(f[2]) !== uid)) return false;
+    const entry = fs.readFileSync(files.group, "utf8").split("\n").map((line) => line.split(":")).find((f) => f.length >= 4 && Number(f[2]) === gid);
+    if (!entry) return false;
+    return (entry[3] ?? "").split(",").map((name) => name.trim()).filter(Boolean).every((name) => name === self);
+  } catch { return false; }
 };
 
 /**
  * Run `create` (synchronous: our 0600 state.db create and SQLite's first open) under umask 077, so nothing it
- * creates can be wider than owner-only. -wal and -shm, created later by SQLite, take state.db's own mode
- * (os_unix.c robust_open/findCreateFileMode), i.e. 0600, inside the 0700 root. A worker thread cannot set the
- * umask (ERR_WORKER_UNSUPPORTED_OPERATION): there the 0600 create and the 0700 root still hold.
+ * creates can be wider than owner-only. A worker thread cannot set the umask (ERR_WORKER_UNSUPPORTED_OPERATION):
+ * there the 0600 create and the 0700 root still hold. (Process-wide; smarty-dev#7451 item 1.)
  */
 export const withOwnerOnlyUmask = <T>(create: () => T): T => {
   let previous: number | undefined;

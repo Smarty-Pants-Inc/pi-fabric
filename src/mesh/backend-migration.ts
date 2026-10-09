@@ -92,7 +92,7 @@ import type { MeshIdentity } from "./event-log.js";
 import { holdMeshFence } from "./fence-lock.js";
 import type { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
-import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
+import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, openPrivateStateDb, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
@@ -380,13 +380,9 @@ class FenceDb {
       const refusal = filesystemRefusal(root);
       if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     }
-    if (!exists) {
-      fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-      // O_EXCL: when this succeeds no connection in this process has the file open.
-      try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    }
-    const db = (options.open ?? openNodeSqlite)(file);
+    // The one root and file gate (pi-fabric#694 rounds 7-8): refuse a root that is not 0700 and ours, an unsafe
+    // ancestor, or a state file that is not owner-only; create state.db 0600 only when it does not exist yet.
+    const db = openPrivateStateDb(root, !exists, options.open ?? openNodeSqlite);
     try {
       db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
       db.exec("PRAGMA trusted_schema = OFF");

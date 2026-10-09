@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, reclaimClaimPath, removeOwnedFile, SqliteStateStore, tryLockFile }
+import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, reclaimClaimPath, privateGroup, removeOwnedFile, SqliteStateStore, tryLockFile }
   from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
@@ -346,41 +346,70 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     store.close();
   });
 
-  it("no state file is ever wider than 0600, even under umask 0, and a fresh root is 0700 (SEC: the creation window)", async () => {
+  // SEC creation window (pi-fabric#694 rounds 7-8). Watchers are installed BEFORE each open, under umask 0. On
+  // 1098156a the pre-existing 0755 root was accepted and state.db/-wal/-shm appeared in it: this test failed there.
+  it("no state file ever appears in a root others can enter, nor wider than 0600, even under umask 0", async () => {
     const parent = tempRoot("creation-window");
-    fs.chmodSync(parent, 0o755);
-    const root = path.join(parent, "mesh");
-    const seen: Array<[string, number]> = [];
+    const seen: Array<{ root: string; name: string; mode: number; rootMode: number }> = [];
+    const watch = (root: string) => fs.watch(root, (_event, name) => {
+      if (!name || !String(name).startsWith("state.db")) return;
+      const file = fs.statSync(path.join(root, String(name)), { throwIfNoEntry: false });
+      const dir = fs.statSync(root, { throwIfNoEntry: false });
+      if (file && dir) seen.push({ root, name: String(name), mode: file.mode & 0o777, rootMode: dir.mode & 0o777 });
+    });
+    const wide = path.join(parent, "wide");
+    const fresh = path.join(parent, "fresh");
+    fs.mkdirSync(wide);
+    fs.mkdirSync(fresh, { mode: 0o700 });
     const previous = process.umask(0); // worst case: SQLite's default 0644 would show as 0644 here
-    // Watch the parent first (the root does not exist yet), then the root as soon as it does.
-    const observe = (dir: string) => (_event: string, name: string | Buffer | null) => {
-      if (!name) return;
-      const st = fs.statSync(path.join(dir, String(name)), { throwIfNoEntry: false });
-      if (st) seen.push([String(name), st.mode & 0o777]);
-    };
-    const watchers = [fs.watch(parent, observe(parent))];
+    fs.chmodSync(wide, 0o755);
+    const watchers = [watch(wide), watch(fresh)];
     let store: SqliteStateStore | undefined;
     try {
-      // The root exists (0700) and is watched BEFORE the store opens: state.db, -wal and -shm are all observed at creation.
-      fs.mkdirSync(root, { mode: 0o700 });
-      watchers.push(fs.watch(root, observe(root)));
-      store = await openStore(root);
+      expect(await refused(wide)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/must be exactly 0700.*chmod 700/) });
+      store = await openStore(fresh);
       for (let i = 0; i < 20; i += 1) await store.put({ key: `k${i}`, value: { i }, identity: { id: "t", name: "t" } } as never).catch(() => undefined);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     } finally {
       for (const w of watchers) w.close();
       process.umask(previous);
+      store?.close();
     }
-    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    expect(fs.readdirSync(wide).filter((name) => name.startsWith("state.db"))).toEqual([]);
+    expect(seen.filter((event) => event.root === fresh).length).toBeGreaterThan(0);
+    for (const event of seen) expect({ ...event, mode: event.mode & 0o077 }).toEqual({ ...event, root: fresh, mode: 0, rootMode: 0o700 });
     for (const name of ["state.db", "state.db-wal", "state.db-shm"]) {
-      const st = fs.statSync(path.join(root, name), { throwIfNoEntry: false });
+      const st = fs.statSync(path.join(fresh, name), { throwIfNoEntry: false });
       if (st) expect([name, st.mode & 0o777]).toEqual([name, 0o600]);
     }
-    for (const [name, mode] of seen) {
-      if (name === "mesh") expect([name, mode]).toEqual([name, 0o700]);
-      else if (name.startsWith("state.db")) expect([name, mode & 0o077]).toEqual([name, 0]);
-    }
-    store?.close();
+  });
+
+  it("refuses a root under an ancestor others can write (StrictModes); a sticky ancestor is fine", async () => {
+    const parent = tempRoot("ancestor");
+    const open = path.join(parent, "open");
+    fs.mkdirSync(open);
+    fs.chmodSync(open, 0o777);
+    try {
+      expect(await refused(path.join(open, "mesh"))).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/ancestor .*open is writable by other/) });
+      fs.chmodSync(open, 0o1777);
+      (await openStore(path.join(open, "mesh"))).close();
+    } finally { fs.chmodSync(open, 0o700); }
+  });
+
+  it("privateGroup: only a group nobody else can act as", () => {
+    const dir = tempRoot("groups");
+    const write = (group: string, passwd: string) => {
+      fs.writeFileSync(path.join(dir, "group"), group);
+      fs.writeFileSync(path.join(dir, "passwd"), passwd);
+      return { group: path.join(dir, "group"), passwd: path.join(dir, "passwd") };
+    };
+    const passwd = "root:x:0:0::/root:/bin/sh\npaul:x:1000:1000::/home/paul:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n";
+    expect(privateGroup(1000, 1000, write("paul:x:1000:\n", passwd))).toBe(true);
+    expect(privateGroup(1000, 1000, write("paul:x:1000:paul\n", passwd))).toBe(true);
+    expect(privateGroup(1000, 1000, write("paul:x:1000:bob\n", passwd))).toBe(false);
+    expect(privateGroup(1001, 1000, write("bob:x:1001:\n", passwd))).toBe(false); // bob's primary group
+    expect(privateGroup(1000, 1000, write("other:x:7:\n", passwd))).toBe(false); // no such group
+    expect(privateGroup(1000, 1000, { group: path.join(dir, "missing"), passwd: path.join(dir, "passwd") })).toBe(false);
   });
 
   it("refuses an existing 0755 or 0750 root (never repaired) and a symlinked root", async () => {

@@ -80,6 +80,22 @@ const setRawMeta = (root: string, name: string, value: string | number): void =>
 const sorted = <T extends { key: string }>(entries: T[]): T[] => [...entries].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
 describe("mesh backend import", () => {
+  it("import, status and rollback all pass the one root gate: a 0755 root is refused, never repaired (pi-fabric#694 round 8)", async () => {
+    const root = tempRoot("gate");
+    await seedFileRoot(root);
+    fs.chmodSync(root, 0o755);
+    await expect(importMeshState(root)).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/must be exactly 0700/) });
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.statSync(root).mode & 0o777).toBe(0o755);
+    fs.chmodSync(root, 0o700);
+    await importMeshState(root);
+    fs.chmodSync(root, 0o755);
+    try {
+      await expect(meshBackendStatus(root)).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      await expect(rollbackMeshState(root)).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    } finally { fs.chmodSync(root, 0o700); }
+  });
+
   it("imports state.json into state.db in one verified transaction and converges on rerun", async () => {
     const root = tempRoot("import");
     const files = await seedFileRoot(root);

@@ -94,6 +94,7 @@ import { processStartTime, residentProcessAlive } from "../residency/process-ide
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
+import { formatWalReaders, walReaderPids } from "./wal-readers.js";
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -336,9 +337,9 @@ export class MeshStateRetiredError extends Error {
 /** A write refused while the WAL is above `walHardCapBytes` (a reader is pinning it). Retryable later. */
 export class MeshStateWalCapError extends Error {
   readonly code = "FABRIC_MESH_STATE_WAL_CAP";
-  constructor(readonly walBytes: number, readonly capBytes: number) {
+  constructor(readonly walBytes: number, readonly capBytes: number, readonly readers = "") {
     super(`Fabric mesh state write refused: the SQLite WAL is ${walBytes} bytes, above the ${capBytes}-byte cap; `
-      + "a reader is pinning the WAL; restart it or roll back");
+      + `a reader is pinning the WAL; restart it or roll back${readers ? ` (WAL readers: ${readers})` : ""}`);
     this.name = "MeshStateWalCapError";
   }
 }
@@ -1526,7 +1527,7 @@ export class SqliteStateStore {
       } catch { this.#stats.checkpoints.failed += 1; }
       size = this.walBytes();
     }
-    if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes);
+    if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(walReaderPids(this.file)));
     this.#walCapped = false;
   }
 

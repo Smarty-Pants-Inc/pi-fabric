@@ -169,6 +169,8 @@ describe("SQLite WAL bound under pinned and constant readers (smarty-dev#6477 P1
     expect((refusal as MeshStateWalCapError).code).toBe("FABRIC_MESH_STATE_WAL_CAP");
     expect((refusal as Error).message).toContain(String(cap));
     expect((refusal as Error).message).toContain("a reader is pinning the WAL; restart it or roll back");
+    // The report names the pinning reader: this process holds the raw read transaction.
+    if (process.platform === "linux") expect((refusal as MeshStateWalCapError).readers).toContain(`pid ${process.pid} `);
     const refusedAgain = await put(); // still pinned: still refused, the WAL does not grow
     expect(refusedAgain).toBeInstanceOf(MeshStateWalCapError);
     expect(walBytes(root)).toBe(walAtRefusal);

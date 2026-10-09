@@ -21,6 +21,8 @@ import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
+import os from "node:os";
+import { archiveActorForRemoval } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -41,7 +43,7 @@ import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, meshProcessStartedAt, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
@@ -64,6 +66,7 @@ import {
   commitResidentRequest,
   readResidentRequestDecision,
   residentDeliveryPrefix,
+  residentActorRoots,
   residentHostId,
   residentRemovalsPath,
   residentResultPath,
@@ -120,12 +123,6 @@ const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
 };
 
-const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
-  config.sessionActorRoot
-    ? { project: config.actorRoot, session: config.sessionActorRoot }
-    : config.mesh.actorScope === "session"
-      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
-      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
 
 const readJson = <T>(filePath: string): T | undefined => {
   try {
@@ -1535,9 +1532,11 @@ export class ResidentHost {
             (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
           throw new Error("Invalid resident operator actor request");
         }
-        const evidence = readResidentOperatorEvidence(this.config, this.mesh);
+        // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
+        const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self);
         const check = () => assertResidentOperatorConfirmed(
-          readResidentOperatorEvidence(this.config, this.mesh), command.confirmDeadRoot);
+          readResidentOperatorEvidence(this.config, this.mesh, self), command.confirmDeadRoot);
         assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
@@ -1553,6 +1552,13 @@ export class ResidentHost {
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
+          // smarty-dev#7817: archive first, before the removal deletes or revokes anything.
+          if (command.action === "remove") {
+            const sessionDir = path.dirname(stopped.sessionFile ?? "");
+            const row = new ActorRegistryStore(path.dirname(sessionDir)).snapshot().actors.find(entry => entry.id === actor.id);
+            if (!stopped.sessionFile || !row) throw new Error(`Actor ${actor.id} registry row not found for its removal archive`);
+            archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, sessionDir);
+          }
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
             : await this.#removeResidentActor(actor.id, requestId, () => check());

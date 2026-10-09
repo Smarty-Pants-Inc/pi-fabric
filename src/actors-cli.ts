@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
@@ -67,13 +68,20 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
         fs.realpathSync(config.residencyRoot) !== directory || fs.realpathSync(residentRoot(config.meshRoot, config.rootId)) !== directory) {
       throw new Error("Resident directory/config/owner identity mismatch");
     }
-    if (!residentProcessAlive(owner.pid, owner.processStartTime)) throw new Error("Root resident host is not live");
+    const confirmation = values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {};
+    if (!residentProcessAlive(owner.pid, owner.processStartTime)) {
+      // smarty-dev#7817: a dead resident cannot carry out the removal; do it offline under its host.lock fence.
+      if (action !== "remove") throw new Error("Root resident host is not live");
+      const response = await removeActorOffline(directory, config, values["--actor"], { dryRun, ...confirmation });
+      io.out(JSON.stringify({ resident: directory, action, ...response }) + "\n");
+      return response.cleaned === false ? 1 : 0;
+    }
     // The runtime exchange deliberately unrefs its polling timer. A standalone
     // operator process must stay alive until the acknowledged response is printed.
     const keepAlive = setInterval(() => {}, 30_000);
     try {
       const response = await new ResidentActorClient(config.meshRoot, config.rootId).operatorActor(action,
-        values["--actor"], { dryRun, ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}) });
+        values["--actor"], { dryRun, ...confirmation });
       io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;
     } finally { clearInterval(keepAlive); }

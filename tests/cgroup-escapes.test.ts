@@ -17,6 +17,7 @@ describe.skipIf(process.platform !== "linux")("documented same-UID escape residu
     const read = vi.spyOn(fs, "readFileSync").mockImplementation(file => {
       if (String(file).endsWith("cgroup.events")) return "populated 1\nfrozen 1\n";
       if (String(file).endsWith("cgroup.procs")) return "100\n";
+      if (String(file) === "/proc/100/cgroup") return `0::${own.slice("/sys/fs/cgroup".length)}\n`;
       if (String(file) === "/proc/100/stat") {
         const fields = Array<string>(20).fill("0");
         fields[0] = "S"; fields[2] = "100"; fields[3] = "100"; fields[19] = "1000";
@@ -37,7 +38,7 @@ describe.skipIf(process.platform !== "linux")("documented same-UID escape residu
         "/proc/self/fd/42/cgroup.freeze", "/proc/self/fd/42/cgroup.freeze", "/proc/self/fd/42/cgroup.kill",
       ]);
       expect(scan).not.toHaveBeenCalled();
-      expect(read.mock.calls.every(call => String(call[0]).startsWith("/proc/self/fd/42/") || String(call[0]) === "/proc/100/stat")).toBe(true);
+      expect(read.mock.calls.every(call => String(call[0]).startsWith("/proc/self/fd/42/") || ["/proc/100/stat", "/proc/100/cgroup"].includes(String(call[0])))).toBe(true);
     } finally { receipt.dispose(); }
   });
 });

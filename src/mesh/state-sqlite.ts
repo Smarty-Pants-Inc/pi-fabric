@@ -333,6 +333,16 @@ export class MeshStateRetiredError extends Error {
   }
 }
 
+/** A write refused while the WAL is above `walHardCapBytes` (a reader is pinning it). Retryable later. */
+export class MeshStateWalCapError extends Error {
+  readonly code = "FABRIC_MESH_STATE_WAL_CAP";
+  constructor(readonly walBytes: number, readonly capBytes: number) {
+    super(`Fabric mesh state write refused: the SQLite WAL is ${walBytes} bytes, above the ${capBytes}-byte cap; `
+      + "a reader is pinning the WAL; restart it or roll back");
+    this.name = "MeshStateWalCapError";
+  }
+}
+
 export interface SqliteStateStoreOptions {
   /** Upper bound on the projected state.json (old readers throw above 32 MiB). Default 32 MiB. */
   maxStateBytes?: number;
@@ -358,6 +368,14 @@ export interface SqliteStateStoreOptions {
   checkpointBusyMs?: number;
   /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 8 MiB. */
   walResetBytes?: number;
+  /**
+   * WAL hard cap (smarty-dev#6477 security pass P1). A reader that pins one snapshot defeats every
+   * checkpoint, so the WAL only grows. Once a commit leaves the WAL above this size, this store's later
+   * write transactions refuse before BEGIN with `MeshStateWalCapError` (reads keep working). Each refused
+   * write first tries ONE non-blocking TRUNCATE, so writes recover by themselves once the reader lets go.
+   * Default 256 MiB; 0 disables.
+   */
+  walHardCapBytes?: number;
   /** `journal_size_limit`. Default 16 MiB. */
   journalSizeLimitBytes?: number;
   /** Rows kept in the `changes` feed. Default 4,096. */
@@ -457,6 +475,7 @@ const WAL_RESET_LOCK_STALE_MS = 2_000;
 // A busy reset: this process's next attempt waits for a commit at least this much later.
 const WAL_RESET_BACKOFF_MS = 2_000;
 const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
+const DEFAULT_WAL_HARD_CAP_BYTES = 256 * 1024 * 1024;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
 const PREFIX_END = "\u007f";
@@ -679,6 +698,8 @@ export class SqliteStateStore {
   #truncateBudgetMs: number;
   #lastWalBytes = 0;
   readonly #walResetBytes: number;
+  readonly #walHardCapBytes: number;
+  #walCapped = false;
   #walResetting = false;
   #walResetBusyAt = Number.NEGATIVE_INFINITY;
   #lastWalResetCheck = 0;
@@ -702,6 +723,7 @@ export class SqliteStateStore {
     this.#truncateBudgetMs = this.#checkpointBusyMs;
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
+    this.#walHardCapBytes = Math.max(0, Math.floor(options.walHardCapBytes ?? DEFAULT_WAL_HARD_CAP_BYTES));
     if (options.checkpoint === "maintainer") {
       const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
       this.#timer = setInterval(() => {
@@ -1096,6 +1118,7 @@ export class SqliteStateStore {
    * or another store, fails with MeshStateRetiredError. Never rename or delete the files while open.
    */
   async retire(): Promise<number> {
+    // Exempt from the WAL cap: retiring is the roll-back the cap's refusal advises (a few meta rows).
     return this.#write((tx) => {
       const epoch = this.#epoch + 1;
       // data_version does not move for this connection's own commits: drop the cached value so the
@@ -1105,7 +1128,7 @@ export class SqliteStateStore {
       this.#sql.metaSet.run(epoch, "epoch");
       tx.changes.length = 0;
       return epoch;
-    });
+    }, this.#lockTimeoutMs, true);
   }
 
   /** One-time import of a file-store snapshot into an empty database (lane L4 drives migration). */
@@ -1355,7 +1378,7 @@ export class SqliteStateStore {
   // Asynchronous, fair acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
-  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
+  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs, walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1370,6 +1393,7 @@ export class SqliteStateStore {
         this.#signal?.throwIfAborted();
         this.#assertOpen();
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
+        if (!walCapExempt) this.#refuseAboveWalCap();
         if (this.#checkpointPending()) this.#stats.checkpoints.writerYields += 1;
         else if (!ticket || ticket.mayContend()) {
           const now = performance.now();
@@ -1443,7 +1467,7 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); }
+      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); this.#checkWalCap(); }
     }
   }
 
@@ -1482,6 +1506,28 @@ export class SqliteStateStore {
       this.#stats.checkpoints.emergency += 1;
       this.checkpoint(this.#checkpointBytes);
     } catch { this.#stats.checkpoints.failed += 1; }
+  }
+
+  // The WAL hard cap's post-commit check: a commit that leaves the WAL above the cap arms the refusal.
+  #checkWalCap(): void {
+    if (this.#walHardCapBytes <= 0 || this.#walCapped) return;
+    try { if (this.walBytes() > this.#walHardCapBytes) this.#walCapped = true; } catch { /* stat failed: next commit */ }
+  }
+
+  // Before BEGIN, while armed: ONE non-blocking TRUNCATE (busy_timeout 0), then re-check by stat.
+  // Still above the cap: refuse. Back under it: disarm. No loop, no timer; the next write re-checks.
+  #refuseAboveWalCap(): void {
+    if (!this.#walCapped) return;
+    let size = this.walBytes();
+    if (size > this.#walHardCapBytes && !this.#db.isTransaction) {
+      try {
+        if (this.#tryTruncate()) { this.#stats.checkpoints.walResets += 1; this.#lastWalBytes = 0; }
+        else this.#stats.checkpoints.walResetBusy += 1;
+      } catch { this.#stats.checkpoints.failed += 1; }
+      size = this.walBytes();
+    }
+    if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes);
+    this.#walCapped = false;
   }
 
   // Reader starvation (see the module comment): after a COMMIT, throttled to 4/s, a WAL above

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { MeshStateWalCapError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#6477 security pass P1 (comment 6075855599): show the WAL bound under readers that never let go.
@@ -132,6 +132,64 @@ describe("SQLite WAL bound under pinned and constant readers (smarty-dev#6477 P1
     expect(finalWal).toBeLessThan(8 * MiB); // released: the WAL is truncated
     for (const [key, value] of last) expect((store.get(key)?.value as { n: number }).n).toBe(value); // no lost write
     expect(Math.max(...all, ...after)).toBeLessThan(2_000); // no indefinite writer stall
+  }, 240_000);
+
+  it("Case C: the WAL hard cap refuses writes while pinned, keeps reads, and recovers on the next write after release", async () => {
+    // Production-size: cap 80 MiB over the 64 MiB emergency path (WALPIN_FULL=1). Default: cap 16 MiB, below the
+    // default 64 MiB emergency threshold, so the refusal is reached without paying the per-commit TRUNCATE budget.
+    const cap = (FULL ? 80 : 16) * MiB;
+    const root = tempRoot("cap");
+    const store = await openStore(root, { walHardCapBytes: cap, ...(FULL ? { emergencyCheckpointBytes: EMERGENCY } : {}) });
+    const last = new Map<string, number>();
+    let n = 0;
+    const put = async (): Promise<unknown> => {
+      const key = `k${n % KEYS}`;
+      try { await store.put({ key, value: { n, pad }, identity }); last.set(key, n); return undefined; }
+      catch (error) { return error; }
+      finally { n += 1; }
+    };
+    for (let i = 0; i < KEYS; i += 1) expect(await put()).toBeUndefined();
+    const reader = raw(root);
+    reader.exec("BEGIN");
+    reader.prepare("SELECT count(*) AS n FROM kv").get();
+
+    const began = performance.now();
+    let refusal: unknown;
+    let commitsWhilePinned = 0;
+    let maxMs = 0;
+    while (performance.now() - began < 150_000) {
+      const started = performance.now();
+      refusal = await put();
+      maxMs = Math.max(maxMs, performance.now() - started);
+      if (refusal !== undefined) break;
+      commitsWhilePinned += 1;
+    }
+    const walAtRefusal = walBytes(root);
+    expect(refusal).toBeInstanceOf(MeshStateWalCapError);
+    expect((refusal as MeshStateWalCapError).code).toBe("FABRIC_MESH_STATE_WAL_CAP");
+    expect((refusal as Error).message).toContain(String(cap));
+    expect((refusal as Error).message).toContain("a reader is pinning the WAL; restart it or roll back");
+    const refusedAgain = await put(); // still pinned: still refused, the WAL does not grow
+    expect(refusedAgain).toBeInstanceOf(MeshStateWalCapError);
+    expect(walBytes(root)).toBe(walAtRefusal);
+    for (const [key, value] of last) expect((store.get(key)?.value as { n: number }).n).toBe(value); // reads keep working
+
+    reader.exec("COMMIT");
+    const released = performance.now();
+    const recovered = await put(); // the first write after release truncates and commits
+    const recoveryMs = performance.now() - released;
+    expect(recovered).toBeUndefined();
+    const walAfter = walBytes(root);
+    const stats = store.stats();
+    const metrics = { case: "C-wal-hard-cap", capMiB: mib(cap), commitsWhilePinned, walAtRefusalMiB: mib(walAtRefusal),
+      maxCommitMs: ms(maxMs), refusal: (refusal as Error).message, recoveryMs: ms(recoveryMs), walAfterRecoveryMiB: mib(walAfter),
+      checkpoints: stats.checkpoints };
+    console.log(`WALPIN ${JSON.stringify(metrics)}`);
+    progress(`WALPIN ${JSON.stringify(metrics)}`);
+    expect(walAtRefusal).toBeGreaterThan(cap);
+    expect(walAfter).toBeLessThan(8 * MiB);
+    for (const [key, value] of last) expect((store.get(key)?.value as { n: number }).n).toBe(value); // no lost write
+    expect(maxMs).toBeLessThan(2_000);
   }, 240_000);
 
   it("Case B: four processes of constant short readers keep the WAL under the emergency threshold", async () => {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
@@ -68,6 +68,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 const pad = "x".repeat(6_000);
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const database of databases.splice(0)) try { database.close(); } catch { /* closed */ }
   for (const store of stores.splice(0)) try { store.closeState(); } catch { /* closed */ }
   for (const store of sqlite.splice(0)) try { store.close(); } catch { /* closed */ }
@@ -156,4 +157,94 @@ describe("WAL stays bounded without a maintainer (defect 1)", () => {
     expect(max).toBeLessThan(6 * 1024 * 1024);
     expect(store.stats().checkpoints.emergency).toBe(0);
   });
+});
+
+describe("synchronous busy retries stay inside their wall-clock budget (PR #691 review P2)", () => {
+  const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+  const timed = (operation: () => unknown): { error: unknown; ms: number } => {
+    const started = performance.now();
+    const error = failure(operation);
+    return { error, ms: performance.now() - started };
+  };
+
+  it("a persistently busy read on an open store blocks for <= ~15 ms, busy-handler waits included", async () => {
+    const root = tempRoot("p2-read");
+    const store = open(root, { busyTimeoutMs: 5 } as MeshStoreOptions); // the maximum handler wait per attempt
+    await store.put({ key: "a", value: 1, identity });
+    expect(store.get("a")?.value).toBe(1); // opened
+    let attempts = 0;
+    vi.spyOn(SqliteStateStore.prototype, "listAll").mockImplementation(() => {
+      attempts += 1;
+      sleepSync(5); // what SQLite's busy handler spends before it gives up
+      throw Object.assign(new Error("database is locked"), { errcode: 5 });
+    });
+    const { error, ms } = timed(() => store.listAll(""));
+    expectRetryableBusy(error);
+    expect(attempts).toBeGreaterThan(1); // it does retry
+    // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms (+ timer slack).
+    expect(ms).toBeLessThan(15 + 10);
+  });
+
+  it("a busy first open under an exclusive hold blocks for <= ~40 ms, busy-handler waits included", async () => {
+    const root = tempRoot("p2-open");
+    const seed = open(root);
+    await seed.put({ key: "a", value: 1, identity });
+    seed.closeState();
+    const holder = holdExclusive(root);
+    const fresh = open(root, { busyTimeoutMs: 5, lockTimeoutMs: 150 } as MeshStoreOptions);
+    const { error, ms } = timed(() => fresh.get("a"));
+    expectRetryableBusy(error);
+    expect(ms).toBeLessThan(40 + 15);
+    release(holder);
+    expect(fresh.get("a")?.value).toBe(1);
+  });
+});
+
+describe("WAL stays bounded with constant concurrent readers (full-load soak defect)", () => {
+  // Readers that always overlap: a new read transaction starts every 2 ms and each one ends ~6 ms later, so
+  // some reader always holds a WAL read mark and a PASSIVE checkpoint can never let the WAL restart.
+  const overlappingReaders = (root: string): () => void => {
+    const connections = [raw(root), raw(root), raw(root), raw(root)];
+    let next = 0;
+    const timer = setInterval(() => {
+      const reader = connections[next % connections.length]!;
+      const old = connections[(next + connections.length - 3) % connections.length]!;
+      try { old.exec("COMMIT"); } catch { /* none open */ }
+      try { reader.exec("COMMIT"); } catch { /* none open */ }
+      reader.exec("BEGIN");
+      reader.prepare("SELECT count(*) AS n FROM kv").get();
+      next += 1;
+    }, 2);
+    return () => {
+      clearInterval(timer);
+      for (const connection of connections) try { connection.exec("COMMIT"); } catch { /* none open */ }
+    };
+  };
+  const run = async (walResetBytes: number): Promise<{ max: number; stats: ReturnType<SqliteStateStore["stats"]> }> => {
+    const root = tempRoot(`readers-${walResetBytes}`);
+    const store = await openStore(root, { walResetBytes });
+    const stop = overlappingReaders(root);
+    let max = 0;
+    try {
+      for (let n = 0; n < 700; n += 1) { // ~8 MiB of commits, below the 64 MiB emergency threshold
+        await store.put({ key: `k${n % 50}`, value: { n, pad }, identity });
+        max = Math.max(max, walBytes(root));
+        if (n % 25 === 0) await sleep(1); // let the readers' timer and an in-flight reset run
+      }
+      await sleep(50);
+    } finally { stop(); }
+    return { max, stats: store.stats() };
+  };
+
+  it("the client-side TRUNCATE resets the WAL that overlapping readers keep PASSIVE checkpoints from restarting", async () => {
+    const control = await run(0); // the reset off: starvation reproduces
+    console.info(`WAL with readers: control max ${control.max}`);
+    expect(control.max).toBeGreaterThan(6 * 1024 * 1024);
+    const fixed = await run(1024 * 1024);
+    expect(fixed.stats.checkpoints.walResets).toBeGreaterThan(0);
+    expect(fixed.stats.checkpoints.emergency).toBe(0);
+    console.info(`WAL with readers: reset max ${fixed.max}, resets ${fixed.stats.checkpoints.walResets}`);
+    // The 1 MiB threshold plus what this tight loop commits in one 250 ms check window and one reset.
+    expect(fixed.max).toBeLessThan(5 * 1024 * 1024);
+  }, 60_000);
 });

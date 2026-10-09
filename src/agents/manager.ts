@@ -2966,9 +2966,9 @@ export class AgentManager {
 
   // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
   // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
-  async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
+  async #noteUnconfirmedExit(managed: ManagedAgent, observedAlive?: boolean): Promise<void> {
     const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
-    const alive = lost === undefined && await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true);
+    const alive = lost === undefined && (observedAlive ?? await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true));
     if (lost === undefined && !alive) {
       managed.executionExited = true;
       this.#retentionRevision++;
@@ -3328,6 +3328,7 @@ export class AgentManager {
     let watchedTransport: AgentTransportHandle | undefined;
     let nativeClosePending = false;
     let recordPending = false;
+    let nestedPending = false;
     let deadlineRead = false;
     let watchFailure: string | undefined;
     let wake: (() => void) | undefined;
@@ -3364,8 +3365,11 @@ export class AgentManager {
             // Status/lifecycle publication is a separate event source, never a
             // liveness probe. Watch the directory to survive atomic file renames.
             try {
-              records = fs.watch(managed.runDirectory, { persistent: false }, (_event, file) => {
-                if (file !== null && file !== path.basename(managed.statusFile) && file !== path.basename(managed.lifecycleFile)) return;
+              records = fs.watch(managed.runDirectory, { persistent: false, recursive: managed.recursive }, (_event, file) => {
+                const name = file?.toString();
+                const nested = managed.recursive && (name === "nested" || name?.startsWith(`nested${path.sep}`));
+                if (name !== undefined && name !== path.basename(managed.statusFile) && name !== path.basename(managed.lifecycleFile) && !nested) return;
+                if (nested) nestedPending = true;
                 recordPending = true;
                 wake?.();
               });
@@ -3391,9 +3395,10 @@ export class AgentManager {
             this.#invalidateUiList();
           }
         }
-        if (managed.recursive) this.#nestedAgents(managed);
+        if (managed.recursive) this.#nestedAgents(managed, nestedPending);
+        nestedPending = false;
         if (record?.runnerSessionId) managed.runnerSessionId = record.runnerSessionId;
-        if (record && terminalStatuses.has(record.status)) {
+        if (record && terminalStatuses.has(record.status) && (!eventDriven || watchFailure === undefined)) {
           if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
           if (await this.#resumeStopped(managed, record, deadline)) continue;
           if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
@@ -3462,7 +3467,7 @@ export class AgentManager {
                 managed.lastRetriedTransportFailure = failed;
                 continue;
               }
-              await this.#noteUnconfirmedExit(managed);
+              await this.#noteUnconfirmedExit(managed, eventDriven && !managed.relaunchFailure && !managed.lostContact ? false : undefined);
               const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
               writeRecord(managed.statusFile, settled);
               this.#settle(managed, settled);

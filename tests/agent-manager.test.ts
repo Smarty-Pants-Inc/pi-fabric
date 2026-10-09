@@ -1289,6 +1289,9 @@ describe("AgentManager", () => {
       let stopped = false;
       return {
         ...handle,
+        // This intentionally models a legacy query-only adapter, not the
+        // native captured-close contract exercised in process-liveness-events.
+        liveness: "poll",
         // The first worker is alive, but its liveness check is "dropped" until it is stopped.
         isAlive: async () => (stopped ? handle.isAlive() : false),
         stop: async () => { events.push("stop:1"); stopped = true; await handle.stop(); },
@@ -1325,7 +1328,7 @@ describe("AgentManager", () => {
       launches++;
       handles.push(handle);
       // The worker looks lost at once, as a Herdr pane whose server stayed unreachable.
-      return { ...handle, relaunchable: false, isAlive: async () => false };
+      return { ...handle, liveness: "poll", relaunchable: false, isAlive: async () => false };
     });
     try {
       const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -1357,7 +1360,7 @@ describe("AgentManager", () => {
       launches++;
       handles.push(handle);
       // As a Herdr handle past its bound: the worker keeps running, contact is lost.
-      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+      return { ...handle, liveness: "poll", relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
     });
     try {
       const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -1397,7 +1400,7 @@ describe("AgentManager", () => {
       launches++;
       handles.push(handle);
       // As a Herdr handle past its bound: the worker keeps running, contact is lost.
-      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+      return { ...handle, liveness: "poll", relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
     });
     try {
       const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -1576,6 +1579,9 @@ describe("AgentManager", () => {
       let stopRequested = false;
       return {
         ...handle,
+        // A legacy query-only adapter can misjudge liveness independently of
+        // the native event contract; preserve its no-overlap regression.
+        liveness: "poll",
         // Misjudged as dead until a stop is requested; the stop is then lost, so it stays alive.
         isAlive: async () => (stopRequested ? handle.isAlive() : false),
         stop: async () => { stopRequested = true; },

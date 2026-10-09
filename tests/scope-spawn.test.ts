@@ -68,6 +68,35 @@ describe.skipIf(process.platform !== "linux")("spawn-result scope authority", ()
     expect(f.launch).toHaveBeenCalledOnce(); expect(f.gate.end).toHaveBeenCalledExactlyOnceWith(); expect(f.child.kill).not.toHaveBeenCalled();
     expect(f.receipt.dispose).toHaveBeenCalledOnce();
   });
+  it("a marker written before the first membership check cannot downgrade a migrated launcher", async () => {
+    const f = setup(); vi.useFakeTimers(); vi.spyOn(cgroup, "processScopePath").mockReturnValue("/sys/fs/cgroup/foreign.scope");
+    const pending = spawnScopedExecution(f.launch, "target", [], { stdio: "ignore" });
+    const outcome = pending.then(() => undefined, error => error);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await outcome).toMatchObject({ message: expect.stringContaining("refusing execution replay") });
+    expect(f.pin).not.toHaveBeenCalled(); expect(f.launch).toHaveBeenCalledOnce(); expect(f.child.kill).not.toHaveBeenCalled();
+  });
+  it("failed pinned admission retains grace then uses atomic scope KILL, never launcher.kill", async () => {
+    const f = setup(true); vi.useFakeTimers(); f.gate.end.mockImplementation(() => {});
+    vi.mocked(f.receipt.signal).mockImplementation(async () => { f.child.emit("close", 125); });
+    const outcome = spawnScopedExecution(f.launch, "target", [], { stdio: "ignore" }).then(() => undefined, error => error);
+    await vi.advanceTimersByTimeAsync(1_999); expect(f.receipt.signal).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); expect((await outcome).message).toContain("left its spawn scope");
+    expect(f.receipt.signal).toHaveBeenCalledExactlyOnceWith("SIGKILL"); expect(f.child.kill).not.toHaveBeenCalled();
+  });
+  it("an unconfirmed unpinned launcher vetoes replay and exposes existing manager cleanup debt", async () => {
+    const f = setup(); vi.useFakeTimers(); f.gate.end.mockImplementation(() => {});
+    vi.spyOn(cgroup, "processScopePath").mockReturnValue(undefined);
+    const outcome = spawnScopedExecution(f.launch, "target", [], { stdio: "ignore" }).then(() => undefined, error => error);
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(await outcome).toMatchObject({ launchOutcome: "unknown", cleanupPending: true, sessionId: "123" });
+    expect(f.launch).toHaveBeenCalledOnce(); expect(f.child.kill).not.toHaveBeenCalled(); f.child.emit("close", 125);
+  });
+  it("an unreadable initial launcher birth closes its gate and never leaks or replays target", async () => {
+    const f = setup(); vi.spyOn(cgroup, "executionIdentity").mockImplementation(() => { throw new Error("birth unreadable"); });
+    await expect(spawnScopedExecution(f.launch, "target", [], { stdio: "ignore" })).rejects.toThrow("birth unreadable");
+    expect(f.gate.end).toHaveBeenCalledExactlyOnceWith(); expect(f.launch).toHaveBeenCalledOnce(); expect(f.child.kill).not.toHaveBeenCalled();
+  });
   it("a late migration before gate release is rejected rather than replayed", async () => {
     const f = setup(); const child = await spawnScopedExecution(f.launch, "target", [], { stdio: "ignore" });
     f.receipt.verify = () => { throw new Error("late migration"); };

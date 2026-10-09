@@ -17,7 +17,7 @@ export const scopeDirectory = (root: string, slice: string, unit: string): strin
   if (!root.startsWith("/") || root === "/" || path.posix.normalize(root) !== root || root.split("/").includes("..") ||
     !/^fabric-(?:execution|worker)-[0-9a-f-]+[.]scope$/.test(unit)) throw new Error("Invalid Fabric scope placement");
   if (slice === "-.slice") return path.join(ROOT, root, unit);
-  if (!/^[A-Za-z0-9_:]+(?:-[A-Za-z0-9_:]+)*[.]slice$/.test(slice)) throw new Error(`Unsupported execution slice ${slice}`);
+  if (!/^[A-Za-z0-9_.:]+(?:-[A-Za-z0-9_.:]+)*[.]slice$/.test(slice)) throw new Error(`Unsupported execution slice ${slice}`);
   const parts = slice.slice(0, -6).split("-");
   return path.join(ROOT, root, ...parts.map((_, index) => `${parts.slice(0, index + 1).join("-")}.slice`), unit);
 };

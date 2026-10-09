@@ -9,7 +9,8 @@ afterEach(() => vi.restoreAllMocks());
 describe.skipIf(process.platform !== "linux")("spawn-pinned cgroup custody", () => {
   const directory = "/sys/fs/cgroup/user.slice/app.slice/fabric-execution-a.scope", pinned = "/proc/self/fd/42";
   const setup = () => {
-    let populated = true, pids = [100, 101], location = directory, started = "1000";
+    let populated = true, pids = [100, 101];
+    const locations = new Map<number, string>(), births = new Map([[100, "1000"], [101, "1001"]]);
     const uid = process.getuid!();
     const stat = vi.spyOn(fs, "lstatSync").mockReturnValue({ dev: 1, ino: 2, uid, isDirectory: () => true } as fs.Stats);
     const open = vi.spyOn(fs, "openSync").mockReturnValue(42);
@@ -19,8 +20,9 @@ describe.skipIf(process.platform !== "linux")("spawn-pinned cgroup custody", () 
     const read = vi.spyOn(fs, "readFileSync").mockImplementation(file => {
       if (String(file) === `${pinned}/cgroup.events`) return `populated ${populated ? 1 : 0}\n`;
       if (String(file) === `${pinned}/cgroup.procs`) return pids.join("\n");
-      if (String(file).endsWith("/cgroup")) return `0::${location.slice("/sys/fs/cgroup".length)}\n`;
-      const fields = Array<string>(20).fill("0"); fields[0] = "S"; fields[2] = "100"; fields[3] = "100"; fields[19] = started;
+      const pid = Number(String(file).split("/")[2]);
+      if (String(file).endsWith("/cgroup")) return `0::${(locations.get(pid) ?? directory).slice("/sys/fs/cgroup".length)}\n`;
+      const fields = Array<string>(20).fill("0"); fields[0] = "S"; fields[2] = "100"; fields[3] = "100"; fields[19] = births.get(pid)!;
       return `100 (fixture) ${fields.join(" ")}`;
     });
     const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
@@ -34,7 +36,8 @@ describe.skipIf(process.platform !== "linux")("spawn-pinned cgroup custody", () 
       empty: () => { populated = false; pids = []; },
       orphan: () => { pids = [101]; },
       directEmpty: () => { pids = []; },
-      migrate: (reuse = false) => { pids = [100]; location = "/sys/fs/cgroup/sibling.scope"; if (reuse) started = "9999"; },
+      migrate: (reuse = false) => { pids = [100]; locations.set(101, "/sys/fs/cgroup/sibling.scope"); if (reuse) births.set(101, "9999"); },
+      migrateLauncher: (reuse = false) => { locations.set(100, "/sys/fs/cgroup/sibling.scope"); if (reuse) births.set(100, "9999"); },
     };
   };
   it("pins exact inode and current UID; verifies launcher membership and birth", () => {
@@ -44,7 +47,7 @@ describe.skipIf(process.platform !== "linux")("spawn-pinned cgroup custody", () 
     expect(f.receipt.pin).toEqual({ dev: 1, ino: 2, uid: process.getuid!() }); f.receipt.dispose();
   });
   it.each([false, true])("rejects migrated/reused launcher ownership (PID reuse=%s)", reuse => {
-    const f = setup(); f.migrate(reuse);
+    const f = setup(); f.migrateLauncher(reuse);
     expect(() => f.receipt.verify(f.identity)).toThrow("left its spawn scope");
     expect(f.kill).not.toHaveBeenCalled(); f.receipt.dispose();
   });

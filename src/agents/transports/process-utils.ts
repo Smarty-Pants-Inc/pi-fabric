@@ -272,7 +272,7 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-  scope?: { executable: string; slice: string; warn: (reason: string) => void },
+  scope?: { executable: string; slice: string; warn: (reason: string) => void; legacy?: boolean },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
@@ -291,7 +291,7 @@ export const spawnDetached = async (
   };
   const child = scope ? await spawnScopedExecution((binary, args, opts) => spawn(binary, [...args], opts),
     runtime, [workerPath, ...workerArguments], options, true,
-    { ...scope, prefix: "worker", authorize: () => assertTransportLaunchAllowed(authority) })
+    { ...scope, prefix: "worker", authorize: () => assertTransportLaunchAllowed(authority), ...(authority?.signal ? { signal: authority.signal } : {}) })
     : spawn(runtime, [workerPath, ...workerArguments], options);
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
@@ -316,8 +316,13 @@ export const spawnDetached = async (
   let executionBoundaryConfirmed = false;
   const scopes = new Map<string, CgroupCustody>();
   if (primaryScope) scopes.set(primaryScope.directory, primaryScope);
-  const scopesAlive = (): boolean => [...scopes.values()].some(scope => !scope.exited()) ||
-    (executionPending && !executionBoundaryConfirmed);
+  const scopesAlive = (): boolean => {
+    // Observe every pin, even while the worker's primary scope is still live,
+    // so completed provider attempts close their retained directory descriptors.
+    let alive = false;
+    for (const scope of scopes.values()) if (!scope.exited()) alive = true;
+    return alive || (executionPending && !executionBoundaryConfirmed);
+  };
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
   // native unref above is still valid; optional channel APIs are not custody.
@@ -329,7 +334,7 @@ export const spawnDetached = async (
       // The real worker cannot spawn execution until we acknowledge custody.
       executionPending = true;
       executionBoundaryConfirmed = false;
-      if (child.connected) child.send({ type: "fabric-execution-custody-ack", cgroupCustody: primaryScope !== undefined }, () => undefined);
+      if (child.connected) child.send({ type: "fabric-execution-custody-ack", ...(primaryScope ? { cgroupCustody: true } : {}) }, () => undefined);
     } else if (message.type === "fabric-execution-started" && "pid" in message &&
       Number.isSafeInteger(message.pid) && Number(message.pid) > 0 && "started" in message && typeof message.started === "string") {
       // This private native channel belongs to our worker. Retain its reported
@@ -338,6 +343,7 @@ export const spawnDetached = async (
       if (process.platform === "linux") {
         owned.set(Number(message.pid), message.started);
         groups.add(Number(message.pid));
+        executionBoundaryConfirmed = false;
         // The private channel transfers the scope pin carried by the worker's
         // spawn result, not an admission marker. Pin the very same inode/owner
         // and verify the still-gated launcher before granting the release ACK.

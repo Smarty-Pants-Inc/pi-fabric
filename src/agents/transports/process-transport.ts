@@ -148,7 +148,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         workerArguments,
       ),
-      executable ? { executable, slice: this.processSlice ?? "app.slice", warn: this.#warnScope } : undefined,
+      executable ? { executable, slice: this.processSlice ?? "app.slice", warn: this.#warnScope, legacy: this.processSlice !== undefined } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );

@@ -446,6 +446,36 @@ describe("addressed-shadow age horizon (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
+  it.each(["answer", "blocker", "handoff", "completion"])("does not re-deliver an already delivered late addressed %s after a cursor rewind, once per root", async (kind) => {
+    const h = setup();
+    const box = () => new RootInbox(h.mesh, me, () => [me.id, "shared-inbox"], { now: Date.now, steerGraceMs: 0 });
+    const inbox = box(); inbox.start();
+    const event = await h.mesh.publish({ topic: "fleet.work.tasks", kind, from: peer, to: "shared-inbox", text: "late result" });
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(e => e.id)).toEqual([event.id]);
+    h.entries.push({ type: "custom_message", timestamp: new Date(Date.now()).toISOString(), ...rootInboxMessage(batch.events) });
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const rewind = async (clearReceipts = false) => {
+      const saved = h.mesh.get(inbox.key, { fresh: true })!.value as { after: number };
+      await h.mesh.put({ key: inbox.key, identity: me, value: { ...saved, after: 0,
+        ...(clearReceipts ? { delivered: [], deliveredAt: [] } : {}) } });
+    };
+    await rewind();
+    // A restart with the original canonical receipt absent still has the durable ledger.
+    expect((await box().next(rootInboxSession([]))).events).toEqual([]);
+    h.advance(3 * HOUR);
+    h.entries.push(...Array.from({ length: 600 }, () => ({ type: "message" })));
+    await rewind(true);
+    // Even without the bounded ledger, the old whole-history session receipt wins.
+    expect((await box().next(h.session())).events).toEqual([]);
+    // The same mesh event is not a receipt for a different root accepting that address.
+    const other = { ...me, id: "session:other-root" };
+    const otherInbox = new RootInbox(h.mesh, other, () => [other.id, "shared-inbox"], { now: Date.now, steerGraceMs: 0 });
+    await h.mesh.put({ key: otherInbox.key, identity: other, value: { after: 0 } });
+    expect((await otherInbox.next(rootInboxSession([]))).events.map(e => e.id)).toEqual([event.id]);
+  });
+
   it("skips a 20-hour backlog on the first drain in one summary, without idle wakes", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     for (let index = 0; index < 65; index++) await h.publish({ key: `old:${index}` });

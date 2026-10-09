@@ -433,6 +433,66 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
   }, 60_000);
 
+  // A passive followUp records context without inference. Its receipt prevents repeated idle
+  // injection and a second copy at before_agent_start (Pi's nextTurn queue has no receipt yet).
+  const occurrences = (value: unknown, needle: string) => JSON.stringify(value).split(needle).length - 1;
+  const threeHours = 3 * 60 * 60_000;
+
+  it("queues a late answer for an idle Main's next natural turn without a model turn, and brings it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    const id = missedWork("LATE-IDLE-553 answer for Main", undefined, threeHours, "answer");
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read the late answer");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await until(() => inboxMessages().length > 0 || faux.state.callCount > calls, 5_000);
+    expect(inboxMessages()).toHaveLength(1);
+    // Many idle ticks after passive admission: no inference and no second copy.
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("3 h ago) LATE-IDLE-553 answer for Main");
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    faux.setResponses([fauxAssistantMessage("again")]);
+    await session.prompt("again");
+    expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("does not chain an inference for a late answer that arrives during a run; the next turn takes it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    let id = "";
+    faux.setResponses([
+      () => { id = missedWork("LATE-SETTLE-553 answer for Main", undefined, threeHours, "answer"); return fauxAssistantMessage("working"); },
+      fauxAssistantMessage("unexpected chained turn"),
+    ]);
+    await session.prompt("work");
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read it");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 2);
+  }, 60_000);
+
   it("is inert on a Pi without the preflight capability: an idle Main takes the event at its next turn", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { optIn: false });
     faux.setResponses([fauxAssistantMessage("should not run"), fauxAssistantMessage("next turn")]);

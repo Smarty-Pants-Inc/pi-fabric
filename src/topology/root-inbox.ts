@@ -62,8 +62,13 @@ const wakeCooldownMs = (): number => {
   return process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() && Number.isFinite(value) && value >= 0 ? value : WAKE_COOLDOWN_MS;
 };
 
+export interface RootInboxEvent extends MeshEvent {
+  /** Shaped on drain only: old actionable work never requests a turn. */
+  deliveredLate?: true;
+}
+
 export interface RootInboxBatch {
-  events: MeshEvent[];
+  events: RootInboxEvent[];
   /** The sequence the cursor moves to once these events are in the session. */
   through: number;
   /** Expired addressed shadows skipped in this drain, never delivered as work. */
@@ -217,13 +222,15 @@ export class RootInbox {
     if (cooling && !urgent) return undefined;
     const batch = await this.next(session);
     if (!idle()) return undefined;
-    // A stale-only drain reports once but must not buy a model turn.
+    // Late actionable work is passive context for the next natural turn, never an idle wake.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
+    const waking = batch.events.filter((event) => !event.deliveredLate);
+    if (waking.length === 0) return batch;
     const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
     void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
-      data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
+      data: { count: waking.length, reason, ids: waking.map((event) => event.id) },
     }));
     return batch;
   }
@@ -251,7 +258,7 @@ export class RootInbox {
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
-    const events: MeshEvent[] = [];
+    const events: RootInboxEvent[] = [];
     let through = after;
     let bytes = 0;
     let skippedStale = 0;
@@ -342,11 +349,11 @@ export class RootInbox {
     return event.createdAt < this.#now() - this.#horizon() && !this.#neverExpire(event);
   }
 
-  #late(event: MeshEvent): MeshEvent {
+  #late(event: MeshEvent): RootInboxEvent {
     const age = this.#now() - event.createdAt;
     if (age <= this.#horizon() || !this.#neverExpire(event)) return event;
     const hours = Math.floor(age / LATE_DELIVERY_HOUR_MS);
-    return { ...event, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
+    return { ...event, deliveredLate: true, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
   }
 
   #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {

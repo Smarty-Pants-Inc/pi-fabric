@@ -286,7 +286,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -321,7 +321,7 @@ export const spawnDetached = async (
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
   child.once("exit", () => { exited = true; clearTimeout(force); });
-  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const closed = new Promise<void>((resolve) => child.once("close", () => { exited = true; clearTimeout(force); resolve(); }));
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
   const unconfirmed = (reason: string): void => {

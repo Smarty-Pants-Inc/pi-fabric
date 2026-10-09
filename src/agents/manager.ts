@@ -386,6 +386,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   background: boolean;
   completionNotified?: boolean;
   lastLivenessCheckAt: number;
+  monitorWake?: () => void;
   /** Sum of tokens.usage deltas drained from the worker so far. Settle closes
    *  the gap against the status file's cumulative snapshot so the ledger total
    *  is identical whether the stream arrived live or only at settle. */
@@ -2907,6 +2908,7 @@ export class AgentManager {
         const alive = await bounded(() => transport.isAlive());
         if (transport.lostContact?.() !== undefined) return false;
         if (!alive) return true;
+        if (transport.liveness === "events") return false; // stop already joined the native event deadline
         if (stopFailed) return false; // a fresh exact receipt may discharge this on retry
         await delay(Math.min(transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now()));
       }
@@ -3039,7 +3041,7 @@ export class AgentManager {
     if (remaining <= 0) throw new Error("Worker exit observation deadline expired");
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([transport.isAlive(), new Promise<never>((_, reject) => {
+      return await Promise.race([transport.isAlive({ deadline }), new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("Worker exit observation timed out")), remaining);
       })]);
     } finally { if (timer) clearTimeout(timer); }
@@ -3049,6 +3051,19 @@ export class AgentManager {
     // Never issue a potentially hung query that cannot supply exit proof.
     if (uncheckedExternalExit(managed.transport)) return;
     const deadline = Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
+    if (managed.transport.liveness === "events") {
+      const receipt = managed.transport.treeClosed ?? managed.transport.closed;
+      if (!receipt) return; // absence is not permission to poll or release custody
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([receipt, new Promise<void>(resolve => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+        })]);
+      } catch (error) {
+        this.#markLost(managed, error instanceof Error ? error.message : String(error));
+      } finally { clearTimeout(timer); }
+      return;
+    }
     const pollIntervalMs = managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
     try {
       while (Date.now() < deadline && await this.#transportAliveUntil(managed.transport, deadline)) {
@@ -3312,154 +3327,180 @@ export class AgentManager {
     let firstObservedDeadAt: number | undefined;
     let watchedTransport: AgentTransportHandle | undefined;
     let nativeClosePending = false;
+    let recordPending = false;
+    let deadlineRead = false;
+    let watchFailure: string | undefined;
     let wake: (() => void) | undefined;
-    while (!managed.settled) {
-      if (managed.transport !== watchedTransport) {
-        const transport = watchedTransport = managed.transport;
-        nativeClosePending = false;
-        void transport.closed?.then(() => {
-          if (managed.transport !== transport || managed.settled) return;
-          nativeClosePending = true;
-          wake?.();
-        }, () => { /* notification is not exit proof */ });
-      }
-      this.#drainLifecycle(managed);
-      const record = readRecord(managed.statusFile);
-      this.#checkFollowUps(managed, record);
-      if (record) {
-        this.#observeProgress(managed, record);
-        const previous = managed.latestRecord;
-        managed.latestRecord = record;
-        if (
-          !previous ||
-          previous.updatedAt !== record.updatedAt ||
-          previous.status !== record.status ||
-          previous.runnerSessionId !== record.runnerSessionId ||
-          previous.currentTool !== record.currentTool
-        ) {
-          managed.latestUiRecord = compactUiRecord(record);
-          this.#invalidateUiList();
+    let records: fs.FSWatcher | undefined;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const watchFailed = (error: unknown): void => {
+      watchFailure ??= error instanceof Error ? error.message : String(error);
+      // No retry timer or synthetic exit notification. Fail closed at the deadline.
+    };
+    managed.monitorWake = () => wake?.();
+    try {
+      while (!managed.settled) {
+        const eventDriven = managed.transport.liveness === "events";
+        if (managed.transport !== watchedTransport) {
+          const transport = watchedTransport = managed.transport;
+          nativeClosePending = false;
+          firstObservedDeadAt = undefined;
+          deadlineRead = false;
+          watchFailure = undefined;
+          records?.close(); records = undefined;
+          const notify = (): void => {
+            if (managed.transport !== transport || managed.settled) return;
+            nativeClosePending = true;
+            managed.lastLivenessCheckAt = 0;
+            wake?.();
+          };
+          const failed = (error: unknown): void => {
+            if (managed.transport === transport && !managed.settled) watchFailed(error);
+          };
+          void transport.closed?.then(notify, failed);
+          void transport.treeClosed?.then(notify, failed);
+          if (eventDriven) {
+            if (!transport.closed) watchFailed(new Error("Native process close notification unavailable"));
+            // Status/lifecycle publication is a separate event source, never a
+            // liveness probe. Watch the directory to survive atomic file renames.
+            try {
+              records = fs.watch(managed.runDirectory, { persistent: false }, (_event, file) => {
+                if (file !== null && file !== path.basename(managed.statusFile) && file !== path.basename(managed.lifecycleFile)) return;
+                recordPending = true;
+                wake?.();
+              });
+              records.on("error", failed);
+            } catch (error) { failed(error); }
+            if (!deadlineTimer) {
+              deadlineTimer = setTimeout(() => { recordPending = true; wake?.(); }, Math.max(0, deadline - Date.now()));
+              deadlineTimer.unref?.();
+            }
+          }
         }
-      }
-      if (managed.recursive) this.#nestedAgents(managed);
-      if (record?.runnerSessionId) {
-        managed.runnerSessionId = record.runnerSessionId;
-      }
-      if (record && terminalStatuses.has(record.status)) {
-        // A terminal file can race an explicit stop or its tree-helper outcome.
-        // Join the bounded stop before settlement can transfer native admission.
-        if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
-        if (await this.#resumeStopped(managed, record, deadline)) continue;
-        // A relaunch that failed is terminal: no fallback launch may run after it.
-        if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
-        // Terminal publication may precede a worker's final native-session flush.
-        // Give normal process exit a bounded observation window before stop():
-        // on Windows SIGTERM is destructive, not a cooperative flush request.
-        const nativeWindowsClose = managed.transport.kind === "process" && process.platform === "win32" &&
-          managed.transport.waitForClose && !managed.launchCancelled &&
-          !managed.transport.lostContact?.() && !managed.lostContact;
-        if (managed.transport.kind === "process" && !nativeWindowsClose) {
-          await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
+        recordPending = false;
+        this.#drainLifecycle(managed);
+        const record = readRecord(managed.statusFile);
+        this.#checkFollowUps(managed, record);
+        if (record) {
+          this.#observeProgress(managed, record);
+          const previous = managed.latestRecord;
+          managed.latestRecord = record;
+          if (!previous || previous.updatedAt !== record.updatedAt || previous.status !== record.status ||
+              previous.runnerSessionId !== record.runnerSessionId || previous.currentTool !== record.currentTool) {
+            managed.latestUiRecord = compactUiRecord(record);
+            this.#invalidateUiList();
+          }
         }
-        if (!nativeWindowsClose) await this.#drainExecution(managed);
-        this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
-        return;
-      }
-      if (Date.now() >= deadline) {
-        managed.stopRequested = true;
-        await this.#stopManagedTransport(managed);
-        await this.#waitForTransportExit(managed);
-        await this.#noteUnconfirmedExit(managed);
-        const completed = readRecord(managed.statusFile);
-        if (
-          completed &&
-          terminalStatuses.has(completed.status) &&
-          completed.status !== "stopped"
-        ) {
-          this.#settle(
-            managed,
-            this.#withTransportMetadata(completed, managed) as AgentRunResult,
-          );
+        if (managed.recursive) this.#nestedAgents(managed);
+        if (record?.runnerSessionId) managed.runnerSessionId = record.runnerSessionId;
+        if (record && terminalStatuses.has(record.status)) {
+          if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
+          if (await this.#resumeStopped(managed, record, deadline)) continue;
+          if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+          const nativeWindowsClose = managed.transport.kind === "process" && process.platform === "win32" &&
+            managed.transport.waitForClose && !managed.launchCancelled &&
+            !managed.transport.lostContact?.() && !managed.lostContact;
+          if (managed.transport.kind === "process" && !nativeWindowsClose) {
+            await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
+          }
+          if (!nativeWindowsClose) await this.#drainExecution(managed);
+          this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
           return;
         }
-        if (managed.lastRetriedTransportFailure) {
-          // The deadline fired mid-retry: the root cause is the dead transport
-          // we were recovering from, not runaway wall time. Report that failure.
-          this.#settle(
-            managed,
-            this.#withTransportMetadata(
-              managed.lastRetriedTransportFailure,
-              managed,
-            ) as AgentRunResult,
-          );
-          return;
-        }
-        const timedOut = failedRecord(
-          managed,
-          "timed_out",
-          `Agent timed out after ${timeoutMs}ms`,
-        );
-        writeRecord(managed.statusFile, timedOut);
-        this.#settle(managed, timedOut);
-        return;
-      }
-      const livenessPollIntervalMs =
-        managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
-      const livenessCheckedAt = Date.now();
-      if (livenessCheckedAt - managed.lastLivenessCheckAt >= livenessPollIntervalMs) {
-        managed.lastLivenessCheckAt = livenessCheckedAt;
-        const alive = await managed.transport.isAlive();
-        if (!alive) {
-          firstObservedDeadAt ??= livenessCheckedAt;
-          if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
-            // Worker exit can precede the tree-helper/native-close join. The
-            // explicit stop owns the no-result terminal status; joining it is
-            // still mandatory, but absence during teardown is not run failure.
-            if (managed.stopRequested && managed.transport.kind === "process") {
-              await this.#stopManagedTransport(managed);
-              return;
-            }
-            const lost = managed.transport.lostContact?.();
-            if (lost) {
-              // Not an exit: never relaunched, retried or cleaned up automatically.
-              this.#markLost(managed, lost);
-              const failed = failedRecord(
-                managed,
-                "failed",
-                `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`,
-              );
-              writeRecord(managed.statusFile, failed);
-              this.#settle(managed, failed);
-              return;
-            }
-            const logSummary = summarizeRunLog(managed.runDirectory, 8);
-            const failed = failedRecord(
-              managed,
-              "failed",
-              logSummary
-                ? `Agent transport exited without a result; last run log: ${logSummary}`
-                : "Agent transport exited without a result",
-            );
-            if (await this.#resumeStopped(managed, failed, deadline)) continue;
-            if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
-              managed.lastRetriedTransportFailure = failed;
-              continue;
-            }
-            await this.#noteUnconfirmedExit(managed);
-            const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
-            writeRecord(managed.statusFile, settled);
-            this.#settle(managed, settled);
+        const atDeadline = Date.now() >= deadline;
+        const livenessCheckedAt = Date.now();
+        const checkLiveness = eventDriven
+          ? nativeClosePending || (atDeadline && !deadlineRead)
+          : livenessCheckedAt - managed.lastLivenessCheckAt >=
+              (managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS);
+        if (checkLiveness) {
+          nativeClosePending = false;
+          managed.lastLivenessCheckAt = livenessCheckedAt;
+          if (eventDriven && atDeadline) deadlineRead = true;
+          let alive = true;
+          try {
+            alive = await this.#transportAliveUntil(managed.transport, eventDriven && atDeadline
+              ? Date.now() + TRANSPORT_EXIT_GRACE_MS : deadline);
+          } catch (error) {
+            if (!eventDriven) throw error;
+            watchFailed(error);
+          }
+          if (eventDriven && atDeadline && watchFailure !== undefined) {
+            const failed = failedRecord(managed, "failed", `Process liveness watcher failed: ${watchFailure}`);
+            failed.errorCode = "PROCESS_LIVENESS_WATCH_FAILED";
+            this.#markLost(managed, failed.error!);
+            // Unknown is logically unavailable, NEVER permission to retry,
+            // delete evidence or release native admission. Explicit stop owns recovery.
+            writeRecord(managed.statusFile, failed);
+            this.#settle(managed, failed);
             return;
           }
-        } else {
-          firstObservedDeadAt = undefined;
+          if (!alive) {
+            firstObservedDeadAt ??= livenessCheckedAt;
+            // Native close has already joined final publication. Legacy RPC
+            // absence still receives its original grace window.
+            if (eventDriven || livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
+              if (managed.stopRequested && managed.transport.kind === "process") {
+                await this.#stopManagedTransport(managed);
+                return;
+              }
+              const lost = managed.transport.lostContact?.();
+              if (lost) {
+                this.#markLost(managed, lost);
+                const failed = failedRecord(managed, "failed",
+                  `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`);
+                writeRecord(managed.statusFile, failed);
+                this.#settle(managed, failed);
+                return;
+              }
+              const logSummary = summarizeRunLog(managed.runDirectory, 8);
+              const failed = failedRecord(managed, "failed", logSummary
+                ? `Agent transport exited without a result; last run log: ${logSummary}`
+                : "Agent transport exited without a result");
+              if (await this.#resumeStopped(managed, failed, deadline)) continue;
+              if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
+                managed.lastRetriedTransportFailure = failed;
+                continue;
+              }
+              await this.#noteUnconfirmedExit(managed);
+              const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
+              writeRecord(managed.statusFile, settled);
+              this.#settle(managed, settled);
+              return;
+            }
+          } else firstObservedDeadAt = undefined;
         }
+        if (atDeadline) {
+          managed.stopRequested = true;
+          await this.#stopManagedTransport(managed);
+          await this.#waitForTransportExit(managed);
+          await this.#noteUnconfirmedExit(managed);
+          const completed = readRecord(managed.statusFile);
+          if (completed && terminalStatuses.has(completed.status) && completed.status !== "stopped") {
+            this.#settle(managed, this.#withTransportMetadata(completed, managed) as AgentRunResult);
+            return;
+          }
+          if (managed.lastRetriedTransportFailure) {
+            this.#settle(managed, this.#withTransportMetadata(managed.lastRetriedTransportFailure, managed) as AgentRunResult);
+            return;
+          }
+          const timedOut = failedRecord(managed, "timed_out", `Agent timed out after ${timeoutMs}ms`);
+          writeRecord(managed.statusFile, timedOut);
+          this.#settle(managed, timedOut);
+          return;
+        }
+        if (nativeClosePending || recordPending || managed.settled) continue;
+        await new Promise<void>(resolve => {
+          // Event-driven processes have no recurring wake. Legacy external
+          // adapters retain the status/query cadence they explicitly require.
+          const timer = eventDriven ? undefined : setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
+          wake = () => { clearTimeout(timer); wake = undefined; resolve(); };
+        });
       }
-      if (nativeClosePending) { nativeClosePending = false; continue; }
-      await new Promise<void>(resolve => {
-        const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
-        wake = () => { clearTimeout(timer); wake = undefined; nativeClosePending = false; resolve(); };
-      });
+    } finally {
+      records?.close();
+      clearTimeout(deadlineTimer);
+      delete managed.monitorWake;
     }
   }
 
@@ -3501,6 +3542,8 @@ export class AgentManager {
       };
     }
     if (!beginAgentSettlement(managed)) return;
+    managed.monitorWake?.();
+    delete managed.monitorWake;
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.

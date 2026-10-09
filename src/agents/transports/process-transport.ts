@@ -156,11 +156,13 @@ export class ProcessTransport implements AgentTransportAdapter {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
       sessionId: String(processHandle.pid),
+      liveness: "events",
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
+      ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
       stop: processHandle.stop,
     };
   }

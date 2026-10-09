@@ -199,8 +199,8 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
-  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
+  /** Machine-readable terminal cause; watcher failure is not exit/custody proof. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED";
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -398,6 +398,9 @@ export interface AgentTransportHandle {
   kind: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
+  /** Native process notifications, not a periodic liveness query. External adapters
+   * omit this field (or use poll) and retain their checked-query contract. */
+  liveness?: "events" | "poll";
   livenessPollIntervalMs?: number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
@@ -422,6 +425,9 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
+  /** Passive cgroup.events populated-0 receipt from the scope owner. This is
+   * a notification only; native close and custody still have to be joined. */
+  treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

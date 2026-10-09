@@ -101,8 +101,8 @@ it.skipIf(posix)("win32: an idle exit writes no exit line (no O_NOFOLLOW) and th
 });
 
 // #1882: after the host releases owner.json the root may belong to the next
-// generation: no exit line, no error.json, nothing late.
-it("a failure from close() after the release writes no line, no error.json, nothing late", { timeout: 60_000 }, async () => {
+// generation: no exit line after it. (error.json handling is main's, unchanged here.)
+it("a failure from close() after the release writes no exit line after the release", { timeout: 60_000 }, async () => {
   const h = harness("release");
   // The release is the last step of close(); this failure surfaces after it.
   vi.spyOn(AgentManager.prototype, "close").mockRejectedValue(new Error("injected teardown failure"));
@@ -116,22 +116,21 @@ it("a failure from close() after the release writes no line, no error.json, noth
     const expected = posix ? [expect.objectContaining({ event: "resident-exit", reason: "stopped" })] : [];
     expect(h.atRelease.lines).toEqual(expected);
     expect(exitLines(h.residencyRoot)).toEqual(expected);
-    expect(h.late()).toEqual([]);
-    expect(fs.existsSync(path.join(h.residencyRoot, "error.json"))).toBe(false);
+    // Only main's own error.json write may follow the release; never launcher.log.
+    expect(h.late().filter(file => path.basename(file) !== "error.json")).toEqual([]);
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
   }
 });
 
-// A host that never owned the root has no fence: no error.json, stderr only.
+// A host that never owned the root has no fence: it writes no exit line.
 // Another generation owns this root; the failing non-owner must not touch it.
 it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as const)("a pre-ownership failure (%s) leaves a live owner's files byte-identical", { timeout: 60_000 }, async failure => {
   const h = harness(`pre-owner-${failure}`);
   const previous = process.env.PI_FABRIC_RESIDENT_LAUNCHER;
   const files = {
     [h.ownerPath]: JSON.stringify({ format: 1, hostId: "resident:other", pid: process.pid, token: "other-generation", startedAt: Date.now() }),
-    [path.join(h.residencyRoot, "error.json")]: JSON.stringify({ error: "sentinel from the other generation" }),
     [path.join(h.residencyRoot, "launcher.log")]: `${JSON.stringify({ event: "launcher-started", pid: 4242 })}\n`,
   };
   for (const [file, bytes] of Object.entries(files)) fs.writeFileSync(file, bytes, { mode: 0o600 });
@@ -144,17 +143,10 @@ it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as
     holder = spawn("flock", ["-x", path.join(h.residencyRoot, "host-fence-establish.lock"), "sh", "-c", `touch '${ready}'; sleep 20`], { stdio: "ignore" });
     await waitFor(() => fs.existsSync(ready), 10_000);
   }
-  const stderr: string[] = [];
-  const write = process.stderr.write.bind(process.stderr);
-  vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
-    stderr.push(String(chunk));
-    return write(chunk, ...rest);
-  }) as typeof process.stderr.write);
   try {
     const run = runResidentHostFromConfigPath(h.configPath);
     if (failure === "launch-context") {
       await expect(run).rejects.toThrow("Resident launcher identity is uncertain");
-      expect(stderr.join("")).toContain("Fabric resident host failed before owning its root: Resident launcher identity is uncertain");
     } else {
       await expect(run).resolves.toBeUndefined(); // Already running: a silent return, as on main.
     }
@@ -173,7 +165,7 @@ it.each(["O_NOFOLLOW", "O_NONBLOCK"] as const)("skips the write without %s (fail
   try {
     const constants: Partial<typeof fs.constants> = { ...fs.constants };
     delete constants[flag];
-    reportResidentExit(root, "idle-exit", constants);
+    reportResidentExit(root, "idle-exit", undefined, constants);
     expect(fs.existsSync(path.join(root, "launcher.log"))).toBe(false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -214,6 +206,21 @@ describe.skipIf(!posix)("resident-exit line file safety (POSIX: FIFO, symlink, m
     }
   });
 
+  it("writes nothing and reports on stderr when owned() fails at the open", () => {
+    const root = dir();
+    const lines: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
+      lines.push(String(chunk));
+      return write(chunk, ...rest);
+    }) as typeof process.stderr.write);
+    try {
+      reportResidentExit(root, "idle-exit", () => false);
+      expect(fs.existsSync(path.join(root, "launcher.log"))).toBe(false);
+      expect(lines.join("")).toContain("Fabric resident host exit (idle-exit) without a proven root fence");
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("does not follow a symlinked launcher.log", () => {
     const root = dir();
     try {
@@ -242,7 +249,7 @@ describe.skipIf(!posix)("resident-exit line file safety (POSIX: FIFO, symlink, m
 });
 
 // host.lock replaced after this host locked its old inode: the old fd is no
-// fence. beforeRelease must not write the successor's launcher.log or error.json.
+// fence. beforeRelease must not write the successor's launcher.log.
 describe.skipIf(!posix)("resident exit without a proven fence", () => {
   const captureStderr = (): string[] => {
     const lines: string[] = [];
@@ -259,7 +266,6 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
     fs.writeFileSync(replacement, "", { mode: 0o600 });
     fs.renameSync(replacement, path.join(residencyRoot, "host.lock"));
     const files: Record<string, string> = {
-      [path.join(residencyRoot, "error.json")]: JSON.stringify({ error: "successor sentinel" }),
       [path.join(residencyRoot, "launcher.log")]: `${JSON.stringify({ event: "launcher-started", pid: 4343 })}\n`,
     };
     if (withOwner) files[ownerPath] = JSON.stringify({ format: 1, hostId: "resident:successor", pid: process.pid, token: "successor", startedAt: Date.now() });
@@ -284,47 +290,6 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
       expect(files).toBeDefined();
       for (const [file, bytes] of Object.entries(files!)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
       expect(stderr.join("")).toContain("Fabric resident host exit (error) without a proven root fence");
-      expect(stderr.join("")).toContain("Fabric resident host error: injected start failure without a proven root fence");
-    } finally {
-      vi.restoreAllMocks();
-      fs.rmSync(h.root, { recursive: true, force: true });
-    }
-  });
-
-  it.each(["replaced host.lock", "another owner.json"] as const)("revalidates before error.json: fence lost after the exit line (%s) leaves the successor's error.json byte-identical", { timeout: 60_000 }, async loss => {
-    const h = harness(`between-${loss === "replaced host.lock" ? "lock" : "owner"}`);
-    const stderr = captureStderr();
-    const errorPath = path.join(h.residencyRoot, "error.json");
-    const sentinel = JSON.stringify({ error: "successor sentinel" });
-    let lost = false;
-    const writeSync = fs.writeSync;
-    // The hook sits between the two writes: right after the exit line lands.
-    vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, data: string, ...rest: never[]) => {
-      const written = writeSync(fd, data, ...rest);
-      if (!lost && String(data).includes('"event":"resident-exit"')) {
-        lost = true;
-        if (loss === "replaced host.lock") {
-          const replacement = path.join(h.residencyRoot, "host.lock.next");
-          fs.writeFileSync(replacement, "", { mode: 0o600 });
-          fs.renameSync(replacement, path.join(h.residencyRoot, "host.lock"));
-        } else {
-          fs.writeFileSync(h.ownerPath, JSON.stringify({ format: 1, hostId: "resident:successor", pid: process.pid, token: "successor", startedAt: Date.now() }));
-        }
-        fs.writeFileSync(errorPath, sentinel, { mode: 0o600 });
-      }
-      return written;
-    }) as typeof fs.writeSync);
-    const mkdirSync = fs.mkdirSync;
-    vi.spyOn(fs, "mkdirSync").mockImplementation(((dir: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
-      if (String(dir) === path.join(h.residencyRoot, "requests")) throw new Error("injected start failure");
-      return mkdirSync(dir, options);
-    }) as typeof fs.mkdirSync);
-    try {
-      await expect(runResidentHostFromConfigPath(h.configPath)).rejects.toThrow("injected start failure");
-      expect(lost).toBe(true); // the exit line was written while the fence held
-      expect(exitLines(h.residencyRoot)).toEqual([expect.objectContaining({ reason: "error" })]);
-      expect(fs.readFileSync(errorPath, "utf8")).toBe(sentinel);
-      expect(stderr.join("")).toContain("Fabric resident host error: injected start failure without a proven root fence");
     } finally {
       vi.restoreAllMocks();
       fs.rmSync(h.root, { recursive: true, force: true });

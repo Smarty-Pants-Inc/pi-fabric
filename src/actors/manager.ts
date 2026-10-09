@@ -3860,9 +3860,11 @@ export class ActorManager {
     const event = payload as { topic?: unknown } | undefined;
     if (typeof event?.topic !== "string") return undefined;
     const key = meshScalarValue(event, actor.dedupeKey);
+    // Blank occurrence values are no key; keep resource coalescing's scalar rules unchanged.
+    if (key === undefined || (typeof key === "string" && key.trim().length === 0)) return undefined;
     // Occurrence identity is explicitly opted into, never inferred from a resource
     // coalesceKey. A new namespace also excludes legacy resource completion fences.
-    return key === undefined ? undefined : JSON.stringify(["mesh-dedupe", actor.dedupeKey, event.topic, key]);
+    return JSON.stringify(["mesh-dedupe", actor.dedupeKey, event.topic, key]);
   }
 
   #hasProcessedKey(actor: ManagedActor, source: string, payload: unknown): boolean {

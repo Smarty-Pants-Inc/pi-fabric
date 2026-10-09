@@ -80,13 +80,13 @@ describe("durable actor opt-in occurrence dedupeKey (smarty-dev#7710)", () => {
     expect(outputs(second.actors, actor.id)).toHaveLength(4);
   }, 30_000);
 
-  it("wakes once for a producer retry with a different event id, but runs a different key", async () => {
+  it.each(["work:7742", 0])("wakes once for a producer retry with a different event id, but runs a different key (%j)", async (key) => {
     const { mesh, actors } = setup();
     const actor = await create(actors);
-    const first = await alarm(mesh, "work:7742");
+    const first = await alarm(mesh, key);
     await settled(actors, actor.id, 1);
     // The producer died after publish and before recording 'told', then published again.
-    const retry = await alarm(mesh, "work:7742");
+    const retry = await alarm(mesh, key);
     expect(retry.id).not.toBe(first.id);
     await alarm(mesh, "work:7722");
     await settled(actors, actor.id, 2);
@@ -170,14 +170,36 @@ describe("durable actor opt-in occurrence dedupeKey (smarty-dev#7710)", () => {
     expect(outputs(actors, a.id)).toHaveLength(4);
   });
 
+  it.each([
+    { label: "empty-string", key: "" },
+    { label: "whitespace-only", key: " \t\r\n" },
+  ])("runs both $label events and records no occurrence key", async ({ key }) => {
+    const { root, mesh, actors } = setup();
+    const actor = await create(actors);
+    // Keep an intentional completion fence so the persisted queue remains observable.
+    await alarm(mesh, "real-occurrence");
+    await settled(actors, actor.id, 1);
+    const file = queueFile(root, actor.id);
+    const expectedKeys = [JSON.stringify(["mesh-dedupe", "data.key", topic, "real-occurrence"])];
+    await alarm(mesh, key);
+    await settled(actors, actor.id, 2);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).processedKeys).toEqual(expectedKeys);
+    await alarm(mesh, key);
+    await settled(actors, actor.id, 3);
+    expect(outputs(actors, actor.id)).toHaveLength(3);
+    expect(outputs(actors, actor.id).every((message) => !message.error)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).processedKeys).toEqual(expectedKeys);
+  });
+
   it("runs each event when the opted-in occurrence field is missing or non-scalar", async () => {
     const { mesh, actors } = setup();
     const actor = await create(actors);
-    for (const key of [undefined, undefined, { value: "same" }, { value: "same" }, ["same"], ["same"]]) {
+    const keys = [undefined, null, true, false, { value: "same" }, ["same"]].flatMap((key) => [key, key]);
+    for (const key of keys) {
       await mesh.publish({ topic, kind: "stuck.work", from, data: { key } });
     }
-    await settled(actors, actor.id, 6);
-    expect(outputs(actors, actor.id)).toHaveLength(6);
+    await settled(actors, actor.id, keys.length);
+    expect(outputs(actors, actor.id)).toHaveLength(keys.length);
   });
 
   it("does not interpret legacy resource completion fences as occurrence keys", async () => {

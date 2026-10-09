@@ -177,7 +177,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
       expect(sqlite.listAll("").map((entry) => entry.key)).toEqual(["a"]);
     }
     let err = "";
-    const code = await main(["import", "--root", touched], { stdout: () => {}, stderr: (text) => { err += text; } });
+    const code = await main(["import", "--root", touched, "--accept-unready", "factory,fabric@unknown"], { stdout: () => {}, stderr: (text) => { err += text; } });
     expect(code, err).toBe(0);
     const viaCli = open(touched, { stateBackend: "sqlite" });
     await viaCli.put({ key: "b", value: 1, identity });
@@ -400,7 +400,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     const viaCli = tempRoot("cli");
     await seedFileRoot(viaCli);
     let err = "";
-    const code = await main(["import", "--root", viaCli], { stdout: () => {}, stderr: (text) => { err += text; } });
+    const code = await main(["import", "--root", viaCli, "--accept-unready", "factory,fabric@unknown"], { stdout: () => {}, stderr: (text) => { err += text; } });
     expect(code, err).toBe(0);
     const after = open(viaCli, { stateBackend: "sqlite" });
     expect(after.listAll("").length).toBe(24);

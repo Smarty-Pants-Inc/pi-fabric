@@ -46,7 +46,7 @@ import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
-import { scriptSpawnArgs } from "./transports/process-utils.js";
+import { ProcessTreeCustodyUnconfirmedError, scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import { resolveAgentSpawner } from "./spawner.js";
@@ -3352,20 +3352,30 @@ export class AgentManager {
     let nestedPending = false;
     let deadlineRead = false;
     let watchFailure: string | undefined;
+    let custodyFailure: ProcessTreeCustodyUnconfirmedError | undefined;
     let wake: (() => void) | undefined;
     let records: fs.FSWatcher | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const watchFailed = (error: unknown): void => {
       watchFailure ??= error instanceof Error ? error.message : String(error);
-      // No retry timer or synthetic exit notification. Fail closed at the deadline.
+      if (error instanceof ProcessTreeCustodyUnconfirmedError) {
+        custodyFailure ??= error;
+        wake?.(); // the single post-close custody deadline, not a polling wake
+      }
+      // Other watcher failures remain fail-closed at the run deadline.
     };
     // A watcher failure is sticky for this exact attempt. Every asynchronous
     // retry stage rechecks it before admitting a replacement worker.
     const canRetry = (): boolean => watchFailure === undefined;
-    const settleWatchFailure = (): boolean => {
+    const settleWatchFailure = async (): Promise<boolean> => {
       if (managed.transport.liveness !== "events" || watchFailure === undefined) return false;
-      const failed = failedRecord(managed, "failed", `Process liveness watcher failed: ${watchFailure}`);
-      failed.errorCode = "PROCESS_LIVENESS_WATCH_FAILED";
+      if (custodyFailure) {
+        // Every settlement path joins the retained descendants, including a
+        // custody deadline that arrives during a liveness/status/exit join.
+        await this.#stopManagedTransport(managed).catch(() => undefined);
+      }
+      const failed = failedRecord(managed, "failed", custodyFailure?.message ?? `Process liveness watcher failed: ${watchFailure}`);
+      failed.errorCode = custodyFailure?.code ?? "PROCESS_LIVENESS_WATCH_FAILED";
       this.#markLost(managed, failed.error!);
       writeRecord(managed.statusFile, failed);
       this.#settle(managed, failed);
@@ -3381,6 +3391,7 @@ export class AgentManager {
           firstObservedDeadAt = undefined;
           deadlineRead = false;
           watchFailure = undefined;
+          custodyFailure = undefined;
           records?.close(); records = undefined;
           const notify = (): void => {
             if (managed.transport !== transport || managed.settled) return;
@@ -3414,6 +3425,7 @@ export class AgentManager {
             }
           }
         }
+        if (custodyFailure && await settleWatchFailure()) return;
         recordPending = false;
         this.#drainLifecycle(managed);
         const record = readRecord(managed.statusFile);
@@ -3433,20 +3445,20 @@ export class AgentManager {
         if (record?.runnerSessionId) managed.runnerSessionId = record.runnerSessionId;
         if (record && terminalStatuses.has(record.status) && (!eventDriven || watchFailure === undefined)) {
           if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           if (await this.#resumeStopped(managed, record, deadline, canRetry)) continue;
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline, canRetry)) continue;
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           const nativeWindowsClose = managed.transport.kind === "process" && process.platform === "win32" &&
             managed.transport.waitForClose && !managed.launchCancelled &&
             !managed.transport.lostContact?.() && !managed.lostContact;
           if (managed.transport.kind === "process" && !nativeWindowsClose) {
             await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
           }
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           if (!nativeWindowsClose) await this.#drainExecution(managed);
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
           return;
         }
@@ -3470,7 +3482,7 @@ export class AgentManager {
           }
           // A later close/tree wake and an absent process cannot erase an
           // earlier watcher failure, even before the deadline safety read.
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           if (!alive) {
             firstObservedDeadAt ??= livenessCheckedAt;
             // Native close has already joined final publication. Legacy RPC
@@ -3494,14 +3506,14 @@ export class AgentManager {
                 ? `Agent transport exited without a result; last run log: ${logSummary}`
                 : "Agent transport exited without a result");
               if (await this.#resumeStopped(managed, failed, deadline, canRetry)) continue;
-              if (settleWatchFailure()) return;
+              if (await settleWatchFailure()) return;
               if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline, canRetry)) {
                 managed.lastRetriedTransportFailure = failed;
                 continue;
               }
-              if (settleWatchFailure()) return;
+              if (await settleWatchFailure()) return;
               await this.#noteUnconfirmedExit(managed, eventDriven && !managed.relaunchFailure && !managed.lostContact ? false : undefined);
-              if (settleWatchFailure()) return;
+              if (await settleWatchFailure()) return;
               const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
               writeRecord(managed.statusFile, settled);
               this.#settle(managed, settled);
@@ -3510,14 +3522,14 @@ export class AgentManager {
           } else firstObservedDeadAt = undefined;
         }
         if (atDeadline) {
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           managed.stopRequested = true;
           await this.#stopManagedTransport(managed);
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           await this.#waitForTransportExit(managed);
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           await this.#noteUnconfirmedExit(managed);
-          if (settleWatchFailure()) return;
+          if (await settleWatchFailure()) return;
           const completed = readRecord(managed.statusFile);
           if (completed && terminalStatuses.has(completed.status) && completed.status !== "stopped") {
             this.#settle(managed, this.#withTransportMetadata(completed, managed) as AgentRunResult);

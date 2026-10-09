@@ -6,6 +6,15 @@ import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 
+/** A bounded tree observation ended without proof of descendant exit. */
+export class ProcessTreeCustodyUnconfirmedError extends Error {
+  readonly code = "PROCESS_TREE_CUSTODY_UNCONFIRMED" as const;
+  constructor(readonly descendants: number) {
+    super(`custody unconfirmed: ${descendants} descendants may remain`);
+    this.name = "ProcessTreeCustodyUnconfirmedError";
+  }
+}
+
 export interface ExecFileResult {
   stdout: string;
   stderr: string;
@@ -274,6 +283,7 @@ const linuxProcesses = (): LinuxGroupMember[] =>
   });
 const STOP_TERM_MS = 2_000;
 const STOP_KILL_MS = 2_000;
+const TREE_CENSUS_MIN_SPACING_MS = 60_000;
 const stopDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
 
 export const spawnDetached = async (
@@ -490,9 +500,9 @@ export const spawnDetached = async (
       throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
     }
   };
-  // The scope owner publishes one tree-empty receipt. Idle workers have no
-  // census timer: on unscoped POSIX only captured native close starts the
-  // existing birth-checked census. The manager's deadline remains the backstop.
+  // The scope owner publishes one passive tree-empty receipt. Unscoped POSIX
+  // takes one birth-checked census at native close and, only if necessary, one
+  // final deadline census. Neither path has a recurring liveness timer.
   const posix = process.platform !== "win32";
   let treeConfirmed = false;
   let treeFinished = false;
@@ -502,6 +512,8 @@ export const spawnDetached = async (
   let scopeWatcher: fs.FSWatcher | undefined;
   let scopeEvents: string | undefined;
   let observingTree = false;
+  let censusStarted = false;
+  let censusDeadlineReached = false;
   const scopeIsEmpty = (): boolean => {
     const populated = fs.readFileSync(scopeEvents!, "utf8").match(/^populated ([01])$/m)?.[1];
     if (populated === undefined) throw new Error("Owned scope populated receipt is unreadable");
@@ -521,21 +533,36 @@ export const spawnDetached = async (
     if (error !== undefined) rejectTree(error);
     else { treeConfirmed = true; resolveTree(); }
   };
-  const observeTree = async (): Promise<void> => {
+  const observeTree = async (atDeadline = false): Promise<void> => {
     if (!posix || treeFinished || observingTree || !nativeClosed || !treeObservationReady) return;
-    clearTimeout(censusTimer);
+    // Unscoped native close admits exactly one initial census. Scope changes
+    // may deliver populated-0, but cannot restart a pending deadline census.
+    if (!atDeadline && (censusTimer || (!scopeEvents && censusStarted))) return;
     observingTree = true;
     // cgroup.events is passive even after primary close. Never replace a live
     // owned scope's populated receipt with a primary-PID absence observation.
     try {
       if (scopeEvents && !scopeIsEmpty()) return;
-      const alive = process.platform === "linux"
-        ? members().length > 0 || (executionPending && groups.size === 1)
-        : executionPending || portableUncertain || (await portableMembers()).length > 0;
-      if (!alive) { finishTree(); return; }
-      // A populated-zero scope may still have separately retained execution
-      // obligations. Census only those obligations until their owned exit.
-      censusTimer = setTimeout(() => { void observeTree(); }, 50);
+      censusStarted = true;
+      const remaining = process.platform === "linux" ? members().length : (await portableMembers()).length;
+      const uncertain = process.platform === "linux"
+        ? executionPending && groups.size === 1 : executionPending || portableUncertain;
+      if (remaining === 0 && !uncertain) { finishTree(); return; }
+      if (atDeadline || censusDeadlineReached) {
+        // A pending execution receipt represents at least one possible child,
+        // even when the census cannot name it. Never turn uncertainty into exit.
+        const error = new ProcessTreeCustodyUnconfirmedError(Math.max(remaining, uncertain ? 1 : 0));
+        unconfirmed(error.message);
+        finishTree(error);
+        return;
+      }
+      // A populated-zero scope can retain separately grouped execution too.
+      // Give those obligations the same ONE final observation, never a loop.
+      censusTimer = setTimeout(() => {
+        censusTimer = undefined;
+        censusDeadlineReached = true;
+        void observeTree(true);
+      }, Math.max(TREE_CENSUS_MIN_SPACING_MS, termGraceMs + STOP_KILL_MS));
       censusTimer.unref?.();
     } catch (error) { finishTree(error); }
     finally { observingTree = false; }
@@ -656,6 +683,11 @@ export const spawnDetached = async (
     },
     async isAlive() {
       if (treeConfirmed) return false;
+      // The close/deadline census owns this observation. A manager close wake
+      // must not duplicate it, nor turn an early descendant exit into a probe
+      // loop. Pending custody is conservatively alive until its one receipt.
+      // Explicit stop still owns the existing birth-checked cleanup drain.
+      if (nativeClosed && censusStarted && !treeFinished && !stopping) return true;
       if (exited && scopeEvents && !scopeIsEmpty()) return true;
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.

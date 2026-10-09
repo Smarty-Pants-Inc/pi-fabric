@@ -199,8 +199,8 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
-  /** Machine-readable terminal cause; watcher failure is not exit/custody proof. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED";
+  /** Machine-readable terminal cause; watcher/custody failure is not exit proof. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -426,7 +426,8 @@ export interface AgentTransportHandle {
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
   /** Owned tree-empty notification: cgroup.events populated-0 for an admitted
-   * scope, otherwise the post-close birth-checked census reaching empty.
+   * scope, otherwise a birth-checked census at native close or the single
+   * post-close deadline (at least 60 seconds later) reaching empty.
    * Native close and execution custody must still be joined; failed observation
    * rejects instead of authorizing collection or a replacement worker. */
   treeClosed?: Promise<void>;

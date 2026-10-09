@@ -2311,7 +2311,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, this.options.rootId), { fresh: true });
       const root = entry && participantFromEntry(entry);
       // The marker also survives reloads whose shared quiesce write failed.
-      return previous.reloadUntil !== undefined || previous.expiresAt <= Date.now() ||
+      // ponytail: BASE's Main serializer had no marker. ONLY reload quiescence
+      // made host/session expiries equal with a bounded >15 s session span;
+      // ordinary session renewal always used the fixed 15 s TTL. Recognize that
+      // exact older wire contract, never an arbitrary long host lease.
+      const session = previous.session;
+      const legacyReload = this.options.identity.kind === "main" && this.options.hostId === this.options.rootId &&
+        session?.id === this.options.identity.sessionId && session !== undefined &&
+        session.expiresAt === previous.expiresAt &&
+        session.expiresAt - session.updatedAt > PARTICIPANT_LEASE_MS &&
+        session.expiresAt - session.updatedAt <= MAIN_RELOAD_LEASE_MS &&
+        previous.expiresAt - previous.updatedAt <= MAIN_RELOAD_LEASE_MS;
+      return previous.reloadUntil !== undefined || legacyReload || previous.expiresAt <= Date.now() ||
         root?.status === "reloading" && root.reloadUntil !== undefined;
     };
     if (!handoff()) return;

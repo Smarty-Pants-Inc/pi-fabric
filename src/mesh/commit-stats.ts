@@ -37,6 +37,9 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
     : key.startsWith("topology/hosts/") ? "host-lease"
     : key.startsWith("topology/participants/") ? "participant"
     : key.startsWith("topology/") ? "topology" : key.split("/")[0] || "state";
+  // Named maintenance exception: opt-in PI_FABRIC_COMMIT_STATS diagnostic sampler.
+  // Its unref'd minute boundary (including zero samples) is the public sink contract.
+  // Disabled by default, so normal file stores/bridges allocate no sampler timer.
   const timer = setInterval(() => {
     const at = Date.now();
     try {
@@ -71,7 +74,8 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 //
 // Every acquisition of a mesh root's `.lock` records who took it (the store entry point), how
 // long it waited and how long it held the lock. Wall-clock minutes are aggregated in memory and
-// written just after each minute (and at exit) to `<root>/lock-stats/<host>-<pid>.json`: one
+// written on the next acquisition after a minute boundary (and at exit/explicit flush) to
+// `<root>/lock-stats/<host>-<pid>.json`: one
 // small file per process, rewritten by an atomic rename, holding at most the last 60 complete
 // minutes plus the current one (the longest query window, see LOCK_STATS_RETAIN_MINUTES). No extra
 // lock, no fsync, and nothing at all before the first acquisition. `fabric-mesh-lock-stats`
@@ -212,7 +216,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const host = lockStatsHost();
   const startedAt = Date.now();
   const roots = new Map<string, RootLockStats>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let flushedMinute = Math.floor(startedAt / 60_000);
   let started = false;
   const warn = options.warn ?? warnPrivately;
 
@@ -275,7 +279,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
           write(entry, now);
           entry.dirty = false;
         }
-        // Hourly and read-only, also for a quiet root: never creates the directory.
+        // At most hourly, during actual diagnostic work: never creates the directory.
         if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
           entry.prunedAt = now;
           prune(path.join(entry.root, LOCK_STATS_DIR), now);
@@ -292,14 +296,14 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       }
     }
   };
-  // Just after each wall-clock minute (spread by pid), so a reader sees every process's last
-  // complete minute within a few seconds.
-  const schedule = (): void => {
-    timer = setTimeout(() => {
-      flush();
-      schedule();
-    }, 60_000 - Date.now() % 60_000 + 500 + process.pid % 2_000);
-    timer.unref?.();
+  // A minute boundary alone is not work: even one startup sample must not wake an
+  // otherwise empty bridge 60 s later. Flush on the next real record in a newer minute
+  // (and at exit/explicit flush). Quiet roots are pruned only during that actual work.
+  const flushIfDue = (): void => {
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute <= flushedMinute) return;
+    flushedMinute = minute;
+    flush();
   };
   const onExit = (): void => flush();
   // One bucket per real root, whatever the spelling (relative, trailing slash, symlink, case on
@@ -326,7 +330,6 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       roots.set(key, entry);
       if (!started) {
         started = true;
-        schedule();
         process.once("exit", onExit);
       }
     }
@@ -352,6 +355,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (holdMs > bucket.holdMaxMs) bucket.holdMaxMs = holdMs;
       bucket.waitHist[histogramIndex(waitMs)]!++;
       bucket.holdHist[histogramIndex(holdMs)]!++;
+      flushIfDue();
     },
     failed(root, lockClass, waitMs, tried) {
       const bucket = bucketOf(root, lockClass);
@@ -359,11 +363,10 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (tried) bucket.tries++;
       else bucket.timeouts++;
       bucket.failedWaitMs += waitMs;
+      flushIfDue();
     },
   };
   const dispose = (): void => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
     started = false;
     process.removeListener("exit", onExit);
   };

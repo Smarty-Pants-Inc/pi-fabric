@@ -424,7 +424,9 @@ const ENVELOPE_BYTES = 256;
 // A TRUNCATE checkpoint must win the writer lock against writers that retry every few ms; SQLite's
 // own busy handler would lose that race (the FULL unfairness of design §1.5). Writers therefore
 // yield while this flag is fresh. It is a separate inode, never one of the state.db* files.
-const CHECKPOINT_FLAG = "state-checkpoint.flag";
+// One flag file per active checkpoint request, so requests never share or clear each other's flag
+// (pi-fabric#691 review). Writers yield while any fresh one exists.
+const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 const CHECKPOINT_FLAG_STALE_MS = 1_000;
 const MAX_TRUNCATE_BUDGET_MS = 400;
 // The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, short attempts.
@@ -1116,9 +1118,7 @@ export class SqliteStateStore {
       // Writers yield to the flag, so the writer lock is free within one short hold; the busy budget
       // then only waits for readers that started before the checkpoint. It escalates after each
       // busy attempt, so readers that outlast it delay the reset but can never starve it.
-      const flag = path.join(this.root, CHECKPOINT_FLAG);
-      const flagToken = ownerToken();
-      try { fs.writeFileSync(flag, `${flagToken}\n`, { mode: 0o600 }); } catch { /* advisory */ }
+      const flag = raiseCheckpointFlag(this.root, ownerToken());
       this.#db.exec(`PRAGMA busy_timeout = ${this.#truncateBudgetMs}`);
       try {
         const truncate = this.#sql.checkpointTruncate.get() ?? {};
@@ -1128,7 +1128,7 @@ export class SqliteStateStore {
         if (!isBusy(error)) throw error;
       } finally {
         this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
-        removeOwnedFile(flag, flagToken);
+        lowerCheckpointFlag(flag);
       }
       if (truncated) {
         this.#lastWalBytes = 0;
@@ -1339,8 +1339,7 @@ export class SqliteStateStore {
 
   // One stat per attempt: a fresh flag means a TRUNCATE checkpoint wants the writer lock.
   #checkpointPending(): boolean {
-    const flag = fs.statSync(path.join(this.root, CHECKPOINT_FLAG), { throwIfNoEntry: false });
-    return flag !== undefined && Date.now() - flag.mtimeMs < CHECKPOINT_FLAG_STALE_MS;
+    return checkpointFlagRaised(this.root);
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {
@@ -1445,10 +1444,9 @@ export class SqliteStateStore {
   // Short TRUNCATE attempts between event-loop turns, for at most WAL_RESET_BUDGET_MS. A busy attempt
   // raises the checkpoint flag (writers yield), so no new frames arrive and the old readers drain.
   async #resetWal(): Promise<boolean> {
-    const flag = path.join(this.root, CHECKPOINT_FLAG);
     const deadline = performance.now() + WAL_RESET_BUDGET_MS;
     const flagToken = ownerToken();
-    let flagged = false;
+    let flag: string | undefined;
     try {
       await new Promise<void>((resolve) => setImmediate(resolve)); // after the writer's own continuation
       for (;;) {
@@ -1459,11 +1457,11 @@ export class SqliteStateStore {
           return true;
         }
         if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return false; }
-        try { fs.writeFileSync(flag, `${flagToken}\n`, { mode: 0o600 }); flagged = true; } catch { /* advisory */ }
+        flag = raiseCheckpointFlag(this.root, flagToken); // refreshes this request's own flag
         await delay(WAL_RESET_RETRY_MS);
       }
     } finally {
-      if (flagged) removeOwnedFile(flag, flagToken);
+      if (flag) lowerCheckpointFlag(flag);
       if (!this.#closed) this.walBytes();
     }
   }
@@ -1520,6 +1518,35 @@ export const ownerToken = (): string => `${process.pid}.${randomUUID()}`;
 
 export const ownsFile = (file: string, token: string): boolean => {
   try { return fs.readFileSync(file, "utf8") === `${token}\n`; } catch { return false; }
+};
+
+// A checkpoint request's own flag: raising it again refreshes its mtime; lowering it removes only it.
+// An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
+// zero or one) per pending check; a crashed request's flag goes stale and is ignored.
+export const raiseCheckpointFlag = (root: string, token: string): string => {
+  const dir = path.join(root, CHECKPOINT_FLAGS);
+  const flag = path.join(dir, token);
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(flag, "", { mode: 0o600 });
+    return flag;
+  } catch { return ""; }
+};
+
+export const lowerCheckpointFlag = (flag: string): void => {
+  if (flag) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+};
+
+export const checkpointFlagRaised = (root: string): boolean => {
+  const dir = path.join(root, CHECKPOINT_FLAGS);
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return false; }
+  const now = Date.now();
+  for (const name of names) {
+    const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
+    if (stat && now - stat.mtimeMs < CHECKPOINT_FLAG_STALE_MS) return true;
+  }
+  return false;
 };
 
 // Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one).

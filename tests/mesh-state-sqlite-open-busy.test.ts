@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { ownerToken, removeOwnedFile, SqliteStateStore, tryLockFile } from "../src/mesh/state-sqlite.js";
+import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, removeOwnedFile, SqliteStateStore, tryLockFile }
+  from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // smarty-dev#6477 P0 (sqlite soak): wal_autocheckpoint=0 and no production checkpointer let the hub's WAL grow
@@ -289,7 +290,23 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
   });
 
-  it("a release removes only the releaser's own lock or flag, never one another process holds", () => {
+  it("concurrent checkpoint requests each own a flag: one finishing never lowers another's", () => {
+    const root = lockRoot();
+    expect(checkpointFlagRaised(root)).toBe(false);
+    const first = raiseCheckpointFlag(root, ownerToken());
+    const second = raiseCheckpointFlag(root, ownerToken());
+    expect(checkpointFlagRaised(root)).toBe(true);
+    lowerCheckpointFlag(second); // the later request finishes first
+    expect(checkpointFlagRaised(root)).toBe(true); // the earlier one is still active: writers keep yielding
+    lowerCheckpointFlag(first);
+    expect(checkpointFlagRaised(root)).toBe(false);
+    // A crashed request's flag goes stale and stops blocking writers.
+    const crashed = raiseCheckpointFlag(root, ownerToken());
+    age(crashed, 5_000);
+    expect(checkpointFlagRaised(root)).toBe(false);
+  });
+
+  it("a release removes only the releaser's own lock, never one another process holds", () => {
     const dir = lockRoot();
     const lock = path.join(dir, "state-wal-reset.lock");
     const mine = ownerToken();
@@ -302,15 +319,5 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(fs.readFileSync(lock, "utf8")).toBe(`${theirs}\n`);
     removeOwnedFile(lock, theirs);
     expect(fs.existsSync(lock)).toBe(false);
-    // The checkpoint flag: the last raiser owns it; an earlier raiser's cleanup leaves it raised.
-    const flag = path.join(dir, "state-checkpoint.flag");
-    const first = ownerToken();
-    const second = ownerToken();
-    fs.writeFileSync(flag, `${first}\n`);
-    fs.writeFileSync(flag, `${second}\n`);
-    removeOwnedFile(flag, first);
-    expect(fs.readFileSync(flag, "utf8")).toBe(`${second}\n`);
-    removeOwnedFile(flag, second);
-    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });

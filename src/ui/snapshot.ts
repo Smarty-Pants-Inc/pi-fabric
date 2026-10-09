@@ -14,6 +14,7 @@ import {
 } from "./types.js";
 
 const MAX_UI_AGENTS = 240;
+export const SHELL_DISPLAY_EXPIRY_MS = 30_000;
 
 const boundedUiAgents = (
   local: FabricUiAgent[],
@@ -123,7 +124,10 @@ export const createDashboardSnapshot = (
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
   const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true, displayOnly: true }) : [];
-  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
+  const now = Date.now();
+  const shells = state.shellJobs?.list().filter(job =>
+    (job.spilledAt !== undefined || job.monitor) &&
+    (job.finishedAt === undefined || now - job.finishedAt < SHELL_DISPLAY_EXPIRY_MS)) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };
   const previous = cache?.get(inputs);
@@ -315,7 +319,7 @@ export const createDashboardSnapshot = (
     .slice(0, 120);
 
   const snapshot: FabricDashboardSnapshot = {
-    now: Date.now(),
+    now,
     shells,
     runs: orderedRuns,
     main,

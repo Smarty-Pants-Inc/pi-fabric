@@ -1,4 +1,5 @@
 import path from "node:path";
+import { watchUiFiles } from "./watch-files.js";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import * as piConversationHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -20,7 +21,7 @@ import { participantFilesCachedStamp, participantFilesStamp, readParticipantFile
 import { hostLeasesStamp } from "../topology/host-leases.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
-import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
+import { createDashboardSnapshot, FabricDashboardSnapshotCache, SHELL_DISPLAY_EXPIRY_MS } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
@@ -28,10 +29,11 @@ import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
+const FALLBACK_REFRESH_MS = 60_000;
 // The participant heartbeat (src/topology/participant-directory.ts); kept local so the startup
 // graph does not load the topology module.
 const REMOTE_REFRESH_MS = 5_000;
-// A poll with no changed input still rebuilds this often: a peer's lease lapses with time alone.
+// Active clock/cache rebuild budget; unchanged idle inputs do not refresh on time alone.
 const REMOTE_MAX_AGE_MS = 15_000;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
@@ -68,10 +70,14 @@ export class FabricUiController {
   #events: MeshEvent[] = [];
   #meshOffset = 0;
   #timer: NodeJS.Timeout | undefined;
+  #expiryTimer: NodeJS.Timeout | undefined;
+  #expiryAt: number | undefined;
   #activityUnsubscribe: (() => void) | undefined;
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
   #shellUnsubscribe: (() => void) | undefined;
+  #meshUnsubscribe: (() => void) | undefined;
+  #inputUnsubscribe: (() => void) | undefined;
   #tasksOpen = false;
   #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
   #closeTasks: (() => void) | undefined;
@@ -121,7 +127,18 @@ export class FabricUiController {
     if (this.state.config.mesh.enabled) {
       this.#events = this.state.mesh.read({ limit: this.state.config.ui.eventHistory });
       this.#meshOffset = this.state.mesh.latestOffset();
+      if (typeof this.state.mesh.root === "string") {
+        const epoch = this.#epoch;
+        this.#meshUnsubscribe = watchUiFiles(this.state.mesh.root,
+          ["state.read-signal.json", "events.jsonl", "generation"],
+          () => this.#runBackground(epoch, () => this.#scheduleRefresh()));
+      }
     }
+    const inputEpoch = this.#epoch;
+    this.#inputUnsubscribe = context.ui.onTerminalInput?.(() => {
+      this.#runBackground(inputEpoch, () => this.#scheduleRefresh());
+      return undefined; // Observe input; never consume or transform it.
+    });
     this.#activityUnsubscribe = this.state.activity.subscribe(() => this.#scheduleRefresh());
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
     this.#agentUnsubscribe = this.state.agents.subscribeUi(() => this.#scheduleRefresh());
@@ -139,6 +156,10 @@ export class FabricUiController {
     this.#tasksOpen = false;
     this.#shellUnsubscribe?.();
     this.#shellUnsubscribe = undefined;
+    this.#meshUnsubscribe?.();
+    this.#meshUnsubscribe = undefined;
+    this.#inputUnsubscribe?.();
+    this.#inputUnsubscribe = undefined;
     this.#closeConversation?.();
     this.#closeConversation = undefined;
     this.#conversationView?.dispose();
@@ -149,6 +170,9 @@ export class FabricUiController {
     this.#conversationState = undefined;
     if (this.#timer) clearTimeout(this.#timer);
     if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+    this.#expiryTimer = undefined;
+    this.#expiryAt = undefined;
     this.#timer = undefined;
     this.#scheduledRefresh = undefined;
     this.#widget = undefined;
@@ -682,7 +706,7 @@ export class FabricUiController {
     if (this.#timer || !this.#context || !this.state.initialized) return;
     const localActive =
       this.#snapshot.main.status === "running" ||
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
+      this.#snapshot.shells?.some(job => job.finishedAt === undefined) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(
@@ -693,24 +717,75 @@ export class FabricUiController {
     const remoteActive =
       this.#snapshot.peers.length > 0 ||
       this.#snapshot.agents.some((agent) => agent.local === false && isActiveStatus(agent.status));
-    if (!this.ownsInput && !localActive && !remoteActive) return;
-    // Remote records change at most once per owner heartbeat, and on a shared mesh some peer is
-    // always present, so polling them at refreshMs kept every idle Pi rebuilding the snapshot
-    // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
-    const pollDelay = this.ownsInput || localActive
-      ? this.state.config.ui.refreshMs
-      : Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
-    // Wake at the fixed cache deadline too: a recently warmed cache must not add a second
-    // 5 s UI poll window after the store's 5 s reuse window (smarty-dev#4383).
-    const remaining = this.state.config.mesh.enabled ? this.state.mesh.readCacheRemainingMs : 0;
-    const delay = remaining > 0 ? Math.min(pollDelay, remaining) : pollDelay;
+    if (!this.ownsInput && !localActive && !remoteActive && !this.state.config.mesh.enabled) return;
+    // R-no-polling exception (smarty-dev#7403): this >=60s recovery ponytail covers missed
+    // filesystem notifications, file-only topology/lease changes and elapsed clocks. Events
+    // still own immediate updates; neither a healthy watcher nor a warm cache may rearm a
+    // faster idle loop. Unchanged idle stamps do not refresh, even after the cache ages out.
+    const delay = Math.max(this.state.config.ui.refreshMs, FALLBACK_REFRESH_MS);
     const epoch = this.#epoch;
     this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
       this.#timer = undefined;
-      this.#refresh(false);
+      if (this.#needsFallbackRefresh()) this.#refresh(false);
       this.#schedulePoll();
     }), delay);
     this.#timer.unref();
+  }
+
+  /** A fallback wake is not a refresh when an idle dashboard has no changed inputs. */
+  #needsFallbackRefresh(): boolean {
+    const snapshot = this.#snapshot;
+    if (this.#conversationOpen || snapshot.main.status === "running" ||
+      snapshot.shells?.some(job => job.finishedAt === undefined) ||
+      snapshot.runs.some(run => run.status === "running") ||
+      snapshot.agents.some(agent => agent.local !== false && isActiveStatus(agent.status)) ||
+      snapshot.actors.some(actor => isActiveStatus(actor.status) ||
+        Boolean(actor.worker && isActiveStatus(actor.worker.status)))) return true;
+    const meshEnabled = this.state.config.mesh.enabled;
+    const root = meshEnabled && typeof this.state.mesh.root === "string" ? this.state.mesh.root : undefined;
+    const remote = JSON.stringify([
+      meshEnabled ? this.state.mesh.latestOffset() : this.#meshOffset,
+      meshEnabled ? this.state.mesh.stateStamp?.() : undefined,
+      root ? participantFilesStamp(root) : undefined,
+      root ? hostLeasesStamp(root) : undefined,
+      this.state.globalActors.stamp?.(),
+    ]);
+    return remote !== this.#builtRemote;
+  }
+
+  /** Display expiry is a deadline, not a polling interval or a cache-recovery wake. */
+  #scheduleExpiry(): void {
+    if (!this.#context || !this.state.initialized) return;
+    let deadline: number | undefined;
+    const consider = (at: unknown): void => {
+      // Already consumed deadlines must not create a zero-delay refresh loop if a source
+      // retains expired records. A late timer still refreshes once at its original deadline.
+      if (typeof at === "number" && Number.isFinite(at) && at > this.#snapshot.now &&
+        (deadline === undefined || at < deadline)) deadline = at;
+    };
+    for (const job of this.#snapshot.shells ?? []) {
+      if (job.finishedAt !== undefined) consider(job.finishedAt + SHELL_DISPLAY_EXPIRY_MS);
+    }
+    // Honor explicit expiry metadata on any top-level snapshot item, without walking
+    // arbitrary activity payloads. Sources own how those items change after expiration.
+    for (const value of Object.values(this.#snapshot)) {
+      for (const item of Array.isArray(value) ? value : [value]) {
+        if (item !== null && typeof item === "object" && "expiresAt" in item) consider(item.expiresAt);
+      }
+    }
+    if (deadline === this.#expiryAt) return;
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+    this.#expiryTimer = undefined;
+    this.#expiryAt = deadline;
+    if (deadline === undefined) return;
+    const epoch = this.#epoch;
+    this.#expiryTimer = setTimeout(() => this.#runBackground(epoch, () => {
+      this.#expiryTimer = undefined;
+      this.#expiryAt = undefined;
+      this.#refresh(); // Force a rebuild: expiry may not move any input revision or stamp.
+      this.#schedulePoll(true);
+    }), Math.max(0, deadline - Date.now()));
+    this.#expiryTimer.unref();
   }
 
   #scheduleRefresh(): void {
@@ -787,9 +862,9 @@ export class FabricUiController {
   }
 
   #refresh(force = true): void {
-    this.#lastRefreshAt = performance.now();
     const context = this.#context;
     if (!context || !this.state.initialized) return;
+    this.#lastRefreshAt = performance.now();
     try {
       this.#pollMesh();
       const revision =
@@ -815,11 +890,12 @@ export class FabricUiController {
       }
       // smarty-dev#1043: a poll gathered every input (the whole participant list, actors, the
       // mesh, the global registry) and deep-compared it twice a second while any local work was
-      // active: about 11% of a busy Main. Local changes already refresh through their own
-      // events, so a poll now rebuilds the snapshot only when a cheap stamp moved: Main's own
-      // state or the activity revision at once, remote state and mesh events at most every
-      // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
-      // dashboard or conversation view stays live. The rest of the refresh runs either way.
+      // active: about 11% of a busy Main. Events now own prompt updates and the slow fallback
+      // only runs when an input/clock needs it. It rebuilds when a cheap stamp moved: Main's own
+      // state or the activity revision at once. REMOTE_REFRESH_MS/REMOTE_MAX_AGE_MS remain
+      // cache budgets inside a refresh, not timer intervals: missed events and active clocks
+      // recover on the >=60s ponytail. Idle unchanged stamps never rebuild on age alone.
+      // An open dashboard or conversation view stays live on events.
       const now = Date.now();
       const main = { ...this.state.mainAgentInfo(context) };
       // agent_end can precede isIdle() becoming true. Its explicit boundary
@@ -883,6 +959,7 @@ export class FabricUiController {
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
+      this.#scheduleExpiry();
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.

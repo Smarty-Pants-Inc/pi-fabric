@@ -90,7 +90,7 @@ describe("controller preview performance", () => {
     vi.mocked(h.state.actors.messages).mockClear();
     vi.mocked(h.state.actors.instructions).mockClear();
     reads.mockClear();
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(180000);
     expect(reads).toHaveBeenCalledTimes(3);
     expect(project).not.toHaveBeenCalled();
     expect(h.findModel).toHaveBeenCalledTimes(3); // once per distinct model, not per target/frame
@@ -105,17 +105,17 @@ describe("controller preview performance", () => {
     await h.open();
     h.requestRender.mockClear();
     fs.appendFileSync(h.logFile, JSON.stringify({ type: "message_end", message: assistantMessage("native appended", 4) }) + "\n");
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     expect(h.requestRender).toHaveBeenCalledTimes(1);
     expect(h.view().render(100).join("\n")).toContain("native appended");
     h.requestRender.mockClear();
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     expect(h.requestRender).not.toHaveBeenCalled();
     h.records[0]!.status = "running";
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     h.view().render(100);
     h.requestRender.mockClear();
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     expect(h.requestRender.mock.calls.length).toBeGreaterThan(1); // native 80ms Working animation plus poll
   });
 
@@ -165,7 +165,7 @@ describe("controller preview performance", () => {
     await h.open();
     h.findModel.mockReturnValue({ contextWindow: 200_000 });
     h.requestRender.mockClear();
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     expect(h.requestRender).toHaveBeenCalledTimes(1);
     h.records[0]!.model = "test/replacement";
     h.records[0]!.status = "running";
@@ -174,7 +174,7 @@ describe("controller preview performance", () => {
       id: "a", name: "a", kind: "agent", ownerHostId: "new-owner", rootId: "main", local: false,
       stale: true, capabilities: ["steer", "followUp", "stop"],
     }] as never);
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(60000);
     expect(h.findModel).toHaveBeenCalledWith("test", "replacement");
     expect(h.controller.snapshot().agents.find((agent) => agent.id === "a")).toMatchObject({
       model: "test/replacement", usage: { output: 999 }, stale: true, ownerHostId: "new-owner",

@@ -264,22 +264,58 @@ export class EventLog {
     };
   }
 
-  /** Recheck both identities before cleanup; never unlink a newer reservation or recreate a
-   * receipt lost since off-lock confirmation. The matched receipt's file barrier also works
-   * on Windows, where the intent unlink has no supported directory-fsync barrier. */
+  /** Pin the checked receipt through its file barrier; a legacy off-lock writer can still
+   * replace either pathname during this CAS hold. Any mismatch preserves the recovery fence.
+   * Windows needs the same file barrier, not an unsupported directory-fsync assumption. */
   #cleanupReceiptIntent(event: MeshEvent, intentPath: string): Promise<void> {
     return this.#lock.withLock(() => {
-      let intent: MeshDedupeIntent;
-      try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
-      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-      if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
-          intent.reservedSequence !== event.sequence) return;
-      const current = this.#readDedupeReceipt(intent.dedupeKey, false);
-      if (!current || current.id !== event.id || current.sequence !== event.sequence) return;
-      // Keep the recovery fence until the still-authoritative receipt is confirmed under
-      // the same CAS hold. Close its descriptor before unlink (Windows delete semantics).
-      this.#confirmEventFile(this.#dedupePath(intent.dedupeKey, ".json"));
-      this.#removeDedupeIntent(intentPath);
+      const sameInode = (left: fs.Stats, right: fs.Stats): boolean =>
+        left.dev === right.dev && left.ino === right.ino;
+      try {
+        const intentIdentity = fs.lstatSync(intentPath);
+        if (!intentIdentity.isFile()) return;
+        const intentText = fs.readFileSync(intentPath, "utf8");
+        if (!sameInode(intentIdentity, fs.lstatSync(intentPath))) return;
+        const intent = JSON.parse(intentText) as MeshDedupeIntent;
+        if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
+            intent.reservedSequence !== event.sequence) return;
+        const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
+        const receiptIdentity = fs.lstatSync(receiptPath);
+        if (!receiptIdentity.isFile()) return;
+        // Open only once: validation and fsync must refer to this exact inode, never a
+        // second pathname lookup's descriptor. A replaced receipt is never fsynced here.
+        const fd = fs.openSync(receiptPath, process.platform === "win32" ? "r+" : "r");
+        try {
+          const sameReceipt = (stat: fs.Stats): boolean => stat.isFile() &&
+            sameInode(receiptIdentity, stat) && stat.size === receiptIdentity.size;
+          if (!sameReceipt(fs.fstatSync(fd))) return;
+          const text = fs.readFileSync(fd, "utf8");
+          const current = JSON.parse(text) as MeshEvent;
+          if (current.dedupeKey !== intent.dedupeKey || current.id !== event.id ||
+              current.sequence !== event.sequence || Buffer.byteLength(text, "utf8") !== receiptIdentity.size) return;
+          // Size alone cannot detect an in-place rewrite. Reread at offset zero on the
+          // pinned descriptor, and also check that its pathname still names that inode.
+          const unchanged = (): boolean => {
+            if (!sameReceipt(fs.fstatSync(fd))) return false;
+            const bytes = Buffer.allocUnsafe(receiptIdentity.size);
+            return fs.readSync(fd, bytes, 0, bytes.length, 0) === bytes.length &&
+              bytes.equals(Buffer.from(text, "utf8")) && sameReceipt(fs.fstatSync(fd)) &&
+              sameReceipt(fs.lstatSync(receiptPath));
+          };
+          if (!unchanged()) return;
+          fs.fsyncSync(fd);
+          if (!unchanged()) return;
+          syncPathNamespace(receiptPath, receiptIdentity);
+        } finally { fs.closeSync(fd); }
+        // Close before unlink (Windows delete semantics). Recheck after that close too:
+        // neither a replacement receipt nor a replacement reservation authorizes cleanup.
+        const namedReceipt = fs.lstatSync(receiptPath);
+        if (!sameInode(receiptIdentity, namedReceipt) || namedReceipt.size !== receiptIdentity.size ||
+            fs.readFileSync(intentPath, "utf8") !== intentText) return;
+        const namedIntent = fs.lstatSync(intentPath);
+        if (!sameInode(intentIdentity, namedIntent)) return;
+        this.#removeDedupeIntent(intentPath);
+      } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
     }, undefined, "publish");
   }
 

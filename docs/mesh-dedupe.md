@@ -71,10 +71,13 @@ makes that finalizer a no-op. Single and batch publication await this finalizer.
 Receipt durability and pending-file cleanup remain inside that CAS lock hold,
 so a delayed finalizer cannot resurrect an evicted receipt outside the cap.
 An existing/late receipt is first confirmed off-lock. If its matching intent still
-exists, cleanup rechecks both receipt and intent identities under the CAS lock,
-confirms the still-matching receipt file, closes it, and only then removes the
-intent. A missing/replaced receipt or a failed barrier retains the intent; cleanup
-never rewrites or recreates a receipt. The receipt-file barrier is portable even
+exists, cleanup opens the receipt once under the CAS lock and validates its
+`dev`/`ino`, size, and event identity on that same descriptor. It rechecks the
+receipt's bytes and pathname before and after fsync, then closes the descriptor.
+Immediately before removal, cleanup re-lstats the intent and compares its checked
+`dev`/`ino` (as well as its bytes). A missing/replaced receipt or intent, an in-place
+receipt rewrite, or a failed barrier retains the intent; cleanup never rewrites,
+recreates, or fsyncs a replacement receipt. The receipt-file barrier is portable even
 on Windows, where directory fsync is unsupported. Windows unlink namespace
 persistence remains subject to that existing platform limitation: if an intent
 reappears after a crash, the authoritative receipt settles it without re-appending.

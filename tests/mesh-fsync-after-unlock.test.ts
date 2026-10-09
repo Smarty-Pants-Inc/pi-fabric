@@ -433,6 +433,110 @@ describe("off-lock live barriers and locked receipt CAS (smarty-dev#6477 E1)", (
     expect(mesh.read()).toEqual([committed]);
   });
 
+  it.each(["replacement", "same-size rewrite", "size change"] as const)("recovery: %s between receipt check and fsync preserves the intent without syncing foreign bytes", async change => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `checked-receipt-${change}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreign = { ...committed, id: `${committed.id.slice(0, -1)}${committed.id.endsWith("a") ? "b" : "a"}`,
+      ...(change === "size change" ? { text: "different-sized foreign receipt" } : {}) };
+    const foreignText = JSON.stringify(foreign);
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    const read = fs.readFileSync.bind(fs) as (...args: unknown[]) => string | Buffer;
+    let cleanupStarted = false, changed = false, lockedOpens = 0, foreignSyncs = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      const text = read(...args);
+      if (args[0] === intentPath && held()) cleanupStarted = true;
+      const checkedReceipt = args[0] === receiptPath ||
+        (typeof args[0] === "number" && sameFile(args[0], receiptPath));
+      // Inject after the checked content was read, but before its cleanup file barrier.
+      // Support both pathname and descriptor readers so this also reproduces the old race.
+      if (!changed && cleanupStarted && held() && checkedReceipt) {
+        if (change === "replacement") fs.renameSync(receiptPath, `${receiptPath}.checked`);
+        fs.writeFileSync(receiptPath, foreignText);
+        changed = true;
+      }
+      return text;
+    }) as typeof fs.readFileSync);
+    const open = fs.openSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (file === receiptPath && cleanupStarted && held()) lockedOpens++;
+      return open(file, flags, mode);
+    });
+    watchBarriers(mesh.root, fd => { if (changed && sameFile(fd, receiptPath)) foreignSyncs++; });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(lockedOpens).toBe(1);
+    expect(foreignSyncs).toBe(0);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(fs.readFileSync(receiptPath, "utf8")).toBe(foreignText);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it("recovery: replacing the receipt at fsync still syncs only the pinned inode and keeps the intent", async () => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, "receipt-swap-at-fsync");
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreignText = JSON.stringify({ ...committed, id: "foreign-at-fsync" });
+    const sync = fs.fsyncSync.bind(fs);
+    let changed = false, syncedPinned = false, foreignSyncs = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (!changed && sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"))) {
+        fs.renameSync(receiptPath, `${receiptPath}.checked`);
+        fs.writeFileSync(receiptPath, foreignText);
+        changed = true;
+        syncedPinned = sameFile(fd, `${receiptPath}.checked`);
+      }
+      if (changed && sameFile(fd, receiptPath)) foreignSyncs++;
+      sync(fd);
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(syncedPinned).toBe(true);
+    expect(foreignSyncs).toBe(0);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(fs.readFileSync(receiptPath, "utf8")).toBe(foreignText);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each([false, true])("recovery: an intent replaced between check and unlink is not removed (identical bytes=%s)", async identical => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `intent-swap-before-unlink-${identical}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const originalIdentity = fs.lstatSync(intentPath);
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreignText = identical ? intentBefore : JSON.stringify({ ...JSON.parse(intentBefore), eventId: "foreign-intent" });
+    const close = fs.closeSync.bind(fs);
+    const remove = fs.rmSync.bind(fs);
+    let changed = false, removedReplacement = false;
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+      const checkedReceipt = sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"));
+      close(fd);
+      // The checked file barrier has completed; cleanup is about to unlink its intent.
+      if (!changed && checkedReceipt) {
+        fs.renameSync(intentPath, `${intentPath}.checked`);
+        fs.writeFileSync(intentPath, foreignText);
+        changed = true;
+      }
+    });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (file === intentPath && changed) removedReplacement = true;
+      remove(file, options);
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(removedReplacement).toBe(false);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(foreignText);
+    const retained = fs.lstatSync(intentPath);
+    expect([retained.dev, retained.ino]).not.toEqual([originalIdentity.dev, originalIdentity.ino]);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
   it.each(["missing", "replaced"] as const)("recovery: cleanup retains its intent if the confirmed receipt is %s before CAS", async change => {
     const mesh = store();
     const { packet, intentPath, committed } = await strandIntent(mesh, `receipt-${change}-before-cas`);

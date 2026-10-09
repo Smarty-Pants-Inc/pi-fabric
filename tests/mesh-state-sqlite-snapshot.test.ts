@@ -61,7 +61,7 @@ const expectEqualsExport = (store: MeshStore, state: SqliteStateExport): void =>
   expect(store.list("k", 1_000)).toEqual(want.sorted.filter((entry) => entry.key.startsWith("k")));
 };
 
-// Keys that exercise localeCompare (case, punctuation, digits) rather than byte order.
+// Keys whose localeCompare order (case, punctuation, digits) differs from byte order.
 const KEYS = ["k/a", "k/A", "k/b", "k/B-1", "k/b.1", "k/b-1", "k/b:1", "k/10", "k/9", "k/a/x", "k/a.x", "k-a", "k.a",
   "K/a", "Ka", "x/1", "x/2", "x/3", "y", "Y", "z9", "z10", "0", "9/a"];
 

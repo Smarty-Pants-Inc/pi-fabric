@@ -876,7 +876,7 @@ Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setC
 
 #### Minimum interval for settlement observations
 
-For a supervisor that should not wake on every rapid settlement, pass an optional leading-edge minimum interval to `agents.create`:
+For a supervisor that should not wake on every rapid settlement, pass an optional minimum interval with leading and trailing admission to `agents.create`:
 
 ```ts
 const supervisor = await agents.create({
@@ -888,13 +888,13 @@ const supervisor = await agents.create({
 });
 ```
 
-`activation.minIntervalMs` is a non-negative safe integer in milliseconds. Omit `activation` (the default), or use `0`, to keep today's behavior. It applies **only to host `agent_settled` observations**, independently for each actor and source agent session. The first event is admitted immediately; events from that same source inside the interval are dropped before queueing. A dropped event does not slide the deadline. An event at or after the boundary is admitted immediately. There is no delayed or trailing wake: if no new event arrives after the boundary, nothing runs. "Immediately" means admitted without an interval timer; normal actor serialization, capability waits and queue limits still apply.
+`activation.minIntervalMs` is a non-negative safe integer in milliseconds. Omit `activation` (the default), or use `0`, to keep today's behavior. It applies **only to host `agent_settled` observations**, independently for each actor and source agent session. The first event is admitted immediately. Events from that same source inside the interval are held before queueing: only the latest payload and images are retained. A one-shot timer admits that latest event once at the original window end, even if no further settlement arrives. Replacements do not slide the deadline. An event at or after the boundary is admitted immediately and replaces any still-pending trailing event from that source. Each admission starts the next minimum interval. "Immediately" means admitted without an interval timer; normal actor serialization, capability waits and queue limits still apply.
 
 Source identity comes from the real host envelope's `session.id`, not `signal.payload.source` (which denotes a user/extension input origin). Older envelopes without a session ID use the trusted local root identity, or the authenticated sending root for a durable-owner relay. Both local and relayed events share the owner's gate. A different source session has its own window. Other host event kinds, mesh events (even those whose kind is `agent_settled`), and direct `ask`/`tell` messages are unaffected.
 
-This is not queue coalescing or trailing-edge debounce. `coalesce: true` still replaces only queued host events of the same kind; `coalesceKey` still groups queued mesh subjects. Those existing options apply after interval admission. `activationFilter` remains a skip-only predicate filter; an event it filters on arrival does not arm the interval. Interval drops are not activation-filter skips and do not increment `filteredCount`.
+This is not queue coalescing or sliding trailing-edge debounce. `coalesce: true` still replaces only queued host events of the same kind; `coalesceKey` still groups queued mesh subjects. Those existing options apply after interval admission, including trailing delivery. `activationFilter` remains a skip-only predicate filter; an event it filters on arrival does not arm the interval. Suppressed events are not activation-filter skips and do not increment `filteredCount`; the retained event is checked against the current filter again when its timer fires.
 
-The configuration is returned in actor status and definitions and survives global template export/import and registry reloads. **Window timestamps are in-memory only**: same-process registry/ownership object reloads retain them, but a process restart or transfer to a new owner runtime resets them, so the next settlement is a fresh first wake. Timestamps are not stored in actor definitions, templates or durable queues. Expired source windows are pruned when another settlement arrives, and removal/close clears runtime state. Configure the interval at creation (or in the template before import).
+The configuration is returned in actor status and definitions and survives global template export/import and registry reloads. **Window timestamps and pending trailing events are in-memory only**: same-process registry object reloads retain them, but a process restart or transfer to a new owner runtime resets them, so the next settlement is a fresh first wake. Pending events are not a durable delivery guarantee across a restart. They are not stored in actor definitions, templates or durable queues until admitted. Expired source windows are pruned when another settlement arrives. Stop, removal, redefinition and manager close cancel pending trailing timers; a user halt cancels pending trailing work too. A timer rechecks current actor ownership and lifecycle before admission. Configure the interval at creation (or in the template before import).
 
 #### Activation filter
 

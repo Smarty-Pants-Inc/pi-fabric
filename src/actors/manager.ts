@@ -124,6 +124,13 @@ interface ActorQueueItem {
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
 
+interface SettledWindow {
+  acceptedAt: number;
+  intervalMs: number;
+  pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string };
+  timer?: NodeJS.Timeout;
+}
+
 interface ManagedActor {
   id: string;
   name: string;
@@ -543,7 +550,7 @@ export class ActorManager {
   readonly #delivered = new Set<string>();
   // Admission times belong to the running manager, not replaceable registry objects.
   // Never serialized: restart/owner transfer starts with a fresh leading edge.
-  readonly #settledWindows = new Map<string, Map<string, number>>();
+  readonly #settledWindows = new Map<string, Map<string, SettledWindow>>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
@@ -1914,9 +1921,10 @@ export class ActorManager {
     if (this.#skipOnArrival(actor, `host:${event}`, payload)) return true;
     const interval = event === "agent_settled" ? actor.activation?.minIntervalMs ?? 0 : 0;
     let sourceId: string | undefined;
-    let windows: Map<string, number> | undefined;
+    let windows: Map<string, SettledWindow> | undefined;
     const now = Date.now();
     if (interval > 0) {
+      if (this.#closing || this.#halted) return false;
       // Host envelopes carry the real observed agent in session.id. In particular,
       // signal.payload.source is only an input origin (user/extension), not an agent.
       const sessionId = typeof payload === "object" && payload !== null
@@ -1925,11 +1933,16 @@ export class ActorManager {
         ? `session:${sessionId}` : sourceRootId;
       windows = this.#settledWindows.get(actor.id);
       if (windows) {
-        for (const [source, acceptedAt] of windows) {
-          if (now - acceptedAt >= interval) windows.delete(source);
+        for (const [source, window] of windows) {
+          if (!window.timer && now - window.acceptedAt >= interval) windows.delete(source);
         }
-        const acceptedAt = windows.get(sourceId);
-        if (acceptedAt !== undefined && now - acceptedAt < interval) return false;
+        const window = windows.get(sourceId);
+        if (window && now - window.acceptedAt < interval) {
+          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId };
+          // Latest payload wins, but subsequent arrivals never move the original boundary.
+          if (!window.timer) this.#armSettledWindow(actor.id, sourceId, window);
+          return false;
+        }
       }
     }
     this.#enqueue(actor, `host:${event}`, payload, {
@@ -1937,12 +1950,61 @@ export class ActorManager {
       ...(images.length > 0 ? { images } : {}),
       ownershipChecked: true,
     });
-    // Only an admitted event arms the window. Dropped/filtered events never slide it.
+    // Only an admitted event arms the window. Filtered events never slide it.
     if (sourceId !== undefined) {
       if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
-      windows.set(sourceId, now);
+      // An arrival at the boundary can beat the timer: it supersedes the held payload.
+      const previous = windows.get(sourceId);
+      if (previous?.timer) clearTimeout(previous.timer);
+      windows.set(sourceId, { acceptedAt: now, intervalMs: interval });
     }
     return true;
+  }
+
+  #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
+    // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
+    const remaining = window.intervalMs - (Date.now() - window.acceptedAt);
+    window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
+    window.timer.unref();
+  }
+
+  #flushSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
+    if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
+    delete window.timer;
+    if (!window.pending || this.#closing || this.#halted) {
+      delete window.pending;
+      return;
+    }
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(actorId);
+    // Reload/reacquisition can replace every registry object. Resolve only after fencing.
+    const actor = this.#actors.get(actorId);
+    if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
+    if (!actor || actor.status === "stopped" || actor.removal || !actor.events.includes("agent_settled") ||
+        !this.#canManageCached(actorId)) {
+      delete window.pending;
+      return;
+    }
+    if (Date.now() - window.acceptedAt < window.intervalMs) {
+      this.#armSettledWindow(actorId, sourceId, window);
+      return;
+    }
+    const pending = window.pending;
+    delete window.pending;
+    try {
+      this.#enqueueHostEvent(actor, "agent_settled", pending.payload, pending.images, pending.sourceRootId);
+    } catch (error) {
+      actor.lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  #clearSettledWindows(actorId?: string): void {
+    const windows = actorId === undefined ? this.#settledWindows.values() : [this.#settledWindows.get(actorId)];
+    for (const sources of windows) {
+      if (sources) for (const window of sources.values()) if (window.timer) clearTimeout(window.timer);
+    }
+    if (actorId === undefined) this.#settledWindows.clear();
+    else this.#settledWindows.delete(actorId);
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
@@ -1979,6 +2041,7 @@ export class ActorManager {
   }
 
   #stopRun(actor: ManagedActor): void {
+    this.#clearSettledWindows(actor.id);
     actor.status = "stopped";
     actor.updatedAt = Date.now();
     // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
@@ -2070,6 +2133,7 @@ export class ActorManager {
     // work) so an idle-but-subscribed actor is not re-armed by the interrupt's
     // own settle events.
     this.#halted = true;
+    this.#clearSettledWindows();
     // An explicit cancel beats an ownership retry: a run that an ownership loss already
     // aborted must not be parked and run again after the interrupt. Drains are found by
     // actor id, because a reload may have replaced the object an older drain still runs on.
@@ -2407,7 +2471,7 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
-      this.#settledWindows.delete(actor.id);
+      this.#clearSettledWindows(actor.id);
       this.#emitChange();
     }
     return this.#finishCleanup(cleanup);
@@ -2445,7 +2509,7 @@ export class ActorManager {
   close(): Promise<void> {
     if (!this.#closePromise) {
       this.#closing = true;
-      this.#settledWindows.clear();
+      this.#clearSettledWindows();
       this.#closePromise = this.#close();
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
@@ -3172,6 +3236,7 @@ export class ActorManager {
           }
           item.resolve?.(structuredClone(message));
           if (message.action === "stop") {
+            this.#clearSettledWindows(actor.id);
             actor.status = "stopped";
             this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
@@ -4743,6 +4808,9 @@ export class ActorManager {
       typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
         ? [(value as { id: string }).id] : []));
     this.#rememberLineages(records);
+    for (const id of this.#settledWindows.keys()) {
+      if (!this.#registryIds.has(id)) this.#clearSettledWindows(id);
+    }
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const source = value as Record<string, unknown>;
@@ -4894,6 +4962,7 @@ export class ActorManager {
       };
       this.#installLazyMessages(actor, source);
       this.#actors.set(actor.id, actor);
+      if (actor.status === "stopped" || actor.removal) this.#clearSettledWindows(actor.id);
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);

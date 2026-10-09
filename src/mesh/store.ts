@@ -9,6 +9,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-f
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError } from "./event-log.js";
@@ -277,7 +278,12 @@ export class MeshStore {
     this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
     this.#state = createStateBackend(context, options);
-    this.#events = new EventLog(context, options);
+    this.#events = new EventLog(context, options, event => {
+      if (!fs.existsSync(path.join(this.root, "residency"))) return;
+      const subscriptions = event.topic === "fabric.participant.lifecycle"
+        ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
+      indexResidentDeliveries(this.root, event, subscriptions);
+    });
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     // Best effort: the writer census is advisory, never a gate (smarty-dev#6982), so a failed
     // record changes nothing here; the census reports the writer's evidence as unknown instead.
@@ -327,12 +333,28 @@ export class MeshStore {
 
   // Events (event-log.ts).
 
-  publish(input: MeshPublishInput): Promise<MeshEvent> {
-    return this.#events.publish(input);
+  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+    const event = await this.#events.publish(input);
+    await this.#wakeAfterPublish([event]);
+    return event;
   }
 
-  publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
-    return this.#events.publishBatch(inputs);
+  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    const events = await this.#events.publishBatch(inputs);
+    await this.#wakeAfterPublish(events);
+    return events;
+  }
+
+  async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
+    if (!events.length || !fs.existsSync(path.join(this.root, "residency"))) return;
+    try {
+      const { wakeResidentActors } = await import("../residency/wake.js");
+      await wakeResidentActors(this, events);
+    } catch (error) {
+      // Already committed: throwing would invite a duplicate publish. The wake request and
+      // archived event remain retryable; report failure rather than inventing delivery.
+      console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
+    }
   }
 
   read(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): MeshEvent[] {

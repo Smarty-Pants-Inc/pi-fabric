@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { ResidentHost } from "../src/residency/host.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import { readHostLease } from "../src/topology/host-leases.js";
@@ -30,6 +31,9 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   // Optimistic writes prepare outside custody; write() is the legacy writer.
   const registryWrites = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+  // Measure presence-size rejection/retry isolation independently of autonomous
+  // idle -> dormant publication, including startup's immediate eligibility edge.
+  const eligibility = vi.spyOn(ActorDirectory.prototype, "hasDormantIdleActor").mockReturnValue(false);
   let host = new ResidentHost(config);
   try {
     for (let recovery = 0; recovery < 2; recovery++) {
@@ -66,7 +70,7 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
     }
     expect(warn.mock.calls.filter(([message]) => String(message).includes("Actor presence omitted"))).toHaveLength(1);
   } finally {
-    await host.close(); warn.mockRestore(); registryWrites.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    await host.close(); eligibility.mockRestore(); warn.mockRestore(); registryWrites.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
   }
 }, 20000);
 

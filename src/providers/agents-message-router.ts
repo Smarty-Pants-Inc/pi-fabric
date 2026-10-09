@@ -736,7 +736,6 @@ export class AgentMessageRouter {
         from,
         ...(verification === undefined ? {} : { verification }),
         principal: provenance?.principal,
-        admissionTopic: "fabric.control.command",
         message,
         delivery: command.operation,
         deliveryId: command.commandId,

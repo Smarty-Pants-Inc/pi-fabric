@@ -202,6 +202,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const receiver = control(mesh, remoteIdentity);
     const sourceProvider = provider(root, mesh, localIdentity, local.controller, localParticipants, sender);
     const ownerProvider = provider(root, mesh, remoteIdentity, remote.controller, remoteParticipants, receiver);
+    const deliver = vi.spyOn(remote.controller, "deliverAgent");
     sender.start(() => ({ accepted: false }));
     receiver.start((command, from, signal, verification) => ownerProvider.acceptControl(command, from, signal, verification));
     const event = lifecycle("remote:settled", "session:actual-observer", "root");
@@ -210,6 +211,9 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const command = mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!;
     expect(command.from.id).toBe(localIdentity.id); // Principal/provenance are still command-envelope based.
     expect(command.data).not.toHaveProperty("wakeCause");
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(deliver.mock.calls[0]![0]).not.toHaveProperty("admissionTopic");
+    expect(mesh.read({ topic: "fabric.control.ack", limit: 100 }).at(-1)!.data).not.toHaveProperty("admissionTopic");
     const expected = fabricWakeCause(localIdentity, "followUp", "fabric.control.command", command.id);
     expect(remote.sent).toHaveLength(0);
     expect(JSON.parse(fs.readFileSync(remote.journal, "utf8")).items[0]).toMatchObject({

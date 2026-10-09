@@ -242,7 +242,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
   registerFabricPrincipalCapture(pi);
-  registerFabricWakeCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;
@@ -797,8 +796,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   });
 
-  // Keep activation/reload startup first; the renderer's session_start hook
-  // only snapshots display history and must not replace that entry point.
+  // Keep activation/reload startup first; diagnostic and display session_start
+  // observers must not replace that entry point.
+  registerFabricWakeCapture(pi);
   registerIncomingMessageRenderers(pi, () => principalViewIncomingMode(state.provisionalConfig().ui.principalView));
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget

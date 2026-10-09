@@ -17,9 +17,11 @@
  *   divergence checks. A SQLite failure never fails, delays past its own small budget, or changes
  *   the result of the caller; it is counted in `diagnostics()`.
  *
- * Selection: `mesh.stateBackend` in the Fabric config (`"file" | "shadow" | "sqlite"`, default
- * `"file"`); the environment variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a
- * non-local filesystem (R16) or a runtime without `node:sqlite` falls back to `"file"`.
+ * Selection: `mesh.stateBackend` in the Fabric config (`"file" | "shadow" | "sqlite" | "nats"`, default
+ * `"file"`); the environment variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. Each kind is a
+ * registered factory (`STATE_BACKEND_FACTORIES`, smarty-dev#7504, docs/mesh-backends.md). A root on a
+ * non-local filesystem (R16) or a runtime without `node:sqlite` falls back to `"file"` for sqlite and
+ * shadow. `"nats"` refuses with `MeshStateBackendNotBuiltError` until fabric-v2's store lands.
  *
  * This file was committed first as the interface milestone; lanes L3 (projector) and L4 (cutover)
  * build against these declarations. Changes after that commit are recorded in the lane's
@@ -28,6 +30,7 @@
 import path from "node:path";
 import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
+import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
@@ -36,8 +39,7 @@ import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteD
 
 export type { MeshBatchOperation, MeshBatchResult, MeshBatchView, MeshReadOptions, MeshStateEntry };
 
-/** The configured state backend (`mesh.stateBackend`, env `PI_FABRIC_MESH_STATE_BACKEND`). */
-export type MeshStateBackendKind = "file" | "shadow" | "sqlite";
+export { isMeshStateBackendKind, type MeshStateBackendKind };
 
 /** The environment override of `mesh.stateBackend`. */
 export const MESH_STATE_BACKEND_ENV = "PI_FABRIC_MESH_STATE_BACKEND";
@@ -243,11 +245,6 @@ export interface StateBackendOptions {
 
 export { MeshStateFileReadChangedError };
 
-const KINDS: ReadonlySet<string> = new Set<MeshStateBackendKind>(["file", "shadow", "sqlite"]);
-
-export const isMeshStateBackendKind = (value: unknown): value is MeshStateBackendKind =>
-  typeof value === "string" && KINDS.has(value);
-
 /**
  * The effective kind: an explicit option wins, then a valid `PI_FABRIC_MESH_STATE_BACKEND`, then
  * `"file"`. An unknown environment value is ignored (fail safe to the file backend).
@@ -255,7 +252,7 @@ export const isMeshStateBackendKind = (value: unknown): value is MeshStateBacken
 export const resolveMeshStateBackend = (explicit?: MeshStateBackendKind,
   env: string | undefined = process.env[MESH_STATE_BACKEND_ENV]): MeshStateBackendKind => {
   if (explicit !== undefined) {
-    if (!isMeshStateBackendKind(explicit)) throw new Error("mesh.stateBackend must be file, shadow or sqlite");
+    if (!isMeshStateBackendKind(explicit)) throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
     return explicit;
   }
   const value = env?.trim().toLowerCase();
@@ -351,22 +348,55 @@ export type CreateStateBackendOptions = StateBackendOptions & StateFileOptions &
   shadowVerifyMs?: number;
 };
 
+/** One registered backend kind (smarty-dev#7504). */
+export interface StateBackendFactory {
+  /** Why this root or runtime cannot host the kind; the selector then falls back to `"file"`. */
+  unavailable?(context: MeshStoreContext): string | undefined;
+  /** Opens the backend; throws to refuse (no fallback). */
+  create(context: MeshStoreContext, options: CreateStateBackendOptions): StateBackend;
+}
+
+export const MESH_STATE_BACKEND_NOT_BUILT_CODE = "FABRIC_MESH_STATE_BACKEND_NOT_BUILT";
+
+/** The selected kind has no store in this build (`nats` until fabric-v2's store lands, smarty-dev#7504). */
+export class MeshStateBackendNotBuiltError extends Error {
+  readonly code = MESH_STATE_BACKEND_NOT_BUILT_CODE;
+  constructor(readonly kind: MeshStateBackendKind, detail: string) {
+    super(`${MESH_STATE_BACKEND_NOT_BUILT_CODE}: mesh state backend "${kind}" is not built: ${detail}. ` +
+      `Use mesh.stateBackend (or ${MESH_STATE_BACKEND_ENV}) file or sqlite; see docs/mesh-backends.md`);
+    this.name = "MeshStateBackendNotBuiltError";
+  }
+}
+
+const sqliteRefusal = (context: MeshStoreContext): string | undefined => filesystemRefusal(context.root) ?? sqliteUnavailable();
+
 /**
- * The backend for one MeshStore. `"file"` touches nothing new (no SQLite import side effect, no
+ * The registry the selector reads. `"file"` touches nothing new (no SQLite import side effect, no
  * file). `"sqlite"` and `"shadow"` fall back to `"file"` on a non-local filesystem (R16) or without
- * `node:sqlite` (R19); `diagnostics().fallback` says why.
+ * `node:sqlite` (R19). `"nats"` never falls back: a host that silently wrote local state while its
+ * peers wrote the shared stream would split the mesh, so it refuses until a store is registered.
+ */
+export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendFactory> = {
+  file: { create: (context, options) => new StateFile(context, options) },
+  sqlite: { unavailable: sqliteRefusal, create: (context, options) => new SqliteStateBackend(context, options) },
+  shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
+  nats: { create: () => { throw new MeshStateBackendNotBuiltError("nats", "fabric-v2's JetStream state store (pi-fabric#708) has not landed"); } },
+};
+
+/**
+ * The backend for one MeshStore: the registered factory of the resolved kind, or `"file"` with
+ * `diagnostics().fallback` saying why when that kind is unavailable on this root or runtime.
  */
 export const createStateBackend = (context: MeshStoreContext, options: CreateStateBackendOptions = {}): StateBackend => {
   const kind = resolveMeshStateBackend(options.stateBackend);
-  if (kind === "file") return new StateFile(context, options);
-  const refusal = filesystemRefusal(context.root) ?? sqliteUnavailable();
+  const factory = STATE_BACKEND_FACTORIES[kind];
+  const refusal = factory.unavailable?.(context);
   if (refusal) {
     const file = new StateFile(context, options);
     file.fallback = `${kind}: ${refusal}`;
     return file;
   }
-  if (kind === "sqlite") return new SqliteStateBackend(context, options);
-  return new ShadowStateBackend(context, options);
+  return factory.create(context, options);
 };
 
 const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = options.lockTimeoutMs): SqliteStateStoreOptions => ({

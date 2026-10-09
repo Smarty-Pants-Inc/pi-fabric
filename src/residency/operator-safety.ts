@@ -82,7 +82,7 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
     const { verdict, snapshot } = rootParticipantVerdict(config, mesh, rootLease, selfWindow, resident);
     evidence.mainLiveness = verdict;
     evidence.toolEvidence = snapshot;
-    if (!verdict.startsWith("absent:") && !verdict.startsWith("stale:")) mainLive = true;
+    if (!verdict.startsWith("stale:")) mainLive = true;
   }
   if (!options.mainStopped && evidence.residentRenewedLease) mainLive = true;
   evidence.liveLease = mainLive;
@@ -156,7 +156,7 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
   return `gone: Main pid ${main.pid} was reused (start time ${current}, recorded ${main.startTime})`;
 };
 
-/** What the root participant shows; "absent:" and "stale:" are the only answers that do not refuse.
+/** What the root participant shows; "stale:" (every record stale, its Main pid verified gone) is the only answer that does not refuse.
  * The snapshot is the tool's own evidence for the audit record. A participant's process (its owner
  * lease writer) that is alive on this host refuses, whatever the operator's attestation says. */
 function rootParticipantVerdict(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
@@ -215,7 +215,9 @@ function rootParticipantVerdict(config: ResidentHostConfig, mesh: Pick<MeshStore
     if (ownerUntil !== undefined && ownerUntil >= now) first("live: participant owner lease is live");
   }
   if (rootWriter?.check?.alive === true) first(`live: root lease writer process ${rootWriter.pid} is alive on this host`);
-  return done(verdict ?? (entries.length ? "stale: root participant is stale and its owner lease expired" : "absent: no root participant"));
+  // No root participant record means no recorded Main identity to verify: unknown, never "gone".
+  return done(verdict ?? (entries.length ? "stale: root participant is stale and its owner lease expired"
+    : "unknown: Main process identity unavailable (no root participant record; automatic proof for roots whose records are gone: smarty-dev#7956)"));
 }
 
 export const MAIN_STOPPED_REQUIRED = "the root's Main may be running; confirm it is stopped and pass --main-stopped (automatic proof: smarty-dev#7956)";

@@ -12,9 +12,12 @@ import { offlineRemovalHooks } from "../src/actors/remove-offline.js";
 import { MeshStore, meshProcessStartedAt } from "../src/mesh/store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as fileLock from "../src/residency/file-lock.js";
-import { ResidentHost } from "../src/residency/host.js";
+import { ResidentHost, ResidentHostAlreadyRunning } from "../src/residency/host.js";
 import { residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime } from "../src/residency/process-identity.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
+import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
+import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
@@ -65,6 +68,8 @@ const fixture = async () => {
     for (const name of ["owner.json", "host.lock"]) {
       fs.writeFileSync(path.join(config.residencyRoot, name), JSON.stringify({ ...owner, pid: 2147483647, processStartTime: "1" }));
     }
+    // Its Main is gone too: a stale root participant whose recorded Main pid no longer exists.
+    mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
   };
   return { config, host, cli, create, registered, archives, mainParticipant, killResident, close: async () => {
     if (!closed) { for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true); await host.close(); }
@@ -103,7 +108,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
   it.each([
     ["a fresh root participant", fresh / 2, "live: root participant is fresh"],
     ["a reloading root participant", "reloading", "unknown: root participant is reloading"],
-    ["no root participant", undefined, undefined],
+    ["no root participant record (identity unavailable)", undefined, "no root participant record; automatic proof for roots whose records are gone: smarty-dev#7956"],
     ["a stale participant whose owner lease expired", 2 * fresh, undefined],
   ] as const)("case 1: --main-stopped under a resident-renewed lease with %s", async (_name, participant, refusal) => {
     const f = await fixture();
@@ -135,7 +140,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       // The tool's own snapshot: root lease (the resident's heartbeat), each participant and its pid check.
       expect(record.toolEvidence).toMatchObject({ host: os.hostname(), capturedAt: expect.any(String),
         rootLease: { present: true, writer: { pid: process.pid, isResident: true } } });
-      expect(record.toolEvidence.participants).toEqual(participant === undefined ? [] : expect.arrayContaining([
+      expect(record.toolEvidence.participants).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: "file", ownerHostId: f.config.rootId, lastSeen: expect.any(Number), pid: 2147483647,
           host: os.hostname(), identity: "gone: Main pid 2147483647 does not exist on this host" })]));
       expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining(["SHA256SUMS", `${actor.id}.registry.json`]));
@@ -172,6 +177,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const f = await fixture();
     try {
       const actor = await f.create("live-linked");
+      f.mainParticipant(Date.now() - 2 * fresh);
       const actorDir = path.dirname(f.host.actors.status(actor.id).sessionFile!);
       fs.mkdirSync(actorDir, { recursive: true });
       fs.symlinkSync(path.join(f.config.meshRoot, "elsewhere"), path.join(actorDir, "escape"));
@@ -211,6 +217,52 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     } finally { child.kill(); await f.close(); }
   }, 40_000);
 
+  it("offline: no root participant record with --main-stopped refuses (identity unavailable)", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("no-record");
+      await f.killResident();
+      fs.unlinkSync(participantFile(f));
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1); expect(result.err).toContain("no root participant record");
+      expectUnchanged(f, actor.id);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("offline: the resident startup claim is held for the whole removal; a busy claim refuses", async () => {
+    const f = await fixture();
+    try {
+      const busy = await f.create("busy-claim"), actor = await f.create("claimed");
+      for (const id of [busy.id, actor.id]) {
+        fs.mkdirSync(path.join(f.config.actorRoot, id), { recursive: true });
+        fs.writeFileSync(path.join(f.config.actorRoot, id, "session.jsonl"), "history\n");
+      }
+      await f.killResident();
+      const claim = path.join(f.config.residencyRoot, "host-fence-establish.lock");
+      // A resident host is starting: its startup claim is held. The removal refuses and changes nothing.
+      const held = await fileLock.lockFile(claim, 0, true);
+      try {
+        const result = await f.cli(busy.id);
+        expect(result.code).toBe(1); expect(result.err).toContain("startup claim is busy");
+      } finally { fs.closeSync(held); }
+      expectUnchanged(f, busy.id);
+      // During the removal, a resident host start on this root is refused.
+      const starts: unknown[] = [];
+      offlineRemovalHooks.afterStep = async step => {
+        if (step !== "revoke") return;
+        const host = new ResidentHost(f.config, () => {});
+        try { await host.start(); starts.push("started"); } catch (error) { starts.push(error); }
+        finally { await host.close().catch(() => undefined); }
+      };
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      expect(result).toMatchObject({ code: 0, err: "" });
+      expect(starts).toHaveLength(1);
+      expect(starts[0]).toBeInstanceOf(ResidentHostAlreadyRunning);
+      expect(f.registered(actor.id)).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
   it("live path: the CLI wait holds no periodic timer and leaves nothing pending after settle", async () => {
     const f = await fixture();
     const interval = vi.spyOn(globalThis, "setInterval");
@@ -223,6 +275,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     try {
       const actor = await f.create("timer");
       selfLease(f, 2 * fresh);
+      f.mainParticipant(Date.now() - 2 * fresh);
       let result: Awaited<ReturnType<typeof f.cli>>;
       try { result = await f.cli(actor.id); } finally { timeout.mockRestore(); }
       expect(result).toMatchObject({ code: 0, err: "" });
@@ -265,6 +318,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const getuid = process.getuid;
     try {
       const actor = await f.create("no-owner-proof");
+      f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       if (mode === "offline") await f.killResident();
@@ -410,4 +464,56 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(fs.readFileSync(path.join(output.archive, "SHA256SUMS"), "utf8")).toContain(createHash("sha256").update(fs.readFileSync(tar)).digest("hex"));
     } finally { await f.close(); }
   }, 40_000);
+});
+
+describe("ResidentActorClient wait is event-driven (smarty-dev#7817)", () => {
+  const fakeResident = () => {
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-client-wait-"));
+    const rootId = "session:client-wait";
+    const dir = residentRoot(meshRoot, rootId);
+    fs.mkdirSync(dir, { recursive: true });
+    const owner = path.join(dir, "owner.json");
+    fs.writeFileSync(owner, JSON.stringify({ format: 1, hostId: residentHostId(rootId), pid: process.pid, token: "t", startedAt: 1, readyAt: 1,
+      requestFence: 1, commands: ["operatorActor"] }));
+    const request = async (): Promise<{ requestId: string; format: number }> => {
+      for (;;) {
+        const files = fs.existsSync(path.join(dir, "requests")) ? fs.readdirSync(path.join(dir, "requests")).filter(name => name.endsWith(".json")) : [];
+        if (files.length) return JSON.parse(fs.readFileSync(path.join(dir, "requests", files[0]!), "utf8"));
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    };
+    return { client: new ResidentActorClient(meshRoot, rootId), dir, owner, request,
+      close: () => fs.rmSync(meshRoot, { recursive: true, force: true }) };
+  };
+
+  it("resolves on a response written after the call with no timer ticks", async () => {
+    const r = fakeResident();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    try {
+      const pending = r.client.operatorActor("stop", "actor", { dryRun: true });
+      const { requestId } = await r.request();
+      writeJsonAtomic(path.join(r.dir, "responses", `${requestId}.json`), { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() });
+      await expect(pending).resolves.toMatchObject({ ok: true, requestId });
+    } finally { vi.useRealTimers(); r.close(); }
+  });
+
+  it("detects a host exit through the watch", async () => {
+    const r = fakeResident();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    try {
+      const pending = r.client.operatorActor("stop", "actor", { dryRun: true });
+      await r.request();
+      fs.unlinkSync(r.owner);
+      await expect(pending).rejects.toThrow(/exited during actor request|outcome/i);
+    } finally { vi.useRealTimers(); r.close(); }
+  });
+
+  it("fails the request, undispatched, when fs.watch throws", async () => {
+    const r = fakeResident();
+    const watch = vi.spyOn(fs, "watch").mockImplementation(() => { throw Object.assign(new Error("watch unavailable"), { code: "ENOSPC" }); });
+    try {
+      await expect(r.client.operatorActor("stop", "actor", { dryRun: true })).rejects.toThrow("Cannot watch the resident host's responses");
+      expect(fs.readdirSync(path.join(r.dir, "requests"))).toEqual([]);
+    } finally { watch.mockRestore(); r.close(); }
+  });
 });

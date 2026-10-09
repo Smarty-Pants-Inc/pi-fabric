@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,8 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 beforeEach(() => installInProcessResidentFence());
@@ -38,6 +41,13 @@ const fixture = async () => {
   const host = new ResidentHost(config, () => {});
   try { await host.start(); } catch (error) { await host.close(); throw error; }
   const confirm = ["--confirm-dead-root", config.rootId];
+  // The dead owner's stale root participant: its recorded Main pid no longer exists (smarty-dev#7817).
+  writeParticipantFile(meshRoot, {
+    key: "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex"),
+    value: { id: config.rootId, rootId: config.rootId, kind: "root", ownerHostId: config.rootId, ownerIdentityId: config.rootId,
+      mainProcess: { pid: 2147483647, host: os.hostname(), startTime: "1" } },
+    version: 1, updatedAt: Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS, updatedBy: { id: config.rootId, name: "main", kind: "main" },
+  });
   const mainStopped = ["--main-stopped", "--evidence", "herdr agent list / ps: no Main for this session"];
   const cli = async (action: "stop" | "remove", actor: string, flags: string[] = [], resident = config.residencyRoot) => {
     let out = "", err = "";

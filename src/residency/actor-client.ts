@@ -27,14 +27,12 @@ import {
   RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
   residentRoot,
-  sleepUnlessAborted,
   type ResidentCommand,
   type ResidentCommandResponse,
   type ResidentActorMutation,
 } from "./protocol.js";
 
 const COMMAND_TIMEOUT_MS = 30_000;
-const STATUS_POLL_MS = 100;
 
 const readJson = <T>(filePath: string): T | undefined => {
   try {
@@ -159,17 +157,48 @@ export class ResidentActorClient {
     command = residentCommandForOwner(command, owner);
     registerResidentCancellation(signal, this.#residencyDir, command);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
+    fs.mkdirSync(this.#responsesPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
-    let responseWatcher: fs.FSWatcher | undefined;
+    // Event-driven wait (smarty-dev#7817): watch the responses and the owner record's directory
+    // BEFORE the request is written, so no response or host exit can slip between write and wait.
+    // Wake only on those events, one deadline timer and the abort signal; no polling fallback.
+    let dirty = true;
+    let wake: (() => void) | undefined;
+    const notify = (): void => { dirty = true; wake?.(); };
+    const watchers: fs.FSWatcher[] = [];
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let expired = false;
+    const onAbort = (): void => notify();
+    const cleanup = (): void => {
+      for (const watcher of watchers) watcher.close();
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    try {
+      for (const directory of [this.#responsesPath, path.dirname(this.#ownerPath)]) {
+        const watcher = fs.watch(directory, { persistent: false }, notify);
+        watcher.on("error", notify);
+        watchers.push(watcher);
+      }
+    } catch (error) {
+      cleanup();
+      throw new Error(`Cannot watch the resident host's responses (${error instanceof Error ? error.message : String(error)}); no request was dispatched`);
+    }
     try {
       writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
-      const deadline = Date.now() + this.commandTimeoutMs;
-      // Event-driven: a write in the responses directory wakes the wait at once. ponytail: the short
-      // timed re-check stays as the fallback for a missed watch event (fs.watch is best effort).
-      let wake: (() => void) | undefined;
-      try { responseWatcher = fs.watch(this.#responsesPath, { persistent: false }, () => wake?.()); } catch { /* polled */ }
-      while (Date.now() < deadline) {
+      // Unref'd as before: a standalone caller (the fabric-actors CLI) keeps its own ref'd deadline timer.
+      deadlineTimer = setTimeout(() => { expired = true; notify(); }, this.commandTimeoutMs);
+      deadlineTimer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      for (;;) {
         if (signal?.aborted) throw new Error("Resident host actor request was aborted");
+        if (!dirty) {
+          if (expired) break;
+          await new Promise<void>(resolve => { wake = resolve; if (dirty || expired || signal?.aborted) resolve(); });
+          wake = undefined;
+          continue;
+        }
+        dirty = false;
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.#residencyDir, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
@@ -191,8 +220,6 @@ export class ResidentActorClient {
         }
         const owner = readJson<{ pid?: number }>(this.#ownerPath);
         if (!owner?.pid) throw new Error("Root resident host exited during actor request");
-        await new Promise<void>(resolve => { wake = resolve; void sleepUnlessAborted(STATUS_POLL_MS, signal).then(resolve, resolve); });
-        wake = undefined;
       }
       const note = residentHostStateNote(this.#residencyDir);
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
@@ -211,6 +238,6 @@ export class ResidentActorClient {
       }
       if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
-    } finally { responseWatcher?.close(); }
+    } finally { cleanup(); }
   }
 }

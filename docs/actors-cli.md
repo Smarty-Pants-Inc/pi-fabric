@@ -22,6 +22,12 @@ the time. The tool adds its own observation at removal time (`toolEvidence`): ev
 the record, the owner lease state, and the time. The record is archived as `<id>.operator.json` (in
 `SHA256SUMS`, beside the actor's tar and registry row) and, offline, kept in the removal record.
 
+With `--main-stopped` the tool verifies every root participant record's Main process (pid, host, start time):
+the pid must be gone from this host, or reused with a different start time. A record without that identity,
+from another host, or a root with no participant record at all refuses as "identity unavailable"; the
+automatic proof for roots whose records are gone is smarty-dev#7956. Offline removal holds the root's resident
+startup claim (`host-fence-establish.lock`) and `host.lock` throughout, so no resident host starts meanwhile.
+
 The attestation never overrides an observation: a live root lease (other than the resident's own heartbeat),
 a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When
 the resident host itself is dead, `remove` runs offline under its `host.lock` fence (dead holders, a claimable

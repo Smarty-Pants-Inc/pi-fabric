@@ -240,7 +240,17 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
   options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: MainStoppedAudit } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
   assertOwnershipProvable(); // before the fence, any record or any mutation
-  const fd = await claimFence(directory);
+  // The root's existing resident startup claim, held for the whole removal, in the host's own order
+  // (startup claim, then host.lock): no resident host can start on this root meanwhile; it gets
+  // ResidentHostAlreadyRunning. A busy claim (a host starting now) refuses. Same lock path and helper.
+  let startupClaim: number;
+  try { startupClaim = await lockFile(path.join(directory, "host-fence-establish.lock"), 0, true); }
+  catch (error) {
+    throw new Error(`Root resident startup claim is busy (a resident host is starting): ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let fd: number;
+  try { fd = await claimFence(directory); }
+  catch (error) { fs.closeSync(startupClaim); throw error; }
   let mesh: MeshStore | undefined;
   let tree: PinnedActorTree | undefined;
   try {
@@ -345,5 +355,6 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     tree?.close();
     mesh?.closeState();
     fs.closeSync(fd);
+    fs.closeSync(startupClaim);
   }
 };

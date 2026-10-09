@@ -1535,6 +1535,8 @@ export class ResidentHost {
         }
         // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
         const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
+        // The live path needs no startup claim: this running host holds host.lock for its whole life, so no
+        // other resident host can start on this root while it executes the removal (smarty-dev#7817).
         // Remove needs the operator's --main-stopped assertion (smarty-dev#7956 carries automatic proof);
         // it never overrides a live lease or a fresh, reloading or doubtful root participant.
         const mainStopped = command.action === "remove" ? command.mainStoppedAudit !== undefined : undefined;

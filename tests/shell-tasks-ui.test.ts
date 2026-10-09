@@ -66,7 +66,7 @@ describe("background shell UI", () => {
       expect(lines[0]).toContain(ansiTheme.fg("dim", " · /fabric tasks · ctrl+alt+t"));
       expect(lines[1]).toBe(
         `  ${ansiTheme.fg(color, glyph)} ${ansiTheme.fg("muted", "7b6eb606")} ${ansiTheme.fg("muted", status)}` +
-        `${ansiTheme.fg("dim", " · 3s · ")}${ansiTheme.fg("muted", description ? "Watch CI 界" : "sleep 30")}`,
+        `${ansiTheme.fg("dim", job.finishedAt === undefined ? " · " : " · 3s · ")}${ansiTheme.fg("muted", description ? "Watch CI 界" : "sleep 30")}`,
       );
       for (const width of [1, 12, 40, 80]) {
         expect(widget.render(width).every(line => visibleWidth(line) <= width)).toBe(true);
@@ -90,7 +90,7 @@ describe("background shell UI", () => {
     expect(widget.hasChanged()).toBe(false);
     expect(widget.render(120)[1]).toMatch(/^  ✓ /);
   });
-  it("keeps the widget live after the executor is idle and refreshes elapsed time without output", async () => {
+  it("keeps active shell status visible without recurring elapsed refreshes and expires it on the next event", async () => {
     vi.useFakeTimers(); vi.setSystemTime(10000);
     const h = fixture(); h.controller.start(h.context);
     expect(vi.getTimerCount()).toBe(0);
@@ -104,12 +104,22 @@ describe("background shell UI", () => {
     expect(widget.render(80).join("\n")).toContain("/fabric tasks");
     expect(widget.render(80).join("\n")).toContain("Watch CI");
     const actors = vi.spyOn(h.state.actors, "list");
+    h.requestRender.mockClear();
+    const eventTime = h.controller.snapshot().now;
+    expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(3000);
     expect(actors).not.toHaveBeenCalled();
-    expect(h.requestRender).toHaveBeenCalled();
-    expect(widget.render(80).join("\n")).toContain("3s");
+    expect(h.requestRender).not.toHaveBeenCalled();
+    expect(h.controller.snapshot().now).toBe(eventTime);
+    expect(widget.render(80).join("\n")).not.toContain("3s");
     await job.finish(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.requestRender).toHaveBeenCalled();
+    expect(widget.render(80).join("\n")).toContain("3s"); // Fixed completion duration.
+    expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(31000);
+    expect(shouldShowFabricWidget(h.controller.snapshot(), "auto")).toBe(true); // Quiet state is unchanged.
+    h.controller.setHostStreaming(false); // Next explicit event observes age expiry.
     expect(shouldShowFabricWidget(h.controller.snapshot(), "auto")).toBe(false);
     h.controller.stop(); expect(vi.getTimerCount()).toBe(0);
   });

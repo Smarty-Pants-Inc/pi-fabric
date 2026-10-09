@@ -2649,7 +2649,7 @@ export class ActorManager {
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
       this.#closing = true;
-      this.#closePromise = this.#close();
+      this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
@@ -2725,6 +2725,7 @@ export class ActorManager {
     await Promise.allSettled(
       [...this.#actors.values()].map((actor) => actor.drain ?? Promise.resolve()),
     );
+    this.#registry.releaseReadCache();
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 

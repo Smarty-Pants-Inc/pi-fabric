@@ -72,7 +72,6 @@ export class FabricUiController {
   #closeTasks: (() => void) | undefined;
   #scheduledRefresh: NodeJS.Timeout | undefined;
   #widgetTui: TUI | undefined;
-  #widgetClock: NodeJS.Timeout | undefined;
   #conversationWatchKey: string | undefined;
   #conversationWatches: fs.FSWatcher[] = [];
   #dashboardTui: TUI | undefined;
@@ -148,8 +147,6 @@ export class FabricUiController {
     this.#meshUnsubscribe = undefined;
     this.#scheduledRefresh = undefined;
     this.#widget = undefined;
-    if (this.#widgetClock) clearTimeout(this.#widgetClock);
-    this.#widgetClock = undefined;
     this.#activityUnsubscribe?.();
     this.#activityUnsubscribe = undefined;
     this.#actorUnsubscribe?.();
@@ -792,33 +789,6 @@ export class FabricUiController {
     if (this.#conversationWatches.length === directories.size) this.#conversationWatchKey = key;
   }
 
-  /** Elapsed-label animation only: never lists managers, reads registries, or polls the mesh. */
-  #scheduleWidgetClock(): void {
-    const active = !this.#dashboardOpen && this.#widgetTui && (
-      this.#snapshot.main.status === "running" || this.#snapshot.runs.some(run => run.status === "running") ||
-      this.#snapshot.agents.some(agent => isActiveStatus(agent.status)) ||
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30_000)
-    );
-    if (!active) {
-      if (this.#widgetClock) clearTimeout(this.#widgetClock);
-      this.#widgetClock = undefined;
-      return;
-    }
-    if (this.#widgetClock) return;
-    const epoch = this.#epoch;
-    this.#widgetClock = setTimeout(() => {
-      if (epoch !== this.#epoch) return;
-      this.#widgetClock = undefined;
-      this.#runBackground(epoch, () => {
-        this.#snapshot = { ...this.#snapshot, now: Date.now() };
-        if (this.#context) this.#renderWidget(this.#context);
-        if (this.#widget?.hasChanged()) this.#widgetTui?.requestRender();
-        this.#scheduleWidgetClock();
-      });
-    }, 1_000);
-    this.#widgetClock.unref();
-  }
-
   #refresh(): void {
     this.#lastRefreshAt = performance.now();
     const context = this.#context;
@@ -863,7 +833,6 @@ export class FabricUiController {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
       this.#renderWidget(context);
-      this.#scheduleWidgetClock();
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
       if (this.#conversationTui && this.#conversationView?.refresh?.() !== false) {

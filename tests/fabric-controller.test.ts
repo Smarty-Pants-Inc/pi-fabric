@@ -1118,7 +1118,7 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("contains render-only clock faults from a disposed TUI without rearming", async () => {
+  it("contains event-render faults from a disposed TUI without rearming", async () => {
     vi.useFakeTimers();
     const state = stubState();
     Object.assign(state.config.ui, { widget: "auto", maxRows: 6 });
@@ -1137,6 +1137,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       vi.mocked(tui.requestRender).mockImplementation(() => { throw new Error("disposed TUI"); });
+      activity.beginCall("live", { callId: "disposed", ref: "pi.read", args: {} });
       await vi.advanceTimersByTimeAsync(1_000);
       expect(context.ui.notify).toHaveBeenCalledWith(expect.stringContaining("disposed TUI"), "warning");
       expect(vi.getTimerCount()).toBe(0);
@@ -1145,7 +1146,7 @@ describe("FabricUiController dashboard wiring", () => {
     } finally { controller.stop(); vi.useRealTimers(); }
   });
 
-  it("animates widget elapsed labels without polling managers while nested calls are idle", async () => {
+  it("redraws visible active work only on progress/finish events, with no elapsed clock", async () => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.widget = "auto";
@@ -1188,8 +1189,9 @@ describe("FabricUiController dashboard wiring", () => {
       expect(first).toContain("T06 slice A");
       expect(first).toContain("6/6 calls");
       expect(first.split("\n")).toHaveLength(reserved.length);
-      // Sub-second elapsed stays hidden, so the clock shows its first real tick.
-      expect(first).toMatch(/1s/);
+      expect(first).not.toMatch(/\b\d+s\b/);
+      expect(vi.getTimerCount()).toBe(0);
+      const eventTime = controller.snapshot().now;
       expect(controller.snapshot().runs[0]?.status).toBe("running");
       requestRender.mockClear();
       vi.mocked(state.actors.list).mockClear();
@@ -1198,9 +1200,17 @@ describe("FabricUiController dashboard wiring", () => {
       const elapsedMs =
         controller.snapshot().now - controller.snapshot().runs[0]!.startedAt;
       const second = widget!.render(80).join("\n");
-      expect(elapsedMs).toBeGreaterThanOrEqual(5_000);
-      expect(second).toMatch(/6s/);
+      expect(controller.snapshot().now).toBe(eventTime);
+      expect(elapsedMs).toBeLessThan(5_000);
+      expect(second).toBe(first);
+      expect(requestRender).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      activity.beginCall("live", { callId: "progress", ref: "pi.read", args: {} });
+      await vi.advanceTimersByTimeAsync(110);
       expect(requestRender).toHaveBeenCalled();
+      expect(controller.snapshot().now).toBeGreaterThan(eventTime);
+      expect(widget!.render(80).join("\n")).toContain("6/7 calls");
+      expect(vi.getTimerCount()).toBe(0);
       activity.finish("live", true);
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
       await vi.advanceTimersByTimeAsync(110);

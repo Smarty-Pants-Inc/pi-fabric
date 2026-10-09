@@ -21,6 +21,35 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore cached read (#7791)", () => {
+  it("bounds decoded generations to 64 paths and promotes hits before LRU eviction", () => {
+    const fixtures = Array.from({ length: 65 }, () => setup());
+    const views = fixtures.slice(0, 64).map(({ store }) => store.read());
+    expect(fixtures[0]!.store.read()).toBe(views[0]); // Most recently used, not oldest inserted.
+    fixtures[64]!.store.read();
+    const parse = vi.spyOn(JSON, "parse");
+    expect(fixtures[0]!.store.read()).toBe(views[0]);
+    expect(parse).not.toHaveBeenCalled();
+    expect(fixtures[1]!.store.read()).not.toBe(views[1]);
+    expect(parse).toHaveBeenCalledTimes(1);
+    // Reading the evicted path inserts it and evicts the next least recent path.
+    expect(fixtures[2]!.store.read()).not.toBe(views[2]);
+    expect(parse).toHaveBeenCalledTimes(2);
+  });
+
+  it("explicit release evicts the shared normalized path but preserves other roots", () => {
+    const { root, store } = setup();
+    const alias = new ActorRegistryStore(path.join(root, "."));
+    const other = setup().store;
+    const before = store.read(), retained = other.read();
+    alias.releaseReadCache();
+    const parse = vi.spyOn(JSON, "parse");
+    expect(store.read()).not.toBe(before);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(other.read()).toBe(retained);
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+
+
   it("parses once for 1,000 unchanged reads with one fstat per read, shared across path aliases", () => {
     const { root, value, store } = setup();
     const alias = new ActorRegistryStore(path.join(root, "."));

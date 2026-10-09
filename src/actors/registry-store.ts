@@ -62,6 +62,9 @@ const freezeRegistryValue = <T>(value: T): T => {
 // Stores naming the same normalized path share one immutable decoded generation.
 // Read identity is taken from the open descriptor, so an atomic rename between
 // lookup and decoding cannot cache new bytes under the old inode (or vice versa).
+// Keep at most 64 normalized paths, least recently read first. Managers also
+// release their path on close; ad-hoc store readers remain bounded by this LRU.
+const REGISTRY_READ_CACHE_LIMIT = 64;
 const registryReadCache = new Map<string, { generation: string; value: unknown }>();
 
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
@@ -433,16 +436,32 @@ export class ActorRegistryStore {
     }
   }
 
+  /** Release shared decoded state when its manager closes or its root is removed. */
+  releaseReadCache(): void {
+    registryReadCache.delete(this.#registryPath);
+    this.#snapshot = undefined;
+  }
+
   /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
-    const fd = fs.openSync(this.#registryPath, "r");
+    let fd: number;
+    try { fd = fs.openSync(this.#registryPath, "r"); }
+    catch (error) { this.releaseReadCache(); throw error; }
     try {
       const stat = fs.fstatSync(fd, { bigint: true });
       const generation = `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.size}`;
       const cached = registryReadCache.get(this.#registryPath);
-      if (cached?.generation === generation) return cached.value;
+      // Delete/reinsert promotes both unchanged and replaced generations.
+      registryReadCache.delete(this.#registryPath);
+      if (cached?.generation === generation) {
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
       const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
       registryReadCache.set(this.#registryPath, { generation, value });
+      if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
+        registryReadCache.delete(registryReadCache.keys().next().value!);
+      }
       return value;
     } finally {
       fs.closeSync(fd);

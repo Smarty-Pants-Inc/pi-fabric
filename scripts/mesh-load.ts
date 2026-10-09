@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import fs from "node:fs";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { readLockStats, summarizeLockStats } from "../src/mesh/commit-stats.js";
+import { createScratchRoot, requireScratchRoot, MeshLoadRootError } from "./mesh-load-scratch.js";
 
 const args = new Map<string, string | true>();
 for (let i = 2; i < process.argv.length; i++) {
@@ -93,8 +94,10 @@ const seedState = async (root: string, mb: number): Promise<{
     store.closeState();
   }
 };
-const USAGE = `Usage: bun scripts/mesh-load.ts --root <dir> --target-writes-per-min <n> --target-processes <n> [options]
-  --root <dir>                 mesh root (required; never inferred)
+const USAGE = `Usage: bun scripts/mesh-load.ts [--root <dir>] --target-writes-per-min <n> --target-processes <n> [options]
+  --root <dir>                 reuse a script-created scratch root containing .mesh-load-scratch;
+                               omitted: create a private mkdtemp root under os.tmpdir(). Live mesh roots,
+                               their ancestors/descendants and symlink aliases are always refused
   --target-writes-per-min <n>  mesh writes/min to sustain; at least ${HEARTBEAT_WRITES_PER_MIN} x --target-processes,
                                because each worker heartbeats every 5 s (${HEARTBEAT_WRITES_PER_MIN} writes/min)
   --target-processes <n>       minimum worker processes (positive integer)
@@ -130,8 +133,19 @@ const usageError = (message: string): never => {
   process.exit(2);
 };
 
+const scratchRootOrExit = (root?: string): string => {
+  try { return root === undefined ? createScratchRoot() : requireScratchRoot(root); }
+  catch (error) {
+    if (!(error instanceof MeshLoadRootError)) throw error;
+    process.stderr.write(`mesh-load: ${error.name} [${error.code}]: ${error.message}\n`);
+    process.exit(2);
+  }
+};
+
 if (args.has("--worker")) {
-  const root = String(args.get("--root"));
+  const rootArg = args.get("--root");
+  if (typeof rootArg !== "string" || !rootArg.trim()) usageError("--worker requires a marked --root");
+  const root = scratchRootOrExit(rootArg as string);
   const id = String(args.get("--id"));
   const rate = Math.max(0, number("--rate", 1));
   const putShare = Math.min(1, Math.max(0, number("--put-share", 0)));
@@ -216,9 +230,10 @@ if (args.has("--worker")) {
 } else {
   if (args.has("--help")) { process.stdout.write(USAGE); process.exit(0); }
   const rootArg = args.get("--root");
-  if (typeof rootArg !== "string" || !rootArg.trim()) usageError("--root is required; mesh-load never infers a mesh root");
+  if (rootArg !== undefined && (typeof rootArg !== "string" || !rootArg.trim())) usageError("--root must name a marked scratch directory");
+  if (args.has("--dry-run") && rootArg === undefined) usageError("--dry-run requires a marked --root (no scratch is created)");
   if (os.hostname().toLowerCase().startsWith("epyc1") && !args.has("--allow-epyc1")) throw new Error("refusing to run on epyc1 without --allow-epyc1");
-  const root = path.resolve(rootArg as string);
+  let root = typeof rootArg === "string" ? scratchRootOrExit(rootArg) : "";
   const target = number("--target-writes-per-min", NaN);
   const requested = number("--target-processes", NaN);
   const maxWorkers = number("--max-workers", 64);
@@ -309,6 +324,7 @@ if (args.has("--worker")) {
       seedStateMb: seedMb, putShare, custodyShare, maxInFlight, controlIntervalSec: controlIntervalS }) + "\n");
     process.exit(0);
   }
+  if (!root) root = scratchRootOrExit();
   const store = new MeshStore(root, 64 * 1024, 100);
   const backend = store.stateBackend;
   store.closeState();

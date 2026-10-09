@@ -101,12 +101,14 @@ The fleet hub runs at 55-65% busy with 25-40 timeouts/min. On a fresh mesh, hold
 | put 0.4, custody 0.4, target 2400, 10 procs (→13) | 483 | 1044 | 35.3 ms (custody 95) | 61.4 (1 full minute) | ≤2.5 s | 17 | 1.45 |
 | **hub profile**: put 0.4, custody 0.4, target 2400, 12 procs fixed | 373 | 904 | 40.4 ms (custody 126, put 25.7) | **60.9 (64.1/57.7)** | ≤1 s | 19.5 | 1.15 |
 
-Hub profile, about 60% busy at about 20 timeouts/min. Add processes or raise `--custody-share` to push the timeouts toward the hub's 25-40/min:
+Hub profile, about 60% busy at about 20 timeouts/min. Add processes or raise `--custody-share` to push the timeouts toward the hub's 25-40/min. Omit `--root` for a fresh private scratch mesh under `os.tmpdir()` (set `TMPDIR` to a private scratch directory first):
 
 ```sh
-nice -n 10 taskset -c 4-11 bun scripts/mesh-load.ts --root <scratch-mesh> --seed-state-mb 4.8 \
+nice -n 10 taskset -c 4-11 bun scripts/mesh-load.ts --seed-state-mb 4.8 \
   --put-share 0.4 --custody-share 0.4 --target-writes-per-min 2400 --target-processes 12 --max-workers 12 --duration 600
 ```
+
+The script reports the created root on stderr and writes `.mesh-load-scratch` there. Reuse it with `--root <reported-scratch-root>`; existing unmarked roots, copied/symlink markers, live mesh roots, their ancestors/descendants, and symlink aliases are refused with a typed error and exit 2 before any mesh backend is opened. Live-path protection covers environment/configured roots and the shared-home `~/.local/share/smarty-dev/fabric-mesh/` namespace, even when a scratch marker is present. `--dry-run` requires an already marked root and creates nothing. For SQLite, create a scratch root with a short file-backend run first, import that **scratch** root with `fabric-mesh-backend import --root <reported-scratch-root>`, then rerun with `PI_FABRIC_MESH_STATE_BACKEND=sqlite`. Never import or load a live mesh for this benchmark.
 
 The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy and does not queue them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
 

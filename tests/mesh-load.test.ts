@@ -6,12 +6,13 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshStateBackendKind } from "../src/mesh/store.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
+import { createScratchRoot, requireScratchRoot, SCRATCH_MARKER } from "../scripts/mesh-load-scratch.js";
 
 const script = fileURLToPath(new URL("../scripts/mesh-load.ts", import.meta.url));
 const roots: string[] = [];
 const running: ChildProcessWithoutNullStreams[] = [];
 const tempRoot = () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-mesh-load-"));
+  const root = createScratchRoot();
   roots.push(root);
   return root;
 };
@@ -64,6 +65,128 @@ const waitFor = async (check: () => boolean, ms = 20_000) => {
   while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
   return check();
 };
+
+describe("mesh-load root safety", () => {
+  const probe = (root: string, env: NodeJS.ProcessEnv = {}, extra: string[] = [], cwd?: string) => spawnSync("bun",
+    [script, "--root", root, "--target-writes-per-min", "12", "--target-processes", "1",
+      "--seed-state-mb", "0.3", "--duration", "0.01", ...extra],
+    { encoding: "utf8", timeout: 5_000, ...(cwd ? { cwd } : {}), env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "sqlite", ...env } });
+  const refused = (result: ReturnType<typeof probe>, code: string) => {
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain(`MeshLoadRootError [${code}]`);
+    expect(result.stderr).not.toMatch(/mesh-load: (?:seeded|run)/);
+    expect(result.stdout).toBe("");
+  };
+
+  it("refuses a live root, its parent and descendants before any backend is opened, including worker/dry-run entry", () => {
+    const parent = tempRoot();
+    const live = path.join(parent, "live");
+    fs.mkdirSync(live);
+    const sentinel = path.join(live, "state.db");
+    fs.writeFileSync(sentinel, "do not open this live database");
+    const before = fs.readdirSync(live);
+    for (const selector of ["PI_FABRIC_MESH_DIR", "PI_FABRIC_MESH_ROOT"]) {
+      for (const root of [live, parent, path.join(live, "child")]) {
+        for (const extra of [[], ["--worker", "--id", "guard-test"], ["--dry-run"]]) {
+          refused(probe(root, { [selector]: live }, extra), "MESH_LOAD_LIVE_ROOT");
+        }
+      }
+    }
+    expect(fs.readdirSync(live)).toEqual(before);
+    expect(fs.readFileSync(sentinel, "utf8")).toBe("do not open this live database");
+    expect(fs.existsSync(path.join(parent, "state.db"))).toBe(false);
+  });
+
+  it("refuses symlink aliases of live roots, live config aliases, and missing descendants through aliases", () => {
+    const parent = tempRoot();
+    const live = path.join(parent, "live");
+    const alias = path.join(parent, "alias");
+    fs.mkdirSync(live);
+    fs.symlinkSync(live, alias, process.platform === "win32" ? "junction" : "dir");
+    for (const root of [alias, path.join(alias, "missing")]) refused(probe(root, { PI_FABRIC_MESH_DIR: live }), "MESH_LOAD_LIVE_ROOT");
+    refused(probe(live, { PI_FABRIC_MESH_DIR: alias }), "MESH_LOAD_LIVE_ROOT");
+    expect(fs.readdirSync(live)).toEqual([]);
+  });
+
+  it.each(["dir", "root"])("refuses fabric.json mesh.%s from both host and project config, relative to the project root", (key) => {
+    const parent = tempRoot();
+    const live = path.join(parent, "configured-live");
+    const agent = path.join(parent, "agent");
+    const projectConfig = path.join(parent, ".pi");
+    fs.mkdirSync(live);
+    fs.mkdirSync(agent);
+    fs.mkdirSync(projectConfig);
+    const env = { PI_FABRIC_MESH_ROOT: "", PI_FABRIC_MESH_DIR: "", PI_FABRIC_PROJECT_ROOT: parent, PI_CODING_AGENT_DIR: agent };
+    for (const configDir of [agent, projectConfig]) {
+      fs.writeFileSync(path.join(configDir, "fabric.json"), JSON.stringify({ mesh: { [key]: "configured-live" } }));
+      refused(probe(live, env, [], parent), "MESH_LOAD_LIVE_ROOT");
+    }
+    expect(fs.readdirSync(live)).toEqual([]);
+  });
+
+  it("refuses every shared-home default mesh and its parent even with an environment override", () => {
+    const home = tempRoot();
+    const namespace = path.join(home, ".local", "share", "smarty-dev", "fabric-mesh");
+    const live = path.join(namespace, "default");
+    fs.mkdirSync(live, { recursive: true });
+    for (const root of [live, namespace, path.join(live, "missing")]) {
+      refused(probe(root, { HOME: home, USERPROFILE: home, PI_FABRIC_MESH_DIR: path.join(home, "other-live") }), "MESH_LOAD_LIVE_ROOT");
+    }
+    expect(fs.readdirSync(live)).toEqual([]);
+  });
+
+  it("refuses unmarked existing and nonexistent explicit roots without creating state or a marker", () => {
+    const parent = tempRoot();
+    const unmarked = path.join(parent, "unmarked");
+    fs.mkdirSync(unmarked);
+    for (const root of [unmarked, path.join(parent, "missing")]) {
+      refused(probe(root), "MESH_LOAD_NOT_SCRATCH");
+      refused(probe(root, {}, ["--worker", "--id", "guard-test"]), "MESH_LOAD_NOT_SCRATCH");
+    }
+    expect(fs.readdirSync(unmarked)).toEqual([]);
+    expect(fs.existsSync(path.join(parent, "missing"))).toBe(false);
+  });
+
+  it("rejects copied markers and symlink markers", () => {
+    const source = tempRoot();
+    const parent = tempRoot();
+    const copy = path.join(parent, "copy");
+    const alias = path.join(parent, "alias");
+    fs.mkdirSync(copy);
+    fs.mkdirSync(alias);
+    fs.copyFileSync(path.join(source, SCRATCH_MARKER), path.join(copy, SCRATCH_MARKER));
+    fs.symlinkSync(path.join(source, SCRATCH_MARKER), path.join(alias, SCRATCH_MARKER));
+    for (const root of [copy, alias]) refused(probe(root), "MESH_LOAD_NOT_SCRATCH");
+  });
+
+  it("creates a private mkdtemp root with its marker and permits a rerun on that marked root", async () => {
+    const first = start(["--target-writes-per-min", "12", "--target-processes", "1", "--duration", "0.01"], {}, 5_000);
+    await runId(first.out);
+    const root = /run [0-9a-f]{8} root (.+) backend=/.exec(first.out.stderr)![1]!;
+    roots.push(root);
+    expect(await first.exit, first.out.stderr).toBe(0);
+    expect(path.dirname(root)).toBe(fs.realpathSync(os.tmpdir()));
+    expect(path.basename(root)).toMatch(/^fabric-mesh-load-/);
+    expect(JSON.parse(fs.readFileSync(path.join(root, SCRATCH_MARKER), "utf8"))).toEqual({ format: "mesh-load-scratch/1", root });
+    if (process.platform !== "win32") expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    expect(requireScratchRoot(root)).toBe(root);
+    const again = start(["--root", root, "--target-writes-per-min", "12", "--target-processes", "1", "--duration", "0.01"], {}, 5_000);
+    expect(await again.exit, again.out.stderr).toBe(0);
+    expect(finalReport(again.out)).toMatchObject({ final: true, backend: "file" });
+    expect(synthetic(root)).toEqual([]);
+  });
+
+  it("refuses to create scratch when TMPDIR is inside live mesh, without creating even a marker", () => {
+    const live = tempRoot();
+    const before = fs.readdirSync(live);
+    const result = spawnSync("bun", [script, "--target-writes-per-min", "12", "--target-processes", "1", "--duration", "0.01"],
+      { encoding: "utf8", timeout: 5_000, env: { ...process.env, TMPDIR: live, TMP: live, TEMP: live, PI_FABRIC_MESH_DIR: live } });
+    refused(result, "MESH_LOAD_LIVE_ROOT");
+    expect(fs.readdirSync(live)).toEqual(before);
+  });
+});
 
 describe("mesh-load", () => {
   it("drives real mesh writes and cleans synthetic presence on termination", async () => {

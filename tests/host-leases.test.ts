@@ -91,7 +91,7 @@ describe("host lease files on a transient read failure", () => {
     } finally { abort.abort(); }
   });
 
-  it("all publishers/removers share wx exclusion and a held renewal is skipped, not superseded", () => {
+  it("all publishers/removers share atomic exclusion and a held renewal is skipped, not superseded", () => {
     const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
     writeHostLease(root, original);
     const release = acquireHostLeasePublishLock(root, original.id);

@@ -642,11 +642,18 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
 
   it.each(["main spawn", "nested create"] as const)("%s reports unknown rather than rejection if atomic abandonment cannot be established", async (kind) => {
     const state = await harness(false);
-    vi.spyOn(fs, "linkSync").mockImplementation(() => { throw Object.assign(new Error("fence unavailable"), { code: "EPERM" }); });
+    const link = fs.linkSync.bind(fs);
+    const unavailable = vi.fn(() => { throw Object.assign(new Error("fence unavailable"), { code: "EPERM" }); });
+    vi.spyOn(fs, "linkSync").mockImplementation((source, target) => {
+      // Fault only the abandonment/commit fence, not independent lease admission.
+      if (path.dirname(String(target)) === path.join(state.residencyRoot, "decisions")) unavailable();
+      else link(source, target);
+    });
     try {
       const error = await send(state, kind, new AbortController().signal).catch((error: Error) => error);
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: expect.any(String) });
       expect((error as Error).message).toContain("fence unavailable");
+      expect(unavailable).toHaveBeenCalled();
       expect(entries(state.residencyRoot, "agents")).toEqual([]);
       expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
     } finally { vi.restoreAllMocks(); await state.close(); }

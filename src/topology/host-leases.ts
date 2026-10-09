@@ -128,7 +128,8 @@ interface PublishOwner { pid: number; startTime: string | null; token: string }
 const readPublishOwner = (lock: string): PublishOwner | undefined => {
   try {
     const stat = fs.lstatSync(lock);
-    if (!stat.isFile() || stat.nlink !== 1) return undefined;
+    // Publication briefly has two links; a crash after link can leave the staging link.
+    if (!stat.isFile()) return undefined;
     const value = JSON.parse(fs.readFileSync(lock, "utf8")) as PublishOwner;
     return Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.token === "string" && value.token.length > 0 &&
       (value.startTime === null || typeof value.startTime === "string") ? value : undefined;
@@ -156,25 +157,30 @@ export const acquireHostLeasePublishLock = (meshRoot: string, hostId: string): (
   const lock = hostLeasePublishLockPath(meshRoot, hostId);
   fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
   const owner: PublishOwner = { pid: process.pid, startTime: publishStartTime() ?? null, token: randomUUID() };
-  let fd: number;
-  try { fd = fs.openSync(lock, "wx", 0o600); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HostLeasePublishLockBusyError(lock);
-    throw error;
-  }
-  try { fs.writeFileSync(fd, JSON.stringify(owner)); }
-  catch (error) {
-    fs.closeSync(fd);
-    // A torn receipt is UNKNOWN, not reclaimable by age or unconditional unlink.
-    if (readPublishOwner(lock)?.token === owner.token) fs.unlinkSync(lock);
-    throw error;
-  }
-  fs.closeSync(fd);
-  return () => {
+  const temporary = `${lock}.${process.pid}.${owner.token}.tmp`;
+  const release = (): void => {
     // A delayed release is never permission to unlink a successor's receipt.
     try { if (readPublishOwner(lock)?.token === owner.token) fs.unlinkSync(lock); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   };
+  let published = false;
+  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(owner));
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    // The exclusive link makes the complete, durable receipt visible in one syscall.
+    try { fs.linkSync(temporary, lock); published = true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HostLeasePublishLockBusyError(lock);
+      throw error;
+    }
+  } finally {
+    try { fs.rmSync(temporary, { force: true }); }
+    catch (error) { if (published) release(); throw error; }
+  }
+  return release;
 };
 
 export const withHostLeasePublishLock = <T>(meshRoot: string, hostId: string, operation: () => T): T => {
@@ -186,10 +192,48 @@ export const withHostLeasePublishLock = <T>(meshRoot: string, hostId: string, op
  * custody. Two reclaimers cannot compare the dead token then unlink a fresh holder.
  * Only ESRCH or a different native process start identity is proof; never age. */
 type LeasePublishCustody = { root: string; custody<T>(operation: () => T): Promise<T> };
+const processGone = (pid: number): boolean => {
+  try { process.kill(pid, 0); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  return false;
+};
+
+/** New publishers cannot tear a visible receipt. For legacy/external corruption,
+ * the current lease's same-host writer is independent owner evidence. No lease,
+ * foreign/unknown writer, live PID (including reuse), or probe error stays held.
+ * Wall-clock writer.startedAt and lock age NEVER prove a native process dead. */
+const recoverMalformedPublishLock = async (mesh: LeasePublishCustody, lock: string): Promise<void> => {
+  let seen: fs.BigIntStats;
+  try { seen = fs.lstatSync(lock, { bigint: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  const file = lock.slice(0, -".publish.lock".length);
+  const readLease = (): FabricHostLease | undefined => parseLease(file, path.basename(file)).lease;
+  const lease = readLease(), writer = lease?.writer;
+  if (!seen.isFile() || seen.nlink !== 1n || !writer || writer.host !== os.hostname() || !processGone(writer.pid)) {
+    console.warn(`[pi-fabric] invalid host lease publish lock ${lock}; retaining: no provably dead local lease writer`);
+    return;
+  }
+  await mesh.custody(() => {
+    let current: fs.BigIntStats;
+    try { current = fs.lstatSync(lock, { bigint: true }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    // No receipt token exists: fence the exact corrupt inode/bytes AND independent
+    // lease ownership instead. A concurrent reclaimer/successor changes this fence.
+    if (current.dev !== seen.dev || current.ino !== seen.ino || current.size !== seen.size ||
+      current.mtimeNs !== seen.mtimeNs || current.ctimeNs !== seen.ctimeNs || readPublishOwner(lock) ||
+      JSON.stringify(readLease()) !== JSON.stringify(lease) || !processGone(writer.pid)) {
+      console.warn(`[pi-fabric] invalid host lease publish lock ${lock}; retaining: recovery evidence changed`);
+      return;
+    }
+    console.warn(`[pi-fabric] invalid host lease publish lock ${lock}; reclaiming after local lease writer pid ${writer.pid} proved dead (ESRCH)`);
+    fs.unlinkSync(lock);
+  });
+};
+
 const preparePublishLock = async (mesh: LeasePublishCustody, lock: string): Promise<void> => {
   const seen = readPublishOwner(lock);
   ownStartTime ??= publishStartTime() ?? await ownProcessIncarnation();
-  if (!seen) return;
+  if (!seen) return recoverMalformedPublishLock(mesh, lock);
   let dead = false;
   try { process.kill(seen.pid, 0); }
   catch (error) { dead = (error as NodeJS.ErrnoException).code === "ESRCH"; }

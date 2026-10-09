@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { legacyHostPolicyAllowed, readHostPolicy, warnAgentLandlockDisabled } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
@@ -1730,6 +1731,22 @@ const resolveFabricConfig = (
   applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
+  const policy = readHostPolicy();
+  const legacyPolicy = legacyHostPolicyAllowed(policy);
+  if (policy.status === "valid") {
+    // Whitelist authority keys: root policy is not a third general settings layer.
+    const agents = objectValue(policy.document.agents);
+    const requireReason = objectValue(agents.modelPolicy).requireReason;
+    const disabled = objectValue(objectValue(policy.document.executor).landlock).disabled;
+    merged = mergeObjects(merged, {
+      executor: { landlock: { disabled: disabled === true } },
+      agents: {
+        ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
+        ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
+      },
+    });
+  }
   const hostPlan = planConfigFile(path.join(options.agentDir, "fabric.json"));
   const projectPlan = includeProject ? planConfigFile(path.join(options.cwd, ".pi", "fabric.json")) : undefined;
   for (const plan of [hostPlan, projectPlan]) {
@@ -1741,6 +1758,30 @@ const resolveFabricConfig = (
     // project preferences still override global ones without rewriting files.
     if (ui.principalView === undefined && ui.incomingMessages !== undefined) {
       document.ui = { ...ui, principalView: principalViewModeValue(ui) };
+    }
+    if (plan === hostPlan) {
+      const executor = { ...objectValue(document.executor) };
+      const landlock = { ...objectValue(executor.landlock) };
+      if (landlock.disabled === true) warnAgentLandlockDisabled(legacyPolicy);
+      if (!legacyPolicy) {
+        delete landlock.disabled;
+        executor.landlock = landlock;
+        document.executor = executor;
+        const agents = { ...objectValue(document.agents) };
+        delete agents.processSlice;
+        const inheritedAgents = objectValue(merged.agents);
+        // Agent-writable lists can add restrictions, never remove a root/default gate.
+        const union = (base: unknown, extra: unknown): unknown[] => [
+          ...(Array.isArray(base) ? base : []), ...(Array.isArray(extra) ? extra : []),
+        ];
+        agents.deniedModels = union(inheritedAgents.deniedModels, agents.deniedModels);
+        agents.modelPolicy = {
+          ...objectValue(agents.modelPolicy),
+          requireReason: union(objectValue(inheritedAgents.modelPolicy).requireReason,
+            objectValue(agents.modelPolicy).requireReason),
+        };
+        document.agents = agents;
+      }
     }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
@@ -1817,15 +1858,17 @@ export const loadFabricConfig = (options: {
 // The global configuration plus environment overrides, readable at extension load before a
 // session context exists (smarty-dev#459). Project configuration needs the trust decision
 // that only bootstrap has, so it is left out here.
-/**
- * Host-only Landlock kill switch, read from the global fabric.json on every
- * call so already-running lanes observe a fleet-wide flip without a reload.
- * Unreadable/malformed host files keep the session's loaded value.
- */
+/** Live root-owned kill switch. Only missing policy permits rollout fallback. */
 export const readHostLandlockDisabled = (agentDir: string): boolean | undefined => {
+  const policy = readHostPolicy();
+  if (policy.status === "valid") {
+    return objectValue(objectValue(policy.document.executor).landlock).disabled === true;
+  }
+  if (!legacyHostPolicyAllowed(policy)) return false;
   try {
     const document: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"));
     const disabled = objectValue(objectValue(objectValue(document).executor).landlock).disabled;
+    if (disabled === true) warnAgentLandlockDisabled(true);
     return typeof disabled === "boolean" ? disabled : false;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;

@@ -1,0 +1,229 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { HOST_POLICY_PATH, REQUIRE_HOST_POLICY } from "../src/host-policy.js";
+
+type Metadata = { uid?: number; mode?: number; dev?: number; ino?: number };
+const policyDirectory = path.dirname(HOST_POLICY_PATH);
+let agentDir: string;
+let cwd: string;
+let config: typeof import("../src/config.js");
+let policy: typeof import("../src/host-policy.js");
+let warn: MockInstance<typeof console.warn>;
+const metadata = new Map<string, Metadata>();
+let openedMetadata: Metadata;
+let openedDescriptor: number | undefined;
+
+const changeStat = (stat: fs.Stats, changes: Metadata): fs.Stats =>
+  Object.assign(Object.create(Object.getPrototypeOf(stat)) as fs.Stats, stat, changes);
+
+// Unprivileged tests use REAL temp files, opens, reads and dev/ino identities;
+// only ownership/ancestor modes are simulated. No chown or /etc writes.
+const simulateRootOwnership = (): void => {
+  const ancestors = new Set<string>();
+  for (let directory = policyDirectory;;) {
+    ancestors.add(directory);
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  const lstat = fs.lstatSync;
+  vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+    const stat = (lstat as (...args: unknown[]) => fs.Stats)(file, ...args);
+    const name = String(file);
+    if (name === HOST_POLICY_PATH || ancestors.has(name)) {
+      return changeStat(stat, { uid: 0, ...(ancestors.has(name) ? { mode: stat.mode & ~0o022 } : {}), ...metadata.get(name) });
+    }
+    return stat;
+  }) as typeof fs.lstatSync);
+  const open = fs.openSync;
+  vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+    const fd = (open as (...args: unknown[]) => number)(file, ...args);
+    if (String(file) === HOST_POLICY_PATH) openedDescriptor = fd;
+    return fd;
+  }) as typeof fs.openSync);
+  const fstat = fs.fstatSync;
+  vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+    const stat = (fstat as (...args: unknown[]) => fs.Stats)(fd, ...args);
+    return fd === openedDescriptor ? changeStat(stat, { uid: 0, ...openedMetadata }) : stat;
+  }) as typeof fs.fstatSync);
+};
+const writePolicy = (document: unknown): void => {
+  fs.writeFileSync(HOST_POLICY_PATH, JSON.stringify(document), { mode: 0o600 });
+};
+const writeAgent = (document: unknown): void => {
+  fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ configVersion: 4, ...document as object }));
+};
+const load = () => config.loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+
+// POSIX uid/mode/O_NOFOLLOW policy; Windows retains missing-policy rollout.
+describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", () => {
+  beforeEach(async () => {
+    // Hard guard: test build constant must point into its private temp directory.
+    if (!HOST_POLICY_PATH.startsWith(`${os.tmpdir()}${path.sep}`)) throw new Error("test policy path is not private");
+    fs.mkdirSync(policyDirectory, { recursive: true, mode: 0o700 });
+    agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "policy-agent-"));
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), "policy-project-"));
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    metadata.clear(); openedMetadata = {}; openedDescriptor = undefined;
+    vi.resetModules();
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    policy = await import("../src/host-policy.js");
+    config = await import("../src/config.js");
+  });
+  afterEach(() => {
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
+    for (const directory of [policyDirectory, agentDir, cwd]) fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("warns once and retains missing-policy behavior only during rollout", () => {
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
+      processSlice: "legacy.slice", deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] },
+    } });
+    for (let i = 0; i < 3; i++) {
+      const loaded = load();
+      expect(loaded.executor.landlock.disabled).toBe(!REQUIRE_HOST_POLICY);
+      expect(loaded.agents.processSlice).toBe(REQUIRE_HOST_POLICY ? undefined : "legacy.slice");
+      expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(REQUIRE_HOST_POLICY ? ["gpt-6-astra"] : []);
+      expect(config.readHostLandlockDisabled(agentDir)).toBe(!REQUIRE_HOST_POLICY);
+    }
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("is missing"))).toHaveLength(1);
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("agent-dir executor.landlock.disabled"))).toHaveLength(1);
+  });
+
+  it("applies root relaxations and unions only agent restrictions across all loaders", () => {
+    simulateRootOwnership();
+    writePolicy({ executor: { landlock: { disabled: true, mode: "enforce" } }, fullCodeMode: false,
+      agents: { processSlice: "root.slice", deniedModels: [" ROOT-DENY "], modelPolicy: { requireReason: [] } } });
+    writeAgent({ executor: { landlock: { disabled: false } }, agents: {
+      processSlice: "agent.slice", deniedModels: ["agent-deny", "root-deny"], modelPolicy: { requireReason: [" AGENT-REASON "] },
+    } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ agents: {
+      processSlice: "project.slice", deniedModels: [], modelPolicy: { requireReason: [] },
+    }, executor: { landlock: { disabled: false } } }));
+    for (const loaded of [load(), config.loadGlobalFabricConfig(agentDir),
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "global")]) {
+      expect(loaded.executor.landlock.disabled).toBe(true);
+      expect(loaded.executor.landlock.mode).toBe("off"); // root file is not general settings
+      expect(loaded.fullCodeMode).toBe(config.DEFAULT_FABRIC_CONFIG.fullCodeMode);
+      expect(loaded.agents.processSlice).toBe("root.slice");
+      expect(loaded.agents.deniedModels).toEqual(["root-deny", "agent-deny"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["agent-reason"]);
+    }
+    writeAgent({ agents: { deniedModels: [], modelPolicy: { requireReason: [] } } });
+    writePolicy({ agents: { deniedModels: ["root-deny"], modelPolicy: { requireReason: ["root-reason"] } } });
+    expect(load().agents.deniedModels).toEqual(["root-deny"]);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["root-reason"]);
+    writePolicy({ agents: { deniedModels: [], modelPolicy: { requireReason: [] } } });
+    expect(load().agents.deniedModels).toEqual([]); // only root can remove its deny
+    expect(load().agents.modelPolicy.requireReason).toEqual([]);
+  });
+
+  it("ignores agent kill switch once provisioned and preserves default reason gate", () => {
+    simulateRootOwnership(); writePolicy({});
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
+      deniedModels: ["agent-deny"], modelPolicy: { requireReason: ["extra-reason"] },
+    } });
+    expect(load().executor.landlock.disabled).toBe(false);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "extra-reason"]);
+    writeAgent({ agents: { deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] } } });
+    expect(load().agents.deniedModels).toEqual(["agent-deny"]);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  });
+
+  it.each(["non-root", "group-writable", "world-writable", "directory", "malformed", "array", "symlink"])("rejects %s policy with no legacy fallback", kind => {
+    simulateRootOwnership();
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
+      processSlice: "unsafe.slice", deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] },
+    } });
+    writePolicy({ executor: { landlock: { disabled: true } } });
+    if (kind === "non-root") metadata.set(HOST_POLICY_PATH, { uid: 1000 });
+    if (kind === "group-writable") fs.chmodSync(HOST_POLICY_PATH, 0o660);
+    if (kind === "world-writable") fs.chmodSync(HOST_POLICY_PATH, 0o606);
+    if (kind === "malformed") fs.writeFileSync(HOST_POLICY_PATH, "{broken");
+    if (kind === "array") writePolicy([]);
+    if (kind === "directory") { fs.unlinkSync(HOST_POLICY_PATH); fs.mkdirSync(HOST_POLICY_PATH); }
+    if (kind === "symlink") {
+      fs.renameSync(HOST_POLICY_PATH, `${HOST_POLICY_PATH}.target`);
+      fs.symlinkSync(`${HOST_POLICY_PATH}.target`, HOST_POLICY_PATH);
+    }
+    for (let i = 0; i < 2; i++) {
+      const loaded = load();
+      expect(loaded.executor.landlock.disabled).toBe(false);
+      expect(loaded.agents.processSlice).toBeUndefined();
+      expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+      expect(config.liveLandlockSettings({ mode: "enforce", disabled: true }, agentDir).disabled).toBe(false);
+    }
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
+    expect(warn.mock.calls.some(call => String(call[0]).includes("is missing"))).toBe(false);
+  });
+
+  it("rejects a real non-root-owned file without simulated metadata", () => {
+    if (process.getuid?.() === 0) return; // covered above via explicit non-root uid on root runners
+    writePolicy({ executor: { landlock: { disabled: true } } });
+    expect(policy.readHostPolicy().status).toBe("invalid");
+  });
+
+  it.each(["non-root", "writable", "symlink"])("rejects %s ancestry", kind => {
+    simulateRootOwnership(); writePolicy({});
+    if (kind === "non-root") metadata.set(policyDirectory, { uid: 1000 });
+    if (kind === "writable") metadata.set(policyDirectory, { mode: 0o777 });
+    if (kind === "symlink") {
+      const target = path.join(agentDir, "policy-target");
+      fs.renameSync(policyDirectory, target);
+      fs.symlinkSync(target, policyDirectory);
+    }
+    expect(policy.readHostPolicy().status).toBe("invalid");
+  });
+
+  it.each(["inode", "device", "owner", "mode"])("rejects opened-fd %s changes and closes the fd", change => {
+    simulateRootOwnership(); writePolicy({});
+    const stat = fs.statSync(HOST_POLICY_PATH);
+    openedMetadata = change === "inode" ? { ino: stat.ino + 1 } : change === "device" ? { dev: stat.dev + 1 }
+      : change === "owner" ? { uid: 1000 } : { mode: 0o100666 };
+    expect(policy.readHostPolicy().status).toBe("invalid");
+    expect(fs.fstatSync).toHaveBeenCalledTimes(1);
+    expect(() => fs.readFileSync(openedDescriptor!)).toThrow();
+  });
+
+  it("reads through one verified fd opened O_NOFOLLOW and closes it", () => {
+    simulateRootOwnership(); writePolicy({ agents: { processSlice: "root.slice" } });
+    vi.mocked(fs.openSync).mockClear();
+    expect(policy.readHostPolicy()).toEqual({ status: "valid", document: { agents: { processSlice: "root.slice" } } });
+    expect(fs.fstatSync).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(fs.openSync).mock.calls.find(args => String(args[0]) === HOST_POLICY_PATH)!;
+    expect(Number(call[1]) & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+    expect(() => fs.readFileSync(openedDescriptor!)).toThrow();
+  });
+
+  it("does not enter legacy fallback if an existing file vanishes before open", () => {
+    simulateRootOwnership(); writePolicy({});
+    vi.mocked(fs.openSync).mockImplementationOnce(() => { throw Object.assign(new Error("removed"), { code: "ENOENT" }); });
+    expect(policy.readHostPolicy().status).toBe("invalid");
+  });
+
+  it("rereads root kill-switch flips and revokes a loaded grant when policy becomes unsafe", () => {
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { disabled: true } } });
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
+    const loaded = load().executor.landlock;
+    expect(config.liveLandlockSettings(loaded, agentDir).disabled).toBe(true);
+    writePolicy({ executor: { landlock: { disabled: false } } });
+    expect(config.liveLandlockSettings(loaded, agentDir).disabled).toBe(false);
+    writePolicy({ executor: { landlock: { disabled: true } } });
+    fs.chmodSync(HOST_POLICY_PATH, 0o660);
+    expect(config.liveLandlockSettings(loaded, agentDir).disabled).toBe(false);
+  });
+
+  it("ignores environment/config attempts to select a different authority path", () => {
+    const other = path.join(agentDir, "other-policy.json");
+    fs.writeFileSync(other, JSON.stringify({ executor: { landlock: { disabled: true } } }));
+    vi.stubEnv("PI_FABRIC_HOST_POLICY_PATH", other); vi.stubEnv("FABRIC_HOST_POLICY_PATH", other);
+    vi.stubEnv("PI_FABRIC_REQUIRE_HOST_POLICY", String(!REQUIRE_HOST_POLICY));
+    writeAgent({ hostPolicyPath: other, agents: { modelPolicy: { requireReason: [] } } });
+    expect(policy.readHostPolicy().status).toBe("missing");
+    expect(load().agents.modelPolicy.requireReason).toEqual(REQUIRE_HOST_POLICY ? ["gpt-6-astra"] : []);
+  });
+});

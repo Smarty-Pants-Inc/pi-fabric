@@ -1267,7 +1267,7 @@ export class AgentsProvider implements FabricProvider {
           participant.ownerIdentityId,
           {
             timeoutMs: (actor?.timeoutMs ?? this.manager.config.timeoutMs) +
-              REMOTE_ASK_ACK_GRACE_MS,
+              REMOTE_ASK_ACK_GRACE_MS + (participant.stale ? 90_000 : 0),
             ...(context.signal ? { signal: context.signal } : {}),
             routedRemoteHost: participant.remoteHost ?? null,
             detachOnMainCeiling: isInteractiveMain(context.extensionContext),

@@ -28,6 +28,10 @@ export const resolveAgentDir = (envDir = process.env[ENV_AGENT_DIR]): string => 
 // code splitting does not create an additional eager startup chunk for release selectors.
 export const SELF_RELOAD_COMMAND = "fabric-release-reload";
 
+/** First UUID-fenced lease format; missing release markers are pre-UUID. Shared here with
+ * cheap release selectors so admission does not pull the worker contract into startup. */
+export const LEASE_FORMAT_UUID_MIN = 2;
+
 const isFabricPackage = (root: string): boolean => {
   try {
     return (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown }).name === "pi-fabric";

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
+import { preparedUuidHostClaim, prepareFirstUuidHostClaim } from "./host-lease-upgrade-gate.js";
 import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
@@ -217,10 +218,13 @@ const samePredecessor = (left: FabricHostLease | undefined, right: FabricHostLea
 /** Synchronous lease CAS; caller MUST hold this host's leaseCustody gate through the write.
  * Reload successors use it in the successful shared commit hook, never before a timed-out batch. */
 export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostLease,
-  options: { claim?: boolean; expected?: FabricHostLease | undefined } = {}): void => {
+  options: { claim?: boolean; expected?: FabricHostLease | undefined; uuidAdmission?: (() => void) | undefined } = {}): void => {
   if (!lease.incarnationToken) throw new TypeError("Host lease mutation requires an incarnation token");
   const expected = options.expected;
   const current = hostLeasePredecessor(meshRoot, lease.id);
+  const markUuidClaim = options.claim ? options.uuidAdmission
+    ? preparedUuidHostClaim(options.uuidAdmission, meshRoot, lease.id, lease.incarnationToken)
+    : prepareFirstUuidHostClaim(meshRoot, lease.id, lease.incarnationToken) : undefined;
   if (current?.incarnationToken === undefined && current !== undefined) {
     if (!options.claim) throw new FabricHostLeaseContestedError(lease.id, lease.identityId, lease.startedAt);
     if (current.expiresAt > Date.now()) throw new FabricHostLeaseLegacyBusyError(lease.id, current.expiresAt);
@@ -239,6 +243,7 @@ export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostL
       } : {}),
     } : {}),
   });
+  markUuidClaim?.();
 };
 
 /** Initial claim compares the captured predecessor, not clocks; subsequent renewal never
@@ -250,6 +255,9 @@ export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease
     ? Object.hasOwn(options, "expected") ? options.expected : hostLeasePredecessor(mesh.root, lease.id)
     : undefined;
   if (expected && expected.incarnationToken === undefined && expected.expiresAt > Date.now()) {
+    // Refuse live/unknown old processes BEFORE waiting for a legacy TTL. A successful
+    // preflight is revalidated under custody after the single expiry wake, never cached.
+    prepareFirstUuidHostClaim(mesh.root, lease.id, lease.incarnationToken);
     const waitMs = Math.min(expected.expiresAt - Date.now(), options.timeoutMs ?? Number.POSITIVE_INFINITY);
     if (waitMs <= 0) throw new FabricHostLeaseLegacyBusyError(lease.id, expected.expiresAt);
     await waitForLegacyExpiry(waitMs, options.signal); // ONE wake, never a renewal/poll loop.

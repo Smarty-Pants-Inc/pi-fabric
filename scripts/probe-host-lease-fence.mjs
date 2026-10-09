@@ -38,8 +38,19 @@ const candidate = { format: 1, id: "compiled-r3-agent", kind: "agent", rootId: o
 const message = value => process.send?.(value);
 const pause = (point) => { message({ type: "paused", point }); process.kill(process.pid, "SIGSTOP"); };
 const [mode, root, backend, filesPolicy] = process.argv.slice(2);
+// Each probe models a private host. Never census or modify the live fleet. The admission case
+// copies a REAL SIGSTOP child's kernel stat into fake /proc; all gate reads use compiled code.
+let censusRoot;
+const nativeOpendir = fs.opendirSync, nativeOpen = fs.openSync, nativeStat = fs.statSync, nativeExists = fs.existsSync;
+const censusPath = file => typeof file === "string" && /^\/proc\/\d+(?:\/|$)/.test(file) && censusRoot
+  ? path.join(censusRoot, file.slice("/proc/".length)) : file;
+fs.opendirSync = (file, ...args) => nativeOpendir(file === "/proc" ? censusRoot : file, ...args);
+fs.openSync = (file, ...args) => nativeOpen(censusPath(file), ...args);
+fs.statSync = (file, ...args) => nativeStat(censusPath(file), ...args);
+fs.existsSync = file => nativeExists(censusPath(file));
 
 if (mode?.startsWith("child-")) {
+  censusRoot = path.join(root, "probe-proc");
   const mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend });
   assert.equal(mesh.stateBackend, backend);
   let directory;
@@ -110,6 +121,7 @@ if (mode?.startsWith("child-")) {
   const children = new Set();
   const prepareRoot = (root, backend) => {
     fs.mkdirSync(root, { mode: 0o700 });
+    censusRoot = path.join(root, "probe-proc"); fs.mkdirSync(censusRoot);
     if (backend !== "sqlite") return;
     // Exercise production admission; never set the test-only sqlite initializer symbol.
     for (const command of ["import", "cutover"]) {
@@ -155,6 +167,33 @@ if (mode?.startsWith("child-")) {
   const report = value => console.log(JSON.stringify({ compiled: true, ...value }));
   try {
     for (const backend of ["file", "sqlite"]) {
+      {
+        const root = path.join(base, `${backend}-first-uuid-gate`); prepareRoot(root, backend);
+        const mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend }); let old;
+        try {
+          const legacy = { id: hostId, rootId: options.rootId, identityId: identity.id, startedAt: 1,
+            updatedAt: Date.now() - 120_000, expiresAt: Date.now() - 1 };
+          writeHostLease(root, legacy); fs.writeFileSync(path.join(root, "probe-input.json"), JSON.stringify(legacy));
+          old = child("child-legacy", root, backend); await old.next("paused"); stopped(old);
+          const proc = path.join(censusRoot, String(old.process.pid)); fs.mkdirSync(proc);
+          const release = path.join(base, "fabric", "releases", "a".repeat(40)); fs.mkdirSync(path.join(release, "dist"), { recursive: true });
+          fs.writeFileSync(path.join(release, "dist", "worker-protocol.json"), JSON.stringify({ version: 1 }));
+          fs.writeFileSync(path.join(proc, "stat"), fs.readFileSync(`/proc/${old.process.pid}/stat`, "utf8"));
+          fs.writeFileSync(path.join(proc, "cmdline"), "/usr/bin/node\0/example/pi-runtime/cli.js\0");
+          fs.writeFileSync(path.join(proc, "environ"), `PI_FABRIC_RELEASE_ROOT=${release}\0PI_CODING_AGENT_DIR=${root}/profile\0`);
+          fs.writeFileSync(path.join(proc, "maps"), "");
+          const lease = { ...legacy, incarnationToken: randomUUID(), updatedAt: Date.now(), expiresAt: Date.now() + 120_000 };
+          const error = await renewHostLease(mesh, lease, { claim: true }).then(() => undefined, error => error);
+          assert.equal(error?.code, "FABRIC_PRE_UUID_PROCESS_ALIVE"); assert.deepEqual(error.pids, [old.process.pid]);
+          assert.match(error.processes[0].reason, /pre-UUID release/); assert.deepEqual(readHostLeaseCurrent(root, hostId), legacy);
+          assert.equal(fs.readdirSync(path.join(root, "host-leases")).some(file => file.startsWith(".uuid-format-")), false);
+          const blockedPid = old.process.pid; await old.stop(); fs.rmSync(proc, { recursive: true, force: true });
+          await renewHostLease(mesh, lease, { claim: true }); assert.deepEqual(readHostLeaseCurrent(root, hostId), lease);
+          assert.equal(fs.readdirSync(path.join(root, "host-leases")).filter(file => file.startsWith(".uuid-format-")).length, 1);
+          report({ backend, case: "first-UUID-refuses-SIGSTOP-pre-UUID-then-admits-after-exit", verdict: "PASS",
+            code: error.code, blockedPid, expiredLeasePreserved: true, markerWrittenOnlyAfterExit: true });
+        } finally { if (old) await old.stop(); mesh.closeState(); }
+      }
       for (const filesOnly of [false, true]) {
         const root = path.join(base, `${backend}-after-renew-${filesOnly}`); prepareRoot(root, backend);
         const run = child("child-after-renew", root, backend, filesOnly), mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend });
@@ -235,7 +274,8 @@ if (mode?.startsWith("child-")) {
         const mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend });
         let old, batch;
         try {
-          // Model an old release paused beyond its TTL, then resumed after UUID admission.
+          // Deliberately simulate a writer introduced AFTER the admission snapshot/marker.
+          // The mechanical first-claim gate is proved above; this retains the final-CAS regression.
           const legacy = { id: hostId, rootId: options.rootId, identityId: identity.id, startedAt: 1,
             updatedAt: Date.now() - 120_000, expiresAt: Date.now() - 1 };
           writeHostLease(root, legacy); fs.writeFileSync(path.join(root, "probe-input.json"), JSON.stringify(legacy));

@@ -46,6 +46,7 @@ import {
   meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
+import { FabricPreUuidProcessAliveError, prepareFirstUuidHostClaim } from "./host-lease-upgrade-gate.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -569,7 +570,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #leaseAbort = new AbortController();
   #leaseClaimed = false;
   #prepareLeaseLock = true;
-  #superseded: FabricHostLeaseSupersededError | undefined;
+  #superseded: FabricHostLeaseSupersededError | FabricPreUuidProcessAliveError | undefined;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
@@ -597,6 +598,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #leaseConfirmed = false;
   /** Only a kept predecessor reload lease needs takeover after the first host commit. */
   #keptReloadLease = false;
+  #reloadUuidAdmission: (() => void) | undefined;
   #deadHostSweepAt = Date.now();
   #presencePassAt = Date.now();
   #quiescing = false;
@@ -829,10 +831,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // canConsumeMesh treat this as a successful commit. Peers still use #484's grace.
       if (this.#leaseConfirmed && !this.#closed && !this.#quiescing && !(error instanceof HostLeaseLockBusyError)) {
         try { await this.#renewFileLease(); } catch (renewError) {
-          if (renewError instanceof FabricHostLeaseSupersededError) error = renewError;
+          if (renewError instanceof FabricHostLeaseSupersededError || renewError instanceof FabricPreUuidProcessAliveError) error = renewError;
         }
       }
-      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      if (error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) this.#markSuperseded(error);
       error = this.#superseded ?? error;
       this.#refreshError = error;
       this.#routingReadAt = 0;
@@ -1584,7 +1586,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // own lease file, which needs no mesh lock, and let close() keep the root and lease.
       if (this.#reloadUntil !== undefined && this.options.enabled) {
         try { await this.#renewFileLease(); } catch (renewError) {
-          if (renewError instanceof FabricHostLeaseSupersededError) throw renewError;
+          if (renewError instanceof FabricHostLeaseSupersededError || renewError instanceof FabricPreUuidProcessAliveError) throw renewError;
         }
         this.#reloadPublished = true;
       }
@@ -1641,7 +1643,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
     if (!ownsLease()) {
       try { assertHostLeaseOwner(this.mesh.root, leaseOwner); }
-      catch (error) { if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error); }
+      catch (error) { if (error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) this.#markSuperseded(error); }
       return;
     }
     const own = (entry: MeshStateEntry): boolean => {
@@ -2084,7 +2086,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
             // Retained reload authority is checked under the SAME gate as this COMMIT.
             // Rotate only after success, before any post-commit file copy or gate release.
             commitHostLeaseUnderCustody(this.mesh.root, this.#fileLease(Date.now()),
-              { claim: true, expected: this.#leasePredecessor });
+              { claim: true, expected: this.#leasePredecessor, uuidAdmission: this.#reloadUuidAdmission });
             this.#leaseClaimed = true; this.#keptReloadLease = false;
           }
           committedAt = Date.now(); publication?.committed();
@@ -2117,7 +2119,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     } catch (error) {
       // A busy shared mesh is not a single-key fault. Abort this fenced round,
       // rather than multiplying acquisition attempts while retaining registries.
-      if (isMeshLockTimeout(error) || error instanceof FabricHostLeaseSupersededError) throw error;
+      if (isMeshLockTimeout(error) || error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) throw error;
       return undefined; /* retry this key on the next refresh */
     }
     finally {
@@ -2189,7 +2191,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
             return { ...current, version: current.version + 1, updatedAt: Date.now() };
           }, { ...this.#fileLockOptions(), ownIncarnation: this.#ownIncarnationValue, registryFenced: true }), 0);
         } catch (error) {
-          if (error instanceof FabricHostLeaseSupersededError) throw error;
+          if (error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) throw error;
           if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
           // One busy key never stops siblings. Native recovery, when needed,
           // happens in the ordinary preparation lane outside every registry.
@@ -2270,7 +2272,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#superseded) throw this.#superseded;
   }
 
-  #markSuperseded(error: FabricHostLeaseSupersededError): void {
+  #markSuperseded(error: FabricHostLeaseSupersededError | FabricPreUuidProcessAliveError): void {
     this.#superseded = error;
     this.#leaseAbort.abort();
     this.#refreshError = error;
@@ -2331,7 +2333,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       { claim: !this.#leaseClaimed, expected: this.#leasePredecessor, signal: this.#leaseAbort.signal,
         ownIncarnation: this.#ownIncarnationValue });
     } catch (error) {
-      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      if (error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) this.#markSuperseded(error);
       if (error instanceof HostLeaseLockBusyError) this.#prepareLeaseLock = true;
       throw error;
     }
@@ -2379,10 +2381,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
     this.#assertLeaseActive();
-    try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
+    const retainedReload = this.#keptReloadLease;
+    const admitted = async () => {
+      if (!retainedReload) return operation();
+      const validate = () => { this.#reloadUuidAdmission = prepareFirstUuidHostClaim(
+        this.mesh.root, this.options.hostId, this.#incarnationToken); };
+      validate();
+      try { return await this.mesh.withBatchCommitFence(validate, operation); }
+      finally { this.#reloadUuidAdmission = undefined; }
+    };
+    try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), admitted,
       { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
     catch (error) {
-      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+      if (error instanceof FabricHostLeaseSupersededError || error instanceof FabricPreUuidProcessAliveError) this.#markSuperseded(error);
       if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;
       throw error;
     }

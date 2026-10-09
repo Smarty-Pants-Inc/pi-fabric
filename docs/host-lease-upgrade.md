@@ -19,11 +19,38 @@ old writer extends the lease in the meantime, it returns `FABRIC_HOST_LEASE_LEGA
 `expiresAt`; it does not poll or rearm itself. Explicit zero-wait callers get that typed busy
 error immediately.
 
-### Residual security gap: a paused old release can outlive its TTL
+### Mechanical first-UUID claim gate (smarty-dev#7947)
+
+Before this physical host/UID's first UUID claim in a mesh, native admission takes a read-only,
+bounded `/proc` census. A live Pi/Fabric process (including state `T`, SIGSTOP) must identify its
+loaded release from environment/argv/maps paths under `fabric/releases/<sha>`, or a runtime release
+record tied to the PID's kernel start ticks. The current active pin is never proof of loaded code.
+Releases advertise `LEASE_FORMAT_UUID_MIN = 2` as `leaseFormat: 2` in `dist/worker-protocol.json`.
+Missing/older markers, unreadable evidence and unknown live candidates fail closed with
+`FabricPreUuidProcessAliveError` (`FABRIC_PRE_UUID_PROCESS_ALIVE`, message
+`pre-UUID Fabric process alive`) listing every observed blocking PID. No lease or admission marker
+is written on refusal. Other UIDs and exited/zombie processes are not live same-UID writers.
+
+Only after the UUID lease write succeeds is a physical-machine/UID-qualified `.uuid-format-*.marker`
+marker atomically written in `host-leases/`. Later claims on that host in that mesh do not rescan;
+renewals retain the UUID CAS, and target reaping/final batch revalidation remain unchanged.
+Retained reload authority also checks admission before its shared batch and at the final durable
+commit boundary; an exact-claim, single-use census receipt lets the successful commit rotate its
+UUID without discovering a new admission refusal only after COMMIT. A gate refusal is terminal
+for that directory: renewal/publication timers and consumer admission stop, with no scan retries.
+The snapshot is capped at 4096 processes, 1 MiB per observation, 32 MiB total and a 2 s deadline.
+A fresh legacy predecessor is checked before its single expiry/deadline wake and rechecked
+under custody before the lease write (at most two snapshots per gated operation); TTL waiting never admits an old
+process. There is no process killing, pin mutation, scan retry loop or polling. Non-Linux/unavailable census
+or physical host identity is unknown and refuses rather than silently bypassing the gate.
+
+### Residual security gap: old code introduced after admission is still unfenced
 
 The precise upgrade-window precondition is an **old-release, pre-UUID process paused for
 longer than its host lease TTL**, then resumed **after a new UUID writer has claimed** the
-expired lease. The old process can execute its unfenced legacy lease write (and potentially
+expired lease. The new mechanical gate rejects such a process at the first-claim snapshot, so
+this residual now requires an old writer to be introduced/reintroduced after that snapshot or
+through an already-admitted host marker. The old process can execute its unfenced legacy lease write (and potentially
 its old publication code) without taking the new host commit gate. Expiry proves neither
 process exit nor quiescence. This does not describe an in-place `/reload`: that path quiesces
 and fences the old runtime before the successor is admitted.
@@ -38,7 +65,9 @@ lease file and shared state: old code can still overwrite after the final check,
 state itself. New code cannot retroactively fence that writer, and cannot claim coexistence
 with it is safe.
 
-**Mitigation:** upgrade by stopping all old-release processes sharing the native host lease
+**Mitigation:** the first-claim gate mechanically refuses until old/unknown processes have
+stopped or have verifiably upgraded. Keep host process launches quiescent across that bounded
+snapshot and the claim; upgrade by stopping all old-release processes sharing the native host lease
 **before** allowing the new claim. Do not rely on waiting one TTL, a stale file, or SIGSTOP as
 proof they have stopped. Keep the old processes stopped until their binaries are upgraded.
 

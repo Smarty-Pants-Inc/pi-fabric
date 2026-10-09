@@ -134,8 +134,8 @@ const result = await build({
 });
 
 // Advertise the exact manager/worker contract without importing candidate code at spawn.
-const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
-writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);
+const { WORKER_PROTOCOL_VERSION, LEASE_FORMAT_UUID_MIN } = await import("../dist/agents/worker-protocol.js");
+writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION, leaseFormat: LEASE_FORMAT_UUID_MIN })}\n`);
 
 // Pi supplies these packages to extensions through its module aliases, so
 // they are peers and must never be bundled into code that Pi loads.

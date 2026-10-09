@@ -104,9 +104,10 @@ if (process.platform === "linux") required.push("native/fabric-landlock");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
 
-const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+const { WORKER_PROTOCOL_VERSION, LEASE_FORMAT_UUID_MIN } = await import("../dist/agents/worker-protocol.js");
 const workerProtocol = JSON.parse(readFileSync(join(dist, "worker-protocol.json"), "utf8"));
 if (workerProtocol.version !== WORKER_PROTOCOL_VERSION) throw new Error("Worker protocol manifest differs from manager contract");
+if (workerProtocol.leaseFormat !== LEASE_FORMAT_UUID_MIN) throw new Error("Lease format marker differs from UUID admission contract");
 
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(root, "config/landlock-roles.json"))) {

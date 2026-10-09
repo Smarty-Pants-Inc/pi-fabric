@@ -3,3 +3,5 @@
  * value in dist/worker-protocol.json without executing their code in the parent.
  */
 export const WORKER_PROTOCOL_VERSION = 1;
+
+export { LEASE_FORMAT_UUID_MIN } from "../core/agent-dir.js";

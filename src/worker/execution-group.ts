@@ -64,8 +64,8 @@ export const executionGroup = (child: ChildProcess) => {
       try { process.kill(-pid, 0); return false; }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") { empty = true; return true; } throw error; }
     },
-    signal(signal: NodeJS.Signals): void {
-      if (cgroup) { cgroup.signal(signal); return; }
+    signal(signal: NodeJS.Signals): void | Promise<void> {
+      if (cgroup) return cgroup.signal(signal);
       if (!pid) return;
       if (process.platform === "linux") {
         if (!members().length) return;

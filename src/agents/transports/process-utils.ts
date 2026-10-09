@@ -6,7 +6,7 @@ import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { randomUUID } from "node:crypto";
-import { cgroupCustody, processScopePath, scopePath, CUSTODY_POLL_MS, type CgroupCustody } from "../../process-cgroup.js";
+import { cgroupCustody, executionIdentity, processScopePath, scopePath, scopeLauncherEnvironment, CUSTODY_POLL_MS, type CgroupCustody, type ExecutionIdentity } from "../../process-cgroup.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -305,7 +305,7 @@ export const spawnDetached = async (
     "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
-    ...(environment ? { env: environment } : {}),
+    ...(scope ? { env: scopeLauncherEnvironment(environment) } : environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
@@ -343,10 +343,10 @@ export const spawnDetached = async (
     try { if (primaryScope && !scopesAlive()) resolveTreeClosed(); }
     catch { /* failed identity remains an obligation, not an empty notification */ }
   };
-  const retainScope = (directory: string): CgroupCustody => {
+  const retainScope = (directory: string, execution?: ExecutionIdentity): CgroupCustody => {
     let receipt = scopes.get(directory);
     if (!receipt) {
-      receipt = cgroupCustody(directory); scopes.set(directory, receipt);
+      receipt = cgroupCustody(directory, execution); scopes.set(directory, receipt);
       void receipt.closed.then(checkTreeClosed);
     }
     return receipt;
@@ -374,7 +374,14 @@ export const spawnDetached = async (
         // Private native IPC transfers this scope even if its leader already died.
         if ("cgroup" in message && typeof message.cgroup === "string" &&
           /^\/sys\/fs\/cgroup\/.+\/fabric-execution-[0-9a-f-]+\.scope$/.test(message.cgroup)) {
-          try { retainScope(message.cgroup); executionBoundaryConfirmed = true; }
+          try {
+            const current = executionIdentity(Number(message.pid));
+            const identity = "group" in message && "session" in message &&
+              Number.isSafeInteger(message.group) && Number(message.group) > 0 && Number.isSafeInteger(message.session) && Number(message.session) > 0
+              ? { pid: Number(message.pid), parent: 0, started: message.started, group: Number(message.group), session: Number(message.session) }
+              : current?.started === message.started ? current : undefined;
+            retainScope(message.cgroup, identity); executionBoundaryConfirmed = true;
+          }
           catch (error) { unconfirmed(`Execution scope custody unconfirmed: ${String(error)}`); }
         } else if (scopeUnit) {
           // Compatible older workers inherit our scope instead of reporting a
@@ -382,7 +389,7 @@ export const spawnDetached = async (
           try {
             const current = linuxGroupMember(Number(message.pid));
             const directory = current?.started === message.started ? processScopePath(Number(message.pid), scopeUnit) : undefined;
-            if (directory) { retainScope(directory); executionBoundaryConfirmed = true; }
+            if (directory) { retainScope(directory, executionIdentity(Number(message.pid))); executionBoundaryConfirmed = true; }
           } catch { /* retain unknown execution debt */ }
         }
         if (executionBoundaryConfirmed && child.connected) {
@@ -477,6 +484,7 @@ export const spawnDetached = async (
   const stop = async (): Promise<void> => {
     if (stopped) return;
     if (primaryScope) {
+      for (const scope of scopes.values()) scope.detectEscapes();
       const settled = (): boolean => !scopesAlive() && exited;
       const wait = async (ms: number): Promise<boolean> => {
         const deadline = Date.now() + ms;
@@ -495,12 +503,12 @@ export const spawnDetached = async (
         return settled();
       };
       // The live custodian must persist stop intent before draining execution.
-      if (!exited) primaryScope.signal("SIGTERM");
-      else for (const scope of scopes.values()) scope.signal("SIGTERM");
+      if (!exited) await primaryScope.signal("SIGTERM");
+      else for (const scope of scopes.values()) await scope.signal("SIGTERM");
       if (await wait(termGraceMs)) return;
       // Kernel membership includes setsid and unsampled double-fork children.
-      for (const scope of scopes.values()) if (scope !== primaryScope) scope.signal("SIGKILL");
-      primaryScope.signal("SIGKILL");
+      for (const scope of scopes.values()) if (scope !== primaryScope) await scope.signal("SIGKILL");
+      await primaryScope.signal("SIGKILL");
       if (!(await wait(STOP_KILL_MS))) {
         const reason = `Fabric worker ${pid} did not confirm scope/native exit after bounded SIGTERM/SIGKILL cleanup`;
         if (tracksExecution) { unconfirmed(reason); return; }
@@ -679,9 +687,9 @@ export const spawnDetached = async (
             // A live pid plus a missing mount path is UNKNOWN, not an empty group.
             try { fs.statSync(directory); }
             catch (error) { if (linuxGroupMember(pid)) throw error; }
-            primaryScope = retainScope(directory);
+            primaryScope = retainScope(directory, executionIdentity(pid));
             checkTreeClosed();
-          }
+          } else scope.warn("admitted scope has no cgroup v2 path");
         } catch (error) { scope.warn(`cgroup custody unavailable: ${String(error)}`); }
         return handle;
       }
@@ -696,9 +704,9 @@ export const spawnDetached = async (
             // A live pid plus a missing mount path is UNKNOWN, not an empty group.
             try { fs.statSync(directory); }
             catch (error) { if (linuxGroupMember(pid)) throw error; }
-            primaryScope = retainScope(directory);
+            primaryScope = retainScope(directory, executionIdentity(pid));
             checkTreeClosed();
-          }
+          } else scope.warn("admitted scope has no cgroup v2 path");
         } catch (error) { scope.warn(`cgroup custody unavailable: ${String(error)}`); }
         return handle;
       } // admitted during teardown: never replay

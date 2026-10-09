@@ -60,7 +60,7 @@ describe.skipIf(!available)("compiled worker cgroup custody", () => {
     }
   }, 20_000);
 
-  it("ProcessTransport -> real worker -> gated execution transfers distinct scopes before inference and stops without /proc scans", async () => {
+  it("ProcessTransport -> real worker -> gated execution transfers distinct scopes before inference and keeps hot checks scan-free and scans only at stop", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-worker-cgroup-"));
     const ready = path.join(root, "execution.json"), piBinary = path.join(root, "pi.mjs");
     fs.writeFileSync(piBinary, `import fs from 'node:fs';
@@ -84,8 +84,9 @@ describe.skipIf(!available)("compiled worker cgroup custody", () => {
       expect(execution.cgroup).toMatch(/fabric-execution-[0-9a-f-]+[.]scope/);
       expect(execution.cgroup).not.toBe(workerCgroup);
       const scan = vi.spyOn(fs, "readdirSync");
-      expect((await manager.stop(run.id)).status).toBe("stopped");
       expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
+      expect((await manager.stop(run.id)).status).toBe("stopped");
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc").length).toBeLessThanOrEqual(2);
       await vi.waitFor(() => {
         try {
           const fields = fs.readFileSync(`/proc/${execution.pid}/stat`, "utf8").split(") ").at(-1)!.split(" ");

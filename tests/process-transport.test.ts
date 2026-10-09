@@ -292,7 +292,8 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8").slice(fs.readFileSync(`/proc/${pid}/stat`, "utf8").lastIndexOf(")") + 2).split(" ");
       expect(Number(stat[2])).toBe(pid); // field 5 is PGID
       expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 8)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", expect.stringMatching(/^--unit=fabric-worker-.*[.]scope$/), "--expand-environment=no", "--"]);
-      expect(await handle.isAlive()).toBe(true); expect(warn).not.toHaveBeenCalled();
+      expect(await handle.isAlive()).toBe(true);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("admitted scope has no cgroup v2 path"));
     } finally { await handle.stop(); await handle.waitForClose?.(); }
     expect(await handle.isAlive()).toBe(false); expect(handle.lostContact?.()).toBeUndefined();
     const kill = vi.spyOn(process, "kill"); await handle.stop(); expect(kill).not.toHaveBeenCalled();
@@ -314,12 +315,39 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     try { expect(await workerStarted(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); }
     finally { await handle.stop(); await handle.waitForClose(); }
   });
+  it("warns once on admitted v1 downgrade and never replays the worker", async () => {
+    const f = fixture();
+    const original = fs.readFileSync.bind(fs);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) =>
+      String(args[0]).endsWith("/cgroup") || String(args[0]).endsWith("/admitted")
+        ? "1:name=systemd:/user.slice/worker.scope\n" : original(...args)
+    ) as typeof fs.readFileSync);
+    const warn = vi.fn();
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable: path.join(f.root, "systemd-run"), slice: "app.slice", warn });
+    try {
+      expect(await workerStarted(f.root)).toBe(handle.pid);
+      expect(handle.treeClosed).toBeUndefined(); expect(warn).toHaveBeenCalledExactlyOnceWith("admitted scope has no cgroup v2 path");
+      expect(fs.readFileSync(path.join(f.root, "started"), "utf8").trim().split("\n")).toEqual([String(handle.pid)]);
+    } finally { await handle.stop(); await handle.waitForClose(); }
+  });
+  it("warns on admitted v1 downgrade during teardown without replay", async () => {
+    const f = fixture(`while [ "$1" != "--" ]; do shift; done; shift; marker="$5";
+      trap 'printf "1:name=systemd:/worker.scope\\n" > "$marker"; exit 0' TERM
+      while :; do /bin/sleep 0.05; done`);
+    const warn = vi.fn();
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable: path.join(f.root, "systemd-run"), slice: "app.slice", warn });
+    try {
+      expect(warn).toHaveBeenCalledExactlyOnceWith("admitted scope has no cgroup v2 path");
+      expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+      expect(handle.treeClosed).toBeUndefined(); expect(await handle.isAlive()).toBe(false);
+    } finally { await handle.stop(); await handle.waitForClose(); }
+  }, 10_000);
   it("does not replay a worker that fails after successful scope admission", async () => {
     const f = fixture(); fs.writeFileSync(f.worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); process.exit(1);');
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const handle = await new ProcessTransport("batch.slice").launch(f.request); await handle.waitForClose?.();
     expect(fs.readFileSync(path.join(f.root, "started"), "utf8").trim().split("\n")).toEqual([handle.sessionId]);
-    expect(warn).not.toHaveBeenCalled(); expect(await handle.isAlive()).toBe(false);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("admitted scope has no cgroup v2 path")); expect(await handle.isAlive()).toBe(false);
   });
 });
 }

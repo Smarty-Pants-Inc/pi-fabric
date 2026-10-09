@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import type { Writable } from "node:stream";
 import { findExecutable } from "../agents/transports/process-utils.js";
-import { cgroupCustody, executionCgroups, processScopePath, scopePath } from "../process-cgroup.js";
+import { cgroupCustody, executionCgroups, executionIdentity, processScopePath, scopePath, scopeLauncherEnvironment } from "../process-cgroup.js";
 
 let warned = false;
 const warn = (reason: string): void => {
@@ -23,9 +23,15 @@ export const spawnScopedExecution = async (
   parentCanRetainScopes = true,
 ): Promise<ChildProcess> => {
   if (process.platform !== "linux") return spawn(command, args, options);
-  if (!parentCanRetainScopes) { warn("parent lacks cgroup custody capability"); return spawn(command, args, options); }
+  // Only the launcher needs the user bus. Executions have no bus dependency;
+  // XDG_RUNTIME_DIR must go too: systemd-run otherwise discovers the same bus.
+  const env = { ...(options.env ?? process.env) };
+  delete env.DBUS_SESSION_BUS_ADDRESS;
+  delete env.XDG_RUNTIME_DIR;
+  const targetOptions = { ...options, env };
+  if (!parentCanRetainScopes) { warn("parent lacks cgroup custody capability"); return spawn(command, args, targetOptions); }
   const executable = findExecutable("systemd-run");
-  if (!executable) { warn("systemd-run unavailable"); return spawn(command, args, options); }
+  if (!executable) { warn("systemd-run unavailable"); return spawn(command, args, targetOptions); }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-execution-scope-"));
   const marker = path.join(root, "admitted");
   const stdio = Array.isArray(options.stdio) ? [...options.stdio] : Array(3).fill(options.stdio ?? "pipe");
@@ -33,8 +39,8 @@ export const spawnScopedExecution = async (
   stdio.push("pipe");
   const unit = `fabric-execution-${randomUUID()}.scope`;
   const child = spawn(executable, ["--user", "--scope", `--unit=${unit}`, "--expand-environment=no", "--quiet", "--collect", "--",
-    "/bin/sh", "-c", `/bin/cat /proc/self/cgroup > "$1.tmp" && /bin/mv "$1.tmp" "$1" || exit 125; IFS= read -r release <&${gateFd} || exit 125; exec ${gateFd}<&-; shift; exec "$@"`,
-    "fabric-execution", marker, command, ...args], { ...options, stdio });
+    "/bin/sh", "-c", `/bin/cat /proc/self/cgroup > "$1.tmp" && /bin/mv "$1.tmp" "$1" || exit 125; IFS= read -r release <&${gateFd} || exit 125; exec ${gateFd}<&-; shift; unset DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; exec "$@"`,
+    "fabric-execution", marker, command, ...args], { ...options, env: scopeLauncherEnvironment(options.env), stdio });
   const gate = child.stdio[gateFd] as Writable | null;
   gate?.on("error", () => { /* native close owns a broken admission pipe */ });
   let closed = false, error: Error | undefined;
@@ -45,7 +51,7 @@ export const spawnScopedExecution = async (
   if (fs.existsSync(marker)) {
     try {
       const directory = (child.pid ? processScopePath(child.pid, unit) : undefined) ?? scopePath(fs.readFileSync(marker, "utf8"), unit);
-      if (directory) { fs.statSync(directory); executionCgroups.set(child, cgroupCustody(directory)); }
+      if (directory) { fs.statSync(directory); executionCgroups.set(child, cgroupCustody(directory, child.pid ? executionIdentity(child.pid) : undefined)); }
       else warn("admitted scope has no cgroup v2 path");
     } catch (value) { warn(`admitted cgroup unavailable: ${String(value)}`); }
     const cleanup = (): void => { fs.rmSync(root, { recursive: true, force: true }); };
@@ -68,5 +74,5 @@ export const spawnScopedExecution = async (
   }
   fs.rmSync(root, { recursive: true, force: true });
   warn(error?.message ?? "systemd-run failed or user manager unavailable");
-  return spawn(command, args, options);
+  return spawn(command, args, targetOptions);
 };

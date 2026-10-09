@@ -260,8 +260,10 @@ const runnerLabel = (runner: string): string =>
 const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
 let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  try { executionGroups.get(child)?.signal(signal); }
-  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
+  try {
+    const pending = executionGroups.get(child)?.signal(signal);
+    if (pending) void pending.catch(error => console.error(`Execution cleanup unresolved: ${String(error)}`));
+  } catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -683,6 +685,7 @@ const main = async (): Promise<void> => {
     const groupObserver = group.cgroup ? undefined : setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, process.platform === "linux" ? CUSTODY_POLL_MS : 100);
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
+      group.cgroup?.detectEscapes();
       const exited = () => nativeClosed && group.exited();
       const wait = async (ms: number) => {
         const deadline = Date.now() + ms;
@@ -700,16 +703,16 @@ const main = async (): Promise<void> => {
         return exited();
       };
       if (!exited()) {
-        group.signal("SIGTERM");
+        await group.signal("SIGTERM");
         execution.stdin?.end();
         if (!await wait(KILL_GRACE_MS)) {
-          group.signal("SIGKILL");
+          await group.signal("SIGKILL");
           if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
         }
       }
       clearInterval(groupObserver);
     })();
-    const message = { type: "fabric-execution-started", pid: execution.pid, started: executionBirth, cgroup: group.cgroup?.directory };
+    const message = { type: "fabric-execution-started", pid: execution.pid, started: executionBirth, cgroup: group.cgroup?.directory, group: group.cgroup?.execution?.group, session: group.cgroup?.execution?.session };
     if (group.cgroup && process.send && parentScopeCustody) {
       // The target remains behind its pipe gate until the parent has the scope
       // receipt. This also seals provider-resume and worker-crash handoff races.

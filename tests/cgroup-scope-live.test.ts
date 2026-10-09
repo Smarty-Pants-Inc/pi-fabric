@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { executionCgroups } from "../src/process-cgroup.js";
+import { cgroupCustody, executionCgroups } from "../src/process-cgroup.js";
 import { executionGroup } from "../src/worker/execution-group.js";
 import { spawnScopedExecution, releaseScopedChild } from "../src/worker/scope-spawn.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -23,6 +23,80 @@ const executing = (pid: number): boolean => {
 };
 
 describe.skipIf(!available)("real Linux cgroup scope custody", () => {
+  it("scrubs target user-bus discovery and nested systemd-run --user --scope fails", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-bus-"));
+    const marker = path.join(root, "bus.json");
+    const child = await spawnScopedExecution((binary, args, options) => spawn(binary, [...args], options),
+      process.execPath, ["-e", `const fs=require('node:fs'),{spawnSync}=require('node:child_process');
+        const probe=spawnSync('systemd-run',['--user','--scope','true'],{timeout:2000,encoding:'utf8'});
+        fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({status:probe.status,stderr:probe.stderr,dbus:process.env.DBUS_SESSION_BUS_ADDRESS,xdg:process.env.XDG_RUNTIME_DIR}));`],
+      { stdio: "ignore", detached: true });
+    const close = new Promise<void>(resolve => child.once("close", () => resolve()));
+    const receipt = executionCgroups.get(child);
+    try {
+      expect(receipt).toBeDefined(); releaseScopedChild(child); await closedWithin(close);
+      const result = JSON.parse(fs.readFileSync(marker, "utf8"));
+      expect(result.dbus).toBeUndefined(); expect(result.xdg).toBeUndefined();
+      expect(result.status).not.toBe(0); expect(result.stderr).toContain("Failed to connect");
+      expect(await receipt!.waitForExit(2_000)).toBe(true);
+    } finally {
+      await receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("nested Fabric custody launchers still obtain scopes with a scrubbed ambient environment", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-nested-"));
+    const worker = path.join(root, "worker.mjs"); fs.writeFileSync(worker, "setInterval(()=>{},1000)");
+    vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined); vi.stubEnv("XDG_RUNTIME_DIR", undefined);
+    let child: ChildProcess | undefined, close: Promise<void> | undefined;
+    let handle: Awaited<ReturnType<ProcessTransport["launch"]>> | undefined;
+    try {
+      child = await spawnScopedExecution((binary, args, options) => spawn(binary, [...args], options), process.execPath, [worker], { detached: true, stdio: "ignore" });
+      close = new Promise(resolve => child!.once("close", () => resolve()));
+      expect(executionCgroups.get(child)).toBeDefined(); releaseScopedChild(child);
+      handle = await new ProcessTransport().launch({ id: "nested", name: "nested", cwd: root, workerPath: worker, workerArguments: [] });
+      expect(handle.treeClosed).toBeDefined(); expect(await handle.isAlive()).toBe(true);
+    } finally {
+      if (child) { await executionCgroups.get(child)?.signal("SIGKILL"); releaseScopedChild(child); if (close) await closedWithin(close); }
+      if (handle) { await handle.stop(); await handle.waitForClose?.(); }
+      vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("catches a sibling systemd scope escaper with the recorded session, even after leader exit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-escape-"));
+    const marker = path.join(root, "escape.json"), leaf = path.join(root, "leaf.mjs"), worker = path.join(root, "worker.mjs");
+    const bus = { DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR };
+    fs.writeFileSync(leaf, `import fs from 'node:fs'; process.on('SIGTERM',()=>{});
+      const fields=fs.readFileSync('/proc/self/stat','utf8').split(') ').at(-1).split(' ');
+      fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,session:Number(fields[3]),scope:'/sys/fs/cgroup'+fs.readFileSync('/proc/self/cgroup','utf8').trim().split('::')[1]}));setInterval(()=>{},1000);`);
+    fs.writeFileSync(worker, `import fs from 'node:fs'; import {spawn} from 'node:child_process'; import {randomUUID} from 'node:crypto';
+      // Deliberately restore known bus discovery: scrub is hardening, not a same-UID boundary.
+      const escape=spawn('/usr/bin/systemd-run',['--user','--scope','--quiet','--collect','--unit=fabric-test-escape-'+randomUUID()+'.scope','--',process.execPath,${JSON.stringify(leaf)}],{env:{...process.env,...${JSON.stringify(bus)}},stdio:'ignore'});escape.unref();
+      const ready=setInterval(()=>{if(fs.existsSync(${JSON.stringify(marker)})){clearInterval(ready);process.exit(0)}},10);`);
+    const child = await spawnScopedExecution((binary, args, options) => spawn(binary, [...args], options), process.execPath, [worker], { detached: true, stdio: "ignore" });
+    const close = new Promise<void>(resolve => child.once("close", () => resolve()));
+    const receipt = executionCgroups.get(child);
+    let escaped: { pid: number; session: number; scope: string } | undefined;
+    try {
+      expect(receipt).toBeDefined(); releaseScopedChild(child);
+      await vi.waitFor(() => expect(fs.existsSync(marker)).toBe(true), { timeout: 5_000 });
+      escaped = JSON.parse(fs.readFileSync(marker, "utf8"));
+      expect(escaped!.scope).not.toBe(receipt!.directory);
+      expect(escaped!.session).toBe(receipt!.execution!.session);
+      await closedWithin(close); expect(executing(escaped!.pid)).toBe(true);
+      const started = Date.now(); await receipt!.signal("SIGKILL");
+      expect(await receipt!.waitForExit(3_000)).toBe(true);
+      await vi.waitFor(() => expect(executing(escaped!.pid)).toBe(false), { timeout: 3_000 });
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      await receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
+      if (!escaped && fs.existsSync(marker)) escaped = JSON.parse(fs.readFileSync(marker, "utf8"));
+      if (escaped) { const cleanup = cgroupCustody(escaped.scope); await cleanup.signal("SIGKILL"); expect(await cleanup.waitForExit(3_000)).toBe(true); }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it.each(["setsid", "double-fork"])("lists and KILLs an unsampled %s escaper after scope leader exit (#7248)", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-live-"));
     const marker = path.join(root, "orphan.pid");
@@ -49,15 +123,16 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       expect(receipt!.members()).toContain(pid);
       const scan = vi.spyOn(fs, "readdirSync");
       group.observe(); expect(group.exited()).toBe(false);
-      group.signal("SIGKILL");
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
+      await group.signal("SIGKILL");
       expect(await receipt!.waitForExit(3_000)).toBe(true);
       await vi.waitFor(() => expect(executing(pid)).toBe(false), { timeout: 3_000, interval: 10 });
-      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toHaveLength(1);
       expect(group.exited()).toBe(true);
     } finally {
       vi.restoreAllMocks();
       if (child) {
-        executionCgroups.get(child)?.signal("SIGKILL");
+        await executionCgroups.get(child)?.signal("SIGKILL");
         releaseScopedChild(child);
         if (close) await closedWithin(close);
       }
@@ -80,7 +155,7 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       expect(await receipt!.waitForExit(2_000)).toBe(true);
       expect(fs.existsSync(marker)).toBe(false);
     } finally {
-      receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
+      await receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -100,7 +175,7 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual(argv);
       expect(await receipt!.waitForExit(2_000)).toBe(true);
     } finally {
-      receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
+      await receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -135,10 +210,11 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       fs.writeFileSync(crash, "crash"); await closedWithin(handle.closed!);
       const scan = vi.spyOn(fs, "readdirSync");
       expect(await handle.isAlive(), "dead custodian cannot release live execution").toBe(true);
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
       await handle.stop();
       expect(await handle.isAlive()).toBe(false);
       await vi.waitFor(() => expect(executing(pid)).toBe(false), { timeout: 3_000, interval: 10 });
-      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc").length).toBeLessThanOrEqual(2);
       expect(handle.lostContact?.()).toBeUndefined();
     } finally {
       vi.restoreAllMocks(); await handle.stop(); await handle.waitForClose?.();

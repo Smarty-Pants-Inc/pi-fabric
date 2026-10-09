@@ -194,13 +194,13 @@ const warnPrivately = (message: string): void => {
 const WRITE_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
 
-/** Sanitized host label used in file names. */
 // ponytail: as processAlive in src/storage/scratch.ts, inlined because release generations load
 // this module as a self-contained copy (see the module-generation tests).
 const processAlive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; }
   catch (error) { return errorCodeOf(error) !== "ESRCH"; }
 };
+/** Sanitized host label used in file names. */
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
 /**
@@ -432,13 +432,13 @@ const readRegularFile = (file: string): string => {
   } finally { fs.closeSync(descriptor); }
 };
 
-/**
- * Every process's file under `<root>/lock-stats`. Unreadable, oversized, foreign or invalid
- * files are skipped and named in `problems` (a gate must not pass on what it could not read).
- */
 /** Start of a window of `span` complete minutes before `now`, the current minute included. */
 const lockStatsWindowStartMs = (now: number, span: number): number => (Math.floor(now / 60_000) - span) * 60_000;
 
+/**
+ * Every process's file under `<root>/lock-stats` that can hold a minute of the window. Unreadable, oversized,
+ * foreign or invalid files are skipped and named in `problems` (a gate must not pass on what it could not read).
+ */
 export const readLockStats = (root: string, problems: string[] = [],
   options: { minutes?: number; now?: number | undefined } = {}): LockStatsFile[] => {
   const directory = path.join(root, LOCK_STATS_DIR);

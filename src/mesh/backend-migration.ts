@@ -141,11 +141,12 @@ export interface MeshBackendOptions {
   /** Synchronous crash-point hook (tests kill the tool here). */
   onStep?: (step: MeshBackendStep) => void;
   /**
-   * Runs synchronously under the fence, inside the import transaction right before its COMMIT, with
-   * the flag and epoch from before this import. A throw rolls the import back with nothing changed
+   * Runs synchronously under the fence, inside the transaction right before EACH flag COMMIT of a
+   * switch to sqlite: `importing` (also a rerun that redoes it) and the final `sqlite`. `fromEpoch` is
+   * the epoch the switch started from, `toEpoch` the one it commits. A throw rolls that transaction back
    * (smarty-dev#7815: the reader readiness gate is re-checked here, see reader-proof.ts).
    */
-  beforeCommit?: (before: { backend: string; epoch: number; commit: number }) => void;
+  beforeCommit?: (commit: { phase: "importing" | "sqlite"; fromEpoch: number; toEpoch: number }) => void;
   /** Fence violations and late writers. The error is thrown as well. */
   onAlarm?: (alarm: MeshBackendAlarm) => void;
 }
@@ -753,7 +754,7 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
     verifyImported(fence, { epoch: next, digest }, root, options, "importing");
     // Reconcile right before COMMIT: a state.json that moved since G0 keeps the flag where it was.
     assertFileUnchanged(root, options, { generation, digest }, "before the flag commit", "import aborted, the backend flag is unchanged");
-    options.beforeCommit?.({ backend: meta.backend, epoch: meta.epoch, commit: meta.commit });
+    options.beforeCommit?.({ phase: "importing", fromEpoch: previous, toEpoch: next });
     return { epoch: next, previousEpoch: previous };
   });
   options.onStep?.("import-commit");
@@ -862,6 +863,7 @@ const commitRollForward = (root: string, options: MeshBackendOptions, fence: Fen
   const committed = fence.transaction(() => {
     const current = fence.meta();
     if (current.backend === "sqlite" && current.epoch === imported.epoch) return false;
+    options.beforeCommit?.({ phase: "sqlite", fromEpoch: Number(current.values.get("import_previous_epoch") ?? imported.epoch - 1), toEpoch: imported.epoch });
     verifyImported(fence, imported, root, options, "importing");
     fence.setMeta("backend", "sqlite");
     return true;

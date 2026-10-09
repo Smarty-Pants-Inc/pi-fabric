@@ -6,102 +6,121 @@ store before the switch goes live. smarty-dev#7815: the #6477 switch went live w
 factory could not read the new store (`KeyError 'entries'`), and the GitHub event forwarder
 crash-looped for hours. The gate stops that.
 
+## Which readers are required
+
+The gate decides from an inventory, never from what readers chose to register:
+
+1. **Live Fabric releases.** The writer census (`fabric-mesh-backend census`) attributes live
+   writers from the host leases (`<mesh>/host-leases/*.json`, field `writer.releaseSha`) and the
+   process records (`<mesh>/.writer-census/*`, field `releaseSha`). Topology participant records
+   carry no release. Each distinct release R becomes the required reader `fabric@R`. Attributed live
+   writers without a release (`"unknown"`), or a census that fails, become `fabric@unknown`, which can
+   only be accepted, never proved. Evidence the census cannot attribute (a pid-only lock owner, a torn
+   record) does not gate (smarty-dev#6982); the intent records it as `unattributedEvidence`.
+2. **Built-in non-Fabric readers**, fixed in code (`BUILTIN_READERS` in `src/mesh/reader-proof.ts`):
+   `factory` with the trusted release root `~/.local/share/smarty-dev/factory`. A built-in whose
+   release root does not exist on this host is not installed here and not required.
+3. **`--require-reader NAME=/abs/release/root`**, repeatable, always required, recorded in the intent.
+
+Proofs of readers that are not required are ignored.
+
 ## The rule
 
-A switch that starts from `backend=file` (or a legacy root without `state.db`) reads every entry
-`<mesh>/readers/*.json`. Each one must be a valid proof (below) that:
+The switch refuses (exit 3, nothing switched) unless each required reader is ready:
 
-- is a regular file (`lstat`; a symlink, directory or unreadable entry is unready, never skipped);
-- parses under the strict schema below (no unknown fields);
-- lists `sqlite` in `backends`;
-- has `provedEpoch` **equal** to the mesh backend epoch now (`fabric-mesh-backend status --json`, `epoch`);
-- has `provedAt` at most 24 h ago and at most 5 min in the future (clock skew);
-- has `release` equal to `basename(realpath(<installRoot>/current))` now: a reader upgraded since
-  its proof is unready.
+- `fabric@R`: some proof with `"implementation": "fabric-meshstore"` and `"release": R` is valid.
+- an installed reader N with trusted root T: `<mesh>/readers/N.json` is a valid proof and its
+  `release` equals `basename(realpath(T/current))` now. The proof's own `installRoot` is ignored:
+  a reader upgraded since its proof is unready.
 
-The switch refuses (exit 3, nothing changed) while any reader is unready, and also when there is no
-reader at all (no `readers/` directory, or an empty one). Overrides:
+A valid proof is a regular file (`lstat`; not a symlink) owned by the gate's user and not
+group/other-writable, passes the strict schema below, lists `sqlite`, has `provedEpoch` equal to
+the epoch the switch starts from (or the epoch it commits, for a proof made while a crashed switch
+sits at `importing`), and has `provedAt` at most 24 h old and at most 5 min in the future.
+The `readers/` directory itself must be a directory owned by the gate's user and not
+group/other-writable: otherwise the switch refuses and no override lifts that.
 
-- `--accept-unready NAME,...`: go ahead although the named readers are unready;
-- `--accept-empty-registry`: go ahead with no registered reader.
+`--accept-unready NAME,...` is the only override.
 
-Order of a gated switch:
+Order of a switch (crash reruns included):
 
-1. Scan the registry; refuse on any reader not covered by an override.
-2. Append the **intent** to `<mesh>/backend-switches.jsonl` (fsync of the file and the directory),
-   with a new `switchId` and the overrides. If it cannot be written, refuse.
-3. Run the fenced switch. Under the fence (`custody.lock` and the mesh `.lock`), inside the import
-   transaction right before its COMMIT, the whole check runs again (`beforeCommit`): a reader that
-   registered or changed its proof since step 1 is seen, and a refusal rolls the import back.
-4. Append the **outcome** with the same `switchId` (best effort: the intent already records the override).
+1. Inventory and scan; refuse on any required reader that is unready and not accepted.
+2. Append the **intent** to `<mesh>/backend-switches.jsonl` (fsync of file and directory) with a new
+   `switchId`, the required readers, the overrides and the unattributed evidence. If it cannot be
+   written, refuse.
+3. Run the fenced switch. Under the fence, inside the transaction right before EACH flag commit
+   (`backend=importing`, then `backend=sqlite`; a rerun from `importing` included), the full check
+   runs again. A refusal rolls that transaction back. A refusal at the `sqlite` commit leaves the
+   root at `importing` with the moved marker; readers keep reading SQLite through the reader rule,
+   and a rerun completes the switch once the readers are ready (or `rollback`).
+4. Append the **outcome** with the same `switchId` (best effort), with `checkedUnderFence`.
 
-```json
-{"at":"…","switchId":"6f0…","phase":"intent","command":"cutover","backend":"sqlite","fromEpoch":0,
- "readersReady":["fabric"],"acceptedUnready":[{"name":"factory","reason":"missing sqlite (has file)"}],"acceptedEmptyRegistry":false}
-{"at":"…","switchId":"6f0…","phase":"outcome","ok":true,"epoch":1,"converged":false,"underFence":true,
- "readersReady":["fabric"],"acceptedUnready":[{"name":"factory","reason":"missing sqlite (has file)"}]}
-```
-
-A rerun after a crash (`backend=importing` or `sqlite`) is not gated: it converges the switch that
-already started. `rollback` is not gated: it is the way back.
+`rollback` is not gated: it is the way back.
 
 ## The proof file
 
-`<mesh>/readers/<name>.json`, one per reader. It is the reader's registration and its proof.
+`<mesh>/readers/<name>.json`, mode 0600, in a directory of mode 0700:
 
 | Field            | Type     | Required | Meaning |
 |------------------|----------|----------|---------|
 | `name`           | string   | yes | Equal to the file name without `.json`; `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
-| `implementation` | string   | no  | The read code. `fabric-meshstore` = Fabric's MeshStore; anything else (for example `python-factory`) is its own. |
+| `implementation` | string   | no  | The read code. `fabric-meshstore` is reserved for `reader-proof --backend`. |
 | `version`        | string   | yes | The reader's version, non-empty (informational). |
-| `installRoot`    | string   | yes | Absolute path of the reader's release root, for example `/home/paul/.local/share/smarty-dev/factory`. |
-| `release`        | string   | yes | `basename(realpath(installRoot + "/current"))` when the proof ran. |
-| `backends`       | string[] | yes | Non-empty; each `file` or `sqlite`: backends this release read for real. |
-| `provedAt`       | string   | yes | ISO 8601 with a zone (`2026-10-09T16:58:12Z`), the time of the read. |
-| `provedEpoch`    | integer  | yes | The mesh backend epoch when the read ran: `epoch` of `fabric-mesh-backend status --root <mesh> --json`. |
+| `installRoot`    | string   | no  | Informational; the gate uses its own trusted root. |
+| `release`        | string   | yes | `basename(realpath(<release root>/current))` of the code that did the read. |
+| `backends`       | string[] | yes | Non-empty; each `file` or `sqlite`. |
+| `provedAt`       | string   | yes | ISO 8601 with a zone, the time of the read. |
+| `provedEpoch`    | integer  | yes | `epoch` of `fabric-mesh-backend status --root <mesh> --json` at the read. |
 
 No other field is allowed.
 
 ```json
 {"name": "factory", "implementation": "python-factory", "version": "4f2c9e1",
- "installRoot": "/home/paul/.local/share/smarty-dev/factory", "release": "4f2c9e1a…",
+ "release": "1ed31d0d543512f7ffe9b19934cabac58c1c4899",
  "backends": ["file", "sqlite"], "provedAt": "2026-10-09T16:58:12Z", "provedEpoch": 0}
 ```
 
-A reader that cannot prove `sqlite` yet still writes its file (for example `"backends": ["file"]`):
-then the switch knows it exists and refuses until it proves `sqlite`.
-
 ## Writing a proof
 
-### Readers that read through Fabric's MeshStore
+Every proof is written under the migration fence, so no proof changes between the final check and
+the commit. The fence is two lock directories at the mesh root, taken in this order and held
+while the proof is renamed into place:
 
-Pi sessions, mesh-bridge and actors read through MeshStore. Run as the installed release:
+1. `<mesh>/custody.lock`: a directory published by `rename` of a staging directory holding `owner`;
+2. `<mesh>/.lock` (protocol 1): `mkdir`, then `owner` created with `O_EXCL`.
+
+They are not `flock` locks. A crashed owner is reclaimed by the Fabric lock code (pid and process
+incarnation checks), so another program must not reimplement them: it takes the fence by running
+the CLI below, which holds both locks while it writes.
+
+### Fabric (MeshStore readers: Pi sessions, mesh-bridge, actors)
+
+Run as each installed Fabric release that reads the mesh:
 
 ```sh
-fabric-mesh-backend reader-proof --root <mesh> --name fabric --backend sqlite --install-root <release root>
+fabric-mesh-backend reader-proof --root <mesh> --backend sqlite
 ```
 
 It copies `state.json` to a scratch directory, imports it there with the cutover's own code, lists
-every entry through MeshStore, and checks the count. Only then does it write the proof, bound to the
-installed release of `--install-root` (or the existing entry's `installRoot`). The live root is
-never changed. A root already cut over is read in place. It refuses every reader except `fabric` and
-entries with `"implementation": "fabric-meshstore"`: a proof by MeshStore says nothing about
-another program's read code.
+every entry through MeshStore and checks the count, then under the fence writes
+`readers/fabric-<release>.json` with this release: `PI_FABRIC_RELEASE_SHA` (else
+`PI_FABRIC_BUILD_SHA`, `GITHUB_SHA`, else the package directory name): the same value its writer
+records carry. The live root is never changed.
 
 ### Any other reader (the Python factory)
 
-The reader writes its own proof, after a real read with its **own installed** read code, never
-with MeshStore and never the live root before the switch:
+The reader proves with its **own installed** read code, then hands the proof to the CLI, which
+checks the schema and writes it under the fence:
 
-1. Resolve `release = basename(realpath(<installRoot>/current))` of the running install.
-2. Read `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
+1. `release = basename(realpath(<its release root>/current))` of the running install.
+2. `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
 3. Copy `<mesh>/state.json` into an empty scratch directory and run
-   `fabric-mesh-backend import --root <scratch>` there (the scratch has no registry, so pass
-   `--accept-empty-registry`).
-4. Read every entry from `<scratch>` with the reader's own SQLite read path; fail on any error or a
-   count other than the import's `entries`.
-5. Write `<mesh>/readers/<name>.json` with the format above: temp file in the same directory, fsync,
-   rename. Keep `file` in `backends` when the reader still reads `state.json`.
+   `fabric-mesh-backend import --root <scratch>` there.
+4. Read every entry from `<scratch>` with its own SQLite read path; fail on any error or a count
+   other than the import's `entries`.
+5. Write the proof JSON (format above) to a private temp file and run
+   `fabric-mesh-backend reader-proof --root <mesh> --name <name> --proof-file <temp>`.
+   It refuses `fabric*` names and `implementation: "fabric-meshstore"`.
 
-Prove again after each install (a new `release` makes the proof unready), each switch (a new epoch
-does) and at least once every 24 h before a planned switch.
+Prove again after each install (a new release makes the proof unready), after each switch (a new
+epoch does) and within 24 h before a planned switch.

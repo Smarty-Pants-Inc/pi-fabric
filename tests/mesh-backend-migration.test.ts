@@ -426,11 +426,12 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
-    const code = await main(["cutover", "--root", other, "--accept-empty-registry"], {
-      census: async () => ({ writers: [fileWriter] }), stdout: () => undefined, stderr: (text) => { err += text; },
+    const code = await main(["cutover", "--root", other, "--accept-unready", "fabric@3.1.57"], {
+      census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe(`fabric-mesh-backend: no reader registered in ${other}/readers (accepted by --accept-empty-registry)\nfabric-mesh-backend: advisory: 1 writer, 0 unknown\n`);
+    expect(err).toBe("fabric-mesh-backend: reader fabric@3.1.57 not ready: no proof from installed reader fabric release 3.1.57 (live: pid 103 file) (accepted by --accept-unready)\n"
+      + "fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 
@@ -912,8 +913,8 @@ describe("fabric-mesh-backend CLI", () => {
     // An unknown writer never blocks: the cutover is fenced on .lock and custody.lock only.
     expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(2);
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
-    const cutover = await run("cutover", "--root", root, "--accept-empty-registry", "--json");
-    expect(cutover.code).toBe(0);
+    const cutover = await run("cutover", "--root", root, "--accept-unready", "factory", "--json");
+    expect(cutover.code, cutover.err).toBe(0);
     expect(cutover.err).toMatch(/fabric-mesh-backend: advisory: 0 writers, 1 unknown/);
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1 });
     expect((await run("status", "--root", root)).out).toMatch(/census {8}advisory: 0 writers, 1 unknown/);

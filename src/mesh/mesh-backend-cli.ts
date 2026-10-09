@@ -9,15 +9,17 @@ import { census as writerCensus, type CensusWriter } from "./writer-census.js";
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
-import { blockingReaders, isReaderName, proveReader, readerReadiness, recordSwitch, type ReaderBackend, type ReaderReadiness } from "./reader-proof.js";
+import { BUILTIN_READERS, installReaderProof, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
+  type InstalledReader, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
 
 const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof"] as const;
 type Command = typeof COMMANDS[number];
 
 const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback|abort-rollback> --root DIR [--json]
-                          [--lock-protocol 1|2] [--lock-timeout-ms N] [--accept-unready NAME,...] [--accept-empty-registry]
-       fabric-mesh-backend reader-proof --root DIR --name NAME --backend file|sqlite [--install-root DIR]
-                          [--reader-version V] [--json]
+                          [--lock-protocol 1|2] [--lock-timeout-ms N] [--accept-unready NAME,...]
+                          [--require-reader NAME=INSTALL_ROOT]...
+       fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
+       fabric-mesh-backend reader-proof --root DIR --name NAME --proof-file FILE [--json]
 
   census          the ADVISORY writer census (writer-census.ts): the processes it attributed (mode,
                   release) and the evidence it could not. Informational; always exit 0 when it ran.
@@ -29,16 +31,17 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
   rollback        the R1 fence: flag exporting (E+1), export to a verified temp, switch to file,
                   then replace the marker (last). A rerun converges from the stored flag.
   abort-rollback  under the fence: restore the marker, then exporting -> sqlite, keeping epoch E+1.
-  reader-proof    a real read of the backend with Fabric's MeshStore (sqlite: a migrated scratch copy
-                  of state.json), then the proof in <root>/readers/NAME.json, bound to the release
-                  of --install-root (or the entry's installRoot). Only for NAME fabric or an entry
-                  with implementation fabric-meshstore; other readers write their own proof.
+  reader-proof    --backend: THIS Fabric release reads the backend with MeshStore (sqlite: a migrated
+                  scratch copy of state.json), then writes readers/fabric-<release>.json.
+                  --proof-file: installs the proof a non-Fabric reader made with its own read code.
+                  Both write under the migration fence (custody.lock, then .lock).
 
 Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refuse (exit 3) unless
-every reader in <root>/readers/ holds a valid proof of sqlite at the current epoch, made within 24 h
-by the release installed now. --accept-unready NAME,... and --accept-empty-registry override; the
-intent (with the overrides) is written to <root>/backend-switches.jsonl before the switch, and the
-check is repeated under the fence right before the commit.
+every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
+release. Required: each distinct release of a live Fabric writer (host leases and process records),
+the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
+only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
+runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
 
 The fence is the mesh .lock plus custody.lock, held for the whole section of import, cutover,
 rollback and abort-rollback. Stop every writer (Pi sessions, actors, mesh-bridge, the projector) first.
@@ -69,7 +72,7 @@ export const meshWriterCensus = (root: string): MeshWriterCensus => async () => 
 
 interface Options {
   command: Command; root: string; json: boolean; lockProtocol: 1 | 2; lockTimeoutMs?: number;
-  acceptUnready: string[]; acceptEmptyRegistry: boolean; name?: string; backend?: ReaderBackend; readerVersion?: string; installRoot?: string;
+  acceptUnready: string[]; requireReaders: InstalledReader[]; name?: string; backend?: ReaderBackend; readerVersion?: string; proofFile?: string;
 }
 
 class UsageError extends Error {}
@@ -86,12 +89,11 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let name: string | undefined;
   let backend: ReaderBackend | undefined;
   let readerVersion: string | undefined;
-  let installRoot: string | undefined;
-  let acceptEmptyRegistry = false;
+  let proofFile: string | undefined;
+  const requireReaders: InstalledReader[] = [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
-    if (flag === "--accept-empty-registry") { acceptEmptyRegistry = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
@@ -110,13 +112,22 @@ const parseArgs = (argv: string[]): Options | "help" => {
       if (value !== "file" && value !== "sqlite") throw new UsageError("--backend must be file or sqlite");
       backend = value;
     } else if (flag === "--reader-version") readerVersion = value;
-    else if (flag === "--install-root") installRoot = path.resolve(value);
+    else if (flag === "--proof-file") proofFile = value;
+    else if (flag === "--require-reader") {
+      const [readerName, installRoot] = [value.slice(0, value.indexOf("=")), value.slice(value.indexOf("=") + 1)];
+      if (!value.includes("=") || !isReaderName(readerName) || readerName.startsWith("fabric") || !path.isAbsolute(installRoot)) {
+        throw new UsageError(`Bad --require-reader ${value} (NAME=/absolute/release/root; NAME not fabric*)`);
+      }
+      requireReaders.push({ name: readerName, installRoot });
+    }
     else throw new UsageError(`Bad argument: ${flag}`);
   }
   if (!root) throw new UsageError("--root DIR is required");
-  if (command === "reader-proof" && (!name || !backend)) throw new UsageError("reader-proof needs --name NAME and --backend file|sqlite");
-  return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, acceptEmptyRegistry,
-    ...(installRoot === undefined ? {} : { installRoot }),
+  if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
+    throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
+  }
+  return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
+    ...(proofFile === undefined ? {} : { proofFile }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
     ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }) };
 };
@@ -159,48 +170,62 @@ const formatResult = (command: Command, result: Record<string, unknown>): string
   return `abort-rollback ${done}: backend=sqlite epoch ${String(result.epoch)}`;
 };
 
-interface Gate { switchId: string; readiness: ReaderReadiness; final?: ReaderReadiness }
+interface Gate { switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
 
 /**
- * The readiness gate of a switch to sqlite (smarty-dev#7815). Only a switch that starts from file is
- * gated; a rerun after a crash (importing, sqlite) converges. Scans the registry (refuse early), writes
- * the intent with its overrides (refuse if it cannot), then installs `beforeCommit`, which repeats the
- * whole check under the fence inside the import transaction, so a proof changed since the scan counts.
+ * The readiness gate of a switch to sqlite (smarty-dev#7815). The required readers come from the
+ * inventory (live writers' releases from the census, built-in installed readers, --require-reader),
+ * never from the registry. Scans (refuse early), writes the intent (refuse if it cannot), then installs
+ * `beforeCommit`: the whole check again under the fence right before each flag commit, crash reruns too.
  */
-const openGate = async (options: Options, library: MeshBackendOptions, warn: (text: string) => void): Promise<Gate | undefined> => {
+const openGate = async (options: Options, library: MeshBackendOptions, builtins: readonly InstalledReader[],
+  warn: (text: string) => void): Promise<Gate | undefined> => {
   // No mesh root: the switch itself refuses with nothing changed.
   if (!fs.statSync(options.root, { throwIfNoEntry: false })?.isDirectory()) return undefined;
   const { backend, epoch } = await meshBackendStatus(options.root);
-  if (backend !== "file" && backend !== "none") return undefined;
-  const accept = { unready: options.acceptUnready, emptyRegistry: options.acceptEmptyRegistry };
-  const check = (readiness: ReaderReadiness, when: string): void => {
-    const blocking = blockingReaders(readiness, accept);
+  // sqlite: switched already, a rerun only verifies (no commit); exporting/file+marker: the switch refuses.
+  if (backend !== "file" && backend !== "none" && backend !== "importing") return undefined;
+  // Attributed writers only: evidence the census cannot attribute (a pid-only lock owner, a torn record)
+  // never gates (smarty-dev#6982); it is recorded in the intent. A census failure blocks as fabric@unknown.
+  let writers: MeshCensusWriter[];
+  let unattributed: MeshCensusWriter[] = [];
+  try {
+    const report = await library.census?.();
+    writers = (report?.writers ?? []).filter(writer => writer.pid !== process.pid);
+    unattributed = (report?.unknown ?? []).filter(writer => writer.pid !== process.pid);
+  } catch (error) {
+    writers = [{ pid: 0, release: "unknown", mode: `census failed: ${(error as Error).message}` }];
+  }
+  const required = requiredReaders(writers, builtins, options.requireReaders);
+  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string): ReaderReadiness => {
+    let readiness: ReaderReadiness;
+    try { readiness = readerReadiness(options.root, "sqlite", required, window); }
+    catch (error) { throw new MeshBackendRefusedError(`${(error as Error).message}${when}`); }
+    const blocking = readiness.unready.filter(reader => !options.acceptUnready.includes(reader.name));
     if (blocking.length > 0) {
-      throw new MeshBackendRefusedError(`readers not ready for sqlite${when}: ${blocking.join("; ")}; `
+      throw new MeshBackendRefusedError(`readers not ready for sqlite${when}: ${blocking.map(reader => `${reader.name} (${reader.reason})`).join("; ")}; `
         + "each reader proves a real read (docs/mesh-backend.md), or pass --accept-unready NAME,...");
     }
+    return readiness;
   };
-  const readiness = readerReadiness(options.root, "sqlite", epoch);
-  for (const reader of readiness.unready) {
-    warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${accept.unready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
+  const window = backend === "importing" ? { fromEpoch: epoch - 1, toEpoch: epoch } : { fromEpoch: epoch, toEpoch: epoch + 1 };
+  const preview = (() => { try { return readerReadiness(options.root, "sqlite", required, window); } catch { return undefined; } })();
+  for (const reader of preview?.unready ?? []) {
+    warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
   }
-  check(readiness, "");
-  const empty = readiness.ready.length + readiness.unready.length === 0;
-  if (empty) warn(`fabric-mesh-backend: no reader registered in ${options.root}/readers (accepted by --accept-empty-registry)\n`);
-  const gate: Gate = { switchId: randomUUID(), readiness };
+  const readiness = evaluate(window, "");
+  const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [] };
   try {
-    recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", fromEpoch: epoch,
-      readersReady: readiness.ready, acceptedUnready: readiness.unready, acceptedEmptyRegistry: empty });
+    recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
+      required, requireReader: options.requireReaders, unattributedEvidence: unattributed, readersReady: readiness.ready, acceptedUnready: readiness.unready });
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
   }
   const outer = library.beforeCommit;
-  library.beforeCommit = (before) => {
-    outer?.(before);
-    if (before.backend !== "file") return;
-    const now = readerReadiness(options.root, "sqlite", before.epoch);
-    check(now, " (under the fence, before the commit)");
-    gate.final = now;
+  library.beforeCommit = (commit) => {
+    outer?.(commit);
+    gate.final = evaluate(commit, ` (under the fence, before the ${commit.phase} commit)`);
+    gate.checked.push(commit.phase);
   };
   return gate;
 };
@@ -218,6 +243,8 @@ export const main = async (argv: string[], io: {
   stdout?: (text: string) => void; stderr?: (text: string) => void;
   /** The writer census; default `meshWriterCensus` (writer-census.ts) of --root. */
   census?: MeshWriterCensus;
+  /** The built-in installed readers; default BUILTIN_READERS (tests replace them). */
+  builtinReaders?: readonly InstalledReader[];
   /** Extra library options (tests: onStep, open). */
   options?: Partial<MeshBackendOptions>;
 } = {}): Promise<number> => {
@@ -256,11 +283,13 @@ export const main = async (argv: string[], io: {
       io.options?.onAdvisory?.(advisory);
     };
     if (options.command === "reader-proof") {
-      const proved = await proveReader(options.root, { name: options.name!, backend: options.backend!,
-        ...(options.readerVersion === undefined ? {} : { version: options.readerVersion }),
-        ...(options.installRoot === undefined ? {} : { installRoot: options.installRoot }) });
+      const proved = options.proofFile !== undefined
+        ? { ...(await installReaderProof(options.root, options.name!, fs.readFileSync(options.proofFile, "utf8"))), entries: undefined }
+        : await proveFabricReader(options.root, { backend: options.backend!, ...(options.name === undefined ? {} : { name: options.name }),
+          ...(options.readerVersion === undefined ? {} : { version: options.readerVersion }) });
       write(`${options.json ? JSON.stringify({ command: "reader-proof", ok: true, ...proved }, null, 2)
-        : `reader-proof done: ${proved.proof.name} read ${options.backend} (${proved.entries} entries), backends ${proved.proof.backends.join(",")} at epoch ${proved.proof.provedEpoch}, release ${proved.proof.release}: ${proved.file}`}\n`);
+        : `reader-proof done: ${proved.proof.name} ${proved.entries === undefined ? "installed" : `read ${options.backend} (${proved.entries} entries)`}, `
+          + `backends ${proved.proof.backends.join(",")} at epoch ${proved.proof.provedEpoch}, release ${proved.proof.release}: ${proved.file}`}\n`);
       return 0;
     }
     if (options.command === "status") {
@@ -269,17 +298,16 @@ export const main = async (argv: string[], io: {
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
-    if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, warn);
+    if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS, warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)
           : abortMeshRollback(options.root, library))) };
     if (gate) {
       const final = gate.final ?? gate.readiness;
-      result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready,
-        acceptedEmptyRegistry: final.ready.length + final.unready.length === 0 };
+      result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
-        underFence: gate.final !== undefined, readersReady: final.ready, acceptedUnready: final.unready });
+        checkedUnderFence: gate.checked, readersReady: final.ready, acceptedUnready: final.unready });
     }
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;

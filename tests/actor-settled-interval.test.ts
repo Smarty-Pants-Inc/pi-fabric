@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,14 +25,15 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settled-interval-")), owns?: () => boolean) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settled-interval-")), owns?: () => boolean,
+  options: { releasePaused?: boolean; canConsumeMesh?: () => boolean } = {}) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-    actorRoot: path.join(root, "actors"), persistent: true,
+    actorRoot: path.join(root, "actors"), persistent: true, ...options,
     ...(owns ? { canManageActor: owns } : {}),
   });
   const close = async () => { await actors.close(); await agents.close(); };
@@ -111,6 +113,262 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(cancelled).toHaveBeenCalledWith(timer);
     vi.advanceTimersByTime(2_000);
     expect(incoming(actors, actor.id)).toHaveLength(1);
+  });
+
+  it.each([400, 1_200])("restores one latest pending settle across restart after %i ms without another event", async (downtime) => {
+    const first = await timedActor();
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "superseded" });
+    const latest = { ...payload(), marker: "latest" };
+    const images = [{ type: "image" as const, data: "latest-image", mimeType: "image/png" }];
+    actors.dispatchHostEvent("agent_settled", latest, images);
+    latest.marker = "mutated"; images[0]!.data = "mutated";
+    await first.close();
+    vi.advanceTimersByTime(downtime);
+    expect(incoming(actors, actor.id)).toHaveLength(1); // No old-manager delivery.
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve(); // Restore admission uses the host's explicit bootstrap-ready boundary.
+    const remaining = Math.max(0, 900 - downtime);
+    if (remaining) {
+      vi.advanceTimersByTime(remaining - 1);
+      expect(incoming(second.actors, actor.id)).toHaveLength(1);
+    }
+    vi.advanceTimersByTime(remaining ? 1 : 0);
+    expect(incoming(second.actors, actor.id).map((message) => (message.data as { marker: string }).marker)).toEqual(["leading", "latest"]);
+    const directory = path.join(first.root, "actors", actor.id);
+    const queued = JSON.parse(fs.readFileSync(path.join(directory, fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!), "utf8"));
+    expect(queued.items.find((item: { payload: { marker: string } }) => item.payload.marker === "latest").images).toEqual([{ type: "image", data: "latest-image", mimeType: "image/png" }]);
+    await second.close();
+    const third = setup(first.root, undefined, { releasePaused: true });
+    third.actors.resumeQueued();
+    await Promise.resolve();
+    vi.advanceTimersByTime(2_000);
+    expect(incoming(third.actors, actor.id)).toHaveLength(2); // Successful admission left no pending duplicate.
+  });
+
+  it.each(["stop", "remove", "recreate", "halt"] as const)("does not resurrect durable pending after explicit %s and restart", async (cancel) => {
+    const first = await timedActor();
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "cancelled" });
+    if (cancel === "halt") actors.haltAll();
+    else if (cancel === "remove") await actors.remove(actor.id);
+    else {
+      const definition = actors.definition(actor.id);
+      await actors.stop(actor.id);
+      if (cancel === "recreate") expect((await actors.create(definition)).id).not.toBe(actor.id);
+    }
+    await first.close();
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve();
+    vi.advanceTimersByTime(2_000);
+    for (const restored of second.actors.list()) {
+      expect(incoming(second.actors, restored.id).some(message => (message.data as { marker?: string }).marker === "cancelled")).toBe(false);
+      const directory = path.join(first.root, "actors", restored.id);
+      for (const file of fs.readdirSync(directory).filter(file => file.startsWith("queue-"))) {
+        expect(JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")).settledWindows).toBeUndefined();
+      }
+    }
+    if (cancel === "remove") expect(second.actors.list()).toHaveLength(0);
+    if (cancel === "recreate") {
+      second.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new" });
+      expect(incoming(second.actors, second.actors.list()[0]!.id)).toHaveLength(1);
+    }
+  });
+
+  it("restores independent sources and authenticated root fallback only after publication is ready", async () => {
+    let monitor: ActorMeshMonitor | undefined;
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
+    const first = await timedActor();
+    const { actors, actor, mesh } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload("source-a"), marker: "a-leading" });
+    vi.advanceTimersByTime(200);
+    actors.dispatchHostEvent("agent_settled", { ...payload("source-b"), marker: "b-leading" });
+    actors.dispatchHostEvent("agent_settled", { marker: "root-leading" });
+    actors.dispatchHostEvent("agent_settled", { ...payload("source-a"), marker: "a-latest" });
+    actors.dispatchHostEvent("agent_settled", { ...payload("source-b"), marker: "b-latest" });
+    const relay = await mesh.publish({
+      topic: "fabric.actor.host-event", kind: "agent_settled", from: identity, to: actor.id,
+      data: { version: 1, actorId: actor.id, event: "agent_settled", payload: { marker: "root-latest" }, mainRevision: 0, taskRevision: 0, idle: true },
+    });
+    monitor!.callbacks.onEvent(relay);
+    await first.close();
+    vi.advanceTimersByTime(300);
+    let published = false;
+    const second = setup(first.root, undefined, { releasePaused: true, canConsumeMesh: () => published });
+    await Promise.resolve();
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(499);
+    expect(incoming(second.actors, actor.id)).toHaveLength(3);
+    published = true;
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(1); // a's original 11,000 boundary, not 1,000 after restart.
+    expect((incoming(second.actors, actor.id)[3]!.data as { marker: string }).marker).toBe("a-latest");
+    published = false; // A live timer's publication veto preserves, rather than drops, pending.
+    vi.advanceTimersByTime(200);
+    expect(incoming(second.actors, actor.id)).toHaveLength(4);
+    published = true;
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(0);
+    expect(incoming(second.actors, actor.id).slice(3).map(message => (message.data as { marker: string }).marker)).toEqual(["a-latest", "b-latest", "root-latest"]);
+    expect(second.actors.inFlightCount()).toBe(0); // releasePaused still gates worker activation.
+  });
+
+  it("keeps pending work across failed timer admission and another restart", async () => {
+    const first = await timedActor();
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    const clone = globalThis.structuredClone;
+    const failing = vi.spyOn(globalThis, "structuredClone").mockImplementation(value => {
+      if ((value as { marker?: string })?.marker === "latest") throw new Error("temporary admission failure");
+      return clone(value);
+    });
+    vi.advanceTimersByTime(900);
+    expect(incoming(actors, actor.id)).toHaveLength(1);
+    failing.mockRestore();
+    await first.close();
+    const second = setup(first.root, undefined, { releasePaused: true });
+    await Promise.resolve();
+    vi.advanceTimersByTime(0);
+    expect(incoming(second.actors, actor.id)).toHaveLength(1); // No constructor-time overdue activation.
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(0);
+    expect(incoming(second.actors, actor.id).map(message => (message.data as { marker: string }).marker)).toEqual(["leading", "latest"]);
+  });
+
+  it.each([false, true])("persists boundary admission atomically even if the next checkpoint fails (coalesce %s)", async (coalesce) => {
+    const first = await timedActor(1_000, undefined, coalesce);
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "obsolete" });
+    const directory = path.join(first.root, "actors", actor.id);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
+    const rename = fs.renameSync;
+    let admittedCheckpoint = false;
+    const checkpoint = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === queueFile) {
+        if (admittedCheckpoint) throw new Error("no second checkpoint");
+        // Revision checkpoints legitimately precede admission. Fence after the
+        // first snapshot containing the boundary work, not after those writes.
+        const candidate = JSON.parse(fs.readFileSync(from, "utf8"));
+        admittedCheckpoint = candidate.items.some((item: { payload: { marker?: string } }) => item.payload.marker === "boundary-latest");
+      }
+      return rename(from, to);
+    });
+    vi.setSystemTime(11_000);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "boundary-latest" });
+    const saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    expect(admittedCheckpoint).toBe(true);
+    expect(saved.items).toHaveLength(coalesce ? 1 : 2);
+    expect(saved.items.at(-1).payload.marker).toBe("boundary-latest");
+    expect(saved.settledWindows).toBeUndefined(); // Already correct in the admission's first atomic write.
+    checkpoint.mockRestore();
+    await first.close();
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve();
+    vi.advanceTimersByTime(2_000);
+    expect(incoming(second.actors, actor.id)).toHaveLength(coalesce ? 1 : 2); // Coalesce admission does not append telemetry.
+    expect(second.actors.status(actor.id).queued).toBe(coalesce ? 1 : 2);
+  });
+
+  it("retains a pending-only snapshot after the leading queue has completed", async () => {
+    const first = await timedActor();
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    await first.close();
+    const directory = path.join(first.root, "actors", actor.id);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
+    const saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    saved.items = []; delete saved.cleanHandover; // Completed leading run; only the unadmitted trailing snapshot remains.
+    fs.writeFileSync(queueFile, JSON.stringify(saved));
+    const second = setup(first.root, undefined, { releasePaused: true });
+    await Promise.resolve();
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).settledWindows).toHaveLength(1);
+    vi.advanceTimersByTime(900);
+    expect(incoming(second.actors, actor.id)).toHaveLength(1); // Pending-only restore waits for bootstrap, even when due.
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(0);
+    expect(incoming(second.actors, actor.id).map(message => (message.data as { marker: string }).marker)).toEqual(["leading", "latest"]);
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toHaveLength(1);
+  });
+
+  it("imports latest predecessor pending before checkpoint/delete and keeps it when checkpoint fails", async () => {
+    const first = await timedActor();
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "own-pending" });
+    await first.close();
+    const directory = path.join(first.root, "actors", actor.id);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
+    const predecessorRoot = "session:predecessor";
+    const predecessorKey = createHash("sha256").update([predecessorRoot, "session"].join("\0")).digest("hex").slice(0, 16);
+    const predecessorFile = path.join(directory, `queue-${predecessorKey}.json`);
+    const saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    saved.settledWindows[0].pending.payload.marker = "predecessor-latest";
+    saved.settledWindows[0].pending.observedAt += 1;
+    fs.writeFileSync(predecessorFile, JSON.stringify(saved));
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((record: { id: string }) => record.id === actor.id).adoptedFrom = [predecessorRoot];
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const rename = fs.renameSync;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === queueFile) throw new Error("checkpoint unavailable");
+      return rename(from, to);
+    });
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve();
+    expect(fs.existsSync(predecessorFile)).toBe(true);
+    await second.close();
+    failed.mockRestore();
+    const third = setup(first.root, undefined, { releasePaused: true });
+    third.actors.resumeQueued();
+    await Promise.resolve();
+    expect(fs.existsSync(predecessorFile)).toBe(false); // Only the successfully merged own snapshot permits deletion.
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).settledWindows[0].pending.payload.marker).toBe("predecessor-latest");
+    vi.advanceTimersByTime(900);
+    expect(incoming(third.actors, actor.id).map(message => (message.data as { marker: string }).marker)).toEqual(["leading", "predecessor-latest"]);
+    await third.close();
+    const fourth = setup(first.root, undefined, { releasePaused: true });
+    fourth.actors.resumeQueued();
+    await Promise.resolve();
+    vi.advanceTimersByTime(2_000);
+    expect(incoming(fourth.actors, actor.id)).toHaveLength(2);
+  });
+
+  it("retains ownership-deferred pending through restart and admits it once after reacquisition", async () => {
+    let owned = true;
+    const first = await timedActor(1_000, () => owned);
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    owned = false;
+    vi.advanceTimersByTime(900);
+    expect(incoming(actors, actor.id)).toHaveLength(1);
+    await first.close();
+    const second = setup(first.root, () => owned, { releasePaused: true });
+    await Promise.resolve();
+    vi.advanceTimersByTime(1_000);
+    // The old owner's buffered telemetry need not be archived on unowned close.
+    expect(incoming(second.actors, actor.id).some(message => (message.data as { marker: string }).marker === "latest")).toBe(false);
+    owned = true;
+    second.actors.resumeQueued();
+    vi.advanceTimersByTime(0);
+    expect(incoming(second.actors, actor.id).filter(message => (message.data as { marker: string }).marker === "latest")).toHaveLength(1);
   });
 
   it("lets a boundary arrival supersede an older still-pending trailing event", async () => {

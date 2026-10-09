@@ -127,7 +127,7 @@ import type { FabricPythonRuntime } from "../config.js";
 interface SettledWindow {
   acceptedAt: number;
   intervalMs: number;
-  pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string };
+  pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string; observedAt: number };
   timer?: NodeJS.Timeout;
 }
 
@@ -548,9 +548,10 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
-  // Admission times belong to the running manager, not replaceable registry objects.
-  // Never serialized: restart/owner transfer starts with a fresh leading edge.
+  // Admission times belong to the manager, not replaceable registry objects.
+  // Only windows with undelivered work survive in the lineage's existing queue file.
   readonly #settledWindows = new Map<string, Map<string, SettledWindow>>();
+  #settledRestoreReady = false;
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
@@ -717,6 +718,7 @@ export class ActorManager {
         if (this.#initialRetentionPending) this.#startRetentionSweep();
         this.#syncActorsFromRegistry();
         this.#refreshOwnership(undefined, false);
+        this.#resumeSettledWindows();
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
         }
@@ -762,10 +764,12 @@ export class ActorManager {
   /** Re-admit restored work after the host's providers and ownership directory are ready. */
   resumeQueued(): void {
     if (this.#closing || this.#halted) return;
+    this.#settledRestoreReady = true;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
     if (this.#initialRetentionPending) this.#startRetentionSweep();
     this.#scheduleRestoreParked();
+    this.#resumeSettledWindows();
     for (const actor of this.#actors.values()) {
       if (actor.queue.length > 0 || this.#inFlight.has(actor.id)) this.#requestDrain(actor);
     }
@@ -1917,11 +1921,12 @@ export class ActorManager {
     payload: unknown,
     images: readonly ImageContent[],
     sourceRootId: string,
+    pendingSourceId?: string,
   ): boolean {
     if (this.#skipOnArrival(actor, `host:${event}`, payload)) return true;
     const interval = event === "agent_settled" ? actor.activation?.minIntervalMs ?? 0 : 0;
-    let sourceId: string | undefined;
-    let windows: Map<string, SettledWindow> | undefined;
+    let sourceId = pendingSourceId;
+    let windows = pendingSourceId === undefined ? undefined : this.#settledWindows.get(actor.id);
     const now = Date.now();
     if (interval > 0) {
       if (this.#closing || this.#halted) return false;
@@ -1934,12 +1939,13 @@ export class ActorManager {
       windows = this.#settledWindows.get(actor.id);
       if (windows) {
         for (const [source, window] of windows) {
-          if (!window.timer && now - window.acceptedAt >= interval) windows.delete(source);
+          if (!window.pending && !window.timer && now - window.acceptedAt >= window.intervalMs) windows.delete(source);
         }
         const window = windows.get(sourceId);
-        if (window && now - window.acceptedAt < interval) {
-          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId };
+        if (window && now - window.acceptedAt < window.intervalMs) {
+          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now };
           // Latest payload wins, but subsequent arrivals never move the original boundary.
+          this.#persistQueue(actor.id);
           if (!window.timer) this.#armSettledWindow(actor.id, sourceId, window);
           return false;
         }
@@ -1949,21 +1955,37 @@ export class ActorManager {
       ...(actor.coalesce ? { coalesceKey: `host:${event}` } : {}),
       ...(images.length > 0 ? { images } : {}),
       ownershipChecked: true,
+      ...(sourceId !== undefined ? {
+        // Keep pending work on failed admission, including a full queue/overflow.
+        holdWhenFull: windows?.get(sourceId)?.pending !== undefined,
+        onAccepted: () => {
+          if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
+          // Replace BEFORE the queue write: never persist admitted work alongside
+          // obsolete pending work, or neither side of this transfer on restart.
+          const previous = windows.get(sourceId!);
+          if (previous?.timer) clearTimeout(previous.timer);
+          windows.set(sourceId!, { acceptedAt: now, intervalMs: interval });
+        },
+      } : {}),
     });
-    // Only an admitted event arms the window. Filtered events never slide it.
-    if (sourceId !== undefined) {
-      if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
-      // An arrival at the boundary can beat the timer: it supersedes the held payload.
-      const previous = windows.get(sourceId);
-      if (previous?.timer) clearTimeout(previous.timer);
-      windows.set(sourceId, { acceptedAt: now, intervalMs: interval });
-    }
     return true;
   }
 
-  #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
+  #resumeSettledWindows(): void {
+    // The host calls resumeQueued/resumeAfterRelease after providers and ownership
+    // bootstrap. Registry construction/polls must only retain, not activate, work.
+    if (!this.#settledRestoreReady || this.#closing || this.#halted || this.#canConsumeMesh?.() === false) return;
+    for (const [actorId, sources] of this.#settledWindows) {
+      if (!this.#canManageCached(actorId)) continue;
+      for (const [sourceId, window] of sources) {
+        if (window.pending && !window.timer) this.#armSettledWindow(actorId, sourceId, window);
+      }
+    }
+  }
+
+  #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow, retryMs = 0): void {
     // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
-    const remaining = window.intervalMs - (Date.now() - window.acceptedAt);
+    const remaining = Math.max(retryMs, 0, window.intervalMs - (Date.now() - window.acceptedAt));
     window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
     window.timer.unref();
   }
@@ -1971,40 +1993,49 @@ export class ActorManager {
   #flushSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
     if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
     delete window.timer;
-    if (!window.pending || this.#closing || this.#halted) {
-      delete window.pending;
-      return;
-    }
+    if (!window.pending || this.#closing || this.#halted || this.#canConsumeMesh?.() === false) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(actorId);
     // Reload/reacquisition can replace every registry object. Resolve only after fencing.
     const actor = this.#actors.get(actorId);
     if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
-    if (!actor || actor.status === "stopped" || actor.removal || !actor.events.includes("agent_settled") ||
-        !this.#canManageCached(actorId)) {
-      delete window.pending;
+    if (!actor || actor.status === "stopped" || actor.removal || !actor.events.includes("agent_settled")) {
+      this.#clearSettledWindows(actorId);
       return;
     }
+    // Ownership/publication loss is a deferral, not an explicit cancellation.
+    if (!this.#canManageCached(actorId)) return;
     if (Date.now() - window.acceptedAt < window.intervalMs) {
       this.#armSettledWindow(actorId, sourceId, window);
       return;
     }
     const pending = window.pending;
-    delete window.pending;
     try {
-      this.#enqueueHostEvent(actor, "agent_settled", pending.payload, pending.images, pending.sourceRootId);
+      if (this.#enqueueHostEvent(actor, "agent_settled", pending.payload, pending.images, pending.sourceRootId, sourceId) &&
+          this.#settledWindows.get(actorId)?.get(sourceId) === window) {
+        // A current skip-only filter intentionally consumes this delivery.
+        delete window.pending;
+        this.#persistQueue(actorId);
+      }
     } catch (error) {
       actor.lastError = error instanceof Error ? error.message : String(error);
+      if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending) {
+        this.#armSettledWindow(actorId, sourceId, window, this.#preparationRetryMs);
+      }
     }
   }
 
-  #clearSettledWindows(actorId?: string): void {
-    const windows = actorId === undefined ? this.#settledWindows.values() : [this.#settledWindows.get(actorId)];
-    for (const sources of windows) {
-      if (sources) for (const window of sources.values()) if (window.timer) clearTimeout(window.timer);
+  #clearSettledWindows(actorId?: string, suspend = false): void {
+    const ids = actorId === undefined ? [...this.#settledWindows.keys()] : [actorId];
+    for (const id of ids) {
+      const sources = this.#settledWindows.get(id);
+      if (!sources) continue;
+      const pending = [...sources.values()].some(window => window.pending);
+      for (const window of sources.values()) if (window.timer) clearTimeout(window.timer);
+      this.#settledWindows.delete(id);
+      // Close suspends the persisted queue; stop/halt/removal cancel its pending work.
+      if (pending && !suspend) this.#persistQueue(id, true);
     }
-    if (actorId === undefined) this.#settledWindows.clear();
-    else this.#settledWindows.delete(actorId);
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
@@ -2481,6 +2512,8 @@ export class ActorManager {
   pauseForRelease(): void { this.#releasePaused = true; }
   resumeAfterRelease(): void {
     this.#releasePaused = false;
+    this.#settledRestoreReady = true;
+    this.#resumeSettledWindows();
     if (this.#initialRetentionPending) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
@@ -2509,7 +2542,7 @@ export class ActorManager {
   close(): Promise<void> {
     if (!this.#closePromise) {
       this.#closing = true;
-      this.#clearSettledWindows();
+      this.#clearSettledWindows(undefined, true);
       this.#closePromise = this.#close();
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
@@ -2718,6 +2751,8 @@ export class ActorManager {
       deadLetter?: boolean;
       /** A dead-lettered event returning to the queue; it never goes back to the file. */
       replaying?: boolean;
+      /** Internal atomic transfer of a held host event into the queue snapshot. */
+      onAccepted?: () => void;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2761,6 +2796,7 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
+        options.onAccepted?.();
         const persisted = this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         // Memory already runs the merged item; an unacknowledged replay coalesces again.
@@ -2816,6 +2852,7 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
+    options.onAccepted?.();
     if (!this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
       // Not durable in the receiver's queue: do not accept it, so the host cursor
       // keeps the event and offers it again rather than losing it on a restart.
@@ -5052,8 +5089,11 @@ export class ActorManager {
       });
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
+    const settledWindows = [...(this.#settledWindows.get(actorId) ?? [])]
+      .flatMap(([sourceId, window]) => window.pending
+        ? [{ sourceId, acceptedAt: window.acceptedAt, intervalMs: window.intervalMs, pending: window.pending }] : []);
     try {
-      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
+      if (items.length === 0 && settledWindows.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
         try {
@@ -5080,6 +5120,7 @@ export class ActorManager {
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
+          ...(settledWindows.length ? { settledWindows } : {}),
           ...(cleanHandover ? { cleanHandover: true } : {}),
         }, { durable });
       }
@@ -5167,9 +5208,30 @@ export class ActorManager {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
+      settledWindows?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    // Import before any queue rewrite (including dropped restart attempts) and
+    // before predecessor deletion. Never replace newer same-process pending work.
+    if (actor.status !== "stopped" && !actor.removal && Array.isArray(saved.settledWindows)) {
+      for (const record of saved.settledWindows) {
+        if (typeof record !== "object" || record === null) continue;
+        const value = record as SettledWindow & { sourceId?: unknown };
+        if (typeof value.sourceId !== "string" || !value.sourceId ||
+            !Number.isSafeInteger(value.acceptedAt) || value.acceptedAt < 0 ||
+            !Number.isSafeInteger(value.intervalMs) || value.intervalMs <= 0 ||
+            !value.pending || typeof value.pending.sourceRootId !== "string" ||
+            !Number.isSafeInteger(value.pending.observedAt) || !Array.isArray(value.pending.images) ||
+            !value.pending.images.every(image => image?.type === "image" && typeof image.data === "string" && typeof image.mimeType === "string")) continue;
+        let windows = this.#settledWindows.get(actor.id);
+        if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
+        const existing = windows.get(value.sourceId);
+        if (existing?.pending && existing.pending.observedAt >= value.pending.observedAt) continue;
+        if (existing?.timer) clearTimeout(existing.timer);
+        windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending });
+      }
+    }
     const counter = (value: unknown): number =>
       typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
     actor.latestActivationSequence = Math.max(actor.latestActivationSequence, counter(saved.latestActivationSequence));

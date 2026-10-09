@@ -725,8 +725,9 @@ export class SqliteStateStore {
     const requested = initializeOf(options);
     const initialize = guardBeforeOpen(root, requested);
     if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
-    // The same fence as open() (a synchronous caller: bounded synchronous attempts at the same two locks).
-    return holdMeshFenceSync(root, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS, () =>
+    // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
+    // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
+    return holdMeshFenceSync(root, 0, () =>
       SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
   }
 

@@ -363,10 +363,10 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
         expect(fs.readFileSync(stateJson(first), "utf8")).toBe(populated);
         expect(fs.existsSync(path.join(first, "state.db"))).toBe(false);
 
-        // The synchronous create cannot enter while the writer holds .lock either: it times out with no side effect.
+        // The synchronous create cannot enter while the writer holds .lock either: a busy refusal, no side effect.
         const blocked = seed("sync", start);
         await meshLock(blocked).withLockAcrossAwait(async () => {
-          expect(() => SqliteStateStore.openSync(blocked, 64 * 1024, 1_000, { initialize: "create", lockTimeoutMs: 100 })).toThrow(MeshLockTimeoutError);
+          expect(() => SqliteStateStore.openSync(blocked, 64 * 1024, 1_000, { initialize: "create" })).toThrow(MeshLockTimeoutError);
           expect(fs.existsSync(path.join(blocked, "state.db"))).toBe(false);
           expect(readMeshStateMovedMarker(blocked)).toBeUndefined();
           commit(blocked);

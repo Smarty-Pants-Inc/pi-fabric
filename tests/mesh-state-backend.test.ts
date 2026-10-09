@@ -255,6 +255,9 @@ describe("sqlite backend acquisition", () => {
   it("never takes the mesh .lock for state", async () => {
     const root = tempRoot("nolock");
     const store = open(root, { stateBackend: "sqlite" });
+    // A fixture's first open of a fresh root installs the marker under the import's fence (custody.lock and
+    // .lock, smarty-dev#6477 review round 2): that is initialisation, not state, so it happens before watching.
+    expect(store.listAll("")).toEqual([]);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     try {

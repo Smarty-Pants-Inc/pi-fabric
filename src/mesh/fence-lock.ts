@@ -69,9 +69,18 @@ const release = (lock: string, token: string, record: string): void => {
 };
 
 /**
- * The same fence for a synchronous caller (`SqliteStateStore.openSync` with `initialize: "create"`): bounded
- * single attempts at each lock with short synchronous sleeps, the locks' own wire formats, no stale-owner
- * recovery (a dead holder is recovered by the next asynchronous acquirer; this one times out naming it).
+ * The fence was busy for a synchronous acquirer. It carries SQLITE_BUSY's errcode so a synchronous open's
+ * caller retries it exactly as a busy database (state-backend.ts falls back to the asynchronous open).
+ */
+export class MeshFenceBusyError extends MeshLockTimeoutError {
+  readonly errcode = 5;
+}
+
+/**
+ * The same fence for a synchronous caller (`SqliteStateStore.openSync` with `initialize: "create"`): attempts
+ * at each lock until `timeoutMs` (0: one attempt) with short synchronous sleeps, the locks' own wire formats,
+ * no stale-owner recovery (a dead holder is recovered by the next asynchronous acquirer). A synchronous
+ * waiter blocks the event loop, so it can never outwait an in-process holder: callers pass 0 and retry.
  */
 export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation: () => T): T => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -91,7 +100,7 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       if (Date.now() >= deadline) {
         let pid: string | undefined;
         try { pid = fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[1]; } catch { /* ownerless or gone */ }
-        throw new MeshLockTimeoutError(` (${path.basename(lock)} ${lock}${pid ? `, held by pid ${pid}` : ""})`, attempts, maxGapMs);
+        throw new MeshFenceBusyError(` (${path.basename(lock)} ${lock}${pid ? `, held by pid ${pid}` : ""})`, attempts, maxGapMs);
       }
       sleepSync(Math.min(Math.max(1, deadline - Date.now()), 2 + Math.floor(Math.random() * 4)));
     }

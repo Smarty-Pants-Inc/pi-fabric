@@ -191,6 +191,65 @@ Verdict: no throughput verdict versus the single-host ~430 msg/s / CAS p50 3 ms.
 predict lower: each CT4000P3 fsync costs 2.7–3.2 ms, 2–5× the 990 EVO Plus (0.58–1.27 ms), with
 sub-ms RTT, so a 3-host R3 sync-always run would likely be disk-bound below intel1.
 
+### epyc1 single host (CT4000P3) (lane fs-7504d, 2026-10-09)
+
+The single-host variant of the NVMe rerun on the disk class the cluster would use, since the
+3-host run is blocked. Orchestrated from Ryzen 1 over ssh. Same v2.14.7 tarball (SHA-256
+`e5c20b1c…b8be2`, matches `SHA256SUMS`), same scripts and cells, `nats` 2.29.3, the host's Node
+24.19.0. `epyc1`, bare metal (`systemd-detect-virt`: none), AMD EPYC 4545P 16-core, 32 threads,
+Ubuntu 26.04.1, kernel 7.0.0-38-generic. Load 0.2–0.5 before the run, up to 3.7 during it (the
+bench itself). All 3 nodes share one device:
+
+| Node | Device | Model | fs | `dd bs=4k count=1000 oflag=dsync` |
+|---|---|---|---|---|
+| n1, n2, n3 | nvme0n1p2 (`/`) | Crucial P3 4TB (CT4000P3PSSD8) | ext4, relatime | 2.73 / 2.73 / 2.83 ms per write |
+
+Listeners on 127.0.0.1 only (client 26420–26422, routes 26423–26425; control 26430–26435),
+stores in one `mktemp -d` under `~/.cache`. No `smarty-reap` on epyc1: nodes ran under `nohup`,
+PIDs recorded, stopped by PID; the temp dir was removed with `rm -rf -- <path>`.
+
+#### Stream publish, R3 file stream (6 s per cell; control 4 s)
+
+| Payload | Publishers | msg/s | p50 ms | p99 ms | Control: default sync (msg/s, p50, p99) |
+|---|---|---|---|---|---|
+| 256 B | 1 | 79 | 12.2 | 15.9 | 12629, 0.07, 0.17 |
+| 256 B | 16 | 172 | 92.5 | 118 | 43783, 0.31, 0.74 |
+| 256 B | 64 | 172 | 368 | 407 | 44828, 1.34, 2.87 |
+| 4 KB | 1 | 76 | 13.8 | 15.0 | 10884, 0.09, 0.20 |
+| 4 KB | 16 | 169 | 94.3 | 117 | 38072, 0.35, 1.42 |
+| 4 KB | 64 | 168 | 377 | 423 | 36077, 1.62, 3.76 |
+
+Errors 0 and stored = acked in every cell. Again flat from 16 publishers on and independent of
+payload size: the ceiling is synced writes. The control column (default `sync_interval`, fresh
+stores) is 2–3× intel1's, so the CPU and NATS are not the limit; the fsync is.
+
+#### KV (R3 bucket, history 1, 256 B values, 3 s per cell)
+
+| Operation | Clients | ops | p50 ms | p99 ms |
+|---|---|---|---|---|
+| put | 1 / 16 | 232 / 523 | 13.4 / 92.9 | 15.9 / 121 |
+| get, direct (any replica) | 1 / 16 | 66563 / 122283 | 0.05 / 0.32 | 0.09 / 0.86 |
+| get, leader (`STREAM.MSG.GET`) | 1 / 16 | 61950 / 120773 | 0.04 / 0.34 | 0.15 / 0.89 |
+| CAS `update(key, v, rev)` | 1 / 16 | 233 / 505 | 13.2 / 95.9 | 16.5 / 128 |
+| CAS, 16 clients on 1 key | 16 | 256 wins, 34011 conflicts | 11.6 | 17.2 |
+
+CAS errors 1 / 16 are each client's first update on revision 0 (the bench artifact above); no
+other errors.
+
+#### Leader kill under load (SIGKILL, 16 publishers + 6 lease contenders, 25 s run)
+
+| Trial | Killed | Resume (largest ack gap after kill) | Acked / stored / read back | Lost | Dup stored | Dup acks (deduped retries) | Client retries | Lease result |
+|---|---|---|---|---|---|---|---|---|
+| 1 | n3: stream leader | 7.18 s (first ack after kill: 7.17 s) | 3031 / 3031 / 3031 | 0 | 0 | 12 | 1663 | lease leader (n2) not hit; 1 holder (7 failed renewals) |
+| 2 | n1: stream + lease leader | 4.33 s (first ack after kill: 0 ms, in flight) | 3537 / 3537 / 3537 | 0 | 0 | 13 | 760 | 2 grants: the holder lost the lease and one other took it; no overlap, no two grants on one revision (handover delay not captured) |
+| 3 | n2: lease leader (`KILL=lease`; also stream leader) | 4.32 s (first ack after kill: 0 ms, in flight) | 3506 / 3506 / 3506 | 0 | 0 | 12 | 756 | holder 4 kept the lease through 11 failed renewals; no overlap |
+
+Two holders: 0 in all trials. Trial 1's 7.18 s is just under the 7.5 s limit of section 6.
+
+Verdict: on the CT4000P3 the R3 sync-always ceiling is **~170 msg/s at 16 publishers (40 % of
+intel1's ~430) and CAS p50 13.2 ms (4.4× intel1's 3.0 ms)**, matching the 2.7 ms vs 0.6–1.3 ms
+fsync gap; this disk class, not intel1's, sets the budget.
+
 ## 2. Shape: one stream for state and events, local projection for sync reads
 
 `StateBackend` reads are synchronous (`state-backend.ts:173-199`); `writeBatch` is atomic over
@@ -329,10 +388,14 @@ time, grants per expected revision, hold overlap) and the issue's acceptance.
    (`intel1`, 990 EVO Plus, 0.6–1.3 ms per dsync write, 3 nodes on one host) the budget is
    ~205 msg/s at 1 publisher and a flat **~430 msg/s at 16 and 64 publishers**, CAS p50 3.0 ms
    (1 client) / 37.6 ms (16 clients), put p50 3.1 / 35.9 ms; all writes share one stream.
-   **Verdict: no. `sync_interval: always` R3 does not reach 1,000 msg/s at 16 publishers on
-   NVMe (429 msg/s, 43 %).** The 3-host run (Tailscale RTT, CT4000P3) is still open. If the
-   soak's commit rate exceeds ~430/s, the design does not hold with one stream and fsync on
-   every write.
+   On the disk class the cluster would use (`epyc1`, Crucial P3 CT4000P3, 2.7 ms per dsync
+   write, 3 nodes on one host) it is lower: ~78 msg/s at 1 publisher and a flat **~170 msg/s at
+   16 and 64 publishers**, CAS p50 13.2 ms (1 client) / 95.9 ms (16 clients), put p50 13.4 /
+   92.9 ms. **Verdict: no. `sync_interval: always` R3 does not reach 1,000 msg/s at 16
+   publishers on NVMe (429 msg/s on the 990 EVO Plus, 172 msg/s on the CT4000P3, 17 %).** The
+   3-host run (Tailscale RTT) is still open and can only add network latency. If the soak's
+   commit rate exceeds ~170/s, the design does not hold with one stream and fsync on every
+   write.
 2. **Failover window.** Publishes stopped 4.5 s and 7.6 s after a stream-leader kill. Lease TTL
    and renewals must cover that, and callers must treat a timeout as unknown (12 and 11 retried
    publishes had landed and were deduped only by Msg-Id).

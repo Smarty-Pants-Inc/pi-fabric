@@ -1,4 +1,4 @@
-import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
@@ -9,7 +9,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import type {
   FabricActorDelivery,
@@ -246,6 +246,9 @@ const compactHandoffResult = (
     usage: result.usage,
   },
   implementation: result.value ?? result.text,
+  ...(result.partialText !== undefined ? { partialText: result.partialText } : {}),
+  ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+  ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
   ...(result.error ? { error: result.error } : {}),
 });
 
@@ -303,6 +306,8 @@ const actorRequest = (
   }
   validateActorInferenceContext(args.inferenceContext, runner);
   validateActorCoalesceKey(args.coalesceKey);
+  validateActorDedupeKey(args.dedupeKey);
+  const activation = normalizeActorActivation(args.activation);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
@@ -337,6 +342,8 @@ const actorRequest = (
     ...(typeof args.triggerTurn === "boolean" ? { triggerTurn: args.triggerTurn } : {}),
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
+    ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
+    ...(activation ? { activation } : {}),
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
@@ -486,6 +493,10 @@ export class AgentsProvider implements FabricProvider {
         from: single
           ? lifecycleSourceIdentity(first.event.source)
           : lifecycleSourceIdentity(last.event.source),
+        // Display/provenance keep the existing representative sender. The local
+        // admission snapshot retains every observed event; it never crosses the wire.
+        ...withFabricWakeAdmission({}, batch.map(item => fabricWakeCause(
+          lifecycleSourceIdentity(item.event.source), "host-event", item.event.event, item.event.id))),
         triggerTurn: batch.some((delivery) => delivery.subscription.triggerTurn),
       },
     );
@@ -1692,6 +1703,8 @@ export class AgentsProvider implements FabricProvider {
     context?: FabricInvocationContext,
     options: {
       from?: MeshIdentity;
+      /** Diagnostic producer snapshot only; never sender authority. */
+      wakeCause?: FabricWakeCause;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;

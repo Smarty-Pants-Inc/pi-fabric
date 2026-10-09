@@ -2,14 +2,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricActorDeliveryRequest } from "./types.js";
 import { actorDeliveryNotice } from "./delivery-policy.js";
-import { sendFabricMessage } from "../fabric-provenance.js";
+import { fabricWakeCause, sendFabricMessage } from "../fabric-provenance.js";
 
 const escapeXmlText = (text: string): string => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 /** The production actor/lifecycle output call site, shared with the runtime's ActorDirectory. */
 export const deliverActorToMain = (
   pi: ExtensionAPI,
-  _host: MeshIdentity,
+  host: MeshIdentity,
   { actor, message, delivery, triggerTurn }: FabricActorDeliveryRequest,
 ): void => {
   const text = message.text ?? "";
@@ -18,6 +18,10 @@ export const deliverActorToMain = (
   // Participant-free failure alarms pass no claim; only actor-produced output
   // names the actor. Neither text nor the failing actor supplies alarm authority.
   const from: MeshIdentity | undefined = message.source === "fabric-host" ? undefined : { id: actor.id, name: actor.name, kind: "actor" };
+  // source is copied from the host-owned activation queue; data/text can be model
+  // output and must not supply attribution. The output id is host-generated too.
+  const topic = message.source.startsWith("mesh:") || message.source.startsWith("host:") ? message.source.slice(5) : undefined;
+  const wakeCause = fabricWakeCause(from ?? host, from ? "actor" : "host-event", topic, message.id);
   sendFabricMessage(pi, {
     customType: "pi-fabric-actor",
     content: [
@@ -26,5 +30,5 @@ export const deliverActorToMain = (
     ].filter((line): line is string => Boolean(line)).join("\n"),
     display: true,
     details: { actor, message, delivery: { mode: delivery, triggerTurn, passive: Boolean(deliveryNotice) } },
-  }, { deliverAs: delivery, triggerTurn }, from, "actor", "mesh", message.source === "fabric-host" ? undefined : message.principal);
+  }, { deliverAs: delivery, triggerTurn }, from, "actor", "mesh", message.source === "fabric-host" ? undefined : message.principal, wakeCause);
 };

@@ -18,8 +18,10 @@ const createStore = (options?: MeshStoreOptions, maxEventBytes = 1024): MeshStor
 };
 const statePath = (store: MeshStore): string => path.join(store.root, "state.json");
 const bytes = (store: MeshStore): string => fs.readFileSync(statePath(store), "utf8");
+// The writer census directory (smarty-dev#6477 L4a) is written at construction, not by state writes.
+const rootEntries = (store: MeshStore): string[] => fs.readdirSync(store.root).filter((name) => name !== ".writer-census");
 const directoryBytes = (store: MeshStore): Array<[string, string]> =>
-  fs.readdirSync(store.root).map((name) => [name, fs.readFileSync(path.join(store.root, name), "utf8")]);
+  rootEntries(store).map((name) => [name, fs.readFileSync(path.join(store.root, name), "utf8")]);
 const hold = (store: MeshStore): (() => void) => {
   const lock = path.join(store.root, ".lock");
   fs.mkdirSync(lock);
@@ -445,7 +447,7 @@ describe("MeshStore uses the proved transition", () => {
     await expect(store.put({ key: "state/a", value: 2, identity, ifVersion: 9 })).rejects.toThrow("invalid state format");
     await expect(store.delete({ key: "state/a", ifVersion: 9 })).rejects.toThrow("invalid state format");
     expect(bytes(store)).toBe(before);
-    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+    expect(rootEntries(store)).toEqual(["state.json"]);
   });
 
   it("failed size admission leaves unrelated entries, tombstones and cache unchanged", async () => {

@@ -1,4 +1,6 @@
 import type { AgentRunRequest } from "./types.js";
+import { normalizeAgentRequires } from "./input-validation.js";
+import { normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import { isFabricThinking } from "../thinking.js";
 import { parseAgentNice } from "./priority.js";
 import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
@@ -41,9 +43,8 @@ export const normalizeAgentRunRequest = (
   if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
     throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
   }
-  if (args.needs !== undefined && (!Array.isArray(args.needs) || !args.needs.every(entry => typeof entry === "string" && !!entry.trim()))) {
-    throw new Error("Invalid agent needs: expected nonempty capability strings");
-  }
+  const requires = normalizeAgentRequires(args.requires);
+  const needs = normalizeAgentCapabilityTokens(args.needs);
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
@@ -71,7 +72,8 @@ export const normalizeAgentRunRequest = (
     ...(thinking ? { thinking } : {}),
     ...(nice !== undefined ? { nice } : {}),
     ...(tools ? { tools } : {}),
-    ...(args.needs !== undefined ? { needs: [...args.needs as string[]] } : {}),
+    ...(needs !== undefined ? { needs } : {}),
+    ...(requires !== undefined ? { requires } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean"
       ? { extensions: args.extensions }

@@ -41,7 +41,8 @@
     "mesh-bridge": "./bin/mesh-bridge",
     "fabric-releases": "./bin/fabric-releases",
     "fabric-actors": "./bin/fabric-actors",
-    "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats"
+    "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats",
+    "fabric-mesh-backend": "./bin/fabric-mesh-backend"
   },
   "files": [
     "bin/",
@@ -70,7 +71,7 @@
     "test:jev:dist": "node scripts/smoke-jev.mjs",
     "test:changed": "node scripts/test-affected.mjs",
     "test:affected": "node scripts/test-affected.mjs --base $PI_TEST_BASE",
-    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/conversation-native-reader-suspension.test.ts",
+    "test:smoke": "vitest run tests/optional-preview-startup.test.ts tests/script-runtime.test.ts tests/pi-binary.test.ts tests/host-compatibility.test.ts tests/output-budget.test.ts tests/actor-mesh-monitor.test.ts tests/handoff.test.ts tests/config-migrations.test.ts tests/monty-payload-preflight.test.ts tests/bundled-binary-spawn.test.ts tests/conversation-native-reader-suspension.test.ts tests/mesh-backend-windows.test.ts tests/mesh-state-sqlite-powercut.test.ts",
     "test:related": "vitest related --run",
     "check:fast": "bun run typecheck && bun run test:changed",
     "certify:context": "bun run build && node scripts/certify-context.mjs",
@@ -89,7 +90,9 @@
     "prepack": "bun run proof:check && bun run typecheck && bun run build",
     "smoke:package-install": "node scripts/smoke-package-install.mjs",
     "benchmark:lock-stats": "bun run build && node scripts/benchmark-lock-stats.mjs",
-    "bench:mesh-lock": "bun run build && node scripts/benchmark-mesh-lock.mjs"
+    "bench:mesh-lock": "bun run build && node scripts/benchmark-mesh-lock.mjs",
+    "bench:mesh-lock:check": "node scripts/benchmark-mesh-lock.mjs --baseline bench/mesh-lock-baseline.json --max-regress 10",
+    "load:mesh": "bun scripts/mesh-load.ts"
   },
   "keywords": [
     "pi-package",

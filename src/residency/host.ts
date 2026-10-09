@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -36,11 +36,13 @@ import { ActorDirectory } from "../actors/directory.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
+import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
@@ -75,48 +77,14 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
-import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
-import { hasPreservedResidentResult } from "./preserved-result.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
-export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
-
-/** Called under the host fence, before constructing the manager: every existing run is untracked. */
-export const sweepResidentRuns = (
-  runsRoot: string, now = Date.now(), budgetMs = 100,
-  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean } = {},
-): string[] => {
-  const removed: string[] = [];
-  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
-  const started = performance.now();
-  const expired = () => performance.now() - started >= budgetMs;
-  const retained = retainedActorRunIds(options.actorRoots ?? []);
-  if (retained.has("*")) return removed;
-  let directory: fs.Dir;
-  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
-  try {
-    let entry: fs.Dirent | null;
-    while (!expired() && (entry = directory.readSync())) {
-      if (!entry.isDirectory() || retained.has(entry.name)) continue;
-      const run = path.join(runsRoot, entry.name);
-      const stat = ownedStat(run);
-      if (!stat?.isDirectory()) continue;
-      if (!options.retainRuns && now - stat.mtimeMs > RESIDENT_RUN_RETENTION_MS &&
-          !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
-          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
-        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
-      } else {
-        compactTerminalRunEvents(run, { ...options, now, expired });
-      }
-    }
-  } finally { directory.closeSync(); }
-  return removed;
-};
-
+// Moved to ./retention.js so the mesh-wide sweep (storage/retention-cli.ts) can run it under the
+// dead host's fence without loading the host (smarty-dev#3252).
+export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
 // The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
@@ -239,6 +207,10 @@ export class ResidentHost {
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  // A delivery whose root is chosen on shared state is written after the commit that chose it
+  // (smarty-dev#6477 R11); a crash in between leaves its row for the next flush to replay.
+  #deliveryCommits!: CommitOutbox;
+  #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
@@ -266,6 +238,7 @@ export class ResidentHost {
   #staged = false;
   #publicationFailed = false;
   #reloadEvent: Promise<unknown> | undefined;
+  #stateProjector: Promise<StateProjector | undefined> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
   readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
@@ -308,7 +281,11 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
+        stateBackend: config.mesh.stateBackend });
+    this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
+      delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),
+    });
     // Global order remains registry -> mesh, with the #535 50 ms mesh try.
     // Prepare actor/presence observations BEFORE acquisition, then validate exact
     // atomic registry generations under custody and retain custody through publication.
@@ -344,8 +321,9 @@ export class ResidentHost {
       listReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS,
       withPublicationFence: publishFenced,
       // Acquire/release only: never carry a selected snapshot or mesh custody into
-      // registry acquisition. FIFO waiting gets us into periodic free windows.
-      waitForPublicationRetry: () => this.mesh.exclusive(() => undefined),
+      // registry acquisition. FIFO waiting gets us into periodic free windows. A state
+      // fence, so it waits on whichever lock the state backend commits under (R3).
+      waitForPublicationRetry: () => withStateFence(this.mesh, this.identity, () => undefined),
       publicationBatch: full => this.actors.presenceBatch(full),
       hostId: this.hostId,
       rootId: config.rootId,
@@ -557,6 +535,10 @@ export class ResidentHost {
           config.rootId,
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
+          // Alarms retain the actor's display label, but their producer is this host.
+          fabricWakeCause(message.source === "fabric-host" ? this.identity : { id: actor.id, name: actor.name, kind: "actor" },
+            message.source === "fabric-host" ? "host-event" : "actor",
+            message.source.startsWith("mesh:") || message.source.startsWith("host:") ? message.source.slice(5) : undefined, message.id),
         ));
       },
       {
@@ -644,7 +626,7 @@ export class ResidentHost {
         ),
       );
       this.participants.registerSource(() =>
-        this.actors.listOwned().map((actor) =>
+        this.actors.listOwned(true).map((actor) =>
           actorParticipantRecord(
             actor,
             this.config.rootId,
@@ -710,6 +692,7 @@ export class ResidentHost {
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
       if (retentionV2Enabled()) {
@@ -735,9 +718,34 @@ export class ResidentHost {
     }
   }
 
+  /**
+   * smarty-dev#6477 W1: with mesh.stateBackend=shadow (the effective backend, after the env override
+   * and the R16/R19 fallback) this host runs the L3 projector for its mesh root. The lease elects one
+   * active projector per root; another host's stays standby. Loaded on first use; a projector that
+   * cannot open never fails the host (shadow state is not the authority). Its database is the
+   * shadow default <mesh>/state-projector/state.db (projectorDatabaseRoot), never <mesh>/state.db.
+   */
+  #startStateProjector(): void {
+    if (this.mesh.stateBackend !== "shadow" || this.#stateProjector) return;
+    this.#stateProjector = import("../mesh/state-projector.js").then(async ({ StateProjector }) => {
+      const projector = await StateProjector.open({ root: this.config.meshRoot, mode: "shadow" });
+      if (!this.#closed) return projector.run();
+      await projector.stop();
+      return undefined;
+    }).catch(() => undefined);
+  }
+
+  /** The running L3 projector (shadow mode); undefined in file or sqlite mode or when it failed to open. */
+  get stateProjector(): Promise<StateProjector | undefined> {
+    return this.#stateProjector ?? Promise.resolve(undefined);
+  }
+
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    // Stops with the host (shutdown and the release handover's exit alike): the lease is released
+    // so the successor host's projector takes over at once.
+    const projectorStopped = this.#stateProjector?.then(projector => projector?.stop()).catch(() => undefined);
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
@@ -767,6 +775,10 @@ export class ResidentHost {
           await this.#backgroundDeliveries.close();
           await this.#flushingDeliveries;
           await this.participants?.close().catch(() => undefined);
+          await projectorStopped;
+          // The host owns its MeshStore: release the state database handle before the host fence,
+          // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
+          try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }
         }
       } finally { this.#releaseLock(); }
     }
@@ -895,6 +907,7 @@ export class ResidentHost {
 
   async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
     const message = `Fabric lifecycle ${event.event} from ${event.source.name} (${event.source.id})${event.status ? ` with status ${event.status}` : ""}.`;
+    const wakeCause = fabricWakeCause(lifecycleSourceIdentity(event.source), "host-event", event.event, event.id);
     if (subscription.to === this.config.rootId) {
       await this.#queueDelivery(
         lifecycleSourceIdentity(event.source),
@@ -902,6 +915,11 @@ export class ResidentHost {
         subscription.delivery,
         subscription.triggerTurn,
         event,
+        undefined,
+        this.config.rootId,
+        undefined,
+        undefined,
+        wakeCause,
       );
       return;
     }
@@ -927,7 +945,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn },
+      { message, data: event, triggerTurn: subscription.triggerTurn, wakeCause },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );
@@ -943,15 +961,17 @@ export class ResidentHost {
     rootId: string | (() => string) = this.config.rootId,
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
+    wakeCause?: FabricWakeCause,
   ): Promise<void> {
     const id = randomUUID();
-    const persist = (target: string): void => {
-      const record: ResidentDeliveryRecord = {
+    const diagnostic = copyFabricWakeCause(wakeCause);
+    const record = (target: string): ResidentDeliveryRecord => ({
         format: RESIDENT_HOST_FORMAT,
         id,
         rootId: target,
         from,
         ...(source ? { source } : {}),
+        ...(diagnostic ? { wakeCause: diagnostic } : {}),
         ...(principal ? { principal } : {}),
         delivery,
         triggerTurn,
@@ -959,18 +979,28 @@ export class ResidentHost {
         ...(data === undefined ? {} : { data }),
         ...(agentCompletionId ? { agentCompletionId } : {}),
         createdAt: Date.now(),
-      };
-      // Persist before handing off: idle exit/queue pressure must not drop custody.
-      // Agent completions use the fixed creating root and still persist before yielding.
-      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
-    };
+      });
+    // Persist before handing off: idle exit/queue pressure must not drop custody.
+    // Agent completions use the fixed creating root and still persist before yielding.
+    const persist = (target: string): void =>
+      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record(target), { durable: true });
     if (typeof rootId === "function") {
-      // Serialize proof+absence, target selection and the irreversible outbox
-      // write with resumed-root proof invalidation. Never persist a stale choice.
-      // This stays on the mesh lock, not file custody (smarty-dev#6477 L5):
-      // resumeLineage() invalidates the proof with a shared-state delete.
-      try { await this.mesh.exclusive(() => persist(rootId())); }
-      catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
+      // Serialize proof+absence and target selection with resumed-root proof
+      // invalidation: resumeLineage() invalidates the proof with a shared-state delete,
+      // so the choice is a state commit (smarty-dev#6477 L5, R11). The irreversible
+      // outbox write is that commit's effect: recorded in it, written after it, and
+      // replayed after a crash. Never persist a stale choice.
+      // The plan is this call's own: concurrent deliveries never run each other's effect or
+      // read each other's result (on SQLite another batch can commit before this afterCommit).
+      let chosen = false;
+      const plan = this.#deliveryCommits.plan();
+      try {
+        await this.mesh.writeBatch({ identity: this.identity, ops: [],
+          prepare: () => plan.stage([], [{ kind: "delivery", key: id, payload: record(rootId()) }], { durable: true }),
+          afterCommit: view => { chosen = plan.run(view) === 1; } });
+        await this.#deliveryCommits.retire().catch(() => undefined);
+      } catch { /* no commit: the original mailbox below */ }
+      if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.
     } else persist(rootId);
     await this.#retryDeliveries();
   }
@@ -986,7 +1016,22 @@ export class ResidentHost {
     return flushing;
   }
 
+  // The commit effect of a state-chosen delivery (see #queueDelivery). A replay never
+  // recreates a delivery that a flush already handed to the mesh under either root.
+  #writeDelivery(record: ResidentDeliveryRecord, view: MeshBatchView, replay: boolean): void {
+    const file = path.join(this.#deliveryOutboxPath, `${record.id}.json`);
+    if (replay && (fs.existsSync(file) || [record.rootId, this.config.rootId].some(root =>
+      view.version(`${residentDeliveryPrefix(root)}${record.id}`) > 0))) return;
+    writeJsonAtomic(file, record, { durable: true });
+  }
+
   async #flushDeliveries(): Promise<void> {
+    if (!this.#deliveryCommitsRecovered) {
+      try {
+        await this.#deliveryCommits.recover();
+        this.#deliveryCommitsRecovered = true;
+      } catch { /* retried on the next flush; the files below still flush */ }
+    }
     if (!fs.existsSync(this.#deliveryOutboxPath)) return;
     for (const entry of fs.readdirSync(this.#deliveryOutboxPath).filter(entry => entry.endsWith(".json")).slice(0, 32)) {
       const file = path.join(this.#deliveryOutboxPath, entry);

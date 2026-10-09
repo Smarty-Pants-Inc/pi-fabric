@@ -139,6 +139,17 @@ describe("AgentCompletionInbox", () => {
     expect(() => noUnsub.close()).not.toThrow();
   });
 
+  it("delivers a failed partial report with its warning, never a success notification", () => {
+    const h = harness();
+    const warning = "final report interrupted by a model stream error; showing the last persisted output";
+    h.inbox.enqueue(result("cut", { status: "failed", text: "VERDICT: PASS", partialText: "VERDICT: PASS", error: "stream disconnected", warnings: [warning] }));
+    expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("failed: stream disconnected"), "warning");
+    h.boundary();
+    const content = h.sendMessage.mock.calls[0]![0].content;
+    expect(content).toContain("failed after");
+    expect(content).toContain(`[pi-fabric warning] ${warning}`);
+    expect(content).toContain("Partial output (not a completed report):\nVERDICT: PASS");
+  });
   it("shows concise status immediately but batches unread results only after the entire tool turn", async () => {
     const h = harness();
     h.inbox.enqueue(result("a"));

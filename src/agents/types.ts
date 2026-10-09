@@ -74,8 +74,10 @@ export interface AgentRunRequest {
   task: string;
   /** Caller classification passed to the optional external spawn router. */
   complexity?: "simple" | "normal" | "complex" | "delicate";
-  /** Required target capabilities. Unknown needs force configured placement local. */
+  /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
+  /** Absolute inputs that must exist on the selected execution host before starting. */
+  requires?: string[];
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -196,14 +198,19 @@ export interface AgentRunRecord {
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
   toolCalls: number;
+  /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
+  /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
+  lastCompleteText?: string;
+  /** Streaming text; on an interrupted failed task, retained partial output (possibly the preceding message), never a successful report. */
+  partialText?: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
   replyVia?: "tool";
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
   errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
-  /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
+  /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
   exitCode?: number | null;
@@ -372,6 +379,7 @@ export interface AgentTransportLaunch {
   workerPath: string;
   workerArguments: string[];
   needs?: string[];
+  requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */

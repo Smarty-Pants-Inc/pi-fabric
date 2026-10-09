@@ -83,6 +83,8 @@ const lockWaiter = (fd: number): boolean => {
  * exist and be claimable, diagnostic holders must be proven dead, and actor roots
  * must belong to those fenced resident roots. Live/legacy/unknown custody is skipped.
  * Dry-run never creates locks, markers or files (flock on an existing inode only). */
+/** Why every apply is refused (smarty-dev#7916). */
+export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled until smarty-dev#7916 (verified-inode deletion); run --dry-run";
 export const sweepMeshRetention = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number;
   /** Remove terminal actor runs older than this, mesh-wide (the actor archive TTL). Unset: compaction only. */
@@ -90,7 +92,10 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   /** Removal age of a proven-dead resident root's runs (default: the live host's 24 h). */
   residentRunRetentionMs?: number;
 } = {}) => {
-  const dryRun = options.dryRun !== false;
+  // Deletes nothing by construction (smarty-dev#7916): an apply throws before any fence, discovery or helper call,
+  // so no in-process caller reaches a deleter. The apply branches below stay for #7916 to re-enable.
+  if (options.dryRun === false) throw new Error(MESH_RETENTION_APPLY_DISABLED);
+  const dryRun = true;
   const now = options.now ?? Date.now();
   const removedRuns: string[] = [];
   const changes: Array<{ path: string; beforeBytes: number; afterBytes: number }> = [];
@@ -333,7 +338,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   // --apply is off until deletion verifies each inode it removes (smarty-dev#7916); the dry run and report stay.
   const runRetentionMs = value === undefined ? undefined : Number(value);
   if (mode === "--apply") {
-    console.error("retention --apply is disabled until smarty-dev#7916 (verified-inode deletion); run --dry-run");
+    console.error(MESH_RETENTION_APPLY_DISABLED);
     process.exitCode = 2;
   } else if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
       (runRetentionMs !== undefined && (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 60 * 60 * 1_000))) {

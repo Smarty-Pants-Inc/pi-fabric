@@ -31,7 +31,8 @@ import type { MeshIdentity } from "./event-log.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
-import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteStateStoreOptions } from "./state-sqlite.js";
+import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteDeltaKey, type SqliteStateDelta, type SqliteStateExport,
+  type SqliteStateStoreOptions } from "./state-sqlite.js";
 
 export type { MeshBatchOperation, MeshBatchResult, MeshBatchView, MeshReadOptions, MeshStateEntry };
 
@@ -369,21 +370,130 @@ const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = optio
   ...(options.writeSignal ? { writeSignal: options.writeSignal } : {}),
 });
 
+/**
+ * One immutable state snapshot. Never mutated once built: a newer one shares the unchanged maps and
+ * entries (copy on write), so a pinned token and the process-shared copy stay exact.
+ */
 interface SqliteSnapshot {
   stamp: string;
-  entries: Map<string, MeshStateEntry>;
+  /** `<store>:<epoch>`: snapshots of one lineage are brought forward by its change feed. */
+  lineage: string;
+  commit: number;
+  entries: ReadonlyMap<string, Readonly<MeshStateEntry>>;
   /** Sorted by key (localeCompare), shared and frozen. */
   sorted: readonly Readonly<MeshStateEntry>[];
-  versions: Record<string, number>;
+  /** Every live version and retained tombstone version (exportState's `versions`). */
+  versions: ReadonlyMap<string, number>;
 }
 
 const freezeEntry = (entry: MeshStateEntry): Readonly<MeshStateEntry> => Object.freeze(entry);
+const byKey = (left: Readonly<MeshStateEntry>, right: Readonly<MeshStateEntry>): number => left.key.localeCompare(right.key);
+const lineageOf = (stamp: string): string => stamp.slice(0, stamp.lastIndexOf(":"));
+
+/** The full rebuild: every row, parsed, frozen and sorted (the only path before smarty-dev#6477). */
+const fullSnapshot = (stamp: string, state: SqliteStateExport): SqliteSnapshot => {
+  const entries = new Map<string, Readonly<MeshStateEntry>>();
+  for (const [key, entry] of Object.entries(state.entries)) entries.set(key, freezeEntry(entry));
+  const sorted = Object.freeze([...entries.values()].sort(byKey));
+  return { stamp, lineage: lineageOf(stamp), commit: state.commit, entries, sorted, versions: new Map(Object.entries(state.versions)) };
+};
+
+const isTombstone = (snapshot: SqliteSnapshot, key: string): boolean => snapshot.versions.has(key) && !snapshot.entries.has(key);
+
+/** The tombstone count `base` would hold after `changed` (evictions and imports write no change row). */
+const predictTombstones = (base: SqliteSnapshot, changed: readonly SqliteDeltaKey[]): number => {
+  let count = base.versions.size - base.entries.size;
+  for (const { key, entry, version } of changed) {
+    count += (entry === undefined && version > 0 ? 1 : 0) - (isTombstone(base, key) ? 1 : 0);
+  }
+  return count;
+};
+
+/** First index in `sorted` (from `from`) whose key does not sort before `key`. */
+const lowerBound = (sorted: readonly Readonly<MeshStateEntry>[], entry: Readonly<MeshStateEntry>, from: number): number => {
+  let low = from;
+  let high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (byKey(sorted[middle]!, entry) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+};
+
+/**
+ * `base` brought forward by a complete delta (smarty-dev#6477): only the changed keys are parsed;
+ * the sorted list is the old one minus the changed keys plus their new entries, each placed by
+ * binary search, so it equals a full export's sort. Unchanged structures are shared.
+ */
+const applySqliteDelta = (base: SqliteSnapshot, delta: SqliteStateDelta): SqliteSnapshot => {
+  if (delta.changed.length === 0 && !delta.tombstones) {
+    return { ...base, stamp: delta.stamp, lineage: lineageOf(delta.stamp), commit: delta.commit };
+  }
+  const entries = new Map(base.entries);
+  const versions = new Map(base.versions);
+  const removed = new Set<string>();
+  const inserted: Readonly<MeshStateEntry>[] = [];
+  for (const { key, entry, version } of delta.changed) {
+    if (entries.has(key)) removed.add(key);
+    if (entry) {
+      const frozen = freezeEntry(entry);
+      entries.set(key, frozen);
+      inserted.push(frozen);
+    } else entries.delete(key);
+    if (version > 0) versions.set(key, version);
+    else versions.delete(key);
+  }
+  if (delta.tombstones) {
+    for (const key of [...versions.keys()]) if (!entries.has(key)) versions.delete(key);
+    for (const [key, version] of delta.tombstones) versions.set(key, version);
+  }
+  let sorted = base.sorted;
+  if (removed.size > 0 || inserted.length > 0) {
+    const kept = removed.size > 0 ? base.sorted.filter((entry) => !removed.has(entry.key)) : base.sorted;
+    inserted.sort(byKey);
+    const merged: Readonly<MeshStateEntry>[] = [];
+    let from = 0;
+    for (const entry of inserted) {
+      const at = lowerBound(kept, entry, from);
+      for (let index = from; index < at; index += 1) merged.push(kept[index]!);
+      merged.push(entry);
+      from = at;
+    }
+    for (let index = from; index < kept.length; index += 1) merged.push(kept[index]!);
+    sorted = Object.freeze(merged);
+  }
+  return { stamp: delta.stamp, lineage: lineageOf(delta.stamp), commit: delta.commit, entries, sorted, versions };
+};
+
+/** `base` (same lineage) brought forward, or a full export when the feed cannot (trimmed, re-epoched). */
+const refreshSnapshot = (store: SqliteStateStore, base: SqliteSnapshot | undefined): SqliteSnapshot => {
+  if (base) {
+    const delta = store.readDelta(base.commit, (changed) => predictTombstones(base, changed));
+    if (delta.complete && lineageOf(delta.stamp) === base.lineage) return applySqliteDelta(base, delta);
+  }
+  const { stamp, state } = store.exportLive();
+  return fullSnapshot(stamp, state);
+};
+
+// The newest snapshot per state.db in this process, as the file store's processReadSnapshots: several
+// MeshStores (and backends) on one root bring ONE snapshot forward per commit (smarty-dev#6477).
+const processSqliteSnapshots = new Map<string, WeakRef<SqliteSnapshot>>();
+const sharedSnapshot = (database: string): SqliteSnapshot | undefined => processSqliteSnapshots.get(database)?.deref();
+const shareSnapshot = (database: string, snapshot: SqliteSnapshot): void => {
+  const shared = sharedSnapshot(database);
+  if (shared && shared.lineage === snapshot.lineage && shared.commit > snapshot.commit) return;
+  if (processSqliteSnapshots.size >= 64 && !processSqliteSnapshots.has(database)) {
+    processSqliteSnapshots.delete(processSqliteSnapshots.keys().next().value!);
+  }
+  processSqliteSnapshots.set(database, new WeakRef(snapshot));
+};
 
 /** A read-only view over a captured snapshot (copies out). */
 const snapshotView = (snapshot: () => SqliteSnapshot): MeshBatchView => ({
   get: (key) => { const entry = snapshot().entries.get(key); return entry ? jsonClone(entry) : undefined; },
   listAll: (prefix) => snapshot().sorted.filter((entry) => entry.key.startsWith(prefix)).map((entry) => jsonClone(entry)),
-  version: (key) => snapshot().versions[key] ?? 0,
+  version: (key) => snapshot().versions.get(key) ?? 0,
 });
 
 /**
@@ -582,17 +692,25 @@ export class SqliteStateBackend implements StateBackend {
     const store = this.#open();
     // The stamp carries the database's CURRENT epoch and retirement (read from state.db), so a
     // retirement by any connection is a miss; a hit is a live, unchanged state (review round 3).
+    // Every read checks it: SQLite reads stay exact (no readCacheMs window), as before.
     const stamp = store.stateStamp();
-    if (this.#snapshot?.stamp === stamp) return this.#snapshot;
-    this.#snapshot = undefined;
-    // The stamp is read first: a commit in between makes the snapshot newer than its stamp, so
-    // the next call only rebuilds it once more. `live` checks retirement in the export's own read
-    // transaction: a retired database throws MeshStateRetiredError, exactly as get/listAll do.
-    const exported = store.exportState({ live: true });
-    const entries = new Map<string, MeshStateEntry>();
-    for (const [key, entry] of Object.entries(exported.entries)) entries.set(key, freezeEntry(entry));
-    const sorted = Object.freeze([...entries.values()].sort((left, right) => left.key.localeCompare(right.key)));
-    const snapshot: SqliteSnapshot = { stamp, entries, sorted, versions: exported.versions };
+    const own = this.#snapshot;
+    if (own?.stamp === stamp) return own;
+    const database = path.resolve(this.database);
+    const shared = sharedSnapshot(database);
+    let snapshot: SqliteSnapshot;
+    if (shared?.stamp === stamp) snapshot = shared;
+    else {
+      // smarty-dev#6477: a miss brings the newest snapshot of this lineage forward by the change feed
+      // (only the changed rows are read and parsed) instead of exporting every row. The delta and
+      // its stamp come from ONE read transaction; a retired database throws MeshStateRetiredError
+      // there, exactly as get/listAll do.
+      const lineage = lineageOf(stamp);
+      const bases = [own, shared].filter((candidate): candidate is SqliteSnapshot => candidate?.lineage === lineage);
+      const base = bases.sort((left, right) => right.commit - left.commit)[0];
+      snapshot = refreshSnapshot(store, base);
+      shareSnapshot(database, snapshot);
+    }
     this.#tokens.add(snapshot);
     this.#snapshot = snapshot;
     return snapshot;
@@ -686,7 +804,8 @@ export class SqliteStateBackend implements StateBackend {
       const result = deadline !== undefined
         ? await ready.withTryLock(() => operation(ready), Math.max(0, deadline - performance.now()))
         : await operation(ready);
-      this.#snapshot = undefined;
+      // The kept snapshot is no longer current (its stamp moved), but it is the base the next read
+      // brings forward with this commit's change rows instead of a full export (smarty-dev#6477).
       return result;
     } catch (error) {
       if (error instanceof MeshLockTimeoutError && !(error instanceof MeshStateBusyError)) {

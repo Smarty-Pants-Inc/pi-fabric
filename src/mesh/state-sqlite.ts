@@ -407,6 +407,27 @@ export interface SqliteStateExport {
   commit: number;
 }
 
+/** A key the change feed named since a reader's commit: its current row, or its tombstone version (0: gone). */
+export interface SqliteDeltaKey {
+  key: string;
+  entry: MeshStateEntry | undefined;
+  /** The live version, else the retained tombstone's, else 0 (exportState's `versions`). */
+  version: number;
+}
+
+/** `SqliteStateStore.readDelta`: what changed after a reader's commit, from one read transaction. */
+export interface SqliteStateDelta {
+  /** The live `stateStamp()` of the snapshot this delta brings a reader to. */
+  stamp: string;
+  commit: number;
+  /** False when the feed no longer covers every commit after `after`: read `exportLive()` instead. */
+  complete: boolean;
+  /** Each changed key once, in first-change order. */
+  changed: SqliteDeltaKey[];
+  /** Every retained tombstone `[key, version]` in eviction order, only when the predicted count was wrong. */
+  tombstones?: Array<[string, number]>;
+}
+
 export interface SqliteStateChanges {
   commit: number;
   /** False when the feed was trimmed past `after`: the reader must rescan. */
@@ -842,6 +863,50 @@ export class SqliteStateStore {
       })) : [];
       return { commit, complete, changes };
     });
+  }
+
+  /**
+   * The incremental reader's step (smarty-dev#6477): ONE read transaction gives the live stamp and, when
+   * the change feed still covers every commit after `after`, the current row (or tombstone version)
+   * of each key changed since. Tombstone evictions and an import's tombstones write no change row:
+   * `tombstones(changed)` predicts the reader's tombstone count after applying `changed`, and a
+   * different count returns every tombstone too (at most `maxStateTombstones` rows). A retired or
+   * re-epoched database throws MeshStateRetiredError, as `exportState({ live: true })` does.
+   */
+  readDelta(after: number, tombstones: (changed: readonly SqliteDeltaKey[]) => number): SqliteStateDelta {
+    this.#assertOpen();
+    return this.#readTransaction(() => {
+      const { epoch, commit } = this.#assertLiveMeta(this.#stampMeta());
+      const stamp = `${this.#storeId}:${epoch}:${commit}`;
+      if (after > commit) return { stamp, commit, complete: false, changed: [] };
+      const oldest = after === commit ? undefined : this.#sql.changesOldest.get()?.oldest;
+      if (after < commit && (oldest === null || oldest === undefined || Number(oldest) > after + 1)) {
+        return { stamp, commit, complete: false, changed: [] };
+      }
+      const keys = new Set<string>();
+      if (after < commit) for (const row of this.#sql.changesSince.all(after)) keys.add(String(row.key));
+      const changed: SqliteDeltaKey[] = [];
+      for (const key of keys) {
+        const row = this.#sql.kvGet.get(key);
+        if (row) {
+          const entry = toEntry(row);
+          changed.push({ key, entry, version: entry.version });
+          continue;
+        }
+        const tombstone = this.#sql.tombGet.get(key);
+        changed.push({ key, entry: undefined, version: tombstone ? Number(tombstone.version) : 0 });
+      }
+      const count = Number(this.#sql.tombCount.get()?.n ?? 0);
+      if (count === tombstones(changed)) return { stamp, commit, complete: true, changed };
+      const all: Array<[string, number]> = this.#sql.tombAll.all().map((row) => [String(row.key), Number(row.version)]);
+      return { stamp, commit, complete: true, changed, tombstones: all };
+    });
+  }
+
+  /** `exportState({ live: true })` with the live `stateStamp()` of that same read transaction. */
+  exportLive(): { stamp: string; state: SqliteStateExport } {
+    const state = this.exportState({ live: true });
+    return { stamp: `${this.#storeId}:${state.epoch}:${state.commit}`, state };
   }
 
   /**

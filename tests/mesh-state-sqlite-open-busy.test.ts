@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { SqliteStateStore, tryLockFile } from "../src/mesh/state-sqlite.js";
+import { ownerToken, removeOwnedFile, SqliteStateStore, tryLockFile } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // smarty-dev#6477 P0 (sqlite soak): wal_autocheckpoint=0 and no production checkpointer let the hub's WAL grow
@@ -257,10 +257,10 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
 
   it("reclaims a stale lock and refuses a fresh one", () => {
     const lock = path.join(lockRoot(), "state-wal-reset.lock");
-    expect(tryLockFile(lock, 2_000)).toBe(true);
-    expect(tryLockFile(lock, 2_000)).toBe(false);
+    expect(tryLockFile(lock, 2_000, ownerToken())).toBe(true);
+    expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
     age(lock, 5_000);
-    expect(tryLockFile(lock, 2_000)).toBe(true);
+    expect(tryLockFile(lock, 2_000, ownerToken())).toBe(true);
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
   });
 
@@ -280,12 +280,37 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
       return result;
     }) as typeof fs.statSync);
     try {
-      expect(tryLockFile(lock, 2_000)).toBe(false);
+      expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
     } finally {
       spy.mockRestore();
     }
     expect(raced).toBe(true);
     expect(fs.readFileSync(lock, "utf8")).toBe("other holder\n");
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("a release removes only the releaser's own lock or flag, never one another process holds", () => {
+    const dir = lockRoot();
+    const lock = path.join(dir, "state-wal-reset.lock");
+    const mine = ownerToken();
+    expect(tryLockFile(lock, 2_000, mine)).toBe(true);
+    // Another process reclaimed it (a stall past the stale age) and holds it now.
+    const theirs = ownerToken();
+    fs.rmSync(lock);
+    fs.writeFileSync(lock, `${theirs}\n`);
+    removeOwnedFile(lock, mine);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${theirs}\n`);
+    removeOwnedFile(lock, theirs);
+    expect(fs.existsSync(lock)).toBe(false);
+    // The checkpoint flag: the last raiser owns it; an earlier raiser's cleanup leaves it raised.
+    const flag = path.join(dir, "state-checkpoint.flag");
+    const first = ownerToken();
+    const second = ownerToken();
+    fs.writeFileSync(flag, `${first}\n`);
+    fs.writeFileSync(flag, `${second}\n`);
+    removeOwnedFile(flag, first);
+    expect(fs.readFileSync(flag, "utf8")).toBe(`${second}\n`);
+    removeOwnedFile(flag, second);
+    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });

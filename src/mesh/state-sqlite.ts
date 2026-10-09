@@ -1117,7 +1117,8 @@ export class SqliteStateStore {
       // then only waits for readers that started before the checkpoint. It escalates after each
       // busy attempt, so readers that outlast it delay the reset but can never starve it.
       const flag = path.join(this.root, CHECKPOINT_FLAG);
-      try { fs.writeFileSync(flag, `${process.pid}\n`, { mode: 0o600 }); } catch { /* advisory */ }
+      const flagToken = ownerToken();
+      try { fs.writeFileSync(flag, `${flagToken}\n`, { mode: 0o600 }); } catch { /* advisory */ }
       this.#db.exec(`PRAGMA busy_timeout = ${this.#truncateBudgetMs}`);
       try {
         const truncate = this.#sql.checkpointTruncate.get() ?? {};
@@ -1127,7 +1128,7 @@ export class SqliteStateStore {
         if (!isBusy(error)) throw error;
       } finally {
         this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
-        try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+        removeOwnedFile(flag, flagToken);
       }
       if (truncated) {
         this.#lastWalBytes = 0;
@@ -1426,7 +1427,8 @@ export class SqliteStateStore {
     this.#lastWalResetCheck = now;
     try { if (this.walBytes() <= this.#walResetBytes) return; } catch { return; }
     const lock = path.join(this.root, WAL_RESET_LOCK);
-    if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS)) return;
+    const token = ownerToken();
+    if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS, token)) return;
     this.#walResetting = true;
     void this.#resetWal()
       .catch(() => { this.#stats.checkpoints.failed += 1; return false; })
@@ -1434,7 +1436,9 @@ export class SqliteStateStore {
         this.#walResetting = false;
         // A failed reset leaves a fresh lock as a fleet-wide back-off, so readers that outlast the budget
         // (a saturated host) never keep writers yielding back to back.
-        try { if (reset) fs.rmSync(lock, { force: true }); else fs.writeFileSync(lock, `${process.pid}\n`); } catch { /* stale */ }
+        // Only while this process still owns it: a lock reclaimed by another process is never touched.
+        if (reset) removeOwnedFile(lock, token);
+        else if (ownsFile(lock, token)) try { const now = new Date(); fs.utimesSync(lock, now, now); } catch { /* reclaimed */ }
       });
   }
 
@@ -1443,6 +1447,7 @@ export class SqliteStateStore {
   async #resetWal(): Promise<boolean> {
     const flag = path.join(this.root, CHECKPOINT_FLAG);
     const deadline = performance.now() + WAL_RESET_BUDGET_MS;
+    const flagToken = ownerToken();
     let flagged = false;
     try {
       await new Promise<void>((resolve) => setImmediate(resolve)); // after the writer's own continuation
@@ -1454,11 +1459,11 @@ export class SqliteStateStore {
           return true;
         }
         if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return false; }
-        try { fs.writeFileSync(flag, `${process.pid}\n`, { mode: 0o600 }); flagged = true; } catch { /* advisory */ }
+        try { fs.writeFileSync(flag, `${flagToken}\n`, { mode: 0o600 }); flagged = true; } catch { /* advisory */ }
         await delay(WAL_RESET_RETRY_MS);
       }
     } finally {
-      if (flagged) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+      if (flagged) removeOwnedFile(flag, flagToken);
       if (!this.#closed) this.walBytes();
     }
   }
@@ -1485,10 +1490,11 @@ export class SqliteStateStore {
 // ponytail: one remaining interleaving (a third process creating a lock between the rename and the link-back)
 // can start a second resetter; that is harmless, because SQLite's own checkpoint lock serializes TRUNCATE
 // checkpoints and the second one only sees busy. The file sheds load; SQLite provides the exclusion.
-export const tryLockFile = (file: string, staleMs: number): boolean => {
+export const tryLockFile = (file: string, staleMs: number, token: string): boolean => {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      fs.closeSync(fs.openSync(file, "wx", 0o600));
+      const fd = fs.openSync(file, "wx", 0o600);
+      try { fs.writeSync(fd, `${token}\n`); } finally { fs.closeSync(fd); }
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
@@ -1505,6 +1511,23 @@ export const tryLockFile = (file: string, staleMs: number): boolean => {
     }
   }
   return false;
+};
+
+// The checkpoint flag and the reset lock carry their writer's token, and only that writer removes them:
+// a process never clears a flag or lock that another process raised or reclaimed (pi-fabric#691 review).
+// A flag raised by two processes belongs to the last writer; the first one's next attempt raises it again.
+export const ownerToken = (): string => `${process.pid}.${randomUUID()}`;
+
+export const ownsFile = (file: string, token: string): boolean => {
+  try { return fs.readFileSync(file, "utf8") === `${token}\n`; } catch { return false; }
+};
+
+// Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one).
+export const removeOwnedFile = (file: string, token: string): void => {
+  const aside = `${file}.${process.pid}.${randomUUID()}.release`;
+  try { fs.renameSync(file, aside); } catch { return; }
+  if (!ownsFile(aside, token)) try { fs.linkSync(aside, file); } catch { /* a newer file holds the name */ }
+  try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ }
 };
 
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));

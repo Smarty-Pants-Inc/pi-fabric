@@ -106,11 +106,53 @@ describe("SqliteStateStore", () => {
         connection.prepare = ((text: string) => { sql++; return prepare(text); }) as typeof connection.prepare;
         return connection;
       };
-      await expect(open(root, { open: swapping }), swap).rejects.toThrow(/refuses .*state\.db: the connection('s own descriptor on it is ambiguous \(0 new, [1-9]\d* other\)| opened a different file)/);
+      await expect(open(root, { open: swapping }), swap).rejects.toThrow(/refuses .*state\.db: the connection('s own descriptor on it is not proven \(0 new, [1-9]\d* other| opened a different file)/);
       expect(sql, swap).toBe(0); // rejected before any statement ran on the swapped connection
     }
     expect((await open(root)).get("who/am")?.value).toBe("mine");
     for (const connection of held) connection.close();
+  });
+
+  it.skipIf(process.platform !== "linux")("accepts SQLite's reuse of a descriptor parked on the validated inode, and refuses one parked on another database during a swap (smarty-dev#7784)", async () => {
+    const root = tempRoot("park");
+    const other = tempRoot("park-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const db = path.join(root, "state.db");
+    const fds = (file: string) => fs.readdirSync("/proc/self/fd").filter(fd => {
+      try { return fs.readlinkSync(`/proc/self/fd/${fd}`) === fs.realpathSync(file); } catch { return false; }
+    }).length;
+    // Park a descriptor on OUR inode: a second store closes while the first still has the file open.
+    const first = await open(root);
+    (await open(root)).close();
+    expect(fds(db)).toBe(2); // one live, one parked by SQLite
+    const reopened = await open(root); // SQLite reuses the parked descriptor: zero new, proven by the count
+    expect(fds(db)).toBe(2);
+    expect(reopened.get("who/am")?.value).toBe("mine");
+    reopened.close(); first.close();
+    // Park a descriptor on the OTHER database, then swap our path to it while SQLite opens (ABA, put back).
+    const foreign = path.join(other, "state.db");
+    const holder = await open(other);
+    (await open(other)).close();
+    expect(fds(foreign)).toBe(2);
+    const ours = await open(root); // our inode is open too, with nothing parked on it
+    let sql = 0;
+    const swapping = (file: string): SqliteConnection => {
+      fs.renameSync(db, `${db}.aside`);
+      fs.symlinkSync(foreign, db);
+      const connection = openNodeSqlite(file); // reuses the foreign parked descriptor: zero new
+      fs.renameSync(`${db}.aside`, db);
+      const prepare = connection.prepare.bind(connection);
+      connection.prepare = ((text: string) => { sql++; return prepare(text); }) as typeof connection.prepare;
+      return connection;
+    };
+    await expect(open(root, { open: swapping })).rejects.toThrow(/refuses .*state\.db: the connection's own descriptor on it is not proven \(0 new, 0 other, 0 parked here, parked elsewhere\)/);
+    expect(sql).toBe(0);
+    ours.close(); holder.close();
+    expect((await open(root)).get("who/am")?.value).toBe("mine");
   });
 
   it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {

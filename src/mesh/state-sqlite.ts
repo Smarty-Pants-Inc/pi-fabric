@@ -1732,7 +1732,7 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
  * node:sqlite has no fd API, but SQLite's unix VFS opens the main file inside the constructor, on a descriptor of its
  * own even when another connection has the file open. So, before any SQL: snapshot /proc/self/fd, open, and require
  * exactly one NEW descriptor whose link names this state.db, on the validated dev/ino, with the path still naming it
- * (or SQLite's own reuse of a parked descriptor on that inode, see below).
+ * (or SQLite's reuse of a descriptor parked on that inode, proven below).
  * A swap (a link to another mesh's database, or a renamed-in file, even one put back at once) gives that descriptor
  * another link or identity: zero or several candidates, or a mismatch, closes the connection and fails closed, as
  * does Linux without /proc/self/fd. Other platforms keep only the post-open lstat compare (residual on #7784).
@@ -1754,23 +1754,47 @@ const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): Sqli
       const mains = added.filter(([fd]) => [name, `${name} (deleted)`].includes(link(fd) ?? ""));
       if (mains.length > 1) throw refuse(`the connection's own descriptor on it is ambiguous (${mains.length} new)`);
       if (mains.length === 1 && mains[0]![1] !== target) throw refuse("the connection opened a different file than the one checked");
-      // ponytail: zero new is SQLite's unix VFS taking back a descriptor it parked for this inode when an earlier
-      // connection here closed under another one's POSIX lock (findReusableFd; it matches the inode it stat()s at
-      // open). Accepted only when NO regular descriptor appeared at all (a swapped-in file or link would have opened
-      // one) and a parked descriptor of this name is on the validated inode. Residual on #7784: a swap onto another
-      // database that this same process had open and parked.
-      if (mains.length === 0 && (added.length > 0 ||
-          ![...before].some(([fd, identity]) => identity === target && link(fd) === name))) {
-        throw refuse(`the connection's own descriptor on it is ambiguous (0 new, ${added.length} other)`);
+      // Zero new: SQLite's unix VFS took back a descriptor it parked (setPendingFd) when an earlier connection in this
+      // process closed while another one still had the inode open; findReusableFd hands it to the next open of the
+      // inode it stat()s, so it is unproven by itself. It is proven when no regular descriptor appeared at all and
+      // the validated inode is the ONLY inode with a parked descriptor (descriptors on it beyond this module's live
+      // connections): then the reused one can only be that. Residual on #7784: a SQLite connection in this process
+      // that bypasses this module.
+      if (mains.length === 0) {
+        const fds = new Map<string, number>();
+        for (const [, identity] of before) fds.set(identity, (fds.get(identity) ?? 0) + 1);
+        const parked = (identity: string) => (fds.get(identity) ?? 0) - (liveConnections.get(identity) ?? 0);
+        const elsewhere = [...liveConnections.keys()].some(identity => identity !== target && parked(identity) > 0);
+        if (added.length > 0 || parked(target) < 1 || elsewhere) {
+          throw refuse(`the connection's own descriptor on it is not proven (0 new, ${added.length} other, ` +
+            `${Math.max(0, parked(target))} parked here${elsewhere ? ", parked elsewhere" : ""})`);
+        }
       }
     }
     const now = fs.lstatSync(file, { throwIfNoEntry: false });
     if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
-    return db;
+    return tracked(db, `${validated.dev}:${validated.ino}`);
   } catch (error) {
     try { db.close(); } catch { /* best effort */ }
     throw error;
   }
+};
+
+// This module's live connections per "dev:ino" (openPinned's reuse proof). Closing a connection releases its count.
+const liveConnections = new Map<string, number>();
+const tracked = (db: SqliteConnection, identity: string): SqliteConnection => {
+  liveConnections.set(identity, (liveConnections.get(identity) ?? 0) + 1);
+  const close = db.close.bind(db);
+  let open = true;
+  db.close = () => {
+    if (open) {
+      open = false;
+      const left = (liveConnections.get(identity) ?? 1) - 1;
+      if (left > 0) liveConnections.set(identity, left); else liveConnections.delete(identity);
+    }
+    close();
+  };
+  return db;
 };
 
 // fd -> "dev:ino" of each open regular file. Compared by identity as well as number: the listing's own directory fd

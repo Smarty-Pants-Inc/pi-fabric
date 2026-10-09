@@ -38,8 +38,10 @@ const globals = globalThis as Record<symbol, unknown>;
 let fixtureDefault: unknown;
 beforeEach(() => { fixtureDefault = globals[FIXTURE_DEFAULT]; delete globals[FIXTURE_DEFAULT]; });
 
+const MARKER_HOOK = Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook");
 afterEach(() => {
   globals[FIXTURE_DEFAULT] = fixtureDefault;
+  delete globals[MARKER_HOOK];
   vi.unstubAllEnvs();
   for (const store of stores.splice(0)) try { store.closeState(); } catch { /* closed by the test */ }
   for (const store of sqliteStores.splice(0)) try { store.close(); } catch { /* closed by the test */ }
@@ -219,6 +221,101 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     await seedFileRoot(populated, 2);
     expect(() => SqliteStateStore.openSync(populated, 64 * 1024, 1_000, { initialize: "create" })).toThrow(refusal);
     expect(fs.existsSync(path.join(populated, "state.db"))).toBe(false);
+  });
+
+  describe("initialize: \"create\" only on a genuinely fresh root (review/astra P1)", () => {
+    const create = (root: string) => SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "create" });
+    const createAsync = (root: string) => SqliteStateStore.open(root, 64 * 1024, 1_000, { initialize: "create" });
+
+    it("(1) refuses a nonempty state.db without the marker, bytes unchanged", async () => {
+      const root = tempRoot("create-unmarked-db");
+      SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "detached" }).close();
+      const before = snapshot(root);
+      expect(() => create(root)).toThrow(/existing state\.db without the moved marker/);
+      await expect(createAsync(root)).rejects.toThrow(/existing state\.db without the moved marker/);
+      expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+      expect(snapshot(root)).toEqual(before);
+      // An empty state.json beside it changes nothing: the database is still not an imported one.
+      fs.writeFileSync(path.join(root, "state.json"), "");
+      expect(() => create(root)).toThrow(/existing state\.db without the moved marker/);
+      expect(fs.statSync(path.join(root, "state.json")).size).toBe(0);
+    });
+
+    it("(2) refuses a populated state.json beside an existing state.db, state.json unchanged", async () => {
+      const root = tempRoot("create-populated-db");
+      await seedFileRoot(root, 3);
+      // An old release's fence (or a stray copy) over the populated root.
+      const db = SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "detached" });
+      db.close();
+      const before = snapshot(root);
+      expect(() => create(root)).toThrow(/file-backend state in state\.json and an existing state\.db/);
+      await expect(createAsync(root)).rejects.toThrow(MeshStateUnsupportedError);
+      expect(snapshot(root)).toEqual(before);
+    });
+
+    it("(3) refuses a populated state.json with no db, and the marker without its db", async () => {
+      const root = tempRoot("create-populated");
+      await seedFileRoot(root, 2);
+      const before = snapshot(root);
+      expect(() => create(root)).toThrow(refusal);
+      await expect(createAsync(root)).rejects.toThrow(refusal);
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+      expect(snapshot(root)).toEqual(before);
+      const lost = tempRoot("create-lost");
+      fs.writeFileSync(path.join(lost, "state.json"), encodeMeshStateMovedMarker(4));
+      const lostBefore = snapshot(lost);
+      expect(() => create(lost)).toThrow(/moved marker but state\.db is missing or empty/);
+      expect(snapshot(lost)).toEqual(lostBefore);
+    });
+
+    it("(4) initialises a fresh root (absent, empty or zero-length state.json, zero-length db); an imported root opens normally", async () => {
+      const zeroDb = tempRoot("create-zero-db");
+      fs.writeFileSync(path.join(zeroDb, "state.db"), "");
+      const [none, emptyJson, zeroLength] = freshRoots();
+      for (const root of [none, emptyJson, zeroLength, zeroDb]) {
+        sqliteStores.push(create(root));
+        expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8")), root)
+          .toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
+        expect(fs.readdirSync(root).filter((name) => /\.(tmp|aside)$/.test(name))).toEqual([]);
+      }
+      // "create" again over the now-imported root is a default open: same database, marker untouched.
+      const marker = fs.readFileSync(path.join(none, "state.json"));
+      const first = sqliteStores[0];
+      await first.put({ key: "a", value: 1, identity });
+      const again = create(none);
+      sqliteStores.push(again);
+      expect(again.get("a")?.value).toBe(1);
+      expect(fs.readFileSync(path.join(none, "state.json")).equals(marker)).toBe(true);
+    });
+
+    it("(5) refuses when state.json is populated between the guard and the marker write; state.json unchanged", async () => {
+      const populated = JSON.stringify({ format: 1, revisionFormat: 2, entries: { live: { key: "live", value: 1, version: 1 } }, highWater: 1 });
+      const replace = (root: string): void => {
+        // A file-mode writer's atomic write: temp then rename over the name.
+        const temp = path.join(root, "state.json.writer.tmp");
+        fs.writeFileSync(temp, populated);
+        fs.renameSync(temp, path.join(root, "state.json"));
+      };
+      const cases = [
+        ...["before-marker", "before-claim"].flatMap((phase) => (["absent", "zero-length", "empty"] as const).map((start) => [phase, start] as const)),
+        // The claim itself: the inode renamed aside is the populated one, so it is linked back unchanged.
+        ...(["zero-length", "empty"] as const).map((start) => ["before-rename", start] as const),
+      ];
+      for (const [phase, start] of cases) {
+        {
+          const root = tempRoot(`create-race-${phase}-${start}`);
+          if (start === "zero-length") fs.writeFileSync(path.join(root, "state.json"), "");
+          if (start === "empty") fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, entries: {}, highWater: 0 }));
+          let fired = 0;
+          globals[MARKER_HOOK] = (at: string, hooked: string) => { if (at === phase && hooked === root) { fired += 1; replace(root); } };
+          expect(() => create(root), `${phase}/${start}`).toThrow(/initialize "create" raced/);
+          expect(fired).toBe(1);
+          expect(fs.readFileSync(path.join(root, "state.json"), "utf8"), `${phase}/${start}`).toBe(populated);
+          expect(fs.readdirSync(root).filter((name) => /\.(tmp|aside)$/.test(name))).toEqual([]);
+          delete globals[MARKER_HOOK];
+        }
+      }
+    });
   });
 
   it("opens an imported root, and the import CLI still imports a populated root", async () => {

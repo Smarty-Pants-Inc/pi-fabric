@@ -118,30 +118,43 @@ export class MeshStateUnsupportedError extends Error {
  * The import tool (backend-migration.ts) opens the database itself and never comes through here.
  */
 const assertSqliteRootImported = (root: string): void => {
-  try {
-    if (fs.statSync(path.join(root, "state.db")).size > 0) return; // initialised (or being initialised): its meta decides
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  let serialized: string;
-  try { serialized = fs.readFileSync(path.join(root, "state.json"), "utf8"); } catch (error) {
+  if (stateDbSize(root) > 0) return; // initialised (or being initialised): its meta decides
+  if (classifyStateFile(path.join(root, "state.json")) === "populated") throw importFirst(root, "this root has file-backend state");
+};
+
+/** state.db's size, or -1 when it is absent. */
+const stateDbSize = (root: string): number => {
+  try { return fs.statSync(path.join(root, "state.db")).size; } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return; // a fresh root
+    if (code === "ENOENT" || code === "ENOTDIR") return -1;
     throw error;
   }
-  if (!serialized.trim()) return; // a zero-length state.json holds nothing
+};
+
+/**
+ * What a state.json holds: "absent"; "empty" (zero-length, or no entries, no tombstones and highWater 0);
+ * "marker" (cutover's moved marker); else "populated" (live file state, or damaged: not provably empty).
+ */
+const classifyStateFile = (file: string): "absent" | "empty" | "marker" | "populated" => {
+  let serialized: string;
+  try { serialized = fs.readFileSync(file, "utf8"); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    throw error;
+  }
+  if (!serialized.trim()) return "empty"; // a zero-length state.json holds nothing
   let parsed: unknown;
   try { parsed = JSON.parse(serialized); } catch { parsed = undefined; } // damaged: not provably empty, refuse
-  if (isMeshStateMovedMarker(parsed)) return;
+  if (isMeshStateMovedMarker(parsed)) return "marker";
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const state = parsed as { entries?: unknown; versions?: unknown; tombstoneOrder?: unknown; highWater?: unknown };
     const empty = (value: unknown): boolean => value === undefined || value === null
       || (typeof value === "object" && Object.keys(value).length === 0);
     if (state.entries !== null && typeof state.entries === "object" && !Array.isArray(state.entries)
       && empty(state.entries) && empty(state.versions) && empty(state.tombstoneOrder)
-      && (state.highWater === undefined || state.highWater === 0)) return; // a fresh root's empty state file
+      && (state.highWater === undefined || state.highWater === 0)) return "empty"; // a fresh root's empty state file
   }
-  throw importFirst(root, "this root has file-backend state");
+  return "populated";
 };
 
 const importFirst = (root: string, why: string): MeshStateUnsupportedError =>
@@ -164,22 +177,41 @@ const TEST_FIXTURE_INITIALIZE = Symbol.for("pi-fabric.mesh.sqlite-initialize.tes
 const initializeOf = (options: SqliteStateStoreOptions): SqliteStateStoreOptions["initialize"] =>
   options.initialize ?? ((globalThis as Record<symbol, unknown>)[TEST_FIXTURE_INITIALIZE] === "create" ? "create" : undefined);
 
-const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["initialize"]): void => {
-  if (initialize === "detached") return;
+const lostDatabase = (root: string): MeshStateUnsupportedError =>
+  new MeshStateUnsupportedError(`Fabric mesh SQLite state refused for ${root}: state.json is the moved marker but state.db is `
+    + "missing or empty; restore state.db from a backup or recover state.json from state.json.cutover-<epoch> (smarty-dev#6477)");
+
+/**
+ * Before any side effect. Returns the mode the open runs in: "create" only on a GENUINELY fresh root (no
+ * state.db or a zero-length one, and a state.json that is absent or empty); "create" over an imported root (an
+ * initialised state.db plus the marker) is a default open (undefined), so its database is checked like any
+ * other. Everything else refuses with the root untouched: an existing database without the marker (never
+ * accepted as imported), file state in state.json, or the marker without its database (review/astra P1).
+ */
+const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStoreOptions["initialize"] => {
+  if (initialize === "detached") return initialize;
+  if (initialize === "create") {
+    const state = classifyStateFile(path.join(root, "state.json"));
+    if (stateDbSize(root) > 0) {
+      if (state === "marker") return undefined; // the imported shape: open it as a default open does
+      throw importFirst(root, state === "populated"
+        ? "initialize \"create\" found file-backend state in state.json and an existing state.db"
+        : "initialize \"create\" found an existing state.db without the moved marker, so no import created it "
+          + "(inspect state.db and move it aside if it holds nothing)");
+    }
+    if (state === "populated") throw importFirst(root, "this root has file-backend state");
+    if (state === "marker") throw lostDatabase(root);
+    return "create";
+  }
   assertSqliteRootImported(root);
-  if (initialize === "create") return;
-  try {
-    if (fs.statSync(path.join(root, "state.db")).size > 0) return;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
-  }
-  if (readMeshStateMovedMarker(root)) {
-    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refused for ${root}: state.json is the moved marker but state.db is `
-      + "missing or empty; restore state.db from a backup or recover state.json from state.json.cutover-<epoch> (smarty-dev#6477)");
-  }
+  if (stateDbSize(root) > 0) return initialize;
+  if (readMeshStateMovedMarker(root)) throw lostDatabase(root);
   throw importFirst(root, "this root has no imported state.db");
 };
+
+/** Whether the connection's database was already initialised (a meta table): "create" never adopts one. */
+const hasMeta = (db: SqliteConnection): boolean =>
+  db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get() !== undefined;
 
 /**
  * On the open connection, before initialise seeds anything: an uninitialised state.db is refused, and
@@ -198,17 +230,83 @@ const assertImportedDatabase = (db: SqliteConnection, root: string): void => {
   }
 };
 
-/** "create" only: a fresh root ends like a fresh import, the moved marker at the database's epoch (temp, fsync, rename). */
+/**
+ * Test-only seam (tests/mesh-state-sqlite-unimported.test.ts): a function under this global symbol runs at
+ * "before-marker" (after initialise, before the re-check), "before-claim" (after the re-check, right before the
+ * exclusive link) and "before-rename" (an empty state.json about to be claimed aside), so a test can populate
+ * state.json in each window. Production never sets it.
+ */
+const CREATE_MARKER_HOOK = Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook");
+const markerHook = (phase: "before-marker" | "before-claim" | "before-rename", root: string): void => {
+  const hook = (globalThis as Record<symbol, unknown>)[CREATE_MARKER_HOOK];
+  if (typeof hook === "function") (hook as (phase: string, root: string) => void)(phase, root);
+};
+
+const raced = (root: string, why: string): MeshStateUnsupportedError => importFirst(root, `initialize "create" raced: ${why}; `
+  + "state.json was left as it is (a state.db this open initialised stays and fences file-mode writers: move it aside if it holds nothing)");
+
+/**
+ * "create" only, on a fresh root: the moved marker at the database's epoch, as a fresh import leaves it. It NEVER
+ * replaces a non-marker state.json (review/astra P1): state.json is re-checked here, then claimed exclusively. An
+ * absent state.json is created with link(2) (fails if anything appeared); an empty one is first renamed aside, so
+ * the inode that is judged is the inode that is replaced, and the marker is linked in only while the name is
+ * still free. A claimed state.json that turns out to be populated is linked back unchanged (same inode, same
+ * bytes) and the open refuses. No step overwrites a name another writer may have just written.
+ */
 const ensureMovedMarker = (root: string, epoch: number): void => {
-  if (readMeshStateMovedMarker(root)) return;
+  markerHook("before-marker", root);
   const file = path.join(root, "state.json");
+  const before = classifyStateFile(file);
+  if (before === "marker") return;
+  if (before === "populated") throw raced(root, "state.json was populated after the fresh-root check");
   const temp = `${file}.sqlite-create-${process.pid}-${randomUUID()}.tmp`;
   const descriptor = fs.openSync(temp, "wx", 0o600);
   try {
     fs.writeSync(descriptor, encodeMeshStateMovedMarker(epoch));
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
-  try { fs.renameSync(temp, file); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ } throw error; }
+  try {
+    markerHook("before-claim", root);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { fs.linkSync(temp, file); return; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const present = classifyStateFile(file);
+      if (present === "marker") return; // a concurrent creator or import installed it
+      if (present === "populated") throw raced(root, "state.json was populated before the marker write");
+      if (present === "absent") continue;
+      // An empty state.json: claim that exact inode, judge it, and only then put the marker in place.
+      const aside = `${file}.sqlite-create-${process.pid}-${randomUUID()}.aside`;
+      markerHook("before-rename", root);
+      try { fs.renameSync(file, aside); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const claimed = classifyStateFile(aside);
+      if (claimed === "empty") {
+        try { fs.linkSync(temp, file); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            try { fs.linkSync(aside, file); fs.rmSync(aside, { force: true }); } catch { /* the aside keeps it */ }
+            throw error;
+          }
+          fs.rmSync(aside, { force: true }); // it held nothing; the name is a newer writer's now
+          if (classifyStateFile(file) === "marker") return;
+          throw raced(root, "state.json was written during the marker write");
+        }
+        fs.rmSync(aside, { force: true });
+        return;
+      }
+      // Populated (or a marker) arrived between the re-check and the claim: put the same inode back.
+      try { fs.linkSync(aside, file); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw raced(root, `state.json changed twice during the marker write; the claimed state is kept at ${aside}`);
+        }
+        throw error;
+      }
+      fs.rmSync(aside, { force: true });
+      if (claimed === "marker") return;
+      throw raced(root, "state.json was populated before the marker write");
+    }
+    throw raced(root, "state.json kept changing during the marker write");
+  } finally { fs.rmSync(temp, { force: true }); }
 };
 
 /** The database was retired (rolled back to the file backend) or re-epoched: use the file path. */
@@ -568,8 +666,7 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    const initialize = initializeOf(options);
-    guardBeforeOpen(root, initialize);
+    const initialize = guardBeforeOpen(root, initializeOf(options));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
@@ -583,9 +680,10 @@ export class SqliteStateStore {
       for (;;) {
         options.writeSignal?.throwIfAborted();
         try {
-          if (!initialize) assertImportedDatabase(db, root);
+          const fresh = initialize === "create" && !hasMeta(db);
+          if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
           const identity = initialise(db, options);
-          if (initialize === "create") ensureMovedMarker(root, identity.epoch);
+          if (fresh) ensureMovedMarker(root, identity.epoch);
           return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
         } catch (error) {
           if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
@@ -608,17 +706,17 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    const initialize = initializeOf(options);
-    guardBeforeOpen(root, initialize);
+    const initialize = guardBeforeOpen(root, initializeOf(options));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = (options.open ?? openNodeSqlite)(file);
     try {
-      if (!initialize) assertImportedDatabase(db, root);
+      const fresh = initialize === "create" && !hasMeta(db);
+      if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
       const identity = initialise(db, options);
-      if (initialize === "create") ensureMovedMarker(root, identity.epoch);
+      if (fresh) ensureMovedMarker(root, identity.epoch);
       return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
     } catch (error) {
       if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }

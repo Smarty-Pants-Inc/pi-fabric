@@ -86,7 +86,15 @@ it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by 
 
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
     await mesh.publish({ topic: "native.wake", from: { id: "publisher", kind: "main", name: "publisher" }, data: { n: 1 } });
-    await mesh.publishBatch([2, 3].map(n => ({ topic: "native.wake", from: { id: "publisher", kind: "main" as const, name: "publisher" }, data: { n } })));
+    let pending = [2, 3].map(n => ({ topic: "native.wake", from: { id: "publisher", kind: "main" as const, name: "publisher" }, data: { n } }));
+    // publishBatch commits a bounded prefix, not necessarily its entire input
+    // (50 ms/fsync budget). Retry only its uncommitted suffix before measuring FIFO.
+    while (pending.length) {
+      const committed = await mesh.publishBatch(pending);
+      expect(committed.length).toBeGreaterThan(0);
+      expect(committed.length).toBeLessThanOrEqual(pending.length);
+      pending = pending.slice(committed.length);
+    }
     await until(() => !!owner() && owner()!.pid !== warm.pid);
     const woken = owner()!;
     owned.set(woken.pid, woken.processStartTime);

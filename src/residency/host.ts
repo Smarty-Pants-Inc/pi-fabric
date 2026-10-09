@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { RESIDENT_EXIT_MARKER, type ResidentExitReason } from "./launcher-owner.js";
 import { randomUUID } from "node:crypto";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -245,7 +246,7 @@ export class ResidentHost {
 
   constructor(
     readonly config: ResidentHostConfig,
-    readonly onIdle: () => void = () => {},
+    readonly onIdle: (reason?: ResidentExitReason) => void = () => {},
     private readonly modelRegistry?: PiModelRegistryView,
     readonly launch?: ResidentHostLaunchContext,
   ) {
@@ -1171,7 +1172,7 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
-    this.onIdle();
+    this.onIdle("idle-exit");
   }
 
   #trackPublication(promise: Promise<unknown>): void {
@@ -1278,7 +1279,7 @@ export class ResidentHost {
             !exactResidentProcess(plan.launcher)) throw new Error("Resident launcher custody is uncertain");
         // Receipt precedes release of A's stable flock. The Main is no longer the executor.
         writeHandoverState(this.config.residencyRoot, plan, "released");
-        this.onIdle();
+        this.onIdle("handover-release");
         return;
       }
       if (!mainGenerationCurrent(this.config.residencyRoot, plan.main) || !exactResidentProcess(plan.launcher)) {
@@ -1808,30 +1809,41 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
 
+/** Tells the launcher why this host exits; it names the reason in launcher.log (smarty-dev#7770). */
+const reportResidentExit = (reason: ResidentExitReason): void => {
+  // Only a launcher-spawned host has a launcher reading its stderr.
+  if (!process.env.PI_FABRIC_RESIDENT_CONFIG) return;
+  try { process.stderr.write(`${RESIDENT_EXIT_MARKER}${JSON.stringify({ reason })}\n`); } catch { /* best effort */ }
+};
+
 const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
 ): Promise<void> => {
-  let finishIdle: (() => void) | undefined;
-  const idle = new Promise<void>((resolve) => {
+  let finishIdle: ((reason: ResidentExitReason) => void) | undefined;
+  const idle = new Promise<ResidentExitReason>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
+  const host = new ResidentHost(config, (reason = "idle-exit") => finishIdle?.(reason), modelRegistry, residentHostLaunchContext(config));
   await host.start();
   if (signal?.aborted) {
+    reportResidentExit("stopped");
     await host.close();
     return;
   }
-  await Promise.race([
+  const reason = await Promise.race([
     idle,
-    new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
+    new Promise<ResidentExitReason>((resolve) => {
+      const finish = (): void => resolve("stopped");
       signal?.addEventListener("abort", finish, { once: true });
       process.once("SIGTERM", finish);
       process.once("SIGINT", finish);
     }),
   ]);
+  // Report while this host still owns the root: its close releases owner.json
+  // last, and nothing may write under the root after that (smarty-dev#1882).
+  reportResidentExit(reason);
   await host.close();
 };
 
@@ -1846,6 +1858,7 @@ export const runResidentHostFromConfigPath = async (
     await runResidentHost(config, signal, modelRegistry);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
+    reportResidentExit("error");
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);
     try {
       atomicWrite(path.join(residencyRoot, "error.json"), {

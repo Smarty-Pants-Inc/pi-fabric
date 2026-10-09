@@ -104,3 +104,42 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
     }
   });
 });
+
+// smarty-dev#7770: a clean idle exit must not look like an outside kill.
+describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher child exit log", () => {
+  const run = async (mode: "idle" | "kill"): Promise<Record<string, unknown>[]> => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-exit-"));
+    const hostBinary = path.join(root, "fake-host.mjs");
+    const owner = path.join(root, "owner.json");
+    fs.writeFileSync(hostBinary, [
+      "import fs from 'node:fs';",
+      `fs.writeFileSync(${JSON.stringify(owner)}, JSON.stringify({ pid: process.pid }));`,
+      mode === "idle"
+        // Like the real host: report the reason, release owner.json last, exit 0.
+        ? `setTimeout(() => { process.stderr.write('pi-fabric-resident-exit {"reason":"idle-exit"}\\n'); setTimeout(() => { fs.rmSync(${JSON.stringify(owner)}); process.exit(0); }, 200); }, 500);`
+        : `setTimeout(() => process.kill(process.pid, 'SIGKILL'), 500);`,
+      "setInterval(() => {}, 1000);",
+      "",
+    ].join("\n"));
+    const configPath = path.join(root, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ cwd: root, piBinary: hostBinary }));
+    try {
+      await new Promise<void>(resolve => {
+        execFile(process.execPath, [launcherPath, "--config", configPath], { cwd: root, timeout: 25_000 }, () => resolve());
+      });
+      return fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n")
+        .map(line => JSON.parse(line) as Record<string, unknown>).filter(row => String(row.event).startsWith("child-exit"));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  it("names a clean idle exit", { timeout: 30_000 }, async () => {
+    // Logged while the host still owns the root; nothing is written after its release (#1882).
+    expect(await run("idle")).toEqual([expect.objectContaining({ event: "child-exit-reported", reason: "idle-exit" })]);
+  });
+
+  it("names the signal of a killed host", { timeout: 30_000 }, async () => {
+    expect(await run("kill")).toEqual([expect.objectContaining({ event: "child-exit", code: null, signal: "SIGKILL", reason: "signal", seenOwner: true })]);
+  });
+});

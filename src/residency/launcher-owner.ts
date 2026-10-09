@@ -3,6 +3,18 @@ import { processStartTime } from "./process-identity.js";
 
 export interface OwnedProcess { pid: number; processStartTime: string; ppid: number; state: string; }
 export interface ObservedProcessTree { processes: Map<number, OwnedProcess>; }
+/** Why a resident host exited; it writes this as its last stderr line (smarty-dev#7770). */
+export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";
+export const RESIDENT_EXIT_MARKER = "pi-fabric-resident-exit ";
+/** The last reason a host reported in its captured output, if any. */
+export function reportedExitReason(output: string): string | undefined {
+  const at = output.lastIndexOf(RESIDENT_EXIT_MARKER);
+  if (at < 0) return undefined;
+  try {
+    const reason = (JSON.parse(output.slice(at + RESIDENT_EXIT_MARKER.length).split("\n", 1)[0]!) as { reason?: unknown }).reason;
+    return typeof reason === "string" ? reason.slice(0, 64) : undefined;
+  } catch { return undefined; }
+}
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 function processRows(): OwnedProcess[] {
   const rows: OwnedProcess[] = [];

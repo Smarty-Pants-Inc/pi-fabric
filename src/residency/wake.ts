@@ -122,7 +122,9 @@ export function waitResidentChange(root: string, ready: () => boolean, timeoutMs
       if (error) reject(error); else resolve();
     };
     const check = (): void => {
-      if (settled) return;
+      // An owned startup is proven by the child, never an intermediate file write.
+      // Files get exactly one fallback read at the deadline, even with healthy watches.
+      if (settled || child) return;
       try { if (ready()) finish(); } catch (error) { finish(error); }
     };
     const reread = (cause: unknown): void => {
@@ -141,10 +143,7 @@ export function waitResidentChange(root: string, ready: () => boolean, timeoutMs
     const failed = (error: Error): void => finish(new ResidentWakeStartupFailed(root, error.message, error));
     const exited = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
-      try {
-        if (ready()) finish();
-        else failed(new Error(`Resident startup child exited (${signal ?? code ?? "unknown"}) before ready`));
-      } catch (error) { failed(error instanceof Error ? error : new Error(String(error))); }
+      failed(new Error(`Resident startup child exited (${signal ?? code ?? "unknown"}) before ready`));
     };
     child?.on("message", message);
     child?.once("exit", exited);

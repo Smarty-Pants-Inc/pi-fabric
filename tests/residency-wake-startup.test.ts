@@ -27,7 +27,7 @@ describe("resident native startup outcomes", () => {
       { stdio: ["ignore", "ignore", "ignore", "ipc"] });
     try {
       await waitResidentChange(root, ready, 5_000, "pending", child);
-      expect(ready).toHaveBeenCalledTimes(mode === "throw" ? 0 : 1);
+      expect(ready).not.toHaveBeenCalled();
       expect(interval).not.toHaveBeenCalled();
       expect(child.listenerCount("message")).toBe(0);
       expect(close).toHaveBeenCalledTimes(mode === "throw" ? 0 : 1);
@@ -43,17 +43,32 @@ describe("resident native startup outcomes", () => {
     const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
     vi.spyOn(fs, "watch").mockReturnValue(watcher);
     const child = spawn(process.execPath, ["-e", "process.exit(17)"], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
-    const ready = vi.fn(() => false);
+    // A receipt written before host startup completes must NOT hide a child failure.
+    const ready = vi.fn(() => true);
     const started = performance.now();
     try {
       await expect(waitResidentChange(root, ready, 30_000, "pending", child)).rejects.toMatchObject({
         code: "RESIDENT_WAKE_STARTUP_FAILED", root, message: expect.stringContaining("17"),
       });
       expect(performance.now() - started).toBeLessThan(5_000);
-      expect(ready).toHaveBeenCalledTimes(2);
+      expect(ready).not.toHaveBeenCalled();
       expect(child.listenerCount("message")).toBe(0);
       expect(watcher.close).toHaveBeenCalledOnce();
     } finally { await exit(child); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("uses one direct deadline read as a fallback when a child ready message is lost", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-child-reread-"));
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
+    const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) as unknown as ChildProcess;
+    vi.spyOn(fs, "watch").mockReturnValue(watcher);
+    const ready = vi.fn(() => true);
+    try {
+      await waitResidentChange(root, ready, 10, "pending", child);
+      expect(ready).toHaveBeenCalledOnce();
+      expect(child.listenerCount("message")).toBe(0);
+      expect(watcher.close).toHaveBeenCalledOnce();
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("does exactly one final re-read and retains typed pending when the owned child has not signaled", async () => {
@@ -64,7 +79,7 @@ describe("resident native startup outcomes", () => {
     const ready = vi.fn(() => false);
     try {
       await expect(waitResidentChange(root, ready, 10, "pending", child)).rejects.toMatchObject({ code: "RESIDENT_WAKE_PENDING", root });
-      expect(ready).toHaveBeenCalledTimes(2);
+      expect(ready).toHaveBeenCalledOnce();
       expect(child.listenerCount("exit")).toBe(0);
       expect(child.listenerCount("message")).toBe(0);
     } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }

@@ -110,7 +110,7 @@ export const buildExecutorSection = (
           values: ["off", "enforce"],
         }),
         setting("executor.landlock.disabled", "Fleet confinement kill switch", String(config.executor.landlock.disabled), {
-          description: "Host-only executor.landlock.disabled=true disables confinement for every lane. Set in the global agent fabric.json; project values are ignored.",
+          description: "Root-owned /etc/smarty/fabric-policy.json controls this fleet kill switch. Agent-dir values are ignored once provisioned (legacy fallback only while policy is missing); project values are ignored.",
           values: BOOLEANS,
         }),
         setting(

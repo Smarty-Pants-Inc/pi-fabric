@@ -49,7 +49,7 @@ Older hosts without that optional flag retain their existing readiness contract.
 The default usable-start observation budget includes the mandatory 30-second
 empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
 budgets remain unchanged. A client attaching between owner publication and the
-maintenance receipt waits for that existing generation instead of launching
+maintenance receipt waits for that existing generation and does not launch
 a competitor.
 
 ## Context and lifecycle
@@ -82,7 +82,7 @@ A file-only heartbeat is liveness, not permission to consume mesh work. Control,
 actor mesh, and lifecycle consumers require a confirmed shared-lock renewal.
 An overdue consumer requests a prompt renewal attempt, but stays fenced until
 that real acquisition succeeds. Initial publication failure keeps the same
-host start pending rather than publishing a usable owner prematurely.
+host start pending and does not publish a usable owner prematurely.
 
 Control admission checks the lease under both the shared claim lock and the
 host-local claim lock. The resident rechecks after awaited binding resolution,

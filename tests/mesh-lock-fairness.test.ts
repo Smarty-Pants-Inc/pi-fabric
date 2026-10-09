@@ -121,7 +121,7 @@ describe("bounded FIFO mesh admission", () => {
 
   it("admits 24 enqueued waiters in ticket order, not repeated-winner order", async () => {
     // Leave the host monotonic clock real: fake hrtime gives all tickets the same age.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const root = scratch();
     const lock = held(root);
     const store = new MeshStore(root, 65536, 100);
@@ -137,7 +137,7 @@ describe("bounded FIFO mesh admission", () => {
   });
 
   it("non-heads inspect only the queue, not the holder or acquisition directory", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const root = scratch();
     const head = new MeshLockTicket(root, randomUUID(), 7000);
     const store = new MeshStore(root, 65536, 100);
@@ -165,7 +165,7 @@ describe("bounded FIFO mesh admission", () => {
   });
 
   it("falls back after 80% of the budget even behind a live stalled ticket", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const root = scratch();
     const first = oldTicket(root, process.pid);
     const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 100 });
@@ -188,7 +188,7 @@ describe("bounded FIFO mesh admission", () => {
   });
 
   it("cleans receipts on cancellation, operation exceptions and typed timeouts", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const root = scratch();
     const lock = held(root);
     const abort = new AbortController();

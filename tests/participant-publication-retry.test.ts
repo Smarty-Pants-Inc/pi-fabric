@@ -13,7 +13,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const timeout = () => new MeshLockTimeoutError(" held by test", 1, 0);
-const setup = async (wait: () => Promise<void>) => {
+const setup = async (wait: (signal: AbortSignal) => Promise<void>) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "publication-retry-")); roots.push(root);
   const mesh = new MeshStore(root, 65_536, 100);
   let blocked = false, inFence = false;
@@ -24,7 +24,7 @@ const setup = async (wait: () => Promise<void>) => {
     try { if (blocked) throw timeout(); return await publish(); }
     finally { inFence = false; }
   };
-  const admission = vi.fn(async () => { expect(inFence).toBe(false); await wait(); });
+  const admission = vi.fn(async (signal?: AbortSignal) => { expect(inFence).toBe(false); await wait(signal!); });
   const identity = { id: "resident", name: "resident", kind: "agent" as const };
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: "root", identity,
     withPublicationFence: publicationFence, waitForPublicationRetry: admission, reapDeadHosts: false });
@@ -55,7 +55,7 @@ it("uses one off-heartbeat jittered retry lane capped at 2 s, and admits only a 
   expect(s.directory.confirmedAt()).toBeGreaterThan(prior); expect(s.directory.canConsumeMesh()).toBe(true);
 });
 
-it.each(["close", "quiesce"] as const)("%s drains the outside-custody wait and cancels its retry timer", async operation => {
+it.each(["close", "quiesce"] as const)("%s promptly aborts the outside-custody wait and cancels its retry timer", async operation => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let inline = true;
@@ -67,11 +67,13 @@ it.each(["close", "quiesce"] as const)("%s drains the outside-custody wait and c
     await vi.advanceTimersByTimeAsync(450); await failed;
     expect(s.admission).toHaveBeenCalledTimes(3); inline = false; s.admission.mockClear();
     await vi.advanceTimersByTimeAsync(50); expect(s.admission).toHaveBeenCalledOnce();
+    const signal = s.admission.mock.calls[0]![0]!;
+    s.block(false); // teardown itself can publish; the admission gate is STILL blocked
     let finished = false;
     const stopping = s.directory[operation]().then(() => { finished = true; });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(finished).toBe(false); expect(s.admission).toHaveBeenCalledOnce();
-    s.block(false); release(); await stopping;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(true); expect(signal.aborted).toBe(true);
+    expect(s.admission).toHaveBeenCalledOnce(); await stopping;
     const fences = s.fence.mock.calls.length;
     await vi.advanceTimersByTimeAsync(750);
     expect(s.admission).toHaveBeenCalledOnce(); expect(s.fence).toHaveBeenCalledTimes(fences);

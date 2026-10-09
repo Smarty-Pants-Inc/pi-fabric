@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { withStateFence } from "../src/mesh/commit-outbox.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { readHostLease } from "../src/topology/host-leases.js";
+import { ParticipantDirectory, ParticipantLeaseSupersededError } from "../src/topology/participant-directory.js";
+import { hostLeasePath, readHostLease, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const roots: string[] = [], directories: ParticipantDirectory[] = [];
@@ -181,5 +181,141 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     expect(confirm).toHaveBeenCalledTimes(2);
     acquired(Date.now()); release(); await Promise.all([first, joining]);
     expect(s.directory.canConsumeMesh()).toBe(true);
+  });
+
+  const replaceLease = (s: Awaited<ReturnType<typeof setup>>, identity = false) => {
+    const next = { ...s.lease(), startedAt: s.lease().startedAt! + 1,
+      ...(identity ? { identityId: "successor" } : {}) };
+    writeHostLease(s.root, next);
+    return fs.readFileSync(hostLeasePath(s.root, next.id), "utf8");
+  };
+
+  it.each([false, true])("a successor during jitter fences every later renewal and confirmation (identity changes: %s)", async identity => {
+    const s = await setup();
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    const prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
+    const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await vi.advanceTimersByTimeAsync(0); expect(confirm).toHaveBeenCalledOnce();
+    const bytes = replaceLease(s, identity);
+    await vi.advanceTimersByTimeAsync(150); await failed;
+    expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
+    await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+    await expect(s.directory.quiesce("reload")).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await s.directory.closeLineage();
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(hostLeasePath(s.root, s.lease().id), "utf8")).toBe(bytes);
+    expect(s.mesh.listAll("topology/lineage-closures/")).toEqual([]);
+  });
+
+  it("rechecks incarnation after admission, before any fresh publication", async () => {
+    const s = await setup();
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    const prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValueOnce(timeout());
+    let bytes = "";
+    s.wait.mockImplementation(async () => { bytes = replaceLease(s); });
+    const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await vi.advanceTimersByTimeAsync(150); await failed;
+    expect(s.wait).toHaveBeenCalledOnce(); expect(confirm).toHaveBeenCalledOnce();
+    expect(s.fence).toHaveBeenCalledTimes(2); // initial and failed publication, never a third
+    expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
+    expect(fs.readFileSync(hostLeasePath(s.root, s.lease().id), "utf8")).toBe(bytes);
+  });
+
+  it.each([true, false])("fences timeout and base failed-write renewal when the lease changes inside the failed attempt (typed timeout: %s)", async typed => {
+    const s = await setup();
+    let bytes = "";
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockImplementation(async () => {
+      bytes = replaceLease(s); throw typed ? timeout() : new Error("ENOSPC");
+    });
+    const prior = s.directory.confirmedAt();
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    expect(confirm).toHaveBeenCalledOnce(); expect(s.directory.confirmedAt()).toBe(prior);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+    expect(fs.readFileSync(hostLeasePath(s.root, s.lease().id), "utf8")).toBe(bytes);
+  });
+
+  it("fences the base timer renewal and a delayed confirmation callback", async () => {
+    const s = await setup(); vi.useFakeTimers();
+    await s.directory.start();
+    const prior = s.directory.confirmedAt();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockImplementation(async callback => {
+      await gate; callback?.(Date.now());
+    });
+    const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const bytes = replaceLease(s);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      await vi.advanceTimersByTimeAsync(5_000); // timer's independent renewal sees the successor
+      expect(s.directory.canConsumeMesh()).toBe(false);
+      expect(fs.readFileSync(hostLeasePath(s.root, s.lease().id), "utf8")).toBe(bytes);
+      release(); await failed;
+      expect(s.directory.confirmedAt()).toBe(prior); expect(confirm).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(10_000); expect(confirm).toHaveBeenCalledOnce();
+      await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    } finally { release(); }
+  });
+
+  it("revalidates shared write preparation after a successor claims the lease", async () => {
+    const s = await setup();
+    const original = s.mesh.writeBatch.bind(s.mesh);
+    const state = fs.readFileSync(path.join(s.root, "state.json"), "utf8");
+    let bytes = "";
+    vi.spyOn(s.mesh, "writeBatch").mockImplementation(args => original({ ...args, prepare: view => {
+      bytes = replaceLease(s); return args.prepare?.(view) ?? [];
+    } }));
+    s.record.status = "running";
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    expect(fs.readFileSync(path.join(s.root, "state.json"), "utf8")).toBe(state);
+    expect(fs.readFileSync(hostLeasePath(s.root, s.lease().id), "utf8")).toBe(bytes);
+  });
+
+  it("does not start an unbounded acquisition when preparation spent the monotonic budget", async () => {
+    const s = await setup(); vi.useFakeTimers();
+    const prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable");
+    vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(13_001);
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    expect(confirm).not.toHaveBeenCalled(); expect(s.directory.confirmedAt()).toBe(prior);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+  });
+
+  it("spends only the frozen monotonic budget after a backward wall-clock step", async () => {
+    const s = await setup();
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    const start = performance.now(), prior = s.directory.confirmedAt();
+    s.hold();
+    let spent = 0;
+    const failed = expect(s.directory.refresh().finally(() => { spent = performance.now() - start; }))
+      .rejects.toBeInstanceOf(MeshLockTimeoutError);
+    await vi.advanceTimersByTimeAsync(150); // first try failed; now blocked in native FIFO admission
+    vi.setSystemTime(Date.now() - 60_000);
+    await vi.advanceTimersByTimeAsync(12_850); await failed;
+    expect(spent).toBe(13_000); expect(s.directory.confirmedAt()).toBe(prior);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+    expect(readHostLeaseCurrent(s.root, s.lease().id)?.startedAt).toBe(s.lease().startedAt);
+    s.release();
+  });
+
+  it.each(["close", "quiesce"] as const)("%s cancels a blocked native inline admission without awaiting the holder", async operation => {
+    const s = await setup();
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    s.hold();
+    const failed = expect(s.directory.refresh()).rejects.toThrow(`Participant directory is ${operation === "close" ? "closed" : "quiescing"}`);
+    await vi.advanceTimersByTimeAsync(150); expect(s.wait).toHaveBeenCalledOnce();
+    // Teardown may publish its own stopping state, but the retry's FIFO holder
+    // must not be awaited. Stub only teardown writes; keep admission genuinely blocked.
+    if (operation === "close") vi.spyOn(s.mesh, "delete").mockResolvedValue({ deleted: false });
+    else vi.spyOn(s.mesh, "writeBatch").mockResolvedValue([]);
+    let finished = false;
+    const stopping = s.directory[operation]().then(() => { finished = true; });
+    await vi.advanceTimersByTimeAsync(0); await failed;
+    expect(finished).toBe(true); await stopping;
+    expect(fs.existsSync(path.join(s.root, ".lock"))).toBe(true);
+    s.release();
   });
 });

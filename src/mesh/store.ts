@@ -433,8 +433,8 @@ export class MeshStore {
 
   // The lock (mesh-lock.ts).
 
-  withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
-    return this.#lock.withTryLock(operation, timeoutMs);
+  withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0, signal?: AbortSignal): Promise<T> {
+    return this.#lock.withTryLock(operation, timeoutMs, signal);
   }
 
   /** Runs a synchronous operation under mesh custody without writing shared state. */

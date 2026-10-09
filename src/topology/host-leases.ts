@@ -102,7 +102,7 @@ export interface FabricHostLease {
   expiresAt: number;
   /** Incarnation fence; absent on pre-lease-capability writers. */
   startedAt?: number;
-  /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
+  /** Root Main's explicit bounded reload handoff; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
@@ -183,7 +183,7 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       id: value.id, rootId: value.rootId, identityId: value.identityId,
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
-      ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
+      ...(typeof value.reloadUntil === "number" && Number.isFinite(value.reloadUntil) ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };

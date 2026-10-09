@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { FabricTellNameTargetError } from "../src/providers/agents-message-router.js";
 import { herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
 import { rootParticipantName } from "../src/topology/participant-name.js";
 import { claimMainName, mainNameBindingKey, readMainNameBinding, MAIN_NAME_REBINDING_PREFIX } from "../src/topology/main-name-binding.js";
@@ -150,6 +151,19 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       // A Main can address itself by its own Herdr name.
       await expect(a.invoke("agents.followUp", { id: "name:lane-a", message: "self" }))
         .resolves.toMatchObject({ routed: "main", queued: true });
+
+      // tell remains actor-oriented: reject even a resolvable Main name before routing.
+      const tellCommandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      const deliveriesBefore = all.map(m => m.sendMessage.mock.calls.length);
+      for (const target of [{ id: "name:lane-b" }, { to: "name:lane-b" },
+        { id: " name:lane-a " }, { id: "name:nobody" }, { id: "name:org" }]) {
+        const error = await a.invoke("agents.tell", { ...target, message: "never via tell" }).catch(error => error);
+        expect(error).toBeInstanceOf(FabricTellNameTargetError);
+        expect(error).toMatchObject({ code: "FABRIC_TELL_NAME_TARGET_UNSUPPORTED",
+          message: expect.stringContaining("agents.steer or agents.followUp") });
+      }
+      expect(a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(tellCommandsBefore);
+      expect(all.map(m => m.sendMessage.mock.calls.length)).toEqual(deliveriesBefore);
 
       const commandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
       const ambiguous = await a.invoke("agents.followUp", { id: "name:lane-dup", message: "never guess" })

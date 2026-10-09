@@ -118,6 +118,15 @@ export class FabricNameTargetError extends Error {
   }
 }
 
+/** Main name selectors are only supported by steer/followUp, never actor tell. */
+export class FabricTellNameTargetError extends Error {
+  override readonly name = "FabricTellNameTargetError";
+  readonly code = "FABRIC_TELL_NAME_TARGET_UNSUPPORTED";
+  constructor(readonly target: string) {
+    super(`agents.tell does not accept Main name selector ${target}; nothing was sent. Use agents.steer or agents.followUp with this id instead.`);
+  }
+}
+
 /** Principal selectors are forbidden; exact sessions remain ordinary routing targets. */
 export class FabricPrincipalNameTargetError extends Error {
   override readonly name = "FabricPrincipalNameTargetError";

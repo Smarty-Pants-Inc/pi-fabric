@@ -540,7 +540,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "tell",
-    description: "Queue a message through a persistent actor's live owner without waiting. Optional model/thinking values apply only to this activation.",
+    description: "Queue a message through a persistent actor's live owner without waiting. Main name selectors are not supported; use steer or followUp for Main name addressing. Optional model/thinking values apply only to this activation.",
     inputSchema: {
       type: "object",
       properties: { ...actorInvocationProperties,

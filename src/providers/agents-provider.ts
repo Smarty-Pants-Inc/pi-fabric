@@ -102,7 +102,7 @@ import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
-import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
+import { AgentMessageRouter, FabricTellNameTargetError, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
@@ -1281,9 +1281,11 @@ export class AgentsProvider implements FabricProvider {
           },
         );
       }
-      case "tell":
+      case "tell": {
+        const id = String(args.id);
+        if (id.trim().startsWith("name:")) throw new FabricTellNameTargetError(id.trim());
         return this.routeMessage(
-          String(args.id),
+          id,
           String(args.message),
           args.data,
           "followUp",
@@ -1291,6 +1293,7 @@ export class AgentsProvider implements FabricProvider {
           { binding: actorRunBinding(args),
             ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
+      }
       case "steer":
         return this.routeMessage(
           String(args.id),

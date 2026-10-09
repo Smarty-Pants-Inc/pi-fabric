@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention } from "../src/storage/retention-cli.js";
+import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { spawnSync } from "node:child_process";
 
@@ -121,6 +121,53 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(claims[0]).toBe(false);
     expect(claims.at(-1)).toBe(true);
     expect(claimable()).toBe(true);
+  });
+
+  it("stops deleting the moment a hold appears mid-sweep, and a host waiting for a root's lock wins that root (smarty-dev#7766)", async () => {
+    for (const event of ["hold", "wake"] as const) {
+      const { root, host } = make();
+      const runs = snapshot(path.join(host, "runs"));
+      // residentRunRetentionMs is read inside the dead root's fenced sweep, before its first deletion.
+      const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {
+        if (event === "hold") write(path.join(root, MESH_RETENTION_HOLD), "{}");
+        // A waking host: flock(1) blocks on host.lock in the background, so /proc/locks lists a waiter.
+        else spawnSync("sh", ["-c", `flock -x -w 20 '${path.join(host, "host.lock")}' true </dev/null >/dev/null 2>&1 & sleep 0.3`]);
+        return 86400000;
+      } };
+      const result = await sweepMeshRetention(root, options);
+      // A hold stops every deletion; a waking host stops its own root's work. The mesh-wide actor pass is
+      // independent of host liveness by design (pi-fabric#645): it keeps its own registry fences.
+      expect(result.changes.filter(change => event === "hold" || change.path.startsWith(host)), event).toEqual([]);
+      expect(result.skipped.map(item => item.reason).join(" "), event).toMatch(event === "hold" ? /held/ : /host is waking/);
+      if (event === "hold") fs.unlinkSync(path.join(root, MESH_RETENTION_HOLD));
+      expect(snapshot(path.join(host, "runs")), event).toEqual(runs);
+    }
+  });
+
+  it("reads the epoch approval only from our own regular file, never through a link; writes the report atomically without following one", async () => {
+    const { root } = make();
+    write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
+    write(path.join(root, "state.db"), "");
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-approval-")); roots.push(elsewhere);
+    write(path.join(elsewhere, "ok.json"), JSON.stringify({ epoch: 3 }));
+    fs.symlinkSync(path.join(elsewhere, "ok.json"), path.join(root, MESH_RETENTION_APPROVAL));
+    const before = snapshot(root);
+    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
+    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+    expect(snapshot(root)).toEqual(before);
+    fs.unlinkSync(path.join(root, MESH_RETENTION_APPROVAL));
+    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
+    fs.chmodSync(path.join(root, MESH_RETENTION_APPROVAL), 0o666);
+    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+    // The report: a link at its path is replaced, its target never written.
+    const report = path.join(root, ".mesh-retention-report.json");
+    write(path.join(elsewhere, "target"), "keep");
+    fs.symlinkSync(path.join(elsewhere, "target"), report);
+    writeReport(report, "{}\n");
+    expect(fs.readFileSync(path.join(elsewhere, "target"), "utf8")).toBe("keep");
+    expect(fs.lstatSync(report).isFile()).toBe(true);
+    expect(fs.readFileSync(report, "utf8")).toBe("{}\n");
+    expect(fs.statSync(report).mode & 0o777).toBe(0o600);
   });
 
   it("deletes nothing under an operator hold or after a backend switch until a ruling names the new epoch (smarty-dev#7766)", async () => {

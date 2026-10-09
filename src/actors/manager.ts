@@ -4036,13 +4036,12 @@ export class ActorManager {
     if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
-        [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs)]);
+        // Its JSON report (changes, removed runs, skips) is the record of what each apply did (smarty-dev#7766);
+        // the CLI writes it atomically, never through a link.
+        [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs),
+          "--report", path.join(meshRoot, ".mesh-retention-report.json")]);
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      // Its JSON report (changes, removed runs, skips) is the record of what each apply did (smarty-dev#7766).
-      const report = fs.openSync(path.join(meshRoot, ".mesh-retention-report.json"), "w", 0o600);
-      let child: ReturnType<typeof spawn>;
-      try { child = spawn(runtime!, args, { detached: true, stdio: ["ignore", report, "ignore"], windowsHide: true }); }
-      finally { fs.closeSync(report); }
+      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
       if (child.pid) {
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }

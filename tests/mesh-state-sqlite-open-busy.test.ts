@@ -221,10 +221,11 @@ describe("WAL stays bounded with constant concurrent readers (full-load soak def
       for (const connection of connections) try { connection.exec("COMMIT"); } catch { /* none open */ }
     };
   };
-  const run = async (walResetBytes: number): Promise<{ max: number; stats: ReturnType<SqliteStateStore["stats"]> }> => {
+  const run = async (walResetBytes: number): Promise<{ max: number; elapsedMs: number; stats: ReturnType<SqliteStateStore["stats"]> }> => {
     const root = tempRoot(`readers-${walResetBytes}`);
     const store = await openStore(root, { walResetBytes });
     const stop = overlappingReaders(root);
+    const started = Date.now();
     let max = 0;
     try {
       for (let n = 0; n < 1_400; n += 1) { // ~16 MiB of commits, below the 64 MiB emergency threshold
@@ -234,22 +235,68 @@ describe("WAL stays bounded with constant concurrent readers (full-load soak def
       }
       await sleep(50);
     } finally { stop(); }
-    return { max, stats: store.stats() };
+    return { max, elapsedMs: Date.now() - started, stats: store.stats() };
   };
 
-  it("the client-side TRUNCATE resets the WAL that overlapping readers keep PASSIVE checkpoints from restarting", async () => {
+  // pi-fabric#694 P1-B: the reset makes ONE non-blocking attempt and never waits for readers to drain, so
+  // against readers that ALWAYS overlap it defers (a later commit tries again after the 2 s back-off) and the
+  // WAL stays bounded by the emergency path; with the readers gone a later commit resets it (the P1-B test).
+  it("against always-overlapping readers the reset makes one non-blocking attempt per back-off and defers", async () => {
     const control = await run(0); // the reset off: starvation reproduces
     console.info(`WAL with readers: control max ${control.max}`);
     expect(control.max).toBeGreaterThan(12 * 1024 * 1024);
     const fixed = await run(1024 * 1024);
-    expect(fixed.stats.checkpoints.walResets).toBeGreaterThan(0);
-    expect(fixed.stats.checkpoints.emergency).toBe(0);
-    console.info(`WAL with readers: reset max ${fixed.max}, resets ${fixed.stats.checkpoints.walResets}`);
-    // The 1 MiB threshold plus what this tight loop commits during a reset and, on a loaded host, one
-    // failed reset's 2 s back-off (on a loaded host this tight loop commits several MiB in that
-    // window; 9.6 MB seen at load 30): bounded well below the starved WAL, which keeps growing.
-    expect(fixed.max).toBeLessThan(control.max * 0.6);
+    const { walResets, walResetBusy, emergency } = fixed.stats.checkpoints;
+    console.info(`WAL with readers: reset max ${fixed.max}, resets ${walResets}, busy ${walResetBusy}, ${fixed.elapsedMs} ms`);
+    expect(walResets + walResetBusy).toBeGreaterThan(0);
+    // At most one attempt per back-off window (plus the first): no retry loop.
+    expect(walResets + walResetBusy).toBeLessThanOrEqual(Math.floor(fixed.elapsedMs / 2_000) + 1 + walResets);
+    expect(emergency).toBe(0);
   }, 60_000);
+});
+
+describe("a busy WAL reset defers to a later commit (pi-fabric#694 P1-B)", () => {
+  it("a busy reader makes the reset defer without sleeping, and a commit after the back-off truncates", async () => {
+    const root = tempRoot("reset-defer");
+    const store = await openStore(root, { walResetBytes: 1 });
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+    const commit = async (n: number): Promise<void> => {
+      skew += 300; // past the 250 ms check throttle
+      await store.put({ key: `k${n}`, value: { n, pad }, identity });
+      await turn();
+      await turn();
+    };
+    try {
+      await commit(0);
+      const before = store.stats().checkpoints;
+      const reader = raw(root);
+      reader.exec("BEGIN");
+      reader.prepare("SELECT count(*) AS n FROM kv").get(); // pins the WAL: TRUNCATE is busy
+      await commit(1);
+      // Settled within two event-loop turns: one attempt, no sleep or retry, and no lock or flag left behind.
+      let stats = store.stats().checkpoints;
+      expect(stats.walResetBusy).toBe(before.walResetBusy + 1);
+      expect(stats.walResets).toBe(before.walResets);
+      expect(fs.existsSync(path.join(root, "state-wal-reset.lock"))).toBe(false);
+      expect(checkpointFlagRaised(root)).toBe(false);
+      await commit(2); // inside the 2 s back-off: no attempt
+      stats = store.stats().checkpoints;
+      expect(stats.walResetBusy).toBe(before.walResetBusy + 1);
+      expect(walBytes(root)).toBeGreaterThan(0);
+      reader.exec("COMMIT");
+      skew += 2_000;
+      await commit(3); // after the back-off: this commit drives the reset
+      stats = store.stats().checkpoints;
+      expect(stats.walResets).toBe(before.walResets + 1);
+      expect(stats.walResetBusy).toBe(before.walResetBusy + 1);
+      expect(walBytes(root)).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
 });
 
 describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {

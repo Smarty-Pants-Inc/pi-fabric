@@ -57,10 +57,10 @@
  * Reader starvation (smarty-dev#6477, full-load soak): with many processes reading constantly, some reader
  * always holds a WAL read mark, so PASSIVE autocheckpoints copy frames but the WAL never restarts and grows
  * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (8 MiB), one process at a
- * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: asynchronous attempts with a 2 ms busy handler,
- * outside any transaction, so no client stalls on it. While attempts are busy it raises the checkpoint
- * flag: writers yield, no new frames arrive, and the readers that pin old frames drain within one read.
- * It gives up after 300 ms and then keeps the lock for 2 s, so writers pause at most ~13% of the time.
+ * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: ONE non-blocking attempt (busy_timeout 0) after
+ * the writer's continuation, outside any transaction, so no client stalls on it. A busy attempt is not
+ * retried (pi-fabric#694 P1-B, R-no-polling): the next commit that finds the WAL above the threshold
+ * tries again, no sooner than 2 s later. Commits drive the reset; nothing sleeps or polls.
  *
  * Rules (design §3B, review-opus P0-1/P3-8): never open `state*.db*` with plain `fs` calls in the
  * same process (closing any descriptor drops that process's POSIX locks; only `stat` is used here);
@@ -450,13 +450,11 @@ const ENVELOPE_BYTES = 256;
 const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 const CHECKPOINT_FLAG_STALE_MS = 1_000;
 const MAX_TRUNCATE_BUDGET_MS = 400;
-// The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, short attempts.
+// The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, one attempt.
 const WAL_RESET_LOCK = "state-wal-reset.lock";
-// A reset that ran out of budget keeps the lock: no process tries again (and pauses writers) for this long.
 const WAL_RESET_LOCK_STALE_MS = 2_000;
-const WAL_RESET_BUDGET_MS = 300;
-const WAL_RESET_BUSY_MS = 2;
-const WAL_RESET_RETRY_MS = 5;
+// A busy reset: this process's next attempt waits for a commit at least this much later.
+const WAL_RESET_BACKOFF_MS = 2_000;
 const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
@@ -681,6 +679,7 @@ export class SqliteStateStore {
   #lastWalBytes = 0;
   readonly #walResetBytes: number;
   #walResetting = false;
+  #walResetBusyAt = Number.NEGATIVE_INFINITY;
   #lastWalResetCheck = 0;
 
   private constructor(readonly root: string, readonly maxEventBytes: number, readonly maxReadEvents: number,
@@ -1487,53 +1486,39 @@ export class SqliteStateStore {
   #maybeResetWal(): void {
     if (this.#walResetBytes <= 0 || this.#walResetting) return;
     const now = Date.now();
-    if (now - this.#lastWalResetCheck < 250) return;
+    if (now - this.#lastWalResetCheck < 250 || now - this.#walResetBusyAt < WAL_RESET_BACKOFF_MS) return;
     this.#lastWalResetCheck = now;
     try { if (this.walBytes() <= this.#walResetBytes) return; } catch { return; }
     const lock = path.join(this.root, WAL_RESET_LOCK);
     const token = ownerToken();
     if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS, token)) return;
     this.#walResetting = true;
-    void this.#resetWal()
+    void new Promise<void>((resolve) => setImmediate(resolve)) // after the writer's own continuation
+      .then(() => this.#resetWal())
       .catch(() => { this.#stats.checkpoints.failed += 1; return false; })
       .then((reset) => {
         this.#walResetting = false;
-        // A failed reset leaves a fresh lock as a fleet-wide back-off, so readers that outlast the budget
-        // (a saturated host) never keep writers yielding back to back.
-        // Only while this process still owns it: a lock reclaimed by another process is never touched.
-        if (reset) removeOwnedFile(lock, token);
-        else if (ownsFile(lock, token)) try { const now = new Date(); fs.utimesSync(lock, now, now); } catch { /* reclaimed */ }
+        if (!reset) this.#walResetBusyAt = Date.now(); // deferred to a later commit, see WAL_RESET_BACKOFF_MS
+        removeOwnedFile(lock, token); // only while this process still owns it
       });
   }
 
-  // Short TRUNCATE attempts between event-loop turns, for at most WAL_RESET_BUDGET_MS. A busy attempt
-  // raises the checkpoint flag (writers yield), so no new frames arrive and the old readers drain.
-  async #resetWal(): Promise<boolean> {
-    const deadline = performance.now() + WAL_RESET_BUDGET_MS;
-    const flagToken = ownerToken();
-    let flag: string | undefined;
+  // ONE non-blocking TRUNCATE (pi-fabric#694 P1-B): busy defers to a later commit; nothing retries here.
+  #resetWal(): boolean {
     try {
-      await new Promise<void>((resolve) => setImmediate(resolve)); // after the writer's own continuation
-      for (;;) {
-        if (this.#closed) return true;
-        if (!this.#inTransaction && !this.#db.isTransaction && this.#tryTruncate()) {
-          this.#stats.checkpoints.walResets += 1;
-          this.#lastWalBytes = 0;
-          return true;
-        }
-        if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return false; }
-        flag = raiseCheckpointFlag(this.root, flagToken); // refreshes this request's own flag
-        await delay(WAL_RESET_RETRY_MS);
-      }
+      if (this.#closed) return true;
+      if (this.#inTransaction || this.#db.isTransaction || !this.#tryTruncate()) { this.#stats.checkpoints.walResetBusy += 1; return false; }
+      this.#stats.checkpoints.walResets += 1;
+      this.#lastWalBytes = 0;
+      return true;
     } finally {
-      if (flag) lowerCheckpointFlag(flag);
       if (!this.#closed) this.walBytes();
     }
   }
 
-  // One TRUNCATE with a 2 ms busy handler: true when the WAL was reset.
+  // One TRUNCATE with no busy handler (busy_timeout 0): true when the WAL was reset.
   #tryTruncate(): boolean {
-    this.#db.exec(`PRAGMA busy_timeout = ${WAL_RESET_BUSY_MS}`);
+    this.#db.exec("PRAGMA busy_timeout = 0");
     try {
       const result = this.#sql.checkpointTruncate.get() ?? {};
       return Number(result.busy ?? 1) === 0;

@@ -30,10 +30,17 @@ Read in order:
   `$TMPDIR`, no real Fabric values or credentials are accessed. Every server is
   stopped and waited for in `finally`; ephemeral store/key dirs are removed.
 - `check.py`: deterministic generation, ACL, limit and strict child-spec checks.
+- `test_smoke.py`: stdlib regressions for total RPC/PONG deadlines despite PING
+  traffic, explicit no-responder failure, and cancellation escaping retry loops.
+  Live smoke also rejects foreign host ACLs at the core independently of local
+  leaf ACLs, transport-signed application certs on route listeners, and declared
+  payloads above 256 KiB. Read-only failover probes use fresh bounded connections;
+  state/event writes and the metadata mutation are never implicitly retried.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 docs/nats/render.py --out docs/nats/configs
 PYTHONDONTWRITEBYTECODE=1 python3 docs/nats/check.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s docs/nats -p test_smoke.py
 # Pass the official SHA256SUMS-verified binary, not a global unpinned installation:
 PYTHONDONTWRITEBYTECODE=1 python3 docs/nats/smoke.py \
   --server "$TMPDIR/nats-release/nats-server-v2.14.7-linux-amd64/nats-server" \

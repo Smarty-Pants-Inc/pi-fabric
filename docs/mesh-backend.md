@@ -52,8 +52,16 @@ Order of a switch (crash reruns included):
    written, refuse.
 3. Run the fenced switch. Under the fence, inside the transaction right before EACH flag commit
    (`backend=importing`, then `backend=sqlite`; a rerun from `importing` included), the whole
-   inventory (census, built-ins, flags) is recomputed and checked again. There `state.db-wal`/`-shm`
-   evidence is ignored: the tool holds `state.db` open itself. A refusal rolls that transaction back. A refusal at the `sqlite` commit leaves the
+   inventory (census, built-ins, flags) is recomputed and checked again. There the tool holds
+   `state.db` open itself, so its `state.db-wal`/`-shm` are unattributed evidence like any other
+   holder's: the switch's commits need `--accept-unready fabric@unknown` (the intent records the
+   requested overrides as `acceptUnready`, the outcome the readers actually accepted). Precise identification of the holder is tracked in smarty-dev#7936.
+   Before passing `--accept-unready fabric@unknown`, the operator lists every `state.db*` holder and
+   keeps that list with the switch record. The CLI has no free-text intent field yet, so save it next
+   to the intent and cite it on the switch's issue:
+   `{ date -u +%FT%TZ; fuser -v <mesh>/state.db* 2>&1 || lsof <mesh>/state.db*; } >> <mesh>/backend-switches.holders.txt`.
+   With every writer stopped the list is empty; any holder means stop it before the switch.
+   A refusal rolls that transaction back. A refusal at the `sqlite` commit leaves the
    root at `importing` with the moved marker; readers keep reading SQLite through the reader rule,
    and a rerun completes the switch once the readers are ready (or `rollback`).
 4. Append the **outcome** with the same `switchId` (best effort), with `checkedUnderFence`.

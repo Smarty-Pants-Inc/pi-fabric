@@ -426,7 +426,8 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
-    const code = await main(["cutover", "--root", other], {
+    // The tool's own state.db connection is unattributed evidence under the fence (smarty-dev#7936).
+    const code = await main(["cutover", "--root", other, "--accept-unready", "fabric@unknown"], {
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);

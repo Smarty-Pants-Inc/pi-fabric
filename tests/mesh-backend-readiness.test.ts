@@ -56,12 +56,13 @@ const placeProof = (root: string, proof: Record<string, unknown>): void => {
 };
 
 type Writer = { pid: number; release: string; mode: string };
-interface Harness { builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[]; options: Partial<MeshBackendOptions> }
+interface Harness { builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[] | (() => Writer[]); options: Partial<MeshBackendOptions> }
 const run = async (argv: string[], harness: Partial<Harness> = {}): Promise<{ code: number; out: string; err: string }> => {
   let out = "";
   let err = "";
   const writers = (): Writer[] => typeof harness.writers === "function" ? harness.writers() : harness.writers ?? [];
-  const code = await main(argv, { census: async () => ({ writers: writers() }), gateCensus: () => ({ writers: writers(), unknown: harness.unknown ?? [] }),
+  const code = await main(argv, { census: async () => ({ writers: writers() }), gateCensus: () => ({ writers: writers(),
+    unknown: typeof harness.unknown === "function" ? harness.unknown() : harness.unknown ?? [] }),
     builtinReaders: harness.builtins ?? [],
     options: harness.options ?? {}, stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
   return { code, out, err };
@@ -269,6 +270,26 @@ describe("fabric-mesh-backend readiness gate", () => {
     expect(result.code).toBe(3);
     expect(result.err).toContain("(under the fence, before the importing commit): fabric@fabric-rel-new (no proof from installed reader fabric release fabric-rel-new");
     expect(await backendOf(root)).toBe("file");
+  });
+
+  it("requires a state.db holder that appears under the fence as fabric@unknown: refused without the flag, passes with it", async () => {
+    const root = await fileRoot();
+    for (const accept of [[], ["--accept-unready", "fabric@unknown"]]) {
+      let unknown: Writer[] = [];
+      const result = await run(["cutover", "--root", root, ...accept], { unknown: () => unknown,
+        options: { beforeCommit: () => { unknown = [{ pid: 0, release: "unknown", mode: `unknown state-database ${root}/state.db-wal` }]; } } });
+      if (accept.length === 0) {
+        expect(result.code).toBe(3);
+        expect(result.err).toContain(`(under the fence, before the importing commit): fabric@unknown (live writer evidence without an attributable release: pid 0 unknown state-database ${root}/state.db-wal)`);
+        expect(await backendOf(root)).toBe("file");
+      } else {
+        expect(result.code, result.err).toBe(0);
+        expect(await backendOf(root)).toBe("sqlite");
+        const outcome = records(root).at(-1)!;
+        expect(outcome).toMatchObject({ phase: "outcome", ok: true, acceptedUnready: [{ name: "fabric@unknown" }] });
+        expect(records(root).filter(record => record.phase === "intent").at(-1)).toMatchObject({ acceptUnready: ["fabric@unknown"], acceptedUnready: [] });
+      }
+    }
   });
 
   it("reserves built-in reader names: --require-reader only adds readers", async () => {

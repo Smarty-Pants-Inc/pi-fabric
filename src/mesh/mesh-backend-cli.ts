@@ -195,23 +195,22 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   if (backend !== "file" && backend !== "none" && backend !== "importing") return undefined;
   // The whole inventory, recomputed for every check (pre-fence and under the fence before each commit).
   // Evidence the census cannot attribute, and a failed census, are required as fabric@unknown.
-  const inventory = (underFence = false): RequiredReader[] => {
+  const inventory = (): RequiredReader[] => {
     let writers: MeshCensusWriter[];
     let unattributed: MeshCensusWriter[] = [];
     try {
       const report = gateCensus();
       writers = (report.writers ?? []).filter(writer => writer.pid !== process.pid);
-      // ponytail: under the fence this tool holds state.db open itself, so -wal/-shm evidence there
-      // ("state-database", pid 0) is its own connection; before the fence it counts.
-      unattributed = (report.unknown ?? []).filter(writer => writer.pid !== process.pid
-        && !(underFence && writer.mode.startsWith("unknown state-database ")));
+      // Under the fence this tool holds state.db open itself, so its -wal/-shm count as unattributed
+      // evidence too: the commits then need --accept-unready fabric@unknown (holder identification: smarty-dev#7936).
+      unattributed = (report.unknown ?? []).filter(writer => writer.pid !== process.pid);
     } catch (error) {
       writers = [];
       unattributed = [{ pid: 0, release: "unknown", mode: `census failed: ${(error as Error).message}` }];
     }
     return requiredReaders(writers, unattributed, builtins, options.requireReaders);
   };
-  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory(true)): ReaderReadiness => {
+  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory()): ReaderReadiness => {
     let readiness: ReaderReadiness;
     try { readiness = readerReadiness(options.root, "sqlite", required, window); }
     catch (error) { throw new MeshBackendRefusedError(`${(error as Error).message}${when}`); }
@@ -232,7 +231,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [] };
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
-      required, requireReader: options.requireReaders, readersReady: readiness.ready, acceptedUnready: readiness.unready });
+      required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
   }

@@ -11,6 +11,7 @@ import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
+import { CUSTODY_POLL_MS } from "../../process-cgroup.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
@@ -61,7 +62,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
-    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice ?? "app.slice (default)"}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {
@@ -112,8 +113,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
     }
-    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
-    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+    const executable = process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    if (process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -148,7 +149,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         workerArguments,
       ),
-      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+      executable ? { executable, slice: this.processSlice ?? "app.slice", warn: this.#warnScope } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );
@@ -161,6 +162,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
+      ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
+      ...(process.platform === "linux" ? { livenessPollIntervalMs: CUSTODY_POLL_MS } : {}),
       stop: processHandle.stop,
     };
   }

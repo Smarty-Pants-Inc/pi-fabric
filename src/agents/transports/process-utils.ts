@@ -5,6 +5,8 @@ import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
+import { randomUUID } from "node:crypto";
+import { cgroupCustody, processScopePath, scopePath, CUSTODY_POLL_MS, type CgroupCustody } from "../../process-cgroup.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -286,7 +288,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void> | undefined; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -296,9 +298,10 @@ export const spawnDetached = async (
   // Scope admission execs in place: the captured PID and custody IPC stay owned.
   const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
+  const scopeUnit = scope ? `fabric-worker-${randomUUID()}.scope` : undefined;
   const child = spawn(scope?.executable ?? runtime, scope ? [
-    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
-    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", `--unit=${scopeUnit}`, "--expand-environment=no", "--",
+    "/bin/sh", "-c", '/bin/cat /proc/self/cgroup > "$1.tmp" && /bin/mv "$1.tmp" "$1" || exit 125; shift; exec "$@"',
     "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
@@ -329,6 +332,25 @@ export const spawnDetached = async (
     lost = reason;
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
+  let primaryScope: CgroupCustody | undefined;
+  let executionBoundaryConfirmed = false;
+  const scopes = new Map<string, CgroupCustody>();
+  let resolveTreeClosed!: () => void;
+  const treeClosed = new Promise<void>(resolve => { resolveTreeClosed = resolve; });
+  const scopesAlive = (): boolean => [...scopes.values()].some(scope => !scope.exited()) ||
+    (executionPending && !executionBoundaryConfirmed);
+  const checkTreeClosed = (): void => {
+    try { if (primaryScope && !scopesAlive()) resolveTreeClosed(); }
+    catch { /* failed identity remains an obligation, not an empty notification */ }
+  };
+  const retainScope = (directory: string): CgroupCustody => {
+    let receipt = scopes.get(directory);
+    if (!receipt) {
+      receipt = cgroupCustody(directory); scopes.set(directory, receipt);
+      void receipt.closed.then(checkTreeClosed);
+    }
+    return receipt;
+  };
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
   // native unref above is still valid; optional channel APIs are not custody.
@@ -339,7 +361,8 @@ export const spawnDetached = async (
     if (message.type === "fabric-execution-custody") {
       // The real worker cannot spawn execution until we acknowledge custody.
       executionPending = true;
-      if (child.connected) child.send({ type: "fabric-execution-custody-ack" }, () => undefined);
+      executionBoundaryConfirmed = false;
+      if (child.connected) child.send({ type: "fabric-execution-custody-ack", cgroupCustody: primaryScope !== undefined }, () => undefined);
     } else if (message.type === "fabric-execution-started" && "pid" in message &&
       Number.isSafeInteger(message.pid) && Number(message.pid) > 0 && "started" in message && typeof message.started === "string") {
       // This private native channel belongs to our worker. Retain its reported
@@ -348,8 +371,25 @@ export const spawnDetached = async (
       if (process.platform === "linux") {
         owned.set(Number(message.pid), message.started);
         groups.add(Number(message.pid));
+        // Private native IPC transfers this scope even if its leader already died.
+        if ("cgroup" in message && typeof message.cgroup === "string" &&
+          /^\/sys\/fs\/cgroup\/.+\/fabric-execution-[0-9a-f-]+\.scope$/.test(message.cgroup)) {
+          try { retainScope(message.cgroup); executionBoundaryConfirmed = true; }
+          catch (error) { unconfirmed(`Execution scope custody unconfirmed: ${String(error)}`); }
+        } else if (scopeUnit) {
+          // Compatible older workers inherit our scope instead of reporting a
+          // sibling scope. A matching live birth proves that boundary too.
+          try {
+            const current = linuxGroupMember(Number(message.pid));
+            const directory = current?.started === message.started ? processScopePath(Number(message.pid), scopeUnit) : undefined;
+            if (directory) { retainScope(directory); executionBoundaryConfirmed = true; }
+          } catch { /* retain unknown execution debt */ }
+        }
+        if (executionBoundaryConfirmed && child.connected) {
+          child.send({ type: "fabric-execution-started-ack", pid: message.pid, started: message.started }, () => undefined);
+        }
       }
-    } else if (message.type === "fabric-execution-settled") executionPending = false;
+    } else if (message.type === "fabric-execution-settled") { executionPending = false; checkTreeClosed(); }
   });
   let birth: LinuxGroupMember | undefined;
   let birthUnknown = false;
@@ -392,6 +432,9 @@ export const spawnDetached = async (
   let stopped = false;
   let stopFailed = false;
   const members = (): LinuxGroupMember[] => {
+    if (primaryScope) return [...scopes.values()].flatMap(scope => scope.members().flatMap(pid => {
+      const value = linuxGroupMember(pid); return value && !["Z", "X"].includes(value.state) ? [value] : [];
+    }));
     const snapshot = linuxProcesses().filter((member) => !exited || member.pid !== pid);
     // Retain detached execution groups BEFORE their custodian can die/reparent
     // them. An edge is admitted only while its parent's birth still matches.
@@ -433,6 +476,38 @@ export const spawnDetached = async (
   };
   const stop = async (): Promise<void> => {
     if (stopped) return;
+    if (primaryScope) {
+      const settled = (): boolean => !scopesAlive() && exited;
+      const wait = async (ms: number): Promise<boolean> => {
+        const deadline = Date.now() + ms;
+        do {
+          if (settled()) return true;
+          const remaining = Math.min(CUSTODY_POLL_MS, deadline - Date.now());
+          if (remaining <= 0) break;
+          const active = [...scopes.values()].find(scope => !scope.exited());
+          if (active) await active.waitForExit(remaining);
+          else if (!exited) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try { await Promise.race([closed, new Promise<void>(resolve => { timer = setTimeout(resolve, remaining); })]); }
+            finally { clearTimeout(timer); }
+          } else await new Promise(resolve => setTimeout(resolve, remaining));
+        } while (Date.now() < deadline);
+        return settled();
+      };
+      // The live custodian must persist stop intent before draining execution.
+      if (!exited) primaryScope.signal("SIGTERM");
+      else for (const scope of scopes.values()) scope.signal("SIGTERM");
+      if (await wait(termGraceMs)) return;
+      // Kernel membership includes setsid and unsampled double-fork children.
+      for (const scope of scopes.values()) if (scope !== primaryScope) scope.signal("SIGKILL");
+      primaryScope.signal("SIGKILL");
+      if (!(await wait(STOP_KILL_MS))) {
+        const reason = `Fabric worker ${pid} did not confirm scope/native exit after bounded SIGTERM/SIGKILL cleanup`;
+        if (tracksExecution) { unconfirmed(reason); return; }
+        throw new Error(reason);
+      }
+      return;
+    }
     // Capture group identities BEFORE TERM, while the owned leader still pins it.
     // A leader can exit before its refusing child. Retain that child's birth, not
     // just a group number, and never adopt a recycled group with no owned member.
@@ -492,6 +567,7 @@ export const spawnDetached = async (
   const handle = {
     pid,
     closed,
+    get treeClosed(): Promise<void> | undefined { return primaryScope ? treeClosed : undefined; },
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
@@ -510,9 +586,9 @@ export const spawnDetached = async (
       stopFailed = false;
       const pending = (async () => {
         // Retain the PR's observed detached descendants before TERM can reparent them.
-        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
+        if (!primaryScope && ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         if (process.platform !== "win32") {
-          if (process.platform === "linux" && !birth) {
+          if (process.platform === "linux" && !primaryScope && !birth) {
             // A captured native handle can lag /proc absence. Bound its close
             // without adopting a new birth or an unowned surviving group. In
             // particular, an unreadable birth is NOT this absent-worker case.
@@ -560,7 +636,7 @@ export const spawnDetached = async (
           ]);
           // Sampling cleanup supplements, but never replaces, the confirmed-exit
           // custody and birth-checked group drain above. Native-close debt stays latched.
-          if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
+          if (!primaryScope && ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
         } finally { clearTimeout(force); clearTimeout(deadline); }
       })();
@@ -570,6 +646,7 @@ export const spawnDetached = async (
       return pending;
     },
     async isAlive() {
+      if (primaryScope) return scopesAlive();
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
       if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
@@ -595,12 +672,36 @@ export const spawnDetached = async (
       while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
         await new Promise<void>(resolve => setTimeout(resolve, 10));
       }
-      if (fs.existsSync(marker)) return handle;
+      if (fs.existsSync(marker)) {
+        try {
+          const directory = processScopePath(pid, scopeUnit) ?? scopePath(fs.readFileSync(marker, "utf8"), scopeUnit);
+          if (directory) {
+            // A live pid plus a missing mount path is UNKNOWN, not an empty group.
+            try { fs.statSync(directory); }
+            catch (error) { if (linuxGroupMember(pid)) throw error; }
+            primaryScope = retainScope(directory);
+            checkTreeClosed();
+          }
+        } catch (error) { scope.warn(`cgroup custody unavailable: ${String(error)}`); }
+        return handle;
+      }
       if (!nativeClosed) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
-      if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
+      if (fs.existsSync(marker)) {
+        try {
+          const directory = processScopePath(pid, scopeUnit) ?? scopePath(fs.readFileSync(marker, "utf8"), scopeUnit);
+          if (directory) {
+            // A live pid plus a missing mount path is UNKNOWN, not an empty group.
+            try { fs.statSync(directory); }
+            catch (error) { if (linuxGroupMember(pid)) throw error; }
+            primaryScope = retainScope(directory);
+            checkTreeClosed();
+          }
+        } catch (error) { scope.warn(`cgroup custody unavailable: ${String(error)}`); }
+        return handle;
+      } // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }

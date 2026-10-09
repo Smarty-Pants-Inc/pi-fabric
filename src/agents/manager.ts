@@ -3317,11 +3317,14 @@ export class AgentManager {
       if (managed.transport !== watchedTransport) {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
-        void transport.closed?.then(() => {
+        const notify = (): void => {
           if (managed.transport !== transport || managed.settled) return;
           nativeClosePending = true;
+          if (transport.treeClosed) managed.lastLivenessCheckAt = 0;
           wake?.();
-        }, () => { /* notification is not exit proof */ });
+        };
+        void transport.closed?.then(notify, () => { /* notification is not exit proof */ });
+        void transport.treeClosed?.then(notify, () => { /* notification is not exit proof */ });
       }
       this.#drainLifecycle(managed);
       const record = readRecord(managed.statusFile);
@@ -3457,7 +3460,9 @@ export class AgentManager {
       }
       if (nativeClosePending) { nativeClosePending = false; continue; }
       await new Promise<void>(resolve => {
-        const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
+        const timer = setTimeout(() => { wake = undefined; resolve(); }, process.platform === "linux" && managed.transport.treeClosed
+          ? managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS
+          : AGENT_STATUS_POLL_INTERVAL_MS);
         wake = () => { clearTimeout(timer); wake = undefined; nativeClosePending = false; resolve(); };
       });
     }

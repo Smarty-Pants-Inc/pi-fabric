@@ -278,9 +278,9 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     expect(debt).toHaveBeenCalledOnce(); expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
   }, 20_000);
 
-  it("is off by default", async () => {
+  it("uses a scope in app.slice by default on Linux", async () => {
     const f = fixture(); const handle = await new ProcessTransport().launch(f.request);
-    try { expect(await workerStarted(f.root)).toBe(Number(handle.sessionId)); expect(fs.existsSync(path.join(f.root, "scope-args"))).toBe(false); }
+    try { expect(await workerStarted(f.root)).toBe(Number(handle.sessionId)); expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8")).toContain("--slice=app.slice\n"); }
     finally { await handle.stop(); await handle.waitForClose?.(); }
   });
   it("execs the scoped worker in place, retaining PID, PGID, native close and exit fence", async () => {
@@ -291,7 +291,7 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       expect(await workerStarted(f.root)).toBe(pid);
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8").slice(fs.readFileSync(`/proc/${pid}/stat`, "utf8").lastIndexOf(")") + 2).split(" ");
       expect(Number(stat[2])).toBe(pid); // field 5 is PGID
-      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 6)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", "--"]);
+      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 8)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", expect.stringMatching(/^--unit=fabric-worker-.*[.]scope$/), "--expand-environment=no", "--"]);
       expect(await handle.isAlive()).toBe(true); expect(warn).not.toHaveBeenCalled();
     } finally { await handle.stop(); await handle.waitForClose?.(); }
     expect(await handle.isAlive()).toBe(false); expect(handle.lostContact?.()).toBeUndefined();

@@ -221,7 +221,7 @@ describe("spawnDetached", () => {
     await spawnDetached("worker.mjs", [], process.cwd(), undefined, undefined, undefined, 7_000, true);
     expect(child.unref).toHaveBeenCalledOnce();
     child.emit("message", { type: "fabric-execution-custody" });
-    expect(child.send).toHaveBeenCalledWith({ type: "fabric-execution-custody-ack" }, expect.any(Function));
+    expect(child.send).toHaveBeenCalledWith({ type: "fabric-execution-custody-ack", cgroupCustody: false }, expect.any(Function));
     child.emit("message", { type: "fabric-execution-settled" });
     child.emit("exit", 0);
   });

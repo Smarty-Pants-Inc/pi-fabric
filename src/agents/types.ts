@@ -422,6 +422,8 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
+  /** Passive cgroup-empty notification; monitoring rechecks custody/native close. */
+  treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type { ChildProcess } from "node:child_process";
+import { executionCgroups } from "../process-cgroup.js";
 
 type Member = { pid: number; group: number; started: string; state: string };
 const member = (pid: number): Member | undefined => {
@@ -21,6 +22,7 @@ export const executionGroup = (child: ChildProcess) => {
   // Windows keeps its legacy native-child behavior outside this receipt API.
   if (process.platform === "win32") throw new Error("Windows execution-tree custody is unsupported");
   const pid = child.pid;
+  const cgroup = executionCgroups.get(child);
   const owned = new Map<number, string>();
   let empty = false;
   let closed = false;
@@ -49,8 +51,11 @@ export const executionGroup = (child: ChildProcess) => {
     return current;
   };
   return {
-    observe(): void { if (process.platform === "linux") members(); },
+    cgroup,
+    closed: cgroup?.closed,
+    observe(): void { if (process.platform === "linux" && !cgroup) members(); },
     exited(): boolean {
+      if (cgroup) return cgroup.exited();
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;
       // Portable POSIX: pipes closing is not proof the detached group emptied.
@@ -60,6 +65,7 @@ export const executionGroup = (child: ChildProcess) => {
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") { empty = true; return true; } throw error; }
     },
     signal(signal: NodeJS.Signals): void {
+      if (cgroup) { cgroup.signal(signal); return; }
       if (!pid) return;
       if (process.platform === "linux") {
         if (!members().length) return;

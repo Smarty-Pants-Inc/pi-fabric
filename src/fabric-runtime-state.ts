@@ -747,6 +747,7 @@ export class FabricRuntimeState {
     }
     this.#rootInbox?.start();
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: this.#participants.ownerIncarnation,
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,

@@ -72,6 +72,10 @@ retain main's existing behavior; no new bounded-close or whole-attempt containme
 guarantee is claimed. Those features require a separate fabric-v2 follow-up with
 checked whole-attempt exit and completed-drain proofs before recovery admission.
 
+### Owner incarnation fencing
+
+A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls are refused before actor admission with `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and conservative legacy compatibility.
+
 ### Lease-fenced consumption and accepted-work custody
 
 A file-only heartbeat is liveness, not permission to consume mesh work. Control,

@@ -525,6 +525,7 @@ export class AgentMessageRouter {
         kind,
         {
           principal: options.principal,
+          ownerIncarnation: participant.ownerIncarnation,
           message,
           data,
           // Carry the local Main default across runtime generations (#3015).
@@ -581,7 +582,7 @@ export class AgentMessageRouter {
         remoteAgent.ownerHostId,
         remoteAgent.id,
         kind,
-        { message, data, principal: options.principal },
+        { message, data, principal: options.principal, ownerIncarnation: remoteAgent.ownerIncarnation },
         remoteAgent.ownerIdentityId,
         { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
@@ -641,6 +642,7 @@ export class AgentMessageRouter {
       kind,
       {
         principal: options.principal,
+        ownerIncarnation: participant.ownerIncarnation,
         message,
         data,
         ...(typeof options.triggerTurn === "boolean"

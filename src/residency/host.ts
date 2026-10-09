@@ -333,6 +333,7 @@ export class ResidentHost {
         this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
+      ownerIncarnation: this.participants.ownerIncarnation,
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
@@ -935,7 +936,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn },
+      { message, data: event, triggerTurn: subscription.triggerTurn, ownerIncarnation: target.ownerIncarnation },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );

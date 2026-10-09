@@ -699,6 +699,14 @@ Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followU
 
 A root session stays reachable for 5 minutes after its lease lapses, because a late heartbeat under mesh lock contention does not mean the session ended. Fabric sends the command to that root's last owner host, which acknowledges it when the session is alive. After 5 minutes, or when the target has no record on this mesh root, the `Unknown Fabric participant` error states the reason.
 
+### Owner incarnation fencing
+
+Every owner activation publishes a fresh `ownerIncarnation` on its participant records, including same-process Main reloads and resident relaunches. Directory-routed `steer`, `followUp`, `stop`, and `ask` capture that value before command publication. An unclaimed command for an earlier activation is refused before delivery with `FabricControlStaleIncarnationError` (`code: FABRIC_CONTROL_STALE_INCARNATION`). Fabric does **not** automatically retry this refusal: re-read the participant and decide whether a new command is still wanted.
+
+ACKs carry the claiming activation's incarnation. A sender ignores other-incarnation successes and ordinary errors; an authenticated fencing refusal must name the exact rejected incarnation. Already-claimed work remains deduplicated: replay reports its original outcome/incarnation or an indeterminate outcome, never a second delivery. Reuse an idempotency key only with unchanged input, including the original incarnation; a new target activation requires an explicit new decision, not reinterpreting an old key.
+
+Legacy commands without the field are admitted only on native delivery when **both** the trusted envelope's `createdAt` and the command's `requestedAt` are strictly later than the current activation's start. Equality is ambiguous and refused. Unbound bridged commands are refused: bridge delivery replaces the envelope timestamp, so it cannot prove that the origin command postdates the owner's restart. Older participant records remain readable, but cannot provide a bound remote control address. Fencing assumes a single active owner per host ID, and the native legacy age check assumes a non-regressing local wall clock.
+
 ### Peer labels and queue gates
 
 Every root participant mints a project-scoped label such as `FAB-1` when it first publishes: the prefix derives from the project directory basename (initials for multi-word names, up to three letters for single-word names) and the number comes from a mesh-wide monotonic counter, so retired labels are never reused. Labels appear on participant records, peer projections, and the dashboard, giving other sessions' tooling a stable handle to show users in place of raw session ids.

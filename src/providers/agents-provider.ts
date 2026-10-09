@@ -1259,6 +1259,7 @@ export class AgentsProvider implements FabricProvider {
           "ask",
           {
             principal: invocationFabricPrincipal(context),
+            ownerIncarnation: participant.ownerIncarnation,
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
@@ -1986,7 +1987,7 @@ export class AgentsProvider implements FabricProvider {
       participant.ownerHostId,
       participant.id,
       "stop",
-      {},
+      { ownerIncarnation: participant.ownerIncarnation },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
     );

@@ -1307,7 +1307,7 @@ describe("Main remote ASK observation ownership", () => {
       const connected = bridge;
       pump = (async () => { while (pumping) { await connected.step(); await new Promise(resolve => setTimeout(resolve, 20)); } })();
     }
-    const member: FabricParticipantInfo = { format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: owner.identity.id, ownerHostId: ownerId, ownerIdentityId: owner.identity.id, status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "stop", "actor-bindings"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false, ...(route === "mesh" ? { remoteHost: "remote-machine" } : {}) };
+    const member: FabricParticipantInfo = { format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: owner.identity.id, ownerHostId: ownerId, ownerIdentityId: owner.identity.id, ownerIncarnation: ownerControl.incarnation, status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "stop", "actor-bindings"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false, ...(route === "mesh" ? { remoteHost: "remote-machine" } : {}) };
     const sender = setup([], [member], senderControl);
     const stop = vi.spyOn(owner.agents, "stop");
     const run = vi.spyOn(owner.agents, "run");
@@ -1364,7 +1364,7 @@ describe("Main remote ASK observation ownership", () => {
         // A bridged deadline cannot be shortened below 30 s. Bound this deliberately
         // unsupported actor ACK with explicit observation cancellation, not a short deadline.
         const stopController = new AbortController();
-        const stopping = senderControl.request(ownerId, actor.id, "stop", {}, ownerId,
+        const stopping = senderControl.request(ownerId, actor.id, "stop", { ownerIncarnation: ownerControl.incarnation }, ownerId,
           { timeoutMs: 500, routedRemoteHost: "remote-machine", signal: stopController.signal }).catch(error => {
             expect(error.message).toContain("cancelled");
           });

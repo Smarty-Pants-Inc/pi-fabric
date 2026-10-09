@@ -196,7 +196,7 @@ describe("FabricControlPlane", () => {
     let now = Date.now();
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     const receive = vi.fn(() => ({ accepted: true }));
-    const outcome = sender.request("host:receiver", "agent:target", "stop").catch((error: Error) => error);
+    const outcome = sender.request("host:receiver", "agent:target", "stop", { ownerIncarnation: receiver.incarnation }).catch((error: Error) => error);
     try {
       sender.start(() => ({ accepted: false }));
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1));
@@ -512,6 +512,7 @@ describe("FabricControlPlane", () => {
       const owner = plane(meshRoot, "host:owner");
       sender.start(() => ({ accepted: false }));
       owner.start(() => ({ accepted: true }));
+      await new Promise(resolve => setTimeout(resolve, 5)); // prove fresh legacy-native admission
       await expect(sender.request("host:owner", "agent:target", "steer"))
         .resolves.toMatchObject({ acknowledged: true });
       expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })[0]!.data)
@@ -980,7 +981,7 @@ describe("FabricControlPlane", () => {
         }
         return original.call(this, input);
       });
-      const result = await sender.request("host:receiver", "agent:target", "steer", { message: "late" });
+      const result = await sender.request("host:receiver", "agent:target", "steer", { message: "late", ownerIncarnation: receiver.incarnation });
       const event = new MeshStore(meshRoot, 64 * 1024, 1_000).read({ topic: "fabric.control.command", limit: 10 })
         .find((candidate) => candidate.kind === "steer")!;
       return { result, receive, event };
@@ -1028,7 +1029,7 @@ describe("FabricControlPlane", () => {
       sender.start(() => ({ accepted: false }));
       receiver.start(receive);
       await new Promise((resolve) => setTimeout(resolve, 100));
-      return { meshRoot, receive, request: () => sender.request("host:receiver", "agent:target", "steer", { message: "once" }) };
+      return { meshRoot, receive, request: () => sender.request("host:receiver", "agent:target", "steer", { message: "once", ownerIncarnation: receiver.incarnation }) };
     };
     const shared = (store: MeshStore) => !store.root.includes(`${path.sep}control-seen${path.sep}`);
     const isClaim = (input: { key?: string }) => input.key?.startsWith("topology/control-seen/") === true;
@@ -1102,9 +1103,9 @@ describe("FabricControlPlane", () => {
       "topology/control-seen/" + createHash("sha256").update(`${hostId}\0${commandId}`).digest("hex");
     const ownStore = (meshRoot: string, hostId: string) =>
       new MeshStore(path.join(meshRoot, "control-seen", createHash("sha256").update(hostId).digest("hex").slice(0, 32)), 64 * 1024, 1_000);
-    const command = (commandId: string, to: string) => ({
+    const command = (commandId: string, to: string, ownerIncarnation?: string) => ({
       topic: "fabric.control.command", kind: "steer", from: identity("host:sender"), to,
-      data: { version: 1, commandId, targetId: "agent:target", operation: "steer", replyTo: "host:sender", message: "m", requestedAt: Date.now() },
+      data: { version: 1, commandId, targetId: "agent:target", operation: "steer", replyTo: "host:sender", message: "m", requestedAt: Date.now(), ...(ownerIncarnation ? { ownerIncarnation } : {}) },
     });
     const ackFor = (store: MeshStore, commandId: string) =>
       store.read({ topic: "fabric.control.ack", limit: 100 }).find((event) => (event.data as { commandId?: string }).commandId === commandId);
@@ -1119,7 +1120,7 @@ describe("FabricControlPlane", () => {
       sender.start(() => ({ accepted: false }));
       receiver.start((received) => ({ accepted: true, messageId: "local:" + received.commandId }));
       await new Promise((resolve) => setTimeout(resolve, 100));             // past its one-time legacy move
-      const result = await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      const result = await sender.request("host:receiver", "agent:target", "steer", { message: "once", ownerIncarnation: receiver.incarnation });
       const commandEvent = store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!;
       const commandId = (commandEvent.data as { commandId: string }).commandId;
       expect(result.messageId).toBe("local:" + commandId);
@@ -1170,10 +1171,10 @@ describe("FabricControlPlane", () => {
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
-      await store.publish(command("command:race", "host:receiver"));
+      const receiver = plane(meshRoot, "host:receiver");
+      await store.publish(command("command:race", "host:receiver", receiver.incarnation));
       const older = olderRuntimeAdmits(store, "command:race");               // paused after its check
       expect(older.checked).toBe(true);
-      const receiver = plane(meshRoot, "host:receiver");
       const receive = vi.fn(() => ({ accepted: true }));
       receiver.start(receive);
       await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
@@ -1199,11 +1200,11 @@ describe("FabricControlPlane", () => {
 
     // review/astra on #58, F1: the deadline can pass while the claim waits for a lock, or after it
     // commits and before its promise resumes; the handler must not run then.
-    const expiringCommand = async (meshRoot: string, commandId: string, deadlineInMs: number) => {
+    const expiringCommand = async (meshRoot: string, commandId: string, deadlineInMs: number, ownerIncarnation: string) => {
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const requestedAt = Date.now();
       await store.publish({ ...command(commandId, "host:receiver"),
-        data: { ...command(commandId, "host:receiver").data, requestedAt, deadlineAt: requestedAt + deadlineInMs } });
+        data: { ...command(commandId, "host:receiver", ownerIncarnation).data, requestedAt, deadlineAt: requestedAt + deadlineInMs } });
       return store;
     };
 
@@ -1211,14 +1212,14 @@ describe("FabricControlPlane", () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
-      const store = await expiringCommand(meshRoot, "command:late", 400);
+      const receiver = plane(meshRoot, "host:receiver");
+      const store = await expiringCommand(meshRoot, "command:late", 400, receiver.incarnation);
       const put = MeshStore.prototype.put;
       vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
         const result = await put.call(this, input);                           // the claim commits ...
         if (this.root.includes("control-seen") && input.ifVersion === 0) await new Promise((resolve) => setTimeout(resolve, 600));
         return result;                                                        // ... and returns late
       });
-      const receiver = plane(meshRoot, "host:receiver");
       const receive = vi.fn(() => ({ accepted: true }));
       receiver.start(receive);
       await vi.waitFor(() => expect(ackFor(store, "command:late")).toBeDefined(), { timeout: 3_000, interval: 20 });
@@ -1232,13 +1233,13 @@ describe("FabricControlPlane", () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
-      const store = await expiringCommand(meshRoot, "command:locked", 400);
+      const receiver = plane(meshRoot, "host:receiver");
+      const store = await expiringCommand(meshRoot, "command:locked", 400, receiver.incarnation);
       const own = ownStore(meshRoot, "host:receiver");
       await own.put({ key: "warm", value: 1, identity: identity("host:receiver") });   // the store exists
       const lock = path.join(own.root, ".lock");
       fs.mkdirSync(lock);                                                     // another writer holds it
       fs.writeFileSync(path.join(lock, "owner"), `held\n${process.pid}\n${Date.now()}\n`);   // a live owner
-      const receiver = plane(meshRoot, "host:receiver");
       const receive = vi.fn(() => ({ accepted: true }));
       receiver.start(receive);
       await new Promise((resolve) => setTimeout(resolve, 700));              // past the deadline
@@ -1273,7 +1274,7 @@ describe("FabricControlPlane", () => {
       receiver.start(() => ({ accepted: true }));
       const sender = plane(meshRoot, "host:sender");
       sender.start(() => ({ accepted: false }));
-      await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      await sender.request("host:receiver", "agent:target", "steer", { message: "once", ownerIncarnation: receiver.incarnation });
       const fresh = store.listAll("topology/control-seen/").find((entry) =>
         (entry.value as { hostId?: string }).hostId === "host:receiver");
       expect(fresh?.value).toMatchObject({ explicitDeadline: true });    // new claims carry the flag
@@ -1298,11 +1299,11 @@ describe("FabricControlPlane", () => {
       const meshRoot = path.join(root, "mesh");
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const requestedAt = Date.now();
+      const receiver = plane(meshRoot, "host:receiver");
       await store.publish({ ...command("command:paused", "host:receiver"),
-        data: { ...command("command:paused", "host:receiver").data, requestedAt, deadlineAt: requestedAt + 5_000 } });
+        data: { ...command("command:paused", "host:receiver", receiver.incarnation).data, requestedAt, deadlineAt: requestedAt + 5_000 } });
       const older = olderRuntimeAdmits(store, "command:paused");            // passed admission, then pauses
       expect(older.checked).toBe(true);
-      const receiver = plane(meshRoot, "host:receiver");
       const receive = vi.fn(() => ({ accepted: true }));
       receiver.start(receive);
       await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
@@ -1332,7 +1333,7 @@ describe("FabricControlPlane", () => {
       const receive = vi.fn(() => ({ accepted: true }));
       sender.start(() => ({ accepted: false }));
       receiver.start(receive);
-      await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      await sender.request("host:receiver", "agent:target", "steer", { message: "once", ownerIncarnation: receiver.incarnation });
       const commandId = (store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!.data as { commandId: string }).commandId;
       const own = ownStore(meshRoot, "host:receiver");
       // Expired (at deadline + 1 s) and past one more 1 s cleanup pass, but still in the log.
@@ -1366,8 +1367,7 @@ describe("FabricControlPlane", () => {
     await expect(
       sender.request("host:receiver", "agent:target", "steer", {
         message: "focus",
-        triggerTurn: false,
-      }),
+        triggerTurn: false, ownerIncarnation: receiver.incarnation }),
     ).resolves.toMatchObject({
       queued: true,
       routed: "mesh",
@@ -1398,7 +1398,7 @@ describe("FabricControlPlane", () => {
     sender.start(() => ({ accepted: false }));
     receiver.start(() => ({ accepted: true, triggered: reports.shift() } as never));
     for (const report of [true, false, undefined, undefined, undefined]) {
-      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "hello" });
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "hello", ownerIncarnation: receiver.incarnation });
       if (report === undefined) expect(receipt).not.toHaveProperty("triggered");
       else expect(receipt.triggered).toBe(report);
     }
@@ -1416,7 +1416,7 @@ describe("FabricControlPlane", () => {
     sender.start(() => ({ accepted: false }));
     receiver.start(() => ({ accepted: true, ...reports.shift() } as never));
     for (const expectedReason of [reason, undefined, undefined, undefined, undefined]) {
-      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "held" });
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "held", ownerIncarnation: receiver.incarnation });
       if (expectedReason) expect(receipt).toMatchObject({ triggered: false, reason: expectedReason });
       else expect(receipt).not.toHaveProperty("reason");
     }
@@ -1442,7 +1442,7 @@ describe("FabricControlPlane", () => {
     ];
     sender.start(() => ({ accepted: false }));
     receiver.start(() => replies.shift() as never);
-    const send = () => sender.request("host:receiver", "session:main", "followUp", { message: "later" });
+    const send = () => sender.request("host:receiver", "session:main", "followUp", { message: "later", ownerIncarnation: receiver.incarnation });
     await expect(send()).resolves.toEqual({ queued: true, messageId: "m1", routed: "mesh", acknowledged: true, pendingFollowUps: 3, oldestAgeS: 140 });
     for (const messageId of ["m2", "m3", "m4"]) {
       await expect(send()).resolves.toEqual({ queued: true, messageId, routed: "mesh", acknowledged: true });
@@ -1480,8 +1480,7 @@ describe("FabricControlPlane", () => {
         "ask",
         {
           message: "inspect",
-          binding: { model: "provider/session-b", thinking: "high" },
-        },
+          binding: { model: "provider/session-b", thinking: "high" }, ownerIncarnation: receiver.incarnation },
       ),
     ).resolves.toEqual(response);
     expect(receive).toHaveBeenCalledWith(
@@ -1510,8 +1509,7 @@ describe("FabricControlPlane", () => {
     });
 
     const request = sender.request("host:receiver", "agent:target", "steer", {
-      message: "focus",
-    });
+      message: "focus", ownerIncarnation: receiver.incarnation });
     await new Promise((resolve) => setTimeout(resolve, 35));
     const command = store.read({ topic: "fabric.control.command", limit: 1 })[0];
     const commandId = (command?.data as { commandId?: string } | undefined)?.commandId;
@@ -1536,11 +1534,12 @@ describe("FabricControlPlane", () => {
     });
   });
 
-  it("recovers an unexpired command published before owner startup", async () => {
+  it("recovers an unexpired current-incarnation command queued before polling starts", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
     const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const receiver = plane(meshRoot, "host:receiver");
     await store.publish({
       topic: "fabric.control.command",
       kind: "steer",
@@ -1548,6 +1547,7 @@ describe("FabricControlPlane", () => {
       to: "host:receiver",
       data: {
         version: 1,
+        ownerIncarnation: receiver.incarnation,
         commandId: "command:before-start",
         targetId: "agent:target",
         operation: "steer",
@@ -1556,7 +1556,6 @@ describe("FabricControlPlane", () => {
         requestedAt: Date.now(),
       },
     });
-    const receiver = plane(meshRoot, "host:receiver");
     const receive = vi.fn(() => ({ accepted: true, messageId: "recovered" }));
     receiver.start(receive);
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -1676,6 +1675,7 @@ describe("FabricControlPlane", () => {
       data: {
         version: 1,
         commandId: "command:replayed",
+        ownerIncarnation: receiver.incarnation,
         targetId: "agent:target",
         operation: "steer",
         replyTo: "host:sender",
@@ -1744,6 +1744,7 @@ describe("FabricControlPlane", () => {
       data: {
         version: 1,
         commandId: "command:before-close",
+        ownerIncarnation: receiver.incarnation,
         targetId: "agent:target",
         operation: "steer",
         replyTo: "host:sender",
@@ -1791,7 +1792,7 @@ describe("FabricControlPlane", () => {
     sender.start(() => ({ accepted: false }));
     receiver.start(receive);
 
-    await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+    await sender.request("host:receiver", "agent:target", "steer", { message: "once", ownerIncarnation: receiver.incarnation });
     expect(receive).toHaveBeenCalledTimes(1);
     for (let index = 0; index < 62; index++) {
       await store.publish({
@@ -1832,13 +1833,13 @@ describe("FabricControlPlane", () => {
       "host:receiver",
       "actor:target",
       "ask",
-      { message: "inspect" },
+      { message: "inspect", ownerIncarnation: receiver.incarnation },
       "host:receiver",
       { timeoutMs: 2_000, signal: controller.signal },
     );
     await vi.waitFor(() => expect(askStarted).toBe(true));
     await expect(
-      sender.request("host:receiver", "actor:target", "stop"),
+      sender.request("host:receiver", "actor:target", "stop", { ownerIncarnation: receiver.incarnation }),
     ).resolves.toMatchObject({ acknowledged: true });
 
     controller.abort();
@@ -1881,7 +1882,7 @@ describe("FabricControlPlane", () => {
       "host:receiver",
       "actor:target",
       "ask",
-      { message: "inspect" },
+      { message: "inspect", ownerIncarnation: receiver.incarnation },
       "host:receiver",
       { timeoutMs: 1_000, signal: controller.signal },
     );
@@ -1918,7 +1919,7 @@ describe("FabricControlPlane", () => {
         "host:receiver",
         "actor:target",
         "ask",
-        { message: "inspect" },
+        { message: "inspect", ownerIncarnation: receiver.incarnation },
         "host:receiver",
         { timeoutMs: 500 },
       ),
@@ -1955,7 +1956,7 @@ describe("FabricControlPlane", () => {
       return { accepted: true, messageId: "late-but-delivered" };
     });
     sender.start(() => ({ accepted: false }));
-    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "slow ack" }))
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "slow ack", ownerIncarnation: receiver.incarnation }))
       .resolves.toMatchObject({ acknowledged: true, messageId: "late-but-delivered" });
   });
 
@@ -1998,7 +1999,7 @@ describe("FabricControlPlane", () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     const handler = vi.fn(async () => { await held; return { accepted: true, messageId: "slow" }; });
     receiver.start(handler);
-    const error = await sender.request("host:receiver", "agent:target", "steer", { message: "claimed" })
+    const error = await sender.request("host:receiver", "agent:target", "steer", { message: "claimed", ownerIncarnation: receiver.incarnation })
       .then(() => undefined, (failure: Error) => failure);
     release();
     expect(handler).toHaveBeenCalledTimes(1);
@@ -2016,7 +2017,7 @@ describe("FabricControlPlane", () => {
     receiver.start(() => ({ accepted: false, error: "target already settled" }));
 
     await expect(
-      sender.request("host:receiver", "agent:missing", "stop"),
+      sender.request("host:receiver", "agent:missing", "stop", { ownerIncarnation: receiver.incarnation }),
     ).rejects.toThrow("target already settled");
   });
 
@@ -2033,7 +2034,7 @@ describe("FabricControlPlane", () => {
         ? { accepted: false, error: rejection }
         : { accepted: true, messageId: "delivered:" + command.commandId });
       sender.start(() => ({ accepted: false }));
-      const outcome = sender.request("host:receiver", "agent:target", operation, { message: "late" })
+      const outcome = sender.request("host:receiver", "agent:target", operation, { message: "late", ownerIncarnation: receiver.incarnation })
         .then(
           (value) => ({ value, error: undefined as Error | undefined }),
           (error: Error) => ({ value: undefined, error: error as Error | undefined }),
@@ -2178,7 +2179,7 @@ describe("FabricControlPlane", () => {
       await store.publish({
         topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: "host:receiver",
         data: { version: 1, commandId: "command:warm", targetId: "agent:target", operation: "followUp", replyTo: "host:sender",
-          message: "m", requestedAt, deadlineAt: requestedAt + 1_000 },
+          message: "m", ownerIncarnation: receiver.incarnation, requestedAt, deadlineAt: requestedAt + 1_000 },
       });
       await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1),
         { timeout: 3_000, interval: 20 });

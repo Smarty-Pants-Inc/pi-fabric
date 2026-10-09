@@ -91,6 +91,7 @@ const mainLeaseFixture = async (files: boolean) => {
   const key = (prefix: string) => prefix + createHash("sha256").update(target.id).digest("hex");
   const presence: FabricParticipantRecord = {
     format: 1, id: target.id, rootId: target.id, kind: "root", ownerHostId: target.id, ownerIdentityId: target.id,
+    ownerIncarnation: `lease-test:${sessionId}`,
     name: "lead-example", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
     capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now(),
   };
@@ -103,7 +104,8 @@ const mainLeaseFixture = async (files: boolean) => {
   else await mesh.put({ key: participantKey, identity: target, value: presence });
   const plane = (who: MeshIdentity) => {
     const value = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1000), who,
-      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000,
+        ...(who.id === target.id ? { ownerIncarnation: presence.ownerIncarnation! } : {}) });
     planes.push(value); return value;
   };
   const publishPresence = async (value: FabricParticipantRecord) => {

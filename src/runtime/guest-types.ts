@@ -192,6 +192,7 @@ interface FabricParticipantInfo {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   status: string;

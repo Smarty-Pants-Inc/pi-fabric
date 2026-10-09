@@ -265,6 +265,10 @@ const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
 const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
+/** The hourly mesh retention sweep's CLI argv: a dry run only, never --apply, until deletion verifies each inode it
+ * removes (smarty-dev#7916). Its JSON report (would-be changes, runs, skips) is written atomically, never through a link. */
+export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
+  [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
 /** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
@@ -4385,8 +4389,8 @@ export class ActorManager {
   /**
    * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
    * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
-   * niced process: it removes terminal runs older than the actor archive TTL mesh-wide under the
-   * owners' own fences, and a dead resident root's runs under that root's flock.
+   * niced process. It runs as a dry run only (smarty-dev#7916): it reports the terminal runs older than
+   * the actor archive TTL that it would remove, and deletes nothing.
    */
   async #startMeshRetentionSweep(): Promise<void> {
     const script = this.#meshRetentionSweepPath;
@@ -4395,7 +4399,7 @@ export class ActorManager {
     if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
-        [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs)]);
+        meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
       const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);

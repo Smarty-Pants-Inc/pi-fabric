@@ -372,7 +372,7 @@ describe("FabricUiController dashboard wiring", () => {
 
   // smarty-dev#251: on a shared mesh some peer is always present; polling remote records at
   // refreshMs kept every idle Pi rebuilding its snapshot and re-rendering twice a second.
-  it("skips unchanged remote-only idle refreshes and uses a >=5s local fallback", async () => {
+  it("skips unchanged remote-only idle refreshes and uses a >=60s local fallback", async () => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.refreshMs = 500;
@@ -397,7 +397,7 @@ describe("FabricUiController dashboard wiring", () => {
       controller.start(context);
       expect(controller.snapshot().agents.map((agent) => agent.id)).toContain("agent:remote");
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(4_999);
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);          // no 500 ms poll for peers
       await vi.advanceTimersByTimeAsync(1);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);          // an unchanged idle wake is not a refresh
@@ -408,10 +408,10 @@ describe("FabricUiController dashboard wiring", () => {
       changed();
       await vi.advanceTimersByTimeAsync(0);                          // local event picks up the run
       expect(state.activity.runs).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(4_999);
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(state.activity.runs).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(1);
-      expect(state.activity.runs).toHaveBeenCalledTimes(3);          // local fallback: >=5s
+      expect(state.activity.runs).toHaveBeenCalledTimes(3);          // local fallback: >=60s
     } finally {
       controller.stop();
       vi.useRealTimers();
@@ -584,7 +584,7 @@ describe("FabricUiController dashboard wiring", () => {
 
   // smarty-dev#1043: each 500 ms poll gathered and deep-compared every input while local work
   // was active (about 11% of a busy Main). A poll now rebuilds only when a cheap stamp moved.
-  it("rebuilds a polled snapshot only when a stamp moved: Main at once, remote state at most every 5 s", async () => {
+  it("recovers changed remote stamps on the >=60s fallback while Main events remain immediate", async () => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.refreshMs = 500;
@@ -615,7 +615,7 @@ describe("FabricUiController dashboard wiring", () => {
       stamp = "state-2";                                          // remote state changed
       await vi.advanceTimersByTimeAsync(500);
       expect(gathered()).toBe(settled);                           // less than 5 s since the last build
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(55_400);
       expect(gathered()).toBe(settled + 1);                       // then once
       const afterRemote = gathered();
       vi.mocked(state.mainAgentInfo).mockReturnValue({
@@ -624,10 +624,10 @@ describe("FabricUiController dashboard wiring", () => {
       controller.setHostStreaming(true);                         // Host lifecycle event: at once
       expect(gathered()).toBe(afterRemote + 1);
       const afterMain = gathered();
-      await vi.advanceTimersByTimeAsync(14_000);
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(gathered()).toBe(afterMain);
-      await vi.advanceTimersByTimeAsync(1_500);
-      expect(gathered()).toBe(afterMain + 1);                     // a lapsing lease: every 15 s
+      await vi.advanceTimersByTimeAsync(1);
+      expect(gathered()).toBe(afterMain + 1);                     // active clock recovery: >=60s
     } finally {
       controller.stop();
       vi.useRealTimers();
@@ -660,7 +660,7 @@ describe("FabricUiController dashboard wiring", () => {
       try {
         controller.start(context);
         activity.start("live", { name: "local work" });          // keeps the slow fallback armed
-        await vi.advanceTimersByTimeAsync(4_700);
+        await vi.advanceTimersByTimeAsync(59_700);
         expect(shown()).toBe("A0");
         await writer.put({ key: "status", value: "A", identity });
         expect(mesh.get("status")?.value).toBe("A");             // another reader parses A: a warm cache
@@ -672,7 +672,7 @@ describe("FabricUiController dashboard wiring", () => {
           expect(shown()).toBe("A");
           expect(readCount()).toBe(afterWrite); // Local events retain ordinary warm-cache semantics.
         }
-        await vi.advanceTimersByTimeAsync(5_500); // Warm cache expiry is observed on the >=5s fallback.
+        await vi.advanceTimersByTimeAsync(60_500); // Warm cache expiry cannot shorten the >=60s floor.
         expect(shown()).toBe("B");
         // The journal replays B into a new snapshot; showing the remote value no longer
         // requires another full canonical parse after the writer's locked read.
@@ -686,7 +686,7 @@ describe("FabricUiController dashboard wiring", () => {
     },
   );
 
-  it("idle UI never bypasses a warmed cache and sees expiry on the next >=5s fallback", async () => {
+  it("idle UI never bypasses a warmed cache and sees expiry on the next >=60s fallback", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-idle-coalesce-"));
     const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5_000 });
@@ -707,7 +707,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       state.config.ui.refreshMs = 500;
       controller.start(context);
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(57_000);
       await writer.put({ key: "status", value: "warm", identity });
       // Another correctness consumer warms canonical state just before a remote change.
       expect(mesh.get("status", { fresh: true })?.value).toBe("warm");
@@ -716,7 +716,7 @@ describe("FabricUiController dashboard wiring", () => {
       await vi.advanceTimersByTimeAsync(3_000); // First UI poll consumes the warm, older snapshot.
       expect(shown()).toBe("warm");
       expect(count()).toBe(before); // Generation change must NOT force an idle parse.
-      await vi.advanceTimersByTimeAsync(5_000); // Cache expiry cannot shorten the >=5s fallback floor.
+      await vi.advanceTimersByTimeAsync(60_000); // Cache expiry cannot shorten the >=60s fallback floor.
       expect(shown()).toBe("after");
       // Expiry observes the new generation via the journal, not a redundant full parse.
       expect(count()).toBe(before);
@@ -753,7 +753,7 @@ describe("FabricUiController dashboard wiring", () => {
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...vi.mocked(state.mainAgentInfo)(),
         status: demand === "running" ? "running" : "idle", pendingMessages: demand === "pending",
       } as ReturnType<FabricState["mainAgentInfo"]>);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(60_000);
       expect(controller.snapshot().state.find(entry => entry.key === "status")?.value).toBe("after");
     } finally {
       controller.stop(); vi.restoreAllMocks(); vi.useRealTimers();
@@ -785,10 +785,10 @@ describe("FabricUiController dashboard wiring", () => {
       const before = readCount();
       const stamp = mesh.cachedStateStamp();
       for (let index = 0; index < 6; index++) {
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(60_000);
         expect(mesh.cachedStateStamp(true)).toBe(stamp);
         expect(controller.snapshot().state.find((entry) => entry.key === "status")?.value).toBe("A");
-        expect(readCount()).toBe(before); // Includes observer calls and the 15 s ceiling rebuilds.
+        expect(readCount()).toBe(before); // Includes observer calls and active-clock recovery rebuilds.
       }
       expect(context.ui.notify).not.toHaveBeenCalled();
     } finally {
@@ -826,7 +826,7 @@ describe("FabricUiController dashboard wiring", () => {
       try {
         controller.start(context);
         activity.start("live", { name: "local work" });
-        await vi.advanceTimersByTimeAsync(4_700);
+        await vi.advanceTimersByTimeAsync(59_700);
         expect(shown()).toBe("A0");
         await writer.put({ key: "status", value: "A", identity });
         const afterWrite = readCount();
@@ -898,13 +898,13 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       activity.start("live", { name: "local work" });            // keeps the slow fallback armed
-      await vi.advanceTimersByTimeAsync(4_700);
+      await vi.advanceTimersByTimeAsync(59_700);
       expect(shown()).toBe("A0");
       writeExternally("A");
       expect(readParticipantFiles(root, { maxAgeMs: 0 })).toHaveLength(1);   // another reader: a warm cache holds A
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);      // B lands in a later timestamp tick
       writeExternally("B");
-      await vi.advanceTimersByTimeAsync(5_500); // second fallback after the warmed participant cache expires
+      await vi.advanceTimersByTimeAsync(60_500); // recovery after the warmed participant cache expires
       expect(shown()).toBe("B");
     } finally {
       controller.stop();
@@ -949,7 +949,7 @@ describe("FabricUiController dashboard wiring", () => {
       expect(mounted.render(80)).toHaveLength(6);
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
       // A missed host boundary is recovered by the slow fallback; explicit boundaries remain immediate.
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(60_000);
       expect(mounted.render(80).length).toBeLessThan(6);
       expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(1);
       // Explicit agent_end releases immediately even before Pi's isIdle flips.
@@ -1057,10 +1057,10 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       activity.start("live", { name: "local work" });
-      await vi.advanceTimersByTimeAsync(4_700);
+      await vi.advanceTimersByTimeAsync(59_700);
       expect(controller.snapshot().agents).toEqual([]);
       renew(Date.now());
-      await vi.advanceTimersByTimeAsync(1_000); // next 5 s remote refresh, not the 15 s ceiling
+      await vi.advanceTimersByTimeAsync(1_000); // next >=60s recovery observes the changed lease stamp
       expect(controller.snapshot().agents.map(agent => agent.id)).toEqual(["peer-agent"]);
       expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
     } finally {
@@ -1107,22 +1107,22 @@ describe("FabricUiController dashboard wiring", () => {
         activity.beginCall("live", { callId, ref: "pi.read", args: { path: `${index}.ts` } });
         activity.finishCall("live", callId, { success: true, result: "ok" });
       }
-      await vi.advanceTimersByTimeAsync(5_100);
+      await vi.advanceTimersByTimeAsync(60_100);
       expect(widget).toBeDefined();
       const first = widget!.render(80).join("\n");
       expect(first).toContain("T06 slice A");
       expect(first).toContain("6/6 calls");
       expect(first.split("\n")).toHaveLength(reserved.length);
-      // Elapsed clocks now tick at the >=5s fallback, not twice a second.
-      expect(first).toMatch(/5s/);
+      // Elapsed clocks recover at the >=60s fallback, not twice a second.
+      expect(first).toMatch(/1m00s/);
       expect(controller.snapshot().runs[0]?.status).toBe("running");
       requestRender.mockClear();
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(60_000);
       const elapsedMs =
         controller.snapshot().now - controller.snapshot().runs[0]!.startedAt;
       const second = widget!.render(80).join("\n");
-      expect(elapsedMs).toBeGreaterThanOrEqual(5_000);
-      expect(second).toMatch(/10s/);
+      expect(elapsedMs).toBeGreaterThanOrEqual(120_000);
+      expect(second).toMatch(/2m00s/);
       expect(requestRender).toHaveBeenCalled();
       activity.finish("live", true);
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });

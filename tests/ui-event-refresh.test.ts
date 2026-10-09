@@ -62,12 +62,22 @@ const harness = () => {
 };
 
 describe("event-driven dashboard refresh", () => {
-  it("does not refresh an idle open Main dashboard with peers for 10 seconds", async () => {
+  it.each([
+    { open: false, peers: false }, { open: false, peers: true },
+    { open: true, peers: false }, { open: true, peers: true },
+  ])("has at most five fallback wakes and zero unchanged idle refreshes in five minutes: $open/$peers", async ({ open, peers }) => {
     vi.useFakeTimers();
-    const h = harness(); await h.open();
-    await vi.advanceTimersByTimeAsync(10_000);
+    const h = harness();
+    if (!peers) h.state.peerInfos = () => [];
+    if (open) await h.open();
+    else { h.controller.start(h.context); h.refresh.mockClear(); h.mainAgentInfo.mockClear(); }
+    const wakes = vi.spyOn(h.state.mesh, "latestOffset");
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(wakes).toHaveBeenCalledTimes(5);
     expect(h.refresh).not.toHaveBeenCalled();
+    expect(h.mainAgentInfo).not.toHaveBeenCalled();
     expect(h.requestRender).not.toHaveBeenCalled();
+    wakes.mockRestore();
   });
 
   it("coalesces a mesh change burst into one refresh within 100 ms", async () => {
@@ -89,32 +99,11 @@ describe("event-driven dashboard refresh", () => {
     expect(h.refresh).toHaveBeenCalledTimes(1);
   });
 
-  it("does zero hidden refreshes, cancels queued work, and refreshes exactly once on show", async () => {
-    vi.useFakeTimers();
-    const h = harness(); await h.open();
-    watches.changed(); // Cancel a refresh that was already queued before hiding.
-    h.controller.setPaneVisible(false);
-    for (let i = 0; i < 10; i++) {
-      watches.changed(); h.activity(); h.actor(); h.agent(); h.shell(); h.input();
-      h.controller.setHostStreaming(true);
-    }
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(h.refresh).not.toHaveBeenCalled();
-    expect(h.requestRender).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
-    h.controller.setPaneVisible(true);
-    h.controller.setPaneVisible(true);
-    expect(h.refresh).toHaveBeenCalledTimes(1);
-    expect(h.requestRender).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(h.refresh).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([100, 5000, 12000])("preserves the >=5s fallback floor at refreshMs=%s even with a 1ms cache deadline", async ms => {
+  it.each([100, 5000, 12000, 70000])("preserves the >=60s fallback floor at refreshMs=%s even with a 1ms cache deadline", async ms => {
     vi.useFakeTimers();
     const h = harness(); h.state.config.ui.refreshMs = ms;
     h.controller.start(h.context); h.controller.setHostStreaming(true); h.refresh.mockClear();
-    const floor = Math.max(5000, ms);
+    const floor = Math.max(60000, ms);
     await vi.advanceTimersByTimeAsync(floor - 1);
     expect(h.refresh).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);

@@ -29,10 +29,11 @@ import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
+const FALLBACK_REFRESH_MS = 60_000;
 // The participant heartbeat (src/topology/participant-directory.ts); kept local so the startup
 // graph does not load the topology module.
 const REMOTE_REFRESH_MS = 5_000;
-// A poll with no changed input still rebuilds this often: a peer's lease lapses with time alone.
+// Active clock/cache rebuild budget; unchanged idle inputs do not refresh on time alone.
 const REMOTE_MAX_AGE_MS = 15_000;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
@@ -75,7 +76,6 @@ export class FabricUiController {
   #shellUnsubscribe: (() => void) | undefined;
   #meshUnsubscribe: (() => void) | undefined;
   #inputUnsubscribe: (() => void) | undefined;
-  #paneVisible = true;
   #tasksOpen = false;
   #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
   #closeTasks: (() => void) | undefined;
@@ -211,28 +211,6 @@ export class FabricUiController {
     this.#hostStreaming = streaming;
     this.#refresh();
     this.#schedulePoll(true);
-  }
-
-  /**
-   * Host pane-visibility hook. Pi exposes terminal input and overlay handles, but no terminal
-   * pane visibility subscription. Embedders must call this on hide/show; keyboard focus is
-   * deliberately not visibility (a visible dashboard can lose focus to a picker).
-   */
-  setPaneVisible(visible: boolean): void {
-    if (visible === this.#paneVisible) return;
-    this.#paneVisible = visible;
-    if (this.#timer) clearTimeout(this.#timer);
-    if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
-    this.#timer = undefined;
-    this.#scheduledRefresh = undefined;
-    if (!visible) {
-      this.#suspendConversationReader();
-      return;
-    }
-    this.#runBackground(this.#epoch, () => {
-      this.#refresh(); // Consume all changes accumulated while hidden, exactly once.
-      this.#schedulePoll();
-    });
   }
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
@@ -710,7 +688,7 @@ export class FabricUiController {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    if (this.#timer || !this.#paneVisible || !this.#context || !this.state.initialized) return;
+    if (this.#timer || !this.#context || !this.state.initialized) return;
     const localActive =
       this.#snapshot.main.status === "running" ||
       this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
@@ -725,10 +703,11 @@ export class FabricUiController {
       this.#snapshot.peers.length > 0 ||
       this.#snapshot.agents.some((agent) => agent.local === false && isActiveStatus(agent.status));
     if (!this.ownsInput && !localActive && !remoteActive && !this.state.config.mesh.enabled) return;
-    // Events own prompt updates. This slow fallback covers missed filesystem notifications,
-    // file-only topology/lease changes and elapsed clocks, never the old 500 ms UI loop.
-    // A warm store cache must not shorten the fallback floor (smarty-dev#7403).
-    const delay = Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
+    // R-no-polling exception (smarty-dev#7403): this >=60s recovery ponytail covers missed
+    // filesystem notifications, file-only topology/lease changes and elapsed clocks. Events
+    // still own immediate updates; neither a healthy watcher nor a warm cache may rearm a
+    // faster idle loop. Unchanged idle stamps do not refresh, even after the cache ages out.
+    const delay = Math.max(this.state.config.ui.refreshMs, FALLBACK_REFRESH_MS);
     const epoch = this.#epoch;
     this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
       this.#timer = undefined;
@@ -757,13 +736,11 @@ export class FabricUiController {
       root ? hostLeasesStamp(root) : undefined,
       this.state.globalActors.stamp?.(),
     ]);
-    return remote !== this.#builtRemote ||
-      ((meshEnabled || snapshot.peers.length > 0 || snapshot.agents.some(agent => agent.local === false)) &&
-        Date.now() - this.#builtAt >= REMOTE_MAX_AGE_MS);
+    return remote !== this.#builtRemote;
   }
 
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#paneVisible || !this.#context || !this.state.initialized) return;
+    if (this.#scheduledRefresh || !this.#context || !this.state.initialized) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
@@ -780,7 +757,7 @@ export class FabricUiController {
 
   /** Both poll and coalesced refresh own their faults; a queued old tick cannot rearm. */
   #runBackground(epoch: number, callback: () => void): void {
-    if (epoch !== this.#epoch || !this.#paneVisible || !this.#context || !this.state.initialized) return;
+    if (epoch !== this.#epoch || !this.#context || !this.state.initialized) return;
     try {
       callback();
     } catch (error) {
@@ -837,7 +814,7 @@ export class FabricUiController {
 
   #refresh(force = true): void {
     const context = this.#context;
-    if (!this.#paneVisible || !context || !this.state.initialized) return;
+    if (!context || !this.state.initialized) return;
     this.#lastRefreshAt = performance.now();
     try {
       this.#pollMesh();
@@ -866,9 +843,10 @@ export class FabricUiController {
       // mesh, the global registry) and deep-compared it twice a second while any local work was
       // active: about 11% of a busy Main. Events now own prompt updates and the slow fallback
       // only runs when an input/clock needs it. It rebuilds when a cheap stamp moved: Main's own
-      // state or the activity revision at once, remote state and mesh events at most every
-      // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
-      // dashboard or conversation view stays live. The rest of the refresh runs either way.
+      // state or the activity revision at once. REMOTE_REFRESH_MS/REMOTE_MAX_AGE_MS remain
+      // cache budgets inside a refresh, not timer intervals: missed events and active clocks
+      // recover on the >=60s ponytail. Idle unchanged stamps never rebuild on age alone.
+      // An open dashboard or conversation view stays live on events.
       const now = Date.now();
       const main = { ...this.state.mainAgentInfo(context) };
       // agent_end can precede isIdle() becoming true. Its explicit boundary

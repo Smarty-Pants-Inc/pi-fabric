@@ -2,7 +2,7 @@
 """Bounded smoke protocol tests; no servers, credentials or third-party modules."""
 import time
 import unittest
-from smoke import Nats
+from smoke import Nats, SmokeCancelled, eventually
 
 
 class Socket:
@@ -44,6 +44,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             c.until_pong()
         self.assertGreater(c.sock.timeouts[0], c.sock.timeouts[-1])
+
+    def test_cancellation_escapes_readiness_retries(self):
+        def cancelled():
+            raise SmokeCancelled('cancelled')
+        with self.assertRaises(SmokeCancelled):
+            eventually('cancel test', cancelled, seconds=1)
 
     def test_no_responders_is_failure_not_an_empty_success(self):
         c = self.client()

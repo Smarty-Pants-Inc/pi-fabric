@@ -22,6 +22,10 @@ import urllib.request
 from render import API, CORE, HOSTS, MAX_PAYLOAD, render
 
 
+class SmokeCancelled(BaseException):
+    """Cancellation must escape read-only readiness retry loops."""
+
+
 class Nats:
     def __init__(self, port, tlsdir, identity, inbox, timeout=10):
         self.timeout = timeout
@@ -245,7 +249,7 @@ def main():
         assert tuple(map(int, parts)) >= (2, 14, 7), version
         # Ensure ordinary supervisor cancellation still reaps every owned server.
         def interrupted(signum, frame):
-            raise InterruptedError(f'smoke cancelled by signal {signum}')
+            raise SmokeCancelled(f'smoke cancelled by signal {signum}')
         signal.signal(signal.SIGTERM, interrupted)
         signal.signal(signal.SIGINT, interrupted)
         tlsdir = scratch / 'tls'
@@ -428,13 +432,15 @@ def main():
             note('route_trust_boundary', {'application_cert_rejected': True, 'reason': exc.reason})
         oversized = connect('ryzen3')
         try:
-            oversized.publish('fabric.root.ryzen3.oversized', b'X' * (MAX_PAYLOAD + 1))
-            oversized.sock.sendall(b'PING\r\n')
+            # Declare an oversized body without transmitting it: the server
+            # validates the PUB length before reading the body. Sending a full
+            # oversized body races its immediate close/reset against sendall.
+            oversized.sock.sendall(f'PUB fabric.root.ryzen3.oversized {MAX_PAYLOAD + 1}\r\n'.encode())
             oversized.until_pong()
             raise AssertionError('oversized payload admitted')
         except RuntimeError as exc:
             assert 'Maximum Payload Violation' in str(exc), str(exc)
-            note('payload_limit', {'limit': MAX_PAYLOAD, 'rejected_bytes': MAX_PAYLOAD + 1})
+            note('payload_limit', {'limit': MAX_PAYLOAD, 'rejected_declared_bytes': MAX_PAYLOAD + 1})
         finally:
             oversized.close()
         # Separate subscribers avoid mixing persistent replies with shared delivery.
@@ -518,7 +524,7 @@ def main():
             'streams': surviving_replicas, 'consumer': consumer_after,
             'consumer_after_ack': {'pending': 0, 'event_bytes': len(body)}})
         result['status'] = 'PASS'
-    except Exception as exc:
+    except (Exception, SmokeCancelled) as exc:
         result['error'] = str(exc)
         print('FAIL: ' + str(exc), file=sys.stderr, flush=True)
     finally:

@@ -34,3 +34,23 @@ raw measurement rows) and `terminal.json` (process cleanup receipts). A prior
 sample is comparable with `--compare /path/to/result.json` only on the same host
 and with the same requested duration. CPU core units are one fully occupied core;
 report rates and process population, without normalizing away unrelated host load.
+
+## Comparing revisions and attributing reads
+
+Build each source revision independently; never point the baseline's `dist` at the
+candidate build. Use the same driver bytes and pending-worker lifetime on both
+revisions, even when an older driver had a shorter fixed deadline. A historical
+number without its matching duration/lifetime evidence is not a regression gate.
+
+`syscr` counts kernel reads, including V8/libuv eventfd reads, not just filesystem
+payload reads. Inspect the separate `attribution-main-profile.json` path/API/stacks
+before blaming a delivery-key watcher. In particular, retained legacy readers can
+require canonical `state.json` compatibility heartbeat writes without admitting any
+residency delivery retry. Preserve those authority/lease obligations when optimizing
+allocation. Writer parse reuse is permitted only after freshly reading equal full
+canonical bytes; copied UUIDs, versions, or stat labels alone never justify reuse.
+
+A traced pass has extra overhead and may stretch initial bounded completion replay
+past warmup. Report it separately from unprofiled acceptance numbers, and distinguish
+an initial replay tail from recurring idle discovery. Do not disable GC, alter lease
+cadence, drop fixture work, or switch backends merely to meet a CPU target.

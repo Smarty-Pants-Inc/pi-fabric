@@ -150,6 +150,7 @@ const emptyState = (): MeshStateFile => ({ format: 1, revisionFormat: 2, entries
 
 const readState = (
   filePath: string, maxBytes: number, recoverDamage = true, observed?: (serialized: string) => void,
+  reuse?: (serialized: string) => MeshStateFile | undefined,
 ): MeshStateFile => {
   let serialized: string;
   try {
@@ -163,6 +164,8 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
+  const reused = reuse?.(serialized);
+  if (reused) { observed?.(serialized); return reused; }
   let moved: MeshStateMovedMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
@@ -553,7 +556,7 @@ export class StateFile implements StateBackend {
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
   /** Writer-only bytes from one commit; reusable only after a fresh, exact canonical-text match. */
-  #writeEncodings: { serialized: string; entries: Map<string, EncodedStateEntry> } | undefined;
+  #writeEncodings: { serialized: string; entries: Map<string, EncodedStateEntry>; state: MeshStateFile } | undefined;
   /** The last full signal index parsed, keyed by its unique generation: one object, bounded. */
   #signalIndex: { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined;
   #signalIdentity: string | undefined;
@@ -819,8 +822,17 @@ export class StateFile implements StateBackend {
     let reuse: Map<string, EncodedStateEntry> | undefined;
     const state = readState(this.#statePath, this.#maxStateBytes, false, (serialized) => {
       // Full content equality, not UUID/stat/version equality: a legacy copied-marker writer
-      // can change an entry without advancing any of those labels. Always read and parse fresh.
+      // can change an entry without advancing any of those labels. Always read fresh;
+      // parse again unless every freshly read byte matches our immutable committed tree.
       if (serialized === this.#writeEncodings?.serialized) reuse = this.#writeEncodings.entries;
+    }, serialized => {
+      const prior = this.#writeEncodings;
+      if (!prior || serialized !== prior.serialized) return undefined;
+      // Exact freshly read bytes, never copied marker/version/stat labels. The
+      // private committed tree is frozen; a transaction owns every mutable map.
+      return { ...prior.state, entries: { ...prior.state.entries },
+        ...(prior.state.versions ? { versions: { ...prior.state.versions } } : {}),
+        ...(prior.state.tombstoneOrder ? { tombstoneOrder: [...prior.state.tombstoneOrder] } : {}) };
     });
     // The base carries the snapshot's endpoint stamp so this commit's format-2 record binds
     // its predecessor (#560). The stamp is taken outside custody with the snapshot (#547);
@@ -993,7 +1005,14 @@ export class StateFile implements StateBackend {
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
     // Under the lock our record ends the journal: the next read follows from there by offset.
     else if (journalCursor) this.#stateCache!.journalCursor = journalCursor;
-    this.#writeEncodings = { serialized: serializedText, entries: encoded.entries };
+    const freeze = <T>(value: T): T => {
+      if (value && typeof value === "object" && !Object.isFrozen(value)) {
+        for (const child of Object.values(value)) freeze(child);
+        Object.freeze(value);
+      }
+      return value;
+    };
+    this.#writeEncodings = { serialized: serializedText, entries: encoded.entries, state: freeze(stamped) };
     const trace = process.env.PI_FABRIC_COMMIT_TRACE;
     if (trace) {
       try {

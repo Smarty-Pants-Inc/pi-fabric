@@ -14,6 +14,15 @@ const warn = (reason: string): void => {
   console.warn(`[pi-fabric] Linux execution scope: ${reason}; using legacy process-group custody`);
 };
 export type ScopeLaunch = { executable: string; slice: string; prefix?: "worker" | "execution"; warn: (reason: string) => void; authorize?: () => void; legacy?: boolean; signal?: AbortSignal };
+export class ScopeAdmissionError extends Error {
+  readonly code = "ERR_SCOPE_ADMISSION";
+  constructor(readonly reason: "closed" | "aborted" | "timeout" | "watch" | "launcher", options?: ErrorOptions) {
+    super({ closed: "Scope launcher closed before admission", aborted: "Scope launch aborted before admission",
+      timeout: "Launcher never confirmed its spawn scope; refusing execution replay", watch: "Scope admission watcher failed",
+      launcher: "Scope launcher failed before admission" }[reason], options);
+    this.name = "ScopeAdmissionError";
+  }
+}
 const releases = new WeakMap<ChildProcess, () => void>();
 /** Release only after native-close/stream listeners and parent custody exist. */
 export const releaseScopedChild = (child: ChildProcess): void => { releases.get(child)?.(); releases.delete(child); };
@@ -64,24 +73,54 @@ export const spawnScopedExecution = async (
   child.once("error", value => { error = value; });
   let receipt: CgroupCustody | undefined;
   let pinAttempted = false;
-  const deadline = Date.now() + 5_000;
   try {
     const birth = child.pid ? executionIdentity(child.pid) : undefined;
-    while (!closed && Date.now() < deadline && !configured?.signal?.aborted) {
-      if (directory && !receipt && birth && processScopePath(birth.pid) === directory) {
-        pinAttempted = true;
-        receipt = cgroupCustody(directory, birth);
-        receipt.verify(birth); // pin + exact membership/owner BEFORE trusting the marker
-      }
-      if ((receipt || legacyScope) && fs.existsSync(marker)) {
-        receipt?.verify(birth!);
-        if (receipt) executionCgroups.set(child, receipt);
-        child.once("close", () => fs.rmSync(root, { recursive: true, force: true }));
-        releases.set(child, () => { if (!closed) { receipt?.verify(birth!); gate?.end("release\n"); } });
-        return child; // the spawn result carries custody; marker contents never do
-      }
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
+    await new Promise<void>((resolve, reject) => {
+      let watcher: fs.FSWatcher | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const finish = (failure?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer); watcher?.close();
+        child.removeListener("close", onClose); child.removeListener("error", onError);
+        configured?.signal?.removeEventListener("abort", onAbort);
+        if (failure) reject(failure); else resolve();
+      };
+      const onClose = (): void => finish(new ScopeAdmissionError("closed", { cause: error }));
+      const onError = (cause: Error): void => finish(new ScopeAdmissionError("launcher", { cause }));
+      const onAbort = (): void => finish(new ScopeAdmissionError("aborted", { cause: configured?.signal?.reason }));
+      const check = (): void => {
+        if (settled) return;
+        if (closed) return onClose();
+        if (configured?.signal?.aborted) return onAbort();
+        try {
+          if (directory && !receipt && birth && processScopePath(birth.pid) === directory) {
+            pinAttempted = true;
+            receipt = cgroupCustody(directory, birth);
+            receipt.verify(birth); // pin + exact membership/owner BEFORE trusting the marker
+          }
+          if ((receipt || legacyScope) && fs.existsSync(marker)) {
+            receipt?.verify(birth!); finish();
+          }
+        } catch (value) { finish(value instanceof Error ? value : new Error(String(value))); }
+      };
+      child.once("close", onClose); child.once("error", onError);
+      configured?.signal?.addEventListener("abort", onAbort, { once: true });
+      // Watch the parent before the initial read: creation can precede the read,
+      // or follow it, without a lost wakeup. Events trigger checks, not authority.
+      // The shell writes readiness only after systemd has placed it in the scope.
+      try {
+        timer = setTimeout(() => finish(new ScopeAdmissionError("timeout")), 5_000);
+        watcher = fs.watch(root, check);
+        watcher.once("error", cause => finish(new ScopeAdmissionError("watch", { cause })));
+        // A terminal event during subscription must not strand the new watcher.
+        if (settled) watcher.close(); else if (error) onError(error); else check();
+      } catch (cause) { finish(new ScopeAdmissionError("watch", { cause })); }
+    });
+    if (receipt) executionCgroups.set(child, receipt);
+    child.once("close", () => fs.rmSync(root, { recursive: true, force: true }));
+    releases.set(child, () => { if (!closed) { receipt?.verify(birth!); gate?.end("release\n"); } });
+    return child; // the spawn result carries custody; marker contents never do
   } catch (value) { error = value instanceof Error ? value : new Error(String(value)); }
   // The trusted admission shell exits on EOF, without execing an unowned target.
   // No ChildProcess.kill: that is numeric PID signalling on Node/Bun too.
@@ -113,7 +152,9 @@ export const spawnScopedExecution = async (
     markerPresent = !!directory && fs.existsSync(marker);
     receipt?.dispose(); fs.rmSync(root, { recursive: true, force: true });
   }
-  if (pinAttempted || markerPresent) throw error ?? new Error("Launcher never confirmed its spawn scope; refusing execution replay");
+  if (pinAttempted || markerPresent || (error instanceof ScopeAdmissionError && error.reason !== "timeout")) {
+    throw error ?? new ScopeAdmissionError("timeout");
+  }
 
   warning(error?.message ?? "systemd-run failed or scope admission timed out");
   return direct();

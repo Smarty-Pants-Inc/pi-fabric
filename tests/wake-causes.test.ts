@@ -577,6 +577,57 @@ describe("Receiver-owned wake attribution regressions", () => {
     expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false, causes }]]);
   });
 
+  it.each([true, false])("duplicate root inbox events yield one exact cause (capable=%s)", async capable => {
+    const recording = recordingPi(capable);
+    const event = meshEvent();
+    deliverRootInbox(recording.pi, [event, structuredClone(event)]);
+    expect(recording.sent).toHaveLength(1);
+    expect(recording.sent[0]!.message.details).toMatchObject({ ids: [event.id] });
+    await assertWake(recording, fabricWakeCause(worker, "mesh", event.topic, event.id));
+  });
+
+  it("deduplicates the same keyed source both inside a receipt and across receipts in one boundary", async () => {
+    const recording = recordingPi();
+    const expected = fabricWakeCause(worker, "mesh", "fleet.work.task", "event:repeat");
+    for (const causes of [[expected, expected], [expected]]) {
+      const message = fabricWakeMessage(recording.pi, { customType: "probe", content: "repeat", display: true },
+        { deliverAs: "followUp", triggerTurn: true }, causes);
+      recording.pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+    }
+    await recording.admit(recording.sent.map(({ message }) => ({ ...message, role: "custom" })));
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", expected]]);
+  });
+
+  it.each(["key", "sender", "topic", "unkeyed"] as const)("retains distinct %s admissions within one boundary", async distinction => {
+    const recording = recordingPi();
+    const first = fabricWakeCause(worker, "mesh", "fleet.work.task", distinction === "unkeyed" ? undefined : "event:repeat");
+    const second = fabricWakeCause(distinction === "sender" ? { ...worker, id: "agent:other" } : worker, "mesh",
+      distinction === "topic" ? "fleet.work.other" : "fleet.work.task",
+      distinction === "unkeyed" ? undefined : distinction === "key" ? "event:other" : "event:repeat");
+    const message = fabricWakeMessage(recording.pi, { customType: "probe", content: "batch", display: true },
+      { deliverAs: "followUp", triggerTurn: true }, [first, second]);
+    recording.pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+    await recording.consume();
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false,
+      causes: [first, second].map(cause => ({ ...cause, exact: true })),
+    }]]);
+  });
+
+  it("deduplication resets after context and at a new turn boundary", async () => {
+    const recording = recordingPi();
+    const event = meshEvent();
+    const expected = fabricWakeCause(worker, "mesh", event.topic, event.id);
+    for (const newTurn of [false, true]) {
+      deliverRootInbox(recording.pi, [event]);
+      if (newTurn) await recording.emit("turn_start", { turnIndex: 1, timestamp: 2 });
+      await recording.emit("message_start", { message: { ...recording.sent.at(-1)!.message, role: "custom" } });
+      await recording.emit("context");
+    }
+    expect(recording.fake.appendEntry.mock.calls).toEqual([
+      ["pi-fabric.wake-cause", expected], ["pi-fabric.wake-cause", expected],
+    ]);
+  });
+
   it("a busy Main batch retains each sender instead of naming only the first", async () => {
     const recording = recordingPi(); recording.state.idle = false;
     const main = controller(recording, tempJournal());
@@ -654,6 +705,80 @@ describe("Held and replayed followUps retain original cause and sender", () => {
     expect(recording.sent[0]!.options).toMatchObject({ deliverAs: "steer", triggerTurn: true });
     expect(recording.sent[0]!.message.details).toMatchObject({ delivery: "followUp", from: worker, flushed: true });
     await assertWake(recording, expected);
+  });
+
+  it.each(["wakeCause", "wakeCauses"] as const)("replay ignores a forged serialized %s and derives the authenticated sender", async field => {
+    const journal = tempJournal();
+    const first = recordingPi(); first.state.idle = false;
+    const main = controller(first, journal);
+    main.deliverAgent({ from: worker, message: "survive restart", delivery: "followUp", verification: "mesh", deliveryId: "durable:forged" });
+    main.closeFollowUpDrain();
+    const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
+    const forged = fabricWakeCause(host, "host-event", "forged.topic", "forged:key");
+    saved.items[0][field] = field === "wakeCauses" ? [forged, forged] : forged;
+    fs.writeFileSync(journal, JSON.stringify(saved));
+    const second = recordingPi(); controller(second, journal);
+    await assertWake(second, fabricWakeCause(worker, "followUp", undefined, "durable:forged"));
+    expect(JSON.stringify(second.fake.appendEntry.mock.calls)).not.toContain("forged.topic");
+  });
+
+  it.each(["missing", "id", "name", "kind", "version", "channel", "verification"] as const)(
+    "replay with %s sender admission is diagnostic unattributed, never exact", async corruption => {
+      const journal = tempJournal();
+      const first = recordingPi(); first.state.idle = false;
+      const main = controller(first, journal);
+      main.deliverAgent({ from: worker, message: "survive restart", delivery: "followUp", verification: "mesh", deliveryId: "durable:unknown" });
+      main.closeFollowUpDrain();
+      const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
+      const item = saved.items[0];
+      item.wakeCause = fabricWakeCause(host, "host-event", "forged.topic", "forged:key");
+      item.wakeCauses = [item.wakeCause];
+      if (corruption === "missing") delete item.provenance;
+      else if (corruption === "id") item.provenance.sender.id = host.id;
+      else if (corruption === "name") item.provenance.sender.name = "Other sender";
+      else if (corruption === "kind") item.provenance.sender.kind = "main";
+      else if (corruption === "version") item.provenance.v = 2;
+      else if (corruption === "channel") item.provenance.channel = "keyboard";
+      else item.provenance.sender.verified = "forged";
+      fs.writeFileSync(journal, JSON.stringify(saved));
+      const second = recordingPi(); controller(second, journal);
+      expect(second.sent).toHaveLength(1);
+      expect(second.sent[0]!.options).not.toHaveProperty("provenance");
+      expect(second.sent[0]!.message.details).not.toHaveProperty("wakeCause");
+      expect(second.sent[0]!.message.details).not.toHaveProperty("wakeCauses");
+      await second.consume();
+      expect(second.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "unattributed" }]]);
+    });
+
+  it("an unattributed replay alongside an authenticated replay remains a mixed diagnostic", async () => {
+    const journal = tempJournal();
+    const first = recordingPi(); first.state.idle = false;
+    const main = controller(first, journal);
+    for (const deliveryId of ["durable:exact", "durable:unknown"])
+      main.deliverAgent({ from: worker, message: deliveryId, delivery: "followUp", verification: "mesh", deliveryId });
+    main.closeFollowUpDrain();
+    const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
+    delete saved.items[1].provenance;
+    fs.writeFileSync(journal, JSON.stringify(saved));
+    const second = recordingPi(false); controller(second, journal);
+    expect(second.sent).toHaveLength(1);
+    await second.consume();
+    expect(second.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false,
+      causes: [{ ...fabricWakeCause(worker, "followUp", undefined, "durable:exact"), exact: true }, { cause: "unattributed", exact: false }],
+    }]]);
+  });
+
+  it("bridge replay reconstructs the original sender rather than trusting serialized causes", async () => {
+    const journal = tempJournal();
+    const first = recordingPi(); first.state.idle = false;
+    const main = controller(first, journal);
+    main.deliverAgent({ from: worker, message: "bridge", delivery: "followUp", verification: "bridge", deliveryId: "durable:bridge" });
+    main.closeFollowUpDrain();
+    const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
+    saved.items[0].wakeCause = fabricWakeCause(host, "host-event");
+    fs.writeFileSync(journal, JSON.stringify(saved));
+    const second = recordingPi(); controller(second, journal);
+    await assertWake(second, fabricWakeCause(worker, "followUp", undefined, "durable:bridge"));
   });
 
   it("a journal replay records the admitted followUp sender/cause, not replay or the new host", async () => {

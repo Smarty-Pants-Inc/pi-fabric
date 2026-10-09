@@ -13,6 +13,13 @@ export const deliverRootInbox = (
   options: Parameters<ExtensionAPI["sendMessage"]>[1] = { deliverAs: "followUp", triggerTurn: true },
 ): void => {
   if (!events.length) return;
+  const seen = new Set<string>();
+  events = events.filter(event => {
+    const key = JSON.stringify([event.from.kind, event.from.id, event.topic, event.id]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   let start = 0;
   while (start < events.length) {
     const first = events[start]!;

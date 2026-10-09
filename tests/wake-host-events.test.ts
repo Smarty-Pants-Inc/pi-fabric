@@ -251,7 +251,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", "fabric.control.command", forged.id));
   });
 
-  it("resident lifecycle outbox -> client -> replay derives writer/topic/key from the admitted storage envelope", async () => {
+  it("resident lifecycle replay is unattributed when the original writer differs from the journalled sender", async () => {
     const root = tempRoot();
     const { cfg, host } = await resident(root);
     const participants = await directory(root, host.mesh, identity(cfg.rootId));
@@ -266,7 +266,11 @@ describe("host-event attribution through lifecycle routing and durable resident 
     expect(held).toMatchObject({ from: lifecycleSourceIdentity(event.source), wakeCause: expected });
     recording.controller.closeFollowUpDrain();
     const replay = main(root, "root", true, recording.journal);
-    await assertWake(replay, expected);
+    // Live admission knew the storage writer, but the durable sender/provenance
+    // identifies the observed producer. A serialized wakeCause cannot repair that.
+    expect(replay.sent[0]!.message.details).not.toHaveProperty("wakeCause");
+    await replay.consume();
+    expect(replay.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "unattributed" }]]);
   });
 
   it("resident lifecycle -> remote control names real command sender; passive remote records no wake", async () => {

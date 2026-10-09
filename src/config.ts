@@ -176,14 +176,14 @@ export interface FabricAgentConfig {
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
-  /** Host-only Linux user scope slice; unset launches workers directly. */
+  /** Root-policy Linux user scope slice (legacy agent-dir fallback during rollout). */
   processSlice?: string;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   model?: string;
-  /** Host-only fleet policy; workspace configuration cannot override these keys. */
+  /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
-  /** Host-only explicit-selection exception policy; [] disables the reason gate. */
+  /** Root/default reason baseline unioned with agent-dir additions; only root may relax. */
   modelPolicy: { requireReason: string[] };
   deniedModelReplacement?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */

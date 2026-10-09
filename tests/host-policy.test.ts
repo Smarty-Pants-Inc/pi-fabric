@@ -217,6 +217,48 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(config.liveLandlockSettings(loaded, agentDir).disabled).toBe(false);
   });
 
+  it.runIf(process.platform === "linux")("enforces real Bash despite agent-dir edits; only a verified root flip disables it", async () => {
+    simulateRootOwnership(); writePolicy({});
+    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
+    const loaded = load().executor.landlock;
+    const tmpdir = path.join(agentDir, "private-tmp"); fs.mkdirSync(tmpdir, { mode: 0o700 });
+    vi.stubEnv("TMPDIR", tmpdir); vi.stubEnv("SMARTY_ROLE", "task-agent@reviewed-policy");
+    const { PiToolsProvider } = await import("../src/providers/pi-tools-provider.js");
+    const { ActionRegistry } = await import("../src/core/action-registry.js");
+    const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
+    const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
+    const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
+    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+      powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
+      getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
+    });
+    const registry = new ActionRegistry(); registry.register(provider);
+    const context = { cwd, extensionContext: runner.createContext(), signal: new AbortController().signal,
+      parentToolCallId: "root-policy-parent", nestedToolCallId: "root-policy-bash", update: () => {},
+      approve: async () => {}, audits: [], maxResultChars: 100_000,
+    };
+    const victim = path.join(agentDir, "victim");
+    const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+    const writeVictim = async (): Promise<boolean> => {
+      try {
+        const result = await registry.invoke("pi.bash", { command: `printf released > ${quote(victim)}` }, context) as { ok: boolean };
+        return result.ok;
+      } catch { return false; }
+    };
+    try {
+      expect(await writeVictim()).toBe(false);
+      expect(fs.existsSync(victim)).toBe(false);
+      writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
+      expect(await writeVictim()).toBe(false); // an edit after session load cannot grant an escape
+      writePolicy({ executor: { landlock: { disabled: true } } });
+      expect(await writeVictim()).toBe(true);
+      expect(fs.readFileSync(victim, "utf8")).toBe("released");
+      fs.chmodSync(HOST_POLICY_PATH, 0o660); fs.writeFileSync(victim, "protected");
+      expect(await writeVictim()).toBe(false);
+      expect(fs.readFileSync(victim, "utf8")).toBe("protected");
+    } finally { await registry.close(); }
+  });
+
   it("ignores environment/config attempts to select a different authority path", () => {
     const other = path.join(agentDir, "other-policy.json");
     fs.writeFileSync(other, JSON.stringify({ executor: { landlock: { disabled: true } } }));

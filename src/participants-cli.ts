@@ -122,7 +122,15 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   // The store reads a damaged or envelope-invalid state.json (`{}`, `null`) as an empty state. For
   // a reader that keeps its last snapshot on failure, that must fail, not print [] (pi-fabric#157).
   // An absent state.json is an empty mesh.
+  // The backend is decided ONCE, here: a marker removed after this read cannot turn the SQLite read into a
+  // file read of a missing state.json (an empty mesh). The SQLite open re-checks the marker and refuses then.
+  const moved = readMeshStateMovedMarker(root) !== undefined;
   try {
+    // Any state.db without the marker (lstat: a link or a stray file counts) is a switched root that lost its
+    // marker or a half-done switch: never read it as an empty file mesh.
+    if (!moved && fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false })) {
+      throw new Error("state.db exists but state.json is not the moved marker");
+    }
     assertMeshStateReadable(root);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -133,7 +141,7 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   // A root switched to SQLite (state.json is the moved marker) is read from state.db, whatever this
   // process's configured backend is (smarty-dev#6477: the probe failed on every release after the switch).
   const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS,
-    readMeshStateMovedMarker(root) === undefined ? {} : { stateBackend: "sqlite" });
+    moved ? { stateBackend: "sqlite" } : {});
   const directory = new ParticipantDirectory(store, {
     enabled: true,
     hostId: id,

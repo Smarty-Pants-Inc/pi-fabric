@@ -104,6 +104,33 @@ describe("fabric-participants", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")("denies a switched root whose state.db is a link, foreign-writable, missing or without its marker, never []", async () => {
+    const other = scratch();
+    await addRoot(new MeshStore(other, 64 * 1024, 1_000), "other");
+    await importMeshState(other);
+    const root = scratch();
+    await addRoot(new MeshStore(root, 64 * 1024, 1_000), "mine");
+    await importMeshState(root);
+    const db = path.join(root, "state.db");
+    const denied = async (why: string) => {
+      const result = await run(["--json", "--mesh", root, "--kind", "root"]);
+      expect(result, why).toMatchObject({ code: 2, out: "" });
+      expect(result.err, why).toContain("FABRIC_MESH_UNREADABLE");
+    };
+    fs.renameSync(db, `${db}.aside`);
+    fs.symlinkSync(path.join(other, "state.db"), db); // another mesh's database
+    await denied("symbolic link");
+    fs.unlinkSync(db);
+    await denied("marker without its database");
+    fs.renameSync(`${db}.aside`, db);
+    fs.chmodSync(db, 0o666);
+    await denied("group/world-writable database");
+    fs.chmodSync(db, 0o600);
+    expect((await run(["--json", "--mesh", root, "--kind", "root"])).code).toBe(0);
+    fs.unlinkSync(path.join(root, "state.json")); // the marker is gone: never an empty file mesh
+    await denied("database without its marker");
+  });
+
   it("prints [] for an empty mesh and exits 2 with a named error for a missing one", async () => {
     const root = scratch();
     expect(await run(["--mesh", root])).toEqual({ code: 0, out: "[]\n", err: "" });

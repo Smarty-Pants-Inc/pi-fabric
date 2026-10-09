@@ -320,6 +320,15 @@ const statStamp = (filePath: string): string | undefined => {
   }
 };
 
+// ponytail: the same no-follow test as state-sqlite.ts assertPrivatePath (pi-fabric#694 P2-E; #713's root gate),
+// inlined because state-sqlite.ts imports this module. The SQLite open re-runs its own gate on this exact path.
+const privateStateFile = (file: string): boolean => {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile()) return false; // lstat: a symbolic link is never a file here
+  if (process.platform === "win32" || typeof process.getuid !== "function") return true;
+  return stat.uid === process.getuid() && (stat.mode & 0o022) === 0;
+};
+
 /**
  * Strict read-only check of a mesh root's state.json (pi-fabric#157). An absent file is a valid empty
  * mesh; a present file that is empty, damaged, or not a state envelope (`{}`, `null`) throws. The
@@ -328,9 +337,11 @@ const statStamp = (filePath: string): string | undefined => {
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
   // After the SQLite switch state.json is the moved marker and state.db is the state: a SQLite store reads it
   // and a file store's reads fail closed on the marker (smarty-dev#6477), so the marker is not damage here.
-  // A marker without its database still fails closed below (an alarm, never an empty mesh).
+  // A marker without its database, or with anything but our own private regular file there (a symbolic link to
+  // another mesh's database, a directory, a foreign or group/world-writable file), still fails closed below:
+  // the marker is not state, so the read throws (an alarm, never an empty mesh).
   const moved = readMeshStateMovedMarker(root);
-  if (moved !== undefined && fs.existsSync(path.resolve(root, moved.movedTo))) return;
+  if (moved !== undefined && privateStateFile(path.join(root, "state.db"))) return;
   const file = path.resolve(root, "state.json");
   const identity = stateReadIdentity(file, maxBytes);
   const shared = processReadSnapshots.get(file)?.deref();

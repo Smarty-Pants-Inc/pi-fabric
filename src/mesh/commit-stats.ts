@@ -441,9 +441,10 @@ export const readLockStats = (root: string, problems: string[] = [],
     names = fs.readdirSync(directory);
   } catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
   // A file is written after each minute it holds, so one modified before the window starts
-  // holds no minute in it: skip it before the cap, and cap the newest (smarty-dev#7826).
+  // holds no minute in it: skip it before the cap, and cap the newest (smarty-dev#7826). The
+  // window is summarizeLockStats's exactly: the `span` complete minutes before the current one.
   const span = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(options.minutes ?? LOCK_STATS_RETAIN_MINUTES)));
-  const since = lockStatsWindowStartMs(options.now ?? Date.now(), span + 1);
+  const since = lockStatsWindowStartMs(options.now ?? Date.now(), span);
   const candidates: Array<{ name: string; mtimeMs: number }> = [];
   for (const name of names) {
     if (!name.endsWith(".json")) continue;

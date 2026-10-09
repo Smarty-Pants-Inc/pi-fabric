@@ -497,6 +497,15 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     const io = { stdout: (text: string) => { out += text; }, stderr: () => {}, now };
     expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
     expect(out).toContain("3 acquisitions");
+    // The boundary is the summary window's first minute (MINUTE0 with --minutes 2 at MINUTE0 + 2):
+    // a file last written just before it is skipped; one written at its start is read.
+    fixture(root, "edge-before", 8, [{ minute: MINUTE0 - 1, classes: { publish: bucket({ n: 1 }) } }]);
+    fixture(root, "edge-at", 9, [{ minute: MINUTE0, classes: { publish: bucket({ n: 1 }) } }]);
+    fs.utimesSync(path.join(directory, "edge-before-8.json"), (MINUTE0 * 60_000 - 1) / 1000, (MINUTE0 * 60_000 - 1) / 1000);
+    fs.utimesSync(path.join(directory, "edge-at-9.json"), MINUTE0 * 60, MINUTE0 * 60);
+    expect(readLockStats(root, [], { minutes: 2, now }).map(file => file.host).sort()).toEqual(["edge-at", "zzz-bridge"]);
+    fs.unlinkSync(path.join(directory, "edge-before-8.json"));
+    fs.unlinkSync(path.join(directory, "edge-at-9.json"));
     // Still over the cap inside the window: the newest are read and the cut is reported.
     for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, []);
     const newer = Date.now() / 1000 + 3_600;

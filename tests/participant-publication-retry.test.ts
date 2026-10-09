@@ -34,11 +34,13 @@ const setup = async (wait: () => Promise<void>) => {
 };
 
 it("uses one off-heartbeat jittered retry lane capped at 2 s, and admits only a fresh commit", async () => {
-  let tries = 0;
-  const s = await setup(async () => { if (++tries < 4) throw timeout(); s.block(false); });
+  let tries = 0, inline = true;
+  const s = await setup(async () => { if (inline || ++tries < 4) throw timeout(); s.block(false); });
   vi.spyOn(Math, "random").mockReturnValue(0.999);
   s.block(true); const prior = s.directory.confirmedAt();
-  await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+  const failed = expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+  await vi.advanceTimersByTimeAsync(1_800); await failed; // spend the four-try heartbeat budget first
+  expect(s.admission).toHaveBeenCalledTimes(3); inline = false; s.admission.mockClear();
   for (let actor = 0; actor < 40; actor++) {
     s.directory.scheduleRefresh(); await s.directory.refreshPresence(); expect(s.directory.canConsumeMesh()).toBe(false);
   }
@@ -56,11 +58,14 @@ it("uses one off-heartbeat jittered retry lane capped at 2 s, and admits only a 
 it.each(["close", "quiesce"] as const)("%s drains the outside-custody wait and cancels its retry timer", async operation => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const s = await setup(() => gate);
+  let inline = true;
+  const s = await setup(() => inline ? Promise.reject(timeout()) : gate);
   try {
     vi.spyOn(Math, "random").mockReturnValue(0);
     s.block(true);
-    await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const failed = expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(450); await failed;
+    expect(s.admission).toHaveBeenCalledTimes(3); inline = false; s.admission.mockClear();
     await vi.advanceTimersByTimeAsync(50); expect(s.admission).toHaveBeenCalledOnce();
     let finished = false;
     const stopping = s.directory[operation]().then(() => { finished = true; });

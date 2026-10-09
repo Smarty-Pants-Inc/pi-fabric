@@ -1230,7 +1230,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         persona: vedaPersona ?? DEFAULT_FABRIC_CONFIG.agents.veda.persona,
       },
       thinking: agentThinking,
-      ...(isFabricThinking(agents.thinking) ? { configuredThinking: agents.thinking } : {}),
+      // Idempotent: a normalized config carries the key (possibly undefined), so re-normalizing keeps it
+      // instead of promoting the filled-in thinking fallback to a configured value.
+      configuredThinking: Object.hasOwn(agents, "configuredThinking")
+        ? (isFabricThinking(agents.configuredThinking) ? agents.configuredThinking : undefined)
+        : (isFabricThinking(agents.thinking) ? agents.thinking : undefined),
       maxConcurrent: boundedInteger(
         agents.maxConcurrent,
         DEFAULT_FABRIC_CONFIG.agents.maxConcurrent,

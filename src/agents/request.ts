@@ -11,7 +11,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
-  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; configuredThinking?: AgentRunRequest["thinking"]; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
+  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; configuredThinking?: AgentRunRequest["thinking"]; deniedModels?: readonly string[]; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
   if (args.model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
@@ -29,7 +29,10 @@ export const normalizeAgentRunRequest = (
       ? args.runner
       : defaults.runner;
   const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
-  const configuredModel = runner === "pi" ? defaults.model : undefined;
+  // A configured default that fleet policy denies does not win: fall back to the caller's admitted
+  // binding (#2490), so the deny-replacement path stays where it was before #6062.
+  const configuredModel = runner === "pi" && defaults.model && !defaults.deniedModels?.includes(defaults.model)
+    ? defaults.model : undefined;
   // Configured defaults win. Otherwise inherit the caller's admitted Pi binding,
   // also in actor/task processes whose Main target is remote. Never infer from that target.
   const inheritedModel = runner === "pi" && !explicitModel && !configuredModel && defaults.inheritedModel

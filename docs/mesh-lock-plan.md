@@ -108,7 +108,7 @@ nice -n 10 taskset -c 4-11 bun scripts/mesh-load.ts --root <scratch-mesh> --seed
   --put-share 0.4 --custody-share 0.4 --target-writes-per-min 2400 --target-processes 12 --max-workers 12 --duration 600
 ```
 
-The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy, instead of queueing them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
+The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy and does not queue them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
 
 ## 5. Rollback
 

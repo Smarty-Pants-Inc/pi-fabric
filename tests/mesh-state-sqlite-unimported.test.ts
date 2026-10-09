@@ -3,11 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { assertFileStateWritable, encodeMeshStateMovedMarker, MeshBackendFenceError, readMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { ShadowStateBackend } from "../src/mesh/state-backend.js";
 import { StateProjector } from "../src/mesh/state-projector.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { MeshStateUnsupportedError, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
@@ -319,6 +321,69 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
           expect(fs.readdirSync(root).filter((name) => /\.(tmp|aside)$/.test(name))).toEqual([]);
           delete globals[MARKER_HOOK];
         }
+      }
+    });
+
+    it("(6) is serialized with a file-mode writer that read the fresh state.json first: one authority (review round 2)", async () => {
+      const populated = JSON.stringify({ format: 1, revisionFormat: 2, entries: { live: { key: "live", value: 1, version: 1 } }, highWater: 1 });
+      const stateJson = (root: string): string => path.join(root, "state.json");
+      const seed = (label: string, start: "absent" | "zero-length" | "empty"): string => {
+        const root = tempRoot(`create-writer-${label}-${start}`);
+        if (start === "zero-length") fs.writeFileSync(stateJson(root), "");
+        if (start === "empty") fs.writeFileSync(stateJson(root), JSON.stringify({ format: 1, entries: {}, highWater: 0 }));
+        return root;
+      };
+      // A file-mode writer's commit, as StateFile does it under .lock: the fence check, then temp and rename over state.json.
+      const commit = (root: string): void => {
+        assertFileStateWritable(root);
+        const temp = path.join(root, "state.json.writer.tmp");
+        fs.writeFileSync(temp, populated);
+        fs.renameSync(temp, stateJson(root));
+      };
+      const fresh = (root: string): boolean => {
+        const text = fs.existsSync(stateJson(root)) ? fs.readFileSync(stateJson(root), "utf8") : "";
+        return text === "" || Object.keys((JSON.parse(text) as { entries: object }).entries).length === 0;
+      };
+      const meshLock = (root: string): MeshLock => new MeshLock(root, { lockProtocol: 1, lockTimeoutMs: 10_000 }, () => undefined);
+      for (const start of ["absent", "zero-length", "empty"] as const) {
+        // Happen-before: the writer holds .lock from its read through its rename. Create waits on the fence, then
+        // its re-checked guard sees the writer's state and refuses: state.json is the only authority, no state.db.
+        const first = seed("first", start);
+        let creating: Promise<unknown> | undefined;
+        await meshLock(first).withLockAcrossAwait(async () => {
+          expect(fresh(first)).toBe(true);
+          creating = createAsync(first).then((store) => { sqliteStores.push(store); return store; }, (error: unknown) => error);
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          expect(fs.existsSync(path.join(first, "state.db")), start).toBe(false);
+          commit(first);
+        });
+        const outcome = await creating;
+        expect(outcome, start).toBeInstanceOf(MeshStateUnsupportedError);
+        expect((outcome as Error).message).toMatch(refusal);
+        expect(fs.readFileSync(stateJson(first), "utf8")).toBe(populated);
+        expect(fs.existsSync(path.join(first, "state.db"))).toBe(false);
+
+        // The synchronous create cannot enter while the writer holds .lock either: it times out with no side effect.
+        const blocked = seed("sync", start);
+        await meshLock(blocked).withLockAcrossAwait(async () => {
+          expect(() => SqliteStateStore.openSync(blocked, 64 * 1024, 1_000, { initialize: "create", lockTimeoutMs: 100 })).toThrow(MeshLockTimeoutError);
+          expect(fs.existsSync(path.join(blocked, "state.db"))).toBe(false);
+          expect(readMeshStateMovedMarker(blocked)).toBeUndefined();
+          commit(blocked);
+        });
+        expect(() => create(blocked)).toThrow(refusal);
+        expect(fs.readFileSync(stateJson(blocked), "utf8")).toBe(populated);
+
+        // Fenced: the writer read the fresh state.json BEFORE the create, which then ran; its later commit is
+        // refused by the fence and the marker stays: SQLite is the only authority.
+        const late = seed("late", start);
+        expect(fresh(late)).toBe(true);
+        const store = await createAsync(late);
+        sqliteStores.push(store);
+        await expect(meshLock(late).withLock(() => commit(late))).rejects.toThrow(MeshBackendFenceError);
+        await expect(open(late, { stateBackend: "file" }).put({ key: "f", value: 1, identity })).rejects.toThrow();
+        expect(readMeshStateMovedMarker(late)).toMatchObject({ epoch: 1 });
+        expect(fs.existsSync(path.join(late, "state.json.writer.tmp"))).toBe(false);
       }
     });
   });

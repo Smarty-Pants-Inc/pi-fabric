@@ -89,8 +89,8 @@ import { storageRevision } from "../verified/storage.js";
 import { assertFileStateWritable, encodeMeshStateMovedMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf, readMeshStateMovedMarker,
   readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
-import { acquireMeshCustodyLock } from "./custody-lock.js";
-import { MeshLock } from "./mesh-lock.js";
+import { holdMeshFence } from "./fence-lock.js";
+import type { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
@@ -538,22 +538,14 @@ class FenceDb {
 
 const maxBytesOf = (options: MeshBackendOptions): number => Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES));
 
-const meshLock = (root: string, options: MeshBackendOptions): MeshLock =>
-  new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, () => undefined);
-
 /**
  * The migration fence (smarty-dev#6477, org decision 10-08): `custody.lock` then `.lock` (the
  * order of withMeshCustody), both held across awaits for the whole section; this tool is a
- * dedicated process. Nothing else gates a mutating operation: the census is advisory.
+ * dedicated process. Nothing else gates a mutating operation: the census is advisory. The helper is
+ * shared with a fixture's `initialize: "create"` (fence-lock.ts), the only other marker writer.
  */
-const holdFence = async <T>(root: string, options: MeshBackendOptions, operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
-  const timeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_MS;
-  const releaseCustody = await acquireMeshCustodyLock(root, timeoutMs);
-  try {
-    const lock = meshLock(root, options);
-    return await lock.withLockAcrossAwait(async () => operation(lock), timeoutMs, "other");
-  } finally { releaseCustody(); }
-};
+const holdFence = <T>(root: string, options: MeshBackendOptions, operation: (lock: MeshLock) => Promise<T> | T): Promise<T> =>
+  holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, operation);
 
 const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
   decodeMeshStateFile(path.join(root, STATE_JSON), maxBytesOf(options), false) as FencedFile;

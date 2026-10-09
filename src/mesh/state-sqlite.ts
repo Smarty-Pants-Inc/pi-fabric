@@ -77,6 +77,7 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, readMeshStateMovedMarker } from "./backend-fence.js";
+import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { MeshLockTicket } from "./lock-queue.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
@@ -252,7 +253,9 @@ const raced = (root: string, why: string): MeshStateUnsupportedError => importFi
  * absent state.json is created with link(2) (fails if anything appeared); an empty one is first renamed aside, so
  * the inode that is judged is the inode that is replaced, and the marker is linked in only while the name is
  * still free. A claimed state.json that turns out to be populated is linked back unchanged (same inode, same
- * bytes) and the open refuses. No step overwrites a name another writer may have just written.
+ * bytes) and the open refuses. No step overwrites a name another writer may have just written. Runs under the
+ * fence (review round 2), so a file-mode writer cannot rename over the marker afterwards; the claim protocol
+ * stays for writers that ignore `.lock`.
  */
 const ensureMovedMarker = (root: string, epoch: number): void => {
   markerHook("before-marker", root);
@@ -352,7 +355,8 @@ export interface SqliteStateStoreOptions {
    * Who may initialise state.db (smarty-dev#6477). Default: nobody; only an imported mesh root opens (an
    * initialised state.db plus the moved marker), anything else refuses with no side effect. "create":
    * test fixtures and harnesses only: a FRESH root (no state.json or an empty one) is initialised as an
-   * import would leave it (state.db at epoch 1 plus the moved marker). "detached": a database outside the
+   * import would leave it (state.db at epoch 1 plus the moved marker), under the import's fence
+   * (custody.lock, then .lock; fence-lock.ts) from the re-checked guard through the marker. "detached": a database outside the
    * mesh root that is never a fence (the shadow backend's and the shadow projector's copies).
    */
   initialize?: "create" | "detached";
@@ -667,7 +671,18 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    const initialize = guardBeforeOpen(root, initializeOf(options));
+    const requested = initializeOf(options);
+    const initialize = guardBeforeOpen(root, requested);
+    if (initialize !== "create") return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+    // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
+    // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
+    // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
+    return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
+      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
+  }
+
+  static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
+    initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
@@ -707,7 +722,16 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    const initialize = guardBeforeOpen(root, initializeOf(options));
+    const requested = initializeOf(options);
+    const initialize = guardBeforeOpen(root, requested);
+    if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+    // The same fence as open() (a synchronous caller: bounded synchronous attempts at the same two locks).
+    return holdMeshFenceSync(root, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS, () =>
+      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
+  }
+
+  static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
+    initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }

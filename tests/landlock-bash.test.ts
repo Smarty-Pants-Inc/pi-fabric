@@ -116,7 +116,7 @@ describe("Landlock settings", () => {
     fs.mkdirSync(agentDir); fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { landlock: { disabled: true } } }));
     fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: false } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock).toEqual({ mode: "enforce", disabled: true });
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 });
 
@@ -543,7 +543,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     await expect(h.registry.close()).resolves.toBeUndefined();
   });
 
-  it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
+  it("F2: a missing root policy keeps already-active lanes confined; agent edits cannot override", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));
     roots.push(agentDir);
     const hostFile = path.join(agentDir, "fabric.json");
@@ -567,8 +567,8 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     }
     fs.writeFileSync(hostFile, JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: true } } }));
     for (const lane of lanes) {
-      expect((await lane.invoke({ command: `printf released > ${quote(path.join(lane.sibling, "victim"))}` })).ok).toBe(true);
-      expect(fs.readFileSync(path.join(lane.sibling, "victim"), "utf8")).toBe("released");
+      expect((await lane.invoke({ command: `printf still-confined > ${quote(path.join(lane.sibling, "victim"))}`, settle: true })).ok).toBe(false);
+      expect(fs.readFileSync(path.join(lane.sibling, "victim"), "utf8")).toBe("keep-me");
     }
   });
 

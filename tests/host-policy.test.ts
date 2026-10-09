@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { HOST_POLICY_PATH, REQUIRE_HOST_POLICY } from "../src/host-policy.js";
+import { HOST_POLICY_PATH } from "../src/host-policy.js";
 
 type Metadata = { uid?: number; mode?: number; dev?: number; ino?: number };
 const policyDirectory = path.dirname(HOST_POLICY_PATH);
@@ -57,7 +57,7 @@ const writeAgent = (document: unknown): void => {
 };
 const load = () => config.loadFabricConfig({ cwd, agentDir, projectTrusted: true });
 
-// POSIX uid/mode/O_NOFOLLOW policy; Windows retains missing-policy rollout.
+// POSIX uid/mode/O_NOFOLLOW policy; Windows skips root metadata checks.
 describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", () => {
   beforeEach(async () => {
     // Hard guard: test build constant must point into its private temp directory.
@@ -77,20 +77,42 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     for (const directory of [policyDirectory, agentDir, cwd]) fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("warns once and retains missing-policy behavior only during rollout", () => {
-    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
-      processSlice: "legacy.slice", deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] },
+  it("fails safe when missing: Landlock stays enforced and agent relaxations are ignored", () => {
+    writeAgent({ executor: { landlock: { mode: "off", disabled: true } }, agents: {
+      processSlice: "legacy.slice", deniedModels: [], modelPolicy: { requireReason: [] },
     } });
     for (let i = 0; i < 3; i++) {
       const loaded = load();
-      expect(loaded.executor.landlock.disabled).toBe(!REQUIRE_HOST_POLICY);
-      expect(loaded.agents.processSlice).toBe(REQUIRE_HOST_POLICY ? undefined : "legacy.slice");
-      expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
-      expect(loaded.agents.modelPolicy.requireReason).toEqual(REQUIRE_HOST_POLICY ? ["gpt-6-astra"] : []);
-      expect(config.readHostLandlockDisabled(agentDir)).toBe(!REQUIRE_HOST_POLICY);
+      expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
+      expect(loaded.agents.processSlice).toBeUndefined();
+      expect(loaded.agents.deniedModels).toEqual([]);
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+      expect(config.readHostLandlockDisabled(agentDir)).toBe(false);
+      expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "enforce", disabled: false });
     }
     expect(warn.mock.calls.filter(call => String(call[0]).includes("is missing"))).toHaveLength(1);
-    expect(warn.mock.calls.filter(call => String(call[0]).includes("agent-dir executor.landlock.disabled"))).toHaveLength(1);
+    expect(String(warn.mock.calls.find(call => String(call[0]).includes("is missing"))?.[0])).toContain(HOST_POLICY_PATH);
+  });
+
+  it.each(["off", "permissive", "warn", "audit"])("ignores agent mode %s with missing or provisioned root policy", mode => {
+    writeAgent({ executor: { landlock: { mode } } });
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    simulateRootOwnership(); writePolicy({});
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+  });
+
+  it("enforces without either a root policy or an agent configuration file", () => {
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+  });
+
+  it("keeps tightening agent settings without a root policy", () => {
+    writeAgent({ executor: { landlock: { mode: "enforce" } }, agents: {
+      deniedModels: ["agent-deny"], modelPolicy: { requireReason: ["agent-reason"] },
+    } });
+    const loaded = load();
+    expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    expect(loaded.agents.deniedModels).toEqual(["agent-deny"]);
+    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "agent-reason"]);
   });
 
   it("applies root relaxations and unions only agent restrictions across all loaders", () => {
@@ -106,7 +128,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     for (const loaded of [load(), config.loadGlobalFabricConfig(agentDir),
       config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "global")]) {
       expect(loaded.executor.landlock.disabled).toBe(true);
-      expect(loaded.executor.landlock.mode).toBe("off"); // root file is not general settings
+      expect(loaded.executor.landlock.mode).toBe("enforce"); // root policy controls Landlock mode
       expect(loaded.fullCodeMode).toBe(config.DEFAULT_FABRIC_CONFIG.fullCodeMode);
       expect(loaded.agents.processSlice).toBe("root.slice");
       expect(loaded.agents.deniedModels).toEqual(["root-deny", "agent-deny"]);
@@ -121,19 +143,19 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(load().agents.modelPolicy.requireReason).toEqual([]);
   });
 
-  it("ignores agent kill switch once provisioned and preserves default reason gate", () => {
+  it("ignores agent kill switch once provisioned and preserves root Landlock mode", () => {
     simulateRootOwnership(); writePolicy({});
     writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
       deniedModels: ["agent-deny"], modelPolicy: { requireReason: ["extra-reason"] },
     } });
-    expect(load().executor.landlock.disabled).toBe(false);
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
     expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "extra-reason"]);
     writeAgent({ agents: { deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] } } });
     expect(load().agents.deniedModels).toEqual(["agent-deny"]);
     expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
   });
 
-  it.each(["non-root", "group-writable", "world-writable", "directory", "malformed", "array", "symlink"])("rejects %s policy with no legacy fallback", kind => {
+  it.each(["non-root", "group-writable", "world-writable", "directory", "malformed", "array", "symlink"])("rejects %s policy without fallback", kind => {
     simulateRootOwnership();
     writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } }, agents: {
       processSlice: "unsafe.slice", deniedModels: ["agent-deny"], modelPolicy: { requireReason: [] },
@@ -165,6 +187,19 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     if (process.getuid?.() === 0) return; // covered above via explicit non-root uid on root runners
     writePolicy({ executor: { landlock: { disabled: true } } });
     expect(policy.readHostPolicy().status).toBe("invalid");
+  });
+
+  it("applies a root-owned mode-off relaxation while ignoring the agent copy", () => {
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: "off" } } });
+    writeAgent({ executor: { landlock: { mode: "off", disabled: false } } });
+    const loaded = load().executor.landlock;
+    expect(loaded).toEqual({ mode: "off", disabled: false });
+    expect(config.liveLandlockSettings(loaded, agentDir)).toEqual(loaded);
+    writePolicy({});
+    expect(config.liveLandlockSettings(loaded, agentDir)).toEqual({ mode: "enforce", disabled: false });
+    writePolicy({ executor: { landlock: { mode: "off" } } });
+    writeAgent({ executor: { landlock: { mode: "enforce" } } });
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 
   it.each(["non-root", "writable", "symlink"])("rejects %s ancestry", kind => {
@@ -199,7 +234,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(() => fs.readFileSync(openedDescriptor!)).toThrow();
   });
 
-  it("does not enter legacy fallback if an existing file vanishes before open", () => {
+  it("does not fall back if an existing file vanishes before open", () => {
     simulateRootOwnership(); writePolicy({});
     vi.mocked(fs.openSync).mockImplementationOnce(() => { throw Object.assign(new Error("removed"), { code: "ENOENT" }); });
     expect(policy.readHostPolicy().status).toBe("invalid");
@@ -217,9 +252,13 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(config.liveLandlockSettings(loaded, agentDir).disabled).toBe(false);
   });
 
-  it.runIf(process.platform === "linux")("enforces real Bash despite agent-dir edits; only a verified root flip disables it", async () => {
-    simulateRootOwnership(); writePolicy({});
-    writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
+  it.skipIf(process.platform !== "linux").each([
+    { mode: "enforce", disabled: true },
+    { mode: "off" },
+    { mode: "permissive" },
+  ])("enforces real Bash with missing root policy and agent %j; only a verified root flip disables it", async landlock => {
+    simulateRootOwnership();
+    writeAgent({ executor: { landlock } });
     const loaded = load().executor.landlock;
     const tmpdir = path.join(agentDir, "private-tmp"); fs.mkdirSync(tmpdir, { mode: 0o700 });
     vi.stubEnv("TMPDIR", tmpdir); vi.stubEnv("SMARTY_ROLE", "task-agent@reviewed-policy");
@@ -263,9 +302,8 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const other = path.join(agentDir, "other-policy.json");
     fs.writeFileSync(other, JSON.stringify({ executor: { landlock: { disabled: true } } }));
     vi.stubEnv("PI_FABRIC_HOST_POLICY_PATH", other); vi.stubEnv("FABRIC_HOST_POLICY_PATH", other);
-    vi.stubEnv("PI_FABRIC_REQUIRE_HOST_POLICY", String(!REQUIRE_HOST_POLICY));
     writeAgent({ hostPolicyPath: other, agents: { modelPolicy: { requireReason: [] } } });
     expect(policy.readHostPolicy().status).toBe("missing");
-    expect(load().agents.modelPolicy.requireReason).toEqual(REQUIRE_HOST_POLICY ? ["gpt-6-astra"] : []);
+    expect(load().agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
   });
 });

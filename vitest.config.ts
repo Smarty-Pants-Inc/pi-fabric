@@ -11,9 +11,8 @@ const fleet = isolateTestFleetEnvironment();
 const ci = process.env.CI === "true";
 
 // Separate policy projects avoid writing a fixture read by unrelated config tests.
-const policyConstants = (name: string, required = false) => ({
+const policyConstants = (name: string) => ({
   __FABRIC_HOST_POLICY_PATH__: JSON.stringify(join(temp.TMPDIR, `host-policy-${name}`, "fabric-policy.json")),
-  __FABRIC_REQUIRE_HOST_POLICY__: JSON.stringify(required),
 });
 
 const sharedTests = {
@@ -44,12 +43,8 @@ export default {
         test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts", "tests/host-policy.test.ts"] },
       },
       {
-        define: policyConstants("rollout"),
-        test: { ...sharedTests, name: "host-policy-rollout", include: ["tests/host-policy.test.ts"] },
-      },
-      {
-        define: policyConstants("strict", true),
-        test: { ...sharedTests, name: "host-policy-strict", include: ["tests/host-policy.test.ts"] },
+        define: policyConstants("host-policy"),
+        test: { ...sharedTests, name: "host-policy", include: ["tests/host-policy.test.ts"] },
       },
       {
         define: policyConstants("missing"),

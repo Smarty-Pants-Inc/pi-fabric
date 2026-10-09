@@ -1,14 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// Replaced by the bundler. Neither the environment nor fabric.json can select
-// this path or the rollout gate. Vitest supplies private fixture paths only.
+// Production bundles substitute the fixed root-owned path below. Vitest alone
+// supplies private fixture paths; neither environment nor fabric.json selects it.
 declare const __FABRIC_HOST_POLICY_PATH__: string;
-declare const __FABRIC_REQUIRE_HOST_POLICY__: boolean;
 export const HOST_POLICY_PATH = typeof __FABRIC_HOST_POLICY_PATH__ === "undefined"
   ? "/etc/smarty/fabric-policy.json" : __FABRIC_HOST_POLICY_PATH__;
-export const REQUIRE_HOST_POLICY = typeof __FABRIC_REQUIRE_HOST_POLICY__ === "undefined"
-  ? false : __FABRIC_REQUIRE_HOST_POLICY__;
 
 export type HostPolicy =
   | { status: "valid"; document: Record<string, unknown> }
@@ -18,12 +15,10 @@ let warnedMissing = false;
 let warnedInvalid = false;
 let warnedAgentDisabled = false;
 
-export const warnAgentLandlockDisabled = (legacy: boolean): void => {
+export const warnAgentLandlockDisabled = (): void => {
   if (warnedAgentDisabled) return;
   warnedAgentDisabled = true;
-  console.warn(`[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ${legacy
-    ? "honoured only during the missing-host-policy rollout window"
-    : "ignored; provision /etc/smarty/fabric-policy.json as root"}`);
+  console.warn(`[pi-fabric] agent-dir executor.landlock.disabled is not trusted host policy; ignored; provision ${HOST_POLICY_PATH} as root`);
 };
 
 const trustedMode = (stat: fs.Stats): boolean => stat.uid === 0 && (stat.mode & 0o022) === 0;
@@ -55,15 +50,13 @@ export const readHostPolicy = (): HostPolicy => {
     if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error("policy must be a JSON object");
     return { status: "valid", document: document as Record<string, unknown> };
   } catch (error) {
-    // Only an absent policy is eligible for legacy compatibility. Existing but
-    // untrusted/unreadable/malformed policy never falls back to agent authority.
+    // No valid root policy ever falls back to agent authority. Missing and
+    // existing-but-untrusted policies both fail safe.
     const missing = !foundFile && (error as NodeJS.ErrnoException).code === "ENOENT";
     if (missing) {
       if (!warnedMissing) {
         warnedMissing = true;
-        console.warn(`[pi-fabric] ${HOST_POLICY_PATH} is missing; ${REQUIRE_HOST_POLICY
-          ? "agent-dir authority relaxations are disabled"
-          : "retaining legacy agent-dir host policy during rollout"}. Hosts must provision root-owned policy; the follow-up release disables this compatibility window.`);
+        console.warn(`[pi-fabric] ${HOST_POLICY_PATH} is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.`);
       }
       return { status: "missing" };
     }
@@ -76,6 +69,3 @@ export const readHostPolicy = (): HostPolicy => {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
 };
-
-export const legacyHostPolicyAllowed = (policy: HostPolicy): boolean =>
-  policy.status === "missing" && !REQUIRE_HOST_POLICY;

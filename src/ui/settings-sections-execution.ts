@@ -106,11 +106,11 @@ export const buildExecutorSection = (
           ),
         }),
         setting("executor.landlock.mode", "Bash filesystem confinement", config.executor.landlock.mode, {
-          description: "Linux Landlock ABI >=4 only. Off until rollout; enforce denies writes outside the reviewed role list. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command and is logged. Non-Linux unchanged.",
+          description: "Linux Landlock ABI >=4 only. Enforce denies writes outside the reviewed role list; without a valid root policy Fabric fails safe to enforce and ignores agent-dir off/permissive values. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command and is logged. Non-Linux unchanged.",
           values: ["off", "enforce"],
         }),
         setting("executor.landlock.disabled", "Fleet confinement kill switch", String(config.executor.landlock.disabled), {
-          description: "Root-owned /etc/smarty/fabric-policy.json controls this fleet kill switch. Agent-dir values are ignored once provisioned (legacy fallback only while policy is missing); project values are ignored.",
+          description: "Root-owned /etc/smarty/fabric-policy.json controls this fleet kill switch. Agent-dir and project values are ignored without a valid root policy; project values cannot override it.",
           values: BOOLEANS,
         }),
         setting(

@@ -106,11 +106,10 @@ const lazyEntryPoints = [
 
 buildLandlock();
 
-// Production authority selectors are literals, never environment/config inputs.
-// Private test fixtures override these identifiers in Vitest, not this build.
+// The production authority path is a literal. Only Vitest may substitute a
+// private fixture path; there is no production rollout/requirement switch.
 const hostPolicyConstants = {
   __FABRIC_HOST_POLICY_PATH__: JSON.stringify("/etc/smarty/fabric-policy.json"),
-  __FABRIC_REQUIRE_HOST_POLICY__: "false", // rollout window; follow-up flips this
 };
 
 const result = await build({

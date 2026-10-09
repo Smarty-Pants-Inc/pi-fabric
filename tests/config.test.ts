@@ -45,7 +45,7 @@ describe("host-only explicit model exceptions (#3134)", () => {
     fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
   });
@@ -104,12 +104,12 @@ describe("host-only processSlice (#4383)", () => {
       expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
     }
   });
-  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+  it.each([true, false])("ignores project overrides and unprovisioned host slices (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
   });
 });
 

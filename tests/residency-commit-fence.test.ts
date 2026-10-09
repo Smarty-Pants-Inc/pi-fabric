@@ -950,7 +950,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         await delay(900); return actor;
       });
     }
-    const args = requestArgs(state, "create");
+    // This fixture proves receipt expiry and resumed reconciliation, not host idle
+    // exit. Make its writer a real live-Main supervisor so advancing the retention
+    // wall clock cannot race unrelated cold-host shutdown before status/stop.
+    const args = { ...requestArgs(state, "create"), events: ["agent_settled"] };
     const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
     const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
       (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");

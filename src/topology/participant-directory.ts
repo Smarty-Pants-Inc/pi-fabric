@@ -26,6 +26,7 @@ import {
   hostLiveness,
   LIVENESS_POLICY_KEY,
   readHostLease,
+  readHostLeaseCurrent,
   readHostLeaseSnapshot,
   participantLeaseGraceMs,
   waitForHostLeaseRenewal,
@@ -578,6 +579,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #routingReadAt = 0;
   #routingError: unknown;
   #leaseConfirmed = false;
+  /** Only a kept predecessor reload lease needs takeover after the first host commit. */
+  #keptReloadLease = false;
   #deadHostSweepAt = Date.now();
   #presencePassAt = Date.now();
   #quiescing = false;
@@ -765,6 +768,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Every commit witness up to here is accounted for by this receipt, our own commit's included.
       this.#commitWitnessSeen = latestCommitWitness(this.mesh.root);
       this.#leaseConfirmed = true;
+      // Only a reload successor withheld its own lease before the host commit.
+      if (this.#keptReloadLease && this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) {
+        try { this.#renewFileLease(); } catch { /* the next heartbeat renews it */ }
+      }
       this.#refreshError = undefined;
       this.#cancelPublicationRetry();
       this.#publicationRetryDelay = 750;
@@ -2131,8 +2138,41 @@ export class ParticipantDirectory implements FabricParticipantSource {
       latest > this.#commitWitnessSeen && evidence > this.#refreshedAt && at - evidence <= this.#heartbeatMs;
   }
 
+  /** smarty-dev#6729 gate 1: a listing pairs a root with its owner's shared host record, extended
+   * only by a lease file of the same incarnation (hostLiveness). Until this incarnation's first
+   * shared commit stamps its own host record, that record is still the predecessor's; replacing
+   * the predecessor's live reload lease file with this incarnation's (new startedAt) dropped the
+   * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
+   * Its reloadUntil still bounds the listing if this release never commits.
+   * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
+   * fixed 180 s reload lease never outlasts leaseMs >= 180 s (or heartbeatMs >= 90 s), which made
+   * the guard dead under that config (#663 round 2). Before this incarnation's host record commits,
+   * its own lease file pairs with no host record. Keep only a matching predecessor's reload
+   * lease, never an ordinary heartbeat or a lease after our own host record has committed.
+   * Reload is explicit in new leases; older leases extended the fixed Main session TTL.
+   * Neither signal depends on this release's configurable host TTL. */
+  #keepsPredecessorReloadLease(at: number): boolean {
+    if (this.#leaseConfirmed || this.options.identity.kind !== "main" || this.options.hostId !== this.options.rootId) return false;
+    const entry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true });
+    const host = entry && hostFromEntry(entry);
+    if (!host || host.remoteHost !== undefined || host.startedAt === this.#startedAt ||
+      host.rootId !== this.options.rootId || host.identity.id !== this.options.identity.id) return false;
+    const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+    return lease !== undefined && lease.rootId === this.options.rootId &&
+      lease.identityId === this.options.identity.id && lease.startedAt !== undefined &&
+      lease.startedAt === host.startedAt && lease.startedAt < this.#startedAt && lease.expiresAt > at &&
+      (lease.reloadUntil === lease.expiresAt ||
+        // Older releases extended the fixed Main session TTL without an explicit reload marker.
+        (lease.reloadUntil === undefined && lease.session?.expiresAt === lease.expiresAt &&
+          lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS));
+  }
+
   #renewFileLease(): number {
     const leaseAt = Date.now();
+    if (this.#keepsPredecessorReloadLease(leaseAt)) {
+      this.#keptReloadLease = true;
+      return leaseAt;
+    }
     const root = this.#localRecords.get(this.options.rootId);
     writeHostLease(this.mesh.root, {
       id: this.options.hostId,
@@ -2141,6 +2181,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       startedAt: this.#startedAt,
       // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).
       writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend, meshProcessStartedAt),
+      ...(this.#reloadUntil !== undefined ? { reloadUntil: this.#reloadUntil } : {}),
       ...(this.options.identity.kind === "main" && root?.sessionId ? {
         session: {
           id: root.sessionId,
@@ -2152,6 +2193,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: leaseAt,
       expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
     });
+    this.#keptReloadLease = false;
     return leaseAt;
   }
 

@@ -400,6 +400,10 @@ export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
 /** At most one owner alarm per actor per hour while its events dead-letter. */
 const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+/** An activation block older than this is alarmed again from the retention sweep (smarty-dev#7782)... */
+export const ACTOR_BLOCK_REALARM_AFTER_MS = 2 * 60 * 60 * 1000;
+/** ...at most once per this interval per actor while it stays blocked. */
+export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
@@ -538,6 +542,8 @@ export class ActorManager {
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
+  /** Last repeat activation-block alarm per actor; in memory, so a restart may re-alarm once. */
+  readonly #blockRealarmAt = new Map<string, number>();
   readonly #delivered = new Set<string>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
@@ -619,6 +625,8 @@ export class ActorManager {
       preparationRetryMs?: number;
       /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
       removalRetryMs?: number;
+      /** Retention sweep interval (tests shorten it). */
+      retentionSweepMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -692,7 +700,7 @@ export class ActorManager {
     });
     this.#acquireCapabilityView = options.acquireCapabilityView;
     this.#startRetentionSweep();
-    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
+    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), options.retentionSweepMs ?? RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
@@ -3104,6 +3112,7 @@ export class ActorManager {
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
           delete actor.activationBlocked;
+          this.#blockRealarmAt.delete(actor.id);
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
@@ -4047,6 +4056,22 @@ export class ActorManager {
     } catch { /* the next slot retries */ }
   }
 
+  // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
+  #realarmBlockedActivation(actor: ManagedActor, now: number): void {
+    const blocked = actor.activationBlocked;
+    if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
+    const last = this.#blockRealarmAt.get(actor.id);
+    // An entry older than the block's start belongs to an earlier, cleared block.
+    if (last !== undefined && last >= blocked.since && now - last < ACTOR_BLOCK_REALARM_EVERY_MS) return;
+    this.#blockRealarmAt.set(actor.id, now);
+    void this.#publishNotification({
+      topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+        since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+        pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since },
+    }).catch(() => undefined);
+  }
+
   #startRetentionSweep(): void {
     if (this.#retentionSweep || this.#closing) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
@@ -4058,6 +4083,7 @@ export class ActorManager {
     // A microtask is not a yield: let RPC/input run before touching archives,
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const id of this.#blockRealarmAt.keys()) if (!this.#actors.get(id)?.activationBlocked) this.#blockRealarmAt.delete(id);
     const actors = [...this.#actors.values()];
     // NTFS metadata/deletion can make eight actors (72 expired runs in the
     // startup fixture) monopolize a turn. Keep each run's work unchanged,
@@ -4070,6 +4096,7 @@ export class ActorManager {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          this.#realarmBlockedActivation(actor, now);
           this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]

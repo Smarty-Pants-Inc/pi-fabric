@@ -3015,6 +3015,48 @@ describe("ActorManager", () => {
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
 
+  // smarty-dev#7782: a block that persists for days alarmed only once.
+  it("re-alarms an actor that stays activation-blocked, at most once per interval, and not after it clears", async () => {
+    const s = setup();
+    await s.actors.close();
+    const actors = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors-realarm"), persistent: false, retentionSweepMs: 20,
+    });
+    actorManagers.push(actors);
+    const REALARM_AFTER_MS = 2 * 60 * 60 * 1000, REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    const blocked = await actors.create({ name: "stuck", instructions: "Respond.", responseMode: "directive" });
+    const cleared = await actors.create({ name: "cleared", instructions: "Respond.", responseMode: "directive" });
+    for (const id of [blocked.id, cleared.id]) {
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(id, "FAIL_DIRECTIVE").catch(() => undefined);
+    }
+    await actors.ask(cleared.id, "all good");
+    expect(actors.status(cleared.id).activationBlocked).toBeUndefined();
+    const repeats = (id: string) => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 50 })
+      .filter((event) => (event.data as { actorId?: string; repeat?: boolean }).actorId === id && (event.data as { repeat?: boolean }).repeat);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
+    await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 50 }).length === 2);
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(0);           // younger than the window
+    skew = REALARM_AFTER_MS + 1_000;
+    await waitFor(() => repeats(blocked.id).length === 1);
+    expect(repeats(blocked.id)[0]!.data).toMatchObject({ actorId: blocked.id, repeat: true,
+      code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER, pendingEffects: "reconcile-required",
+      blockedForMs: expect.any(Number) });
+    expect(repeats(blocked.id)[0]!.kind).toBe("actor-activation-blocked");
+    expect((repeats(blocked.id)[0]!.data as { blockedForMs: number }).blockedForMs).toBeGreaterThanOrEqual(REALARM_AFTER_MS);
+    skew += REALARM_EVERY_MS - 60_000;
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(1);           // none again within the interval
+    skew += 120_000;
+    await waitFor(() => repeats(blocked.id).length === 2);
+    await settle();
+    expect(repeats(blocked.id)).toHaveLength(2);
+    expect(repeats(cleared.id)).toHaveLength(0);           // a cleared actor never re-alarms
+  }, 60_000);
+
   it("5256 excludes a failed streak from routing presence across restart and flags pending effects until a successful probe", async () => {
     const s = setup(true);
     const actor = await s.actors.create({ name: "review-shard", instructions: "Review.", responseMode: "text" });

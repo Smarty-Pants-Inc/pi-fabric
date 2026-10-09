@@ -407,6 +407,8 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     expect(privateGroup(1000, 1000, io("paul:x:1000:bob\n"))).toBe(false); // another member
     expect(privateGroup(1001, 1000, io("bob:x:1001:\n"))).toBe(false); // bob's primary group
     expect(privateGroup(1000, 1000, io(""))).toBe(false); // no such group
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\nstaff:x:50:bob\npaul2:x:1000:bob\n"))).toBe(false); // a duplicate gid entry names bob
+    expect(privateGroup(1000, 1000, io("staff:x:50:bob\npaul:x:1000:\n"))).toBe(true); // other groups' members do not matter
     expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "passwd: files sss\ngroup: files sss\n"))).toBe(false); // SSSD: not enumerable
     expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "passwd: files ldap\ngroup: files\n"))).toBe(false);
     expect(privateGroup(1000, 1000, io("paul:x:1000:\n", "group: files\n"))).toBe(false); // passwd line missing

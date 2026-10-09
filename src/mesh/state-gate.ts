@@ -234,9 +234,11 @@ export const privateGroup = (gid: number, uid: number, io: {
     const self = users.find((f) => Number(f[2]) === uid)?.[0];
     if (self === undefined) return false;
     if (users.some((f) => Number(f[3]) === gid && Number(f[2]) !== uid)) return false;
-    const entry = getent("group", String(gid)).split("\n").map((line) => line.split(":")).find((f) => f.length >= 4 && Number(f[2]) === gid);
-    if (!entry) return false;
-    return (entry[3] ?? "").split(",").map((name) => name.trim()).filter(Boolean).every((name) => name === self);
+    // EVERY entry carrying this gid counts (a duplicate /etc/group line grants its members the gid too), so the
+    // whole group database is enumerated, not the first match `getent group <gid>` would return.
+    const entries = getent("group").split("\n").map((line) => line.split(":")).filter((f) => f.length >= 4 && Number(f[2]) === gid);
+    if (entries.length === 0) return false;
+    return entries.every((entry) => (entry[3] ?? "").split(",").map((name) => name.trim()).filter(Boolean).every((name) => name === self));
   } catch { return false; }
 };
 

@@ -15,6 +15,7 @@ import { superviseWake } from "../src/residency/launcher.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { idleDeadlineDriver } from "./helpers/resident-idle-deadline.js";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const until = async (done: () => boolean, ms = 8_000) => {
@@ -50,6 +51,7 @@ const fakeRun = (host: ResidentHost, consume: (task: string) => Promise<void> = 
 describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {
     const { root, config, host, idle } = fixture();
+    const deadline = idleDeadlineDriver();
     try {
       await host.start();
       const actor = await host.actors.create({ name: "listener", instructions: "wait", residency: "durable", topics: ["test.wake"] });
@@ -59,7 +61,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(record?.topics).toEqual(["test.wake"]);
       expect(host.actors.hasActiveDurableActor()).toBe(false);
       const now = Date.now();
+      await until(() => deadline.count() === 1);
       vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      deadline.fire();
       await until(() => idle.mock.calls.length === 1);
       await host.close();
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);

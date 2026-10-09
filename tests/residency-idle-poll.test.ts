@@ -15,8 +15,7 @@ vi.mock("../src/storage/retention-platform.js", async (importOriginal) => ({
   retentionV2Enabled: () => platform.retentionV2,
 }));
 
-// smarty-dev#6729: an idle resident host's 50 ms request poll rebuilt the fleet-wide actor
-// ownership view (every project participant, every host lease) on every tick for its idle check.
+// The resident request/idle-exit path must not rebuild ownership on a recurring 50 ms tick.
 const fixture = (onIdle: () => void = () => {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-idle-poll-"));
   const config: ResidentHostConfig = {
@@ -49,57 +48,44 @@ const replace = (file: string, value: unknown) => {
 const withRetention = (config: ResidentHostConfig, completedRequestMs: number) =>
   ({ ...config, retention: { ...config.retention, completedRequestMs } });
 
-describe("idle resident host polling (smarty-dev#6729)", () => {
-  it("rebuilds the actor ownership view once per second of clock time, not on every 50 ms request tick", async () => {
-    const { root, file, host } = fixture();
-    let now = Date.now();
-    // The host's own clock drives the one-second reuse; real 50 ms ticks keep running.
-    // Measuring against wall time made the bound depend on how fast the runner was.
-    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
-    const reads = vi.spyOn(fs, "readFileSync");
-    const configReads = () => reads.mock.calls.filter(([read]) => String(read) === file).length;
+import { idleDeadlineDriver } from "./helpers/resident-idle-deadline.js";
+
+describe("event-driven resident host idle exit (smarty-dev#6729 / #6782)", () => {
+  it("arms no recurring request/idle-exit timer below 60 seconds and does not sample actors between events", async () => {
+    const { root, host } = fixture();
+    const interval = globalThis.setInterval;
+    const hostIntervals: number[] = [];
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((...args: Parameters<typeof setInterval>) => {
+      const caller = (new Error().stack ?? "").split("\n").find(line => line.includes("/src/"));
+      if (caller?.includes("/residency/host.ts")) hostIntervals.push(Number(args[1]));
+      return interval(...args);
+    }) as typeof setInterval);
+    const deadline = idleDeadlineDriver();
     try {
       await host.start();
-      // The first maintenance pass reads the overlay once; from then on its stamp is cached.
-      expect(await waitUntil(() => configReads() > 0)).toBe(true);
-      await host.actors.create({ name: "idle-poll", instructions: "wait", residency: "durable" });
-      await host.participants.refresh();
-      // Count the fleet-wide listings the idle check itself makes. The actor mesh monitor also
-      // lists participants before each of its polls; that cadence is its own and differs by
-      // platform (a 250 ms timer on Windows, file-watch wakes plus a 2 s reconcile elsewhere).
-      let inCheck = 0;
-      let checkListings = 0;
-      const list = host.participants.list.bind(host.participants);
-      vi.spyOn(host.participants, "list").mockImplementation((...args: Parameters<typeof list>) => {
-        if (inCheck > 0) checkListings++;
-        return list(...args);
-      });
-      const active = host.actors.hasActiveDurableActor.bind(host.actors);
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => {
-        inCheck++;
-        try { return active(); } finally { inCheck--; }
-      });
-      reads.mockClear();
-      // About 20 request ticks with the clock still: at most the one current observation the
-      // reused one needs. Before: one check (and one fleet-wide listing) on every tick.
-      await sleep(1_000);
-      const first = checks.mock.calls.length;
-      expect(first).toBeLessThanOrEqual(1);
-      for (let second = 1; second <= 2; second++) {
-        now += 1_000;
-        expect(await waitUntil(() => checks.mock.calls.length >= first + second)).toBe(true);
-        await sleep(500);
-        expect(checks.mock.calls.length).toBe(first + second);
-      }
-      expect(checkListings).toBe(checks.mock.calls.length);
-      // Before: the 100 ms maintenance tick re-read and parsed the unchanged config.json each time.
-      expect(configReads()).toBe(0);
-    } finally {
-      clock.mockRestore();
-      reads.mockRestore();
-      await host.close();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      expect(hostIntervals.length).toBeGreaterThan(0);
+      expect(hostIntervals.every(ms => ms >= 60_000)).toBe(true);
+      const checks = vi.spyOn(host.actors, "hasActiveDurableActor");
+      await sleep(1_200);
+      expect(checks).not.toHaveBeenCalled();
+      expect(deadline.count()).toBe(1);
+    } finally { await host.close(); expect(deadline.count()).toBe(0); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("watches requests and drains a startup backlog larger than one 32-request batch without a poll", async () => {
+    const { root, config, host } = fixture();
+    const requests = path.join(config.residencyRoot, "requests");
+    const responses = path.join(config.residencyRoot, "responses");
+    fs.mkdirSync(requests, { recursive: true });
+    for (let n = 0; n < 40; n++) fs.writeFileSync(path.join(requests, `backlog-${n}.json`), "{}");
+    try {
+      await host.start();
+      expect(await waitUntil(() => fs.readdirSync(responses).length === 40)).toBe(true);
+      fs.writeFileSync(path.join(requests, "watched.json"), "{}");
+      expect(await waitUntil(() => fs.existsSync(path.join(responses, "watched.json")), 2_000)).toBe(true);
+      expect(fs.readdirSync(requests)).toHaveLength(0);
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   describe.each([
@@ -167,79 +153,70 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     });
   });
 
-  it("never exits on a reused actor observation: an idle exit is confirmed by a current check", async () => {
-    let idled = 0;
-    const { root, host } = fixture(() => { idled++; });
-    let now = Date.now();
-    try {
-      await host.start();
-      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
-      let active = false;
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => active);
-      // Just short of the idle window: the next tick takes a current (inactive) observation.
-      now += 29_950;
-      await sleep(200);
-      expect(idled).toBe(0);
-      // An actor wakes; the reused observation still says inactive, and the window has elapsed.
-      active = true;
-      const before = checks.mock.calls.length;
-      now += 100;
-      await sleep(200);
-      expect(checks.mock.calls.length).toBeGreaterThan(before);
-      expect(idled).toBe(0);
-      // Truly idle for the whole window again: the host exits.
-      active = false;
-      now += 30_100;
-      await sleep(200);
-      expect(idled).toBeGreaterThan(0);
-      clock.mockRestore();
-    } finally {
-      await host.close();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("counts the idle window from a durable actor run that started and ended between two cached samples", async () => {
+  it("checks current actor custody at the one-shot idle deadline and restarts the window on settlement", async () => {
     let idled = 0;
     const { root, host } = fixture(() => { idled++; });
     let now = Date.now();
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const deadline = idleDeadlineDriver();
     try {
       await host.start();
-      // Close to the idle window with no actor: the next tick caches an inactive observation.
-      now += 29_000;
-      await sleep(200);
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      let active = false;
+      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => active);
+      now += 29_950;
+      deadline.fire();
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
       expect(idled).toBe(0);
-      const sampledAt = now;
-      const runs = vi.spyOn(host.agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
-        onSpawned?.({ id: "run-between-samples" } as never);
-        return { id: "run-between-samples", status: "completed", text: "done", toolCalls: 0 } as never;
-      });
-      // A durable actor is created, runs and stops, all inside the same one-second cached sample.
-      const actor = await host.actors.create({ name: "between-samples", instructions: "wait", residency: "durable" });
-      host.actors.tell(actor.id, "go");
-      for (let waited = 0; waited < 5_000 && !(runs.mock.calls.length === 1 && host.actors.status(actor.id).status === "idle"); waited += 20) await sleep(20);
-      expect(runs).toHaveBeenCalledTimes(1);
+      active = true;
+      now += 100;
+      deadline.fire();
+      await sleep(100);
+      expect(checks).toHaveBeenCalled();
+      expect(idled).toBe(0);
+      expect(deadline.count()).toBe(0); // No idle timer while custody remains active.
+      active = false;
+      // A genuine actor settlement signal starts a fresh one-shot idle window.
+      const actor = await host.actors.create({ name: "settled", instructions: "wait", residency: "durable" });
       await host.actors.stop(actor.id);
-      expect(host.actors.status(actor.id).status).toBe("stopped");
-      // The clock did not move: by time alone every tick during the run reused the inactive sample.
-      expect(Date.now()).toBe(sampledAt);
-      const ended = now;
-      // Past the window since the host started, but only 1.1 s after the run ended.
-      now += 1_100;
-      await sleep(200);
-      expect(idled).toBe(0);
-      now = ended + 29_900;
-      await sleep(200);
-      expect(idled).toBe(0);
-      // The full window after the run ended: the host exits.
-      now = ended + 30_100;
-      await sleep(200);
-      expect(idled).toBeGreaterThan(0);
-    } finally {
-      clock.mockRestore();
-      await host.close();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      now += 30_100;
+      deadline.fire();
+      expect(await waitUntil(() => idled === 1)).toBe(true);
+    } finally { clock.mockRestore(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
+
+  it("counts the full idle window from an actor run's settlement, not its last periodic sample", async () => {
+    let idled = 0;
+    const { root, host } = fixture(() => { idled++; });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const deadline = idleDeadlineDriver();
+    try {
+      await host.start();
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      now += 29_000;
+      deadline.fire();
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      const runs = vi.spyOn(host.agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+        onSpawned?.({ id: "run-between-events" } as never);
+        return { id: "run-between-events", status: "completed", text: "done", toolCalls: 0 } as never;
+      });
+      await host.participants.refresh(); // The wall-clock jump must not expire the host's custody lease.
+      const actor = await host.actors.create({ name: "between-events", instructions: "wait", residency: "durable" });
+      host.actors.tell(actor.id, "go");
+      expect(await waitUntil(() => runs.mock.calls.length === 1 && ["idle", "dormant"].includes(host.actors.status(actor.id).status))).toBe(true);
+      await host.actors.stop(actor.id);
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      const ended = now;
+      now = ended + 29_900;
+      deadline.fire();
+      expect(await waitUntil(() => deadline.count() === 1)).toBe(true);
+      expect(idled).toBe(0);
+      now = ended + 30_100;
+      deadline.fire();
+      expect(await waitUntil(() => idled === 1)).toBe(true);
+    } finally { clock.mockRestore(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
 });

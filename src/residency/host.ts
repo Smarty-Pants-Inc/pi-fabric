@@ -86,7 +86,8 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // Moved to ./retention.js so the mesh-wide sweep (storage/retention-cli.ts) can run it under the
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
-const REQUEST_POLL_MS = 50;
+// Native notifications admit requests; this slow reconciliation only covers lost events.
+const REQUEST_RECONCILE_MS = 60_000;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
 // Dormancy is driven by actor/delivery/settlement signals. A single bounded safety
@@ -208,9 +209,19 @@ export class ResidentHost {
   #deliveryCommits!: CommitOutbox;
   #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
+  #deliveryRetryTimer: NodeJS.Timeout | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
+  #requestWatchers: fs.FSWatcher[] = [];
+  #requestCheckQueued = false;
+  #requestCheckRequested = false;
+  #requestCheckPending: Promise<unknown> | undefined;
+  #requestRetryTimer: NodeJS.Timeout | undefined;
+  #releaseDeadline: NodeJS.Timeout | undefined;
+  #idleDeadline: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #maintenanceContinuation: NodeJS.Timeout | undefined;
+  #configSettleTimer: NodeJS.Timeout | undefined;
   #idleCheckQueued = false;
   #idleCheckRequested = false;
   #idleCheckPending: Promise<void> | undefined;
@@ -228,7 +239,7 @@ export class ResidentHost {
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
   #routeOwner?: ShadowRouteOwner;
-  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request admission");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
@@ -243,6 +254,7 @@ export class ResidentHost {
   readonly #requestRetention: ResidentRequestRetention;
   #handover: ResidentHandoverPlan | undefined;
   #advancingRelease = false;
+  #releaseSignalled = false;
   #staged = false;
   #publicationFailed = false;
   #reloadEvent: Promise<unknown> | undefined;
@@ -641,7 +653,7 @@ export class ResidentHost {
           ),
         ),
       );
-      this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
+      this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#noteActorActivity(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.#noteActorActivity());
       this.#wakeWatchErrorUnsubscribe = subscribeResidentWakeWatchErrors(this.config.residencyRoot, () => {
@@ -666,13 +678,35 @@ export class ResidentHost {
         this.lifecycle.pause();
         await this.#probeWorkerStartup();
       }
-      this.#requestTimer = setInterval(
-        () => {
-          void this.#backgroundRequests.run(() => this.#pollRequests());
-          void this.#retryDeliveries();
-        },
-        REQUEST_POLL_MS,
-      );
+      // Arm before readiness and the initial scan: no request can fall between them.
+      this.#requestWatchers.push(fs.watch(this.#requestsPath, () => this.#scheduleRequestCheck()));
+      this.#requestWatchers.push(fs.watch(this.config.residencyRoot, (_event, filename) => {
+        const name = filename?.toString();
+        if (!name || name.startsWith("handover") || name === "main-generation.json") this.#scheduleRequestCheck();
+        if (!name || name === "config.json") {
+          this.#maintainRequests();
+          // A same-stamp replacement is conservatively re-read once it settles.
+          if (this.#configSettleTimer) clearTimeout(this.#configSettleTimer);
+          this.#configSettleTimer = setTimeout(() => {
+            this.#configSettleTimer = undefined;
+            this.#maintainRequests();
+          }, CONFIG_STAMP_SETTLE_MS);
+          this.#configSettleTimer.unref?.();
+        }
+      }));
+      for (const watcher of this.#requestWatchers) watcher.on("error", error => {
+        // An uncertain admission channel cannot authorize idle exit. The slow
+        // reconciliation continues serving queued requests without a retry storm.
+        this.#publicationFailed = true;
+        console.warn(`[pi-fabric] resident request watcher failed: ${String(error)}`);
+        this.#scheduleRequestCheck();
+      });
+      this.#requestTimer = setInterval(() => {
+        this.#scheduleRequestCheck();
+        this.#maintainRequests(); // Legacy Windows retention has no separate V2 timer.
+        void this.#retryDeliveries();
+      }, REQUEST_RECONCILE_MS);
+      this.#requestTimer.unref?.();
       const now = Date.now();
       const owner: ResidentHostOwner = {
         format: RESIDENT_HOST_FORMAT,
@@ -706,12 +740,19 @@ export class ResidentHost {
       this.#ready = true;
       fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
       this.#scheduleIdleCheck();
+      this.#scheduleRequestCheck(); // Admit backlog published before the watches existed.
+      this.#maintenanceContinuation = setTimeout(() => {
+        this.#maintenanceContinuation = undefined;
+        this.#maintainRequests();
+      }, 100);
+      this.#maintenanceContinuation.unref?.();
       this.#writeWakeRoutes();
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
       if (retentionV2Enabled()) {
-        this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
+        this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), REQUEST_RECONCILE_MS);
+        this.#maintenanceTimer.unref?.();
         this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
           actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
           isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
@@ -767,6 +808,12 @@ export class ResidentHost {
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    for (const watcher of this.#requestWatchers) watcher.close();
+    this.#requestWatchers = [];
+    for (const timer of [this.#idleDeadline, this.#requestRetryTimer, this.#releaseDeadline,
+      this.#maintenanceContinuation, this.#configSettleTimer, this.#deliveryRetryTimer]) if (timer) clearTimeout(timer);
+    this.#idleDeadline = this.#requestRetryTimer = this.#releaseDeadline = undefined;
+    this.#maintenanceContinuation = this.#configSettleTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
     if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
@@ -781,6 +828,8 @@ export class ResidentHost {
     // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
     void actorsClosed?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
+    await this.#requestCheckPending;
+    await this.#idleCheckPending;
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
     try {
@@ -818,7 +867,7 @@ export class ResidentHost {
     assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#noteActorActivity(); }
   }
 
   async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
@@ -924,7 +973,7 @@ export class ResidentHost {
     assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { await this.#handleLifecycle(subscription, event); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#noteActorActivity(); }
   }
 
   async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
@@ -1029,7 +1078,20 @@ export class ResidentHost {
     const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {
-      if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+      if (this.#flushingDeliveries === flushing) {
+        this.#flushingDeliveries = undefined;
+        this.#noteActorActivity();
+        if (!this.#closed && !this.#deliveryRetryTimer && (!this.#deliveryCommitsRecovered ||
+            (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json"))))) {
+          // New output may have arrived while this flush was finishing. Retry only
+          // real outbox/recovery debt; an empty host has no delivery timer.
+          this.#deliveryRetryTimer = setTimeout(() => {
+            this.#deliveryRetryTimer = undefined;
+            void this.#retryDeliveries();
+          }, Math.max(100, this.#deliveryRetry.waitMs));
+          this.#deliveryRetryTimer.unref?.();
+        }
+      }
     }).catch(() => undefined);
     return flushing;
   }
@@ -1080,10 +1142,38 @@ export class ResidentHost {
     }
   }
 
+  #scheduleRequestCheck(): void {
+    this.#requestCheckRequested = true;
+    if (!this.#ready || this.#closed || this.#requestCheckQueued || this.#requestCheckPending || this.#requestRetryTimer) return;
+    this.#requestCheckQueued = true;
+    queueMicrotask(() => {
+      this.#requestCheckQueued = false;
+      if (!this.#ready || this.#closed || this.#requestCheckPending || this.#requestRetryTimer) return;
+      this.#requestCheckRequested = false;
+      const pending = this.#backgroundRequests.run(() => this.#pollRequests());
+      this.#requestCheckPending = pending;
+      void pending.then(result => {
+        if (this.#closed) return;
+        if (result === "retry" || result === "skipped" || result === "failed") {
+          // Demand-backed retry, never an idle poll. Preserve typed lock backoff.
+          this.#requestRetryTimer = setTimeout(() => {
+            this.#requestRetryTimer = undefined;
+            this.#scheduleRequestCheck();
+          }, Math.max(100, this.#backgroundRequests.waitMs));
+          this.#requestRetryTimer.unref?.();
+        }
+      }).finally(() => {
+        if (this.#requestCheckPending === pending) this.#requestCheckPending = undefined;
+        if (this.#requestCheckRequested) this.#scheduleRequestCheck();
+      }).catch(() => undefined);
+    });
+  }
+
   async #pollRequests(): Promise<void> {
     if (!this.#ready || this.#pollingRequests || this.#closed) return;
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
+    let hadWork = false;
     try {
       let entries: string[];
       try {
@@ -1091,6 +1181,7 @@ export class ResidentHost {
       } catch {
         return;
       }
+      if (entries.length) { hadWork = true; this.#noteActorActivity(); }
       for (const entry of entries.slice(0, 32)) {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
@@ -1119,10 +1210,11 @@ export class ResidentHost {
           void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
         }
       }
+      if (entries.length > 32 || this.#handover) this.#requestCheckRequested = true;
     } finally {
       this.#pollingRequests = false;
-      if (!retentionV2Enabled()) this.#maintainRequests();
-      await this.#checkIdle(false);
+      if (hadWork) this.#maintainRequests();
+      this.#scheduleIdleCheck();
     }
   }
 
@@ -1148,10 +1240,19 @@ export class ResidentHost {
       if (removal.runId) live.add(removal.runId);
     }
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
+    // Continue only a bounded collector that actually has scan debt. An empty
+    // host waits for the 60-second sample or a request/configuration event.
+    if (this.#requestRetention.due(now) && !this.#maintenanceContinuation) {
+      this.#maintenanceContinuation = setTimeout(() => {
+        this.#maintenanceContinuation = undefined;
+        this.#maintainRequests();
+      }, 100);
+      this.#maintenanceContinuation.unref?.();
+    }
   }
 
   /** The accepted retention overlay, re-read only when config.json was replaced or changed:
-   * this runs on every 100 ms maintenance tick, and Main rewrites the file atomically. */
+   * request/config events and a slow reconciliation sample drive this; Main rewrites atomically. */
   #currentRetention(now = Date.now()): ResidentHostConfig["retention"] {
     let stamp: string | undefined;
     let settled = false;
@@ -1170,6 +1271,7 @@ export class ResidentHost {
   /** Actor activity restarts the idle window and requests an immediate event-driven check. */
   #noteActorActivity(): void {
     this.#idleSince = Date.now();
+    this.#clearIdleDeadline();
     this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
     this.#scheduleIdleCheck();
   }
@@ -1183,7 +1285,8 @@ export class ResidentHost {
 
   #scheduleIdleCheck(): void {
     this.#idleCheckRequested = true;
-    if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
+    if (this.#staged || this.#handover) { this.#scheduleRequestCheck(); return; }
+    if (this.#closed || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
     this.#idleCheckQueued = true;
     queueMicrotask(() => {
       this.#idleCheckQueued = false;
@@ -1196,6 +1299,19 @@ export class ResidentHost {
         if (this.#idleCheckRequested) this.#scheduleIdleCheck();
       }).catch(() => undefined);
     });
+  }
+
+  #clearIdleDeadline(): void {
+    if (this.#idleDeadline) clearTimeout(this.#idleDeadline);
+    this.#idleDeadline = undefined;
+  }
+
+  #armIdleDeadline(remainingMs: number): void {
+    this.#idleDeadline = setTimeout(() => {
+      this.#idleDeadline = undefined;
+      this.#scheduleIdleCheck();
+    }, remainingMs);
+    this.#idleDeadline.unref?.();
   }
 
   #clearDormancySafetyTimer(): void {
@@ -1276,11 +1392,11 @@ export class ResidentHost {
     return protectedIds;
   }
 
-  async #checkIdle(includeDormancy = true): Promise<void> {
-    if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
+  async #checkIdle(): Promise<void> {
+    if (!this.#ready || this.#closed || this.#staged || this.#handover || this.#sleeping) return;
+    this.#clearIdleDeadline();
     const now = Date.now();
-    if (!includeDormancy && this.#idleCheckPending) return;
-    if (includeDormancy) {
+    {
       if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
       const owned = this.actors.listOwned();
       const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
@@ -1320,7 +1436,7 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
-    const activeActor = this.#hasActiveActor(now);
+    const activeActor = this.#hasActiveActor(now, true);
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
@@ -1334,7 +1450,8 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
-    if (now - this.#idleSince < IDLE_EXIT_MS) return;
+    const remainingMs = IDLE_EXIT_MS - (Date.now() - this.#idleSince);
+    if (remainingMs > 0) { this.#armIdleDeadline(remainingMs); return; }
     // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
       this.#idleSince = now;
@@ -1379,14 +1496,14 @@ export class ResidentHost {
 
   #trackPublication(promise: Promise<unknown>): void {
     this.#publications.add(promise);
-    this.#scheduleIdleCheck();
+    this.#noteActorActivity();
     void promise.then(() => {
       this.#publications.delete(promise);
-      this.#scheduleIdleCheck();
+      this.#noteActorActivity();
     }, () => {
       this.#publicationFailed = true;
       this.#publications.delete(promise);
-      this.#scheduleIdleCheck();
+      this.#noteActorActivity();
     });
   }
 
@@ -1438,6 +1555,12 @@ export class ResidentHost {
     }
     writeHandoverState(this.config.residencyRoot, plan, "preparing");
     this.#handover = plan;
+    this.#clearIdleDeadline();
+    this.#releaseDeadline = setTimeout(() => {
+      this.#releaseDeadline = undefined;
+      this.#scheduleRequestCheck();
+    }, HANDOVER_DRAIN_MS + 1);
+    this.#releaseDeadline.unref?.();
     this.actors.pauseForRelease(); this.control.pause(); this.lifecycle.pause();
   }
 
@@ -1445,11 +1568,14 @@ export class ResidentHost {
     if (decideHandover(this.config.residencyRoot, { id: plan.id, state: "cancelled" }).state === "custody") return;
     writeHandoverState(this.config.residencyRoot, plan, "cancelled", reason);
     this.#handover = undefined;
+    if (this.#releaseDeadline) clearTimeout(this.#releaseDeadline);
+    this.#releaseDeadline = undefined;
     this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+    this.#noteActorActivity();
   }
 
   async #advanceRelease(): Promise<void> {
-    if (this.#advancingRelease || this.#closed) return;
+    if (this.#advancingRelease || this.#releaseSignalled || this.#closed) return;
     this.#advancingRelease = true;
     try {
       if (this.#staged) {
@@ -1470,6 +1596,8 @@ export class ResidentHost {
         const { attempt: _completedAttempt, ...servingOwner } = owner;
         writeJsonAtomic(this.#ownerPath, servingOwner, { durable: true });
         this.#staged = false;
+        this.#scheduleRequestCheck();
+        this.#noteActorActivity();
         this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
         this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
           await this.actors.finishPendingRemovals();
@@ -1485,6 +1613,7 @@ export class ResidentHost {
         if (custody.id !== plan.id || JSON.stringify(custody.launcher) !== JSON.stringify(plan.launcher) ||
             !exactResidentProcess(plan.launcher)) throw new Error("Resident launcher custody is uncertain");
         // Receipt precedes release of A's stable flock. The Main is no longer the executor.
+        this.#releaseSignalled = true; // Root watch observes our own publication too.
         writeHandoverState(this.config.residencyRoot, plan, "released");
         this.onIdle();
         return;
@@ -1581,6 +1710,7 @@ export class ResidentHost {
     }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
+    this.#noteActorActivity();
   }
 
   #pruneCreations(): void {

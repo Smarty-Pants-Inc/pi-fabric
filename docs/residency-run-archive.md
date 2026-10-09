@@ -16,9 +16,10 @@ against the pinned main implementation; they are not native Windows CI evidence.
 
 ## POSIX bounded references
 
-The 50 ms request/claim loop does not prepare retention references. Independent
-100 ms maintenance ticks advance one persistent ownership cursor, at most 64
-handles/runs and 2 ms per tick. Native custody changes and `runs/` directory
+PR #704 replaces the former 50 ms request/claim poll and 100 ms idle maintenance
+poll with request/configuration events, a 60-second reconciliation, and bounded
+100 ms one-shot continuations only while the collector has scan debt. The
+ownership cursor remains bounded to at most 64 handles/runs and 2 ms per slice. Native custody changes and `runs/` directory
 changes queue a delta pass, never restart an in-flight historical cursor. An
 identity watermark avoids repeating historical status/tree reads on ordinary
 run creation or UI progress. Periodic revalidation starts at a factory boundary,

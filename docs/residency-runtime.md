@@ -72,7 +72,13 @@ actors subscribed to still-live participants are expected, not truly idle.
 
 A host with only dormant/stopped actors, no running task, and no pending
 request, response/publication or delivery-outbox obligation exits after the
-existing **30-second** `IDLE_EXIT_MS` grace. Ponytail: this constant amortizes
+existing **30-second** `IDLE_EXIT_MS` grace. Native request-file notifications
+and actor/task/delivery/publication settlement events evaluate custody; a single
+one-shot idle deadline expires the grace. There is no recurring 50 ms request or
+idle-exit timer. Lost request notifications have a 60-second reconciliation;
+actual pending request/delivery debt uses bounded one-shot retries. Handover
+state and Main-generation notifications keep release progress event-owned too.
+Ponytail: this constant amortizes
 close/delivery races; it is not a worker keep-warm policy. Before exit the host
 pauses admission, checkpoints control/lifecycle and actor queues/cursors, and
 confirms the actor mesh monitor is caught up. An unconsumed event or new request

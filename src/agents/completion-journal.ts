@@ -427,10 +427,7 @@ const pendingCompletionAsync = async (meshRoot: string, projectRoot: string, pro
   if (consumed?.has(file)) return [];
   const recipient = await readRecipientAsync(target, true);
   if (!recipient || !await accepts(recipient) || await canonicalAsync(recipient.projectRoot) !== project) return [];
-  if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) {
-    await archiveCompletionAsync(target);
-    return [];
-  }
+  if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) return [];
   const value = await readAsync<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
     typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
@@ -451,10 +448,7 @@ const pendingCompletion = (meshRoot: string, projectRoot: string, project: strin
   if (consumed?.has(file)) return [];
   const recipient = readRecipient(target);
   if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
-  if (readReceipt(path.join(directory(meshRoot), "receipts", file))) {
-    archiveCompletion(target);
-    return [];
-  }
+  if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
   const value = read<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
     typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||

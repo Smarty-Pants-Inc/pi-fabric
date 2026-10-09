@@ -195,6 +195,12 @@ const WRITE_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
 
 /** Sanitized host label used in file names. */
+// ponytail: as processAlive in src/storage/scratch.ts, inlined because release generations load
+// this module as a self-contained copy (see the module-generation tests).
+const processAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return errorCodeOf(error) !== "ESRCH"; }
+};
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
 /**
@@ -216,16 +222,22 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   let started = false;
   const warn = options.warn ?? warnPrivately;
 
-  // By age only, the own file included: a fresh own file is never stale, and a stale one (no
+  // By age, the own file included: a fresh own file is never stale, and a stale one (no
   // acquisition here for a day) is safe to delete because the next write recreates it by rename.
+  // Sooner for this host's dead pids (smarty-dev#7826): a regular file of a dead pid that no
+  // query window can reach any more (mtime >= its newest minute) is idle for good.
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
+    const idleBefore = lockStatsWindowStartMs(now, LOCK_STATS_RETAIN_MINUTES + 1);
     for (const name of fs.readdirSync(directory)) {
       if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
       const file = path.join(directory, name);
       try {
         const seen = fs.lstatSync(file);
-        if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
+        const own = /^(.+)-(\d+)\.json$/.exec(name);
+        const pid = own?.[1] === host ? Number(own[2]) : 0;
+        const idle = seen.isFile() && pid > 0 && pid !== process.pid && seen.mtimeMs < idleBefore && !processAlive(pid);
+        if (!idle && now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
         // ponytail: re-lstat right before the unlink and skip a file its owner refreshed
         // (rename = new inode, or a new mtime) since the age check. Best effort: a refresh
         // between this lstat and the unlink still loses that file, until its owner's next
@@ -424,7 +436,11 @@ const readRegularFile = (file: string): string => {
  * Every process's file under `<root>/lock-stats`. Unreadable, oversized, foreign or invalid
  * files are skipped and named in `problems` (a gate must not pass on what it could not read).
  */
-export const readLockStats = (root: string, problems: string[] = []): LockStatsFile[] => {
+/** Start of a window of `span` complete minutes before `now`, the current minute included. */
+const lockStatsWindowStartMs = (now: number, span: number): number => (Math.floor(now / 60_000) - span) * 60_000;
+
+export const readLockStats = (root: string, problems: string[] = [],
+  options: { minutes?: number; now?: number | undefined } = {}): LockStatsFile[] => {
   const directory = path.join(root, LOCK_STATS_DIR);
   let names: string[];
   try {
@@ -434,13 +450,27 @@ export const readLockStats = (root: string, problems: string[] = []): LockStatsF
     }
     names = fs.readdirSync(directory);
   } catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
-  const candidates = names.filter(name => name.endsWith(".json")).sort();
+  // A file is written after each minute it holds, so one modified before the window starts
+  // holds no minute in it: skip it before the cap, and cap the newest (smarty-dev#7826).
+  const span = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(options.minutes ?? LOCK_STATS_RETAIN_MINUTES)));
+  const since = lockStatsWindowStartMs(options.now ?? Date.now(), span + 1);
+  const candidates: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const { mtimeMs } = fs.lstatSync(path.join(directory, name));
+      if (mtimeMs >= since) candidates.push({ name, mtimeMs });
+    } catch (error) {
+      if (errorCodeOf(error) !== "ENOENT") problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (candidates.length > LOCK_STATS_MAX_FILES) {
-    problems.push(`${directory}: ${candidates.length} stats files, read only the first ${LOCK_STATS_MAX_FILES}`);
+    problems.push(`${directory}: ${candidates.length} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`);
     candidates.length = LOCK_STATS_MAX_FILES;
   }
   const files: LockStatsFile[] = [];
-  for (const name of candidates) {
+  for (const { name } of candidates) {
     try {
       const file = JSON.parse(readRegularFile(path.join(directory, name))) as unknown;
       const invalid = invalidLockStats(file);

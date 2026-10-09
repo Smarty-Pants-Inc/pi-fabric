@@ -64,7 +64,7 @@ const waitFor = async (predicate: () => boolean) => {
 describe("actor settled round 3 event-driven regressions", () => {
   // Real queue/overflow and atomic queue files; disable only the monitor's autonomous
   // polling so a timer or beforePoll cannot masquerade as a dequeue/ownership wake.
-  const fixture = async (owns?: () => boolean) => {
+  const fixture = async (owns?: () => boolean, coalesce = false) => {
     let monitor!: ActorMeshMonitor;
     vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
     vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
@@ -76,12 +76,12 @@ describe("actor settled round 3 event-driven regressions", () => {
     });
     const actors = new ActorManager("test", identity, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: 1 }, agents, () => {}, {
-        actorRoot: path.join(root, "actors"), persistent: true, releasePaused: true,
+        actorRoot: path.join(root, "actors"), persistent: true, releasePaused: true, closeGraceMs: 0,
         ...(owns ? { canManageActor: owns } : {}),
       });
     const close = async () => { await actors.close(); await agents.close(); };
     closers.push(close);
-    const actor = await actors.create({ name: "regression", instructions: "Observe.", events: ["agent_settled"], coalesce: false, activation: { minIntervalMs: 1_000 } });
+    const actor = await actors.create({ name: "regression", instructions: "Observe.", events: ["agent_settled"], coalesce, activation: { minIntervalMs: 1_000 } });
     // Bootstrap readiness is set before any pending work; it is not the recovery event.
     actors.resumeQueued();
     await Promise.resolve();
@@ -215,6 +215,164 @@ describe("actor settled round 3 event-driven regressions", () => {
     expect(incoming(second.actors, actor.id).map(message => (message.data as { marker: string }).marker)).toEqual(["leading", "latest"]);
     vi.advanceTimersByTime(20_000);
     expect(incoming(second.actors, actor.id)).toHaveLength(2);
+  });
+
+  it.each([false, true])("r3-transfer-red: failed pending and deadline transfer saves survive final close and repeated restart (coalesce %s)", async (coalesce) => {
+    const first = await fixture(undefined, coalesce);
+    const { actors, actor } = first;
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    const file = first.queueFile();
+    type Snapshot = {
+      items: Array<{ source: string; payload: { marker?: string } }>;
+      settledWindows?: Array<{ pending?: { payload: { marker?: string } } }>;
+    };
+    const readQueue = (): Snapshot => JSON.parse(fs.readFileSync(file, "utf8"));
+    const markers = (snapshot: Snapshot) => snapshot.items.map(item => [item.source, item.payload.marker]);
+    const latestCount = (snapshot: Snapshot) => snapshot.items.filter(item =>
+      item.source === "host:agent_settled" && item.payload.marker === "latest").length;
+    const totalLatestCount = (snapshot: Snapshot) => latestCount(snapshot) +
+      (snapshot.settledWindows?.filter(window => window.pending?.payload.marker === "latest").length ?? 0);
+    const rename = fs.renameSync;
+    let unavailable = true;
+    const attempts: Snapshot[] = [];
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) {
+        attempts.push(JSON.parse(fs.readFileSync(from, "utf8")));
+        if (unavailable) throw new Error("r3 transfer checkpoint unavailable");
+      }
+      return rename(from, to);
+    });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    expect(attempts.some(snapshot => snapshot.settledWindows?.some(window =>
+      window.pending?.payload.marker === "latest"))).toBe(true); // Suppressed checkpoint really failed.
+    expect(markers(readQueue())).toEqual([["host:agent_settled", "leading"]]);
+    attempts.length = 0;
+    vi.advanceTimersByTime(900); // Original 11,000 deadline, no incoming boundary event.
+    expect(Date.now()).toBe(11_000);
+    expect(attempts.some(snapshot => latestCount(snapshot) === 1 && !snapshot.settledWindows?.length),
+      "otherwise available deadline admission must reach the atomic queue transfer").toBe(true);
+    expect(markers(readQueue())).toEqual([["host:agent_settled", "leading"]]);
+    const failedTransferAttempts = attempts.length;
+    attempts.length = 0;
+    unavailable = false; // The sink recovers BEFORE suspension, never by editing the queue.
+    await first.close();
+    const final = readQueue();
+    const closeSaveAttempts = attempts.length;
+    expect.soft(attempts, "close must make exactly one final save after the failed transfer").toHaveLength(1);
+    expect.soft(attempts.filter(snapshot => totalLatestCount(snapshot) === 1),
+      "the final atomic save must carry latest exactly once across queue and pending").toHaveLength(1);
+    expect.soft(totalLatestCount(final), "final disk snapshot must retain latest after transfer failure").toBe(1);
+    const expected = coalesce ? [["host:agent_settled", "latest"]]
+      : [["host:agent_settled", "leading"], ["host:agent_settled", "latest"]];
+    expect.soft(markers(final), "rollback must preserve leading; committed transfer keeps normal coalescing")
+      .toEqual(final.settledWindows?.some(window => window.pending)
+        ? [["host:agent_settled", "leading"]] : expected);
+
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued(); // Real bootstrap admission; no private store/method mocks.
+    await Promise.resolve();
+    const restored = readQueue();
+    expect.soft(markers(restored), "bootstrap restores latest exactly once, including its host source").toEqual(expected);
+    expect.soft(second.actors.status(actor.id).queued, "restored queue count, not coalescing telemetry").toBe(expected.length);
+    vi.advanceTimersByTime(20_000); // Normal postrestart timers must not duplicate transferred work.
+    expect.soft(markers(readQueue()), "later timers leave restored queue unchanged").toEqual(expected);
+    expect(readQueue().settledWindows?.filter(window => window.pending) ?? []).toHaveLength(0);
+    await second.close();
+    const third = setup(first.root, undefined, { releasePaused: true });
+    third.actors.resumeQueued();
+    await Promise.resolve();
+    vi.advanceTimersByTime(20_000);
+    expect.soft(markers(readQueue()), "repeated restart must neither lose nor duplicate latest").toEqual(expected);
+    expect.soft(third.actors.status(actor.id).queued).toBe(expected.length);
+    expect(readQueue().settledWindows?.filter(window => window.pending) ?? []).toHaveLength(0);
+    console.info("r3-transfer-red evidence", JSON.stringify({ coalesce, failedTransferAttempts,
+      closeSaveAttempts, finalLatestCount: totalLatestCount(final),
+      finalMarkers: markers(final), restoredMarkers: markers(restored), repeatedRestartMarkers: markers(readQueue()) }));
+  });
+
+  it.each([false, true])("r3-transfer: coalesced rollback preserves every leading field and newest overdue payload (leading images %s)", async (withLeadingImages) => {
+    const first = await fixture(undefined, true);
+    const { actors, actor } = first;
+    const image = { type: "image" as const, data: "leading-image", mimeType: "image/png" };
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" }, withLeadingImages ? [image] : []);
+    const file = first.queueFile();
+    const readQueue = () => JSON.parse(fs.readFileSync(file, "utf8"));
+    const leading = readQueue().items[0];
+    const rename = fs.renameSync;
+    let unavailable = true;
+    const attempts: ReturnType<typeof readQueue>[] = [];
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) {
+        attempts.push(JSON.parse(fs.readFileSync(from, "utf8")));
+        if (unavailable) throw new Error("r3 rollback write failure details");
+      }
+      return rename(from, to);
+    });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "older" });
+    vi.advanceTimersByTime(900);
+    expect(actors.status(actor.id).lastError).toContain("r3 rollback write failure details");
+    expect(readQueue().items).toEqual([leading]);
+    attempts.length = 0;
+    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    const latest = { ...payload(), marker: "newest" };
+    const latestImages = withLeadingImages ? [] : [{ ...image, data: "newest-image" }];
+    expect(actors.dispatchHostEvent("agent_settled", latest, latestImages)).toBe(0);
+    latest.marker = "caller-mutation";
+    if (latestImages[0]) latestImages[0].data = "caller-mutation";
+    expect(scheduled.mock.calls).toHaveLength(0);
+    expect(attempts.at(-1).items[0].payload.marker).toBe("newest");
+    expect(attempts.at(-1).settledWindows).toBeUndefined();
+    unavailable = false;
+    attempts.length = 0;
+    await first.close();
+    expect(attempts).toHaveLength(1);
+    const final = readQueue();
+    expect(final.items).toEqual([leading]); // Includes original id, activation, binding and image absence/presence.
+    expect(final.latestActivationSequence).toBe(leading.activation.sequence);
+    expect(final.settledWindows).toEqual([expect.objectContaining({ acceptedAt: 10_000, intervalMs: 1_000,
+      pending: expect.objectContaining({ payload: expect.objectContaining({ marker: "newest" }),
+        images: withLeadingImages ? [] : [{ ...image, data: "newest-image" }] }) })]);
+    const second = setup(first.root, undefined, { releasePaused: true });
+    second.actors.resumeQueued();
+    await Promise.resolve();
+    expect(readQueue().items).toHaveLength(1);
+    expect(readQueue().items[0].payload.marker).toBe("newest");
+    expect(readQueue().items[0].id).toBe(leading.id);
+    expect(readQueue().items[0].images).toEqual(withLeadingImages ? undefined : [{ ...image, data: "newest-image" }]);
+    expect(readQueue().settledWindows).toBeUndefined();
+  });
+
+  it("r3-transfer: failed transfer retries on actual dequeue only after the leading item is tracked", async () => {
+    const { actors, actor, queueFile, markers } = await fixture();
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    const file = queueFile();
+    const rename = fs.renameSync;
+    const accepted: Array<{ items: Array<{ payload: { marker: string }; resumed?: boolean }>; settledWindows?: unknown[] }> = [];
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === file) {
+        const snapshot = JSON.parse(fs.readFileSync(from, "utf8"));
+        if (!snapshot.items.some((item: { payload: { marker: string }; resumed?: boolean }) =>
+          item.payload.marker === "leading" && item.resumed)) throw new Error("r3 save waits for actual in-flight tracking");
+        accepted.push(snapshot);
+      }
+      return rename(from, to);
+    });
+    vi.advanceTimersByTime(100);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    vi.advanceTimersByTime(900);
+    expect(markers()).toEqual(["leading"]);
+    actors.resumeAfterRelease(); // Its pre-drain retry still fails, then the real dequeue frees the slot.
+    actors.pauseForRelease();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(markers()).toEqual(["leading", "latest"]);
+    const transfer = accepted.find(snapshot => snapshot.items.some(item => item.payload.marker === "latest"));
+    expect(transfer?.items.map(item => item.payload.marker)).toEqual(["leading", "latest"]);
+    expect(transfer?.items[0]?.resumed).toBe(true);
+    expect(transfer?.settledWindows).toBeUndefined();
+    vi.advanceTimersByTime(20_000);
+    expect(markers()).toEqual(["leading", "latest"]);
   });
 
   it("r3: failed final saves expose a diagnostic and retain latest in every attempted snapshot without cancellation", async () => {

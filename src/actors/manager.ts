@@ -1951,19 +1951,34 @@ export class ActorManager {
           if (!window.timer) this.#armSettledWindow(actor.id, sourceId, window);
           return false;
         }
+        if (window?.pending && pendingSourceId === undefined) {
+          // An overdue fresh arrival supersedes the held payload even if admission fails.
+          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now };
+          window.pendingCheckpointed = false;
+        }
       }
     }
+    const transferWindow = sourceId === undefined ? undefined : windows?.get(sourceId);
+    const transferPending = transferWindow?.pending;
     this.#enqueue(actor, `host:${event}`, payload, {
       ...(actor.coalesce ? { coalesceKey: `host:${event}` } : {}),
       ...(images.length > 0 ? { images } : {}),
       ownershipChecked: true,
       ...(sourceId !== undefined ? {
         // Keep pending work on failed admission, including a full queue/overflow.
-        holdWhenFull: windows?.get(sourceId)?.pending !== undefined,
+        holdWhenFull: transferPending !== undefined,
+        ...(transferWindow && transferPending ? {
+          checkpoint: (item: ActorQueueItem) => {
+            if (!this.#persistent) return;
+            transferWindow.pendingCheckpointed = false;
+            if (!this.#persistQueue(actor.id, true, false, { sourceId: sourceId!, window: transferWindow, pending: transferPending, item })) {
+              throw new Error(actor.lastError ?? `Fabric actor queue checkpoint failed for ${actor.id}; retry`);
+            }
+          },
+        } : {}),
         onAccepted: () => {
           if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
-          // Replace BEFORE the queue write: never persist admitted work alongside
-          // obsolete pending work, or neither side of this transfer on restart.
+          // Commit only after the queue snapshot holds the transfer without its pending copy.
           const previous = windows.get(sourceId!);
           if (previous?.timer) clearTimeout(previous.timer);
           windows.set(sourceId!, { acceptedAt: now, intervalMs: interval });
@@ -2761,7 +2776,8 @@ export class ActorManager {
       deadLetter?: boolean;
       /** A dead-lettered event returning to the queue; it never goes back to the file. */
       replaying?: boolean;
-      /** Internal atomic transfer of a held host event into the queue snapshot. */
+      /** Held host transfers checkpoint staged work before committing or starting drain. */
+      checkpoint?: (item: ActorQueueItem) => void;
       onAccepted?: () => void;
     } = {},
   ): ActorQueueItem {
@@ -2794,20 +2810,31 @@ export class ActorManager {
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
-        existing.payload = structuredClone(payload);
-        existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
-        if (options.images && options.images.length > 0) {
-          existing.images = options.images.map((image) => ({ ...image }));
-        } else {
-          delete existing.images;
+        const previous = options.checkpoint ? { ...existing } : undefined;
+        try {
+          existing.payload = structuredClone(payload);
+          existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
+          if (options.images && options.images.length > 0) {
+            existing.images = options.images.map((image) => ({ ...image }));
+          } else {
+            delete existing.images;
+          }
+          existing.createdAt = createdAt;
+          existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
+          existing.binding = binding;
+          existing.bindingMode = bindingMode;
+          existing.bindingVersion = 2;
+          options.checkpoint?.(existing);
+        } catch (error) {
+          if (previous) {
+            for (const key of Object.keys(existing)) if (!Object.hasOwn(previous, key)) Reflect.deleteProperty(existing, key);
+            Object.assign(existing, previous);
+            actor.latestActivationSequence = sequence - 1;
+          }
+          throw error;
         }
-        existing.createdAt = createdAt;
-        existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
-        existing.binding = binding;
-        existing.bindingMode = bindingMode;
-        existing.bindingVersion = 2;
+        const persisted = options.checkpoint ? true : this.#persistQueue(actor.id);
         options.onAccepted?.();
-        const persisted = this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         // Memory already runs the merged item; an unacknowledged replay coalesces again.
         if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
@@ -2862,8 +2889,18 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    options.onAccepted?.();
-    if (!this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
+    try {
+      options.checkpoint?.(item);
+    } catch (error) {
+      for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
+        const at = held.indexOf(item);
+        if (at >= 0) held.splice(at, 1);
+      }
+      if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
+      actor.latestActivationSequence = sequence - 1;
+      throw error;
+    }
+    if (!options.checkpoint && !this.#persistQueue(actor.id) && options.requirePersisted && this.#persistent) {
       // Not durable in the receiver's queue: do not accept it, so the host cursor
       // keeps the event and offers it again rather than losing it on a restart.
       for (const held of [actor.queue, this.#overflow.get(actor.id) ?? []]) {
@@ -2873,6 +2910,7 @@ export class ActorManager {
       if (this.#overflow.get(actor.id)?.length === 0) this.#overflow.delete(actor.id);
       throw new ActorQueueCheckpointError(actor);
     }
+    options.onAccepted?.();
     if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -5088,15 +5126,21 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string, durable = false, release = false): boolean {
+  #persistQueue(actorId: string, durable = false, release = false, transfer?: {
+    sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
+  }): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     const inFlight = this.#inFlight.get(actorId);
     const persistedIds = new Set<string>();
+    const parked = this.#parked.get(actorId) ?? [];
     const items = [
-      ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []), ...(this.#parked.get(actorId) ?? []),
-      ...(this.#deferredHandoffs.get(actorId) ?? []),
+      ...(inFlight ? [inFlight] : []),
+      // Bootstrap restores parked leading work ahead of newly admitted trailing work.
+      // A transfer checkpoint must already preserve that order if the host dies here.
+      ...(transfer ? parked : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []),
+      ...(!transfer ? parked : []), ...(this.#deferredHandoffs.get(actorId) ?? []),
     ]
       .filter((item) => {
         if (item.resolve || item.reject || persistedIds.has(item.id)) return false;
@@ -5107,9 +5151,15 @@ export class ActorManager {
     const cleanHandover = release || this.#releasePaused;
     const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
       .flatMap(([sourceId, window]) => window.pending ? [{ sourceId, window, pending: window.pending }] : []);
-    const settledWindows = pendingWindows.map(({ sourceId, window, pending }) =>
+    // Projection is serialization-only: pending stays in memory until the atomic write commits.
+    const savedPendingWindows = pendingWindows.filter(({ sourceId, window, pending }) =>
+      !transfer || sourceId !== transfer.sourceId || window !== transfer.window || pending !== transfer.pending);
+    const settledWindows = savedPendingWindows.map(({ sourceId, window, pending }) =>
       ({ sourceId, acceptedAt: window.acceptedAt, intervalMs: window.intervalMs, pending }));
     try {
+      if (transfer && (!items.includes(transfer.item) ||
+          this.#settledWindows.get(actorId)?.get(transfer.sourceId) !== transfer.window ||
+          transfer.window.pending !== transfer.pending)) throw new Error("Held host event queue transfer no longer matches pending work");
       if (items.length === 0 && settledWindows.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
@@ -5142,11 +5192,11 @@ export class ActorManager {
         }, { durable });
       }
     } catch (error) {
-      if (pendingWindows.length) actor.lastError = errorText(error);
+      if (pendingWindows.length || transfer) actor.lastError = errorText(error);
       if (release) throw error;
       return false;                                         // best-effort; memory still runs the work
     }
-    for (const { sourceId, window, pending } of pendingWindows) {
+    for (const { sourceId, window, pending } of savedPendingWindows) {
       if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
     }
     for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });

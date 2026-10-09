@@ -149,8 +149,10 @@ const staleDirectoryDeletes = (
 export const reapDeadHostRecords = async (
   mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & { root?: string },
   identity: MeshIdentity,
-  options: { ownHostId: string; now?: number; deadAfterMs?: number },
+  options: { ownHostId: string; now?: number; deadAfterMs?: number;
+    withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
 ): Promise<number> => {
+  const fenced = options.withCommitFence ?? (async <T>(operation: () => T | Promise<T>): Promise<T> => operation());
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const found = deadHostRecords(mesh, options);
   const bookkeeping = staleDirectoryDeletes(mesh, identity, options.now ?? Date.now());
@@ -169,7 +171,7 @@ export const reapDeadHostRecords = async (
   const leaseStamp = typeof mesh.root === "string" ? meshDirectoryStamp(mesh.root, "host-leases") : "";
   const leasesBefore = fileLeases(mesh);
   let leases = leasesBefore;
-  const results = dead.length === 0 && bookkeeping.length === 0 ? [] : await mesh.writeBatch({
+  const results = dead.length === 0 && bookkeeping.length === 0 ? [] : await fenced(() => mesh.writeBatch({
     identity,
     ops: [...dead.map(({ entry, hostId }) => ({
       kind: "delete" as const,
@@ -193,7 +195,7 @@ export const reapDeadHostRecords = async (
       const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now(), leases);
       return bookkeeping.filter((op) => !live.has(op.key));
     },
-  });
+  }));
   let removed = results.filter((result) => result.applied).length;
   if (typeof mesh.root === "string") {
     // Participant files, each checked again just before its removal: its host must still be gone
@@ -206,14 +208,21 @@ export const reapDeadHostRecords = async (
         return !host || leaseGone(host, cutoff, fileLeases(mesh));
       };
       const gone = await removeParticipantFileIf({ root: mesh.root, custody: (operation) => mesh.custody(operation) }, entry.key, (current) =>
-        current.version === entry.version && current.updatedAt === entry.updatedAt && hostGone()).catch(() => false);
+        current.version === entry.version && current.updatedAt === entry.updatedAt && hostGone(),
+        { withCommitFence: operation => fenced(operation) }).catch(() => false);
       if (gone) removed += 1;
     }
     // A reaped host's file lease goes too, once it is as old.
     const leases = readHostLeases(mesh.root);
     for (const hostId of new Set(found.map((item) => item.hostId))) {
       const lease = leases.get(hostId);
-      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
+      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) {
+        const root = mesh.root;
+        await fenced(() => {
+          const current = readHostLeases(root).get(hostId);
+          if (current && JSON.stringify(current) === JSON.stringify(lease)) removeHostLease(root, hostId);
+        });
+      }
     }
   }
   return removed;

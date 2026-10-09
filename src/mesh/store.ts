@@ -451,11 +451,13 @@ export class MeshStore {
 
   /** Per-host lease commits and recovery serialize without the shared state/custody lock.
    * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
-   * before recovery can change its receipt. Dead gates are recovered only on their own host. */
-  async leaseCustody<T>(file: string, operation: () => T, lockTimeoutMs = 0): Promise<T> {
+   * before recovery can change its receipt. Async lease-owned transactions retain this gate until
+   * settled; recovery requires matching machine identity and death/current-boot evidence. */
+  async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
+    options: { ownIncarnation?: string | undefined } = {}): Promise<T> {
     const domain = path.join(this.root, "host-lease-commits", createHash("sha256").update(path.basename(file)).digest("hex"));
-    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { hostQualified: true });
-    try { return operation(); } finally { release(); }
+    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true });
+    try { return await operation(); } finally { release(); }
   }
 
   /** The active withTryLock budget in this async context, if any. */

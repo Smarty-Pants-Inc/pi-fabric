@@ -3,13 +3,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricHostLeaseSupersededError, hostLeasePath, readHostLeaseCurrent, removeOwnedHostLease, renewHostLease, writeHostLease,
   type FabricHostLease } from "../src/topology/host-leases.js";
+import { readPhysicalHostIdentity } from "../src/core/atomic-write.js";
 import { HostLeaseLockBusyError } from "../src/topology/host-lease-lock.js";
 
+// A deterministic physical host, independent of the OS running this unit suite.
+// Production non-Linux/missing identity still fails closed; unreadable paths are tested below.
+const realReadFile = fs.readFileSync;
+const readWithPhysicalFixture = (...args: Parameters<typeof fs.readFileSync>) => {
+  if (String(args[0]) === "/etc/machine-id") return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+  if (String(args[0]) === "/proc/sys/kernel/random/boot_id") return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n";
+  return realReadFile(...args);
+};
+beforeEach(() => { vi.spyOn(fs, "readFileSync").mockImplementation(readWithPhysicalFixture); });
 const stores: MeshStore[] = [], roots: string[] = [], directories: ParticipantDirectory[] = [];
 afterEach(async () => {
   for (const directory of directories.splice(0)) await directory.close();
@@ -28,6 +38,7 @@ const setup = (stateBackend: "file" | "sqlite") => {
     const lock = path.join(root, "host-lease-locks", path.basename(hostLeasePath(root, lease.id), ".json"));
     fs.mkdirSync(lock, { recursive: true });
     fs.writeFileSync(path.join(lock, "owner"), JSON.stringify({ token: randomUUID(), pid, host,
+      ...(host === os.hostname() ? { physical: readPhysicalHostIdentity() } : {}),
       ...(expiresAt !== undefined ? { expiresAt, incarnationToken: lease.incarnationToken } : {}) }));
     return lock;
   };
@@ -142,11 +153,13 @@ describe.each(["file", "sqlite"] as const)("%s host lease CAS", stateBackend => 
       expect(s.read()).toEqual(s.lease);
     } finally { clearTimeout(releasing); }
   });
-  it("bounds the active-acquisition fallback when fs.watch is unsupported", async () => {
+  it("makes one attempt and creates no polling timers when fs.watch is unsupported", async () => {
     const s = setup(stateBackend); s.hold();
     const watch = vi.spyOn(fs, "watch").mockImplementation(() => { throw new Error("watch unsupported"); });
+    const timers = vi.spyOn(globalThis, "setTimeout");
     await expect(renewHostLease(s.mesh, s.lease, { claim: true, timeoutMs: 45 })).rejects.toBeInstanceOf(HostLeaseLockBusyError);
-    expect(watch.mock.calls.length).toBeLessThanOrEqual(5);
+    expect(watch).toHaveBeenCalledOnce();
+    expect(timers).not.toHaveBeenCalled();
     expect(s.read()).toBeUndefined();
   });
   it.each(["another-host", "unknown"])("does not PID-recover a %s per-host commit gate", async host => {
@@ -165,7 +178,8 @@ describe.each(["file", "sqlite"] as const)("%s host lease CAS", stateBackend => 
     const s = setup(stateBackend); const file = hostLeasePath(s.root, s.lease.id);
     const domain = path.join(s.root, "host-lease-commits", createHash("sha256").update(path.basename(file)).digest("hex"));
     const lock = path.join(domain, "custody.lock"); fs.mkdirSync(lock, { recursive: true });
-    fs.writeFileSync(path.join(lock, "owner"), `gate\n999999999\n1\n\n${os.hostname()}\n`);
+    const physical = readPhysicalHostIdentity()!;
+    fs.writeFileSync(path.join(lock, "owner"), `gate\n999999999\n1\n\n${physical.machineId}\n${physical.bootId}\n`);
     await renewHostLease(s.mesh, s.lease, { claim: true }); expect(s.read()).toEqual(s.lease);
   });
   it("close cancels a waiting directory preparation and publishes no lease", async () => {

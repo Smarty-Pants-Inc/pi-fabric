@@ -2,8 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { sweepMeshRetention } from "../src/storage/retention-cli.js";
+import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { lockFile } from "../src/residency/file-lock.js";
+import { spawnSync } from "node:child_process";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -106,6 +107,39 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
       expect((await sweepMeshRetention(root, { dryRun: false })).changes).toEqual([]);
       expect(snapshot(root)).toEqual(before);
     } finally { fs.closeSync(fd); }
+  });
+
+  it("holds a dead root's host.lock only around that root's own sweep, so a waking host can claim it during the mesh-wide pass (smarty-dev#7766)", async () => {
+    const { root, host } = make();
+    // A waking host's claim: flock(1) non-blocking on the same host.lock, from another process.
+    const claimable = () => spawnSync("flock", ["-x", "-n", path.join(host, "host.lock"), "true"]).status === 0;
+    const claims: boolean[] = [];
+    // The sweep reads runRetentionMs inside the root's fenced sweep and again before the mesh-wide pass.
+    const options = { now: 30 * 86400000, dryRun: false, get runRetentionMs() { claims.push(claimable()); return 7 * 86400000; } };
+    const result = await sweepMeshRetention(root, options);
+    expect(result.skipped).toEqual([]);
+    expect(claims[0]).toBe(false);
+    expect(claims.at(-1)).toBe(true);
+    expect(claimable()).toBe(true);
+  });
+
+  it("deletes nothing under an operator hold or after a backend switch until a ruling names the new epoch (smarty-dev#7766)", async () => {
+    const { root } = make();
+    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
+    write(path.join(root, MESH_RETENTION_HOLD), "{}");
+    let before = snapshot(root);
+    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/held/) }]);
+    expect(snapshot(root)).toEqual(before);
+    fs.unlinkSync(path.join(root, MESH_RETENTION_HOLD));
+    write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
+    write(path.join(root, "state.db"), "");
+    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 2 }));
+    before = snapshot(root);
+    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/epoch 3.*ruling/) }]);
+    expect(snapshot(root)).toEqual(before);
+    expect((await sweepMeshRetention(root, { ...options, dryRun: true })).changes.length).toBeGreaterThan(0);
+    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
+    expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
   });
 
   it("refuses ambiguous identities and linked actor-reference trees without changing them", async () => {

@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
+import { readMeshStateMovedMarker } from "../mesh/backend-fence.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { actorRunReferencedNow, compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -34,6 +35,22 @@ const treeBytes = (file: string, depth = 0): number => {
   } catch { return 0; }
 };
 
+/** An operator hold on deletions (smarty-dev#7766): while present, --apply changes nothing. */
+export const MESH_RETENTION_HOLD = ".mesh-retention-hold.json";
+/** The ruling that allows deletions on a switched backend: `{ "epoch": <the moved marker's epoch> }`. */
+export const MESH_RETENTION_APPROVAL = ".mesh-retention-approved.json";
+/** Why --apply must not delete now, or undefined. A backend switch (a moved marker at a new epoch) holds
+ * deletions until a ruling names that epoch, so no automatic sweep deletes during or after a switch. */
+const applyRefusal = (meshRoot: string): string | undefined => {
+  if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
+  const moved = readMeshStateMovedMarker(meshRoot);
+  if (moved === undefined) return undefined;
+  let approved: unknown;
+  try { approved = read(path.join(meshRoot, MESH_RETENTION_APPROVAL)).epoch; } catch { /* absent or unreadable: not approved */ }
+  return approved === moved.epoch ? undefined
+    : `the mesh switched to ${moved.backend} at epoch ${moved.epoch}; deletions need a ruling in ${MESH_RETENTION_APPROVAL}`;
+};
+
 /** Offline compaction; with `runRetentionMs`, also age-based run removal (smarty-dev#3252). Existing host flocks must
  * exist and be claimable, diagnostic holders must be proven dead, and actor roots
  * must belong to those fenced resident roots. Live/legacy/unknown custody is skipped.
@@ -50,7 +67,10 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   const removedRuns: string[] = [];
   const changes: Array<{ path: string; beforeBytes: number; afterBytes: number }> = [];
   const skipped: Array<{ path: string; reason: string }> = [];
-  const fences: number[] = [];
+  if (!dryRun) {
+    const refused = applyRefusal(meshRoot);
+    if (refused) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [{ path: meshRoot, reason: refused }] };
+  }
   const residents = new Map<string, string>();
   const ambiguous = new Set<string>();
   const registries: string[] = [];
@@ -84,25 +104,44 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
     }
     return rootsChanged;
   };
-  try {
+  // The dead host's flock fence on one residency root: claimed, re-proven and released around
+  // that root's own work only (smarty-dev#7766). Holding every idle root's host.lock for the
+  // whole sweep made each of them unwakeable while it ran (60fe5904, 10-09: a 7-day apply held
+  // 30 roots for 13+ min at 100% CPU and every Main wake timed out). A host that woke since
+  // discovery holds its lock: this root is skipped and the host wins.
+  const claimFence = async (root: string): Promise<{ fd: number; rootId: string }> => {
+    const lock = path.join(root, "host.lock");
+    if (process.platform !== "linux" || !ownedStat(lock)?.isFile() ||
+        !deadHolder(lock) || !deadHolder(path.join(root, "owner.json"), true)) throw new Error("live or unknown holder");
+    const fd = await lockFile(lock, 0, true);
+    try {
+      if (!deadHolder(lock) || !deadHolder(path.join(root, "owner.json"), true)) throw new Error("holder changed");
+      const config = read(path.join(root, "config.json"));
+      if (config.format !== 1 || typeof config.rootId !== "string" ||
+          typeof config.residencyRoot !== "string" || path.resolve(config.residencyRoot) !== path.resolve(root) ||
+          typeof config.meshRoot !== "string" || path.resolve(config.meshRoot) !== path.resolve(meshRoot)) throw new Error("unknown root identity");
+      return { fd, rootId: config.rootId };
+    } catch (error) { fs.closeSync(fd); throw error; }
+  };
+  const fenced = async (rootId: string, root: string, work: () => void | Promise<void>): Promise<void> => {
+    let claim: { fd: number; rootId: string } | undefined;
+    try {
+      claim = await claimFence(root);
+      if (claim.rootId !== rootId) throw new Error("root identity changed");
+      await work();
+    } catch (error) { skipped.push({ path: root, reason: String(error) }); }
+    finally { if (claim) fs.closeSync(claim.fd); }
+  };
+  { // ponytail: the former try/finally's scope, kept to keep this diff small; no fence outlives its root's work now.
     for (const root of directories(path.join(meshRoot, "residency"))) {
-      let fd: number | undefined;
       try {
-        const lock = path.join(root, "host.lock");
-        if (process.platform !== "linux" || !ownedStat(lock)?.isFile() ||
-            !deadHolder(lock) || !deadHolder(path.join(root, "owner.json"), true)) throw new Error("live or unknown holder");
-        fd = await lockFile(lock, 0, true);
-        if (!deadHolder(lock) || !deadHolder(path.join(root, "owner.json"), true)) throw new Error("holder changed");
-        const config = read(path.join(root, "config.json"));
-        if (config.format !== 1 || typeof config.rootId !== "string" ||
-            typeof config.residencyRoot !== "string" || path.resolve(config.residencyRoot) !== path.resolve(root) ||
-            typeof config.meshRoot !== "string" || path.resolve(config.meshRoot) !== path.resolve(meshRoot)) throw new Error("unknown root identity");
-        if (residents.has(config.rootId) || ambiguous.has(config.rootId)) {
-          residents.delete(config.rootId); ambiguous.add(config.rootId); throw new Error("duplicate root identity");
+        const { fd, rootId } = await claimFence(root);
+        fs.closeSync(fd);
+        if (residents.has(rootId) || ambiguous.has(rootId)) {
+          residents.delete(rootId); ambiguous.add(rootId); throw new Error("duplicate root identity");
         }
-        residents.set(config.rootId, root); fences.push(fd); fd = undefined;
+        residents.set(rootId, root);
       } catch (error) { skipped.push({ path: root, reason: String(error) }); }
-      finally { if (fd !== undefined) fs.closeSync(fd); }
     }
     const retained = retainedActorRunIds(registries);
     if (retained.has("*")) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [...skipped, { path: meshRoot, reason: "unknown actor run references" }] };
@@ -114,7 +153,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         });
       }
     };
-    for (const root of residents.values()) {
+    for (const [rootId, root] of residents) await fenced(rootId, root, () => {
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {
@@ -131,17 +170,18 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
         }));
       } else compactRuns(path.join(root, "runs"));
-    }
+    });
     // With runRetentionMs the mesh-wide pass below covers these actors (and every other one).
     for (const registryRoot of residents.size && options.runRetentionMs === undefined ? registries : []) {
-      const prune = () => {
+      // One resident root at a time, under that root's own brief fence (smarty-dev#7766).
+      const prune = (rootId: string) => {
         // Match ActorRegistryStore/retainedActorRunIds: owned registries contain
         // instructions and message history and have no byte-size protocol limit.
         // Diagnostic records keep the bounded reader above.
         const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
         if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
         for (const actor of registry.actors) {
-          if (!actor || typeof actor.rootId !== "string" || !residents.has(actor.rootId) || actor.removal !== undefined ||
+          if (!actor || actor.rootId !== rootId || actor.removal !== undefined ||
               typeof actor.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(actor.id) || typeof actor.sessionFile !== "string" ||
               path.resolve(actor.sessionFile) !== path.join(path.resolve(registryRoot), actor.id, "session.jsonl")) continue;
           const actorRoot = path.dirname(actor.sessionFile);
@@ -152,10 +192,19 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
           pruneActorSessionBackups(actor.sessionFile, { dryRun, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
         }
       };
+      let rootIds: Set<string>;
       try {
-        if (!absent(path.join(registryRoot, "actors.json.lock"))) throw new Error("actor registry has a holder or uncertain lock");
-        if (dryRun) prune(); else await new ActorRegistryStore(registryRoot).withLock(prune);
-      } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
+        const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
+        if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
+        rootIds = new Set(registry.actors.map((actor: Record<string, unknown> | null) => actor?.rootId)
+          .filter((rootId: unknown): rootId is string => typeof rootId === "string" && residents.has(rootId)));
+      } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); continue; }
+      for (const rootId of rootIds) await fenced(rootId, residents.get(rootId)!, async () => {
+        try {
+          if (!absent(path.join(registryRoot, "actors.json.lock"))) throw new Error("actor registry has a holder or uncertain lock");
+          if (dryRun) prune(rootId); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId));
+        } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
+      });
     }
     if (options.runRetentionMs !== undefined) {
       // Mesh-wide, independent of any owner being alive (smarty-dev#3252, #5652): the owning
@@ -204,7 +253,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
       }
     }
-  } finally { for (const fd of fences) fs.closeSync(fd); }
+  }
   return { dryRun, changes, removedRuns, bytesBefore: changes.reduce((sum, item) => sum + item.beforeBytes, 0),
     bytesAfter: changes.reduce((sum, item) => sum + item.afterBytes, 0), skipped };
 };

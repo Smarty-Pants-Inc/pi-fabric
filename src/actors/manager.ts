@@ -4038,7 +4038,11 @@ export class ActorManager {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs)]);
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
+      // Its JSON report (changes, removed runs, skips) is the record of what each apply did (smarty-dev#7766).
+      const report = fs.openSync(path.join(meshRoot, ".mesh-retention-report.json"), "w", 0o600);
+      let child: ReturnType<typeof spawn>;
+      try { child = spawn(runtime!, args, { detached: true, stdio: ["ignore", report, "ignore"], windowsHide: true }); }
+      finally { fs.closeSync(report); }
       child.on("error", () => undefined);
       if (child.pid) {
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }

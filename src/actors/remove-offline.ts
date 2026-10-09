@@ -315,7 +315,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     // in finally. A Main refuses to publish its root participant while it stands, in the same atomic
     // step as the write; each check runs under that root's participant key lock inside the state
     // transaction, so a Main publication either precedes the check (and refuses removal) or is refused.
-    if (!dryRun) releaseFence = acquireMainPublicationFence(config.meshRoot, config.rootId);
+    if (!dryRun) releaseFence = await acquireMainPublicationFence(config.meshRoot, config.rootId);
     const incarnation = await ownProcessIncarnation();
     const identity = { id: residentHostId(config.rootId), name: "fabric-actors remove", kind: "agent" as const };
     const rootKey = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");

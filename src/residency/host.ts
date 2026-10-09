@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import os from "node:os";
-import { archiveActorForRemoval, assertOwnershipProvable, fencedOperatorCheck, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
+import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -540,10 +540,6 @@ export class ResidentHost {
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
-        actorTreeDelete: {
-          check: (id: string) => this.#actorTreeDeleteCheck(id),
-          deleted: (id: string) => fs.rmSync(this.#operatorRemovalPath(id), { force: true }),
-        },
         canManageActor,
         snapshotActorOwnership,
         lineageAlive,
@@ -1597,12 +1593,7 @@ export class ResidentHost {
           }
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await (async () => {
-              // The tree delete (ActorManager cleanup, possibly after a restart) runs this operator check
-              // under the root's Main publication fence while this record exists (smarty-dev#7817).
-              writeJsonAtomic(this.#operatorRemovalPath(actor.id), command.mainStoppedAudit, { durable: true });
-              return this.#removeResidentActor(actor.id, requestId, () => check());
-            })();
+            : await this.#removeResidentActor(actor.id, requestId, () => check());
         }
       } else if (command.operation === "actors") {
         response = {
@@ -1670,19 +1661,6 @@ export class ResidentHost {
       };
     }
     return response;
-  }
-
-  #operatorRemovalPath(id: string): string {
-    return path.join(this.config.residencyRoot, "operator-removals", `${id}.json`);
-  }
-
-  /** The final operator check before an actor tree is deleted, under the Main publication fence. */
-  async #actorTreeDeleteCheck(id: string): Promise<void> {
-    if (!fs.existsSync(this.#operatorRemovalPath(id))) return; // a removal its live Main requested
-    const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
-    await fencedOperatorCheck(this.mesh, { id: this.hostId, name: "Fabric resident host", kind: "agent" }, this.config.rootId,
-      get => assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, { get }, self, { mainStopped: true }),
-        this.config.rootId, false, true));
   }
 
   async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {

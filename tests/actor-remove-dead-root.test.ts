@@ -21,7 +21,7 @@ import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile, writeParticipantFile } from "../src/topology/participant-files.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { MAIN_PUBLICATION_FENCE_TTL_MS, mainPublicationFenced, takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
+import { deleteRootActorTree, mainPublicationFencePath, mainPublicationFenced, takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -300,7 +300,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const rootId = "session:fenced-main";
     const directory = mainDirectory(meshRoot, rootId);
     try {
-      const release = takeMainPublicationFence(meshRoot, rootId);
+      const release = await takeMainPublicationFence(meshRoot, rootId);
       await directory.refresh().catch(() => undefined);
       expect(readParticipantFile(meshRoot, rootParticipantKey(rootId))).toBeUndefined();
       expect(directory.mesh.get(rootParticipantKey(rootId), { fresh: true })).toBeUndefined();
@@ -333,7 +333,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const link = vi.spyOn(fs, "linkSync").mockImplementationOnce(() => { throw Object.assign(new Error("crash"), { code: "EIO" }); });
     const directory = mainDirectory(meshRoot, rootId);
     try {
-      expect(() => takeMainPublicationFence(meshRoot, rootId)).toThrow("crash");
+      await expect(takeMainPublicationFence(meshRoot, rootId)).rejects.toThrow("crash");
       // A leftover temp file (a crash before its unlink) is never the fence.
       fs.writeFileSync(path.join(meshRoot, "main-publication-fences", "x.123.abc.tmp"), "{");
       expect(fs.readdirSync(path.join(meshRoot, "main-publication-fences"))).toEqual(["x.123.abc.tmp"]);
@@ -343,88 +343,56 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     } finally { link.mockRestore(); await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   }, 40_000);
 
-  it.each(["refused", "seen"] as const)("live host remove: a Main publication during the cleanup is %s; the tree is never deleted under a fresh participant", async outcome => {
-    const f = await fixture();
+  it.skipIf(process.platform !== "linux")("a fence whose holder was killed is stale: the Main publishes and the next remover takes it over", async () => {
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-fence-killed-"));
+    const rootId = "session:fence-killed";
+    const file = mainPublicationFencePath(meshRoot, rootId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ format: 1, pid: 1, host: os.hostname(), createdAt: new Date().toISOString() }));
+    // A remover process holding the fence's exclusive flock.
+    const holder = spawn("flock", ["-x", "-o", file, "sleep", "60"], { stdio: "ignore", detached: true });
+    const killHolder = () => { try { process.kill(-holder.pid!, "SIGKILL"); } catch { /* gone */ } };
+    const directory = mainDirectory(meshRoot, rootId);
     try {
-      const actor = await f.create("live-cleanup");
-      selfLease(f, 2 * fresh);
-      f.mainParticipant(Date.now() - 2 * fresh);
-      const actorDir = path.dirname(f.host.actors.status(actor.id).sessionFile!);
-      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
-      const stale = readParticipantFile(f.config.meshRoot, rootParticipantKey(f.config.rootId))!;
-      const attempts: string[] = [];
-      offlineRemovalHooks.beforeFinalCheck = async () => {
-        if (!fs.existsSync(path.join(f.config.residencyRoot, "operator-removals", `${actor.id}.json`))) return;
-        if (outcome === "refused") {
-          // The root's Main restarts during the cleanup: under the fence its publication is refused.
-          const directory = mainDirectory(f.config.meshRoot, f.config.rootId);
-          try { await directory.refresh(); attempts.push("published"); } catch (error) { attempts.push(String(error)); }
-          attempts.push(readParticipantFile(f.config.meshRoot, rootParticipantKey(f.config.rootId))?.updatedAt === stale.updatedAt &&
-            directory.mesh.get(rootParticipantKey(f.config.rootId), { fresh: true }) === undefined ? "unpublished" : "fresh");
-          await directory.close().catch(() => undefined);
-        } else {
-          // A publication that landed before the fence: the final check sees it and refuses the delete.
-          f.mainParticipant(Date.now());
-          attempts.push("fresh");
-        }
-      };
-      let result: Awaited<ReturnType<typeof f.cli>>;
-      try {
-        result = await f.cli(actor.id);
-        await f.host.actors.removalSettled(actor.id);
-      } finally { delete offlineRemovalHooks.beforeFinalCheck; }
-      expect(result.code).toBe(0);
-      expect(f.registered(actor.id)).toBe(false); // revoked before the cleanup
-      if (outcome === "refused") {
-        expect(attempts.at(-1)).toBe("unpublished");
-        expect(fs.existsSync(actorDir)).toBe(false);
-      } else {
-        // The fresh participant stops the delete; the cleanup obligation stays pending.
-        expect(fs.existsSync(path.join(actorDir, "session.jsonl"))).toBe(true);
-        expect(fs.existsSync(path.join(f.config.residencyRoot, "operator-removals", `${actor.id}.json`))).toBe(true);
-      }
-    } finally { await f.close(); }
+      await vi.waitFor(() => expect(mainPublicationFenced(meshRoot, rootId)).toBe(true), { timeout: 5_000, interval: 20 });
+      await expect(takeMainPublicationFence(meshRoot, rootId)).rejects.toThrow("Another operator actor removal");
+      killHolder();
+      // The kernel dropped the lock with the holder: stale, whatever the record says.
+      await vi.waitFor(() => expect(mainPublicationFenced(meshRoot, rootId)).toBe(false), { timeout: 5_000, interval: 20 });
+      await directory.refresh();
+      expect(directory.mesh.get(rootParticipantKey(rootId), { fresh: true })?.value).toMatchObject({ id: rootId, kind: "root" });
+      const release = await takeMainPublicationFence(meshRoot, rootId);
+      expect(mainPublicationFenced(meshRoot, rootId)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ pid: process.pid, host: os.hostname() });
+      release();
+      expect(mainPublicationFenced(meshRoot, rootId)).toBe(false);
+    } finally { killHolder(); await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   }, 40_000);
 
-  it("an expired fence is stale on every host: a foreign-host fence past expiresAt is replaced", async () => {
-    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-fence-expiry-"));
-    const rootId = "session:fence-expiry";
-    try {
-      const file = path.join(meshRoot, "main-publication-fences", createHash("sha256").update(rootId).digest("hex") + ".json");
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      const foreign = { format: 1, pid: 1, host: "other-host", startTime: null, createdAt: new Date().toISOString() };
-      fs.writeFileSync(file, JSON.stringify({ ...foreign, expiresAt: Date.now() + 60_000 }));
-      expect(mainPublicationFenced(meshRoot, rootId)).toBe(true);
-      expect(() => takeMainPublicationFence(meshRoot, rootId)).toThrow("Another operator actor removal");
-      fs.writeFileSync(file, JSON.stringify({ ...foreign, expiresAt: Date.now() - 1 }));
-      expect(mainPublicationFenced(meshRoot, rootId)).toBe(false);
-      const release = takeMainPublicationFence(meshRoot, rootId);
-      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ pid: process.pid, host: os.hostname(),
-        expiresAt: expect.any(Number) });
-      expect(release.expiresAt - Date.now()).toBeGreaterThan(MAIN_PUBLICATION_FENCE_TTL_MS - 60_000);
-      release();
-      expect(fs.existsSync(file)).toBe(false);
-    } finally { fs.rmSync(meshRoot, { recursive: true, force: true }); }
-  });
-
-  it("offline: a remover past its fence deadline refuses before deleting the tree", async () => {
-    const f = await fixture();
+  it.skipIf(process.platform !== "linux")("a slow delete across a clock jump of over an hour keeps the fence held; a Main publish is still refused", async () => {
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-fence-slow-"));
+    const rootId = "session:fence-slow";
+    const observed: boolean[] = [];
+    let published: unknown;
     const now = Date.now;
+    const directory = mainDirectory(meshRoot, rootId);
     try {
-      const actor = await f.create("deadline");
-      const actorDir = path.join(f.config.actorRoot, actor.id);
-      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
-      await f.killResident();
-      offlineRemovalHooks.afterStep = step => {
-        if (step === "bindings") Date.now = () => now() + MAIN_PUBLICATION_FENCE_TTL_MS + 1_000;
-      };
-      let result: Awaited<ReturnType<typeof f.cli>>;
-      try { result = await f.cli(actor.id); } finally { Date.now = now; delete offlineRemovalHooks.afterStep; }
-      expect(result.code).toBe(1);
-      expect(JSON.parse(result.out)).toMatchObject({ cleaned: false, pending: expect.stringContaining("fence expired") });
-      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
-      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
-    } finally { Date.now = now; await f.close(); }
+      await deleteRootActorTree(meshRoot, rootId, async () => {
+        for (let step = 0; step < 5; step++) {
+          observed.push(mainPublicationFenced(meshRoot, rootId));
+          Date.now = () => now() + (step + 1) * 61 * 60 * 1000; // the clock jumps by more than an hour each step
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        // Still inside the slow delete, after the jumps: the root's Main tries to publish.
+        await directory.refresh().catch(() => undefined);
+        published = directory.mesh.get(rootParticipantKey(rootId), { fresh: true }) ?? readParticipantFile(meshRoot, rootParticipantKey(rootId));
+        observed.push(mainPublicationFenced(meshRoot, rootId));
+      });
+      Date.now = now;
+      expect(observed).toEqual([true, true, true, true, true, true]);
+      expect(published).toBeUndefined();
+      expect(mainPublicationFenced(meshRoot, rootId)).toBe(false);
+    } finally { Date.now = now; await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   }, 40_000);
 
   it("offline: a Main publishing between a check and the tree delete is refused; the tree is never deleted under a fresh participant", async () => {

@@ -1,25 +1,20 @@
 /**
  * Root Main publication fence for an offline actor removal (smarty-dev#7817).
  *
- * The remover writes this marker (O_EXCL) BEFORE its first liveness check and removes it when it
- * finishes. While it exists and its writer is alive, the root's Main refuses to publish its root
- * participant record, in the same atomic step as that write (under the participant key lock, or
- * inside the state transaction). The remover checks under those same fences after the marker is
- * visible, so a Main that published first is seen and a Main that publishes later is refused.
+ * The remover holds an exclusive flock(2) on the fence file for its whole check-plus-delete; the kernel
+ * drops it when the remover dies, so a held fence never goes stale by time and a dead holder's never
+ * outlives it. The record (who, when) is written complete for the audit. While the lock is held, the
+ * root's Main refuses to publish its root participant record, in the same atomic step as that write
+ * (under the participant key lock, or inside the state transaction). The remover checks under those
+ * same fences while holding the lock, so a Main that published first is seen and a Main that publishes
+ * later is refused.
  */
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-
-/** Linux /proc/<pid>/stat field 22 (start ticks), after comm. */
-const processStartTime = (pid: number): string | undefined => {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-  } catch { return undefined; }
-};
+import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 
 export class MainPublicationFencedError extends Error {
   readonly code = "FABRIC_MAIN_PUBLICATION_FENCED";
@@ -28,96 +23,108 @@ export class MainPublicationFencedError extends Error {
   }
 }
 
-interface FenceRecord { format: 1; pid: number; host: string; startTime: string | null; createdAt: string; expiresAt: number }
-
-/** ponytail: one fixed lifetime instead of cross-host liveness. Any fence past expiresAt is stale on every
- * host and platform; a remover refuses its delete once its own fence is past it (smarty-dev#7817). */
-export const MAIN_PUBLICATION_FENCE_TTL_MS = 10 * 60 * 1000;
+interface FenceRecord { format: 1; pid: number; host: string; createdAt: string }
 
 export const mainPublicationFencePath = (meshRoot: string, rootId: string): string =>
   path.join(meshRoot, "main-publication-fences", createHash("sha256").update(rootId).digest("hex") + ".json");
 
-/** True while a live remover holds the fence. Unreadable bytes are a fence (fail closed); a fence
- * whose writer is gone (crash) or reused its pid is stale. */
+/** Cheap and synchronous, for the Main's publish step. No fence file: not fenced. A fence file: held
+ * exactly while its exclusive flock is held (a non-blocking shared flock test fails). Unknown: fenced. */
 export const mainPublicationFenced = (meshRoot: string, rootId: string): boolean => {
-  let raw: string;
-  try { raw = fs.readFileSync(mainPublicationFencePath(meshRoot, rootId), "utf8"); }
+  const file = mainPublicationFencePath(meshRoot, rootId);
+  try { fs.lstatSync(file); }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
-  let record: Partial<FenceRecord>;
-  try { record = JSON.parse(raw) as Partial<FenceRecord>; } catch { return true; }
-  if (typeof record.expiresAt === "number" && Date.now() > record.expiresAt) return false;
-  if (typeof record.pid !== "number" || record.host !== os.hostname()) return true;
-  if (!fs.existsSync(`/proc/${record.pid}`) && process.platform === "linux") return false;
-  if (process.platform !== "linux") {
-    try { process.kill(record.pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
-    return true;
+  if (process.platform === "win32") {
+    // ponytail: no flock on Windows; a same-host pid check stands in (kill 0: ESRCH means stale). The offline
+    // remover itself refuses on Windows (smarty-dev#7858), so this only keeps a stray record from blocking forever.
+    try {
+      const record = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<FenceRecord>;
+      if (typeof record.pid !== "number" || record.host !== os.hostname()) return true;
+      process.kill(record.pid, 0);
+      return true;
+    } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
   }
-  const current = processStartTime(record.pid);
-  return current === undefined || record.startTime === null || current === record.startTime;
+  const probe = spawnSync("flock", ["-s", "-n", file, "true"], { stdio: "ignore", timeout: 5_000 });
+  return probe.status !== 0; // 1: held; anything else (no flock, error): fail closed
 };
 
-/** Take the fence (O_EXCL); a stale one is replaced, a live one refuses. Returns its release. */
-export const takeMainPublicationFence = (meshRoot: string, rootId: string): (() => void) & { expiresAt: number } => {
+/** Create the fence file with its complete record (temp file, then link; EEXIST keeps the existing one). */
+const ensureFenceFile = (file: string, record: FenceRecord): void => {
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, JSON.stringify(record)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try { fs.linkSync(tmp, file); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  } finally { fs.rmSync(tmp, { force: true }); }
+};
+
+/** Take the fence: an exclusive flock on the fence file, held until release. A held fence refuses; a stale
+ * one (its holder died, so the kernel dropped its lock) is taken over by locking it, then rewriting it. */
+export const takeMainPublicationFence = async (meshRoot: string, rootId: string): Promise<() => void> => {
+  if (process.platform === "win32") throw new Error("The Main publication fence needs flock (smarty-dev#7858)");
   const file = mainPublicationFencePath(meshRoot, rootId);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const record: FenceRecord = { format: 1, pid: process.pid, host: os.hostname(),
-    startTime: processStartTime(process.pid) ?? null, createdAt: new Date().toISOString(),
-    expiresAt: Date.now() + MAIN_PUBLICATION_FENCE_TTL_MS };
-  // Never a fence without a complete record: write a unique temp file in full (O_EXCL, fsync), then
-  // link it into place (atomic; EEXIST if a fence exists), and unlink the temp in finally. A crash
-  // leaves at most a *.tmp file, which is never the fence.
+  const record: FenceRecord = { format: 1, pid: process.pid, host: os.hostname(), createdAt: new Date().toISOString() };
   for (let attempt = 0; ; attempt++) {
-    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-      try { fs.writeSync(fd, JSON.stringify(record)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      fs.linkSync(tmp, file);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) throw error;
-      if (mainPublicationFenced(meshRoot, rootId)) throw new Error("Another operator actor removal holds this root's Main publication fence");
-      fs.rmSync(file, { force: true }); // stale: its remover is gone
-    } finally { fs.rmSync(tmp, { force: true }); }
+    ensureFenceFile(file, record);
+    let fd: number;
+    try { fd = await lockFile(file, 0, true); }
+    catch (error) {
+      if (error instanceof FileLockBusy) throw new Error("Another operator actor removal holds this root's Main publication fence");
+      throw error;
+    }
+    // The lock must be on the file at the path: a releasing holder may have unlinked it meanwhile.
+    let current: fs.Stats | undefined;
+    try { current = fs.lstatSync(file); } catch { /* unlinked: retry */ }
+    const locked = fs.fstatSync(fd);
+    if (current && current.ino === locked.ino && current.dev === locked.dev) {
+      const bytes = Buffer.from(JSON.stringify(record));
+      fs.ftruncateSync(fd, 0); fs.writeSync(fd, bytes, 0, bytes.length, 0); fs.fsyncSync(fd);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        fs.rmSync(file, { force: true }); // unlink while still locked, then drop the lock
+        fs.closeSync(fd);
+      };
+    }
+    fs.closeSync(fd);
+    if (attempt >= 3) throw new Error("The root's Main publication fence kept changing; retry the removal");
   }
-  return Object.assign(() => {
-    try {
-      const current = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<FenceRecord>;
-      if (current.pid === record.pid && current.createdAt === record.createdAt) fs.rmSync(file, { force: true });
-    } catch { /* already gone */ }
-  }, { expiresAt: record.expiresAt });
 };
 
-const held = new Map<string, { count: number; release: (() => void) & { expiresAt: number } }>();
+const held = new Map<string, { count: number; release: Promise<() => void> }>();
 
 /** Take this root's fence, shared (reference-counted) by the removals of this process. */
-export const acquireMainPublicationFence = (meshRoot: string, rootId: string): (() => void) & { expiresAt: number } => {
+export const acquireMainPublicationFence = async (meshRoot: string, rootId: string): Promise<() => void> => {
   const key = `${path.resolve(meshRoot)}\0${rootId}`;
   let entry = held.get(key);
   if (entry) entry.count += 1;
-  else { entry = { count: 1, release: takeMainPublicationFence(meshRoot, rootId) }; held.set(key, entry); }
+  else {
+    entry = { count: 1, release: takeMainPublicationFence(meshRoot, rootId) };
+    held.set(key, entry);
+    entry.release.catch(() => held.delete(key));
+  }
+  const releaseFence = await entry.release;
   let released = false;
-  return Object.assign(() => {
+  return () => {
     if (released) return;
     released = true;
-    if (--entry!.count === 0) { held.delete(key); entry!.release(); }
-  }, { expiresAt: entry.release.expiresAt });
+    if (--entry!.count === 0) { held.delete(key); releaseFence(); }
+  };
 };
 
 /**
- * THE path that deletes a root's actor tree (smarty-dev#7817): take the root's Main publication fence,
- * run the final check under it, delete, release in finally. A Main cannot publish its root participant
- * between the check and the delete. Every actor-tree delete (the offline remover and every
- * ActorManager cleanup, which the resident host's live remove uses) goes through here.
+ * THE path that deletes a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
+ * Main publication fence, run the final check under it, delete, release in finally. A Main cannot publish
+ * its root participant between the check and the delete. The live host path is smarty-dev#8090.
  */
-export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void,
+export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void | Promise<void>,
   check?: () => void | Promise<void>): Promise<void> => {
-  const release = acquireMainPublicationFence(meshRoot, rootId);
+  const release = await acquireMainPublicationFence(meshRoot, rootId);
   try {
     await check?.();
-    // An expired fence no longer stops a Main publishing: never delete under one.
-    if (Date.now() >= release.expiresAt) {
-      throw new Error(`The removal's Main publication fence expired at ${new Date(release.expiresAt).toISOString()}; refusing to delete the actor tree (retry the removal)`);
-    }
-    remove();
+    await remove();
   } finally { release(); }
 };

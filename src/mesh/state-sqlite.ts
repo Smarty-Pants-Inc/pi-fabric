@@ -1730,35 +1730,33 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
 };
 
 /**
- * The state root is created 0700, or an existing root must be ours and is made 0700 (an O_NOFOLLOW|O_DIRECTORY
- * fd whose dev/ino match the lstat, then fchmod), so no other local user can reach state.db, -wal or -shm at
- * any moment, including the instant SQLite creates -wal/-shm (pi-fabric#694 SEC, smarty-dev#6477: the creation window).
- * Refused (FABRIC_MESH_STATE_UNSUPPORTED): a symbolic link, not a directory, another owner, or a mode we
- * cannot tighten. Windows: type and symlink checks only.
+ * Fail-closed root gate (pi-fabric#694 SEC, smarty-dev#6477: the creation window). The root is created 0700; an
+ * existing root is used only if it is ALREADY 0700-or-narrower, a directory, and owned by this uid, verified on
+ * an O_NOFOLLOW|O_DIRECTORY fd whose dev/ino match the name's lstat. A wider, foreign or symlinked root is refused
+ * (FABRIC_MESH_STATE_UNSUPPORTED), never repaired: whatever opened it while it was wide may still hold an fd.
+ * Windows: type and symlink checks only.
  */
 export const ensurePrivateRoot = (root: string): void => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const stat = fs.lstatSync(root);
-  const posix = process.platform !== "win32" && typeof process.getuid === "function";
-  const why = stat.isSymbolicLink() ? "is a symbolic link"
-    : !stat.isDirectory() ? "is not a directory"
-    : posix && stat.uid !== process.getuid!() ? `is owned by uid ${stat.uid}, not this process's uid ${process.getuid!()}`
-    : posix && (stat.mode & 0o077) !== 0 && !tightenDirectory(root, stat)
-      ? `is accessible to group or other (mode ${(stat.mode & 0o777).toString(8)}) and could not be made 0700`
-    : undefined;
-  if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: it ${why}`);
-};
-
-const tightenDirectory = (dir: string, checked: fs.Stats): boolean => {
+  const refuse = (why: string): never => {
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: it ${why}`);
+  };
+  const named = fs.lstatSync(root);
+  if (named.isSymbolicLink()) refuse("is a symbolic link");
+  if (process.platform === "win32" || typeof process.getuid !== "function") {
+    if (!named.isDirectory()) refuse("is not a directory");
+    return;
+  }
   let fd: number | undefined;
   try {
-    fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_DIRECTORY ?? 0));
+    try { fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_DIRECTORY ?? 0)); }
+    catch { return refuse("cannot be opened as a directory without following links"); }
     const opened = fs.fstatSync(fd);
-    if (opened.dev !== checked.dev || opened.ino !== checked.ino || !opened.isDirectory()) return false;
-    fs.fchmodSync(fd, 0o700);
-    return (fs.fstatSync(fd).mode & 0o077) === 0;
-  } catch { return false; }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
+    if (!opened.isDirectory()) refuse("is not a directory");
+    if (opened.dev !== named.dev || opened.ino !== named.ino) refuse("changed while it was checked");
+    if (opened.uid !== process.getuid()) refuse(`is owned by uid ${opened.uid}, not this process's uid ${process.getuid()}`);
+    if ((opened.mode & 0o077) !== 0) refuse(`is accessible to group or other (mode ${(opened.mode & 0o777).toString(8)}; it must be 0700)`);
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 };
 
 /**

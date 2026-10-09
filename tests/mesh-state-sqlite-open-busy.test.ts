@@ -361,9 +361,10 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     const watchers = [fs.watch(parent, observe(parent))];
     let store: SqliteStateStore | undefined;
     try {
-      // Create the root through the store, then watch inside it for -wal/-shm creation by the first writes.
-      store = await openStore(root);
+      // The root exists (0700) and is watched BEFORE the store opens: state.db, -wal and -shm are all observed at creation.
+      fs.mkdirSync(root, { mode: 0o700 });
       watchers.push(fs.watch(root, observe(root)));
+      store = await openStore(root);
       for (let i = 0; i < 20; i += 1) await store.put({ key: `k${i}`, value: { i }, identity: { id: "t", name: "t" } } as never).catch(() => undefined);
       await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
@@ -382,21 +383,25 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     store?.close();
   });
 
-  it("tightens an owned 0755 root to 0700 and refuses a symlinked root", async () => {
+  it("refuses an existing 0755 or 0750 root (never repaired) and a symlinked root", async () => {
     const root = await prepared("root-0755");
-    fs.chmodSync(root, 0o755);
-    (await openStore(root)).close();
-    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    for (const mode of [0o755, 0o750]) {
+      fs.chmodSync(root, mode);
+      expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/it must be 0700/) });
+      expect(await refused(root, true)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(fs.statSync(root).mode & 0o777).toBe(mode); // left as found
+    }
+    fs.chmodSync(root, 0o700);
     const link = `${root}-link`;
     fs.symlinkSync(root, link);
     expect(await refused(link)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/symbolic link/) });
   });
 
-  it("makes an owned root that others can write 0700 before opening", async () => {
+  it("refuses a root that others can write", async () => {
     const root = await prepared("root-mode");
     fs.chmodSync(root, 0o777);
-    (await openStore(root)).close();
-    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    try { expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/it must be 0700/) }); }
+    finally { fs.chmodSync(root, 0o700); }
   });
 
   it("refuses a symlinked state.db and a symlinked -wal, never following them", async () => {

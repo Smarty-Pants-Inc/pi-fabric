@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import os from "node:os";
-import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
+import { archiveActorForRemoval, assertOwnershipProvable, fencedOperatorCheck, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -540,6 +540,10 @@ export class ResidentHost {
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
+        actorTreeDelete: {
+          check: (id: string) => this.#actorTreeDeleteCheck(id),
+          deleted: (id: string) => fs.rmSync(this.#operatorRemovalPath(id), { force: true }),
+        },
         canManageActor,
         snapshotActorOwnership,
         lineageAlive,
@@ -1551,23 +1555,32 @@ export class ResidentHost {
         const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, options);
         const check = () => assertResidentOperatorConfirmed(
           readResidentOperatorEvidence(this.config, this.mesh, self, options), command.confirmDeadRoot, false, mainStopped);
-        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true, mainStopped);
-        if (command.dryRun === true) {
+        // smarty-dev#7817: verify the actor tree's containment and ownership before any mutation (stop included).
+        const sessionDir = path.dirname(actor.sessionFile ?? "");
+        const removeChecks = (): void => {
+          if (!actor.sessionFile || path.basename(sessionDir) !== actor.id ||
+              !Object.values(residentActorRoots(this.config)).includes(path.dirname(sessionDir))) {
+            throw new Error(`Actor ${actor.id} session is outside this resident's actor roots`);
+          }
+          // Refuses where file ownership cannot be proven (smarty-dev#7858), before the stop.
+          assertOwnershipProvable();
+          pinActorTree(sessionDir).close();
+        };
+        if (command.action === "remove" && command.dryRun === true) {
+          // A remove dry run runs every check a real removal runs, and changes nothing (smarty-dev#7817).
+          try { assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, false, mainStopped); removeChecks(); }
+          catch (error) { throw new ResidentActorAuthorizationError(`would refuse: ${errorMessage(error)}`); }
+          response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now(),
+            plan: { archiveRoot: path.join(this.config.residencyRoot, "archives"),
+              audit: { ...(command.mainStoppedAudit as MainStoppedAudit), toolEvidence: evidence.toolEvidence } } };
+        } else if (command.dryRun === true) {
+          assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, true, mainStopped);
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
+          assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, false, mainStopped);
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
-          // smarty-dev#7817: verify the actor tree's containment and ownership before any mutation (stop included).
-          const sessionDir = path.dirname(actor.sessionFile ?? "");
-          if (command.action === "remove") {
-            if (!actor.sessionFile || path.basename(sessionDir) !== actor.id ||
-                !Object.values(residentActorRoots(this.config)).includes(path.dirname(sessionDir))) {
-              throw new Error(`Actor ${actor.id} session is outside this resident's actor roots`);
-            }
-            // Refuses where file ownership cannot be proven (smarty-dev#7858), before the stop.
-            assertOwnershipProvable();
-            pinActorTree(sessionDir).close();
-          }
+          if (command.action === "remove") removeChecks();
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
@@ -1584,7 +1597,12 @@ export class ResidentHost {
           }
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+            : await (async () => {
+              // The tree delete (ActorManager cleanup, possibly after a restart) runs this operator check
+              // under the root's Main publication fence while this record exists (smarty-dev#7817).
+              writeJsonAtomic(this.#operatorRemovalPath(actor.id), command.mainStoppedAudit, { durable: true });
+              return this.#removeResidentActor(actor.id, requestId, () => check());
+            })();
         }
       } else if (command.operation === "actors") {
         response = {
@@ -1652,6 +1670,19 @@ export class ResidentHost {
       };
     }
     return response;
+  }
+
+  #operatorRemovalPath(id: string): string {
+    return path.join(this.config.residencyRoot, "operator-removals", `${id}.json`);
+  }
+
+  /** The final operator check before an actor tree is deleted, under the Main publication fence. */
+  async #actorTreeDeleteCheck(id: string): Promise<void> {
+    if (!fs.existsSync(this.#operatorRemovalPath(id))) return; // a removal its live Main requested
+    const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
+    await fencedOperatorCheck(this.mesh, { id: this.hostId, name: "Fabric resident host", kind: "agent" }, this.config.rootId,
+      get => assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, { get }, self, { mainStopped: true }),
+        this.config.rootId, false, true));
   }
 
   async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {

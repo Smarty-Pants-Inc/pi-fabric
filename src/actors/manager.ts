@@ -67,6 +67,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
+import { deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -564,6 +565,7 @@ export class ActorManager {
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
+  #actorTreeDelete: { check(id: string): void | Promise<void>; deleted(id: string): void } | undefined;
   readonly #delivered = new Set<string>();
   // Independent of registry objects: ownership/reload may replace them during a drain.
   readonly #processedKeys = new Map<string, Set<string>>();
@@ -653,6 +655,9 @@ export class ActorManager {
       preparationRetryMs?: number;
       /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
       removalRetryMs?: number;
+      /** The owner's final check before an actor tree is deleted under the root's Main publication
+       * fence (smarty-dev#7817), and its receipt once the tree is gone. */
+      actorTreeDelete?: { check(id: string): void | Promise<void>; deleted(id: string): void };
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -758,6 +763,7 @@ export class ActorManager {
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
     this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
+    this.#actorTreeDelete = options.actorTreeDelete;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
     this.#orphanPresenceTimer = setTimeout(() => {
@@ -2546,7 +2552,14 @@ export class ActorManager {
     try {
       await this.#joinStoppedRun(cleanup.id);
       await this.#bindings.delete(cleanup.id);
-      fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      const removeTree = (): void => fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      const rootId = cleanup.owner?.rootId ?? this.#rootId;
+      // smarty-dev#7817: only under the root's Main publication fence, after the owner's final check.
+      // ponytail: a manager with no mesh persistence has no Main publication to fence.
+      if (this.#persistent && this.meshConfig.enabled && rootId) {
+        await deleteRootActorTree(this.mesh.root, rootId, removeTree, () => this.#actorTreeDelete?.check(cleanup.id));
+        this.#actorTreeDelete?.deleted(cleanup.id);
+      } else removeTree();
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
         if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");

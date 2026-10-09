@@ -27,6 +27,9 @@ the pid must be gone from this host, or reused with a different start time. A re
 from another host, or a root with no participant record at all refuses as "identity unavailable"; the
 automatic proof for roots whose records are gone is smarty-dev#7956. Offline removal holds the root's resident
 startup claim (`host-fence-establish.lock`) and `host.lock` throughout, so no resident host starts meanwhile.
+Every actor-tree delete (offline, and the resident host's live cleanup) runs its final check and the delete
+under the root's Main publication fence: the root Main does not publish its participant while it stands.
+The fence expires after 10 minutes on every host; a removal whose fence has expired refuses its delete.
 
 The attestation never overrides an observation: a live root lease (other than the resident's own heartbeat),
 a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When

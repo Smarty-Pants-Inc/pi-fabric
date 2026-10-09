@@ -20,7 +20,7 @@ import { MeshStore } from "../mesh/store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { takeMainPublicationFence } from "../topology/main-publication-fence.js";
+import { acquireMainPublicationFence, deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { withParticipantFileTryLock } from "../topology/participant-files.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence, type MainToolEvidence } from "../residency/operator-safety.js";
 import { residentActorRoots, residentHostId, type ResidentHostConfig } from "../residency/protocol.js";
@@ -227,8 +227,23 @@ const claimFence = async (directory: string): Promise<number> => {
   } catch (error) { fs.closeSync(fd); throw error; }
 };
 
+/** The operator's final liveness check, inside the state transaction and under the root participant's
+ * key lock: a Main publication either precedes it (and it refuses) or is refused by the fence. */
+export const fencedOperatorCheck = async (mesh: MeshStore, identity: { id: string; name: string; kind: "agent" },
+  rootId: string, assert: (get: (key: string) => ReturnType<MeshStore["get"]>) => void): Promise<void> => {
+  await offlineRemovalHooks.beforeFinalCheck?.();
+  const incarnation = await ownProcessIncarnation();
+  const rootKey = "topology/participants/" + createHash("sha256").update(rootId).digest("hex");
+  await withStateFence(mesh, identity, view => withParticipantFileTryLock(mesh, rootKey, incarnation, () =>
+    assert(key => view.get(key))), 10_000);
+};
+
 /** Test seam only: runs after each completed removal step, before the next liveness check. */
-export const offlineRemovalHooks: { afterStep?: (step: "revoke" | "bindings" | "tree") => void | Promise<void> } = {};
+export const offlineRemovalHooks: {
+  afterStep?: (step: "revoke" | "bindings" | "tree") => void | Promise<void>;
+  /** Before every fenced final check, offline and live. */
+  beforeFinalCheck?: () => void | Promise<void>;
+} = {};
 
 export interface OfflineRemoveResult {
   offline: true;
@@ -236,6 +251,8 @@ export interface OfflineRemoveResult {
   actor: { id: string; name: unknown; status: unknown; registry: string };
   operatorEvidence: ReturnType<typeof readResidentOperatorEvidence>;
   archive?: string;
+  /** Dry run: where the archive would go and the audit record it would keep. */
+  plan?: { archiveRoot: string; audit: MainStoppedAudit };
   cleaned?: boolean;
   pending?: string;
 }
@@ -288,20 +305,25 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     }
     const mainStopped = options.mainStoppedAudit !== undefined;
     const evidence = readResidentOperatorEvidence(config, mesh, undefined, { mainStopped });
-    assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, dryRun, mainStopped);
+    // A dry run runs every check a real removal runs (smarty-dev#7817); it reports "would refuse".
+    const wouldRefuse = (error: unknown): never => {
+      throw new Error(`would refuse: ${error instanceof Error ? error.message : String(error)}`);
+    };
+    try { assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, false, mainStopped); }
+    catch (error) { if (dryRun) wouldRefuse(error); throw error; }
     // The root Main publication fence (smarty-dev#7817): taken before the first check below, released
     // in finally. A Main refuses to publish its root participant while it stands, in the same atomic
     // step as the write; each check runs under that root's participant key lock inside the state
     // transaction, so a Main publication either precedes the check (and refuses removal) or is refused.
-    if (!dryRun) releaseFence = takeMainPublicationFence(config.meshRoot, config.rootId);
+    if (!dryRun) releaseFence = acquireMainPublicationFence(config.meshRoot, config.rootId);
     const incarnation = await ownProcessIncarnation();
     const identity = { id: residentHostId(config.rootId), name: "fabric-actors remove", kind: "agent" as const };
     const rootKey = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
     const check = async (): Promise<void> => {
       recheck();
-      await withStateFence(mesh!, identity, view => withParticipantFileTryLock(mesh!, rootKey, incarnation, () =>
-        assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get: key => view.get(key) }, undefined, { mainStopped }),
-          options.confirmDeadRoot, false, mainStopped)), 10_000);
+      await fencedOperatorCheck(mesh!, identity, config.rootId, get =>
+        assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }, undefined, { mainStopped }),
+          options.confirmDeadRoot, false, mainStopped));
     };
     const { store, root, row } = matches[0]!;
     const id = row.id;
@@ -320,7 +342,8 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     }
     // Walk and pin the actor tree first: a symlink, special file or foreign entry refuses before any archive.
     tree = pinActorTree(actorDirectory);
-    if (dryRun) return { offline: true, dryRun, actor: summary, operatorEvidence: evidence };
+    if (dryRun) return { offline: true, dryRun, actor: summary, operatorEvidence: evidence,
+      plan: { archiveRoot: path.join(directory, "archives"), audit: { ...options.mainStoppedAudit!, toolEvidence: evidence.toolEvidence! } } };
 
     // The tool's own observation at removal time, kept beside the operator's attestation.
     const assertion: MainStoppedAudit = { ...options.mainStoppedAudit!,
@@ -356,8 +379,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
       await check();
       await new ActorBindingStore(config.sessionId, root).delete(id);
       await offlineRemovalHooks.afterStep?.("bindings");
-      await check();
-      removePinnedActorTree(tree);
+      await deleteRootActorTree(config.meshRoot, config.rootId, () => removePinnedActorTree(tree!), check);
       await offlineRemovalHooks.afterStep?.("tree");
       await check();
       await mesh.delete({ key: presenceKey });

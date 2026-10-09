@@ -17,6 +17,13 @@ import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Attribute the timer to its direct caller, not an ancestor that causes an existing
+// participant publication throttle or other independently owned deadline.
+const scheduledByHost = (stack: string): boolean => {
+  const frames = stack.split("\n");
+  const timer = frames.findIndex(frame => frame.includes("at setTimeout "));
+  return timer >= 0 && (frames[timer + 1]?.includes("ResidentHost.") ?? false);
+};
 const until = async (done: () => boolean, ms = 8_000) => {
   const started = performance.now();
   while (!done() && performance.now() - started < ms) await sleep(20);
@@ -129,18 +136,109 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("uses at most one safety timer while the same eligibility edge cannot commit dormancy", async () => {
+  it("makes an idle actor dormant at its eligibility event without a dormancy timeout", async () => {
+    const { root, config, host } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    const timers: Array<{ delay: number | undefined; stack: string }> = [];
+    const timeout = globalThis.setTimeout;
+    try {
+      await host.start();
+      // Native watcher capability has separate coverage; isolate eligibility scheduling.
+      vi.spyOn(wake, "assertResidentWakeWatch").mockResolvedValue();
+      const get = host.participants.get.bind(host.participants);
+      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+        ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : get(id, ...rest));
+      const actor = await host.actors.create({ name: "eligibility-event", instructions: "wait", events: ["agent_settled"], residency: "durable" });
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+        timers.push({ delay: args[1], stack: new Error().stack ?? "" });
+        return timeout(...args);
+      }) as typeof setTimeout);
+      await host.actors.setEvents(actor.id, []);
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(timers.filter(timer => scheduledByHost(timer.stack))).toEqual([]);
+      expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("a delivery during the wake proof cancels eligibility and settles dormant without a quiet-period timer", async () => {
+    const { root, host } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    let prove!: () => void;
+    const proof = new Promise<void>(resolve => { prove = resolve; });
+    let finish!: () => void;
+    const running = new Promise<void>(resolve => { finish = resolve; });
+    const timers: string[] = [];
+    const timeout = globalThis.setTimeout;
+    try {
+      await host.start();
+      const probes = vi.spyOn(wake, "assertResidentWakeWatch").mockImplementation(() => proof);
+      const runs = fakeRun(host, async () => running);
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+        timers.push(new Error().stack ?? "");
+        return timeout(...args);
+      }) as typeof setTimeout);
+      const actor = await host.actors.create({ name: "proof-delivery-race", instructions: "process", residency: "durable" });
+      await until(() => probes.mock.calls.length === 1);
+      host.actors.tell(actor.id, "exactly one racing delivery");
+      await until(() => runs.mock.calls.length === 1);
+      prove();
+      await host.participants.refreshPresence();
+      expect(host.actors.status(actor.id).status).not.toBe("dormant");
+      expect(host.actors.inFlightCount()).toBe(1);
+      finish();
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(host.actors.inFlightCount()).toBe(0);
+      expect(runs).toHaveBeenCalledTimes(1);
+      expect(runs.mock.calls[0]![0].task).toContain("exactly one racing delivery");
+      expect(timers.filter(stack => scheduledByHost(stack))).toEqual([]);
+    } finally { prove(); finish(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("revalidates live Main protection after the awaited wake proof", async () => {
+    const { root, config, host } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    let prove!: () => void;
+    const proof = new Promise<void>(resolve => { prove = resolve; });
+    let mainLive = false;
+    try {
+      await host.start();
+      const get = host.participants.get.bind(host.participants);
+      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+        ? mainLive ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : undefined : get(id, ...rest));
+      const probes = vi.spyOn(wake, "assertResidentWakeWatch").mockImplementation(() => proof);
+      const actor = await host.actors.create({ name: "proof-presence-race", instructions: "supervise", events: ["agent_settled"], residency: "durable" });
+      await until(() => probes.mock.calls.length === 1);
+      const commits = vi.spyOn(host.actors, "dormantIdleActors");
+      mainLive = true;
+      prove();
+      await until(() => commits.mock.calls.length > 0);
+      expect(commits.mock.calls[0]![0]?.has(actor.id)).toBe(true);
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      mainLive = false;
+      await host.actors.setEvents(actor.id, []);
+      await until(() => host.actors.status(actor.id).status === "dormant");
+    } finally { prove(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["no-op", "failure"] as const)("does not retry a %s dormancy commit without a new event", async outcome => {
     const { root, host } = fixture();
     try {
       await host.start();
-      const attempts = vi.spyOn(host.actors, "dormantIdleActors").mockResolvedValue(0);
-      const actor = await host.actors.create({ name: "bounded-recheck", instructions: "wait", residency: "durable" });
-      await sleep(1_400);
+      const attempts = vi.spyOn(host.actors, "dormantIdleActors");
+      if (outcome === "failure") attempts.mockRejectedValue(new Error("registry unavailable"));
+      else attempts.mockResolvedValue(0);
+      const actor = await host.actors.create({ name: "event-only-recheck", instructions: "wait", residency: "durable" });
+      await until(() => attempts.mock.calls.length > 0);
+      // Join the event-owned presence write, then observe beyond the removed 1 s nudge.
+      await host.participants.refreshPresence();
+      await sleep(100);
       const count = attempts.mock.calls.length;
-      expect(count).toBeGreaterThan(0);
-      await sleep(2_200);
+      await sleep(1_200);
       expect(attempts).toHaveBeenCalledTimes(count);
       expect(host.actors.status(actor.id).status).toBe("idle");
+      await host.actors.setEvents(actor.id, ["agent_settled"]);
+      await until(() => attempts.mock.calls.length > count);
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

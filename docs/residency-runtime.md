@@ -84,8 +84,12 @@ The existing **50 ms request poll**, **100 ms V2 request-maintenance interval**,
 retention overlay and collector behavior are unchanged. The idle request-polling
 and maintenance-timer rework is separate
 [smarty-dev#7885](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7885).
-Actor/delivery settlement signals drive dormancy eligibility, with one bounded
-safety recheck per eligibility transition; they do not replace request polling.
+Actor changes/final drain settlement, agent settlement, delivery-outbox drain and
+actor presence-publication completion drive dormancy eligibility. Each event's
+check commits eligible dormancy directly after proving native wake support and
+revalidating current actor work and live-participant protection. There is no
+actor quiet period, dormancy timeout, timed safety recheck or periodic retry;
+these signals do not replace the existing request polling.
 
 `MeshStore.publish`/`publishBatch` route wake nudges **after** the existing event
 log durability barrier. Topic/address matches, direct control targets, and

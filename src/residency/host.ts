@@ -89,9 +89,8 @@ export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
-// Dormancy is driven by actor/delivery/settlement signals. A single bounded safety
-// re-check covers a missed signal for each eligibility transition; there is no dormancy poll.
-const IDLE_ACTOR_CHECK_MS = 1_000;
+// Reuse active-actor observations on the existing request poll, not dormancy checks.
+const ACTIVE_ACTOR_CACHE_MS = 1_000;
 // A stat stamp of config.json proves it unchanged only once the file is older than the
 // coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
 // replacement inside one timestamp tick can keep size and times, and its file id too where
@@ -214,9 +213,6 @@ export class ResidentHost {
   #idleCheckQueued = false;
   #idleCheckRequested = false;
   #idleCheckPending: Promise<void> | undefined;
-  #dormancySafetyTimer: NodeJS.Timeout | undefined;
-  #dormancyEligible = false;
-  #dormancySafetyUsed = false;
   #wakeWatchReprobeUsed = false;
   #wakeWatchErrorUnsubscribe: (() => void) | undefined;
   #wakeWatchNeedsReprobe = false;
@@ -550,7 +546,10 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
-        presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
+        presencePublisher: { refresh: async () => {
+          await this.participants.refreshPresence();
+          this.#scheduleIdleCheck();
+        }, schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,
         snapshotActorOwnership,
@@ -769,8 +768,6 @@ export class ResidentHost {
     this.#requestTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
-    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
-    this.#dormancySafetyTimer = undefined;
     this.#wakeWatchErrorUnsubscribe?.();
     this.#wakeWatchErrorUnsubscribe = undefined;
     this.#requestRetention.close();
@@ -1030,6 +1027,7 @@ export class ResidentHost {
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {
       if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+      this.#scheduleIdleCheck(); // Delivery custody ended; do not wait for a timed nudge.
     }).catch(() => undefined);
     return flushing;
   }
@@ -1175,7 +1173,7 @@ export class ResidentHost {
   }
 
   #hasActiveActor(now: number, current = false): boolean {
-    if (current || now - this.#activeActor.at >= IDLE_ACTOR_CHECK_MS) {
+    if (current || now - this.#activeActor.at >= ACTIVE_ACTOR_CACHE_MS) {
       this.#activeActor = { at: now, active: this.actors.hasActiveDurableActor() };
     }
     return this.#activeActor.active;
@@ -1196,21 +1194,6 @@ export class ResidentHost {
         if (this.#idleCheckRequested) this.#scheduleIdleCheck();
       }).catch(() => undefined);
     });
-  }
-
-  #clearDormancySafetyTimer(): void {
-    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
-    this.#dormancySafetyTimer = undefined;
-  }
-
-  #armDormancySafetyTimer(): void {
-    if (this.#dormancySafetyUsed || this.#closed) return;
-    this.#dormancySafetyUsed = true;
-    this.#dormancySafetyTimer = setTimeout(() => {
-      this.#dormancySafetyTimer = undefined;
-      this.#scheduleIdleCheck();
-    }, IDLE_ACTOR_CHECK_MS);
-    this.#dormancySafetyTimer.unref?.();
   }
 
   async #ensureWakeWatch(): Promise<boolean> {
@@ -1286,30 +1269,22 @@ export class ResidentHost {
       const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
       const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
       const eligible = hasIdleActor && this.actors.hasDormantIdleActor(protectedIds);
-      if (!eligible) {
-        this.#dormancyEligible = false;
-        this.#dormancySafetyUsed = false;
-        this.#clearDormancySafetyTimer();
-      } else {
-        const firstEligibility = !this.#dormancyEligible;
-        this.#dormancyEligible = true;
+      if (eligible) {
         if (!await this.#ensureWakeWatch()) {
           this.#idleSince = now;
           return;
         }
-        if (firstEligibility) {
-          // Probe on the edge, but give actor/delivery settlement signals a chance
-          // to make the eligibility decision current before dormancy is committed.
-          this.#armDormancySafetyTimer();
-        } else {
-          try {
-            this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
-            await this.actors.dormantIdleActors(protectedIds);
-          } catch {
-            this.#idleSince = now;
-            this.#armDormancySafetyTimer();
-            return;
-          }
+        if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
+        try {
+          // The watcher proof may yield to delivery or presence changes. Refresh
+          // expected participants; dormantIdleActors rechecks current work custody.
+          const currentProtectedIds = this.#expectedActors();
+          this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
+          await this.actors.dormantIdleActors(currentProtectedIds);
+        } catch {
+          // Keep the actor warm. Only a new actor/delivery/presence event retries.
+          this.#idleSince = now;
+          return;
         }
       }
     }

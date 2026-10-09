@@ -5296,15 +5296,15 @@ describe("AgentsProvider steering", () => {
     const { provider } = setup();
     const actor = await provider.invoke("create", {
       name: "owner-alarm", instructions: "Handle alarms.", topics: ["ops.owner"],
-      dedupeKey: "data.key", coalesceKey: "payload.number",
+      dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 },
     }, context) as { id: string; dedupeKey?: string; coalesceKey?: string };
-    expect(actor).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number" });
+    expect(actor).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 } });
     await expect(provider.invoke("status", { id: actor.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
     await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: null }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
     const template = await provider.invoke("create", {
-      name: "alarm-template", instructions: "Handle alarms.", scope: "global", dedupeKey: "data.key",
+      name: "alarm-template", instructions: "Handle alarms.", scope: "global", dedupeKey: "data.key", activation: { minIntervalMs: 1_000 },
     }, context) as { id: string };
-    await expect(provider.invoke("import", { id: template.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    await expect(provider.invoke("import", { id: template.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key", activation: { minIntervalMs: 1_000 } });
     for (const dedupeKey of ["", "not a path", "data..key", "x".repeat(201), 42, null]) {
       await expect(provider.invoke("create", { name: "bad-dedupe", instructions: "x", dedupeKey }, context)).rejects.toThrow("Invalid actor dedupeKey");
     }

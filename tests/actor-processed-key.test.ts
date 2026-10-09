@@ -122,6 +122,47 @@ describe("durable actor opt-in occurrence dedupeKey (smarty-dev#7710)", () => {
     expect(outputs(second.actors, actor.id)).toHaveLength(2);
   });
 
+  it("preserves completed occurrences and pending settled delivery together across restart", async () => {
+    const first = setup();
+    const actor = await first.actors.create({
+      name: "combined-alarm", instructions: "Observe alarms and settlements.",
+      topics: [topic], events: ["agent_settled"], coalesce: false,
+      dedupeKey: "data.key", activation: { minIntervalMs: 2_000 }, residency: "durable",
+    });
+    await alarm(first.mesh, "already-told");
+    await settled(first.actors, actor.id, 1);
+    first.actors.pauseForRelease();
+    const hostPayload = (marker: string) => ({
+      event: "agent_settled", session: { id: "settled-source", cwd: process.cwd() },
+      digest: {}, transcript: [], signal: { idle: true, observedAt: Date.now() }, marker,
+    });
+    expect(first.actors.dispatchHostEvent("agent_settled", hostPayload("leading"))).toBe(1);
+    expect(first.actors.dispatchHostEvent("agent_settled", hostPayload("latest"))).toBe(0);
+    const file = queueFile(first.root, actor.id);
+    const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+    const completedKey = JSON.stringify(["mesh-dedupe", "data.key", topic, "already-told"]);
+    expect(snapshot.processedKeys).toEqual([completedKey]);
+    expect(snapshot.settledWindows).toHaveLength(1);
+    expect(snapshot.settledWindows[0].pending.payload.marker).toBe("latest");
+    await first.close();
+    const second = setup(first.root);
+    expect(second.actors.status(actor.id)).toMatchObject({ dedupeKey: "data.key", activation: { minIntervalMs: 2_000 } });
+    second.actors.resumeQueued();
+    await alarm(second.mesh, "already-told");
+    await alarm(second.mesh, "new-work");
+    await settled(second.actors, actor.id, 2);
+    const hostOutputs = () => second.actors.messages(actor.id).filter(message =>
+      message.direction === "out" && message.source === "host:agent_settled");
+    await waitFor(() => hostOutputs().length === 2 && second.actors.status(actor.id).status === "idle");
+    expect(outputs(second.actors, actor.id)).toHaveLength(2);
+    expect(second.actors.messages(actor.id).filter(message =>
+      message.direction === "in" && message.source === "host:agent_settled")
+      .map(message => (message.data as { marker: string }).marker)).toEqual(["leading", "latest"]);
+    const restored = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(restored.processedKeys).toContain(completedKey);
+    expect(restored.settledWindows ?? []).toEqual([]);
+  }, 30_000);
+
   it("evicts the oldest of the last 256 processed keys, without refreshing a duplicate", async () => {
     const first = setup();
     const actor = await create(first.actors);

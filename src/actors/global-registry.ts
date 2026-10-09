@@ -8,9 +8,10 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import type {
+  FabricActorActivationPolicy,
   FabricActorDelivery,
   FabricActorHostEvent,
   FabricActorRequest,
@@ -221,6 +222,9 @@ export class GlobalActorRegistry {
       responseMode: patch.responseMode ?? existing.responseMode,
       triggerTurn: patch.triggerTurn ?? existing.triggerTurn,
       coalesce: patch.coalesce ?? existing.coalesce,
+      ...(patch.activation !== undefined
+        ? { activation: patch.activation }
+        : existing.activation !== undefined ? { activation: existing.activation } : {}),
       ...(patch.residency !== undefined
         ? { residency: patch.residency }
         : existing.residency
@@ -337,6 +341,7 @@ export class GlobalActorRegistry {
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
+      ...(def.activation ? { activation: clone(def.activation) } : {}),
       ...(def.activationFilter !== undefined && !def.activationFilterError && !this.#invalidFilters.has(def.id)
         ? { activationFilter: clone(def.activationFilter) }
         : {}),
@@ -398,6 +403,7 @@ export class GlobalActorRegistry {
     validateActorInferenceContext(def.inferenceContext, runner);
     validateActorCoalesceKey(def.coalesceKey);
     validateActorDedupeKey(def.dedupeKey);
+    const activation = normalizeActorActivation(def.activation);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
@@ -433,6 +439,7 @@ export class GlobalActorRegistry {
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
+      ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       ...(validWhile ? { validWhile } : {}),
     };
@@ -540,6 +547,8 @@ export class GlobalActorRegistry {
       const nice = typeof record.nice === "number" && Number.isFinite(record.nice) ? parseAgentNice(record.nice) : undefined;
       const extensions = typeof record.extensions === "boolean" ? record.extensions : undefined;
       let requires: FabricCapabilityRequirement[] | undefined;
+      let activation: FabricActorActivationPolicy | undefined;
+      try { activation = normalizeActorActivation(record.activation); } catch { /* unreadable policy is off */ }
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
@@ -582,6 +591,7 @@ export class GlobalActorRegistry {
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
         ...(record.dedupeKey !== undefined ? { dedupeKey: record.dedupeKey } : {}),
+        ...(activation ? { activation } : {}),
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),

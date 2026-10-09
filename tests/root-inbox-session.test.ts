@@ -210,6 +210,40 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 
+  it("reconciles 50 steer-driven turns inside one real run, without duplicate inbox IDs (#4313)", async () => {
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, { persisted: true });
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 500);
+    const rootId = `session:${session.sessionManager.getSessionId()}`;
+    const key = "topology/inbox/" + createHash("sha256").update(rootId).digest("hex").slice(0, 32);
+    const cursor = () => mesh.get(key, { fresh: true })!.value as { after: number; pending?: unknown };
+    const ids = () => inboxMessages().flatMap(message => (message as { details?: { ids?: string[] } }).details?.ids ?? []);
+    const first = missedWork("held at the first inference");
+    const firstSequence = mesh.read({ after: 0, limit: 500 }).find(event => event.id === first)!.sequence;
+    let second: string, third: string, inferences = 0, settled = 0;
+    const unsubscribe = session.subscribe(event => { if (event.type === "agent_settled") settled++; });
+    try {
+      faux.setResponses(Array.from({ length: 53 }, (_, index) => async () => {
+        const turn = index + 1; inferences++;
+        expect(settled).toBe(0); // No fresh run or completed-settle escape hatch.
+        if (turn === 1) second = missedWork("later work inside the same run");
+        if (turn === 25) third = missedWork("work behind the pending followUp");
+        if (turn >= 2) expect(cursor().after).toBeGreaterThanOrEqual(firstSequence);
+        if (turn <= 50) await session.steer(`continue busy work ${turn}`);
+        if (turn <= 51) expect(ids()).toEqual([first]);
+        if (turn === 52) expect(ids()).toEqual([first, second]);
+        if (turn === 53) expect(ids()).toEqual([first, second, third]);
+        return fauxAssistantMessage(`busy turn ${turn}`);
+      }));
+      await session.prompt("keep working");
+      expect(inferences).toBe(53);
+      expect(settled).toBe(1);
+      expect(ids()).toEqual([first, second!, third!]);
+      expect(new Set(ids()).size).toBe(3);
+      expect(cursor().pending).toBeUndefined();
+    } finally { unsubscribe(); mesh.closeState(); }
+  }, 60_000);
+
   it("turn start never re-inserts an aggregate after split inbox receipts", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
     const identityId = `session:${session.sessionManager.getSessionId()}`;
@@ -227,12 +261,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       customType: "pi-fabric-inbox", content: `recorded ${id}`, display: true, details: { ids: [id] },
     }, { triggerTurn: false });
     expect(inboxMessages()).toHaveLength(2);
-    // Load the persisted pending batch into Fabric's real inbox. An unsuccessful warm
-    // turn must not reconcile at settle; the next before_agent_start owns the receipt.
+    // Load the persisted pending batch into Fabric's real inbox. Even an unsuccessful
+    // warm run commits confirmed work at its turn/settle boundaries, without redelivery.
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
       { ...fauxAssistantMessage("warm failed"), stopReason: "error", errorMessage: "test warm failure" }]);
     await session.prompt("warm");
-    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeDefined();
+    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
     expect(inboxMessages()).toHaveLength(2);
     faux.setResponses([fauxAssistantMessage("noted")]);
     await session.prompt("next");
@@ -361,7 +395,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(session.isStreaming).toBe(false);
   }, 60_000);
 
-  it("does not wake a busy Main: the event comes after the run settles, in a new run", async () => {
+  it("does not wake while a busy Main streams: the event joins its running loop at turn end", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(40, true);
     const order: string[] = [];
     session.subscribe((event) => {
@@ -375,7 +409,8 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await session.prompt("work");
     await until(() => inboxMessages().length > 0 && !session.isStreaming);
     expect(inboxMessages()).toHaveLength(1);
-    expect(order.slice(0, 2)).toEqual(["settled", "inbox"]);
+    expect(order.slice(0, 2)).toEqual(["inbox", "settled"]);
+    expect(order.filter(item => item === "settled")).toHaveLength(1);
   }, 60_000);
 
   it("stays off after a cancelled run until the next turn starts", async () => {

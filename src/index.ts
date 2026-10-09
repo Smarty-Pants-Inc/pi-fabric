@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
@@ -632,10 +632,29 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     (context as { isSettling?: () => boolean }).isSettling?.() ?? false;
   const promptPending = (context: ExtensionContext): boolean =>
     (context as { isPromptPending?: () => boolean }).isPromptPending?.() ?? false;
+  // A followUp can wait behind many steers. Queuing is not a receipt, but must not enqueue
+  // the same pending IDs on every turn. Keep only the current batch, until confirmed/retired.
+  const queuedRootInboxIds = new Set<string>();
+  const inboxEventsToQueue = (inbox: RootInboxBatch) => {
+    const pending = new Set(inbox.events.map(event => event.id));
+    for (const id of queuedRootInboxIds) if (!pending.has(id)) queuedRootInboxIds.delete(id);
+    return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
+  };
+  const reconcileRootInbox = async (context: ExtensionContext, options: RootInboxReconcileOptions): Promise<void> => {
+    if (!state.initialized) return;
+    const inbox = await state.nextRootInbox(inboxHeldBy(context), undefined, options).catch(() => undefined);
+    reportInboxExpiry(pi, inbox);
+    if (!inbox || options.commitOnly) return;
+    const events = inboxEventsToQueue(inbox);
+    if (!events.length) return;
+    deliverRootInbox(pi, events);
+    for (const event of events) queuedRootInboxIds.add(event.id);
+  };
   const stopInboxWake = (): void => {
     if (inboxWake.timer) clearInterval(inboxWake.timer);
     inboxWake.timer = undefined;
     inboxWake.context = undefined;
+    queuedRootInboxIds.clear();
   };
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
@@ -783,32 +802,44 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("turn_end", async (event, context) => {
-    // Speculation never crosses a turn boundary; registry.endInvocation already
-    // dropped entries for completed fabric_exec runs, this catches turns where
-    // the program never executed (type errors, aborts).
-    if (state.initialized) state.resetSpeculation();
-    if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
-    // A turn with new action evidence only enqueues the background compiler;
-    // the hook returns without scanning session files or waiting on a lock.
-    if (entropyEvidenceThisTurn) {
-      entropyEvidenceThisTurn = false;
-      scheduleEntropyCompile(context);
+    try {
+      // Speculation never crosses a turn boundary, including type errors and aborts.
+      if (state.initialized) state.resetSpeculation();
+      if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
+      // Only enqueue the compiler here, without waiting for its scan/lock.
+      if (entropyEvidenceThisTurn) {
+        entropyEvidenceThisTurn = false;
+        scheduleEntropyCompile(context);
+      }
+    } finally {
+      // Pi awaits this boundary before consuming queued followUps in the same running loop.
+      // Never start a retry when this turn failed or the owner cancelled it.
+      await reconcileRootInbox(context, { turnEnd: true, commitOnly: context.signal?.aborted ||
+        (event.message.role === "assistant" && (event.message.stopReason === "aborted" || event.message.stopReason === "error")) });
     }
   });
 
   pi.on("agent_settled", async (event, context) => {
     inboxWake.settling = true;
+    let completed = false;
     try {
       await settle(event, context);
+      completed = settledCompleted(event, context);
     } finally {
-      inboxWake.settling = false;
+      try {
+        // All outcomes acknowledge confirmed work, even if another settle operation threw.
+        // Only a successful completed settle may admit new work and trigger a continuation.
+        await reconcileRootInbox(context, { commitOnly: !completed });
+      } finally {
+        inboxWake.settling = false;
+      }
     }
   });
   const settle = async (event: unknown, context: ExtensionContext): Promise<void> => {
     // Only an owner cancel disarms future mailbox work. A provider error must not leave
     // addressed followUps waiting forever for a boundary that will never come (#4012).
     // This arms the existing idle reader, not a retry: no pending work means no new turn.
-    // Error settlement itself still does not drain below; the inbox's grace/cooldown apply.
+    // Noncompleted settlement only commits held work; the idle reader keeps its grace/cooldown.
     inboxWake.context = context;
     inboxWake.armed = !context.signal?.aborted &&
       ["completed", "error"].includes(settledOutcome(event, context));
@@ -845,14 +876,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     await state.compact.maybeCommit(context);
     await compactAtConfiguredThreshold(context, state.config);
     await state.publishHostLifecycle("pi.agent_settled", event);
-    // A Main whose run completed takes the work events a steer missed as its next turn
-    // (smarty-dev#754). An aborted run waits for owner input; a failed run leaves its
-    // mailbox to the idle reader above, rather than retrying at the error boundary.
     if (settledCompleted(event, context)) {
-      const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
-      reportInboxExpiry(pi, inbox);
-      if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
+      // The shadow root inbox reconciles in the outer finally for every settle outcome.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     }
@@ -1220,10 +1246,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
-    if (!inbox?.events.length) return;
+    if (!inbox) return;
+    const events = inboxEventsToQueue(inbox);
+    if (!events.length) return;
+    for (const event of events) queuedRootInboxIds.add(event.id);
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
-    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };
-    deliverRootInbox(pi, inbox.events, { deliverAs: "nextTurn", triggerTurn: false });
+    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(events) };
+    deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).

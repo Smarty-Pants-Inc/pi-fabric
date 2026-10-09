@@ -330,6 +330,34 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       expect(fs.readFileSync(path.join(f.root, "started"), "utf8").trim().split("\n")).toEqual([String(handle.pid)]);
     } finally { await handle.stop(); await handle.waitForClose(); }
   });
+  it("a lost admission watcher joins the launcher and never replays admission during teardown", async () => {
+    const f = fixture();
+    // Keep readiness inside this fixture after its TERM trap is installed.
+    fs.writeFileSync(path.join(f.root, "systemd-run"), `#!/bin/sh
+      while [ "$1" != "--" ]; do shift; done; shift; marker="$5";
+      trap 'printf "1:name=systemd:/worker.scope\\n" > "$marker"; exit 0' TERM
+      printf ready > "${f.root}/ready"
+      while :; do /bin/sleep 0.05; done
+    `, { mode: 0o700 });
+    let admissionWatch: fs.FSWatcher | undefined;
+    const originalWatch = fs.watch.bind(fs), exists = fs.existsSync.bind(fs);
+    vi.spyOn(fs, "watch").mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      const watcher = originalWatch(...args);
+      if (String(args[0]).includes("fabric-scope-")) admissionWatch = watcher;
+      return watcher;
+    }) as typeof fs.watch);
+    const reads = vi.spyOn(fs, "existsSync").mockImplementation(exists), warn = vi.fn();
+    const launching = spawnDetached(f.worker, [], f.root, undefined, undefined, { executable: path.join(f.root, "systemd-run"), slice: "app.slice", warn });
+    await vi.waitFor(() => expect(fs.existsSync(path.join(f.root, "ready"))).toBe(true));
+    expect(admissionWatch).toBeDefined(); admissionWatch!.emit("error", new Error("watch lost"));
+    const handle = await launching;
+    try {
+      expect(warn).toHaveBeenCalledExactlyOnceWith("admitted scope has no cgroup v2 path");
+      expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+      expect(await handle.isAlive()).toBe(false);
+      expect(reads.mock.calls.filter(call => String(call[0]).endsWith("/admitted"))).toHaveLength(2);
+    } finally { await handle.stop(); await handle.waitForClose(); }
+  });
   it("warns on admitted v1 downgrade during teardown without replay", async () => {
     const f = fixture(`while [ "$1" != "--" ]; do shift; done; shift; marker="$5";
       trap 'printf "1:name=systemd:/worker.scope\\n" > "$marker"; exit 0' TERM

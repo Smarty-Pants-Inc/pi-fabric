@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { waitForScopeAdmission } from "../scope-admission.js";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -40,9 +41,8 @@ export const spawnScopedExecution = async (
   let closed = false, error: Error | undefined;
   const nativeClose = new Promise<void>(resolve => child.once("close", () => { closed = true; resolve(); }));
   child.once("error", value => { error = value; });
-  const deadline = Date.now() + 5_000;
-  while (!fs.existsSync(marker) && !closed && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
-  if (fs.existsSync(marker)) {
+  const admitted = await waitForScopeAdmission(marker, nativeClose);
+  if (admitted) {
     try {
       const directory = (child.pid ? processScopePath(child.pid, unit) : undefined) ?? scopePath(fs.readFileSync(marker, "utf8"), unit);
       if (directory) { fs.statSync(directory); executionCgroups.set(child, cgroupCustody(directory, child.pid ? executionIdentity(child.pid) : undefined)); }

@@ -6,7 +6,8 @@ import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { randomUUID } from "node:crypto";
-import { cgroupCustody, executionIdentity, linuxGroupMember, processScopePath, scopePath, scopeLauncherEnvironment, CUSTODY_POLL_MS, type CgroupCustody, type ExecutionIdentity, type LinuxGroupMember } from "../../process-cgroup.js";
+import { waitForScopeAdmission } from "../../scope-admission.js";
+import { cgroupCustody, executionIdentity, linuxGroupMember, processScopePath, scopePath, scopeLauncherEnvironment, type CgroupCustody, type ExecutionIdentity, type LinuxGroupMember } from "../../process-cgroup.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -490,7 +491,8 @@ export const spawnDetached = async (
         } while (Date.now() < deadline);
         return settled();
       };
-      // The live custodian must persist stop intent before draining execution.
+      // Cgroup receipts skip TERM without PID-stable scope-only authority.
+      // Preserve the grace deadline before atomic member-only KILL.
       if (!exited) await primaryScope.signal("SIGTERM");
       else for (const scope of scopes.values()) await scope.signal("SIGTERM");
       if (await wait(termGraceMs)) return;
@@ -663,12 +665,9 @@ export const spawnDetached = async (
   if (scope && marker) {
     let nativeClosed = false;
     void closed.then(() => { nativeClosed = true; });
-    const admissionDeadline = Date.now() + 5_000;
     try {
-      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
-        await new Promise<void>(resolve => setTimeout(resolve, 10));
-      }
-      if (fs.existsSync(marker)) {
+      const admitted = await waitForScopeAdmission(marker, closed, authority?.signal);
+      if (admitted) {
         try {
           const directory = processScopePath(pid, scopeUnit) ?? scopePath(fs.readFileSync(marker, "utf8"), scopeUnit);
           if (directory) {

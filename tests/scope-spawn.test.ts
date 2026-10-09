@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +44,18 @@ describe.skipIf(process.platform !== "linux")("scope spawn environment downgrade
     expect(launch.mock.calls[0]![2].env).toBeUndefined();
     expect(process.env.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/fixture/bus");
     expect(process.env.XDG_RUNTIME_DIR).toBe("/fixture/runtime");
+  });
+  it("watch creation failure joins the captured launcher without releasing its target gate", async () => {
+    vi.spyOn(processUtils, "findExecutable").mockReturnValue("/fixture/systemd-run");
+    vi.spyOn(fs, "watch").mockImplementation(() => { throw new Error("watch unavailable"); });
+    const gate = { on: vi.fn(), end: vi.fn() };
+    const scoped = Object.assign(new EventEmitter(), { pid: 123, stdio: [null, null, null, gate], kill: vi.fn() }) as unknown as ChildProcess;
+    const kill = vi.spyOn(scoped, "kill").mockImplementation(() => { scoped.emit("close", null, "SIGKILL"); return true; });
+    const target = new EventEmitter() as ChildProcess;
+    const launch = vi.fn((command: string, _args: readonly string[], _options: SpawnOptions) => command === "target" ? target : scoped);
+    expect(await spawnScopedExecution(launch, "target", ["literal"], options)).toBe(target);
+    expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL"); expect(gate.end).not.toHaveBeenCalled();
+    expect(launch).toHaveBeenCalledTimes(2); expect(launch).toHaveBeenLastCalledWith("target", ["literal"], options);
   });
   it("preserves options after a real scoped launcher fails before admission", async () => {
     vi.spyOn(processUtils, "findExecutable").mockReturnValue("/bin/false");

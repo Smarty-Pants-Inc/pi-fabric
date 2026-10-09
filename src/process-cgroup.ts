@@ -72,7 +72,7 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
   const closeFd = (): void => { if (fd !== undefined && active === 0) { fs.closeSync(fd); fd = undefined; } };
   const notify = (): void => { for (const wake of notifications) wake(); };
   const markEmpty = (): void => {
-    empty = true; watcher?.close(); watcher = undefined; closeFd(); resolveEmpty();
+    empty = true; watcher?.close(); watcher = undefined; closeFd(); resolveEmpty(); notify();
   };
   const file = (name: string): string => `/proc/self/fd/${fd}/${name}`;
   try {
@@ -93,7 +93,8 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
       const text = fs.readFileSync(file("cgroup.procs"), "utf8");
       const pids = text.trim() ? text.trim().split(/\s+/).map(Number) : [];
       if (pids.some(pid => !Number.isSafeInteger(pid) || pid <= 0)) throw new Error(`Invalid membership in ${directory}`);
-      if (!pids.length) markEmpty();
+      // Empty direct membership is not empty recursive membership; only
+      // cgroup.events populated 0 (or a removed pinned scope) confirms exit.
       return pids;
     } catch (error) { if (gone(error)) { markEmpty(); return []; } throw error; }
   };
@@ -110,7 +111,7 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
       });
       watcher.on("error", () => { watcher?.close(); watcher = undefined; notify(); });
       observeEvents(); // close the watch/read race
-    } catch { watcher?.close(); watcher = undefined; /* 1s bounded exit fallback */ }
+    } catch { watcher?.close(); watcher = undefined; /* fail closed; one safety read at the drain deadline, never polling */ }
   }
   let signalling = Promise.resolve();
   const signal = (value: NodeJS.Signals): Promise<void> => {
@@ -125,7 +126,10 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
       active++;
       try {
         try { fs.writeFileSync(file("cgroup.kill"), "1"); }
-        catch (error) { if (gone(error) && !members().length) return; throw error; }
+        catch (error) {
+          if (gone(error)) { observeEvents(); if (empty) return; }
+          throw error;
+        }
       } finally { active--; if (empty) closeFd(); }
     };
     const pending = signalling.then(run);
@@ -136,34 +140,26 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
     directory, execution, closed, members, signal,
     dispose(): void { watcher?.close(); watcher = undefined; closeFd(); },
     get watching(): boolean { return watcher !== undefined; },
-    exited: (): boolean => members().length === 0,
-    async waitForExit(ms: number): Promise<boolean> {
-      const deadline = Date.now() + ms;
-      const safetyAt = Date.now() + 60_000;
-      let safetyRead = false;
-      if (!members().length) return true;
-      while (true) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) return false;
-        // ponytail: R-no-polling exception: one >=60s safety membership read per
-        // watched wait for a missed kernel event; deadline wakes do not re-read.
-        const interval = watcher ? (safetyRead ? Infinity : Math.max(0, safetyAt - Date.now())) : CUSTODY_POLL_MS;
+    exited: (): boolean => empty,
+    waitForExit(ms: number): Promise<boolean> {
+      if (empty) return Promise.resolve(true);
+      return new Promise(resolve => {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        let wake!: () => void;
-        let timerWake = false;
-        try {
-          await new Promise<void>(resolve => {
-            wake = resolve; notifications.add(wake);
-            timer = setTimeout(() => { timerWake = true; resolve(); }, Math.min(remaining, interval));
-          });
-        } finally { clearTimeout(timer); notifications.delete(wake); }
-        if (empty) return true;
-        if (timerWake && watcher) {
-          if (remaining < interval) return false;
-          safetyRead = true;
-        }
-        if (!members().length) return true;
-      }
+        const finish = (exited: boolean): void => {
+          clearTimeout(timer); notifications.delete(wake); resolve(exited);
+        };
+        const wake = (): void => { if (empty) finish(true); };
+        notifications.add(wake);
+        // One deadline, shared populated-0 events, no periodic membership read.
+        // A failed watcher retains custody until this deadline. One safety read
+        // may confirm a missed empty/removal event; unknown is false so callers
+        // escalate to pinned cgroup.kill rather than polling or releasing debt.
+        timer = setTimeout(() => {
+          try { observeEvents(); } catch { /* unreadable is not exited */ }
+          finish(empty);
+        }, Math.max(0, ms));
+        wake();
+      });
     },
   };
 };

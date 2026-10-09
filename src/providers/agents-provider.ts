@@ -9,7 +9,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import type {
   FabricActorDelivery,
@@ -303,6 +303,7 @@ const actorRequest = (
   }
   validateActorInferenceContext(args.inferenceContext, runner);
   validateActorCoalesceKey(args.coalesceKey);
+  validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
@@ -338,6 +339,7 @@ const actorRequest = (
     ...(typeof args.triggerTurn === "boolean" ? { triggerTurn: args.triggerTurn } : {}),
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
+    ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
     ...(activation ? { activation } : {}),
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),

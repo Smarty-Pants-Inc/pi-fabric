@@ -26,9 +26,9 @@ export const deliverRootInbox = (
     const batch = events.slice(start, end);
     const message = rootInboxMessage(batch);
     const wakeCauses = batch.map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
-    // The first FIFO event explains the batch wake. Retain all event causes too:
-    // legacy hosts still receive one batch even when its senders differ.
-    pi.sendMessage(fabricWakeMessage(pi, { ...message, details: { ...message.details, wakeCauses } }, options, wakeCauses[0]!),
+    // One native message can admit several sources. Keep the whole FIFO cause
+    // list, including on legacy hosts that batch events from different senders.
+    pi.sendMessage(fabricWakeMessage(pi, message, options, wakeCauses),
       provenance ? fabricProvenanceOptions(pi, options, provenance) : options);
     start = end;
   }

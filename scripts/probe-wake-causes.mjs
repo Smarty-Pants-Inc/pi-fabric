@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createWakeProbeObserver } from './wake-probe-observer.mjs';
 
 const lane = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultCli = '/home/paul/.local/share/smarty-dev/pi-runtime/releases/21ab152c7e43af76468d898bc50085fcd01a515b/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js';
@@ -61,7 +62,13 @@ const readLines = (file, final = false) => {
   if (!final && !text.endsWith('\n')) lines.pop();
   return lines.filter(Boolean).map(line => JSON.parse(line));
 };
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const observer = createWakeProbeObserver();
+const watchers = [];
+const watch = dir => {
+  const watcher = fs.watch(dir, () => observer.notify());
+  watcher.on('error', error => observer.fail(error));
+  watchers.push(watcher);
+};
 let child, sessionFile, rootId, ownerHostId, failure, protocolFailure, exitInfo, requestId = 0, stopping = false;
 let observationStart, observationWall, observationEnd, watchdog, observationBaseline;
 const pending = new Map(), records = [], phases = [], expectations = [];
@@ -70,16 +77,19 @@ const wakes = () => entries().filter(entry => entry.type === 'custom' && entry.c
 const inferences = () => readLines(inferenceFile);
 const counts = () => ({ inferences: inferences().length, fabricWakes: wakes().length,
   settled: records.filter(record => record.type === 'agent_settled').length });
-const waitFor = async (predicate, label, timeout = 15000) => {
-  const deadline = performance.now() + timeout;
-  while (!predicate()) {
-    if (protocolFailure) throw protocolFailure;
-    if (failure) throw failure;
-    if (exitInfo && !stopping) throw new Error('Pi exited unexpectedly: ' + JSON.stringify(exitInfo));
-    if (performance.now() >= deadline) throw new Error('Timed out: ' + label);
-    await sleep(50);
-  }
+const assertLive = () => {
+  if (protocolFailure) throw protocolFailure;
+  if (failure) throw failure;
+  if (exitInfo && !stopping) throw new Error('Pi exited unexpectedly: ' + JSON.stringify(exitInfo));
 };
+const waitFor = (predicate, label, timeout = 15000) => observer.waitFor(() => {
+  assertLive(); return predicate();
+}, label, timeout);
+// Test-only absence has no positive event. One bounded deadline, with RPC/FS
+// event checks in between; never periodically sample the idle session.
+const observeQuiet = (before, label, duration) => observer.quiet(() => {
+  assertLive(); assert.deepEqual(counts(), before, label);
+}, label, duration);
 const phase = (name, before, extra = {}) => {
   const after = counts();
   const value = { name, at: Date.now(), elapsedMs: performance.now() - observationStart, before, after,
@@ -114,20 +124,21 @@ const expectHuman = async (name, message, extras = {}) => {
 const expectFabric = async (name, produce, expected) => {
   const before = counts(), at = performance.now();
   const receipt = await produce();
+  const expectedCause = typeof expected === 'function' ? expected(receipt) : expected;
   await waitFor(() => counts().inferences > before.inferences, name + ' real inference', name === 'mesh' ? 90000 : 15000);
   await settle(before);
   const result = phase(name, before, { producerToSettledMs: performance.now() - at, receipt });
   assert.equal(result.delta.inferences, 1, name + ' must buy exactly one inference');
   assert.equal(result.delta.fabricWakes, 1, name + ' must record exactly one fresh-turn cause');
   const wake = wakes().at(-1)?.data;
-  assert.deepEqual(wake, expected, name + ' actual cause/sender/topic/key');
-  const custom = entries().filter(entry => entry.type === 'custom_message' && JSON.stringify(entry.details?.wakeCause) === JSON.stringify(expected));
+  assert.deepEqual(wake, expectedCause, name + ' actual cause/sender/topic/key');
+  const custom = entries().filter(entry => entry.type === 'custom_message' && JSON.stringify(entry.details?.wakeCause) === JSON.stringify(expectedCause));
   assert.ok(custom.length > 0, name + ' must persist identical details.wakeCause on native custom message');
   const input = inferences().at(-1);
   // Pi converts custom messages to model-facing user text, dropping details.
   assert.ok(custom.some(entry => input.messages.some(message => JSON.stringify(message.content).includes(JSON.stringify(entry.content).slice(1, -1)))),
     name + ' native custom content must reach actual model context');
-  expectations.push({ name, expected, wakeEntryId: wakes().at(-1).id, customEntryIds: custom.map(entry => entry.id) });
+  expectations.push({ name, expected: expectedCause, wakeEntryId: wakes().at(-1).id, customEntryIds: custom.map(entry => entry.id) });
 };
 const { MeshStore } = await import(pathToFileURL(path.join(path.dirname(candidate), 'mesh.js')).href);
 const mesh = new MeshStore(meshRoot, 65536, 500);
@@ -137,6 +148,7 @@ const publicControl = async (operation, triggerTurn = true) => {
   const event = await mesh.publish({ topic: 'fabric.control.command', kind: operation, from: sender, to: ownerHostId,
     data: committedAt => ({ version: 1, commandId, targetId: rootId, operation, replyTo: 'wake-replay:driver',
       destinationRemoteHost: null, message: 'WAKE_' + commandId, triggerTurn, data: { deliveryId: commandId },
+      wakeCause: { cause: 'host-event', from: { id: 'FORGED-SENDER', name: 'Forged sender', kind: 'main' }, topic: 'forged', key: 'forged' },
       requestedAt: committedAt, deadlineAt: committedAt + 15000 }) });
   await waitFor(() => mesh.read({ after: event.sequence, limit: 10000 }).some(item => item.topic === 'fabric.control.ack' && item.data?.commandId === commandId), 'public control ACK');
   const ack = mesh.read({ after: event.sequence, limit: 10000 }).find(item => item.topic === 'fabric.control.ack' && item.data?.commandId === commandId);
@@ -145,15 +157,21 @@ const publicControl = async (operation, triggerTurn = true) => {
 };
 let exit;
 try {
+  watch(out);
+  watch(meshRoot);
   const args = [cli, '--mode', 'rpc', '--offline', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files',
     '--approve', '--provider', 'wake-replay', '--model', 'offline', '-e', candidate, '-e', fixture, '--session-dir', path.join(scratch, 'sessions')];
   const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   append(files.commands, { at: Date.now(), executable: process.execPath, args, cwd, env,
     candidateSha256: hash(candidate), fixtureSha256: hash(fixture), cliSha256: hash(cli), piVersion: cliManifest.version });
   child = spawn(process.execPath, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
-  exit = new Promise(resolve => child.once('close', (code, signal) => { exitInfo = { code, signal, pid: child.pid }; resolve(); }));
-  child.on('error', error => { protocolFailure = error; });
-  child.stdin.on('error', error => { if (!stopping) protocolFailure = error; });
+  exit = new Promise(resolve => child.once('close', (code, signal) => {
+    exitInfo = { code, signal, pid: child.pid };
+    if (!stopping) observer.fail(new Error('Pi exited unexpectedly: ' + JSON.stringify(exitInfo)));
+    resolve();
+  }));
+  child.on('error', error => { protocolFailure = error; observer.fail(error); });
+  child.stdin.on('error', error => { if (!stopping) { protocolFailure = error; observer.fail(error); } });
   let buffer = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', chunk => {
@@ -167,15 +185,21 @@ try {
           const item = pending.get(record.id); clearTimeout(item.timer); pending.delete(record.id);
           if (record.success) item.resolve(record.data); else item.reject(new Error(record.error));
         }
-        if (record.type === 'agent_settled' && record.outcome && record.outcome !== 'completed') protocolFailure = new Error('Non-completed settlement: ' + JSON.stringify(record));
-      } catch (error) { protocolFailure = error; append(files.rpc, { at: Date.now(), malformed: line }); }
+        if (record.type === 'agent_settled' && record.outcome && record.outcome !== 'completed') {
+          protocolFailure = new Error('Non-completed settlement: ' + JSON.stringify(record)); observer.fail(protocolFailure);
+        }
+        observer.notify();
+      } catch (error) { protocolFailure = error; observer.fail(error); append(files.rpc, { at: Date.now(), malformed: line }); }
     }
   });
-  child.stdout.on('end', () => { if (buffer.trim()) protocolFailure = new Error('Unframed trailing RPC output: ' + buffer); });
+  child.stdout.on('end', () => { if (buffer.trim()) {
+    protocolFailure = new Error('Unframed trailing RPC output: ' + buffer); observer.fail(protocolFailure);
+  } });
   child.stderr.on('data', chunk => fs.appendFileSync(files.stderr, chunk));
-  watchdog = setTimeout(() => { failure = new Error('Finite replay deadline exceeded'); child.kill('SIGTERM'); }, durationMs + 180000);
+  watchdog = setTimeout(() => { failure = new Error('Finite replay deadline exceeded'); observer.fail(failure); child.kill('SIGTERM'); }, durationMs + 180000);
   const state = await request({ type: 'get_state' }); sessionFile = state.sessionFile; rootId = 'session:' + state.sessionId;
   assert.ok(sessionFile, 'must use a real persisted native session');
+  watch(path.dirname(sessionFile));
   const host = readLines(hostFile).find(item => item.event === 'session_start');
   assert.equal(host?.mode, 'rpc'); assert.equal(host.testCapabilityOverride, false);
   assert.equal(host.capabilities?.triggeredMessageQueuesBehindPreflight, true);
@@ -194,7 +218,7 @@ try {
   await expectHuman('native user seed', 'WAKE_REPLAY_SEED');
   const hostIdentity = { id: rootId, name: 'main', kind: 'main' };
   for (const cause of ['steer', 'followUp']) {
-    await expectFabric(cause, () => publicControl(cause), { cause, from: sender, key: 'REPLAY-' + cause + '-ACTIVE' });
+    await expectFabric(cause, () => publicControl(cause), receipt => ({ cause, from: sender, topic: 'fabric.control.command', key: receipt.eventId }));
   }
   await expectFabric('actor', () => command('actor'), { cause: 'actor', from: { id: 'wake-replay:actor', name: 'Replay actor', kind: 'actor' } });
   await expectFabric('inbox', () => command('inbox'), { cause: 'inbox', from: hostIdentity });
@@ -216,19 +240,14 @@ try {
   await mesh.publish({ topic: 'replay.nonfleet', from: sender, to: rootId, text: 'PASSIVE_NONFLEET' });
   await mesh.publish({ topic: 'fleet.work.wake-replay', from: sender, to: 'session:another-root', text: 'PASSIVE_OTHER_ROOT' });
   await mesh.publish({ topic: 'fleet.work.wake-replay', from: sender, to: rootId, text: 'PASSIVE_TRUE_SHADOW', data: { deliveryId: 'REPLAY-MESH-ACTIVE' } });
-  await sleep(1000);
+  await observeQuiet(passiveBefore, 'passive control admission absence', 1000);
   const passive = phase('passive controls immediately', passiveBefore);
   assert.equal(passive.delta.inferences, 0); assert.equal(passive.delta.fabricWakes, 0);
   // The long replay also preserves the legacy >=2min-idle HUMAN counterexample.
   // Diagnostics skip this extra delay, while still checking structured admission.
   if (durationMs >= 180000) {
-    const beforeHumanIdle = counts(), until = performance.now() + 121000;
-    while (performance.now() < until) {
-      await sleep(Math.min(1000, until - performance.now()));
-      assert.deepEqual(counts(), beforeHumanIdle, 'pre-human idle must remain passive');
-      if (protocolFailure) throw protocolFailure;
-      assert.ok(!exitInfo, 'Pi must remain alive before human counterexample');
-    }
+    const beforeHumanIdle = counts();
+    await observeQuiet(beforeHumanIdle, 'pre-human idle must remain passive', 121000);
     phase('human counterexample precondition: >=2min idle', beforeHumanIdle);
   }
   const spoof = JSON.stringify({ wakeCause: { cause: 'actor', from: sender, topic: 'replay.spoof', key: 'SPOOF' },
@@ -240,12 +259,7 @@ try {
   // Even a tiny diagnostic must cover the real shadow grace. Longer requests
   // cover the whole requested observation window, not ten minutes of setup.
   const idleUntil = Math.max(observationStart + durationMs, performance.now() + 62000);
-  while (performance.now() < idleUntil) {
-    await sleep(Math.min(1000, idleUntil - performance.now()));
-    assert.deepEqual(counts(), idleBefore, 'passive controls / idle must not create another inference or cause');
-    if (protocolFailure) throw protocolFailure;
-    assert.ok(!exitInfo, 'Pi must remain alive for the observation');
-  }
+  await observeQuiet(idleBefore, 'passive controls / idle must not create another inference or cause', idleUntil - performance.now());
   phase('quiescent passive shadow and idle window', idleBefore);
   const allWakes = wakes();
   assert.equal(allWakes.length, 7, 'zero other Fabric causes');
@@ -260,6 +274,8 @@ try {
 finally {
   observationEnd = performance.now(); clearTimeout(watchdog);
   stopping = true;
+  observer.close();
+  for (const watcher of watchers) watcher.close();
   for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error('CLI stopping')); } pending.clear();
   if (child && !exitInfo) {
     child.stdin.end();

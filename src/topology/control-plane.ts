@@ -1,6 +1,6 @@
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
-import { copyFabricPrincipal, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
+import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -204,9 +204,11 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   ) {
     return undefined;
   }
-  // Invalid diagnostics are ignored, not a reason to refuse an otherwise admitted command.
-  return { ...data, wakeCause: copyFabricWakeCause(data.wakeCause), principal: event.verification === "mesh" || event.verification === "bridge"
-    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand;
+  // Sender diagnostics are never evidence. Derive only from the admitted envelope.
+  const wakeCause = data.operation === "steer" || data.operation === "followUp"
+    ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
+  return withFabricWakeAdmission({ ...data, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
 interface FabricControlSeenRecord {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -7,7 +8,7 @@ import { deliverActorToMain } from "../src/actors/main-delivery.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import {
   currentFabricPrincipal, fabricWakeCause, fabricWakeMessage,
-  registerFabricPrincipalCapture, registerFabricWakeCapture,
+  registerFabricPrincipalCapture, registerFabricWakeCapture, withFabricWakeAdmission,
   sendFabricMessage, sendFabricUserMessage, type FabricWakeCause,
 } from "../src/fabric-provenance.js";
 import { MainAgentController } from "../src/main-agent.js";
@@ -167,7 +168,7 @@ describe("Fabric wake causes: exact metadata from real delivery producers (unit 
     const recording = recordingPi();
     deliverRootInbox(recording.pi, [meshEvent()]);
     const expected: FabricWakeCause = { cause: "mesh", from: workerFrom, topic: "fleet.work.task", key: "mesh-event:42" };
-    expect(recording.sent[0]!.message.details).toMatchObject({ ids: ["mesh-event:42"], wakeCauses: [expected] });
+    expect(recording.sent[0]!.message.details).toMatchObject({ ids: ["mesh-event:42"], wakeCause: expected });
     await assertWake(recording, expected);
   });
 
@@ -255,12 +256,19 @@ describe("Fabric wake capture only records newly admitted requests", () => {
     expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", { cause: "steer", from: workerFrom }]]);
   });
 
-  it("a human/RPC request supersedes a preceding new Fabric custom message in the same boundary", async () => {
+  it.each(["human-first", "Fabric-first"])("%s in one boundary retains both sources, never exact single Fabric", async order => {
     const recording = recordingPi();
     controller(recording).deliverAgent({ from: worker, message: "hello", delivery: "steer" });
-    await recording.emit("input", { source: "rpc", text: "my actual request" });
-    await recording.admit([{ ...recording.sent[0]!.message, role: "custom" }, { role: "user", content: "my actual request" }]);
-    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "unattributed" }]]);
+    const custom = { ...recording.sent[0]!.message, role: "custom" };
+    const human = { role: "user", content: "my actual request" };
+    const fabricCause = { cause: "steer", from: workerFrom, exact: true };
+    const humanCause = { cause: "unattributed", exact: false };
+    await recording.admit(order === "human-first" ? [human, custom] : [custom, human]);
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", {
+      cause: "multiple", exact: false, causes: order === "human-first" ? [humanCause, fabricCause] : [fabricCause, humanCause],
+    }]]);
+    await recording.emit("context");
+    expect(recording.fake.appendEntry).toHaveBeenCalledTimes(1);
   });
 
   it("the dashboard composer stays user even when it sends through the extension API", async () => {
@@ -382,7 +390,9 @@ describe("Conservative raw-user admission: attempts are never exact origin", () 
     await recording.emit("input", { source: "extension", text: "identical" });
     if (boundary === "same") {
       await recording.admit([raw(), raw()]);
-      expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", ambiguous]]);
+      expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false,
+        causes: [{ ...ambiguous, exact: false }, { cause: "unattributed", exact: false }],
+      }]]);
       await recording.emit("context", { messages: [raw(), raw()] });
       expect(recording.fake.appendEntry).toHaveBeenCalledTimes(1);
       await recording.admit([raw("next human request")]);
@@ -392,7 +402,9 @@ describe("Conservative raw-user admission: attempts are never exact origin", () 
       await recording.admit([raw()]);
     }
     expect(recording.fake.appendEntry.mock.calls).toEqual([
-      ["pi-fabric.wake-diagnostic", ambiguous],
+      ["pi-fabric.wake-diagnostic", boundary === "same" ? { cause: "multiple", exact: false,
+        causes: [{ ...ambiguous, exact: false }, { cause: "unattributed", exact: false }],
+      } : ambiguous],
       ["pi-fabric.wake-diagnostic", { cause: "unattributed" }],
     ]);
     expect(recording.fake.appendEntry.mock.calls.some(([type]) => type === "pi-fabric.wake-cause")).toBe(false);
@@ -491,18 +503,20 @@ describe("Conservative raw-user admission: attempts are never exact origin", () 
     expect(currentFabricPrincipal(recording.ctx)).toBeUndefined();
   });
 
-  it("capability-1 emulator keeps the last native-owned request identity in one boundary", async () => {
+  it("capability-1 emulator retains all native-owned identities with inexact aggregate in one boundary", async () => {
     const recording = recordingPi();
     sendFabricUserMessage(recording.pi, "same", worker, "steer", undefined, "mesh");
     sendFabricUserMessage(recording.pi, "same", second, "followUp", undefined, "mesh");
     const messages = await recording.consumeNativeUsers();
     expect(messages.map(message => message.role)).toEqual(["user", "user"]);
-    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", candidates[1]]]);
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", {
+      cause: "multiple", exact: false, causes: candidates.map(cause => ({ ...cause, exact: true })),
+    }]]);
     await recording.emit("context", { messages });
     expect(recording.fake.appendEntry).toHaveBeenCalledTimes(1);
   });
 
-  it("genuine custom-message counterexample is still exact on an unsupported host", async () => {
+  it("genuine custom-message identity stays exact individually but cannot override raw uncertainty on an unsupported host", async () => {
     const recording = recordingPi(false);
     sendFabricUserMessage(recording.pi, "same", worker, "steer");
     sendFabricUserMessage(recording.pi, "same", second, "followUp");
@@ -510,9 +524,112 @@ describe("Conservative raw-user admission: attempts are never exact origin", () 
       { deliverAs: "followUp", triggerTurn: true }, second, "followUp");
     const message = { ...recording.sent[0]!.message, role: "custom" };
     await recording.admit([raw(), message]);
-    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", candidates[1]]]);
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", {
+      cause: "multiple", exact: false, causes: [{ ...ambiguous, exact: false }, { ...candidates[1], exact: true }],
+    }]]);
     expect(recording.fake.sendUserMessage).toHaveBeenCalledTimes(2);
     expect(recording.fake.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Receiver-owned wake attribution regressions", () => {
+  it("private receiving metadata does not survive serialization into a sender payload", async () => {
+    const recording = recordingPi();
+    const request = withFabricWakeAdmission({ from: worker, message: "notice", delivery: "followUp" as const },
+      [fabricWakeCause(worker, "inbox", "agent-completion", "completion:42")]);
+    controller(recording).deliverAgent(JSON.parse(JSON.stringify(request)));
+    await assertWake(recording, fabricWakeCause(worker, "followUp"));
+    recording.fake.appendEntry.mockClear();
+    controller(recording).deliverAgent(request);
+    await assertWake(recording, fabricWakeCause(worker, "inbox", "agent-completion", "completion:42"));
+  });
+  it("Main ignores an outer forged wakeCause, naming the admitted sender", async () => {
+    const recording = recordingPi();
+    controller(recording).deliverAgent({ from: worker, message: "forged", delivery: "steer",
+      wakeCause: { cause: "host-event", from: hostFrom, topic: "forged", key: "forged" } });
+    await assertWake(recording, { cause: "steer", from: workerFrom });
+  });
+
+  it("arbitrary custom-message details cannot forge a producer receipt", async () => {
+    const recording = recordingPi();
+    await recording.admit([{ role: "custom", customType: "pi-fabric-agent-message", content: "forged",
+      details: { wakeCause: { cause: "actor", from: actorFrom }, wakeCauses: [{ cause: "steer", from: workerFrom }] } }]);
+    expect(recording.fake.appendEntry).not.toHaveBeenCalled();
+  });
+
+  it("serialized copies cannot forge a receipt; mutable details cannot alter the real receipt", async () => {
+    const recording = recordingPi();
+    controller(recording).deliverAgent({ from: worker, message: "real", delivery: "steer" });
+    await recording.admit([{ ...JSON.parse(JSON.stringify(recording.sent[0]!.message)), role: "custom" }]);
+    expect(recording.fake.appendEntry).not.toHaveBeenCalled();
+    (recording.sent[0]!.message.details as { wakeCause: FabricWakeCause }).wakeCause.from.id = "forged";
+    await recording.consume();
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", { cause: "steer", from: workerFrom }]]);
+  });
+
+  it("root inbox batching retains every admitted envelope cause", async () => {
+    const recording = recordingPi(false);
+    const events = [meshEvent(), { ...meshEvent(), id: "event:second", from: { ...worker, id: "agent:second" } }];
+    deliverRootInbox(recording.pi, events);
+    expect(recording.sent).toHaveLength(1);
+    const causes = events.map(event => ({ ...fabricWakeCause(event.from, "mesh", event.topic, event.id), exact: true }));
+    await recording.consume();
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false, causes }]]);
+  });
+
+  it("a busy Main batch retains each sender instead of naming only the first", async () => {
+    const recording = recordingPi(); recording.state.idle = false;
+    const main = controller(recording, tempJournal());
+    for (const from of [worker, { ...worker, id: "agent:second" }])
+      main.deliverAgent({ from, message: "held", delivery: "followUp" });
+    main.flushHeldAtNextBoundary();
+    await recording.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+    expect(recording.sent).toHaveLength(1);
+    await recording.consume();
+    expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false,
+      causes: [worker, { ...worker, id: "agent:second" }].map(from => ({ ...fabricWakeCause(from, "followUp"), exact: true })),
+    }]]);
+  });
+
+  it("a new admission after a context boundary is not lost to the preceding record", async () => {
+    const recording = recordingPi();
+    for (const cause of ["steer", "followUp"] as const) {
+      sendFabricMessage(recording.pi, { customType: "probe", content: cause, display: true },
+        { deliverAs: "followUp", triggerTurn: true }, worker, cause);
+      await recording.emit("message_start", { message: { ...recording.sent.at(-1)!.message, role: "custom" } });
+      await recording.emit("context");
+    }
+    expect(recording.fake.appendEntry.mock.calls).toEqual([
+      ["pi-fabric.wake-cause", fabricWakeCause(worker, "steer")], ["pi-fabric.wake-cause", fabricWakeCause(worker, "followUp")],
+    ]);
+  });
+});
+
+describe("Wake evidence reader allowlist", () => {
+  it("drops hostile fields from causes, senders, raw diagnostics and mixed-source lists", () => {
+    const filename = tempJournal();
+    const cause = { ...fabricWakeCause(worker, "mesh", "fleet.work.task", "key"), exact: true };
+    const hostile = { ...cause, hostile: "DROP_ME", principal: { secret: "DROP_ME" }, from: { ...cause.from, hostile: "DROP_ME" } };
+    const entries = [
+      { type: "custom_message", customType: "probe", details: { wakeCause: hostile } },
+      { type: "custom", customType: "pi-fabric.wake-cause", data: hostile },
+      { type: "custom", customType: "pi-fabric.wake-diagnostic", data: { cause: "unattributed", hostile: "DROP_ME", from: hostile.from } },
+      { type: "custom", customType: "pi-fabric.wake-diagnostic", data: { cause: "ambiguous", basis: "unconfirmed-raw-input-attempts",
+        candidates: [hostile, hostile], hostile: "DROP_ME" } },
+      { type: "custom", customType: "pi-fabric.wake-diagnostic", data: { cause: "multiple", exact: false, hostile: "DROP_ME",
+        causes: [hostile, { cause: "unattributed", exact: false, hostile: "DROP_ME" }] } },
+    ];
+    fs.writeFileSync(filename, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    const result = spawnSync("python3", ["scripts/read-wake-causes.py", filename], { encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).not.toContain("DROP_ME");
+    const session = JSON.parse(result.stdout).sessions[0];
+    expect(session.freshTurns[0].record).toEqual(cause);
+    expect(session.producerMessages[0].record).toEqual(cause);
+    expect(session.rawUserDiagnostics.map((row: any) => row.record)).toEqual([
+      { cause: "unattributed" }, { cause: "ambiguous", basis: "unconfirmed-raw-input-attempts", candidates: [cause, cause] },
+      { cause: "multiple", exact: false, causes: [cause, { cause: "unattributed", exact: false }] },
+    ]);
   });
 });
 

@@ -369,20 +369,38 @@ export const copyFabricWakeCause = (value: unknown): FabricWakeCause | undefined
     typeof wake.key === "string" ? wake.key : undefined);
 };
 
+// Private in-process admission metadata survives routing spreads but is never
+// serialized into a sender command. Receiving adapters derive these snapshots
+// from authenticated envelopes; plain wakeCause/data/details fields cannot forge it.
+const wakeAdmission = Symbol("fabric-wake-admission");
+type WakeAdmitted = { [wakeAdmission]?: readonly FabricWakeCause[] };
+export const withFabricWakeAdmission = <T extends object>(request: T, causes: readonly FabricWakeCause[]): T =>
+  ({ ...request, [wakeAdmission]: causes.map(cause => copyFabricWakeCause(cause)!).filter(Boolean) });
+export const copyFabricWakeAdmission = <T extends object>(from: object, request: T): T => {
+  const causes = (from as WakeAdmitted)[wakeAdmission];
+  return causes ? withFabricWakeAdmission(request, causes) : request;
+};
+export const admittedFabricWakeCauses = (request: object): FabricWakeCause[] | undefined =>
+  (request as WakeAdmitted)[wakeAdmission]?.map(cause => copyFabricWakeCause(cause)!);
+
 /** Raw-user diagnostics make NO origin claim; candidates are unconfirmed send attempts. */
-export type FabricWakeDiagnostic = { cause: "unattributed" } | {
+type RawWakeDiagnostic = { cause: "unattributed" } | {
   cause: "ambiguous";
   candidates: FabricWakeCause[];
   basis: "unconfirmed-raw-input-attempts";
 };
+export type FabricWakeSource = (FabricWakeCause & { exact: true }) | (RawWakeDiagnostic & { exact: false });
+export type FabricWakeDiagnostic = RawWakeDiagnostic | { cause: "multiple"; exact: false; causes: FabricWakeSource[] };
 
 interface WakeCapture {
   identity: MeshIdentity;
-  cause?: FabricWakeCause | undefined;
-  recorded: boolean;
-  diagnostic?: FabricWakeDiagnostic | undefined;
+  sources: FabricWakeSource[];
   attempts: FabricWakeCause[];
 }
+// Native sendCustomMessage preserves details by reference. Only our in-process
+// producer can register this receipt; serialized sender fields cannot forge it.
+// Weak ownership neither retains messages nor backfills historical session data.
+const wakeMessageReceipts = new WeakMap<object, FabricWakeCause[]>();
 const wakeCaptures = new WeakMap<ExtensionAPI, WakeCapture>();
 const isWakeInbox = (type: string): boolean => type.includes("inbox") || type.includes("completion") ||
   type === "pi-fabric-agent-complete" || type === "pi-fabric-shell-event" || type === "pi-fabric-records";
@@ -392,20 +410,27 @@ const wakeHost = (pi: ExtensionAPI): MeshIdentity => wakeCaptures.get(pi)?.ident
 /** Preserve model text; persist attribution on the exact native custom-message entry. */
 export const fabricWakeMessage = (
   pi: ExtensionAPI, message: Parameters<ExtensionAPI["sendMessage"]>[0],
-  options: Parameters<ExtensionAPI["sendMessage"]>[1], wake?: FabricWakeCause,
+  options: Parameters<ExtensionAPI["sendMessage"]>[1], wake?: FabricWakeCause | readonly FabricWakeCause[],
 ): Parameters<ExtensionAPI["sendMessage"]>[0] => {
-  if (options?.triggerTurn !== true || options.deliverAs === "nextTurn") return message;
-  const details = message.details && typeof message.details === "object" ? message.details : {};
-  return { ...message, details: { ...details, wakeCause: wake ?? fabricWakeCause(wakeHost(pi),
-    isWakeInbox(message.customType) ? "inbox" : "host-event") } };
+  const supplied = message.details && typeof message.details === "object" ? message.details : {};
+  const { wakeCause: _foreignCause, wakeCauses: _foreignCauses, ...details } = supplied as Record<string, unknown>;
+  if (options?.triggerTurn !== true || options.deliverAs === "nextTurn") {
+    return "wakeCause" in supplied || "wakeCauses" in supplied ? { ...message, details } : message;
+  }
+  const causes = (Array.isArray(wake) ? wake : [wake ?? fabricWakeCause(wakeHost(pi),
+    isWakeInbox(message.customType) ? "inbox" : "host-event")])
+    .map(copyFabricWakeCause).filter((cause): cause is FabricWakeCause => cause !== undefined);
+  const stamped = { ...details, ...(causes.length === 1 ? { wakeCause: causes[0] } : { wakeCauses: causes }) };
+  wakeMessageReceipts.set(stamped, causes.map(cause => copyFabricWakeCause(cause)!));
+  return { ...message, details: stamped };
 };
 
-/** Exact origins and raw-user uncertainty use separate native entries, once per admission boundary. */
+/** Exact only for one admitted source; mixed turns retain every source without a single-origin claim. */
 export const registerFabricWakeCapture = (pi: ExtensionAPI): void => {
   if (wakeCaptures.has(pi)) return;
-  const state: WakeCapture = { identity: wakeHost(pi), recorded: false, attempts: [] };
+  const state: WakeCapture = { identity: wakeHost(pi), sources: [], attempts: [] };
   wakeCaptures.set(pi, state);
-  const reset = (): void => { state.cause = undefined; state.diagnostic = undefined; state.recorded = false; };
+  const reset = (): void => { state.sources = []; };
   const clear = (): void => { reset(); state.attempts = []; };
   pi.on("session_start", (_event, context) => {
     clear();
@@ -420,31 +445,34 @@ export const registerFabricWakeCapture = (pi: ExtensionAPI): void => {
   pi.on("turn_start", reset);
   pi.on("message_start", event => {
     if (event.message.role === "custom") {
-      const details = event.message.details as { wakeCause?: unknown } | undefined;
-      const cause = copyFabricWakeCause(details?.wakeCause);
-      if (cause) { state.cause = cause; state.diagnostic = undefined; }
+      const details = event.message.details;
+      if (details && typeof details === "object") {
+        const causes = wakeMessageReceipts.get(details);
+        wakeMessageReceipts.delete(details);
+        for (const cause of causes ?? []) state.sources.push({ ...copyFabricWakeCause(cause)!, exact: true });
+      }
     } else if (event.message.role === "user") {
       // Only a host-owned admission receipt is exact. Even equal text observed in
       // input preflight is not identity: queued inputs and handled commands break it.
       const receipt = (event.message as { provenance?: FabricTurnProvenance }).provenance;
       const admitted = fabricProvenanceSupported(pi) ? copyFabricProvenance(receipt) : undefined;
-      state.cause = admitted ? fabricWakeCause(admitted.sender,
-        admitted.via === "steer" ? "steer" : admitted.via === "actor" ? "actor" : "followUp") : undefined;
-      if (state.cause) state.diagnostic = undefined;
-      else if (state.diagnostic?.cause !== "ambiguous") {
-        state.diagnostic = state.attempts.length > 1
-          ? { cause: "ambiguous", candidates: state.attempts.map(candidate => fabricWakeCause(candidate.from, candidate.cause)),
-            basis: "unconfirmed-raw-input-attempts" }
-          : { cause: "unattributed" };
-      }
+      if (admitted) state.sources.push({ ...fabricWakeCause(admitted.sender,
+        admitted.via === "steer" ? "steer" : admitted.via === "actor" ? "actor" : "followUp"), exact: true });
+      else state.sources.push(state.attempts.length > 1
+        ? { cause: "ambiguous", exact: false, candidates: state.attempts.map(candidate => fabricWakeCause(candidate.from, candidate.cause)),
+          basis: "unconfirmed-raw-input-attempts" }
+        : { cause: "unattributed", exact: false });
       state.attempts = [];
     }
   });
   pi.on("context", () => {
-    if (state.recorded || (!state.cause && !state.diagnostic)) return;
-    state.recorded = true;
-    if (state.cause) pi.appendEntry("pi-fabric.wake-cause", state.cause);
-    else pi.appendEntry("pi-fabric.wake-diagnostic", state.diagnostic);
+    const sources = state.sources;
+    reset(); // A repeated context with no new admissions is not another wake.
+    if (sources.length > 1) pi.appendEntry("pi-fabric.wake-diagnostic", { cause: "multiple", exact: false, causes: sources });
+    else if (sources.length === 1) {
+      const { exact, ...record } = sources[0]!;
+      pi.appendEntry(exact ? "pi-fabric.wake-cause" : "pi-fabric.wake-diagnostic", record);
+    }
   });
 };
 

@@ -1,5 +1,5 @@
 import { boundAgentSpawner } from "../agents/spawner.js";
-import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
@@ -490,7 +490,7 @@ export class AgentMessageRouter {
           kind: "agent",
           name: "Main",
         });
-        return this.mainAgent.deliverAgent({
+        return this.mainAgent.deliverAgent(copyFabricWakeAdmission(options, {
           from: options.from ?? this.actorManager.identity,
           verification: "mesh", // In-process registered producer, not a received command.
           principal: options.principal,
@@ -501,7 +501,7 @@ export class AgentMessageRouter {
             ? { triggerTurn: options.triggerTurn }
             : {}),
           ...(data === undefined ? {} : { data }),
-        });
+        }));
       }
       let participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id);
       if (!participant) {
@@ -731,13 +731,12 @@ export class AgentMessageRouter {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
       }
       let result: FabricAgentMessageResult;
-      const wakeCause = copyFabricWakeCause(command.wakeCause);
       try {
-        result = this.mainAgent.deliverAgent({
+        result = this.mainAgent.deliverAgent(copyFabricWakeAdmission(command, {
         from,
         ...(verification === undefined ? {} : { verification }),
         principal: provenance?.principal,
-        ...(wakeCause ? { wakeCause } : {}),
+        admissionTopic: "fabric.control.command",
         message,
         delivery: command.operation,
         deliveryId: command.commandId,
@@ -745,7 +744,7 @@ export class AgentMessageRouter {
           ? { triggerTurn: command.triggerTurn }
           : {}),
         ...(command.data === undefined ? {} : { data: command.data }),
-        });
+        }));
       } catch (error) {
         // A full followUp queue, for example: the sender sees why.
         return { accepted: false, error: error instanceof Error ? error.message : String(error) };

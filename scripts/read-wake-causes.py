@@ -36,23 +36,41 @@ def cause_record(value):
     for field in ("topic", "key"):
         if field in value and not isinstance(value[field], str):
             raise ValueError("invalid structured wake " + field)
-    return value
+    record = {"cause": value["cause"], "from": {k: sender[k] for k in ("id", "name", "kind")}}
+    for field in ("topic", "key"):
+        if field in value:
+            record[field] = value[field]
+    if "exact" in value:
+        if not isinstance(value["exact"], bool):
+            raise ValueError("invalid structured wake exactness")
+        record["exact"] = value["exact"]
+    return record
 
 
 def diagnostic_record(value):
-    if not isinstance(value, dict) or value.get("cause") not in ("ambiguous", "unattributed"):
-        raise ValueError("invalid raw-user wake diagnostic")
-    if any(field in value for field in ("from", "principal", "provenance")):
-        raise ValueError("raw-user diagnostic must not claim an origin or authority")
-    if value["cause"] == "ambiguous":
+    if not isinstance(value, dict) or value.get("cause") not in ("ambiguous", "unattributed", "multiple"):
+        raise ValueError("invalid wake diagnostic")
+    record = {"cause": value["cause"]}
+    if "exact" in value:
+        if value["exact"] is not False:
+            raise ValueError("diagnostic must not claim exact single origin")
+        record["exact"] = False
+    if value["cause"] == "multiple":
+        causes = value.get("causes")
+        if value.get("exact") is not False or not isinstance(causes, list) or len(causes) < 2:
+            raise ValueError("multiple diagnostic requires inexact aggregate and admitted causes")
+        record["causes"] = []
+        for source in causes:
+            if not isinstance(source, dict) or not isinstance(source.get("exact"), bool) or source.get("cause") == "multiple":
+                raise ValueError("invalid admitted wake source")
+            record["causes"].append(cause_record(source) if source.get("cause") in CAUSES else diagnostic_record(source))
+    elif value["cause"] == "ambiguous":
         candidates = value.get("candidates")
         if value.get("basis") != "unconfirmed-raw-input-attempts" or not isinstance(candidates, list) or len(candidates) < 2:
             raise ValueError("ambiguous diagnostic requires unconfirmed attempt candidates")
-        for candidate in candidates:
-            cause_record(candidate)
-    elif "candidates" in value:
-        raise ValueError("unattributed diagnostic must not carry candidate origin claims")
-    return value
+        record["candidates"] = [cause_record(candidate) for candidate in candidates]
+        record["basis"] = "unconfirmed-raw-input-attempts"
+    return record
 
 
 def read_session(filename, idle_ms):
@@ -66,9 +84,13 @@ def read_session(filename, idle_ms):
                 entry = json.loads(line)
                 at = timestamp_ms(entry.get("timestamp"))
                 details = entry.get("details") or {}
-                if entry.get("type") == "custom_message" and "wakeCause" in details:
-                    producers.append({"entryId": entry.get("id"), "at": at, "customType": entry.get("customType"),
-                                      "record": cause_record(details["wakeCause"])})
+                if entry.get("type") == "custom_message":
+                    values = details.get("wakeCauses", [details["wakeCause"]] if "wakeCause" in details else [])
+                    if not isinstance(values, list):
+                        raise ValueError("invalid producer wake causes")
+                    for value in values:
+                        producers.append({"entryId": entry.get("id"), "at": at, "customType": entry.get("customType"),
+                                          "record": cause_record(value)})
                 if entry.get("type") == "custom" and entry.get("customType") == "pi-fabric.wake-cause":
                     wakes.append({"entryId": entry.get("id"), "at": at, "record": cause_record(entry.get("data"))})
                 if entry.get("type") == "custom" and entry.get("customType") == "pi-fabric.wake-diagnostic":
@@ -83,7 +105,9 @@ def read_session(filename, idle_ms):
                         idle_requests.append({"entryId": entry.get("id"), "at": at, "idleMs": idle, "cause": "user"})
                     elif entry.get("type") == "custom_message":
                         idle_requests.append({"entryId": entry.get("id"), "at": at, "idleMs": idle,
-                                              **(cause_record(details["wakeCause"]) if "wakeCause" in details
+                                              **(diagnostic_record({"cause": "multiple", "exact": False,
+                                                                    "causes": [{**cause_record(value), "exact": True} for value in details["wakeCauses"]]})
+                                                 if "wakeCauses" in details else cause_record(details["wakeCause"]) if "wakeCause" in details
                                                  else {"cause": "unattributed"})})
                     else:
                         continue

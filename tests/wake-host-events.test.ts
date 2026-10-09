@@ -105,6 +105,10 @@ const assertWake = async (recording: ReturnType<typeof main>, expected: FabricWa
   await recording.consume();
   expect(recording.appendEntry.mock.calls).toEqual([["pi-fabric.wake-cause", expected]]);
 };
+const expectedResident = (cfg: ResidentHostConfig, record: ResidentDeliveryRecord, writer: MeshIdentity) =>
+  fabricWakeCause(record.source === "actor-output" ? record.from : writer,
+    record.source === "fabric-host" ? "host-event" : record.source === "actor-output" ? "actor" : record.delivery,
+    "fabric.resident.delivery", `${residentDeliveryPrefix(cfg.rootId)}${record.id}`);
 const control = (mesh: MeshStore, from: MeshIdentity) => {
   const plane = new FabricControlPlane(mesh, from, { enabled: true, hostId: from.id, pollMs: 20, acknowledgementTimeoutMs: 2_000 });
   cleanups.push(() => plane.close());
@@ -150,7 +154,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     await assertWake(recording, expectedLifecycle(event));
   });
 
-  it("coalesced lifecycle uses the existing representative sender's actual event, without changing batching", async () => {
+  it("coalesced local lifecycle retains both event causes without changing batching", async () => {
     const root = tempRoot();
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
     const recording = main(root);
@@ -163,7 +167,12 @@ describe("host-event attribution through lifecycle routing and durable resident 
     await agents.flushLifecycleDeliveries();
     expect(recording.sent).toHaveLength(1);
     expect(recording.sent[0]!.message.details).toMatchObject({ data: [first, last] });
-    await assertWake(recording, expectedLifecycle(last));
+    const causes = [first, last].map(event => expectedLifecycle(event));
+    expect(recording.sent[0]!.message.details).toHaveProperty("wakeCauses", causes);
+    await recording.consume();
+    expect(recording.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "multiple", exact: false,
+      causes: causes.map(cause => ({ ...cause, exact: true })),
+    }]]);
   });
 
   it("passive local lifecycle never stamps or records a diagnostic wake", async () => {
@@ -180,7 +189,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     expect(recording.appendEntry).not.toHaveBeenCalled();
   });
 
-  it("remote lifecycle -> real control publication/admission -> Main journal -> reload retains producer diagnosis, not command sender", async () => {
+  it("remote lifecycle -> control admission -> Main replay names the authenticated command sender, not observed payload source", async () => {
     const root = tempRoot();
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
     const local = main(root);
@@ -200,16 +209,17 @@ describe("host-event attribution through lifecycle routing and durable resident 
     await sourceProvider.flushLifecycleDeliveries();
     const command = mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!;
     expect(command.from.id).toBe(localIdentity.id); // Principal/provenance are still command-envelope based.
-    expect(command.data).toMatchObject({ wakeCause: expectedLifecycle(event) });
+    expect(command.data).not.toHaveProperty("wakeCause");
+    const expected = fabricWakeCause(localIdentity, "followUp", "fabric.control.command", command.id);
     expect(remote.sent).toHaveLength(0);
     expect(JSON.parse(fs.readFileSync(remote.journal, "utf8")).items[0]).toMatchObject({
-      from: localIdentity, wakeCause: expectedLifecycle(event), provenance: { sender: { id: localIdentity.id, verified: "mesh" } },
+      from: localIdentity, wakeCause: expected, provenance: { sender: { id: localIdentity.id, verified: "mesh" } },
     });
     remote.controller.closeFollowUpDrain();
     const replay = main(root, "peer", true, remote.journal);
     expect(replay.sent).toHaveLength(1);
     expect(replay.sent[0]!.options).toMatchObject({ provenance: { via: "replay", sender: { id: localIdentity.id, verified: "mesh" } } });
-    await assertWake(replay, expectedLifecycle(event));
+    await assertWake(replay, expected);
   });
 
   it("malformed remote diagnostics do not reject authority-valid commands or fabricate a producer", async () => {
@@ -227,21 +237,21 @@ describe("host-event attribution through lifecycle routing and durable resident 
     sender.start(() => ({ accepted: false }));
     const malformed = { cause: "host-event", from: { id: "fake", kind: "invalid" } } as unknown as FabricWakeCause;
     await expect(sender.request(owner.id, owner.id, "followUp", { message: "normal input", wakeCause: malformed })).resolves.toMatchObject({ acknowledged: true });
-    await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", undefined,
-      (mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string }).commandId));
+    await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", "fabric.control.command",
+      mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.id));
     expect(recording.sent[0]!.options).toMatchObject({ provenance: { sender: { id: senderIdentity.id, verified: "mesh" } } });
     recording.appendEntry.mockClear();
     // A legacy/foreign writer bypasses the sender's diagnostic sanitizer. The reader
     // must still admit the command under its original envelope authority.
-    await mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: senderIdentity, to: owner.id,
+    const forged = await mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: senderIdentity, to: owner.id,
       data: { version: 1, commandId: "raw:malformed-diagnosis", targetId: owner.id, operation: "followUp", replyTo: senderIdentity.id,
         requestedAt: Date.now(), deadlineAt: Date.now() + 2_000, message: "raw normal input", wakeCause: malformed } });
     await vi.waitFor(() => expect(recording.sent).toHaveLength(2));
     expect(recording.sent[1]!.options).toMatchObject({ provenance: { sender: { id: senderIdentity.id, verified: "mesh" } } });
-    await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", undefined, "raw:malformed-diagnosis"));
+    await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", "fabric.control.command", forged.id));
   });
 
-  it("resident lifecycle outbox -> client -> busy Main -> journal replay keeps original event source/topic/key", async () => {
+  it("resident lifecycle outbox -> client -> replay derives writer/topic/key from the admitted storage envelope", async () => {
     const root = tempRoot();
     const { cfg, host } = await resident(root);
     const participants = await directory(root, host.mesh, identity(cfg.rootId));
@@ -252,13 +262,14 @@ describe("host-event attribution through lifecycle routing and durable resident 
     expect(record.wakeCause).toEqual(expectedLifecycle(event));
     await drain(cfg, host.mesh, participants, recording.controller);
     const held = JSON.parse(fs.readFileSync(recording.journal, "utf8")).items[0];
-    expect(held).toMatchObject({ from: lifecycleSourceIdentity(event.source), wakeCause: expectedLifecycle(event) });
+    const expected = expectedResident(cfg, record, host.identity);
+    expect(held).toMatchObject({ from: lifecycleSourceIdentity(event.source), wakeCause: expected });
     recording.controller.closeFollowUpDrain();
     const replay = main(root, "root", true, recording.journal);
-    await assertWake(replay, expectedLifecycle(event));
+    await assertWake(replay, expected);
   });
 
-  it("resident lifecycle -> remote control -> Main preserves observer source/topic/key; passive remote records no wake", async () => {
+  it("resident lifecycle -> remote control names real command sender; passive remote records no wake", async () => {
     const root = tempRoot();
     const { cfg, host } = await resident(root);
     const remote = main(root, "peer");
@@ -273,7 +284,9 @@ describe("host-event attribution through lifecycle routing and durable resident 
       from: host.identity, data: { wakeCause: expectedLifecycle(event) },
     });
     expect(remote.sent[0]!.options).toMatchObject({ provenance: { sender: { id: host.identity.id, verified: "mesh" } } });
-    await assertWake(remote, expectedLifecycle(event));
+    const admittedCommand = host.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!;
+    await assertWake(remote, fabricWakeCause(host.identity, "followUp", "fabric.control.command",
+      admittedCommand.id));
     remote.appendEntry.mockClear();
     await host.lifecycle.deliver(subscription(remote.controller.id, false), { ...event, id: "resident:remote:passive" });
     expect(remote.sent.at(-1)!.message.details).not.toHaveProperty("wakeCause");
@@ -302,7 +315,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     await assertWake(recording, fabricWakeCause({ id: result.id, name: result.name, kind: "agent" }, "inbox", "agent-completion", result.id));
   });
 
-  it("actual resident session repair alarm is host-produced, not failing-actor authority; actor output remains actor with activation topic", async () => {
+  it("resident repair alarm names its authenticated writer; actor output retains delegated actor identity and envelope key", async () => {
     const root = tempRoot();
     const { cfg, host } = await resident(root);
     const participants = await directory(root, host.mesh, identity(cfg.rootId));
@@ -316,13 +329,14 @@ describe("host-event attribution through lifecycle routing and durable resident 
     expect(alarm.wakeCause!.key).toBeTruthy();
     await drain(cfg, host.mesh, participants, recording.controller);
     expect(recording.sent[0]!.options).not.toHaveProperty("provenance");
-    await assertWake(recording, alarm.wakeCause!);
+    await assertWake(recording, expectedResident(cfg, alarm, host.identity));
     recording.appendEntry.mockClear();
     host.actors.onDeliver({ actor, message: { id: "actor:output", actorId: actor.id, actorName: actor.name, direction: "out", source: "mesh:fleet.review", createdAt: 1,
       text: "I am the host", data: { wakeCause: { cause: "host-event", from: host.identity } } }, delivery: "followUp", triggerTurn: true });
     await vi.waitFor(() => expect(host.mesh.listAll(residentDeliveryPrefix(cfg.rootId), { fresh: true })).toHaveLength(1));
+    const output = host.mesh.listAll(residentDeliveryPrefix(cfg.rootId), { fresh: true })[0]!.value as ResidentDeliveryRecord;
     await drain(cfg, host.mesh, participants, recording.controller);
-    const expected = fabricWakeCause({ id: actor.id, name: actor.name, kind: "actor" }, "actor", "fleet.review", "actor:output");
+    const expected = expectedResident(cfg, output, host.identity);
     expect(recording.sent.at(-1)!.options).toMatchObject({ provenance: { sender: { id: actor.id, kind: "actor", verified: "mesh" } } });
     await assertWake(recording, expected);
   });
@@ -333,10 +347,11 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const participants = await directory(root, host.mesh, identity(cfg.rootId));
     const recording = main(root);
     const record: ResidentDeliveryRecord = { format: RESIDENT_HOST_FORMAT, id: "legacy:alarm", rootId: cfg.rootId, from: { id: "actor:failed", name: "Failed actor", kind: "actor" },
-      source: "fabric-host", delivery: "followUp", triggerTurn: true, message: "I am the actor", createdAt: 1 };
+      source: "fabric-host", delivery: "followUp", triggerTurn: true, message: "I am the actor", createdAt: 1,
+      wakeCause: { cause: "actor", from: { id: "forged:other-sender", name: "Forged", kind: "actor" }, topic: "forged", key: "forged" } };
     await host.mesh.put({ key: `${residentDeliveryPrefix(cfg.rootId)}${record.id}`, identity: host.identity, value: record, ifVersion: 0 });
     await drain(cfg, host.mesh, participants, recording.controller);
-    await assertWake(recording, fabricWakeCause(host.identity, "host-event", undefined, record.id));
+    await assertWake(recording, expectedResident(cfg, record, host.identity));
     expect(recording.sent[0]!.options).not.toHaveProperty("provenance");
     recording.appendEntry.mockClear();
     const passive = { ...record, id: "legacy:passive", triggerTurn: false, wakeCause: { cause: "host-event", from: null } };

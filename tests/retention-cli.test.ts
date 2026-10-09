@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
+import { pruneActorSessionBackups } from "../src/storage/retention.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { spawnSync } from "node:child_process";
 
@@ -168,6 +169,29 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(fs.lstatSync(report).isFile()).toBe(true);
     expect(fs.readFileSync(report, "utf8")).toBe("{}\n");
     expect(fs.statSync(report).mode & 0o777).toBe(0o600);
+  });
+
+  it("re-checks the gate before EACH session-backup unlink, and never accepts an approval whose owner cannot be proven (smarty-dev#7766)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-backups-")); roots.push(dir);
+    const session = path.join(dir, "session.jsonl");
+    write(session, "");
+    for (const stamp of ["20260927T150000000Z", "20260928T150000000Z", "20260929T150000000Z", "20260930T150000000Z"]) write(`${session}.${stamp}.bak`, "x");
+    let asked = 0;
+    // A hold lands after the first unlink: the remaining older backups stay.
+    expect(pruneActorSessionBackups(session, { stop: () => asked++ > 0 })).toHaveLength(1);
+    expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak"))).toHaveLength(3);
+    // No getuid (Windows): even our own private approval naming the right epoch is refused.
+    const { root } = make();
+    write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
+    write(path.join(root, "state.db"), "");
+    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
+    fs.chmodSync(path.join(root, MESH_RETENTION_APPROVAL), 0o600);
+    const getuid = process.getuid;
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
+    try {
+      const result = await sweepMeshRetention(root, { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 });
+      expect(result.skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+    } finally { Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }); }
   });
 
   it("deletes nothing under an operator hold or after a backend switch until a ruling names the new epoch (smarty-dev#7766)", async () => {

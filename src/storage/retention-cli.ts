@@ -43,7 +43,8 @@ export const MESH_RETENTION_APPROVAL = ".mesh-retention-approved.json";
  * deletions until a ruling names that epoch, so no automatic sweep deletes during or after a switch. */
 // The caller has proven meshRoot an owned directory. Any hold entry (lstat: a link counts) holds. The approval is
 // read from one O_NOFOLLOW descriptor that fstat proves our own regular, not group/world-writable file, so a
-// swapped-in link or foreign file never supplies an epoch.
+// swapped-in link or foreign file never supplies an epoch. Where ownership cannot be proven (no getuid: Windows),
+// no approval is ever valid, so a switched mesh deletes nothing there (fail closed).
 const applyRefusal = (meshRoot: string): string | undefined => {
   if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
   const moved = readMeshStateMovedMarker(meshRoot);
@@ -57,7 +58,8 @@ const readPrivate = (file: string, maxBytes = 64 * 1024): Record<string, unknown
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > maxBytes || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0) {
+    if (!stat.isFile() || stat.size > maxBytes || typeof process.getuid !== "function" || stat.uid !== process.getuid() ||
+        (stat.mode & 0o022) !== 0) {
       throw new Error(`Unsafe record: ${file}`);
     }
     return JSON.parse(fs.readFileSync(fd, "utf8"));
@@ -236,7 +238,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
           compactRuns(path.join(actorRoot, "runs"), veto);
           // Pending launch/drain/removal is not a joined writer receipt for session history.
           if (actor.inFlightRun !== undefined || actor.preparing !== undefined || !["idle", "stopped"].includes(actor.status)) continue;
-          if (!veto()) pruneActorSessionBackups(actor.sessionFile, { dryRun, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
+          pruneActorSessionBackups(actor.sessionFile, { dryRun, stop: veto, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
         }
       };
       let rootIds: Set<string>;
@@ -294,7 +296,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
             // Rotation history of an actor whose writer is joined: keep only the newest backup.
             if (row && row.inFlightRun === undefined && row.preparing === undefined && ["idle", "stopped"].includes(row.status) &&
                 typeof row.sessionFile === "string" && path.resolve(row.sessionFile) === path.join(path.resolve(actorRoot), "session.jsonl")) {
-              if (!gate()) pruneActorSessionBackups(row.sessionFile, { dryRun, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
+              pruneActorSessionBackups(row.sessionFile, { dryRun, stop: gate, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
             }
           }
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }

@@ -276,6 +276,9 @@ describe("#4383 resident host presence batch", () => {
 
   it.each([false, true])("flushes only changed presence before the next full renewal (files=%s)", async files => {
     const { host, config, records } = await fixture(files);
+    // Exercise presence batching in isolation under the real reversible activation
+    // gate; autonomous dormancy is covered by residency-dormancy.test.ts.
+    host.actors.pauseForRelease();
     let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
     const full = vi.spyOn(host.participants, "refresh");
     const batch = vi.spyOn(host.mesh, "writeBatch");
@@ -402,6 +405,7 @@ describe("#4383 resident host presence batch", () => {
 
   it("checks active durable metadata in both scopes without building public records", async () => {
     const { host, records } = await fixture();
+    host.actors.pauseForRelease(); // keep fixture statuses stable while testing the metadata-only read
     const bindingReads = vi.spyOn(ActorBindingStore.prototype, "get");
     const messageReads = vi.spyOn(ActorRegistryStore.prototype, "messageCount");
     expect(host.actors.hasActiveDurableActor()).toBe(true);

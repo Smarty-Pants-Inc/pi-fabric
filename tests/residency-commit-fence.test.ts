@@ -1083,7 +1083,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
     try {
       const run = await registeredExecution(state, main, 5_000);
       const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
-      const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
+      const result = await run(`try { await agents.create(${JSON.stringify({ ...requestArgs(state, "create"), events: ["agent_settled"] })}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
       const settled = await executed.mock.results[0]!.value;
       const text = visibleText(result);
       artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
@@ -1092,6 +1092,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      await state.participants.refresh(); // resumed Main owns a real renewed lease at this watermark
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();

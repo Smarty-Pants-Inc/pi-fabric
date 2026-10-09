@@ -1,8 +1,65 @@
 # Exact mesh publication dedupe
 
 `MeshStore.publish({ dedupeKey })` uses a durable per-key intent, not a search
-window. Dedupe keys and receipts remain host-only; the public mesh provider does
-not accept them. Receipt names are the SHA-256 of the key.
+window. Dedupe keys and receipts remain host-only. Trusted extension components
+may now supply keys through the mesh provider; model-authored programs cannot.
+Receipt names are the SHA-256 of the final, host-namespaced key.
+
+## Provider publication: trusted host versus public guest
+
+Trusted Pi extension components call `context.call("mesh.publish", args)` or
+`context.call("mesh.publishBatch", { events })` after declaring those exact refs
+in `requires`. Fabric captures their component instance ID in a private host
+invocation token. A component-looking tool-call ID, event data, principal, or
+caller-supplied trust field cannot grant this access.
+
+- Host `mesh.publish` accepts an optional `dedupeKey`.
+- Host `mesh.publishBatch` accepts `events` (1..256), each with the same publication
+  fields (`topic`, optional `kind`, `to`, `text`, `data`, and `dedupeKey`). Both
+  schemas retain `additionalProperties: false`; host store controls such as
+  `from`, `principal`, `durable`, `admit`, and `fence` are not accepted.
+- Each supplied key must be a **string of 1..512 UTF-8 bytes**. Null, empty,
+  non-string, and overlong keys fail before any event in that request is appended.
+  The provider prefixes it with the stable component ID, length-framed as
+  `component:<UTF-8 ID byte length>:<component ID>:<raw key>`. This prevents
+  collisions between component instances, including delimiter-containing IDs.
+  The raw-key limit excludes the host prefix. The stored/returned event contains
+  the namespaced key; component reloads and process restarts retain that namespace.
+- The public catalog, QuickJS proxy, and guest declarations are unchanged:
+  `mesh.publish` has no `dedupeKey` property and `publishBatch` is not exposed.
+  A generic untrusted call supplying `dedupeKey` (even null) or requesting the
+  host-only batch action fails with `MeshHostPublishError`, code
+  `FABRIC_MESH_HOST_PUBLISH_REQUIRED`, `retryable: false`. The fixed error metadata
+  survives the QuickJS boundary. A `data.dedupeKey` is ordinary payload, not a
+  publication receipt key.
+
+```ts host
+// In a trusted extension component declaring both mesh publication requirements:
+const events = [
+  { topic: "github.delivery", kind: "delivery", dedupeKey: "delivery-1", data: first },
+  { topic: "github.delivery", kind: "delivery", dedupeKey: "delivery-2", data: second },
+];
+const committed = await context.call("mesh.publishBatch", { events });
+// If this reply is lost, retry the same keyed request, not fresh keys.
+```
+
+Each batch event uses the existing durable intent/receipt protocol independently,
+on both file and SQLite mesh configurations (event receipts remain in the durable
+file event log; SQLite selects the keyed-state backend). Batches commit a bounded
+**prefix**, not an all-or-nothing transaction: the existing 50 ms/retained-tail work
+bounds can return fewer events than requested. Results preserve input order and
+include the **original events, IDs, and sequences** for already-committed keys;
+only new keys append. Checkpoint the returned prefix and continue the remaining
+suffix. After an uncertain reply, retrying the entire keyed batch safely recovers
+its committed prefix and admits the suffix, subject to those same bounds. Returned
+originals need not be at the current log head. No provider-side automatic batch
+retry is performed. Unkeyed events retain ordinary at-least-once retry behavior.
+
+One key means one publication across topics within that component: reusing it with
+a changed payload/topic returns the first event, not an update or a new append.
+Choose a stable key covering the source store ID, route, delivery ID, and topic;
+key reuse for unrelated deliveries suppresses them. This is publication dedupe,
+not exactly-once arbitrary consumer or external side effects.
 
 ## Locked protocol
 

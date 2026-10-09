@@ -224,6 +224,19 @@ export const invocationFabricPrincipal = (context: PrincipalInvocation): FabricP
   return captured ? captured.principal : currentFabricPrincipal(context.extensionContext);
 };
 
+// Trusted extension components run outside the guest interpreter. A private host token,
+// not a caller-supplied field or a component-looking tool-call id, admits their host-only
+// provider arguments. Like the principal snapshot it survives host context spreads; guest
+// execution services construct fresh contexts and never copy it into a program's calls.
+const hostCaller = Symbol("fabric.host-caller");
+type HostCallerInvocation = { [hostCaller]?: Readonly<{ componentId: string }> };
+export const withFabricHostCaller = <T extends object>(context: T, componentId: string): T => ({
+  ...context,
+  [hostCaller]: Object.freeze({ componentId }),
+});
+export const fabricHostCallerId = (context: object): string | undefined =>
+  (context as HostCallerInvocation)[hostCaller]?.componentId;
+
 export interface FabricIdentityResolution {
   identity: MeshIdentity;
   mainAgentId: string;

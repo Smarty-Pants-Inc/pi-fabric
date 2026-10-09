@@ -27,7 +27,7 @@ export interface MeshEvent {
   verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
-  /** Host-only once-publication identity; never accepted from the public mesh provider. */
+  /** Host-only once-publication identity; the provider namespaces trusted component keys. */
   dedupeKey?: string;
   topic: string;
   kind: string;
@@ -40,7 +40,7 @@ export interface MeshEvent {
 
 export interface MeshPublishInput {
   topic: string;
-  /** Host-only durable publication receipt; never accepted by the public provider. */
+  /** Host-only durable publication receipt; model-authored provider calls cannot supply it. */
   dedupeKey?: string;
   /** Host-only durability fence; batches share this barrier across their prefix. */
   durable?: boolean;

@@ -52,6 +52,12 @@ const installLegacyPrimaryExitReceipt = () => {
   });
 };
 
+// Force sampling through a production configuration notification, not a private
+// maintenance call or a new request below this test's artificial expiry floor.
+const signalMaintenance = (config: ResidentHostConfig) => {
+  fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+};
+
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 5_000;
   while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
@@ -112,6 +118,8 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
     due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
+    // A forced sample is test demand, not a production idle poll.
+    signalMaintenance(config);
     await waitFor(() => scans > 0);
     due.mockReturnValue(false);
     expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
@@ -153,6 +161,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
+    signalMaintenance(config); // Signal this explicitly forced collection sample.
     let attempted = before;
     await waitFor(() => {
       if (scans <= before) return false;
@@ -174,6 +183,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     const collected = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
+    signalMaintenance(config); // Signal this explicitly forced collection sample.
     await waitFor(() => scans > collected);
     due.mockReturnValue(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
@@ -275,6 +285,8 @@ it.skipIf(process.platform === "win32").each([
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
     due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
+    // A forced sample is test demand, not a production idle poll.
+    signalMaintenance(config);
     await waitFor(() => scans > 0);
     due.mockReturnValue(false);
     expect(fs.existsSync(decisionPath)).toBe(true);
@@ -326,6 +338,7 @@ it.skipIf(process.platform === "win32").each([
       const before = scans;
       scanTime = (scanTime ?? 0) + 60_001;
       due.mockReturnValue(true);
+    signalMaintenance(config); // Signal this explicitly forced collection sample.
       await waitFor(() => scans > before);
       due.mockReturnValue(false);
       expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
@@ -352,6 +365,7 @@ it.skipIf(process.platform === "win32").each([
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
+    signalMaintenance(config); // Signal this explicitly forced collection sample.
     await waitFor(() => scans > before && !fs.existsSync(decisionPath));
     due.mockReturnValue(false);
     expect(fs.existsSync(ackPath)).toBe(false);
@@ -359,6 +373,7 @@ it.skipIf(process.platform === "win32").each([
     const collected = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
+    signalMaintenance(config); // Signal this explicitly forced collection sample.
     await waitFor(() => scans > collected);
     due.mockReturnValue(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);

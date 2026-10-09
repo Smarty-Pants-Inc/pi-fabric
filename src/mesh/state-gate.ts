@@ -212,13 +212,21 @@ const unsafeDirectory = (dir: string, stat: fs.Stats, uid: number): string | und
 const ENUMERABLE_SOURCES = new Set(["files", "systemd"]);
 
 /**
- * A group is private when nobody but `uid` can act as it, judged through the name service (getent, so NSS sources
- * count, not only /etc): no account other than `uid` has it as primary group and its member list names nobody
- * else. Fail closed (not private) unless nsswitch.conf's passwd and group sources are all enumerable (files,
- * systemd; an LDAP/SSSD/NIS source may hold members getent cannot list) and both lookups succeed.
+ * A group is private when nobody but `uid` can act as it. Fail closed (not private) unless ALL hold:
+ * - nsswitch.conf's passwd and group sources are only `files` and `systemd` (an LDAP/SSSD/NIS source may hold
+ *   members nothing here can list);
+ * - the systemd source does not resolve this gid at all (`getent -s systemd group <gid>`: a dynamic or userdb
+ *   group whose members are not enumerated in /etc);
+ * - EVERY account with this gid as primary group is `uid` (getent passwd and every /etc/passwd line);
+ * - EVERY group record carrying this gid names nobody but this user (the full getent group enumeration and every
+ *   /etc/group line: a duplicate later line grants its members the gid too; `getent group <gid>` returns only the
+ *   first match);
+ * - every lookup succeeds.
  */
 export const privateGroup = (gid: number, uid: number, io: {
-  nsswitch?: () => string; getent?: (database: "passwd" | "group", key?: string) => string;
+  nsswitch?: () => string;
+  getent?: (database: "passwd" | "group", key?: string, service?: string) => string;
+  readFile?: (file: "/etc/passwd" | "/etc/group") => string;
 } = {}): boolean => {
   try {
     const nsswitch = (io.nsswitch ?? (() => fs.readFileSync("/etc/nsswitch.conf", "utf8")))();
@@ -228,18 +236,28 @@ export const privateGroup = (gid: number, uid: number, io: {
       const sources = line.slice(database.length + 1).replace(/\[[^\]]*\]/g, " ").split(/\s+/).filter(Boolean);
       if (sources.length === 0 || sources.some((source) => !ENUMERABLE_SOURCES.has(source))) return false;
     }
-    const getent = io.getent ?? ((database, key) =>
-      execFileSync("getent", key === undefined ? [database] : [database, key], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] }));
-    const users = getent("passwd").split("\n").map((line) => line.split(":")).filter((f) => f.length >= 4);
+    const getent = io.getent ?? defaultGetent;
+    const readFile = io.readFile ?? ((file) => fs.readFileSync(file, "utf8"));
+    const records = (text: string) => text.split("\n").map((line) => line.split(":")).filter((f) => f.length >= 4);
+    if (records(getent("group", String(gid), "systemd")).some((f) => Number(f[2]) === gid)) return false;
+    const users = [...records(getent("passwd")), ...records(readFile("/etc/passwd"))];
     const self = users.find((f) => Number(f[2]) === uid)?.[0];
     if (self === undefined) return false;
-    if (users.some((f) => Number(f[3]) === gid && Number(f[2]) !== uid)) return false;
-    // EVERY entry carrying this gid counts (a duplicate /etc/group line grants its members the gid too), so the
-    // whole group database is enumerated, not the first match `getent group <gid>` would return.
-    const entries = getent("group").split("\n").map((line) => line.split(":")).filter((f) => f.length >= 4 && Number(f[2]) === gid);
-    if (entries.length === 0) return false;
-    return entries.every((entry) => (entry[3] ?? "").split(",").map((name) => name.trim()).filter(Boolean).every((name) => name === self));
+    if (users.some((f) => Number(f[3]) === gid && (Number(f[2]) !== uid || f[0] !== self))) return false;
+    const groups = [...records(getent("group")), ...records(readFile("/etc/group"))].filter((f) => Number(f[2]) === gid);
+    if (groups.length === 0) return false;
+    return groups.every((entry) => (entry[3] ?? "").split(",").map((name) => name.trim()).filter(Boolean).every((name) => name === self));
   } catch { return false; }
+};
+
+// getent exits 2 for "no such entry": that is an empty answer, not a failure; anything else throws (fail closed).
+const defaultGetent = (database: "passwd" | "group", key?: string, service?: string): string => {
+  const args = [...(service ? ["-s", service] : []), database, ...(key === undefined ? [] : [key])];
+  try { return execFileSync("getent", args, { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] }); }
+  catch (error) {
+    if ((error as { status?: number }).status === 2) return "";
+    throw error;
+  }
 };
 
 /**

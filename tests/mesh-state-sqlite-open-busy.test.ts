@@ -398,10 +398,18 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
 
   it("privateGroup: only a group nobody else can act as, judged through the name service, fail closed", () => {
     const passwd = "root:x:0:0::/root:/bin/sh\npaul:x:1000:1000::/home/paul:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n";
-    const io = (group: string, nsswitch = "passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n") => ({
+    const io = (group: string, nsswitch = "passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n",
+      files = { group: "", passwd: "" }, systemd = "") => ({
       nsswitch: () => nsswitch,
-      getent: (database: "passwd" | "group") => (database === "passwd" ? passwd : group),
+      getent: (database: "passwd" | "group", _key?: string, service?: string) => (service === "systemd" ? systemd : database === "passwd" ? passwd : group),
+      readFile: (file: "/etc/passwd" | "/etc/group") => (file === "/etc/passwd" ? files.passwd : files.group),
     });
+    // A duplicate LATER /etc/group line naming bob, even when the name service shows only the first record.
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", undefined, { group: "paul:x:1000:\nwheel2:x:1000:bob\n", passwd: "" }))).toBe(false);
+    // An /etc/passwd account other than paul with gid 1000 as primary.
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", undefined, { group: "", passwd: "svc:x:1002:1000::/:/bin/false\n" }))).toBe(false);
+    // The systemd source resolves the gid (a dynamic or userdb group): not provably private.
+    expect(privateGroup(1000, 1000, io("paul:x:1000:\n", undefined, undefined, "paul:x:1000:\n"))).toBe(false);
     expect(privateGroup(1000, 1000, io("paul:x:1000:\n"))).toBe(true);
     expect(privateGroup(1000, 1000, io("paul:x:1000:paul\n"))).toBe(true);
     expect(privateGroup(1000, 1000, io("paul:x:1000:bob\n"))).toBe(false); // another member

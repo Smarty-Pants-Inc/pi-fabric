@@ -160,6 +160,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       lostContact: processHandle.lostContact,
       finishingGraceMs: 7_000,
       ...(processHandle.forcedCleanupCount ? { forcedCleanupCount: processHandle.forcedCleanupCount } : {}),
+      ...(processHandle.remainingDescendantCount ? { remainingDescendantCount: processHandle.remainingDescendantCount } : {}),
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,

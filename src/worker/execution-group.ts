@@ -1,5 +1,22 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { ChildProcess } from "node:child_process";
+
+/** Only an execution-specific cgroup can become empty while this worker lives.
+ * A shared user/session scope (including this worker) is not a tree receipt. */
+const executionCgroupEvents = (pid: number): string | undefined => {
+  try {
+    const scope = (file: string): string | undefined => fs.readFileSync(file, "utf8")
+      .split("\n").find(line => line.startsWith("0::"))?.slice(3);
+    const childScope = scope(`/proc/${pid}/cgroup`);
+    if (!childScope || childScope === "/" || childScope === scope("/proc/self/cgroup")) return undefined;
+    const root = "/sys/fs/cgroup";
+    const directory = path.resolve(root, `.${childScope}`);
+    if (!directory.startsWith(root + path.sep)) return undefined;
+    const events = path.join(directory, "cgroup.events");
+    return fs.existsSync(events) ? events : undefined;
+  } catch { return undefined; }
+};
 
 type Member = { pid: number; group: number; started: string; state: string };
 const member = (pid: number): Member | undefined => {
@@ -50,6 +67,7 @@ export const executionGroup = (child: ChildProcess) => {
     return current;
   };
   return {
+    cgroupEventsFile: process.platform === "linux" && pid ? executionCgroupEvents(pid) : undefined,
     observe(): void { if (process.platform === "linux") members(); },
     /** Count every birth-checked descendant signalled, including closeChild escalation. */
     forcedCleanupCount: (): number => forcedDescendants.size,

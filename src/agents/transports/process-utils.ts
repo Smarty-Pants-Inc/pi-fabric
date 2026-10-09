@@ -286,7 +286,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -502,6 +502,11 @@ export const spawnDetached = async (
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     forcedCleanupCount: () => forcedDescendants.size,
+    remainingDescendantCount: () => {
+      if (process.platform !== "linux") return 1;
+      try { return members().filter(member => member.pid !== pid).length; }
+      catch { return Math.max(1, [...owned.keys()].filter(member => member !== pid).length); }
+    },
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {

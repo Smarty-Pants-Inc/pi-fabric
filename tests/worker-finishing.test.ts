@@ -71,6 +71,59 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync(workerPath))("nat
     }
   }, 20_000);
 
+  it("arms no 20 ms polling timers or membership interval during real worker finishing", async () => {
+    const f = fixture(false);
+    const census = path.join(f.root, "timer-census.jsonl");
+    const preload = path.join(f.root, "timer-census.mjs");
+    fs.writeFileSync(preload, `
+import fs from "node:fs";
+const output = ${JSON.stringify(census)};
+const write = fs.writeFileSync.bind(fs);
+const timeout = globalThis.setTimeout;
+const interval = globalThis.setInterval;
+const clear = globalThis.clearInterval;
+const intervals = new Map();
+let finishing = false;
+const log = event => fs.appendFileSync(output, JSON.stringify(event) + "\\n");
+globalThis.setInterval = (callback, ms, ...args) => {
+  const timer = interval(callback, ms, ...args);
+  intervals.set(timer, ms);
+  return timer;
+};
+globalThis.clearInterval = timer => { intervals.delete(timer); return clear(timer); };
+globalThis.setTimeout = (callback, ms, ...args) => {
+  if (finishing && ms === 20) log({ event: "poll-timer", ms });
+  return timeout(callback, ms, ...args);
+};
+fs.writeFileSync = (file, data, ...args) => {
+  if (String(file).includes("status.json") && typeof data === "string") {
+    try {
+      const record = JSON.parse(data);
+      if (record.status === "finishing") {
+        finishing = true;
+        log({ event: "finishing", membershipIntervals: [...intervals.values()].filter(ms => ms === 100).length });
+      }
+    } catch {}
+  }
+  return write(file, data, ...args);
+};
+`);
+    const previous = process.env.NODE_OPTIONS ?? "";
+    vi.stubEnv("NODE_OPTIONS", `${previous} --import=${preload}`.trim());
+    fs.writeFileSync(f.settle, "native completion");
+    const handle = await f.manager.spawn({ task: "real finishing timer census", transport: "process" });
+    try {
+      await vi.waitFor(() => expect(f.manager.status(handle.id).status).toBe("finishing"), { timeout: 5_000 });
+      fs.writeFileSync(f.release, "exit naturally");
+      const result = await f.manager.wait(handle.id);
+      expect(result).toMatchObject({ status: "completed", text: "QUIESCENT" });
+      const events = fs.readFileSync(census, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(events).toContainEqual({ event: "finishing", membershipIntervals: 0 });
+      expect(events.filter(event => event.event === "poll-timer")).toEqual([]);
+      expect(events.filter(event => event.event === "finishing").every(event => event.membershipIntervals === 0)).toBe(true);
+    } finally { fs.writeFileSync(f.release, "exit"); }
+  }, 20_000);
+
   it("counts a refusing native Pi root as an owned descendant when closeChild escalates", async () => {
     const f = fixture(true, true);
     fs.writeFileSync(f.settle, "native completion");

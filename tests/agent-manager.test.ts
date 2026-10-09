@@ -1334,11 +1334,11 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"), { timeout: 10_000 });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 10_000 });
       const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
       expect(candidate.error).toContain("Agent transport exited without a result");
-      await expect(manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"))).toBe(false);
       expect(await handles[0]!.isAlive()).toBe(true);
       await handles[0]!.stop();
@@ -1350,7 +1350,8 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
-  // Lost contact is not an exit: retain a readable failed candidate without\n  // settling, releasing admission, or deleting files the worker may still use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1371,15 +1372,15 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"), { timeout: 5_000 });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
       const result = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
-      expect(result.status).toBe("finishing");
-      await expect(manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.status).toBe("failed");
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
-      await expect(manager.cleanup(result.id)).rejects.toThrow(/running agent/);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
       await expectUnconfirmedClose(manager);
@@ -1390,7 +1391,8 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
-  // Lost contact is not an exit: retain a readable failed candidate without\n  // settling, releasing admission, or deleting files the worker may still use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1414,19 +1416,19 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
-      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"), { timeout: 5_000 });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
       const result = manager.status(handle.id) as AgentRunRecord;
       const persisted = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"));
       expect.soft(persisted).toMatchObject({ status: "failed", modelReason });
-      expect.soft(settled).not.toHaveBeenCalled();
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: "failed", modelReason, errorCode: "CUSTODY_UNCONFIRMED" }));
       expect(launches).toBe(1);
-      expect(result.status).toBe("finishing");
+      expect(result.status).toBe("failed");
       expect(result.modelReason).toBe(modelReason);
-      await expect(manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
-      await expect(manager.cleanup(result.id)).rejects.toThrow(/running agent/);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
       await expectUnconfirmedClose(manager);
@@ -1472,13 +1474,13 @@ describe("AgentManager", () => {
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
       if (path_ === "stop") await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
       else {
-        await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"), { timeout: 12_000 });
-        await expect(manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
+        await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 12_000 });
+        await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       }
       const runDirectory = manager.runDirectory(handle.id)!;
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
         .toMatch(/Herdr server has been unreachable/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(path_ === "stop" ? /running agent/ : /lost track of its worker/);
       await expectUnconfirmedClose(manager);
       expect(fs.existsSync(runDirectory)).toBe(true);
     } finally {
@@ -1602,16 +1604,16 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"), { timeout: 25_000 });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 25_000 });
       const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
       expect(candidate.error).toContain("did not stop, so it was not relaunched");
-      await expect(manager.wait(handle.id, { timeoutMs: 50 })).rejects.toThrow(/still running/);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
         .trim().split("\n").map((line) => JSON.parse(line));
       expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
       // The failed stop cannot release or replace a still-live worker.
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
       expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
       expect(await first!.isAlive()).toBe(true);
       await first!.stop();

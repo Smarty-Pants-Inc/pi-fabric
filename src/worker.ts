@@ -19,6 +19,7 @@ import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
+import { waitForExecutionExit } from "./worker/execution-exit.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
@@ -654,11 +655,14 @@ const main = async (): Promise<void> => {
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
+  let finishingStartedAt: number | undefined;
+  const stopGroupObservers = new WeakMap<ChildProcess, () => void>();
   const retainExecutionCustody = (execution: ChildProcess): void => {
     const executionBirth = execution.pid === undefined ? undefined : processStartTime(execution.pid);
     let nativeClosed = false;
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
+      cgroupEventsFile: undefined,
       observe(): void {},
       forcedCleanupCount: (): number => 0,
       exited: () => nativeClosed,
@@ -669,33 +673,46 @@ const main = async (): Promise<void> => {
     executionGroups.set(execution, group);
     execution.once("close", () => { nativeClosed = true; });
     const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    stopGroupObservers.set(execution, () => clearInterval(groupObserver));
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
-      const exited = () => nativeClosed && group.exited();
-      const wait = async (ms: number) => {
-        const deadline = Date.now() + ms;
-        do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
-        return exited();
-      };
-      // After native completion, let remaining descendants exit naturally
-      // within the same grace budget used for cooperative stop.
-      if (!exited() && record.status === "finishing" && !terminalStatus && !externalStopRequested) {
-        await wait(KILL_GRACE_MS);
-      }
-      if (!exited()) {
-        group.signal("SIGTERM");
-        execution.stdin?.end();
-        if (!await wait(KILL_GRACE_MS)) {
-          group.signal("SIGKILL");
-          if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
-        }
-      }
-      const forced = group.forcedCleanupCount();
-      if (forced > 0) {
-        record.warnings = [...(record.warnings ?? []), `finished with forced cleanup of ${forced} descendants`];
-        update();
-      }
+      // Membership sampling is allowed during execution, never during finishing.
       clearInterval(groupObserver);
+      const exited = () => nativeClosed && group.exited();
+      const finishing = record.status === "finishing" && !externalStopRequested;
+      const natural = finishing && !terminalStatus;
+      const started = finishing ? finishingStartedAt ?? Date.now() : Date.now();
+      const killAt = started + KILL_GRACE_MS * (finishing ? 2 : 1);
+      const deadline = killAt + 2000;
+      let termTimer: ReturnType<typeof setTimeout> | undefined;
+      let forceTimer: ReturnType<typeof setTimeout> | undefined;
+      let signalError: unknown;
+      let notifyExit: (() => void) | undefined;
+      const signal = (value: NodeJS.Signals): void => {
+        try {
+          if (!exited()) { group.signal(value); execution.stdin?.end(); }
+        } catch (error) { signalError = error; }
+        finally { notifyExit?.(); } // a one-shot cleanup event, never a poll
+      };
+      try {
+        if (!exited()) {
+          // These are one-shot escalation events, not exit probes or deadlines.
+          if (natural) termTimer = setTimeout(() => signal("SIGTERM"), Math.max(0, started + KILL_GRACE_MS - Date.now()));
+          else signal("SIGTERM");
+          forceTimer = setTimeout(() => signal("SIGKILL"), Math.max(0, killAt - Date.now()));
+          if (!await waitForExecutionExit(execution, exited, deadline, group.cgroupEventsFile, notify => {
+            notifyExit = notify;
+            return () => { notifyExit = undefined; };
+          })) {
+            throw signalError ?? new Error("Execution group did not confirm exit after cleanup");
+          }
+        }
+        const forced = group.forcedCleanupCount();
+        if (forced > 0) {
+          record.warnings = [...(record.warnings ?? []), `finished with forced cleanup of ${forced} descendants`];
+          update();
+        }
+      } finally { clearTimeout(termTimer); clearTimeout(forceTimer); }
     })();
     if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
   };
@@ -814,9 +831,11 @@ const main = async (): Promise<void> => {
     // Capture descendant births at the native boundary BEFORE EOF can reap the
     // execution root. A periodic sample alone can miss a fast final turn.
     executionGroups.get(child)?.observe();
+    stopGroupObservers.get(child)?.();
     // This is reached from native settlement, after pending controls/follow-ups,
     // not from final-text heuristics. A pre-dispatch reseed is still running.
     if (!contextReseedRequest) {
+      finishingStartedAt ??= Date.now();
       record.status = "finishing";
       update();
     }
@@ -1924,6 +1943,7 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    finishingStartedAt = undefined;
     record.status = "running";
     update();
     sawAgentError = false;

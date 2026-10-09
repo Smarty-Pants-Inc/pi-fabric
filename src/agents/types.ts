@@ -200,8 +200,9 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
-  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
+  /** Machine-readable terminal cause; failure publication is not an exit receipt. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "CUSTODY_UNCONFIRMED";
+  executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -404,6 +405,8 @@ export interface AgentTransportHandle {
   finishingGraceMs?: number;
   /** Birth-checked descendants signalled during custody cleanup, counted once. */
   forcedCleanupCount?(): number;
+  /** Conservative count of descendants whose exit is not confirmed. */
+  remainingDescendantCount?(): number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.

@@ -1,8 +1,8 @@
 import path from "node:path";
 import { Buffer } from "node:buffer";
 
-import { AgentInputError, MAX_AGENT_REQUIRED_INPUTS, MAX_AGENT_REQUIRED_INPUT_BYTES } from "../host-compatibility.js";
-export { AgentInputError } from "../host-compatibility.js";
+import { AgentInputError, MAX_AGENT_REQUIRED_INPUTS, MAX_AGENT_REQUIRED_INPUT_BYTES, RequiredInputMissingError } from "../host-compatibility.js";
+export { AgentInputError, RequiredInputMissingError } from "../host-compatibility.js";
 
 /** Validate and snapshot before model preparation, queuing, or launcher invocation. */
 export const normalizeAgentRequires = (value: unknown): string[] | undefined => {
@@ -24,6 +24,6 @@ export const normalizeAgentRequires = (value: unknown): string[] | undefined => 
 /** Only the selected local execution host may check existence; remote inputs are target-local. */
 export const assertAgentRequiredInputsExist = (requires: readonly string[] | undefined, exists: (file: string) => boolean): void => {
   for (const [index, file] of (requires ?? []).entries()) {
-    if (!exists(file)) throw new AgentInputError("requires", `Missing required agent input requires[${index}]: ${file}; path must exist on the selected host; no worker started`);
+    if (!exists(file)) throw new RequiredInputMissingError(file, index);
   }
 };

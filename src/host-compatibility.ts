@@ -25,12 +25,33 @@ export const normalizeAgentCapabilityTokens = (value: unknown, field = "needs"):
   if (!Array.isArray(value)) throw new AgentInputError(field, `Invalid agent ${field}: expected capability strings`);
   const tokens: string[] = [];
   for (const [index, entry] of value.entries()) {
-    const parts = typeof entry === "string" ? entry.trim().toLowerCase().split(/[,\s]+/u).filter(Boolean) : [];
+    const parts = typeof entry === "string"
+      ? entry.normalize("NFKC").toLowerCase().split(/[\p{White_Space},]+/u).filter(Boolean)
+      : [];
     if (!parts.length) throw new AgentInputError(field, `Invalid agent ${field}[${index}]: expected nonempty capability tokens`);
-    tokens.push(...parts);
+    for (const token of parts) {
+      if (!/^[a-z0-9._-]+$/u.test(token)) {
+        throw new AgentInputError(field, `Invalid agent ${field}[${index}]: token ${JSON.stringify(token)} must contain only ASCII letters, digits, dot, underscore or hyphen`);
+      }
+      tokens.push(token);
+    }
   }
   return [...new Set(tokens)];
 };
+
+/** A target-side preflight proved that this literal input was absent before launch. */
+export class RequiredInputMissingError extends AgentInputError {
+  readonly path: string;
+  readonly index: number | undefined;
+
+  constructor(path: string, index?: number) {
+    const slot = index === undefined ? "requires" : `requires[${index}]`;
+    super("requires", `Missing required agent input ${slot}: ${path}; path must exist on the selected host; no worker started`);
+    this.name = "RequiredInputMissingError";
+    this.path = path;
+    this.index = index;
+  }
+}
 
 /** Trusted host policy for every Fabric participant model selection. */
 export interface FabricModelPolicy {

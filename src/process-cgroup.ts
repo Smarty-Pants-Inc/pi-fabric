@@ -131,12 +131,22 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
     try {
       fs.writeFileSync(file("cgroup.freeze"), "1");
       if (!await waitFrozen()) return;
-      // Only live frozen members keep their PID allocated until the signal.
-      // Zombies can be reaped by an outside parent despite the freezer.
+      // ponytail: cgroup.procs contains numeric PIDs, including zombies that an
+      // outside parent can reap despite freezing. Bind live stat/start time ->
+      // exact scope membership -> same live stat/start time before signalling.
+      // A live process inside OUR FROZEN scope at the middle read cannot exit
+      // until thaw, so its PID cannot be reused before kill; the two stat reads
+      // bind that identity across membership validation. An already-reused
+      // outside PID fails the exact path check even if its first stat is live.
       for (const pid of members()) {
         let member: LinuxGroupMember | undefined;
-        try { member = linuxGroupMember(pid); } catch { continue; }
-        if (!member || ["Z", "X"].includes(member.state)) continue;
+        try {
+          member = linuxGroupMember(pid);
+          if (!member?.started || ["Z", "X"].includes(member.state)) continue;
+          if (processScopePath(pid) !== directory) continue;
+          const current = linuxGroupMember(pid);
+          if (!current || current.started !== member.started || ["Z", "X"].includes(current.state)) continue;
+        } catch { continue; }
         try { process.kill(pid, signal); }
         catch (error) { if (!gone(error)) throw error; }
       }

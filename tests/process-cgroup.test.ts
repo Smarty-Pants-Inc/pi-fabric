@@ -14,6 +14,7 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     let frozen = false, freezes = true, confirmFreeze = true;
     const births = new Map([[100, "1000"], [101, "1001"]]);
     const states = new Map<number, string>();
+    const scopes = new Map<number, string>();
     const statErrors = new Map<number, string>();
     const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
     let event!: () => void;
@@ -36,7 +37,7 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
       }
       const pid = Number(name.split("/")[2]);
       if (!births.has(pid)) throw Object.assign(new Error("gone pid"), { code: "ENOENT" });
-      if (name.endsWith("/cgroup")) return `0::${directory.slice("/sys/fs/cgroup".length)}\n`;
+      if (name.endsWith("/cgroup")) return `0::${(scopes.get(pid) ?? directory).slice("/sys/fs/cgroup".length)}\n`;
       if (statErrors.has(pid)) throw Object.assign(new Error("unreadable stat"), { code: statErrors.get(pid) });
       const fields = Array<string>(20).fill("0");
       fields[0] = states.get(pid) ?? "S"; fields[2] = String(pid); fields[3] = "100"; fields[19] = births.get(pid)!;
@@ -55,7 +56,7 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     executionCgroups.set(child, receipt);
     const group = executionGroup(child);
     return { receipt, group, child, watch, watcher, read, write, kill, scan, births, open, fstat, close, stat, access,
-      states, statErrors,
+      states, statErrors, scopes,
       pids: (value: number[]) => { pids = value; },
       gone: () => { missing = true; }, recycle: () => { inode++; },
       unknown: () => { unreadable = true; },
@@ -99,7 +100,9 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"], [101, "SIGTERM"]]);
     expect(f.write.mock.calls).toEqual([[`${pinned}/cgroup.freeze`, "1"], [`${pinned}/cgroup.freeze`, "0"]]);
     expect(f.read.mock.calls.map(call => String(call[0]))).toEqual([
-      `${pinned}/cgroup.events`, `${pinned}/cgroup.procs`, "/proc/100/stat", "/proc/101/stat",
+      `${pinned}/cgroup.events`, `${pinned}/cgroup.procs`,
+      "/proc/100/stat", "/proc/100/cgroup", "/proc/100/stat",
+      "/proc/101/stat", "/proc/101/cgroup", "/proc/101/stat",
     ]);
     expect(f.frozen()).toBe(false); f.emptyEvent();
   });
@@ -117,6 +120,63 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     await f.group.signal("SIGTERM");
     expect(f.kill.mock.calls).toEqual([[101, "SIGTERM"]]);
     expect(f.frozen()).toBe(false); expect(f.scan).not.toHaveBeenCalled(); f.emptyEvent();
+  });
+  it("skips a listed zombie PID reused by an outside live process before the first stat read", async () => {
+    const f = setup(); f.states.set(101, "Z");
+    const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const value = read(...args);
+      if (String(args[0]) === `${pinned}/cgroup.procs`) {
+        // A frozen zombie can still be reaped by its unfrozen outside parent.
+        f.births.set(101, "9999"); f.states.set(101, "S");
+        f.scopes.set(101, "/sys/fs/cgroup/outside.scope");
+      }
+      return value;
+    }) as typeof fs.readFileSync);
+    await f.receipt.signal("SIGTERM");
+    expect(f.read).toHaveBeenCalledWith("/proc/101/cgroup", "utf8");
+    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]);
+    expect(f.frozen()).toBe(false); f.emptyEvent();
+  });
+  it.each([
+    "/sys/fs/cgroup/other.slice/fabric-execution-test.scope",
+    `${directory}/child.scope`,
+  ])("requires the exact execution scope path, not a matching basename or descendant (%s)", async scope => {
+    const f = setup(); f.scopes.set(101, scope);
+    await f.receipt.signal("SIGTERM");
+    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
+  });
+  it("skips a PID whose start time changes across the scope membership read", async () => {
+    const f = setup(); const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const value = read(...args);
+      if (String(args[0]) === "/proc/101/cgroup") f.births.set(101, "9999");
+      return value;
+    }) as typeof fs.readFileSync);
+    await f.receipt.signal("SIGTERM");
+    expect(f.read.mock.calls.filter(call => String(call[0]) === "/proc/101/stat")).toHaveLength(2);
+    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
+  });
+  it.each(["Z", "X", "missing"])("skips a member that becomes %s at identity revalidation", async state => {
+    const f = setup(); const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const value = read(...args);
+      if (String(args[0]) === "/proc/101/cgroup") {
+        if (state === "missing") f.births.delete(101); else f.states.set(101, state);
+      }
+      return value;
+    }) as typeof fs.readFileSync);
+    await f.receipt.signal("SIGTERM");
+    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
+  });
+  it.each(["ENOENT", "ESRCH", "EACCES", "EIO"])("skips a member whose scope read fails with %s", async code => {
+    const f = setup(); const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      if (String(args[0]) === "/proc/101/cgroup") throw Object.assign(new Error("unreadable scope"), { code });
+      return read(...args);
+    }) as typeof fs.readFileSync);
+    await f.receipt.signal("SIGTERM");
+    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
   });
   it("an attempted exit/reuse between membership check and syscall cannot hit a non-member", async () => {
     const f = setup(); const read = f.read.getMockImplementation()!;

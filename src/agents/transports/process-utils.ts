@@ -749,12 +749,44 @@ export const spawnDetached = async (
     },
   };
   if (scope && marker) {
-    const admissionDeadline = Date.now() + 5_000;
     try {
-      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
-        await new Promise<void>(resolve => setTimeout(resolve, 10));
-      }
-      if (fs.existsSync(marker)) { await armTreeObservation(); return { ...handle, ...(treeClosed ? { treeClosed } : {}) }; }
+      const admitted = await (async (): Promise<boolean> => {
+        let watcher: fs.FSWatcher | undefined;
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        let finish!: (admitted: boolean) => void;
+        const ended = (): void => finish(false);
+        try {
+          return await new Promise<boolean>(resolve => {
+            let settled = false;
+            finish = admitted => {
+              if (settled) return;
+              settled = true;
+              resolve(admitted);
+            };
+            // Subscribe to the DIRECTORY before checking once: the shim may
+            // create the marker either side of the watcher's admission race.
+            watcher = fs.watch(path.dirname(marker), { persistent: false }, (_event, filename) => {
+              if (filename?.toString() === path.basename(marker)) finish(true);
+            });
+            watcher.once("error", ended);
+            child.once("close", ended);
+            authority?.signal?.addEventListener("abort", ended, { once: true });
+            if (fs.existsSync(marker)) finish(true);
+            else if (nativeClosed || authority?.signal?.aborted) finish(false);
+            else if (!settled) deadline = setTimeout(ended, 5_000);
+          });
+        } catch {
+          // An unavailable directory watch uses the checked legacy fallback
+          // below, never a marker polling loop or an unverified tree receipt.
+          return false;
+        } finally {
+          clearTimeout(deadline);
+          watcher?.close();
+          child.removeListener("close", ended);
+          authority?.signal?.removeEventListener("abort", ended);
+        }
+      })();
+      if (admitted) { await armTreeObservation(); return { ...handle, ...(treeClosed ? { treeClosed } : {}) }; }
       if (!nativeClosed) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");

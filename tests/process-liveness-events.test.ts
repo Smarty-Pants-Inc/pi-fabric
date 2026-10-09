@@ -24,6 +24,8 @@ afterEach(async () => {
   vi.useRealTimers();
   for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  vi.mocked(spawn).mockReset();
+  vi.mocked(spawn).mockImplementation((await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn);
 });
 const root = () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-event-liveness-"));
@@ -72,6 +74,189 @@ describe("unscoped legacy process liveness", () => {
   });
 });
 
+type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean };
+async function fixtureAdmission(options: AdmissionOptions = {}) {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+  const directory = root();
+  const workerPath = path.join(directory, "worker.mjs");
+  fs.writeFileSync(workerPath, "");
+  const controller = new AbortController();
+  const removeAbort = vi.spyOn(controller.signal, "removeEventListener");
+  const order: string[] = [];
+  const watcher = Object.assign(new EventEmitter(), { close: vi.fn(() => { order.push("watch-close"); }) }) as unknown as fs.FSWatcher;
+  const children = [700_000_020, 700_000_021].map(pid => Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {}, alive: true }));
+  const close = (child = children[0]!) => {
+    if (!child.alive) return;
+    child.alive = false;
+    child.emit("exit", 0); child.emit("close", 0);
+  };
+  let marker = "";
+  const nativeRead = fs.readFileSync.bind(fs);
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, readOptions?: unknown) => {
+    const child = children.find(child => String(file) === `/proc/${child.pid}/stat`);
+    if (child?.alive) {
+      const fields = Array<string>(20).fill("0");
+      fields[0] = "S"; fields[1] = "1"; fields[2] = String(child.pid); fields[19] = String(child.pid);
+      return `${child.pid} (worker) ${fields.join(" ")}`;
+    }
+    if (child || children.some(child => String(file) === `/proc/${child.pid}/cgroup`)) {
+      throw Object.assign(new Error("no owned cgroup receipt"), { code: "ENOENT" });
+    }
+    return nativeRead(file, readOptions as never);
+  }) as typeof fs.readFileSync);
+  const nativeReaddir = fs.readdirSync.bind(fs);
+  vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, readOptions?: unknown) => {
+    if (String(file) === "/proc") return children.filter(child => child.alive).map(child => String(child.pid));
+    return nativeReaddir(file, readOptions as never);
+  }) as typeof fs.readdirSync);
+  vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+    const child = children.find(child => child.pid === Math.abs(pid));
+    if (signal === "SIGTERM" || signal === "SIGKILL") { order.push("stop"); close(child); }
+    return true;
+  });
+  vi.mocked(spawn).mockClear();
+  vi.mocked(spawn).mockImplementationOnce((_command, args) => {
+    marker = args![args!.indexOf("fabric-scope") + 1]!;
+    if (options.present) fs.writeFileSync(marker, "admitted");
+    return children[0] as unknown as ChildProcess;
+  }).mockImplementationOnce(() => children[1] as unknown as ChildProcess);
+  let armed!: () => void;
+  const arming = new Promise<void>(resolve => { armed = resolve; });
+  const watch = vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+    order.push("watch");
+    expect(String(args[0])).toBe(path.dirname(marker));
+    const listener = args.at(-1);
+    if (typeof listener === "function") watcher.on("change", listener);
+    armed();
+    if (options.armFailure) throw new Error("directory watcher unavailable");
+    if (options.race) fs.writeFileSync(marker, "admitted");
+    return watcher;
+  });
+  const nativeExists = fs.existsSync.bind(fs);
+  const exists = vi.spyOn(fs, "existsSync").mockImplementation(file => {
+    if (String(file) === marker) order.push("exists");
+    return nativeExists(file);
+  });
+  const stat = vi.spyOn(fs, "statSync");
+  const lstat = vi.spyOn(fs, "lstatSync");
+  const interval = vi.spyOn(globalThis, "setInterval");
+  const timeout = vi.spyOn(globalThis, "setTimeout");
+  const warn = vi.fn();
+  const launch = spawnDetached(workerPath, [], directory, { signal: controller.signal }, undefined,
+    { executable: "/fixture-systemd-run", slice: "fixture.slice", warn });
+  void launch.catch(() => undefined);
+  await arming;
+  return {
+    launch, watcher, watch, controller, removeAbort, order, interval, timeout, warn, children,
+    markerChecks: () => exists.mock.calls.filter(([file]) => String(file) === marker).length,
+    markerStats: () => [...stat.mock.calls, ...lstat.mock.calls].filter(([file]) => String(file) === marker).length,
+    admit: (filename: string | Buffer = "admitted") => { fs.writeFileSync(marker, "admitted"); watcher.emit("change", "rename", filename); },
+    close,
+    finish: () => { for (const child of children) close(child); },
+  };
+}
+
+function expectAdmissionCleaned(f: Awaited<ReturnType<typeof fixtureAdmission>>, armed = true) {
+  if (armed) expect(f.watcher.close).toHaveBeenCalledOnce();
+  else expect(f.watcher.close).not.toHaveBeenCalled(); // constructor returned no watcher
+  expect(f.children[0]!.listenerCount("close")).toBeLessThanOrEqual(1); // only native close custody remains
+  if (armed) expect(f.removeAbort).toHaveBeenCalledWith("abort", expect.any(Function));
+  expect(vi.getTimerCount()).toBe(0);
+  expect(f.interval).not.toHaveBeenCalled();
+  expect(f.markerStats()).toBe(0);
+}
+
+describe.skipIf(process.platform !== "linux")("event-driven scope admission marker", () => {
+  it.each(["admitted", Buffer.from("admitted")])("resolves on a matching directory event without polling (%s)", async filename => {
+    const f = await fixtureAdmission();
+    expect(f.order).toEqual(["watch", "exists"]);
+    expect(f.watch).toHaveBeenCalledOnce();
+    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([5_000]);
+    expect(vi.getTimerCount()).toBe(1);
+    f.watcher.emit("change", "rename", "admitted.cgroup");
+    f.watcher.emit("change", "rename", null);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(f.markerChecks()).toBe(1);
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    f.admit(filename);
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.markerChecks()).toBe(1);
+    expect(f.warn).not.toHaveBeenCalled();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it.each([{ present: true }, { race: true }])("checks once after arming and immediately accepts a present/racing marker: %j", async options => {
+    const f = await fixtureAdmission(options);
+    const handle = await f.launch;
+    expect(f.order).toEqual(["watch", "exists", "watch-close"]);
+    expect(handle.pid).toBe(f.children[0]!.pid);
+    expect(f.markerChecks()).toBe(1);
+    expect(f.timeout).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it("uses one 5s deadline, closes the watcher, and falls back to an unscoped legacy launch", async () => {
+    const f = await fixtureAdmission();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(f.markerChecks()).toBe(1);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[1]!.pid);
+    expect(handle.treeClosed).toBeUndefined();
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(spawn).mock.calls[1]![1]).toEqual([expect.stringContaining("worker.mjs")]);
+    expect(f.timeout.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(1);
+    expect(f.timeout.mock.calls.some(([, ms]) => ms === 10)).toBe(false);
+    expect(f.markerChecks()).toBe(2); // initial check plus the existing no-replay check AFTER teardown
+    expect(f.order.indexOf("watch-close")).toBeLessThan(f.order.indexOf("stop"));
+    expect(f.warn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it.each(["constructor", "asynchronous"] as const)("falls back to legacy rather than polling on %s watcher failure", async failure => {
+    const f = await fixtureAdmission({ armFailure: failure === "constructor" });
+    if (failure === "asynchronous") f.watcher.emit("error", new Error("watch failed"));
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[1]!.pid);
+    expect(handle.treeClosed).toBeUndefined();
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(f.warn).toHaveBeenCalledOnce();
+    expect(f.timeout.mock.calls.some(([, ms]) => ms === 10)).toBe(false);
+    expectAdmissionCleaned(f, failure !== "constructor");
+    f.finish();
+  });
+
+  it("closes the admission watcher on native close and uses legacy fallback without waiting for the deadline", async () => {
+    const f = await fixtureAdmission();
+    const started = Date.now();
+    f.close();
+    const handle = await f.launch;
+    expect(handle.pid).toBe(f.children[1]!.pid);
+    expect(handle.treeClosed).toBeUndefined();
+    expect(Date.now()).toBe(started);
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
+  it("closes the watcher and clears its deadline on cancellation without replaying the launch", async () => {
+    const f = await fixtureAdmission();
+    f.controller.abort();
+    await expect(f.launch).rejects.toThrow("Agent launch aborted");
+    expect(spawn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+});
+
 type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async";
 async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
@@ -89,7 +274,9 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   const eventsFd = 700_000_010;
   const order: string[] = [];
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
+  const admissionWatcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
   if (scoped) vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+    if (String(args[0]) !== scopeEvents) return admissionWatcher;
     order.push("watch");
     if (failure === "watcher-arm") throw new Error("watcher arm failed");
     const listener = args.at(-1);
@@ -183,7 +370,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   census.mockClear(); kill.mockClear();
   const timeout = vi.spyOn(globalThis, "setTimeout");
   return {
-    handle, transport, census, kill, timeout, unconfirmed, watcher, opened, readEvents, closeEvents, order,
+    handle, transport, census, kill, timeout, unconfirmed, watcher, admissionWatcher, opened, readEvents, closeEvents, order,
     emptyScope: () => { populated = "0"; watcher.emit("change"); },
     depart: () => { descendantAlive = false; },
     close: async () => {
@@ -222,6 +409,7 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     expect(f.transport?.liveness).toBe("events");
     expect(f.handle.treeClosed).toBeInstanceOf(Promise);
     expect(f.order.slice(0, 3)).toEqual(["open", "watch", "read"]);
+    expect(f.admissionWatcher.close).toHaveBeenCalledOnce();
     expect(f.readEvents.mock.calls.filter(([fd]) => fd === 700_000_010).every(call => (call as unknown[])[4] === 0)).toBe(true);
     await f.close();
     expect(f.scans()).toBe(0);

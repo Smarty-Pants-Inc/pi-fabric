@@ -685,13 +685,12 @@ const main = async (): Promise<void> => {
     const groupObserver = group.cgroup ? undefined : setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, process.platform === "linux" ? CUSTODY_POLL_MS : 100);
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
-      group.cgroup?.detectEscapes();
       const exited = () => nativeClosed && group.exited();
       const wait = async (ms: number) => {
         const deadline = Date.now() + ms;
         do {
           if (exited()) return true;
-          const remaining = Math.min(deadline - Date.now(), CUSTODY_POLL_MS);
+          const remaining = group.cgroup ? deadline - Date.now() : Math.min(deadline - Date.now(), CUSTODY_POLL_MS);
           if (remaining <= 0) break;
           if (group.cgroup && !group.cgroup.exited()) await group.cgroup.waitForExit(remaining);
           else if (group.cgroup && !nativeClosed) {

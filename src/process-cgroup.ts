@@ -5,7 +5,6 @@ export const CUSTODY_POLL_MS = 1_000;
 export const FREEZE_TIMEOUT_MS = 1_000;
 const ROOT = "/sys/fs/cgroup";
 const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");
-let warnedLegacySignal = false;
 
 /** Nested Fabric launches run inside a scrubbed execution too. Give only the
  * trusted custody launcher its standard local user-bus discovery, not targets.
@@ -27,10 +26,6 @@ export const scopePath = (record: string, unit?: string): string | undefined => 
   const name = path.posix.basename(directory);
   return (unit ? name === unit : name.endsWith(".scope")) ? directory : undefined;
 };
-const processCgroupPath = (pid: number): string | undefined => {
-  try { return cgroupPath(fs.readFileSync(`/proc/${pid}/cgroup`, "utf8")); }
-  catch (error) { if (gone(error)) return undefined; throw error; }
-};
 export const processScopePath = (pid: number, unit?: string): string | undefined => {
   if (process.platform !== "linux") return undefined;
   try { return scopePath(fs.readFileSync(`/proc/${pid}/cgroup`, "utf8"), unit); }
@@ -45,7 +40,6 @@ export const executionIdentity = (pid: number): ExecutionIdentity | undefined =>
     return { pid, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), started: fields[19]! };
   } catch (error) { if (gone(error)) return undefined; throw error; }
 };
-const birth = (pid: number): string | undefined => executionIdentity(pid)?.started;
 
 /** Kernel membership owns orphans. All file IO uses a pinned directory fd, not
  * a name that another same-UID process could replace between check and open. */
@@ -56,13 +50,12 @@ export interface CgroupCustody {
   watching: boolean;
   members(): number[];
   exited(): boolean;
-  signal(value: NodeJS.Signals, selected?: ReadonlyMap<number, string>): Promise<void>;
-  detectEscapes(): void;
+  signal(value: NodeJS.Signals): Promise<void>;
   dispose(): void;
   waitForExit(ms: number): Promise<boolean>;
 }
-const pinCgroup = (directory: string, execution?: ExecutionIdentity, selectedOnly = false): CgroupCustody => {
-  if (!directory.startsWith(`${ROOT}/`) || path.normalize(directory) !== directory || (!selectedOnly && !directory.endsWith(".scope"))) {
+const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCustody => {
+  if (!directory.startsWith(`${ROOT}/`) || path.normalize(directory) !== directory || !directory.endsWith(".scope")) {
     throw new Error(`Invalid execution cgroup ${directory}`);
   }
   let fd: number | undefined;
@@ -83,7 +76,14 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity, selectedOnl
     const pinned = fs.fstatSync(fd);
     if (pinned.dev !== recorded.dev || pinned.ino !== recorded.ino) throw new Error(`Execution cgroup ${directory} identity changed; exit unconfirmed`);
   } catch (error) { closeFd(); if (gone(error)) markEmpty(); else throw error; }
-  const ownMembers = (): number[] => {
+  if (!empty) {
+    try {
+      // ponytail: require both controls up front; old kernels use the existing
+      // legacy custodian, never an unfrozen per-PID fallback inside this receipt.
+      for (const name of ["cgroup.freeze", "cgroup.kill"]) fs.accessSync(file(name), fs.constants.W_OK);
+    } catch (error) { closeFd(); throw new Error(`Execution cgroup ${directory} controls unavailable: ${String(error)}`); }
+  }
+  const members = (): number[] => {
     if (empty) return [];
     try {
       const text = fs.readFileSync(file("cgroup.procs"), "utf8");
@@ -108,65 +108,6 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity, selectedOnl
       observeEvents(); // close the watch/read race
     } catch { watcher?.close(); watcher = undefined; /* 1s bounded exit fallback */ }
   }
-  const escapes = new Map<string, { receipt: CgroupCustody; targets: Map<number, string> }>();
-  let scanned = false;
-  const detectEscapes = (): void => {
-    if (scanned || !execution) return;
-    const index = directory.indexOf("/app.slice/");
-    const parts = directory.split("/");
-    const manager = parts.findIndex(part => /^user@[0-9]+[.]service$/.test(part));
-    const app = index >= 0 ? directory.slice(0, index + "/app.slice/".length)
-      : manager >= 0 ? `${parts.slice(0, manager + 1).join("/")}/app.slice/` : undefined;
-    if (!app) { scanned = true; return; }
-    // ponytail: same UID can write sibling cgroups; permissions cannot contain
-    // it. Stop-only sampling catches cooperative re-homing, not hostile code.
-    // Named residual (#7248): changing BOTH session/group AND cgroup after
-    // reparenting escapes these anchors. Landlock/separate UID is the boundary.
-    const candidates = fs.readdirSync("/proc").flatMap(entry => {
-      if (!/^\d+$/.test(entry)) return [];
-      const pid = Number(entry);
-      const scope = processCgroupPath(pid);
-      if (!scope?.startsWith(app)) return [];
-      const identity = executionIdentity(pid); // stat only app.slice candidates
-      return identity && BigInt(identity.started) >= BigInt(execution.started) ? [{ ...identity, scope }] : [];
-    });
-    const leader = candidates.find(value => value.pid === execution.pid) ?? executionIdentity(execution.pid);
-    const anchorsValid = !leader || leader.started === execution.started;
-    const descendants = new Set<number>(leader?.started === execution.started ? [execution.pid] : []);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const value of candidates) if (descendants.has(value.parent) && !descendants.has(value.pid)) { descendants.add(value.pid); changed = true; }
-    }
-    for (const value of candidates) {
-      if (value.scope === directory || !(descendants.has(value.pid) || (anchorsValid && (value.session === execution.session || value.group === execution.group)))) continue;
-      let retained = escapes.get(value.scope);
-      if (!retained) {
-        retained = { receipt: pinCgroup(value.scope, undefined, true), targets: new Map() };
-        escapes.set(value.scope, retained);
-        void retained.receipt.closed.then(notify);
-      }
-      retained.targets.set(value.pid, value.started);
-    }
-    scanned = true;
-  };
-  const members = (): number[] => {
-    const pids = ownMembers();
-    for (const [scope, escaped] of escapes) {
-      const current = escaped.receipt.members().filter(pid => escaped.targets.has(pid) && escaped.targets.get(pid) === birth(pid));
-      pids.push(...current);
-      if (!current.length) { escaped.receipt.dispose(); escapes.delete(scope); }
-    }
-    return pids;
-  };
-  const individualSignal = (signal: NodeJS.Signals, selected?: ReadonlyMap<number, string>): void => {
-    const targets = ownMembers().map(pid => ({ pid, started: selected?.get(pid) ?? (selected ? undefined : birth(pid)) }));
-    for (const target of targets) {
-      if (!target.started || birth(target.pid) !== target.started || processCgroupPath(target.pid) !== directory) continue;
-      try { process.kill(target.pid, signal); }
-      catch (error) { if (!gone(error)) throw error; }
-    }
-  };
   const waitFrozen = (): Promise<boolean> => new Promise((resolve, reject) => {
     const finish = (error?: unknown, frozen = false): void => {
       clearTimeout(timer); notifications.delete(inspect);
@@ -180,49 +121,32 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity, selectedOnl
     const timer = setTimeout(() => finish(new Error(`Execution cgroup ${directory} freeze unconfirmed after ${FREEZE_TIMEOUT_MS}ms`)), FREEZE_TIMEOUT_MS);
     notifications.add(inspect); inspect();
   });
-  const frozenSignal = async (signal: NodeJS.Signals, selected?: ReadonlyMap<number, string>): Promise<void> => {
-    let thaw = false;
+  const frozenSignal = async (signal: NodeJS.Signals): Promise<void> => {
     try {
-      try { thaw = true; fs.writeFileSync(file("cgroup.freeze"), "1"); }
-      catch (error) {
-        if (!gone(error)) throw error;
-        thaw = false;
-        if (!ownMembers().length) return;
-        if (!warnedLegacySignal) {
-          warnedLegacySignal = true;
-          console.warn("[pi-fabric] cgroup.freeze unavailable (kernel < 5.2); birth-checked signals retain a non-atomic PID-reuse race");
-        }
-        individualSignal(signal, selected); return;
-      }
+      fs.writeFileSync(file("cgroup.freeze"), "1");
       if (!await waitFrozen()) return;
       // Frozen members cannot exit/reuse their PID between this list and kill.
       // Node has no pidfd_send_signal; the freezer is our atomic-signal answer.
-      for (const pid of ownMembers()) {
-        if (selected && (!selected.has(pid) || selected.get(pid) !== birth(pid))) continue;
+      for (const pid of members()) {
         try { process.kill(pid, signal); }
         catch (error) { if (!gone(error)) throw error; }
       }
     } finally {
-      if (thaw) {
-        try { fs.writeFileSync(file("cgroup.freeze"), "0"); }
-        catch (error) { if (!gone(error)) throw error; }
-      }
+      try { fs.writeFileSync(file("cgroup.freeze"), "0"); }
+      catch (error) { if (!gone(error)) throw error; }
     }
   };
   let signalling = Promise.resolve();
-  const signal = (value: NodeJS.Signals, selected?: ReadonlyMap<number, string>): Promise<void> => {
+  const signal = (value: NodeJS.Signals): Promise<void> => {
     const run = async (): Promise<void> => {
-      if (selectedOnly && !selected) throw new Error("Escaped cgroup requires selected birth identities");
-      detectEscapes();
-      for (const escaped of escapes.values()) await escaped.receipt.signal(value, escaped.targets);
       if (empty) return;
       active++;
       try {
-        if (value === "SIGKILL" && !selected) {
+        if (value === "SIGKILL") {
           try { fs.writeFileSync(file("cgroup.kill"), "1"); return; }
-          catch (error) { if (!gone(error)) throw error; }
+          catch (error) { if (gone(error) && !members().length) return; throw error; }
         }
-        await frozenSignal(value, selected);
+        await frozenSignal(value);
       } finally { active--; if (empty) closeFd(); }
     };
     const pending = signalling.then(run);
@@ -230,24 +154,36 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity, selectedOnl
     return pending;
   };
   return {
-    directory, execution, closed, members, signal, detectEscapes,
+    directory, execution, closed, members, signal,
     dispose(): void { watcher?.close(); watcher = undefined; closeFd(); },
     get watching(): boolean { return watcher !== undefined; },
     exited: (): boolean => members().length === 0,
     async waitForExit(ms: number): Promise<boolean> {
       const deadline = Date.now() + ms;
+      const safetyAt = Date.now() + 60_000;
+      let safetyRead = false;
+      if (!members().length) return true;
       while (true) {
-        if (!members().length) return true;
         const remaining = deadline - Date.now();
         if (remaining <= 0) return false;
+        // ponytail: R-no-polling exception: one >=60s safety membership read per
+        // watched wait for a missed kernel event; deadline wakes do not re-read.
+        const interval = watcher ? (safetyRead ? Infinity : Math.max(0, safetyAt - Date.now())) : CUSTODY_POLL_MS;
         let timer: ReturnType<typeof setTimeout> | undefined;
         let wake!: () => void;
+        let timerWake = false;
         try {
           await new Promise<void>(resolve => {
             wake = resolve; notifications.add(wake);
-            timer = setTimeout(resolve, Math.min(remaining, CUSTODY_POLL_MS));
+            timer = setTimeout(() => { timerWake = true; resolve(); }, Math.min(remaining, interval));
           });
         } finally { clearTimeout(timer); notifications.delete(wake); }
+        if (empty) return true;
+        if (timerWake && watcher) {
+          if (remaining < interval) return false;
+          safetyRead = true;
+        }
+        if (!members().length) return true;
       }
     },
   };

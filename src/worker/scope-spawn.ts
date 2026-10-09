@@ -23,15 +23,9 @@ export const spawnScopedExecution = async (
   parentCanRetainScopes = true,
 ): Promise<ChildProcess> => {
   if (process.platform !== "linux") return spawn(command, args, options);
-  // Only the launcher needs the user bus. Executions have no bus dependency;
-  // XDG_RUNTIME_DIR must go too: systemd-run otherwise discovers the same bus.
-  const env = { ...(options.env ?? process.env) };
-  delete env.DBUS_SESSION_BUS_ADDRESS;
-  delete env.XDG_RUNTIME_DIR;
-  const targetOptions = { ...options, env };
-  if (!parentCanRetainScopes) { warn("parent lacks cgroup custody capability"); return spawn(command, args, targetOptions); }
+  if (!parentCanRetainScopes) { warn("parent lacks cgroup custody capability"); return spawn(command, args, options); }
   const executable = findExecutable("systemd-run");
-  if (!executable) { warn("systemd-run unavailable"); return spawn(command, args, targetOptions); }
+  if (!executable) { warn("systemd-run unavailable"); return spawn(command, args, options); }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-execution-scope-"));
   const marker = path.join(root, "admitted");
   const stdio = Array.isArray(options.stdio) ? [...options.stdio] : Array(3).fill(options.stdio ?? "pipe");
@@ -74,5 +68,5 @@ export const spawnScopedExecution = async (
   }
   fs.rmSync(root, { recursive: true, force: true });
   warn(error?.message ?? "systemd-run failed or user manager unavailable");
-  return spawn(command, args, targetOptions);
+  return spawn(command, args, options);
 };

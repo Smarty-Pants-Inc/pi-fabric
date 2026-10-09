@@ -45,6 +45,31 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
     }
   });
 
+  it.each(["cgroup.freeze", "cgroup.kill"])("downgrades an admitted worker with missing %s to legacy custody without replay", async control => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-downgrade-"));
+    const worker = path.join(root, "worker.mjs"), started = path.join(root, "started");
+    fs.writeFileSync(worker, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(started)},String(process.pid)+'\\n');setInterval(()=>{},1000);`);
+    const original = fs.accessSync.bind(fs);
+    vi.spyOn(fs, "accessSync").mockImplementation((file, mode) => {
+      if (String(file).startsWith("/proc/self/fd/") && String(file).endsWith(`/${control}`)) {
+        throw Object.assign(new Error(`missing ${control}`), { code: "ENOENT" });
+      }
+      original(file, mode);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handle = await new ProcessTransport().launch({ id: "downgrade", name: "downgrade", cwd: root, workerPath: worker, workerArguments: [] });
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(started)).toBe(true), { timeout: 5_000 });
+      expect(handle.treeClosed).toBeUndefined(); expect(await handle.isAlive()).toBe(true);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("cgroup custody unavailable"));
+      expect(fs.readFileSync(started, "utf8").trim().split("\n")).toEqual([handle.sessionId]);
+      await handle.stop(); await handle.waitForClose?.(); expect(await handle.isAlive()).toBe(false);
+    } finally {
+      vi.restoreAllMocks(); await handle.stop(); await handle.waitForClose?.();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("nested Fabric custody launchers still obtain scopes with a scrubbed ambient environment", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-nested-"));
     const worker = path.join(root, "worker.mjs"); fs.writeFileSync(worker, "setInterval(()=>{},1000)");
@@ -63,7 +88,7 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true });
     }
   });
-  it("catches a sibling systemd scope escaper with the recorded session, even after leader exit", async () => {
+  it("documents #7478: scope escape is residual; same-session siblings are not signal authority", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-escape-"));
     const marker = path.join(root, "escape.json"), leaf = path.join(root, "leaf.mjs"), worker = path.join(root, "worker.mjs");
     const bus = { DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR };
@@ -85,10 +110,14 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       expect(escaped!.scope).not.toBe(receipt!.directory);
       expect(escaped!.session).toBe(receipt!.execution!.session);
       await closedWithin(close); expect(executing(escaped!.pid)).toBe(true);
-      const started = Date.now(); await receipt!.signal("SIGKILL");
+      // #7478 accepted residual: matching SID/PGID is not ownership of a sibling.
+      // Stop must not signal anything outside the retained execution scope.
+      const kill = vi.spyOn(process, "kill"), scan = vi.spyOn(fs, "readdirSync");
+      await receipt!.signal("SIGTERM"); await receipt!.signal("SIGKILL");
       expect(await receipt!.waitForExit(3_000)).toBe(true);
-      await vi.waitFor(() => expect(executing(escaped!.pid)).toBe(false), { timeout: 3_000 });
-      expect(Date.now() - started).toBeLessThan(4_000);
+      expect(executing(escaped!.pid)).toBe(true);
+      expect(kill).not.toHaveBeenCalled();
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
     } finally {
       await receipt?.signal("SIGKILL"); releaseScopedChild(child); await closedWithin(close);
       if (!escaped && fs.existsSync(marker)) escaped = JSON.parse(fs.readFileSync(marker, "utf8"));
@@ -127,7 +156,7 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       await group.signal("SIGKILL");
       expect(await receipt!.waitForExit(3_000)).toBe(true);
       await vi.waitFor(() => expect(executing(pid)).toBe(false), { timeout: 3_000, interval: 10 });
-      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toHaveLength(1);
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
       expect(group.exited()).toBe(true);
     } finally {
       vi.restoreAllMocks();
@@ -214,7 +243,7 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
       await handle.stop();
       expect(await handle.isAlive()).toBe(false);
       await vi.waitFor(() => expect(executing(pid)).toBe(false), { timeout: 3_000, interval: 10 });
-      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc").length).toBeLessThanOrEqual(2);
+      expect(scan.mock.calls.filter(call => String(call[0]) === "/proc")).toEqual([]);
       expect(handle.lostContact?.()).toBeUndefined();
     } finally {
       vi.restoreAllMocks(); await handle.stop(); await handle.waitForClose?.();

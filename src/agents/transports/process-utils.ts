@@ -484,13 +484,12 @@ export const spawnDetached = async (
   const stop = async (): Promise<void> => {
     if (stopped) return;
     if (primaryScope) {
-      for (const scope of scopes.values()) scope.detectEscapes();
       const settled = (): boolean => !scopesAlive() && exited;
       const wait = async (ms: number): Promise<boolean> => {
         const deadline = Date.now() + ms;
         do {
           if (settled()) return true;
-          const remaining = Math.min(CUSTODY_POLL_MS, deadline - Date.now());
+          const remaining = deadline - Date.now();
           if (remaining <= 0) break;
           const active = [...scopes.values()].find(scope => !scope.exited());
           if (active) await active.waitForExit(remaining);

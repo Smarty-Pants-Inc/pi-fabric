@@ -101,6 +101,7 @@ it.each(["success", "ensure failure", "publish failure"].flatMap(outcome =>
   const ensure = vi.spyOn(FabricState.prototype, "ensure").mockImplementation(async () => {
     await ensureGate.promise;
     if (outcome === "ensure failure") throw new Error(outcome);
+    return { current: () => true };
   });
   const publish = vi.spyOn(FabricState.prototype, "publishOpsEvent").mockImplementation(async () => {
     await publishGate.promise;

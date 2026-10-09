@@ -23,7 +23,7 @@ import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
-import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
+import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
@@ -80,6 +80,7 @@ export class FabricUiController {
   #dashboardTui: TUI | undefined;
   #widgetMounted = false;
   #widget: FabricWidget | undefined;
+  #hostStreaming: boolean | undefined;
   #lastRefreshErrorAt = 0;
   #lastRefreshAt = 0;
   #dashboardOpen = false;
@@ -164,6 +165,7 @@ export class FabricUiController {
     this.#widgetTui = undefined;
     this.#dashboardTui = undefined;
     this.#widgetMounted = false;
+    this.#hostStreaming = undefined;
     this.#events = [];
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
@@ -182,6 +184,14 @@ export class FabricUiController {
     this.#builtLocal = undefined;
     this.#builtRemote = undefined;
     this.#builtAt = 0;
+  }
+
+  /** Host lifecycle boundaries are independent of child/activity revisions. */
+  setHostStreaming(streaming: boolean): void {
+    if (!this.#context || !this.state.config.ui.enabled || this.#context.mode !== "tui") return;
+    this.#hostStreaming = streaming;
+    this.#refresh();
+    this.#schedulePoll(true);
   }
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
@@ -429,15 +439,20 @@ export class FabricUiController {
     // must be true before this refresh so the first dashboard frame renders
     // from full activity runs rather than stripped summaries.
     this.#dashboardOpen = true;
+    const epoch = this.#epoch;
+    const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
     const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }] =
       await Promise.all([import("./dashboard.js"), import("./model-picker.js")]);
+    if (!current()) return;
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
     if (this.#snapshot.actors.some((actor) => actor.runner === "claude")) {
       try {
         claudeModelSource = buildClaudeModelSource(await this.state.agents.claudeModels());
+        if (!current()) return;
       } catch (error) {
+        if (!current()) return;
         context.ui.notify(
           `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
           "warning",
@@ -447,12 +462,13 @@ export class FabricUiController {
     const reportUpdate = (message: string, update: Promise<unknown>): void => {
       void update
         .then(() => {
+          if (!current()) return;
           context.ui.notify(message, "info");
           this.#refresh();
         })
-        .catch((error) =>
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-        );
+        .catch((error) => {
+          if (current()) context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        });
     };
     const onTargetMessage = (
       target: FabricDashboardMessageTarget,
@@ -545,12 +561,13 @@ export class FabricUiController {
       this.state.actors
         .create(this.state.globalActors.toRequest(def))
         .then((actor) => {
+          if (!current()) return;
           context.ui.notify(`Imported global actor "${def.name}" as ${actor.name}`, "info");
           this.#refresh();
         })
-        .catch((error) =>
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-        );
+        .catch((error) => {
+          if (current()) context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        });
     };
     const onExportActor = (actorId: string): void => {
       try {
@@ -576,10 +593,10 @@ export class FabricUiController {
     };
     this.#schedulePoll(true);
     let conversationTarget: string | undefined;
-    const epoch = this.#epoch;
     try {
       await context.ui.custom<void>(
         (tui, theme, keybindings, done) => {
+          if (!current()) { done(undefined); return { render: () => [], invalidate() {} }; }
           this.#dashboardTui = tui;
           return new FabricDashboard(tui, theme, () => this.#snapshot, () => done(undefined), {
             modelSource,
@@ -654,6 +671,7 @@ export class FabricUiController {
     }
     if (this.#timer || !this.#context || !this.state.initialized) return;
     const localActive =
+      this.#snapshot.main.status === "running" ||
       this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
@@ -793,7 +811,12 @@ export class FabricUiController {
       // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
       // dashboard or conversation view stays live. The rest of the refresh runs either way.
       const now = Date.now();
-      const main = this.state.mainAgentInfo(context);
+      const main = { ...this.state.mainAgentInfo(context) };
+      // agent_end can precede isIdle() becoming true. Its explicit boundary
+      // releases the host reservation immediately; idle is a fallback boundary.
+      if (this.#hostStreaming !== undefined) {
+        main.status = this.#hostStreaming && context.isIdle?.() !== true ? "running" : "idle";
+      }
       const local = JSON.stringify([revision, main.status, main.model, main.thinking, main.pendingMessages,
         this.state.widgetDismissedAt]);
       // Participant records live in files of their own too (smarty-dev#2004); a change to one
@@ -847,6 +870,9 @@ export class FabricUiController {
           participantsRoot ? participantFilesCachedStamp(participantsRoot) : undefined,
         );
       }
+      if (this.#snapshot.main.status !== main.status) {
+        this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
+      }
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
@@ -875,7 +901,12 @@ export class FabricUiController {
     const shouldShow =
       context.mode === "tui" &&
       shouldShowFabricWidget(this.#snapshot, config.widget);
-    if (shouldShow) {
+    // Keep the above-editor component mounted for the entire streamed turn.
+    // A transient status gap must not turn into a remove/add pair while Pi is
+    // diff-rendering the conversation.
+    const keepForStreaming =
+      context.mode === "tui" && config.widget !== "hidden" && isFabricWidgetStreaming(this.#snapshot);
+    if (shouldShow || keepForStreaming) {
       if (this.#widgetMounted) return;
       this.#widgetMounted = true;
       context.ui.setWidget(
@@ -887,6 +918,7 @@ export class FabricUiController {
             () => this.#snapshot,
             config.maxRows,
             () => tui.terminal?.rows ?? process.stdout.rows,
+            true,
           );
           return this.#widget;
         },

@@ -242,10 +242,10 @@ it("TTL source claim rechecks succession when native C confirms before custody l
   await recovery.run(firstAbsent);
   expect(fs.existsSync(routeFile)).toBe(false);
   const now = firstAbsent + options.rootGoneTtlMs + 1;
-  const exclusive = recoveryMesh.exclusive.bind(recoveryMesh);
+  const custody = recoveryMesh.custody.bind(recoveryMesh);
   let next!: ReturnType<typeof main>;
   let injected = false;
-  vi.spyOn(recoveryMesh, "exclusive").mockImplementationOnce(async (operation, timeout) => {
+  vi.spyOn(recoveryMesh, "custody").mockImplementationOnce(async (operation, timeout) => {
     // Pause A's source claim immediately BEFORE lock acquisition. On the old
     // implementation A has already captured no successor here. C wins the real
     // lock, registers, and confirms B -> C without changing B's retired owner.
@@ -256,7 +256,7 @@ it("TTL source claim rechecks succession when native C confirms before custody l
     next = await mesh.exclusive(() => main(mesh, C, true, targetFile));
     expect(await confirmMainSuccessor(mesh, C.id, targetFile)).toBe(true);
     expect(fs.readFileSync(ownerFile, "utf8")).toBe(retiredOwner);
-    return exclusive(operation, timeout); // Resume A only after confirmation committed.
+    return custody(operation, timeout); // Resume A only after confirmation committed.
   });
   await recovery.run(now);
   expect(injected).toBe(true);

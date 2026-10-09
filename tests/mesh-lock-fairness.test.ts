@@ -76,7 +76,8 @@ describe("bounded FIFO mesh admission", () => {
       const store = new MeshStore(root, 65536, 100);
       await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
       expect(fs.readdirSync(parent)).toEqual(["mesh"]);
-      expect(fs.readdirSync(root)).toEqual([]);
+      // Only the writer census (smarty-dev#6477 L4a) lives in the root; no admission sidecar does.
+      expect(fs.readdirSync(root)).toEqual([".writer-census"]);
     } finally { fs.chmodSync(parent, 0o700); }
   });
 
@@ -100,7 +101,7 @@ describe("bounded FIFO mesh admission", () => {
     }
     const store = new MeshStore(root, 65536, 100);
     await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
-    expect(fs.readdirSync(root)).toEqual([]);
+    expect(fs.readdirSync(root)).toEqual([".writer-census"]);
   });
 
   it("shares one queue across canonical mesh-root aliases and isolates other roots", () => {
@@ -213,9 +214,12 @@ describe("bounded FIFO mesh admission", () => {
     buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts"; export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";', resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", outfile: output });
     const { stdout } = await promisify(execFile)(process.execPath, ["scripts/stress-mesh-lock.mjs", `--module=${output}`,
       "--n=24", "--rounds=2", "--load=2", "--cpuMs=1", `--legacyN=${legacyN}`,
-      `--legacyModule=${path.resolve("tests/fixtures/mesh-legacy-contender.mjs")}`], { timeout: 85000 });
+      `--legacyModule=${path.resolve("tests/fixtures/mesh-legacy-contender.mjs")}`],
+      { timeout: 85000, env: { ...process.env, PI_FABRIC_LOCK_STATS: "1" } });
     const report = JSON.parse(stdout);
     expect(report).toMatchObject({ n: 24, acquisitions: 48, timeouts: 0, mutualExclusion: true, remainingTickets: 0, legacyN });
+    // Every current contender recorded exactly its own acquisitions (legacy contenders record none).
+    expect(report.lockStats).toMatchObject({ files: 24 - legacyN, acquisitions: 48 - 2 * legacyN, timeouts: 0 });
     expect(report.waitMs.p50).toBeGreaterThanOrEqual(0);
     expect(report.waitMs.max).toBeGreaterThanOrEqual(report.waitMs.p99);
   }, 90000);

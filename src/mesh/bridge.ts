@@ -5,11 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, hostLiveness, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { meshCursorGeneration, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
+import { isMeshStateBusy } from "./state-backend.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -27,6 +30,8 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** A mirrored host lease lasts this long past its last renewal, so a dead bridge lapses it. */
 export const BRIDGE_LEASE_MS = 15_000;
+/** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
+const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A bridge call the remote has not answered by then closes the transport. */
@@ -41,6 +46,20 @@ export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/;
 
 const keyFor = (prefix: string, id: string): string => prefix + createHash("sha256").update(id).digest("hex");
+
+// Natives' participant files (smarty-dev#2004): their entries, and whether a key has a file at all,
+// readable or not (fail closed, security pass S3 on #142).
+const participantFileSnapshot = (root: string): { entries: readonly MeshStateEntry[]; present: (key: string) => boolean } => {
+  const entries = readParticipantFiles(root, { maxAgeMs: 0 });
+  let names: Set<string>;
+  try {
+    names = new Set(fs.readdirSync(path.join(root, "participants")));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { entries, present: (key) => participantFilePresent(root, key) };
+    names = new Set();
+  }
+  return { entries, present: (key) => key.startsWith(PARTICIPANT_PREFIX) && names.has(`${key.slice(PARTICIPANT_PREFIX.length)}.json`) };
+};
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -124,8 +143,11 @@ export interface BridgeSide {
   holds?(id: string): boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
   mirrored?(id: string): boolean;
-  /** Replace this side's mirror of the peer's presence. */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
+  /**
+   * Replace this side's mirror of the peer's presence. `observedAt` (this side's clock, never a
+   * peer's) is when the snapshot was requested; liveness is judged then, not at commit.
+   */
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
   bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
@@ -170,13 +192,47 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number }
+/**
+ * A removed mirror's lease identity, as its lease file carries it (root, identity, incarnation).
+ * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
+ */
+interface BridgeUnlease { key: string; id: string; rootId?: string; identityId?: string; startedAt?: number }
+
+const incarnationOf = (record: { startedAt?: unknown }): { startedAt?: number } =>
+  typeof record.startedAt === "number" && Number.isFinite(record.startedAt) ? { startedAt: record.startedAt } : {};
+
 export class StoreBridgeSide implements BridgeSide {
+  // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
+  // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
+  // replays them on its own snapshot (CommitOutboxPlan.replay) before it stages anything.
+  readonly #outbox: CommitOutbox;
+  #recovered = false;
+
   constructor(
     readonly store: MeshStore,
     readonly peer: string,
     readonly now: () => number = Date.now,
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
+    this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
+      lease: (lease: BridgeLease, view, replay) => this.#applyLease(lease, view, replay),
+      // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
+      // owner that wrote its file lease before its state record keeps it (L2b owner review, P2).
+      unlease: (gone: BridgeUnlease, view) => {
+        if (view.get(gone.key) || typeof gone.rootId !== "string" || typeof gone.identityId !== "string" ||
+          typeof gone.startedAt !== "number") return;
+        // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
+        // before lease incarnations): root and identity decide it, as before.
+        removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
+          lease.identityId === gone.identityId && (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
+      },
+    });
+  }
+
+  // Each mirror put supplies its checked owner identity; this default is unused for deletes.
+  #identity(): MeshIdentity {
+    return { id: `bridge:${this.peer}`, name: this.peer, kind: "main" };
   }
 
   async latestSequence(): Promise<number> {
@@ -307,13 +363,31 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
-    const published = await this.store.publish(this.#publication(event, held));
+    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
-    const published = await this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [])));
+    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
     return published.map(({ sequence }) => ({ sequence }));
+  }
+
+  // A busy state write fence (SQLite) refused the event before its stamp: nothing was appended,
+  // so it is retried with .lock released in between, for a bounded time; then the busy error
+  // (a lock timeout) goes to the bridge loop's own backoff. A batch whose later event met a busy
+  // fence returns its committed prefix instead, like any other suffix failure. Inside a bounded mesh
+  // try (withTryLock) the retries never outlast that try's budget (pi-fabric#640 review round 1).
+  async #fenceRetry<T>(publish: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + Math.min(BRIDGE_FENCE_RETRY_MS, this.store.tryLockBudgetMs ?? BRIDGE_FENCE_RETRY_MS);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await publish();
+      } catch (error) {
+        if (!isMeshStateBusy(error) || Date.now() >= deadline) throw error;
+        const cap = Math.min(25, 2 ** Math.min(attempt, 5));
+        await new Promise((resolve) => setTimeout(resolve, cap * (0.5 + Math.random() / 2)));
+      }
+    }
   }
 
   #publication(event: BridgePublish, held: string[]): Parameters<MeshStore["publish"]>[0] {
@@ -326,9 +400,17 @@ export class StoreBridgeSide implements BridgeSide {
       from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
-      // round 3, F2). Every state writer takes the same lock. Under the participants-files policy a
-      // native's first file is written without it; its host record, which reserves the root id,
-      // still goes through the lock, and a mirror never outranks a native file (#142 S2).
+      // round 3, F2). Every state writer takes the same lock on the `file` backend. SQLite state
+      // writers do not take `.lock`, so a held event also runs in the state write fence (plan
+      // R20, smarty-dev#6477 L2b owner review P1): with `.lock` held, one `BEGIN IMMEDIATE`, then
+      // this check on that transaction's snapshot and the synchronous append, then ROLLBACK. A
+      // takeover's commit waits for the append, or commits first and this check refuses. Lock
+      // order is `.lock`, then the SQLite write lock, never the reverse (a SQLite transaction is
+      // one synchronous segment and `.lock` is only acquired asynchronously). Under the
+      // participants-files policy a native's first file is written without it; its host record,
+      // which reserves the root id, still goes through the lock, and a mirror never outranks a
+      // native file (#142 S2).
+      ...(held.length > 0 ? { fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit) } : {}),
       data: () => {
         for (const id of held) {
           if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
@@ -339,8 +421,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   /**
-   * Whether this link holds `id` now. Run under the mesh lock that commits a bridged event, so it
-   * decides on the ownership at commit (security review rounds 3 and 4, F2). Any record for the
+   * Whether this link holds `id` now. Run under the mesh lock that commits a bridged event, and in
+   * its state write fence (R20), so it decides on the ownership at commit (security review rounds
+   * 3 and 4, F2). Any record for the
    * id that is not this link's live mirror (a native, another link's, or a reserved id anywhere
    * on this side) is a denial, never a gap to fill from another mirror: `id` must be this
    * link's host, with a live lease, and its root, if present, must be this link's too.
@@ -392,9 +475,9 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> {
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#mirror(presence, false));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -430,44 +513,75 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean): Promise<void> {
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
-    const leases: Array<{ id: string; rootId: string; identityId: string; expiresAt: number }> = [];
-    const removed: Array<{ key: string; id: string }> = [];
+    // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
+    // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
+    // root of such a spoke on every pass (smarty-dev#6477). Never later than now. A non-finite
+    // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
+    // one for a full lease (independent review, P2).
+    const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
+    const leases: BridgeLease[] = [];
+    const removed: BridgeUnlease[] = [];
+    // One idempotency key per host: a later lease write or removal supersedes an earlier one.
+    const effects = (): CommitOutboxEffect[] => [
+      ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
+      ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
+    ];
+    // Participant files are read before the state transaction and revalidated in it by their
+    // directory stamp (R11): only a change in between reads them again under the lock.
+    const filesStamp = meshDirectoryStamp(this.store.root, "participants");
+    const files = participantFileSnapshot(this.store.root);
+    const plan = this.#outbox.plan();
     await this.store.writeBatch({
-      // Each put below supplies its checked owner identity; this default is unused for deletes.
-      identity: { id: `bridge:${this.peer}`, name: this.peer, kind: "main" },
+      identity: this.#identity(),
+      lockClass: "bridge",
       ops: [],
       // Admission, reservations and CAS all observe ONE authoritative snapshot under the
       // write lock. No native takeover can fit between that observation and this commit
       // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
       prepare: (view) => {
-        if (halted()) return [];
+        if (halted()) return plan.stage([], []);
+        // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
+        // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
+        if (!this.#recovered) plan.replay(view);
         const hostEntries = view.listAll(HOST_PREFIX);
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
-        const own = new Set(this.#presence(hostEntries,
-          [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })]).reserved);
+        const participantFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp
+          ? files : participantFileSnapshot(this.store.root);
+        const own = new Set(this.#presence(hostEntries, [...participantEntries, ...participantFiles.entries]).reserved);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt } of presence.hosts) {
+          // Only a peer's natives are mirrored; a record another link mirrored is never relayed.
+          if (remoteHostOf(record) !== undefined) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // Mirror a still-live observation for one source TTL from this side's sync,
-          // not until the source's absolute expiry. Even a final observation just before
-          // the source expires can therefore extend a stopped host by at most one TTL.
-          const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
-          if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
-          const until = now + ttl;
+          // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
+          // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
+          // A mirror never renews: its lease carries the origin's last renewal, not this sync.
+          // Liveness is judged when the snapshot was requested (liveAt); the origin's remaining
+          // life is then counted from this commit, so a slow pass does not lapse a live mirror.
+          // That shift is at most this pass's latency (zero when no observedAt is given) and never
+          // more than one BRIDGE_LEASE_MS, so a stalled pass cannot keep a dead origin's mirror
+          // alive longer than one lease past the origin (independent review, P2). A mirror that
+          // the capped shift leaves already lapsed is not written: it is dropped like any other.
+          if (!Number.isFinite(expiresAt) || expiresAt <= liveAt) continue;
+          const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          if (until <= now) continue;
+          const renewedAt = Math.min(record.updatedAt, now);
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
             identity: record.identity,
           });
-          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, expiresAt: until });
+          // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
+            updatedAt: renewedAt, expiresAt: until });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (!owner || participant.kind !== "root" || own.has(participant.id) || remoteHostOf(participant) !== undefined) continue;
           if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
           wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
             value: { ...participant, remoteHost: this.peer },
@@ -481,7 +595,7 @@ export class StoreBridgeSide implements BridgeSide {
           // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
           // only in its own file (smarty-dev#2004).
           if (existing && remoteHostOf(existing.value) !== this.peer) continue;
-          if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
+          if (participantFiles.present(key)) continue;
           if (
             existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
             contentDigest(existing.updatedBy) === contentDigest(identity) &&
@@ -489,35 +603,50 @@ export class StoreBridgeSide implements BridgeSide {
               ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
               : existing.value.updatedAt === value.updatedAt)
           ) continue;
-          if (halted()) return [];
+          if (halted()) return plan.stage([], []);
           ops.push({ kind: "put", key, value, identity, ifVersion: view.version(key), onConflict: "skip" });
         }
         for (const [key, { value, version }] of mirrored) {
-          if (halted()) return [];
+          if (halted()) return plan.stage([], []);
           if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
-            removed.push({ key, id: value.id });
+            const gone = hostOf(key, value);
+            removed.push(gone
+              ? { key, id: gone.id, rootId: gone.rootId, identityId: gone.identity.id, ...incarnationOf(gone) }
+              : { key, id: value.id });
           }
           ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
         }
-        return ops;
+        // A changing commit records its lease effects in the same commit; a lease-only renewal
+        // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
+        return plan.stage(ops, effects());
       },
-      afterCommit: (view) => {
-        // Lease-only renewal does not rewrite shared state. It still runs inside this ONE
-        // transaction and checks the committed owner, never a fresh per-record state read.
-        for (const lease of leases) {
-          if (halted()) return;
-          const entry = view.get(keyFor(HOST_PREFIX, lease.id));
-          const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
-          if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) continue;
-          writeHostLease(this.store.root, { ...lease, updatedAt: now });
-        }
-        for (const { key, id } of removed) {
-          if (halted()) return;
-          if (!view.get(key)) removeHostLease(this.store.root, id);
-        }
-      },
+      // After the commit, on the committed owner, never a fresh per-record state read.
+      afterCommit: (view) => { plan.run(view, halted); },
     });
+    // Only a committed pass ends recovery; a failed one leaves the rows for the next pass.
+    if (!final) this.#recovered = true;
+  }
+
+  #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
+    const entry = view.get(keyFor(HOST_PREFIX, lease.id));
+    const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+    if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
+    // Only the incarnation the lease was planned for: an overlapping writer may have installed a
+    // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
+    // and a stale effect must not overwrite its lease (pi-fabric#640 review round 2). A row of an
+    // earlier release carries no incarnation and proves none: it is discarded, and a later pass
+    // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
+    if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt) return;
+    const onDisk = readHostLease(this.store.root, lease.id);
+    // A replayed row never shortens a lease that a later pass already renewed.
+    if (replay && (onDisk?.expiresAt ?? -Infinity) >= lease.expiresAt) return;
+    // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
+    // and incarnation can run their effects out of order, and the older one still matches startedAt
+    // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
+    if (onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.expiresAt > lease.expiresAt) return;
+    writeHostLease(this.store.root, lease);
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
@@ -978,7 +1107,7 @@ export class MeshBridge {
     const outbound = boundPresence(local);
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
+    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];

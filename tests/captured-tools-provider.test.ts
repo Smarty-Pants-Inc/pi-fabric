@@ -5,6 +5,7 @@ import {
   type ExtensionRunner,
   type RegisteredTool,
 } from "@earendil-works/pi-coding-agent";
+import type { AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
@@ -31,6 +32,102 @@ const context = {
 };
 
 describe("CapturedToolsProvider", () => {
+  it("cancels direct in-flight and queued child calls on close without a caller signal (#5962)", async () => {
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let retired = false;
+    const execute = vi.fn(async () => { entered(); await gate; return { content: [{ type: "text" as const, text: "late result" }], details: {} }; });
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }),
+      getActiveTools: vi.fn(() => { if (retired) throw new Error("stale ctx"); return ["browser_child"]; }),
+      emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined), emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{ definition: defineTool({ name: "browser_child", label: "Child", description: "IPC child",
+      executionMode: "sequential", parameters: Type.Object({}), execute }),
+      sourceInfo: createSyntheticSourceInfo("/extensions/browser.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/fabric.ts");
+    const provider = new CapturedToolsProvider(catalog);
+    const direct = { ...context, signal: undefined };
+    const first = provider.invoke("browser_child", {}, direct).catch(error => error);
+    await started;
+    const queued = provider.invoke("browser_child", {}, direct).catch(error => error);
+    await provider.close(); retired = true;
+    expect(await first).toMatchObject({ message: "Captured extension tool session closed" });
+    expect(await queued).toMatchObject({ message: "Captured extension tool session closed" });
+    await expect(provider.invoke("browser_child", {}, direct)).rejects.toThrow("session closed");
+    release(); await new Promise(resolve => setImmediate(resolve));
+    expect(execute).toHaveBeenCalledOnce();
+    expect(runner.getActiveTools).toHaveBeenCalledOnce();
+    expect(runner.emitToolResult).not.toHaveBeenCalled();
+  });
+
+  it("drops a non-cooperative tool's late onUpdate after close, cancellation, or settle (#5962)", async () => {
+    const updates: Array<AgentToolUpdateCallback<unknown>> = [];
+    let release!: () => void;
+    const execute = vi.fn(async (_id: string, _args: unknown, _signal: unknown, onUpdate?: AgentToolUpdateCallback<unknown>) => {
+      updates.push(onUpdate!);
+      onUpdate!({ content: [{ type: "text", text: "live progress" }], details: {} });
+      // Non-cooperative: ignores the abort signal and only returns once released.
+      await new Promise<void>(resolve => { release = resolve; });
+      return { content: [{ type: "text" as const, text: "done" }], details: {} };
+    });
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }),
+      getActiveTools: () => ["noncooperative"],
+      emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined), emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{ definition: defineTool({ name: "noncooperative", label: "Late", description: "ignores cancellation",
+      parameters: Type.Object({}), execute }),
+      sourceInfo: createSyntheticSourceInfo("/extensions/late.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/fabric.ts");
+    const late = { content: [{ type: "text" as const, text: "late progress" }], details: {} };
+    const progressEmits = () => vi.mocked(runner.emit).mock.calls.filter(([event]) => (event as { type: string }).type === "tool_execution_update").length;
+
+    // 1. Turn cancellation: the retired invocation's update never reaches the turn context.
+    const provider = new CapturedToolsProvider(catalog);
+    const controller = new AbortController();
+    const cancelled = { ...context, update: vi.fn(), signal: controller.signal };
+    const turn = provider.invoke("noncooperative", {}, cancelled);
+    await vi.waitFor(() => expect(updates).toHaveLength(1));
+    await vi.waitFor(() => expect(progressEmits()).toBe(1));
+    expect(cancelled.update).toHaveBeenCalledExactlyOnceWith("noncooperative: live progress");
+    controller.abort(new Error("turn cancelled"));
+    await expect(turn).rejects.toThrow("turn cancelled");
+    expect(() => updates[0]!(late)).not.toThrow();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cancelled.update).toHaveBeenCalledOnce();
+    expect(progressEmits()).toBe(1);
+    release();
+
+    // 2. Provider close: a late update after close never touches the context either.
+    const closing = { ...context, update: vi.fn() };
+    const second = provider.invoke("noncooperative", {}, closing).catch(error => error);
+    await vi.waitFor(() => expect(updates).toHaveLength(2));
+    expect(closing.update).toHaveBeenCalledOnce();
+    await provider.close();
+    expect(await second).toMatchObject({ message: "Captured extension tool session closed" });
+    expect(() => updates[1]!(late)).not.toThrow();
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(closing.update).toHaveBeenCalledOnce();
+
+    // 3. Settled invocation: an update fired after execute returned is dropped too.
+    const fresh = new CapturedToolsProvider(catalog);
+    const settledContext = { ...context, update: vi.fn() };
+    const done = fresh.invoke("noncooperative", {}, settledContext);
+    await vi.waitFor(() => expect(updates).toHaveLength(3));
+    release();
+    await expect(done).resolves.toMatchObject({ text: "done" });
+    const emitsBefore = progressEmits();
+    expect(() => updates[2]!(late)).not.toThrow();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settledContext.update).toHaveBeenCalledOnce();
+    expect(settledContext.update).not.toHaveBeenCalledWith(expect.stringContaining("late progress"));
+    expect(progressEmits()).toBe(emitsBefore);
+    await fresh.close();
+  });
+
   it("attaches final captured images after result hooks without changing the tool result", async () => {
     const originalImage = { type: "image" as const, data: "original", mimeType: "image/png" };
     const finalImage = { type: "image" as const, data: "final", mimeType: "image/png" };

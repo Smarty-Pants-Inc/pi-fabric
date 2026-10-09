@@ -21,6 +21,8 @@ const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
+/** A timed-out message the sender withdrew before its owner claimed it: definitely not delivered. */
+export const CONTROL_NOT_DELIVERED = "FABRIC_CONTROL_NOT_DELIVERED";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // The sender keeps waiting this long past the command deadline. The owner admits a
@@ -387,7 +389,8 @@ export class FabricControlPlane {
       path.join(mesh.root, "control-seen", createHash("sha256").update(options.hostId).digest("hex").slice(0, 32)),
       mesh.maxEventBytes,
       mesh.maxReadEvents,
-      { lockProtocol: mesh.lockProtocol },
+      // control-seen stays on the file backend (smarty-dev#6477 R20).
+      { lockProtocol: mesh.lockProtocol, stateBackend: "file" },
     );
     // Replay the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
@@ -690,16 +693,70 @@ export class FabricControlPlane {
     }
     void this.#publishCancellation(commandId, timedOut);
     // Neither a live lease nor a missing ACK proves the handler did not run. Never replay.
-    const error = new Error(
-      (timedOut.mirroredOwner
-        ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
-        : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
-        (timedOut.idempotencyKey
-          ? `the outcome is unknown; retry once only with the same idempotencyKey (${timedOut.idempotencyKey}) and unchanged input.`
-          : "the outcome is unknown and it may still be delivered, so a retry can deliver it twice."),
-    );
-    if (timedOut.idempotencyKey) Object.assign(error, { idempotencyKey: timedOut.idempotencyKey });
-    timedOut.reject(error);
+    const unknown = (): void => {
+      const error = new Error(
+        (timedOut.mirroredOwner
+          ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
+          : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
+          (timedOut.idempotencyKey
+            ? `the outcome is unknown; retry once only with the same idempotencyKey (${timedOut.idempotencyKey}) and unchanged input.`
+            : "the outcome is unknown and it may still be delivered, so a retry can deliver it twice."),
+      );
+      if (timedOut.idempotencyKey) Object.assign(error, { idempotencyKey: timedOut.idempotencyKey });
+      timedOut.reject(error);
+    };
+    // A bridged owner's claims live in another mesh: only a native owner can be fenced here.
+    if (timedOut.mirroredOwner || typeof timedOut.destinationRemoteHost === "string" || !timedOut.commandPublished) {
+      unknown();
+      return;
+    }
+    // smarty-dev#6729: an owner that stopped consuming (its lease renewal failing) never claimed
+    // the command, and past its deadline it never will: on resume it only answers "expired".
+    // Make that definite now instead of "outcome unknown" for a message nobody holds.
+    void this.#withdrawUnclaimed(commandId, timedOut).then((withdrawn) => {
+      if (!withdrawn) return unknown();
+      timedOut.reject(Object.assign(new Error(
+        `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; ` +
+          "the owner never admitted the message and it is now withdrawn: not delivered, nothing was queued. " +
+          "Sending it again is safe.",
+      ), { code: CONTROL_NOT_DELIVERED, notDelivered: true }));
+    }, unknown);
+  }
+
+  /**
+   * Win the owner's create-only claim for a timed-out command with a terminal "expired, not run"
+   * record (the same record the owner writes for a command it reads past its deadline). Both the
+   * owner's admission and its duplicate check read this claim before running the handler, so a
+   * win proves the message was never and will never be delivered. A lost race means the owner
+   * holds it, and the outcome stays unknown.
+   */
+  async #withdrawUnclaimed(commandId: string, pending: PendingControlRequest): Promise<boolean> {
+    const key = controlSeenKey(pending.ownerHostId, commandId);
+    const expired = (record: FabricControlSeenRecord | undefined): boolean =>
+      record?.hostId === pending.ownerHostId && record.commandId === commandId && record.targetId === pending.targetId &&
+        record.acceptance?.accepted === false && record.acceptance.notRun === true &&
+        record.acceptance.error === CONTROL_COMMAND_EXPIRED;
+    try {
+      await this.mesh.put({
+        key,
+        value: {
+          format: 1,
+          hostId: pending.ownerHostId,
+          commandId,
+          targetId: pending.targetId,
+          expiresAt: Date.now() + this.#ackTimeoutMs,
+          explicitDeadline: true,
+          acceptance: { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true },
+        } satisfies FabricControlSeenRecord,
+        identity: this.identity,
+        ifVersion: 0,
+      });
+      return true;
+    } catch (error) {
+      if (isLockTimeout(error)) return false;
+      // The owner may itself have recorded the expiry first.
+      return expired(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
+    }
   }
 
   #clearPending(commandId: string): PendingControlRequest | undefined {

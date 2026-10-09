@@ -173,19 +173,24 @@ it.each(["Main", "proxy"] as const)("%s bounded reset wait preserves a committed
   const run = f.host.actors.ask(f.actor.id, "pending activation").catch(error => error);
   try {
     await started;
-    f.client.options.commandTimeoutMs = kind === "Main" ? 5_000 : 200;
-    const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 200);
+    // The caller's bounded wait must end AFTER the resident committed the
+    // reset, or this is the (separately covered) abandoned-before-commit
+    // path. A 200 ms wall-clock deadline raced the host's commit, and the
+    // proxy case also lowered the shared Main client to 200 ms, so the public
+    // actorStatus below timed out on a loaded runner (smarty-dev#6956). End
+    // both callers' waits explicitly once the commit is observed; the
+    // generous client deadlines remain only as hang guards.
+    const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 5_000);
     const reset = (kind === "Main"
       ? f.provider.invoke("resetSession", { id: f.actor.id }, { ...f.context, signal: abort.signal })
-      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id }))
+      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, abort.signal, { identity: f.identity, hostId: f.identity.id }))
       .catch(error => error);
     await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
     const decision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
     expect(await promptly(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context))).toMatchObject({ id: f.actor.id });
-    if (kind === "Main") abort.abort();
+    abort.abort();
     expect(await promptly(reset)).toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.actor.id, requestId: decision.requestId,
       residentOutcome: { state: "committed", operation: "resetSession", id: f.actor.id } });
-    f.client.options.commandTimeoutMs = 5_000;
     expect(await promptly(f.provider.invoke("stop", { id: f.actor.id }, f.context))).toMatchObject({ status: "stopped" });
     await run;
     await waitFor(() => fs.readdirSync(path.join(f.config.residencyRoot, "processing")).length === 0);

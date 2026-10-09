@@ -231,6 +231,11 @@ describe("event-driven mesh observers", () => {
     await publish(mesh); watches[0]!.notify("change", "events.jsonl"); await flush();
     expect(deliver).toHaveBeenCalledOnce(); expect(writes).toHaveBeenCalledOnce();
     watches[0]!.notify("rename", "state.json"); await flush();
+    // The failed put itself emits a notification. Identical failed bytes cannot
+    // buy a new attempt (or spin forever); an actual changed event can retry.
+    expect(writes).toHaveBeenCalledOnce(); expect(deliver).toHaveBeenCalledOnce();
+    await mesh.publish({ topic: "fabric.test.external-hint", kind: "hint", from: identity });
+    watches[0]!.notify("change", "events.jsonl"); await flush();
     expect(writes).toHaveBeenCalledTimes(2); expect(deliver).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(5 * 60_000); expect(writes).toHaveBeenCalledTimes(2);
     expect(deliver).toHaveBeenCalledOnce();

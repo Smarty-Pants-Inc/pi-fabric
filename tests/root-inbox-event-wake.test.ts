@@ -7,7 +7,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, RootInboxEventWake, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, RootInboxEventWake, rootInboxSession, type RootInboxKnownWake } from "../src/topology/root-inbox.js";
 
 const roots: string[] = [];
 const observers: RootInboxEventWake[] = [];
@@ -303,18 +303,19 @@ const fixture = (grace = 60_000, cooldown = 300_000) => {
 describe("root inbox known-work one-shot deadlines", () => {
   const observe = (mesh: MeshStore, box: RootInbox, allowed = () => true) => {
     const delivered: string[] = [];
+    const observed: (readonly string[])[] = [];
     let observer!: RootInboxEventWake;
-    const wake = vi.fn(async () => {
+    const wake = vi.fn(async (hint?: RootInboxKnownWake) => {
       observer.cancelKnownDeadline();
       if (!allowed()) return;
-      const batch = await box.wake(held, allowed);
+      const batch = await box.wake(held, allowed, hint);
       if (!allowed()) return;
       delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
-      observer.armKnownDeadline(box.knownWakeDueAt);
+      observer.armKnownDeadline(box.knownWake);
     });
-    observer = new RootInboxEventWake(mesh.root, wake);
+    observer = new RootInboxEventWake(mesh.root, wake, 60_000, () => { observed.push(box.observe(held)); });
     observers.push(observer); observer.start();
-    return { observer, wake, delivered };
+    return { observer, wake, delivered, observed };
   };
 
   it("matures actual event grace between safety ticks without another append or safety tick", async () => {
@@ -338,6 +339,31 @@ describe("root inbox known-work one-shot deadlines", () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(h.wake).toHaveBeenCalledTimes(calls);
     expect(h.delivered).toEqual(["young"]);
+  });
+
+  it("does not admit a suppressed unknown arrival at a known item's deadline", async () => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box, work } = fixture(0, 75_000);
+    const h = observe(mesh, box); await h.observer.request();
+    await work("first"); await h.observer.request(); await box.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const known = await work("known"); await h.observer.request();
+    expect(box.knownWake?.ids).toEqual([known.id]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const unknown = await work("lost notification", "p0"); // No watcher callback/request.
+    const read = vi.spyOn(mesh, "read");
+    await vi.advanceTimersByTimeAsync(73_000);
+    expect(read).toHaveBeenCalled(); // Fresh ordered read, not a retained payload.
+    expect(h.delivered).toEqual(["first", "known"]);
+    expect(mesh.get(box.key)?.value).toMatchObject({ pending: { ids: [known.id], through: known.sequence } });
+    expect(box.knownWake).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.delivered).toEqual(["first", "known"]); // Safety cannot consume/wake.
+    expect(h.observed.some(ids => ids.includes(unknown.id))).toBe(true); // Minute observation finds the lost hint.
+    expect(mesh.get(box.key)?.value).toMatchObject({ pending: { ids: [known.id] } });
+    await h.observer.request(); // The normal event path still sees the unknown urgent item.
+    expect(h.delivered).toEqual(["first", "known", "lost notification"]);
+    expect(mesh.get(box.key)?.value).toMatchObject({ pending: { ids: [unknown.id] } });
   });
 
   it("matures actual cooldown before the next safety tick without further publication", async () => {
@@ -380,7 +406,7 @@ describe("root inbox known-work one-shot deadlines", () => {
     if (gate === "closed") h.observer.close();
     await vi.advanceTimersByTimeAsync(10_000);
     const calls = h.wake.mock.calls.length;
-    h.observer.armKnownDeadline(box.knownWakeDueAt); // Expired hints never rearm.
+    h.observer.armKnownDeadline(box.knownWake); // Expired hints never rearm.
     await vi.advanceTimersByTimeAsync(40_000);
     expect(h.wake).toHaveBeenCalledTimes(calls); expect(h.delivered).toEqual([]);
     expect(vi.getTimerCount()).toBe(gate === "closed" ? 0 : 1);
@@ -412,10 +438,10 @@ describe("root inbox foreign-head grace deadlines", () => {
     boxes.push(box); box.start();
     const delivered: string[] = [];
     let observer!: RootInboxEventWake;
-    const wake = vi.fn(async () => {
-      const batch = await box.wake(session, () => true);
+    const wake = vi.fn(async (hint?: RootInboxKnownWake) => {
+      const batch = await box.wake(session, () => true, hint);
       delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
-      observer.armKnownDeadline(box.knownWakeDueAt);
+      observer.armKnownDeadline(box.knownWake);
     });
     observer = new RootInboxEventWake(mesh.root, wake);
     observers.push(observer); observer.start(); await observer.request();

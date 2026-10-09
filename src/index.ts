@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { RootInboxEventWake, rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
+import { RootInboxEventWake, rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxKnownWake } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
@@ -474,7 +474,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // uses the already active mesh only; records remain optional and are not opened here.
     inboxWake.context = context;
     if (hostQueuesTriggeredBehindPreflight(pi) && state.config.mesh.enabled && state.mainAgentInfo(context).local) {
-      const observer = new RootInboxEventWake(state.mesh.root, (knownDeadline) => wakeIdleMain(knownDeadline), inboxWakeMs());
+      const observer = new RootInboxEventWake(state.mesh.root, (knownDeadline) => wakeIdleMain(knownDeadline), inboxWakeMs(), () => {
+        const context = inboxWake.context;
+        if (context && state.initialized && state.config.mesh.enabled && state.mainAgentInfo(context).local) {
+          state.observeRootInbox(inboxHeldBy(context));
+        }
+      });
       inboxWake.observer = observer;
       observer.start();
     }
@@ -647,7 +652,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.requested = false;
     inboxWake.context = undefined;
   };
-  const wakeIdleMain = async (knownInboxDeadline = false): Promise<void> => {
+  const wakeIdleMain = async (knownInboxDeadline?: RootInboxKnownWake): Promise<void> => {
     const context = inboxWake.context;
     const observer = inboxWake.observer;
     observer?.cancelKnownDeadline();
@@ -670,7 +675,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.reading = true;
     try {
       if (!idle()) return;
-      const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
+      const inbox = await state.nextRootInbox(inboxHeldBy(context), idle, knownInboxDeadline);
       if (!idle()) return;
       reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
@@ -681,7 +686,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // An inbox item's one-shot is authority to check inbox work only, never
       // an opportunity to deliver unrelated records whose notification was lost.
       if (knownInboxDeadline) {
-        if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWakeDueAt);
+        if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWake);
         return;
       }
       // Records: the same gate, re-checked after an actual event (F21).
@@ -689,7 +694,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (!idle()) return;
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
-      else if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWakeDueAt);
+      else if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWake);
     } catch {
       // A stale context or mesh error: only the next event or explicit turn retries.
     } finally {

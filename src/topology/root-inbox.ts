@@ -70,6 +70,12 @@ export interface RootInboxBatch {
   horizonMs?: number;
 }
 
+/** Immutable observation admitted by an event read, not delivery authority. */
+export interface RootInboxKnownWake {
+  readonly dueAt: number;
+  readonly ids: readonly string[];
+}
+
 interface RootInboxState {
   after: number;
   pending?: { through: number; ids: string[] };
@@ -133,17 +139,24 @@ export class RootInboxEventWake {
   #running: Promise<void> | undefined;
   #requested = false;
   #eventRequested = false;
+  #knownRequested: RootInboxKnownWake | undefined;
+  #safetyStamp: string | undefined;
   #closed = false;
 
-  constructor(readonly root: string, readonly wake: (knownDeadline: boolean) => Promise<void>, readonly safetyMs = 60_000) {}
+  constructor(readonly root: string, readonly wake: (knownDeadline?: RootInboxKnownWake) => Promise<void>, readonly safetyMs = 60_000, readonly observe?: () => void) {}
 
   start(): void {
     if (this.#closed || this.#timer) return;
     this.#watch();
     this.#timer = setInterval(() => {
-      // Reviewed R-no-polling exception: reattach the physical watch only.
-      // Never discover inbox/records work or request a Main turn from a tick.
+      // Reviewed minute exception: repair attachment and observe a changed log.
+      // Observation never saves a cursor, delivers, arms a deadline or wakes Main.
       this.#watch();
+      const stamp = this.#logStamp();
+      if (stamp !== this.#safetyStamp) {
+        this.#safetyStamp = stamp;
+        try { this.observe?.(); } catch { /* Next minute/event retries observation only. */ }
+      }
     }, Math.max(60_000, this.safetyMs));
     this.#timer.unref();
     // Subscribe before reconciling: publication between activation and this read is retained.
@@ -151,13 +164,14 @@ export class RootInboxEventWake {
   }
 
   /** Only a completed trusted wake supplies this observation hint; it never admits work. */
-  armKnownDeadline(dueAt: number | undefined): void {
+  armKnownDeadline(hint: RootInboxKnownWake | undefined): void {
     this.cancelKnownDeadline();
-    const delay = dueAt === undefined ? 0 : dueAt - Date.now();
-    if (this.#closed || !Number.isFinite(delay) || delay <= 0) return;
+    const delay = hint === undefined ? 0 : hint.dueAt - Date.now();
+    if (this.#closed || !hint?.ids.length || !Number.isFinite(delay) || delay <= 0) return;
+    const admitted = { dueAt: hint.dueAt, ids: [...hint.ids] };
     this.#deadline = setTimeout(() => {
       this.#deadline = undefined;
-      void this.request(true);
+      void this.request(admitted);
     }, Math.min(delay, 2_147_483_647));
     this.#deadline.unref();
   }
@@ -167,18 +181,21 @@ export class RootInboxEventWake {
     this.#deadline = undefined;
   }
 
-  request(knownDeadline = false): Promise<void> {
+  request(knownDeadline?: RootInboxKnownWake): Promise<void> {
     this.cancelKnownDeadline();
     if (this.#closed) return Promise.resolve();
     this.#requested = true;
+    if (!knownDeadline) this.#safetyStamp = this.#logStamp();
     this.#eventRequested ||= !knownDeadline;
+    if (knownDeadline) this.#knownRequested = knownDeadline;
     if (this.#running) return this.#running;
     const task = Promise.resolve().then(async () => {
       while (this.#requested && !this.#closed) {
         this.#requested = false;
-        const deadlineOnly = !this.#eventRequested;
+        const deadline = this.#eventRequested ? undefined : this.#knownRequested;
         this.#eventRequested = false;
-        try { await this.wake(deadlineOnly); } catch { /* The next event or explicit turn retries durable work. */ }
+        this.#knownRequested = undefined;
+        try { await this.wake(deadline); } catch { /* The next event or explicit turn retries durable work. */ }
       }
     });
     this.#running = task;
@@ -196,6 +213,13 @@ export class RootInboxEventWake {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     this.#retireWatch();
+  }
+
+  #logStamp(): string | undefined {
+    try {
+      const stat = fs.statSync(path.join(this.root, "events.jsonl"), { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+    } catch { return undefined; }
   }
 
   #retireWatch(): void {
@@ -237,9 +261,10 @@ export class RootInboxEventWake {
 
 export class RootInbox {
   #state: RootInboxState | undefined;
-  #wakeProbe: { stamp: string; names: string; dueAt: number; knownDueAt: number } | undefined;
+  #wakeProbe: { stamp: string; names: string; dueAt: number; knownDueAt: number; ids: string[]; scoped: boolean } | undefined;
   #scanDueAt = Number.POSITIVE_INFINITY;
   #scanKnownDueAt = Number.POSITIVE_INFINITY;
+  #scanKnownIds = new Set<string>();
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
@@ -262,6 +287,23 @@ export class RootInbox {
     return dueAt !== undefined && Number.isFinite(dueAt) ? dueAt : undefined;
   }
 
+  get knownWake(): RootInboxKnownWake | undefined {
+    const dueAt = this.knownWakeDueAt;
+    return dueAt === undefined ? undefined : { dueAt, ids: [...(this.#wakeProbe?.ids ?? [])] };
+  }
+
+  /** Minute lost-notification observation: no pending save, receipt or delivery.
+   * Hints discovered here are never armed as timer work; the next event/turn
+   * performs the authoritative read. Invalidate only the old empty-log shortcut. */
+  observe(session: RootInboxSession): readonly string[] {
+    this.#wakeProbe = undefined;
+    this.#scanDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownIds.clear();
+    const peek = this.#peek(session);
+    return [...new Set([...peek.map(event => event.id), ...this.#scanKnownIds])].slice(0, MAX_BATCH_EVENTS);
+  }
+
   get key(): string {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
   }
@@ -271,7 +313,7 @@ export class RootInbox {
    * not hold is delivered again. A new batch stops at the first event younger than the steer
    * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
    */
-  async next(session: RootInboxSession): Promise<RootInboxBatch> {
+  async next(session: RootInboxSession, admitted?: ReadonlySet<string>): Promise<RootInboxBatch> {
     this.#wakeProbe = undefined; // Turn/settle and receipt recovery always use the trusted drain.
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
@@ -279,6 +321,11 @@ export class RootInbox {
     receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
     let skippedStale = 0;
     if (state.pending) {
+      // Confirmed held batches may retire normally; a deadline cannot retry an
+      // unconfirmed pending batch that it did not observe.
+      if (admitted && !session.holdsBatch(state.pending.ids) && state.pending.ids.some(id => !admitted.has(id))) {
+        return { events: [], through: state.after };
+      }
       const pending = this.#reread(state.after, state.pending);
       if (session.holdsBatch(state.pending.ids)) {
         this.#remember(pending.flatMap(eventReceipts));
@@ -308,7 +355,7 @@ export class RootInbox {
     }
     const batch = this.#scan(state.after, session, true, (event) => {
       receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
-    });
+    }, admitted);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
@@ -331,27 +378,31 @@ export class RootInbox {
    * (the settle path has no cooldown), so the cursor never skips an event.
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
-  async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
+  async wake(session: RootInboxSession, idle: () => boolean, hint?: RootInboxKnownWake): Promise<RootInboxBatch | undefined> {
     if (!idle()) return undefined;
+    const admitted = hint ? new Set(hint.ids) : undefined;
     const now = this.#now();
     const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
     const cooling = now < cooldownEnd;
     const stamp = this.#eventStamp();
     const names = JSON.stringify(this.names());
     const probe = this.#wakeProbe;
-    if (stamp !== undefined && probe?.stamp === stamp && probe.names === names && now < probe.dueAt) return undefined;
+    if (!admitted && !probe?.scoped && stamp !== undefined && probe?.stamp === stamp && probe.names === names && now < probe.dueAt) return undefined;
     this.#scanDueAt = Number.POSITIVE_INFINITY;
     this.#scanKnownDueAt = Number.POSITIVE_INFINITY;
-    const peek = this.#peek(session);
+    this.#scanKnownIds.clear();
+    const peek = this.#peek(session, admitted);
+    for (const event of peek) if (this.#scanKnownIds.size < MAX_BATCH_EVENTS) this.#scanKnownIds.add(event.id);
+    const ids = [...new Set([...peek.map(event => event.id), ...this.#scanKnownIds])].slice(0, MAX_BATCH_EVENTS);
     const urgent = peek.some((event) => URGENT_KINDS.has(event.kind));
     const dueAt = Math.min(this.#scanDueAt, cooling ? cooldownEnd : Number.POSITIVE_INFINITY);
     const knownDueAt = Math.min(this.#scanKnownDueAt, cooling && peek.length ? cooldownEnd : Number.POSITIVE_INFINITY);
     if (cooling && !urgent) {
-      this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt };
+      this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
       return undefined;
     }
-    const batch = await this.next(session);
-    if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt };
+    const batch = await this.next(session, admitted);
+    if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
@@ -373,15 +424,16 @@ export class RootInbox {
   }
 
   /** Every event `next` would bring now or in later batches, without the batch bounds or a save. */
-  #peek(session: RootInboxSession): MeshEvent[] {
+  #peek(session: RootInboxSession, admitted?: ReadonlySet<string>): MeshEvent[] {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      (!admitted || admitted.has(event.id)) && !this.#stale(event) && !this.#steered(event, session)) : []),
+      ...this.#scan(after, session, false, undefined, admitted).events];
   }
 
-  #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
+  #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void, admitted?: ReadonlySet<string>): RootInboxBatch {
     const now = this.#now();
     const names = new Set(this.names().filter((name) =>
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
@@ -397,17 +449,24 @@ export class RootInbox {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (let index = 0; index < page.length; index++) {
         const event = page[index]!;
+        // Stop before unknown addressed work: neither deliver nor advance past it.
+        if (admitted && event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined &&
+            names.has(event.to) && !admitted.has(event.id)) return result();
         if (event.createdAt > cutoff) {
           const dueAt = event.createdAt + (this.options.steerGraceMs ?? STEER_GRACE_MS);
           this.#scanDueAt = Math.min(this.#scanDueAt, dueAt);
           // Observation only: a foreign log head also blocks older own work behind it.
           // Look no farther than this validated fetched page; never admit an event,
           // advance the cursor, or fetch another page past the young-head barrier.
-          if (page.some((pending, pendingIndex) => pendingIndex >= index &&
-              pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined && names.has(pending.to) &&
-              !this.#stale(pending) && !this.#steered(pending, session) &&
-              !eventReceipts(pending).some((id) => seen.has(id)))) {
-            this.#scanKnownDueAt = Math.min(this.#scanKnownDueAt, dueAt);
+          for (const pending of page.slice(index)) {
+            if (admitted && pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined &&
+                names.has(pending.to) && !admitted.has(pending.id)) break;
+            if (pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined && names.has(pending.to) &&
+                !this.#stale(pending) && !this.#steered(pending, session) &&
+                !eventReceipts(pending).some((id) => seen.has(id))) {
+              this.#scanKnownDueAt = Math.min(this.#scanKnownDueAt, dueAt);
+              if (this.#scanKnownIds.size < MAX_BATCH_EVENTS) this.#scanKnownIds.add(pending.id);
+            }
           }
           return result();
         }

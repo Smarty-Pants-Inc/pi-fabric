@@ -220,6 +220,35 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
   });
 
+  it("reads state.json itself: a link, malformed JSON, an unknown shape or a writable file refuses --apply; a legacy file state is unswitched (smarty-dev#7766)", async () => {
+    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
+    const marker = JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" });
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-state-")); roots.push(elsewhere);
+    write(path.join(elsewhere, "marker.json"), marker);
+    const cases: Array<[string, (file: string) => void, RegExp]> = [
+      ["symlink to a valid marker", file => fs.symlinkSync(path.join(elsewhere, "marker.json"), file), /symbolic link/],
+      ["malformed JSON", file => write(file, "{\"format\":1,"), /malformed JSON/],
+      ["foreign-shaped object", file => write(file, JSON.stringify({ format: "other", entries: [] })), /neither a file-backend state nor a moved marker/],
+      ["mode 0666 file", file => { write(file, JSON.stringify({ format: 1, entries: {} })); fs.chmodSync(file, 0o666); }, /group- or world-writable/],
+    ];
+    for (const [name, place, reason] of cases) {
+      const { root } = make();
+      place(path.join(root, "state.json"));
+      const before = snapshot(root);
+      const result = await sweepMeshRetention(root, options);
+      expect(result.changes, name).toEqual([]);
+      expect(result.skipped, name).toEqual([{ path: root, reason: expect.stringMatching(reason) }]);
+      expect(snapshot(root), name).toEqual(before);
+    }
+    // A valid legacy file-backend state is an unswitched mesh: --apply proceeds as before.
+    const { root: legacy } = make();
+    write(path.join(legacy, "state.json"), JSON.stringify({ readGeneration: "00000000-0000-4000-8000-000000000000", backendEpoch: 1, format: 2, entries: {} }));
+    fs.chmodSync(path.join(legacy, "state.json"), 0o600);
+    const applied = await sweepMeshRetention(legacy, options);
+    expect(applied.skipped).toEqual([]);
+    expect(applied.changes.length).toBeGreaterThan(0);
+  });
+
   it("refuses ambiguous identities and linked actor-reference trees without changing them", async () => {
     const { root, host } = make(); const second = path.join(root, "residency", "second");
     write(path.join(second, "host.lock"), JSON.stringify({ pid: 2147483647 }));

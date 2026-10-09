@@ -3,7 +3,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
-import { readMeshStateMovedMarker } from "../mesh/backend-fence.js";
+import { isMeshStateMovedMarker, type MeshStateMovedMarker } from "../mesh/backend-fence.js";
+import { DEFAULT_MAX_STATE_BYTES, isMeshStateFile } from "../mesh/state-file.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { actorRunReferencedNow, compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -46,16 +47,50 @@ export const MESH_RETENTION_APPROVAL = ".mesh-retention-approved.json";
 // swapped-in link or foreign file never supplies an epoch. Where ownership cannot be proven (no getuid: Windows),
 // no approval is ever valid, so a switched mesh deletes nothing there (fail closed).
 const applyRefusal = (meshRoot: string): string | undefined => {
-  // Ownership of the mesh's files cannot be proven without a uid (Windows): --apply never deletes there (a dry run
-  // still previews), whatever the marker says.
+  // Ownership of the mesh's files cannot be proven without a uid (Windows): --apply never deletes there, whatever
+  // the marker says (the shared helpers also delete nothing there, smarty-dev#7858).
   if (typeof process.getuid !== "function") return "file ownership cannot be proven on this platform; --apply deletes nothing";
   if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
-  const moved = readMeshStateMovedMarker(meshRoot);
+  const state = meshStateBackend(meshRoot);
+  if (typeof state === "string") return `state.json cannot be classified (${state}); --apply deletes nothing`;
+  const moved = state.moved;
   if (moved === undefined) return undefined;
   let approved: unknown;
   try { approved = readPrivate(path.join(meshRoot, MESH_RETENTION_APPROVAL)).epoch; } catch { /* absent, unsafe or unreadable: not approved */ }
   return approved === moved.epoch ? undefined
     : `the mesh switched to ${moved.backend} at epoch ${moved.epoch}; deletions need a ruling in ${MESH_RETENTION_APPROVAL}`;
+};
+/** state.json, read by this gate itself (smarty-dev#7766 round 5): absent or a valid file-backend state is an unswitched
+ * mesh (`{}`), a valid moved marker is a switch (`{ moved }`), and anything else is a named refusal (a string): a link,
+ * a foreign, group/world-writable, non-regular or oversized file, malformed JSON or an unknown shape. One O_NOFOLLOW
+ * descriptor; fstat proves it ours before a byte is parsed. The gate runs before every deletion, so an unchanged file
+ * (same device, inode, size, mtime and ctime) reuses its last classification instead of reparsing a large state. */
+let stateCache: { key: string; result: { moved?: MeshStateMovedMarker } } | undefined;
+const meshStateBackend = (meshRoot: string): { moved?: MeshStateMovedMarker } | string => {
+  const file = path.join(meshRoot, "state.json");
+  let fd: number;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return {};
+    return code === "ELOOP" ? "a symbolic link" : `unreadable: ${code ?? "error"}`;
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return "not a regular file";
+    if (stat.uid !== process.getuid!()) return "not owned by this user";
+    if ((stat.mode & 0o022) !== 0) return "group- or world-writable";
+    if (stat.size > DEFAULT_MAX_STATE_BYTES) return `larger than ${DEFAULT_MAX_STATE_BYTES} bytes`;
+    const key = `${file}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    if (stateCache?.key === key) return stateCache.result;
+    let parsed: unknown;
+    try { parsed = JSON.parse(fs.readFileSync(fd, "utf8")); } catch { return "malformed JSON"; }
+    const result = isMeshStateMovedMarker(parsed) ? { moved: parsed } : isMeshStateFile(parsed) ? {} : undefined;
+    if (result === undefined) return "neither a file-backend state nor a moved marker";
+    stateCache = { key, result };
+    return result;
+  } catch (error) { return `unreadable: ${(error as NodeJS.ErrnoException).code ?? "error"}`; }
+  finally { fs.closeSync(fd); }
 };
 const readPrivate = (file: string, maxBytes = 64 * 1024): Record<string, unknown> => {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);

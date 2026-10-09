@@ -194,12 +194,6 @@ const warnPrivately = (message: string): void => {
 const WRITE_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
 
-// ponytail: as processAlive in src/storage/scratch.ts, inlined because release generations load
-// this module as a self-contained copy (see the module-generation tests).
-const processAlive = (pid: number): boolean => {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return errorCodeOf(error) !== "ESRCH"; }
-};
 /** Sanitized host label used in file names. */
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
@@ -222,22 +216,18 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   let started = false;
   const warn = options.warn ?? warnPrivately;
 
-  // By age, the own file included: a fresh own file is never stale, and a stale one (no
+  // By age only, the own file included: a fresh own file is never stale, and a stale one (no
   // acquisition here for a day) is safe to delete because the next write recreates it by rename.
-  // Sooner for this host's dead pids (smarty-dev#7826): a regular file of a dead pid that no
-  // query window can reach any more (mtime >= its newest minute) is idle for good.
+  // ponytail: no sooner prune by pid liveness (smarty-dev#7826 review): pid reuse would race it, and
+  // the reader skips files outside its window before the cap, so stale files no longer hide live ones.
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
-    const idleBefore = lockStatsWindowStartMs(now, LOCK_STATS_RETAIN_MINUTES + 1);
     for (const name of fs.readdirSync(directory)) {
       if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
       const file = path.join(directory, name);
       try {
         const seen = fs.lstatSync(file);
-        const own = /^(.+)-(\d+)\.json$/.exec(name);
-        const pid = own?.[1] === host ? Number(own[2]) : 0;
-        const idle = seen.isFile() && pid > 0 && pid !== process.pid && seen.mtimeMs < idleBefore && !processAlive(pid);
-        if (!idle && now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
+        if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
         // ponytail: re-lstat right before the unlink and skip a file its owner refreshed
         // (rename = new inode, or a new mtime) since the age check. Best effort: a refresh
         // between this lstat and the unlink still loses that file, until its owner's next

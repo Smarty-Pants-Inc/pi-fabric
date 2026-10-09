@@ -359,33 +359,6 @@ describe("mesh lock stats recorder", () => {
     expect(second.createLockStats("1")).toBe(stats);
     expect(second.createLockStats("0")).toBe(stats);
   });
-
-  it("prunes this host's idle files of dead pids, never a live pid's or another host's (smarty-dev#7826)", () => {
-    const root = path.join(temp(), "mesh");
-    const directory = path.join(root, "lock-stats");
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const dead = 2 ** 30; // above any pid_max: kill(pid, 0) fails with ESRCH
-    const name = (host: string, pid: number): string => path.join(directory, `${host}-${pid}.json`);
-    const idleDead = name(lockStatsHost(), dead);
-    const freshDead = name(lockStatsHost(), dead + 1);
-    const idleLive = name(lockStatsHost(), process.ppid);
-    const otherHost = name("elsewhere", dead);
-    for (const file of [idleDead, freshDead, idleLive, otherHost]) fs.writeFileSync(file, "{}");
-    const old = (Date.now() - (LOCK_STATS_RETAIN_MINUTES + 5) * 60_000) / 1000;
-    for (const file of [idleDead, idleLive, otherHost]) fs.utimesSync(file, old, old);
-    const symlinks = process.platform !== "win32";
-    const link = name(lockStatsHost(), dead + 2);
-    if (symlinks) {
-      fs.symlinkSync(idleLive, link);
-      fs.lutimesSync(link, old, old);
-    }
-    const stats = createLockStats("1")!;
-    stats.acquired(root, "custody", 1, 1);
-    registry[lockKey]!.flush();
-    expect(fs.existsSync(idleDead)).toBe(false);
-    for (const file of [freshDead, idleLive, otherHost, ownFile(root)]) expect(fs.existsSync(file)).toBe(true);
-    if (symlinks) expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
-  });
 });
 
 describe("fleet summary and fabric-mesh-lock-stats", () => {

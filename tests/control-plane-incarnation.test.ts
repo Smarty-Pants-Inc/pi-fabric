@@ -63,34 +63,22 @@ describe("owner incarnation admission and durable receipts", () => {
       ownerIncarnation: restarted.incarnation, staleIncarnation: previous.incarnation, errorCode: CONTROL_STALE_INCARNATION }) }));
   });
 
-  it.each(["steer", "followUp"] as const)("delivers queued session-bound %s once across Main/actor reload, including legacy senders", async operation => {
-    for (const targetId of ["session:owner", "actor:target"]) for (const legacy of [false, true]) {
+  it.each(["steer", "followUp"] as const)("delivers queued explicitly bound session %s once across Main/actor reload", async operation => {
+    for (const targetId of ["session:owner", "actor:target"]) {
       const mesh = store(temp());
       const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
       const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
-      const publish = mesh.publish.bind(mesh);
-      const oldWire = vi.spyOn(mesh, "publish").mockImplementation(async input => {
-        if (!legacy || input.topic !== "fabric.control.command") return publish(input);
-        const data = input.data;
-        return publish({ ...input, data: (at: number) => {
-          const { ownerIncarnation: _epoch, requestCreatedAt: _origin, ...wire } =
-            (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
-          return wire;
-        } });
-      });
       const pending = sender.request("session:owner", targetId, operation,
         { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" });
       await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); await previous.close();
       const restarted = plane(mesh, "session:owner");
       const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); restarted.start(handler);
-      try {
-        await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
-        await expect(sender.request("session:owner", targetId, operation,
-          { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" }))
-          .resolves.toMatchObject({ acknowledged: true, messageId: "once" });
-        expect(handler).toHaveBeenCalledOnce();
-        expect(acks(mesh).at(-1)!.data).toMatchObject({ ownerIncarnation: restarted.incarnation });
-      } finally { oldWire.mockRestore(); }
+      await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+      await expect(sender.request("session:owner", targetId, operation,
+        { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" }))
+        .resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+      expect(handler).toHaveBeenCalledOnce();
+      expect(acks(mesh).at(-1)!.data).toMatchObject({ ownerIncarnation: restarted.incarnation });
     }
   });
 
@@ -162,6 +150,10 @@ describe("owner incarnation admission and durable receipts", () => {
       for (const extra of [
         { ownerIncarnation: "other", accepted: true }, { accepted: true }, { ownerIncarnation: 7, accepted: true },
         { ownerIncarnation: "other", accepted: false, errorCode: CONTROL_STALE_INCARNATION, error: STALE_INCARNATION_ERROR, staleIncarnation: "unrelated" },
+        { ownerIncarnation: "other", accepted: false, errorCode: CONTROL_STALE_INCARNATION, error: STALE_INCARNATION_ERROR },
+        { ownerIncarnation: "other", accepted: true, errorCode: CONTROL_STALE_INCARNATION, error: STALE_INCARNATION_ERROR, staleIncarnation: null },
+        { ownerIncarnation: "other", accepted: false, error: STALE_INCARNATION_ERROR, staleIncarnation: null },
+        { accepted: false, errorCode: CONTROL_STALE_INCARNATION, error: STALE_INCARNATION_ERROR, staleIncarnation: null },
       ]) await mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("session:owner"), to: "session:sender",
         data: { version: 1, commandId: command.commandId, targetId: command.targetId, messageId: "forged", ...extra } });
       return { accepted: true, messageId: "current" };
@@ -244,7 +236,7 @@ describe("owner incarnation admission and durable receipts", () => {
     const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
     const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
     clock.mockReturnValue(at + 10);
-    const pending = sender.request("session:owner", "actor:target", "steer", { message: "logical request" }).catch(error => error);
+    const pending = sender.request("session:owner", "actor:target", "steer", { message: "logical request", ownerIncarnation: previous.incarnation }).catch(error => error);
     await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); sender.pause();
     const original = commands(mesh)[0]!.data as { commandId: string };
     // A notRun receipt must be backed by a terminal create-only claim. Otherwise
@@ -270,7 +262,7 @@ describe("owner incarnation admission and durable receipts", () => {
     } finally { restarted.resume(); await pending; clock.mockRestore(); }
   });
 
-  it.each([-1, 0, 1])("admits origin-less native legacy controls only beyond the maximum window (boundary %s)", async boundary => {
+  it.each([-1, 0, 1])("refuses origin-less native legacy controls even beyond the former maximum window (boundary %s)", async boundary => {
     const mesh = store(temp()); const at = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(at);
     const owner = plane(mesh, "session:owner"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
@@ -279,16 +271,32 @@ describe("owner incarnation admission and durable receipts", () => {
     await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity("session:sender"), to: "session:owner",
       data: { version: 1, commandId: "legacy-window", targetId: "actor:target", operation: "stop", replyTo: "session:sender", requestedAt, deadlineAt: requestedAt + 5_000 } });
     await vi.waitFor(() => expect(acks(mesh)).toHaveLength(1));
-    expect(handler).toHaveBeenCalledTimes(boundary > 0 ? 1 : 0);
-    expect(acks(mesh)[0]!.data).toMatchObject(boundary > 0 ? { accepted: true } : { accepted: false, errorCode: CONTROL_STALE_INCARNATION });
+    expect(handler).not.toHaveBeenCalled();
+    expect(acks(mesh)[0]!.data).toMatchObject({ accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null });
   });
 
-  it("accepts a fresh unbound native command only after the activation start", async () => {
-    const mesh = store(temp()); const owner = plane(mesh, "session:owner"); const sender = plane(mesh, "session:sender");
-    const handler = vi.fn(() => ({ accepted: true })); owner.start(handler); sender.start(() => ({ accepted: false }));
-    await new Promise(done => setTimeout(done, 5));
-    await expect(sender.request("session:owner", "actor:target", "followUp", { message: "legacy fresh" })).resolves.toMatchObject({ acknowledged: true });
-    expect(handler).toHaveBeenCalledOnce();
+  it.each(["stop", "ask", "steer", "followUp"] as const)("refuses fresh native %s without an epoch, with or without an immutable origin", async operation => {
+    for (const origin of [true, false]) {
+      const mesh = store(temp()); const owner = plane(mesh, "session:owner"); const sender = plane(mesh, "session:sender");
+      const handler = vi.fn(() => ({ accepted: true })); owner.start(handler); sender.start(() => ({ accepted: false }));
+      const publish = mesh.publish.bind(mesh);
+      vi.spyOn(mesh, "publish").mockImplementation(input => {
+        if (origin || input.topic !== "fabric.control.command") return publish(input);
+        const data = input.data;
+        return publish({ ...input, data: (at: number) => {
+          const { requestCreatedAt: _origin, ...wire } = (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+          return wire;
+        } });
+      });
+      await new Promise(done => setTimeout(done, 5));
+      await expect(sender.request("session:owner", "actor:target", operation, { message: "unverifiable" }))
+        .rejects.toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+      expect(handler).not.toHaveBeenCalled();
+      expect(commands(mesh)).toHaveLength(1);
+      expect(mesh.listAll("topology/control-seen/")).toEqual([]);
+      expect(acks(mesh)[0]!.data).toMatchObject({ accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null });
+      vi.restoreAllMocks();
+    }
   });
 });
 

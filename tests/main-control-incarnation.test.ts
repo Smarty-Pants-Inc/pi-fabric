@@ -114,13 +114,20 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
     { enabled: true, hostId: "session:observer", pollMs: 20, acknowledgementTimeoutMs: 5_000 });
   const observer = new ParticipantDirectory(mesh, { enabled: true, hostId: "session:observer", rootId: "session:observer",
     identity: { id: "session:observer", name: "observer", kind: "main" } });
+  // Keep a real predecessor record durable while the replacement's publication waits.
+  const predecessor = new ParticipantDirectory(mesh, { enabled: true, hostId: ownerId, rootId: ownerId,
+    identity: { id: ownerId, name: "predecessor", kind: "main" }, reapDeadHosts: false });
+  predecessor.registerSource(() => [{ format: 1, id: ownerId, kind: "root", rootId: ownerId,
+    ownerHostId: ownerId, ownerIdentityId: ownerId, name: "predecessor", status: "idle", runner: "pi",
+    transport: "host", capabilities: ["steer", "followUp", "stop", "ask"], cwd: root, sessionId,
+    startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
   let ownerPlane!: FabricControlPlane;
   let ownerDirectory!: ParticipantDirectory;
   let attempts = 0; let release!: () => void;
   const gate = new Promise<void>(done => { release = done; });
   const refresh = ParticipantDirectory.prototype.refresh;
   vi.spyOn(ParticipantDirectory.prototype, "refresh").mockImplementation(async function (this: ParticipantDirectory, ...args) {
-    if (this.options.hostId === ownerId) {
+    if (this.options.hostId === ownerId && this !== predecessor) {
       ownerDirectory = this;
       if (++attempts === 1 && publication === "failed") throw new Error("injected initial publication failure");
       await gate;
@@ -134,16 +141,31 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
       return start.call(this, (command, from, signal, verification) => {
         // Inject a supported execution target: Main itself does not support stop.
         // The actual runtime's publication/consumption/claim/ACK path is unchanged.
-        if (command.operation === "stop" && command.ownerIncarnation === undefined) return admitExecution();
+        if (command.operation === "stop") return admitExecution();
         return args[0](command, from, signal, verification);
       });
     }
     return start.apply(this, args);
   });
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const originals = new Map<string, Record<string, unknown>>();
+  const publish = mesh.publish.bind(mesh);
+  vi.spyOn(mesh, "publish").mockImplementation(input => {
+    if (input.topic !== "fabric.control.command") return publish(input);
+    const data = input.data;
+    return publish({ ...input, data: (at: number) => {
+      const wire = (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+      if (wire.message !== "epoch stripped") return wire;
+      originals.set(wire.commandId as string, wire);
+      const { ownerIncarnation: _epoch, ...stripped } = wire;
+      return stripped; // Remove ONLY the epoch, preserving origin and native event/commit times.
+    } });
+  });
   let initializing: Promise<void> | undefined;
   const pending: Promise<unknown>[] = [];
   try {
+    await predecessor.refresh();
+    const activationStartedAfter = Date.now();
     initializing = runtime.initialize(ctx, config);
     await vi.waitFor(() => expect(ownerDirectory).toBeDefined());
     if (publication === "failed") {
@@ -151,26 +173,47 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("Initial mesh publish failed"));
     }
     expect(ownerDirectory.canConsumeMesh()).toBe(false);
-    expect(observer.get(ownerId, undefined, { fresh: true })).toBeUndefined();
+    const old = observer.get(ownerId, undefined, { fresh: true })!;
+    expect(old.ownerIncarnation).toBe(predecessor.ownerIncarnation);
+    expect(old.ownerIncarnation).not.toBe(ownerPlane.incarnation);
     sender.start(() => ({ accepted: false }));
-    // This native unbound request is created after the activation starts, but before publication.
+    // Current well-formed commands are queued, not admitted, until publication.
     await new Promise(done => setTimeout(done, 5));
-    const input = { message: "while unpublished", triggerTurn: false,
-      ...(publication === "expired" ? { ownerIncarnation: ownerPlane.incarnation } : {}) };
+    const input = { message: "while unpublished", triggerTurn: false, ownerIncarnation: ownerPlane.incarnation };
     const options = { routedRemoteHost: null, timeoutMs: publication === "expired" ? 200 : 5_000 };
     // Observe one attempt for expiry: request() intentionally resends proven-notRun messages.
     pending.push((publication === "expired"
       ? sender.requestResult(ownerId, ownerId, "steer", input, ownerId, options)
       : sender.request(ownerId, ownerId, "steer", input, ownerId, options)).catch(error => error));
     if (publication !== "expired") {
-      pending.push(sender.request(ownerId, ownerId, "stop", { ownerIncarnation: "predecessor" }, ownerId,
+      pending.push(sender.request(old.ownerHostId, old.id, "stop", { ownerIncarnation: old.ownerIncarnation }, old.ownerIdentityId,
         { routedRemoteHost: null }).catch(error => error));
-      // A native execution origin after activation is admitted only after publication.
-      pending.push(sender.request(ownerId, ownerId, "stop", {}, ownerId,
+      pending.push(sender.request(ownerId, ownerId, "stop", { ownerIncarnation: ownerPlane.incarnation }, ownerId,
         { routedRemoteHost: null }).catch(error => error));
+      // The sender still resolves the durable predecessor after the new activation starts.
+      // Drop only that captured epoch on the wire; timestamps cannot authorize a downgrade.
+      for (const operation of ["stop", "ask", "steer", "followUp"] as const) {
+        const strippedInput = { message: "epoch stripped", ownerIncarnation: old.ownerIncarnation, triggerTurn: false };
+        pending.push((operation === "ask"
+          ? sender.requestResult(old.ownerHostId, old.id, operation, strippedInput, old.ownerIdentityId, { routedRemoteHost: null })
+          : sender.request(old.ownerHostId, old.id, operation, strippedInput, old.ownerIdentityId, { routedRemoteHost: null }))
+          .catch(error => error));
+      }
     }
     await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.command" })).toHaveLength(pending.length));
-    const queued = mesh.read({ topic: "fabric.control.command" })[0]!.data as { deadlineAt: number };
+    const queuedCommands = mesh.read({ topic: "fabric.control.command" });
+    const queued = queuedCommands[0]!.data as { deadlineAt: number };
+    if (publication !== "expired") {
+      expect(originals.size).toBe(4);
+      for (const event of queuedCommands.filter(event => (event.data as { message?: string }).message === "epoch stripped")) {
+        const wire = event.data as { commandId: string; requestCreatedAt: number };
+        const { ownerIncarnation, ...expected } = originals.get(wire.commandId)!;
+        expect(ownerIncarnation).toBe(old.ownerIncarnation);
+        expect(event.data).toEqual(expected);
+        expect(wire.requestCreatedAt).toBeGreaterThan(activationStartedAfter);
+        expect(event.createdAt).toBeGreaterThan(activationStartedAfter);
+      }
+    }
     await new Promise(done => setTimeout(done, publication === "expired" ? Math.max(0, queued.deadlineAt - Date.now() + 10) : 100));
     expect(sendMessage).not.toHaveBeenCalled();
     expect(admitExecution).not.toHaveBeenCalled();
@@ -185,9 +228,24 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
       expect(sendMessage).not.toHaveBeenCalled();
       expect(mesh.read({ topic: "fabric.control.ack" })[0]!.data).toMatchObject({ accepted: false, notRun: true, ownerIncarnation: published.ownerIncarnation });
     } else {
+      await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack" })).toHaveLength(7));
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(admitExecution).toHaveBeenCalledOnce();
       expect(await pending[0]).toMatchObject({ acknowledged: true });
       expect(await pending[1]).toMatchObject({ code: CONTROL_STALE_INCARNATION });
       expect(await pending[2]).toMatchObject({ acknowledged: true });
+      for (const refused of pending.slice(3)) {
+        expect(await refused).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+      }
+      const claims = mesh.listAll("topology/control-seen/");
+      expect(claims).toHaveLength(2); // only the two well-formed current commands
+      expect(mesh.read({ topic: "fabric.control.command" })).toHaveLength(7); // no automatic resend
+      for (const commandId of originals.keys()) {
+        expect(claims.some(entry => (entry.value as { commandId: string }).commandId === commandId)).toBe(false);
+        expect(mesh.read({ topic: "fabric.control.ack" })).toContainEqual(expect.objectContaining({ data: expect.objectContaining({
+          commandId, accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null,
+        }) }));
+      }
       expect(sendMessage).toHaveBeenCalledOnce();
       expect(admitExecution).toHaveBeenCalledOnce();
       expect(mesh.read({ topic: "fabric.control.ack" }).every(event =>
@@ -196,7 +254,7 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
   } finally {
     release(); await initializing;
     await sender.close(); await Promise.all(pending);
-    await runtime.shutdown("exit"); await observer.close();
+    await runtime.shutdown("exit"); await observer.close(); await predecessor.close();
     vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true });
   }
 }, 20_000);

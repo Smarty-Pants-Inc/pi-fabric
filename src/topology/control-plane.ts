@@ -364,7 +364,6 @@ interface OwnedControlCommand {
 
 export class FabricControlPlane {
   readonly incarnation: string;
-  readonly #startedAt = Date.now();
   readonly #pending = new Map<string, PendingControlRequest>();
   readonly #activeCommands = new Map<
     string,
@@ -1029,11 +1028,13 @@ export class FabricControlPlane {
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
       (event.data.ownerIncarnation !== undefined && !isIncarnation(event.data.ownerIncarnation)) ||
+      // A correlated typed refusal may explicitly attest a missing wire epoch (null);
+      // ordinary errors, successes, and an absent staleIncarnation never gain that authority.
       (!sessionBoundControlOperation(pending.operation) && pending.ownerIncarnation !== undefined &&
         event.data.ownerIncarnation !== pending.ownerIncarnation &&
         !(event.data.accepted === false && event.data.errorCode === CONTROL_STALE_INCARNATION &&
           event.data.error === STALE_INCARNATION_ERROR && isIncarnation(event.data.ownerIncarnation) &&
-          event.data.staleIncarnation === pending.ownerIncarnation)) ||
+          (event.data.staleIncarnation === pending.ownerIncarnation || event.data.staleIncarnation === null))) ||
       // A validated mirror's answer authority survives record withdrawal/replacement.
       // Known native requests require an unstamped ACK, regardless of later metadata.
       // Only unbound legacy requests use the mutable metadata selector.
@@ -1085,17 +1086,10 @@ export class FabricControlPlane {
       if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
-    const legacyCreatedAfterStart = command.requestCreatedAt !== undefined
-      ? command.requestCreatedAt > this.#startedAt && command.requestCreatedAt <= command.requestedAt
-      // Pre-upgrade senders stamp requestedAt only at commit. Their origin is unprovable
-      // across a recent activation, so fail closed for the maximum command window.
-      : command.requestedAt - MAX_CONTROL_TIMEOUT_MS > this.#startedAt;
-    const incarnationMatches = command.ownerIncarnation !== undefined
-      ? command.ownerIncarnation === this.incarnation
-      // A bridge re-stamps createdAt: no unbound remote command can prove its age.
-      // Refuse equal timestamps too; a same-millisecond restart is ambiguous.
-      : event.verification !== "bridge" && !Object.hasOwn(event.data as object, "bridge") &&
-        event.createdAt > this.#startedAt && command.requestedAt > this.#startedAt && legacyCreatedAfterStart;
+    // Post-switch controls require an explicit captured epoch. Neither sender origin
+    // nor native event/commit time proves which durable owner record was resolved:
+    // that record can still name the predecessor while this epoch's publish waits.
+    const incarnationMatches = command.ownerIncarnation === this.incarnation;
     if (command.operation === "cancel") {
       if (incarnationMatches) this.#acceptCancellation(command, event.from);
       return;
@@ -1121,13 +1115,14 @@ export class FabricControlPlane {
       }
       return;
     }
-    // Messages address the durable session, not its current execution. Keep queued
-    // steer/followUp deliverable across a same-session reload; changed session IDs
-    // still route to a different target/owner and cannot inherit this command.
-    if (!sessionBoundControlOperation(command.operation) && !incarnationMatches) {
+    // Messages with an explicit epoch still address the durable session across a
+    // same-session reload, even when that epoch names the predecessor. Missing an
+    // epoch is never a legacy downgrade: no unclaimed control can be admitted.
+    if (command.ownerIncarnation === undefined ||
+      (!sessionBoundControlOperation(command.operation) && !incarnationMatches)) {
       await this.#publishAcknowledgement(command, {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
-      }, this.incarnation, command.ownerIncarnation);
+      }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
     }
     if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
@@ -1475,7 +1470,8 @@ export class FabricControlPlane {
     command: FabricControlCommand,
     acceptance: FabricControlAcceptance,
     ownerIncarnation: string | null = this.incarnation,
-    staleIncarnation?: string,
+    // null explicitly attests that this command arrived without an epoch.
+    staleIncarnation?: string | null,
   ): Promise<void> {
     await this.mesh
       .publish({

@@ -634,7 +634,7 @@ describe("running-task followUp advisory (#3005)", () => {
     const owner = make("host:owner"), sender = make("host:sender");
     const accept = vi.fn((...args: Parameters<AgentMessageRouter["acceptControl"]>) => router(f.manager).value.acceptControl(...args));
     owner.start(accept); sender.start(() => ({ accepted: false }));
-    const receipt = await router(unknown, [remote(f.id, "idle")], sender).value.routeMessage(f.id, "later", undefined, "followUp");
+    const receipt = await router(unknown, [{ ...remote(f.id, "idle"), ownerIncarnation: owner.incarnation }], sender).value.routeMessage(f.id, "later", undefined, "followUp");
     const command = sender.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;
     await owner.close(); // Replay through a new owner: exercise the persisted seen outcome, not an in-memory map.
     const restarted = make("host:owner"); restarted.start(accept);

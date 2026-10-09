@@ -4691,6 +4691,7 @@ describe("AgentsProvider shared actor definitions", () => {
       rootId: ownerIdentity.id,
       ownerHostId: "host:a",
       ownerIdentityId: ownerIdentity.id,
+      ownerIncarnation: ownerControl.incarnation,
       parentId: ownerIdentity.id,
       name: actor.name,
       status: "idle",

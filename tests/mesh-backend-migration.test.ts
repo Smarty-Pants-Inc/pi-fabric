@@ -410,7 +410,8 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     expect(await rollbackMeshState(root)).toMatchObject({ backend: "file", epoch: 2 });
   });
 
-  it("a file-mode writer reported by the census does not fail a cutover; a moved state.json still does", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("a file-mode writer reported by the census does not fail a cutover; a moved state.json still does", async () => {
     const root = tempRoot("late");
     await seedFileRoot(root);
     const alarms: MeshBackendAlarm[] = [];
@@ -426,8 +427,10 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
-    const code = await main(["cutover", "--root", other], {
-      census: async () => ({ writers: [fileWriter] }), stdout: () => undefined, stderr: (text) => { err += text; },
+    // ponytail: off Linux there is no state.db holder scan, so the gate's own state.db connection stays
+    // fabric@unknown under the fence (fail closed, smarty-dev#7936): accept it there.
+    const code = await main(["cutover", "--root", other, ...(process.platform === "linux" ? [] : ["--accept-unready", "fabric@unknown"])], {
+      census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
     expect(err).toBe("fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
@@ -886,7 +889,8 @@ describe("mesh backend 5 MB round trip", () => {
 });
 
 describe("fabric-mesh-backend CLI", () => {
-  it("runs status, cutover and rollback with exit codes", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("runs status, cutover and rollback with exit codes", async () => {
     const root = tempRoot("cli");
     await seedFileRoot(root);
     const run = async (...argv: string[]): Promise<{ code: number; out: string; err: string }> => {
@@ -909,11 +913,15 @@ describe("fabric-mesh-backend CLI", () => {
     expect(census.out).toMatch(/advisory: 0 writers, 1 unknown/);
     expect(census.out).toMatch(/pid 0 {2}unknown process-record torn\.json/);
     expect(census.out).not.toMatch(/safe|clean/i);
-    // An unknown writer never blocks: the cutover is fenced on .lock and custody.lock only.
+    // The census itself never blocks (smarty-dev#6982), but the reader readiness gate (smarty-dev#7815)
+    // requires unattributable live evidence as fabric@unknown: refused unless accepted explicitly.
     expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(2);
+    const gated = await run("cutover", "--root", root, "--accept-unready", "factory");
+    expect(gated.code).toBe(3);
+    expect(gated.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 0 unknown process-record torn.json");
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
-    const cutover = await run("cutover", "--root", root, "--json");
-    expect(cutover.code).toBe(0);
+    const cutover = await run("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown", "--json");
+    expect(cutover.code, cutover.err).toBe(0);
     expect(cutover.err).toMatch(/fabric-mesh-backend: advisory: 0 writers, 1 unknown/);
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1 });
     expect((await run("status", "--root", root)).out).toMatch(/census {8}advisory: 0 writers, 1 unknown/);

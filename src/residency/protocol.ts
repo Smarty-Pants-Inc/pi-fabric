@@ -1,6 +1,6 @@
 import type { TaskReturnAddress } from "../agents/task-return-address.js";
 import type { FabricParticipantInfo } from "../topology/types.js";
-import type { FabricPrincipal } from "../fabric-provenance.js";
+import type { FabricPrincipal, FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
@@ -695,6 +695,8 @@ export interface ResidentDeliveryRecord {
   /** Producer-owned classification. Only actor-output admits an actor sender; absent or
    * unknown classifications (including older/retained records) keep the label but no claim. */
   source?: "actor-output" | "fabric-host";
+  /** Producer diagnostic snapshot survives outbox replay; not an authority claim. */
+  wakeCause?: FabricWakeCause;
   principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */

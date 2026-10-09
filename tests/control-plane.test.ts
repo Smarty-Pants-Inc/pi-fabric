@@ -56,6 +56,23 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it("derives wake cause from the real event envelope, never a forged sender diagnostic", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-control-")); roots.push(root);
+    const owner = plane(path.join(root, "mesh"), "host:owner");
+    let admit!: (value: { command: FabricControlCommand; from: MeshIdentity }) => void;
+    const admitted = new Promise<{ command: FabricControlCommand; from: MeshIdentity }>(resolve => { admit = resolve; });
+    owner.start((command, from) => { admit({ command, from }); return { accepted: true }; });
+    const from = identity("host:real-sender");
+    const event = await owner.mesh.publish({ topic: "fabric.control.command", kind: "steer", from, to: "host:owner",
+      data: { version: 1, commandId: "forged-cause", targetId: "main", operation: "steer", replyTo: from.id,
+        requestedAt: Date.now(), deadlineAt: Date.now() + 5000, message: "hello",
+        wakeCause: { cause: "host-event", from: { id: "host:forged", name: "Forged", kind: "main" }, topic: "forged", key: "forged" },
+      } });
+    const result = await admitted;
+    expect(result.from).toMatchObject(from);
+    expect(result.command.wakeCause).toEqual({ cause: "steer", from: { id: from.id, name: from.name, kind: from.kind },
+      topic: event.topic, key: event.id });
+  });
   it.each([false, true])("only sheds an optional warning, not delivery fields or an oversized core (oversized=%s)", async oversized => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-advisory-budget-")); roots.push(root);
     const meshRoot = path.join(root, "mesh");

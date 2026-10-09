@@ -23,6 +23,7 @@ describe.skipIf(!available)("compiled worker cgroup custody", () => {
     const target = path.join(root, "target-ran"), piBinary = path.join(root, "pi.mjs");
     fs.writeFileSync(piBinary, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(target)},'executed');setInterval(()=>{},1000);`);
     const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const stopMessage = vi.fn();
     let atReceipt!: () => void;
     const receipt = new Promise<void>(resolve => { atReceipt = resolve; });
     vi.mocked(spawn).mockImplementation((...args: Parameters<typeof spawn>) => {
@@ -36,6 +37,7 @@ describe.skipIf(!available)("compiled worker cgroup custody", () => {
             if (typeof callback === "function") callback(null);
             return true;
           }
+          if (message && typeof message === "object" && "type" in message && message.type === "fabric-stop") stopMessage();
           return send(message, ...rest);
         }) as typeof child.send;
       }
@@ -52,7 +54,10 @@ describe.skipIf(!available)("compiled worker cgroup custody", () => {
       })]);
       clearTimeout(timer);
       expect(fs.existsSync(target)).toBe(false);
-      expect((await manager.stop(run.id)).status).toBe("stopped");
+      const kill = vi.spyOn(process, "kill");
+      const stopped = await manager.stop(run.id);
+      expect(stopped.status, stopped.error).toBe("stopped");
+      expect(stopMessage).toHaveBeenCalledOnce(); expect(kill).not.toHaveBeenCalled();
       expect(fs.existsSync(target)).toBe(false);
     } finally {
       clearTimeout(timer); vi.restoreAllMocks(); vi.mocked(spawn).mockImplementation(actual.spawn);

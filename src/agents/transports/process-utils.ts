@@ -491,8 +491,13 @@ export const spawnDetached = async (
         } while (Date.now() < deadline);
         return settled();
       };
-      // Cgroup receipts skip TERM without PID-stable scope-only authority.
-      // Preserve the grace deadline before atomic member-only KILL.
+      // Captured native IPC can request cooperative worker stop without any
+      // numeric PID/PGID signal authority. Channel failure retains the same
+      // grace deadline and atomic KILL obligation. Execution TERM is skipped.
+      if (!exited && child.connected) {
+        try { child.send({ type: "fabric-stop" }, () => undefined); }
+        catch { /* best effort; never replace a lost channel with numeric TERM */ }
+      }
       if (!exited) await primaryScope.signal("SIGTERM");
       else for (const scope of scopes.values()) await scope.signal("SIGTERM");
       if (await wait(termGraceMs)) return;

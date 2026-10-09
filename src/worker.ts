@@ -1981,8 +1981,12 @@ const main = async (): Promise<void> => {
 
   const stop = (): void => {
     if (terminalStatus) return;
+    externalStopRequested = true;
     terminalStatus = "stopped";
     terminalError = "Agent stopped";
+    // Cancel a pending parent ACK deadline, not the gate. Admission completion
+    // sees externalStopRequested and drains WITHOUT releasing the target.
+    for (const complete of scopeAcknowledgements.values()) complete();
     killChild();
   };
   externalStop = stop;

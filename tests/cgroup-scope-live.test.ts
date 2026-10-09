@@ -170,6 +170,29 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
     }
   }, 15_000);
 
+  it("kernel populated-0 notification wakes drains before the safety deadline with no membership polling", async () => {
+    const child = await spawnScopedExecution((binary, args, options) => spawn(binary, [...args], options),
+      "/bin/sleep", ["60"], { stdio: "ignore", detached: true });
+    const close = new Promise<void>(resolve => child.once("close", () => resolve()));
+    const receipt = executionCgroups.get(child);
+    let drain: Promise<boolean> | undefined;
+    try {
+      expect(receipt).toBeDefined(); expect(receipt!.watching).toBe(true); releaseScopedChild(child);
+      const read = vi.spyOn(fs, "readFileSync");
+      drain = receipt!.waitForExit(10_000);
+      await receipt!.signal("SIGKILL");
+      // Native Linux modify notification must settle within 5s, before the
+      // single 10s safety deadline; deadline-only recovery cannot pass this.
+      await closedWithin(drain.then(empty => { expect(empty).toBe(true); }));
+      expect(read.mock.calls.filter(call => String(call[0]).endsWith("/cgroup.procs"))).toEqual([]);
+      expect(read.mock.calls.some(call => String(call[0]).endsWith("/cgroup.events"))).toBe(true);
+      expect(receipt!.exited()).toBe(true); await closedWithin(close);
+    } finally {
+      await receipt?.signal("SIGKILL"); releaseScopedChild(child);
+      if (drain) await drain; await closedWithin(close);
+    }
+  }, 15_000);
+
   it("never execs an unadmitted target when its owner's gate pipe closes", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-gate-"));
     const marker = path.join(root, "target-ran");

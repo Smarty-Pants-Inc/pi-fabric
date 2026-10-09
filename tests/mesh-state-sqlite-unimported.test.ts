@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { encodeMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { ShadowStateBackend } from "../src/mesh/state-backend.js";
@@ -31,7 +32,14 @@ const open = (root: string, options: MeshStoreOptions = {}): MeshStore => {
   return store;
 };
 
+// The production rule: no suite-wide fixture default (tests/fleet-isolation-setup.ts) in this file.
+const FIXTURE_DEFAULT = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+const globals = globalThis as Record<symbol, unknown>;
+let fixtureDefault: unknown;
+beforeEach(() => { fixtureDefault = globals[FIXTURE_DEFAULT]; delete globals[FIXTURE_DEFAULT]; });
+
 afterEach(() => {
+  globals[FIXTURE_DEFAULT] = fixtureDefault;
   vi.unstubAllEnvs();
   for (const store of stores.splice(0)) try { store.closeState(); } catch { /* closed by the test */ }
   for (const store of sqliteStores.splice(0)) try { store.close(); } catch { /* closed by the test */ }
@@ -60,6 +68,7 @@ const seedFileRoot = async (root: string, count = 25): Promise<void> => {
 };
 
 const refusal = /this root has file-backend state; run `fabric-mesh-backend import --root .+` first \(smarty-dev#6477\)/;
+const notImported = /run `fabric-mesh-backend import --root .+` first \(smarty-dev#6477\)/;
 
 describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
   it("refuses a populated file root without creating state.db or touching any file", async () => {
@@ -114,13 +123,9 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     expect(fs.existsSync(path.join(damaged, "state.db"))).toBe(false);
   });
 
-  it("initialises a fresh root: no state.json, an empty one, or a file store's untouched state", async () => {
-    const fresh = tempRoot("fresh");
-    const store = open(fresh, { stateBackend: "sqlite" });
-    expect(store.listAll("")).toEqual([]);
-    expect((await store.put({ key: "a", value: 1, identity })).version).toBe(1);
-    expect(fs.existsSync(path.join(fresh, "state.db"))).toBe(true);
-
+  /** Fresh roots: none, an empty state file, a zero-length one, a file store's untouched root, a missing directory. */
+  const freshRoots = (): string[] => {
+    const none = tempRoot("fresh");
     const emptyJson = tempRoot("empty-json");
     fs.writeFileSync(path.join(emptyJson, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
     const zeroLength = tempRoot("zero-length");
@@ -129,11 +134,91 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     const file = open(touched, { stateBackend: "file" });
     expect(file.listAll("")).toEqual([]);
     file.closeState();
-    for (const root of [emptyJson, zeroLength, touched]) {
+    return [none, emptyJson, zeroLength, touched];
+  };
+
+  it("refuses a fresh root with no side effects: no state.db, no fence, a file-mode writer still works (part 2)", async () => {
+    const missing = path.join(tempRoot("parent"), "not-yet");
+    expect(() => SqliteStateStore.openSync(missing, 64 * 1024, 1_000)).toThrow(notImported);
+    expect(fs.existsSync(missing)).toBe(false);
+    for (const root of freshRoots()) {
+      const before = snapshot(root);
       const sqlite = open(root, { stateBackend: "sqlite" });
-      await sqlite.put({ key: "a", value: 1, identity });
+      expect(() => sqlite.listAll("")).toThrow(notImported);
+      await expect(sqlite.put({ key: "a", value: 1, identity })).rejects.toThrow(MeshStateUnsupportedError);
+      sqlite.closeState();
+      await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(notImported);
+      expect(() => SqliteStateStore.openSync(root, 64 * 1024, 1_000)).toThrow(notImported);
+      await expect(StateProjector.open({ root, mode: "sqlite" })).rejects.toThrow(notImported);
+      expect(fs.existsSync(path.join(root, "state.db")), root).toBe(false);
+      expect(snapshot(root)).toEqual(before);
+      // No fence was created: a file-mode writer that starts later commits. (The file store itself reads a
+      // zero-length state.json as damage on write, before and after this change: that root is skipped.)
+      if (fs.statSync(path.join(root, "state.json"), { throwIfNoEntry: false })?.size === 0) continue;
+      const file = open(root, { stateBackend: "file" });
+      expect((await file.put({ key: "f", value: 1, identity })).version).toBeGreaterThan(0);
+      expect(file.listAll("").map((entry) => entry.key)).toEqual(["f"]);
+    }
+  });
+
+  it("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
+    const [none, emptyJson, zeroLength, touched] = freshRoots();
+    for (const root of [none, emptyJson, zeroLength]) {
+      const result = await importMeshState(root);
+      expect(result).toMatchObject({ epoch: 1, entries: 0 });
+      expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
+      const sqlite = open(root, { stateBackend: "sqlite" });
+      expect(sqlite.listAll("")).toEqual([]);
+      expect((await sqlite.put({ key: "a", value: 1, identity })).version).toBe(1);
       expect(sqlite.listAll("").map((entry) => entry.key)).toEqual(["a"]);
     }
+    let err = "";
+    const code = await main(["import", "--root", touched], { stdout: () => {}, stderr: (text) => { err += text; } });
+    expect(code, err).toBe(0);
+    const viaCli = open(touched, { stateBackend: "sqlite" });
+    await viaCli.put({ key: "b", value: 1, identity });
+    expect(viaCli.listAll("").map((entry) => entry.key)).toEqual(["b"]);
+  });
+
+  it("refuses state.db without the marker, and the marker without state.db", async () => {
+    // An old release's fence: backend=sqlite at epoch 1 over a fresh root, without any import.
+    const unmarked = tempRoot("unmarked");
+    SqliteStateStore.openSync(unmarked, 64 * 1024, 1_000, { initialize: "detached" }).close();
+    expect(fs.existsSync(path.join(unmarked, "state.json"))).toBe(false);
+    const dbBytes = fs.readFileSync(path.join(unmarked, "state.db"));
+    expect(() => SqliteStateStore.openSync(unmarked, 64 * 1024, 1_000)).toThrow(/backend=sqlite but state\.json is not the moved marker/);
+    await expect(SqliteStateStore.open(unmarked, 64 * 1024, 1_000)).rejects.toThrow(notImported);
+    const sqlite = open(unmarked, { stateBackend: "sqlite" });
+    expect(() => sqlite.listAll("")).toThrow(MeshStateUnsupportedError);
+    sqlite.closeState();
+    expect(fs.existsSync(path.join(unmarked, "state.json"))).toBe(false);
+    expect(fs.readFileSync(path.join(unmarked, "state.db")).equals(dbBytes)).toBe(true);
+
+    // The marker with state.db lost.
+    const lost = tempRoot("lost");
+    fs.writeFileSync(path.join(lost, "state.json"), encodeMeshStateMovedMarker(3));
+    const before = snapshot(lost);
+    expect(() => SqliteStateStore.openSync(lost, 64 * 1024, 1_000)).toThrow(/moved marker but state\.db is missing or empty/);
+    await expect(SqliteStateStore.open(lost, 64 * 1024, 1_000)).rejects.toThrow(/moved marker but state\.db is missing/);
+    expect(snapshot(lost)).toEqual(before);
+    // A zero-length state.db with the marker: refused the same way, nothing seeded.
+    fs.writeFileSync(path.join(lost, "state.db"), "");
+    expect(() => SqliteStateStore.openSync(lost, 64 * 1024, 1_000)).toThrow(/moved marker but state\.db is missing or empty/);
+    expect(fs.statSync(path.join(lost, "state.db")).size).toBe(0);
+  });
+
+  it("lets test fixtures initialise a fresh root explicitly (initialize: \"create\"), never over file state", async () => {
+    const fresh = tempRoot("create");
+    const store = SqliteStateStore.openSync(fresh, 64 * 1024, 1_000, { initialize: "create" });
+    sqliteStores.push(store);
+    expect(JSON.parse(fs.readFileSync(path.join(fresh, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
+    // Now it is an imported-shaped root: the default open works.
+    const sqlite = open(fresh, { stateBackend: "sqlite" });
+    expect((await sqlite.put({ key: "a", value: 1, identity })).version).toBe(1);
+    const populated = tempRoot("create-populated");
+    await seedFileRoot(populated, 2);
+    expect(() => SqliteStateStore.openSync(populated, 64 * 1024, 1_000, { initialize: "create" })).toThrow(refusal);
+    expect(fs.existsSync(path.join(populated, "state.db"))).toBe(false);
   });
 
   it("opens an imported root, and the import CLI still imports a populated root", async () => {

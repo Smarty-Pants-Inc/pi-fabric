@@ -155,6 +155,15 @@ const importFirst = (root: string, why: string): MeshStateUnsupportedError =>
  * "create" (fixtures, the import's peers) may initialise a fresh root; "detached" (a shadow copy outside
  * the mesh root, never a fence) is unguarded.
  */
+/**
+ * Test fixtures only: tests/fleet-isolation-setup.ts sets this global symbol to "create" so the suite's
+ * existing fixtures that build fresh sqlite roots keep doing so in-process (child processes do not inherit
+ * it). Production code never sets it; an explicit `initialize` always wins.
+ */
+const TEST_FIXTURE_INITIALIZE = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+const initializeOf = (options: SqliteStateStoreOptions): SqliteStateStoreOptions["initialize"] =>
+  options.initialize ?? ((globalThis as Record<symbol, unknown>)[TEST_FIXTURE_INITIALIZE] === "create" ? "create" : undefined);
+
 const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["initialize"]): void => {
   if (initialize === "detached") return;
   assertSqliteRootImported(root);
@@ -559,7 +568,8 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    guardBeforeOpen(root, options.initialize);
+    const initialize = initializeOf(options);
+    guardBeforeOpen(root, initialize);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
@@ -573,9 +583,9 @@ export class SqliteStateStore {
       for (;;) {
         options.writeSignal?.throwIfAborted();
         try {
-          if (!options.initialize) assertImportedDatabase(db, root);
+          if (!initialize) assertImportedDatabase(db, root);
           const identity = initialise(db, options);
-          if (options.initialize === "create") ensureMovedMarker(root, identity.epoch);
+          if (initialize === "create") ensureMovedMarker(root, identity.epoch);
           return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
         } catch (error) {
           if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
@@ -598,16 +608,17 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
-    guardBeforeOpen(root, options.initialize);
+    const initialize = initializeOf(options);
+    guardBeforeOpen(root, initialize);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = (options.open ?? openNodeSqlite)(file);
     try {
-      if (!options.initialize) assertImportedDatabase(db, root);
+      if (!initialize) assertImportedDatabase(db, root);
       const identity = initialise(db, options);
-      if (options.initialize === "create") ensureMovedMarker(root, identity.epoch);
+      if (initialize === "create") ensureMovedMarker(root, identity.epoch);
       return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
     } catch (error) {
       if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }

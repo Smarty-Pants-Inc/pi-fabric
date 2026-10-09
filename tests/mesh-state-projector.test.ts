@@ -559,7 +559,8 @@ describe("state projector (sqlite, after cutover)", () => {
     await new Promise(resolve => setTimeout(resolve, 15));
     expect(await projector.tick()).toMatchObject({ role: "active", checkpoints: 2 });
     expect(authority.exportState().entries).toEqual({ ...before.entries, "k/after": authority.get("k/after") });
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // Only the moved marker a fresh root's initialisation leaves (smarty-dev#6477): the projector writes no state.json.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db" });
   });
 
   it.each(["exporting", "file"])("halts retired when meta.backend leaves sqlite (%s): no renewal, no checkpoint (smarty-dev#7064)", async backend => {

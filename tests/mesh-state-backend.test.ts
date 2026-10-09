@@ -265,7 +265,8 @@ describe("sqlite backend acquisition", () => {
       await new Promise(resolve => setTimeout(resolve, 50));
     } finally { watcher.close(); }
     expect(seen.filter(name => name.startsWith(".lock"))).toEqual([]);
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // state.json is only the moved marker a fresh root's initialisation leaves (smarty-dev#6477), never state.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
   });
 

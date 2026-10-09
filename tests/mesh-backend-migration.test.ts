@@ -426,7 +426,9 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
-    const code = await main(["cutover", "--root", other], {
+    // ponytail: off Linux there is no state.db holder scan, so the gate's own state.db connection stays
+    // fabric@unknown under the fence (fail closed, smarty-dev#7936): accept it there.
+    const code = await main(["cutover", "--root", other, ...(process.platform === "linux" ? [] : ["--accept-unready", "fabric@unknown"])], {
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);

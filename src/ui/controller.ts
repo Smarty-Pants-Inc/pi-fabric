@@ -537,6 +537,15 @@ export class FabricUiController {
         context.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
     };
+    const onGlobalEvents = (globalActorId: string, events: FabricActorHostEvent[]): void => {
+      try {
+        this.state.globalActors.update(globalActorId, { events });
+        context.ui.notify("Global actor event subscriptions updated", "info");
+        this.#refresh();
+      } catch (error) {
+        context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    };
     const onActorTools = (actorId: string, tools: string[]): void => {
       reportUpdate("Actor tools updated", this.state.actors.setTools(actorId, tools));
     };
@@ -626,6 +635,7 @@ export class FabricUiController {
             onActorEvents,
             onActorDeliveryPolicy,
             onGlobalDeliveryPolicy,
+            onGlobalEvents,
             onActorTools,
             actorDefaultTools: this.state.config.agents?.defaultTools ?? [],
             onClearMessages,

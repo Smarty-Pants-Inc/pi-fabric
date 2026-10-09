@@ -88,6 +88,7 @@ import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
 import { rootParticipantName } from "./topology/participant-name.js";
+import { herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -667,6 +668,18 @@ export class FabricRuntimeState {
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
+    // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
+    // start or reload (no polling); any failure keeps "main". Print/JSON roots and children inherit
+    // HERDR_PANE_ID but are not the pane's agent, so they never ask.
+    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId() };
+    if (identity.kind === "main" && mainAgent.local && mainAgent.interactive && herdr.pane) {
+      void readHerdrAgentName().then((name) => {
+        if (!name || !live.current()) return;
+        herdr.name = name;
+        this.#participants?.scheduleRefresh();
+      });
+    }
+    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot =
@@ -692,7 +705,7 @@ export class FabricRuntimeState {
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? "", mainName() === "main" ? "" : mainName()])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     let inboxMaintenance: MainInboxMaintenance | undefined;
@@ -855,7 +868,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role,
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -1088,7 +1101,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
-            mainName: rootParticipantName(this.pi.getSessionName?.()),
+            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(role ? { role } : {}),
             project: participantProject(context.cwd),
@@ -1121,7 +1134,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
-          mainName: () => rootParticipantName(live.sessionName()),
+          mainName,
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
@@ -1135,7 +1148,7 @@ export class FabricRuntimeState {
       participants.registerSource(() => {
         const current = live.read(ctx => mainAgent.info(ctx));
         rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
-        return [participants.root(rootInfo, mainAgent.interactive, live.sessionName(), { role })];
+        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane)];
       });
     }
     this.#participants.registerSource(() =>

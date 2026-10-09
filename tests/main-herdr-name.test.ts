@@ -1,0 +1,208 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { normalizeFabricConfig } from "../src/config.js";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
+import { rootParticipantName } from "../src/topology/participant-name.js";
+
+// smarty-dev#6758: an unnamed Main takes its Herdr agent name; name:<x> selects one live Main.
+
+const temp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "fabric-herdr-name-"));
+
+/** A stub `herdr` that answers `herdr agent get <pane>` from a pane -> stdout script. */
+const stubHerdr = (dir: string, body: string): string => {
+  const file = path.join(dir, "herdr");
+  fs.writeFileSync(file, `#!/bin/sh\necho "$@" >> "${path.join(dir, "calls")}"\n${body}\n`, { mode: 0o755 });
+  return file;
+};
+const agentJson = (name: unknown) => JSON.stringify({ id: "cli:agent:get", result: { type: "agent_info", agent: { name, pane_id: "x" } } });
+
+afterEach(() => { vi.unstubAllEnvs(); });
+
+describe.skipIf(process.platform === "win32")("readHerdrAgentName", () => {
+  it("reads result.agent.name for HERDR_PANE_ID through HERDR_BIN_PATH", async () => {
+    const dir = temp();
+    const bin = stubHerdr(dir, `echo '${agentJson("lane-a")}'`);
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: bin })).toBe("lane-a");
+    expect(fs.readFileSync(path.join(dir, "calls"), "utf8")).toBe("agent get w3Q:p1\n");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["an invalid name", `echo '${agentJson("bad/name")}'`],
+    ["a non-string name", `echo '${agentJson(42)}'`],
+    ["malformed JSON", "echo not-json"],
+    ["a failing command", "exit 3"],
+  ])("keeps main on %s", async (_label, body) => {
+    const dir = temp();
+    const bin = stubHerdr(dir, body);
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: bin })).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps main when herdr is slow, within the timeout", async () => {
+    const dir = temp();
+    const bin = stubHerdr(dir, `sleep 5; echo '${agentJson("late")}'`);
+    const started = Date.now();
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: bin }, 200)).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(3000);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps main when herdr is missing or no pane is set, and never runs a command without a pane", async () => {
+    const dir = temp();
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: path.join(dir, "absent") })).toBeUndefined();
+    const bin = stubHerdr(dir, `echo '${agentJson("lane-a")}'`);
+    expect(await readHerdrAgentName({ HERDR_BIN_PATH: bin })).toBeUndefined();
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "bad pane;rm", HERDR_BIN_PATH: bin })).toBeUndefined();
+    expect(fs.existsSync(path.join(dir, "calls"))).toBe(false);
+    expect(herdrPaneId({ HERDR_PANE_ID: " w3Q:p1 " })).toBe("w3Q:p1");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("prefers a valid Pi session name, then the Herdr name, then main", () => {
+    expect(rootParticipantName("pi-name", "lane-a")).toBe("pi-name");
+    expect(rootParticipantName(undefined, "lane-a")).toBe("lane-a");
+    expect(rootParticipantName("bad/name", " lane-a ")).toBe("lane-a");
+    expect(rootParticipantName(undefined, "bad/name")).toBe("main");
+    expect(rootParticipantName()).toBe("main");
+  });
+});
+
+const main = (cwd: string, sessionId: string, sessionName?: string) => {
+  const sendMessage = vi.fn();
+  const pi = { on: vi.fn(() => () => {}), events: { emit: vi.fn() },
+    getThinkingLevel: () => "off", getSessionName: () => sessionName, sendMessage,
+  } as unknown as ExtensionAPI;
+  const context = { cwd, mode: "rpc", hasUI: false, isProjectTrusted: () => true,
+    isIdle: () => true, hasPendingMessages: () => false,
+    modelRegistry: { getAvailable: () => [], find: () => undefined, getApiKeyAndHeaders: async () => ({ ok: true }) },
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined,
+      getBranch: () => [], getLeafId: () => null, getEntries: () => [] },
+    ui: { setStatus: vi.fn(), notify: vi.fn() },
+  } as unknown as ExtensionContext;
+  const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
+    extension: path.join(cwd, "unused-extension.mjs"), worker: path.join(cwd, "unused-worker.mjs"),
+    residentHost: path.join(cwd, "unused-resident.mjs"), skills: cwd,
+  } });
+  const invoke = (ref: string, args: Record<string, unknown> = {}) => runtime.registry.invoke(ref, args, {
+    cwd, signal: undefined, parentToolCallId: "herdr-name-probe", nestedToolCallId: ref,
+    extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000,
+  });
+  return { runtime, context, invoke, sendMessage, id: `session:${sessionId}` };
+};
+
+describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
+  it("publishes Herdr names and panes in agents.sessions and routes name:<x> only to one live Main", async () => {
+    const root = temp();
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    vi.stubEnv("HERDR_BIN_PATH", stubHerdr(root, [
+      'case "$3" in',
+      `  w1:p1) echo '${agentJson("lane-a")}' ;;`,
+      `  w2:p1) echo '${agentJson("lane-b")}' ;;`,
+      `  w3:p1|w4:p1) echo '${agentJson("lane-dup")}' ;;`,
+      `  w5:p1) echo '${agentJson("lane-e")}' ;;`,
+      "  *) exit 1 ;;",
+      "esac",
+    ].join("\n")));
+    const config = normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: path.join(root, "mesh"), actorPollMs: 20 },
+      agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
+      mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const a = main(root, "aaaaaaaa-0000-4000-8000-000000000001");
+    const b = main(root, "bbbbbbbb-0000-4000-8000-000000000002");
+    const dup1 = main(root, "cccccccc-0000-4000-8000-000000000003");
+    const dup2 = main(root, "dddddddd-0000-4000-8000-000000000004");
+    const named = main(root, "eeeeeeee-0000-4000-8000-000000000005", "pi-named");
+    const all = [a, b, dup1, dup2, named];
+    try {
+      for (const [m, pane] of [[a, "w1:p1"], [b, "w2:p1"], [dup1, "w3:p1"], [dup2, "w4:p1"], [named, "w5:p1"]] as const) {
+        vi.stubEnv("HERDR_PANE_ID", pane);
+        await m.runtime.initialize(m.context, config);
+      }
+      await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: a.id, name: "lane-a", herdrPane: "w1:p1" }),
+        expect.objectContaining({ id: b.id, name: "lane-b", herdrPane: "w2:p1" }),
+        expect.objectContaining({ id: dup1.id, name: "lane-dup", herdrPane: "w3:p1" }),
+        expect.objectContaining({ id: dup2.id, name: "lane-dup", herdrPane: "w4:p1" }),
+        // A valid Pi session name wins over the Herdr name.
+        expect.objectContaining({ id: named.id, name: "pi-named", herdrPane: "w5:p1" }),
+      ])), { timeout: 8000, interval: 100 });
+
+      for (const action of ["followUp", "steer"] as const) {
+        await expect(a.invoke(`agents.${action}`, { id: "name:lane-b", message: `to lane-b ${action}` }))
+          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+        expect(b.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+          customType: "pi-fabric-agent-message", content: expect.stringContaining(`to lane-b ${action}`),
+          details: expect.objectContaining({ from: expect.objectContaining({ id: a.id }), delivery: action }),
+        }), expect.objectContaining({ deliverAs: action }));
+      }
+      // A Main can address itself by its own Herdr name.
+      await expect(a.invoke("agents.followUp", { id: "name:lane-a", message: "self" }))
+        .resolves.toMatchObject({ routed: "main", queued: true });
+
+      const commandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      const ambiguous = await a.invoke("agents.followUp", { id: "name:lane-dup", message: "never guess" })
+        .catch((error: unknown) => error) as Error & { code?: string };
+      expect(ambiguous.message).toContain("Ambiguous Fabric Main name: name:lane-dup");
+      for (const text of [dup1.id, dup2.id, "pane w3:p1", "pane w4:p1"]) expect(ambiguous.message).toContain(text);
+      const absent = await a.invoke("agents.steer", { id: "name:nobody", message: "never guess" })
+        .catch((error: unknown) => error) as Error;
+      expect(absent.message).toContain("No live Fabric Main is named nobody");
+      // The Herdr name of a Pi-named Main is not a selector.
+      await expect(a.invoke("agents.followUp", { id: "name:lane-e", message: "x" })).rejects.toThrow("No live Fabric Main");
+      expect(a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(commandsBefore);
+      for (const m of [dup1, dup2, named]) expect(m.sendMessage).not.toHaveBeenCalled();
+
+      // Existing exact targets are unchanged.
+      await expect(a.invoke("agents.followUp", { id: dup1.id, message: "exact id" }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+
+      // The duplicate resolves once only one live Main keeps the name.
+      await dup1.runtime.shutdown();
+      await expect(a.invoke("agents.followUp", { id: "name:lane-dup", message: "only live" }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      expect(dup2.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        content: expect.stringContaining("only live") }), expect.anything());
+    } finally {
+      for (const m of all.reverse()) await m.runtime.shutdown();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 40_000);
+
+  it("keeps main for a Main whose Herdr lookup fails and for a print-mode root", async () => {
+    const root = temp();
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    vi.stubEnv("HERDR_BIN_PATH", stubHerdr(root, `echo '${agentJson("lane-x")}'`));
+    const config = normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: path.join(root, "mesh"), actorPollMs: 20 },
+      agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
+      mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const printed = main(root, "ffffffff-0000-4000-8000-000000000006");
+    (printed.context as { mode: string }).mode = "print";
+    const failing = main(root, "abababab-0000-4000-8000-000000000007");
+    try {
+      vi.stubEnv("HERDR_PANE_ID", "w6:p1");
+      await printed.runtime.initialize(printed.context, config);
+      vi.stubEnv("HERDR_BIN_PATH", path.join(root, "absent-herdr"));
+      await failing.runtime.initialize(failing.context, config);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(fs.existsSync(path.join(root, "calls"))).toBe(false);
+      const sessions = await failing.invoke("agents.sessions") as Array<{ id: string; name: string }>;
+      expect(sessions.find((s) => s.id === failing.id)).toMatchObject({ name: "main", herdrPane: "w6:p1" });
+    } finally {
+      await failing.runtime.shutdown(); await printed.runtime.shutdown();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 30_000);
+});

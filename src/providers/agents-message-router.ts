@@ -90,6 +90,33 @@ export const unknownParticipant = (
   return new Error(`Unknown ${label}: ${id} (${when}, so the session has probably ended)`);
 };
 
+export interface FabricNameTargetCandidate {
+  id: string;
+  status: string;
+  stale: boolean;
+  sessionId?: string;
+  herdrPane?: string;
+  host?: string;
+}
+
+/** `name:<x>` matched no live Main or several; nothing was published (smarty-dev#6758). */
+export class FabricNameTargetError extends Error {
+  override readonly name = "FabricNameTargetError";
+  readonly code: "FABRIC_NAME_TARGET_ABSENT" | "FABRIC_NAME_TARGET_AMBIGUOUS";
+  constructor(readonly target: string, readonly candidates: FabricNameTargetCandidate[], ambiguous: boolean) {
+    const listed = candidates.map((candidate) => [
+      candidate.id,
+      candidate.herdrPane ? `pane ${candidate.herdrPane}` : "",
+      candidate.host ? `host ${candidate.host}` : "",
+      candidate.stale ? "lease lapsed" : candidate.status,
+    ].filter(Boolean).join(" ")).join("; ");
+    super(ambiguous
+      ? `Ambiguous Fabric Main name: name:${target} matches ${candidates.length} live Mains (${listed}); nothing was sent. Use an exact session:<uuid> id.`
+      : `No live Fabric Main is named ${target}${listed ? ` (non-live: ${listed})` : ""}; nothing was sent. Check agents.sessions.`);
+    this.code = ambiguous ? "FABRIC_NAME_TARGET_AMBIGUOUS" : "FABRIC_NAME_TARGET_ABSENT";
+  }
+}
+
 /** The selected root authority disappeared or changed before delivery; nothing was published. */
 export class FabricRouteAuthorityError extends Error {
   readonly code = "FABRIC_ROUTE_AUTHORITY_CHANGED";
@@ -255,6 +282,7 @@ export class AgentMessageRouter {
   // project directory (not just this lineage), then let the existing id-based route revalidate
   // ownership and capabilities. Exact ids, UUID aliases and local `main` keep precedence.
   #messageTarget(id: string): string {
+    if (id.trim().startsWith("name:")) return this.#namedMain(id.trim().slice("name:".length).trim());
     const target = this.#sessionTarget(id);
     if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target) || target.trim().startsWith("session:")) return target;
     // A published name survives an ordinary lease lapse just like its exact session id.
@@ -283,6 +311,26 @@ export class AgentMessageRouter {
       throw new Error(`Ambiguous Fabric participant: ${id} (actor ${actorId}, root ${root.id}); use an exact id`);
     }
     return root.id;
+  }
+
+  // `name:<x>` is a strict Main selector: exactly one live interactive root with that published
+  // name, else a typed refusal listing the candidates. It never falls back to actors, ids or guesses.
+  #namedMain(name: string): string {
+    const matches = this.participants.list
+      ? this.#directoryRead(() => this.participants.list!({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }))
+        .filter((participant) => participant.name === name && participant.interactive !== false)
+      : [];
+    const live = matches.filter((participant) => !participant.stale || this.#eligibleRetainedRoot(participant));
+    if (live.length === 1) return live[0]!.id;
+    const candidates = (live.length ? live : matches).map((participant) => ({
+      id: participant.id,
+      status: participant.status,
+      stale: participant.stale,
+      ...(participant.sessionId ? { sessionId: participant.sessionId } : {}),
+      ...(participant.herdrPane ? { herdrPane: participant.herdrPane } : {}),
+      ...(participant.remoteHost ? { host: participant.remoteHost } : {}),
+    })).sort((a, b) => a.id.localeCompare(b.id));
+    throw new FabricNameTargetError(name, candidates, live.length > 1);
   }
 
   /** Exact process-owned targets need no shared-directory authority or freshness. */

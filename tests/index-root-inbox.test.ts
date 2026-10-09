@@ -79,7 +79,10 @@ const fixture = async () => {
   };
   const cursor = () => mesh.get(inbox.key, { fresh: true })!.value as any;
   const ids = () => entries.flatMap(entry => entry.details?.ids ?? []);
-  const turn = (stopReason = "stop") => emit("turn_end", { message: { role: "assistant", stopReason } });
+  const turn = (stopReason = "stop", preview = true) => emit("turn_end", {
+    message: { role: "assistant", stopReason },
+    ...(preview ? { context: { pendingMessages: queued.map(message => ({ role: "custom", ...message })) } } : {}),
+  });
   return { mesh, inbox, context, entries, fake, queued, emit, consume, work, cursor, ids, turn, reconcile,
     maybeCommit, lifecycle, advance: (ms: number) => { now += ms; } };
 };
@@ -105,6 +108,54 @@ describe("index root inbox turn/settle reconciliation (#4313)", () => {
     expect(h.cursor().pending).toBeUndefined();
     expect(h.ids()).toEqual([first.id, later.id]);
     expect(new Set(h.ids()).size).toBe(h.ids().length);
+  });
+
+  it.each(["turn", "settle", "late-signal", "failed-read"])("redelivers a followUp cancelled before its receipt at an aborted %s", async boundary => {
+    const h = await fixture();
+    const first = await h.work("held");
+    await h.emit("before_agent_start"); h.consume();
+    const pending = await h.work("cancelled queued followUp");
+    const abort = new AbortController();
+    if (boundary === "late-signal") Object.assign(h.context, { signal: abort.signal });
+    await h.turn();
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([pending.id]);
+    h.queued.splice(0); // Host cancellation is not a canonical session receipt.
+    h.fake.sendMessage.mockClear();
+    if (boundary === "failed-read") {
+      h.reconcile.mockRejectedValueOnce(new Error("cursor unavailable during cancellation"));
+      await h.emit("agent_settled", { outcome: "aborted" });
+    } else if (boundary === "turn") await h.turn("aborted");
+    else if (boundary === "settle") await h.emit("agent_settled", { outcome: "aborted" });
+    else {
+      abort.abort(); Object.assign(h.context, { signal: undefined });
+      // Legacy Pi hides both the outcome and the finished run signal at settle.
+      await h.emit("agent_settled");
+    }
+    expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.cursor().after).toBe(first.sequence);
+    expect(h.cursor().pending.ids).toEqual([pending.id]);
+    const newer = await h.work("behind the cancelled batch");
+    await h.emit("before_agent_start"); h.consume();
+    expect(h.ids()).toEqual([first.id, pending.id]);
+    await h.turn(); h.consume(); await h.turn();
+    expect(h.ids()).toEqual([first.id, pending.id, newer.id]);
+    expect(h.cursor().pending).toBeUndefined();
+    expect(new Set(h.ids()).size).toBe(3);
+  });
+
+  it.each([true, false])("expires a queued ID after more than one turn without a receipt or native queue evidence (preview=%s)", async preview => {
+    const h = await fixture();
+    await h.work("held"); await h.emit("before_agent_start"); h.consume();
+    const pending = await h.work("lost queued followUp");
+    await h.turn(); h.queued.splice(0);
+    h.fake.sendMessage.mockClear();
+    await h.turn("stop", preview);
+    expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    await h.turn("stop", preview);
+    expect(h.fake.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([pending.id]);
+    h.consume(); await h.turn();
+    expect(h.cursor().pending).toBeUndefined();
   });
 
   it.each(["completed", "failed", "error", "aborted", "provider-blocked"])("reconciles a %s settle, committing held work without retrying unsuccessful runs", async outcome => {

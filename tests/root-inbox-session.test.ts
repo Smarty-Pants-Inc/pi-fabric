@@ -244,6 +244,61 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     } finally { unsubscribe(); mesh.closeState(); }
   }, 60_000);
 
+  it("redelivers a host-cancelled followUp once on the next prompt, without reload (#4313 round 2)", async () => {
+    let cancelQueued: (() => void) | undefined;
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, {
+      persisted: true,
+      extensions: root => {
+        const observer = path.join(root, "cancel-inbox-followup.ts");
+        fs.writeFileSync(observer, `export default function(pi) {
+          pi.on("turn_end", () => globalThis[Symbol.for("pi-fabric.test.cancel-inbox-followup")]?.());
+        }`);
+        return [observer];
+      },
+    });
+    const cancelKey = Symbol.for("pi-fabric.test.cancel-inbox-followup");
+    const globals = globalThis as Record<symbol, unknown>;
+    globals[cancelKey] = () => cancelQueued?.();
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 500);
+    const rootId = `session:${session.sessionManager.getSessionId()}`;
+    const key = "topology/inbox/" + createHash("sha256").update(rootId).digest("hex").slice(0, 32);
+    const cursor = () => mesh.get(key, { fresh: true })!.value as { after: number; pending?: { ids: string[] } };
+    const ids = () => inboxMessages().flatMap(message => (message as { details?: { ids?: string[] } }).details?.ids ?? []);
+    const held = missedWork("held before cancellation");
+    let pending = "", cancellations = 0, inferences = 0;
+    try {
+      faux.setResponses([() => {
+        inferences++; pending = missedWork("cancel after enqueue before receipt");
+        cancelQueued = () => {
+          expect(session.agent.peekQueuedMessages().some(message => message.role === "custom" &&
+            (message as { details?: { ids?: string[] } }).details?.ids?.includes(pending))).toBe(true);
+          expect(ids()).toEqual([held]);
+          cancelQueued = undefined; cancellations++;
+          session.clearQueue(); session.agent.abort();
+        };
+        return fauxAssistantMessage("owner cancels at the turn boundary");
+      }]);
+      await session.prompt("enqueue then cancel");
+      expect(cancellations).toBe(1);
+      expect(inferences).toBe(1);
+      expect(ids()).toEqual([held]);
+      expect(cursor().pending?.ids).toEqual([pending]);
+      const newer = missedWork("newer work must not wedge behind cancellation");
+      faux.setResponses(Array.from({ length: 2 }, () => () => {
+        inferences++; return fauxAssistantMessage("processed resumed work");
+      }));
+      await session.prompt("resume without reload");
+      expect(ids()).toEqual([held, pending, newer]);
+      expect(new Set(ids()).size).toBe(3);
+      expect(inferences).toBe(3);
+      expect(cursor().pending).toBeUndefined();
+      faux.setResponses([fauxAssistantMessage("no duplicate")]);
+      await session.prompt("check once more");
+      expect(ids()).toEqual([held, pending, newer]);
+    } finally { delete globals[cancelKey]; mesh.closeState(); }
+  }, 60_000);
+
   it("turn start never re-inserts an aggregate after split inbox receipts", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
     const identityId = `session:${session.sessionManager.getSessionId()}`;

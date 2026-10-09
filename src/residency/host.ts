@@ -1022,6 +1022,10 @@ export class ResidentHost {
   #retryDeliveries(): Promise<unknown> {
     if (this.#closed || this.#staged) return Promise.resolve();
     if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    // An empty maintenance retry is not delivery custody. Avoid creating a pending
+    // promise on every request tick which can falsely restart the host idle window.
+    if (this.#deliveryCommitsRecovered && (!fs.existsSync(this.#deliveryOutboxPath) ||
+        !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) return Promise.resolve();
     const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {

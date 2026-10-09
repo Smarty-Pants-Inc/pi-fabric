@@ -277,10 +277,68 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     simulateRootOwnership(); writePolicy({ agents: { processSlice: "root.slice" } });
     vi.mocked(fs.openSync).mockClear();
     expect(policy.readHostPolicy()).toEqual({ status: "valid", document: { agents: { processSlice: "root.slice" } } });
-    expect(fs.fstatSync).toHaveBeenCalledTimes(1);
+    expect(fs.fstatSync).toHaveBeenCalledTimes(2);
     const call = vi.mocked(fs.openSync).mock.calls.find(args => String(args[0]) === HOST_POLICY_PATH)!;
     expect(Number(call[1]) & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
     expect(() => fs.readFileSync(openedDescriptor!)).toThrow();
+  });
+
+  it("accepts a complete policy assembled from partial reads on the verified fd", () => {
+    simulateRootOwnership(); writePolicy({ agents: { processSlice: "root.slice" } });
+    const read = fs.readSync;
+    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) =>
+      read(fd, buffer, offset, Math.min(length, 7), position)) as typeof fs.readSync);
+    expect(policy.readHostPolicy()).toEqual({ status: "valid", document: { agents: { processSlice: "root.slice" } } });
+    expect(fs.readSync).toHaveBeenCalledTimes(Math.ceil(fs.statSync(HOST_POLICY_PATH).size / 7));
+    expect(fs.fstatSync).toHaveBeenCalledTimes(2);
+    expect(() => fs.fstatSync(openedDescriptor!)).toThrow();
+  });
+
+  it.each(["truncated-prefix", "same-size-rewrite", "short-read", "inode-change"])("rejects an unstable policy read: %s and keeps the built-in baseline", kind => {
+    simulateRootOwnership();
+    const grant = JSON.stringify({ executor: { landlock: { disabled: true, allowEscape: true } } });
+    const original = grant + " ".repeat(128);
+    fs.writeFileSync(HOST_POLICY_PATH, original, { mode: 0o600 });
+    const initial = fs.statSync(HOST_POLICY_PATH);
+    const read = fs.readSync;
+    const readFile = fs.readFileSync;
+    let reads = 0;
+    // Also intercept the former unbounded interface: this reproduces acceptance
+    // of a short valid prefix before the stable exact-size reader was added.
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (file === openedDescriptor) {
+        fs.fstatSync(file as number); // Retain real closed-fd failures.
+        if (kind === "truncated-prefix") fs.writeFileSync(HOST_POLICY_PATH, grant);
+        if (kind === "same-size-rewrite") {
+          fs.writeFileSync(HOST_POLICY_PATH, original);
+          fs.utimesSync(HOST_POLICY_PATH, initial.atime, new Date(initial.mtimeMs + 2000));
+        }
+        if (kind === "inode-change") openedMetadata = { ino: initial.ino + 1 };
+        if (kind === "short-read") return grant;
+      }
+      return (readFile as (...input: unknown[]) => string | Buffer)(file, ...args);
+    }) as typeof fs.readFileSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      reads++;
+      if (kind === "short-read" && reads > 1) return 0;
+      if (reads === 1 && kind === "truncated-prefix") fs.writeFileSync(HOST_POLICY_PATH, grant);
+      if (reads === 1 && kind === "same-size-rewrite") {
+        fs.writeFileSync(HOST_POLICY_PATH, original);
+        fs.utimesSync(HOST_POLICY_PATH, initial.atime, new Date(initial.mtimeMs + 2000));
+      }
+      if (reads === 1 && kind === "inode-change") openedMetadata = { ino: initial.ino + 1 };
+      if (kind === "short-read") {
+        const [fd, buffer, offset] = args;
+        return read(fd, buffer, offset as number, Buffer.byteLength(grant), 0);
+      }
+      return (read as (...input: unknown[]) => number)(...args);
+    }) as typeof fs.readSync);
+    expect(policy.readHostPolicy().status).toBe("invalid");
+    expect(reads).toBeGreaterThan(0); // Failure must be at read time, not unsafe fixture metadata.
+    expect(() => fs.fstatSync(openedDescriptor!)).toThrow();
+    // Reinstate the original bytes before repeating the same fault via the loader.
+    fs.writeFileSync(HOST_POLICY_PATH, original); openedMetadata = {}; reads = 0;
+    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
   });
 
   it("does not fall back if an existing file vanishes before open", () => {
@@ -345,6 +403,73 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       fs.chmodSync(HOST_POLICY_PATH, 0o660); fs.writeFileSync(victim, "protected");
       expect(await writeVictim()).toBe(false);
       expect(fs.readFileSync(victim, "utf8")).toBe("protected");
+    } finally { await registry.close(); }
+  });
+
+  it.each([undefined, false, "true", 1, true])("only literal true in valid root policy grants escapes: %s", grant => {
+    writeAgent({ executor: { landlock: { mode: "enforce", allowEscape: true } } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { allowEscape: true } } }));
+    expect(load().executor.landlock.allowEscape).not.toBe(true);
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { allowEscape: grant } } });
+    const loaded = load().executor.landlock;
+    for (const settings of [loaded, config.loadGlobalFabricConfig(agentDir).executor.landlock,
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "global").executor.landlock,
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project").executor.landlock]) {
+      expect(settings.allowEscape === true).toBe(grant === true);
+      expect(config.liveLandlockSettings(settings, agentDir).allowEscape === true).toBe(grant === true);
+    }
+    writeAgent({ executor: { landlock: { mode: "enforce", allowEscape: false } } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { allowEscape: false } } }));
+    expect(load().executor.landlock.allowEscape === true).toBe(grant === true);
+    fs.chmodSync(HOST_POLICY_PATH, 0o660);
+    expect(load().executor.landlock.allowEscape).not.toBe(true);
+    expect(config.liveLandlockSettings(loaded, agentDir).allowEscape).not.toBe(true);
+  });
+
+  it.skipIf(process.platform !== "linux")("allows real Bash escapes only with a live valid root grant, and logs them", async () => {
+    simulateRootOwnership();
+    writeAgent({ executor: { landlock: { mode: "enforce", allowEscape: true } } });
+    const loaded = load().executor.landlock;
+    const tmpdir = path.join(agentDir, "private-tmp"); fs.mkdirSync(tmpdir, { mode: 0o700 });
+    vi.stubEnv("TMPDIR", tmpdir); vi.stubEnv("SMARTY_ROLE", "task-agent@reviewed-policy");
+    const { PiToolsProvider } = await import("../src/providers/pi-tools-provider.js");
+    const { ActionRegistry } = await import("../src/core/action-registry.js");
+    const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
+    const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
+    const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
+    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+      powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
+      getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
+    });
+    const registry = new ActionRegistry(); registry.register(provider);
+    const context = { cwd, extensionContext: runner.createContext(), signal: new AbortController().signal,
+      parentToolCallId: "root-escape-parent", nestedToolCallId: "root-escape-bash", update: () => {},
+      approve: async () => {}, audits: [], maxResultChars: 100_000,
+    };
+    const victim = path.join(agentDir, "escape-victim");
+    const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+    const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf released > ${quote(victim)}`;
+    const invoke = async () => {
+      try { return await registry.invoke("pi.bash", { command }, context) as { ok: boolean; output: string }; }
+      catch { return { ok: false, output: "" }; }
+    };
+    try {
+      expect((await invoke()).ok).toBe(false); expect(fs.existsSync(victim)).toBe(false);
+      writePolicy({ executor: { landlock: { allowEscape: true } } });
+      const released = await invoke(); expect(released.ok).toBe(true);
+      expect(released.output).toContain("Landlock escape: unconfined");
+      expect(fs.readFileSync(victim, "utf8")).toBe("released");
+      writePolicy({}); fs.writeFileSync(victim, "protected");
+      expect((await invoke()).ok).toBe(false);
+      writePolicy({ executor: { landlock: { allowEscape: true } } });
+      fs.chmodSync(HOST_POLICY_PATH, 0o660);
+      expect((await invoke()).ok).toBe(false);
+      fs.unlinkSync(HOST_POLICY_PATH);
+      expect((await invoke()).ok).toBe(false);
+      expect(fs.readFileSync(victim, "utf8")).toBe("protected");
+      const audit = fs.readFileSync(path.join(cwd, ".pi/landlock-audit.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(audit.map(row => row.event)).toEqual(["enforce", "escape", "enforce", "enforce", "enforce"]);
+      expect(JSON.stringify(audit)).not.toContain(command);
     } finally { await registry.close(); }
   });
 

@@ -25,12 +25,14 @@ The authorized fallback is implemented:
   kernels, missing helper, malformed policy, setup failures and incompatible
   opaque/managed overrides fail closed, never retry through an unconfined shell.
 - macOS and Windows leave the wrapper **disabled**, even if `enforce` is selected.
-- Put `executor.landlock.disabled: true` in the **global agent `fabric.json`** to
-  kill confinement fleet-wide. Project values for `disabled` are ignored, so a
-  lane cannot defeat that kill switch. The host file is re-read on every
-  enforced local bash call, so already-running lanes stop confining on their
-  next call without a reload (already-spawned confined children stay confined).
-  The settings UI exposes both keys; change the save scope to global for the switch.
+- Put `executor.landlock.disabled: true` only in valid **root-owned
+  `/etc/smarty/fabric-policy.json`** to kill confinement fleet-wide. Agent-dir
+  and project values are always ignored. The root file is revalidated on every
+  enforced local bash call, so already-running lanes observe root changes on
+  their next call without a reload (already-spawned children stay confined).
+  Missing, unsafe or unstable root policy revokes a disable grant. The settings
+  UI explains these keys but cannot save root authority; switching save scope
+  to global does not authorize the kill switch.
 
 Run the 24-hour **enforce trial on one approved lane**, not a fictitious warn
 soak. Neither this change nor its tests enable a trial or change installed/global
@@ -38,13 +40,27 @@ configuration. Review the policy first; fleet enforcement is a separate rollout.
 
 ### Per-command escape
 
-Use the exact leading assignment in a `pi.bash` command:
+Only a valid root-owned `/etc/smarty/fabric-policy.json` with
+`executor.landlock.allowEscape: true` authorizes per-command escapes. The grant
+is denied by default and cannot be set by agent-dir or project configuration.
+Root must publish this policy by **atomic rename**, not an in-place rewrite;
+short or metadata-changing reads are invalid and grant no escape authority.
+See [root-owned host policy](configuration.md#root-owned-host-policy).
+
+With that explicit owner-approved grant, use the exact leading assignment in a
+`pi.bash` command:
 
 ```sh
 PI_FABRIC_LANDLOCK_ESCAPE=1 your-command arguments
 ```
 
-Fabric removes this reserved prefix, records an `escape` event **before spawning**,
+Without the root grant, Fabric strips the reserved prefix, warns once per
+process, and runs the command **confined**; its journal event is `enforce`, not
+`escape`. Root grants are revalidated on every enforced call: removing the grant
+or making the policy missing, unsafe or unstable revokes escape authority for
+already-running lanes.
+
+With the grant, Fabric removes this reserved prefix, records an `escape` event **before spawning**,
 and runs that one command unconfined through the same cooperative filters.
 Every use emits a visible escape notice and is appended to
 `<session cwd>/.pi/landlock-audit.jsonl`. If mandatory logging fails, no command
@@ -62,8 +78,8 @@ Audit opens pin `.pi` and reject symlinks, hard links and non-regular files.
 
 ## Paul's one-glance write policy
 
-[`config/landlock-roles.json`](../config/landlock-roles.json) is the **only policy
-file**. `default` entries apply to every role; `roles` appends reviewed additions
+[`config/landlock-roles.json`](../config/landlock-roles.json) is the **only write-grant
+list** (root-only mode/disable/escape authority is separate host policy). `default` entries apply to every role; `roles` appends reviewed additions
 for the role in host `SMARTY_ROLE` (the `@commit` suffix is stripped). All three
 roles currently inherit the same minimal list. Unknown roles receive only that
 list, never a wider fallback. Each entry has a one-line reason.
@@ -175,7 +191,7 @@ The kernel tests use actual `ActionRegistry` / `PiToolsProvider`, Pi's real
 assert `tool_call`/`tool_result`, no standalone override fallback, real `EACCES`
 for rm/find/Python/Perl/tee, allowed lane/private temp writes, out-of-lane `cwd`
 and symlink/BASH_ENV protection, run/git grants, escape journals, cancellation,
-background inheritance and off behavior. Kernel tests skip only on non-Linux;
+background inheritance, denied ungranted escapes, root-granted escape logs and off behavior. Kernel tests skip only on non-Linux;
 an unsupported Linux host fails with an explicit ABI check. Literal text guards
 are tested independently: an earlier friendly refusal is not claimed as a
 kernel denial. The optional benchmark interleaves actual calls in fresh modes,

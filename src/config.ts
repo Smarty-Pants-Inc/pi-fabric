@@ -868,7 +868,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const cpython = objectValue(executor.cpython);
   const landlock = objectValue(executor.landlock);
   if (landlock.mode !== undefined && landlock.mode !== "off" && landlock.mode !== "enforce") {
-    throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
+    throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with root-granted, logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
   }
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
@@ -1053,6 +1053,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       landlock: {
         mode: landlock.mode === "enforce" ? "enforce" : "off",
         disabled: landlock.disabled === true,
+        ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
@@ -1730,6 +1731,7 @@ const hostLandlockBaseline = (policy: HostPolicy): LandlockSettings => {
   return {
     mode: landlock.mode === "off" || landlock.mode === "enforce" ? landlock.mode : defaults.mode,
     disabled: typeof landlock.disabled === "boolean" ? landlock.disabled : defaults.disabled,
+    ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
   };
 };
 
@@ -1777,6 +1779,7 @@ const resolveFabricConfig = (
       // off/unknown modes even when no root policy is provisioned.
       if (landlock.mode !== "enforce") delete landlock.mode;
       delete landlock.disabled;
+      delete landlock.allowEscape;
       executor.landlock = landlock;
       document.executor = executor;
       const agents = { ...objectValue(document.agents) };
@@ -1808,6 +1811,7 @@ const resolveFabricConfig = (
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
       delete landlock.disabled; // Host-only fleet kill switch wins over lane config.
+      delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
       document.executor = executor;
@@ -1874,7 +1878,7 @@ export const loadFabricConfig = (options: {
 export const readHostLandlockDisabled = (_agentDir: string): boolean =>
   hostLandlockBaseline(readHostPolicy()).disabled;
 
-/** Session settings with the live host kill switch applied (F2: no cached value). */
+/** Session settings with live root-only grants applied (F2: no cached value). */
 export const liveLandlockSettings = (settings: LandlockSettings, _agentDir: string): LandlockSettings => {
   const baseline = hostLandlockBaseline(readHostPolicy());
   return {
@@ -1882,6 +1886,7 @@ export const liveLandlockSettings = (settings: LandlockSettings, _agentDir: stri
     // without turning missing/invalid policy into a fleet-wide mode change.
     mode: settings.mode === "enforce" ? "enforce" : baseline.mode,
     disabled: baseline.disabled,
+    ...(baseline.allowEscape === true ? { allowEscape: true } : {}),
   };
 };
 

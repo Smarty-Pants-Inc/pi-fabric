@@ -10,12 +10,20 @@ export interface LandlockSettings {
   mode: "off" | "enforce";
   /** Host-only kill switch. Project settings cannot override it. */
   disabled: boolean;
+  /** Root-policy-only per-command escape grant. Absent/false means denied. */
+  allowEscape?: boolean;
 }
 
 const ESCAPE = /^\s*PI_FABRIC_LANDLOCK_ESCAPE=1[ \t]+/;
-export const landlockCommand = (command: string): { escape: boolean; command: string } => ({
-  escape: ESCAPE.test(command), command: command.replace(ESCAPE, ""),
-});
+let warnedEscapeDenied = false;
+export const landlockCommand = (command: string, allowEscape = false): { escape: boolean; command: string } => {
+  const requested = ESCAPE.test(command);
+  if (requested && allowEscape !== true && !warnedEscapeDenied) {
+    warnedEscapeDenied = true;
+    console.warn("[pi-fabric] PI_FABRIC_LANDLOCK_ESCAPE ignored: no valid root policy grants executor.landlock.allowEscape: true; command remains confined");
+  }
+  return { escape: requested && allowEscape === true, command: command.replace(ESCAPE, "") };
+};
 
 /** No git process/hooks: only the lane's actual .git/commondir metadata. */
 const gitCommonDir = (cwd: string): string | undefined => {

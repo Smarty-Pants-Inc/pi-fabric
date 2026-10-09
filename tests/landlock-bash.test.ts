@@ -202,8 +202,24 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     expect(fs.existsSync(path.join(h.cwd, ".pi/landlock-audit.jsonl"))).toBe(false);
   });
 
-  it("logs every per-command escape, then confines the next command; live kill switch is honored", async () => {
+  it("keeps an ungranted leading escape confined and warns once", async () => {
     const h = harness();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`;
+    for (let i = 0; i < 2; i++) {
+      const result = await h.invoke({ command, settle: true });
+      expect(result.ok).toBe(false);
+      expect(result.output).toContain("Permission denied");
+    }
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    expect(h.audit().map(row => row.event)).toEqual(["enforce", "enforce"]);
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("allowEscape"))).toHaveLength(1);
+    // The reserved assignment is removed even when its authority is denied.
+    expect((await h.invoke({ command: "PI_FABRIC_LANDLOCK_ESCAPE=1 printf %s \"${PI_FABRIC_LANDLOCK_ESCAPE-unset}\"" })).output).toBe("unset");
+  });
+
+  it("logs every root-granted per-command escape, then confines the next command; live kill switch is honored", async () => {
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true });
     const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`;
     for (let i = 0; i < 2; i++) expect((await h.invoke({ command })).output).toContain("Landlock escape: unconfined");
     expect(h.audit().filter(row => row.event === "escape")).toHaveLength(2);
@@ -232,7 +248,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
   });
 
   it("never escapes if mandatory logging fails", async () => {
-    const h = harness();
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true });
     fs.mkdirSync(path.join(h.cwd, ".pi"));
     fs.symlinkSync(path.join(h.sibling, "victim"), path.join(h.cwd, ".pi/landlock-audit.jsonl"));
     const result = await h.invoke({ command: `PI_FABRIC_LANDLOCK_ESCAPE=1 printf bad > ${quote(path.join(h.sibling, "victim"))}`, settle: true });

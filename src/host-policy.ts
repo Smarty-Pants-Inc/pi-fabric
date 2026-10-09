@@ -42,11 +42,28 @@ export const readHostPolicy = (): HostPolicy => {
     if (typeof fs.constants.O_NOFOLLOW !== "number") throw new Error("O_NOFOLLOW unavailable");
     descriptor = fs.openSync(HOST_POLICY_PATH,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    const opened = fs.fstatSync(descriptor); // Exactly one fstat on the opened fd.
+    const opened = fs.fstatSync(descriptor);
     if (!opened.isFile() || !trustedMode(opened) || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error("policy changed while opening");
     }
-    const document: unknown = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+    if (!Number.isSafeInteger(opened.size) || opened.size < 0) throw new Error("invalid policy size");
+    // Root must publish by atomic rename, never rewrite this inode in place.
+    // A short but valid JSON prefix must not acquire authority during a rewrite.
+    const bytes = Buffer.alloc(opened.size);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, count, bytes.length - count, count);
+      if (read === 0) break;
+      count += read;
+    }
+    const after = fs.fstatSync(descriptor);
+    if (count !== opened.size || !after.isFile() || !trustedMode(after)
+      || after.size !== opened.size || after.dev !== opened.dev || after.ino !== opened.ino
+      || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+      || after.uid !== opened.uid || after.mode !== opened.mode) {
+      throw new Error("policy changed while reading or read was incomplete");
+    }
+    const document: unknown = JSON.parse(bytes.toString("utf8"));
     if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error("policy must be a JSON object");
     return { status: "valid", document: document as Record<string, unknown> };
   } catch (error) {

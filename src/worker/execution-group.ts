@@ -50,6 +50,22 @@ export const executionGroup = (child: ChildProcess) => {
   };
   return {
     observe(): void { if (process.platform === "linux") members(); },
+    inspectIdle(): "empty" | "leader-only" | "active" {
+      if (process.platform !== "linux") return "active";
+      const current = members();
+      if (!current.length) return "empty";
+      if (current.length !== 1 || current[0]!.pid !== pid) return "active";
+      // A previously recorded descendant may have left this PGID. Its live
+      // same-birth obligation still forbids disarming at a native idle frame.
+      for (const [ownedPid, started] of owned) {
+        const now = member(ownedPid);
+        if (ownedPid === pid && (!now || now.started !== started || now.group !== pid || ["Z", "X"].includes(now.state))) {
+          throw new Error(`Execution group ${pid} leader birth changed; idle unconfirmed`);
+        }
+        if (now && now.started === started && !["Z", "X"].includes(now.state) && ownedPid !== pid) return "active";
+      }
+      return "leader-only";
+    },
     exited(): boolean {
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;

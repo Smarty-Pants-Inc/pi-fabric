@@ -81,6 +81,27 @@ const outcome = async <T>(run: () => Promise<T>): Promise<unknown> => {
 };
 
 describe("SqliteStateStore", () => {
+  it.skipIf(process.platform === "win32")("binds the connection to the validated state.db: a swap between the check and the open fails closed (smarty-dev#7784)", async () => {
+    const root = tempRoot("pin");
+    const other = tempRoot("pin-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const db = path.join(root, "state.db");
+    // The swap lands after assertPrivateStateFiles validated the file and before SQLite opens it.
+    const swapping = (file: string): SqliteConnection => {
+      fs.renameSync(db, `${db}.aside`);
+      fs.symlinkSync(path.join(other, "state.db"), db);
+      return openNodeSqlite(file);
+    };
+    await expect(open(root, { open: swapping })).rejects.toThrow(/refuses .*state\.db: (it was replaced while opening|the connection did not open the validated file)/);
+    fs.unlinkSync(db);
+    fs.renameSync(`${db}.aside`, db);
+    expect((await open(root)).get("who/am")?.value).toBe("mine");
+  });
+
   it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {
     const root = tempRoot("pragmas");
     const executed: string[] = [];

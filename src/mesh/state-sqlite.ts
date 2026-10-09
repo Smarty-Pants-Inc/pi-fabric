@@ -774,7 +774,7 @@ export class SqliteStateStore {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
-    const db = (options.open ?? openNodeSqlite)(file);
+    const db = openPinned(file, options.open ?? openNodeSqlite);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -824,7 +824,7 @@ export class SqliteStateStore {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     assertPrivateStateFiles(file);
-    const db = (options.open ?? openNodeSqlite)(file);
+    const db = openPinned(file, options.open ?? openNodeSqlite);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -1723,6 +1723,60 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
     return (fs.fstatSync(fd).mode & 0o077) === 0;
   } catch { return false; }
   finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
+/**
+ * smarty-dev#7784 (security-gap; pi-fabric#730 CODE c6085070307): bind the SQLite connection to the state.db that
+ * assertPrivateStateFiles validated. node:sqlite has no fd API and opens the file lazily, so: record the validated
+ * dev/ino, snapshot /proc/self/fd, open, force the open with a first read, then require a NEW descriptor on exactly
+ * that inode and the path still naming it. Any mismatch closes the connection and fails closed. Without /proc
+ * (macOS, Windows) only the post-open lstat compare applies.
+ */
+const openPinned = (file: string, open: SqliteOpener): SqliteConnection => {
+  const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: ${why}`);
+  const validated = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!validated?.isFile()) throw refuse("it is not a regular file");
+  const procFds = process.platform === "linux" ? fdSnapshot() : undefined;
+  const db = open(file);
+  try {
+    db.prepare("SELECT count(*) AS n FROM sqlite_master").get(); // the first read opens the main file
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
+    if (procFds !== undefined) {
+      const target = `${validated.dev}:${validated.ino}`;
+      const after = [...(fdSnapshot() ?? new Map<string, string>())];
+      // The first read may also open the -wal/-shm siblings: they are not the main file.
+      const real = fs.realpathSync(file);
+      const sibling = (fd: string) => {
+        try { return /-(wal|shm|journal)$/.test(fs.readlinkSync(`/proc/self/fd/${fd}`)) && fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${real}-`); }
+        catch { return false; }
+      };
+      const added = after.filter(([fd, identity]) => procFds.get(fd) !== identity && !sibling(fd));
+      // A new descriptor on the validated inode; or none at all, when SQLite's unix VFS reused a descriptor it kept
+      // for that inode from an earlier connection in this process (it reuses only for the inode it stat()s at
+      // open, so a swapped path would have opened a new descriptor, and that one is refused).
+      const opened = added.some(([, identity]) => identity === target) ||
+        (added.length === 0 && after.some(([, identity]) => identity === target));
+      if (!opened) throw refuse("the connection did not open the validated file");
+    }
+    return db;
+  } catch (error) {
+    try { db.close(); } catch { /* best effort */ }
+    throw error;
+  }
+};
+
+// fd -> "dev:ino" of each open regular file. Keyed by identity, not number: the listing's own directory fd is
+// closed again at once, so SQLite may get that very number.
+const fdSnapshot = (): Map<string, string> | undefined => {
+  let names: string[];
+  try { names = fs.readdirSync("/proc/self/fd"); } catch { return undefined; }
+  const identities = new Map<string, string>();
+  for (const fd of names) {
+    try { const stat = fs.fstatSync(Number(fd)); if (stat.isFile()) identities.set(fd, `${stat.dev}:${stat.ino}`); }
+    catch { /* closed meanwhile (the listing's own fd) */ }
+  }
+  return identities;
 };
 
 const assertPrivateStateFiles = (file: string): void => {

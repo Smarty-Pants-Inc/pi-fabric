@@ -74,7 +74,7 @@ checked whole-attempt exit and completed-drain proofs before recovery admission.
 
 ### Owner incarnation fencing
 
-A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls are refused before actor admission with `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and conservative legacy compatibility.
+A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed execution-bound controls (`stop`, `ask`, cancellation) are refused before actor admission; session-bound `steer`/`followUp` remain queued for the same actor session across relaunch. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and conservative legacy compatibility.
 
 ### Lease-fenced consumption and accepted-work custody
 

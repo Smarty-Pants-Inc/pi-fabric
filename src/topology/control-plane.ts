@@ -56,6 +56,11 @@ export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 // Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
 
+// Messages address a durable session; stop/ask (and legacy setters/cancel) address
+// a particular execution. A same-session reload must not discard queued messages.
+const sessionBoundControlOperation = (operation: FabricControlOperation): boolean =>
+  operation === "steer" || operation === "followUp";
+
 // Keep the reader free to deliver cancellation while asynchronous work waits at its
 // commit fence. These commands own their handler and outcome/ACK retries after the cursor.
 const detachedControlOperation = (operation: FabricControlOperation): boolean =>
@@ -79,6 +84,9 @@ export interface FabricControlCommand {
   cancelCommandId?: string;
   /** Target activation captured by the sender before publication waits. */
   ownerIncarnation?: string | undefined;
+  /** Immutable sender request origin, captured before any publication/lock wait. */
+  requestCreatedAt?: number;
+  /** Commit time: preserves the existing full delivery/ACK budget after lock waits. */
   requestedAt: number;
   deadlineAt?: number;
 }
@@ -204,6 +212,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
       data.operation !== "setThinking") ||
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
+    (data.requestCreatedAt !== undefined &&
+      (typeof data.requestCreatedAt !== "number" || !Number.isFinite(data.requestCreatedAt))) ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
@@ -330,8 +340,10 @@ interface PendingControlRequest {
   ownerHostId: string;
   ownerIdentityId: string;
   ownerIncarnation?: string | undefined;
+  operation: FabricControlOperation;
   targetId: string;
   commandPublished: boolean;
+  readonly requestCreatedAt: number;
   readOwnerExpiry?: () => number;
   idempotencyKey?: string;
   readonly destinationRemoteHost?: string | null;
@@ -443,7 +455,8 @@ export class FabricControlPlane {
     ownerIdentityId = ownerHostId,
     options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
-    // A proven-notRun resend retains the originally resolved activation, not a mutable caller view.
+    // Resends retain both the originally resolved activation and logical request origin.
+    const requestCreatedAt = Date.now();
     input = { ...input };
     // One logical message key survives both observation retries and a proven-notRun resend.
     options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID() };
@@ -463,6 +476,7 @@ export class FabricControlPlane {
       true,
       retryBudgetSpentMs,
       notRunAttempt,
+      requestCreatedAt,
     );
     let sent;
     try {
@@ -549,6 +563,7 @@ export class FabricControlPlane {
     messageRequest = false,
     retryBudgetSpentMs = 0,
     notRunAttempt = 0,
+    requestCreatedAt = Date.now(),
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (this.#closed) throw new Error("Fabric control plane closed");
     if (!this.options.enabled) {
@@ -558,7 +573,8 @@ export class FabricControlPlane {
     if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
       throw new Error("Invalid Fabric owner incarnation");
     }
-    // Freeze the resolved activation, including absence, before any awaited publication.
+    // Freeze the resolved activation AND request origin before any publication/lock wait.
+    // requestedAt remains commit-stamped and cannot prove a legacy request's origin.
     const ownerIncarnation = input.ownerIncarnation;
     if (options.signal?.aborted) throw new Error(`Remote Fabric request cancelled: ${targetId}`);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
@@ -616,8 +632,10 @@ export class FabricControlPlane {
         ownerHostId,
         ownerIdentityId,
         ownerIncarnation,
+        operation,
         targetId,
         commandPublished: false,
+        requestCreatedAt,
         ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry, idempotencyKey } : {}),
         ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
         ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
@@ -681,6 +699,7 @@ export class FabricControlPlane {
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
           ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+          requestCreatedAt,
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
@@ -882,6 +901,7 @@ export class FabricControlPlane {
         ...(pending.ownerIncarnation !== undefined ? { ownerIncarnation: pending.ownerIncarnation } : {}),
         ...(pending.destinationRemoteHost !== undefined
           ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
+        requestCreatedAt: pending.requestCreatedAt,
         requestedAt: committedAt,
         deadlineAt: committedAt + Math.max(this.#ackTimeoutMs,
           typeof pending.destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0),
@@ -893,7 +913,7 @@ export class FabricControlPlane {
     });
   }
 
-  /** Reload: leave new commands unclaimed; the next activation fences predecessor addresses. */
+  /** Reload: leave commands queued; the next activation fences execution-bound addresses. */
   pause(): void {
     this.#paused = true;
     if (this.#timer) clearTimeout(this.#timer);
@@ -1009,7 +1029,8 @@ export class FabricControlPlane {
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
       (event.data.ownerIncarnation !== undefined && !isIncarnation(event.data.ownerIncarnation)) ||
-      (pending.ownerIncarnation !== undefined && event.data.ownerIncarnation !== pending.ownerIncarnation &&
+      (!sessionBoundControlOperation(pending.operation) && pending.ownerIncarnation !== undefined &&
+        event.data.ownerIncarnation !== pending.ownerIncarnation &&
         !(event.data.accepted === false && event.data.errorCode === CONTROL_STALE_INCARNATION &&
           event.data.error === STALE_INCARNATION_ERROR && isIncarnation(event.data.ownerIncarnation) &&
           event.data.staleIncarnation === pending.ownerIncarnation)) ||
@@ -1064,12 +1085,17 @@ export class FabricControlPlane {
       if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
+    const legacyCreatedAfterStart = command.requestCreatedAt !== undefined
+      ? command.requestCreatedAt > this.#startedAt && command.requestCreatedAt <= command.requestedAt
+      // Pre-upgrade senders stamp requestedAt only at commit. Their origin is unprovable
+      // across a recent activation, so fail closed for the maximum command window.
+      : command.requestedAt - MAX_CONTROL_TIMEOUT_MS > this.#startedAt;
     const incarnationMatches = command.ownerIncarnation !== undefined
       ? command.ownerIncarnation === this.incarnation
       // A bridge re-stamps createdAt: no unbound remote command can prove its age.
       // Refuse equal timestamps too; a same-millisecond restart is ambiguous.
       : event.verification !== "bridge" && !Object.hasOwn(event.data as object, "bridge") &&
-        event.createdAt > this.#startedAt && command.requestedAt > this.#startedAt;
+        event.createdAt > this.#startedAt && command.requestedAt > this.#startedAt && legacyCreatedAfterStart;
     if (command.operation === "cancel") {
       if (incarnationMatches) this.#acceptCancellation(command, event.from);
       return;
@@ -1095,7 +1121,10 @@ export class FabricControlPlane {
       }
       return;
     }
-    if (!incarnationMatches) {
+    // Messages address the durable session, not its current execution. Keep queued
+    // steer/followUp deliverable across a same-session reload; changed session IDs
+    // still route to a different target/owner and cannot inherit this command.
+    if (!sessionBoundControlOperation(command.operation) && !incarnationMatches) {
       await this.#publishAcknowledgement(command, {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
       }, this.incarnation, command.ownerIncarnation);

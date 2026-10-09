@@ -38,7 +38,7 @@ afterEach(async () => {
 });
 
 describe("owner incarnation admission and durable receipts", () => {
-  it.each(["steer", "followUp", "stop", "ask"] as const)("refuses queued %s after a reload, tells the sender, and never resends", async operation => {
+  it.each(["stop", "ask"] as const)("refuses queued %s after a reload, tells the sender, and never resends", async operation => {
     const mesh = store(temp());
     const oldDirectory = directory(mesh, "session:owner");
     await oldDirectory.refresh();
@@ -61,6 +61,51 @@ describe("owner incarnation admission and durable receipts", () => {
     expect(mesh.listAll("topology/control-seen/")).toEqual([]);
     expect(acks(mesh)).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ accepted: false,
       ownerIncarnation: restarted.incarnation, staleIncarnation: previous.incarnation, errorCode: CONTROL_STALE_INCARNATION }) }));
+  });
+
+  it.each(["steer", "followUp"] as const)("delivers queued session-bound %s once across Main/actor reload, including legacy senders", async operation => {
+    for (const targetId of ["session:owner", "actor:target"]) for (const legacy of [false, true]) {
+      const mesh = store(temp());
+      const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
+      const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+      const publish = mesh.publish.bind(mesh);
+      const oldWire = vi.spyOn(mesh, "publish").mockImplementation(async input => {
+        if (!legacy || input.topic !== "fabric.control.command") return publish(input);
+        const data = input.data;
+        return publish({ ...input, data: (at: number) => {
+          const { ownerIncarnation: _epoch, requestCreatedAt: _origin, ...wire } =
+            (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+          return wire;
+        } });
+      });
+      const pending = sender.request("session:owner", targetId, operation,
+        { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" });
+      await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); await previous.close();
+      const restarted = plane(mesh, "session:owner");
+      const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); restarted.start(handler);
+      try {
+        await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+        await expect(sender.request("session:owner", targetId, operation,
+          { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" }))
+          .resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+        expect(handler).toHaveBeenCalledOnce();
+        expect(acks(mesh).at(-1)!.data).toMatchObject({ ownerIncarnation: restarted.incarnation });
+      } finally { oldWire.mockRestore(); }
+    }
+  });
+
+  it.each(["steer", "followUp"] as const)("does not retarget queued %s to a different Main session ID", async operation => {
+    const mesh = store(temp());
+    const previous = plane(mesh, "session:old"); previous.start(() => ({ accepted: true })); previous.pause();
+    const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+    const pending = sender.request("session:old", "session:old", operation,
+      { message: "old session only", ownerIncarnation: previous.incarnation }, "session:old", { timeoutMs: 100 }).catch(error => error);
+    await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); await previous.close();
+    const replacement = plane(mesh, "session:new"); const handler = vi.fn(() => ({ accepted: true })); replacement.start(handler);
+    expect(await pending).toMatchObject({ notDelivered: true });
+    expect(handler).not.toHaveBeenCalled();
+    expect(acks(mesh)).toEqual([]);
+    expect(commands(mesh)[0]).toMatchObject({ to: "session:old", data: { targetId: "session:old" } });
   });
 
   it.each(["steer", "followUp", "stop", "ask"] as const)("admits live %s, stamps claims and ACKs, and delivers a same-key replay only once", async operation => {
@@ -121,7 +166,7 @@ describe("owner incarnation admission and durable receipts", () => {
         data: { version: 1, commandId: command.commandId, targetId: command.targetId, messageId: "forged", ...extra } });
       return { accepted: true, messageId: "current" };
     });
-    await expect(sender.request("session:owner", "actor:target", "steer", { message: "live", ownerIncarnation: owner.incarnation })).resolves.toMatchObject({ messageId: "current" });
+    await expect(sender.request("session:owner", "actor:target", "stop", { message: "live", ownerIncarnation: owner.incarnation })).resolves.toMatchObject({ messageId: "current" });
   });
 
   it("captures the resolved epoch before a publish await, rejecting malformed input before publication", async () => {
@@ -154,6 +199,88 @@ describe("owner incarnation admission and durable receipts", () => {
     }
     await vi.waitFor(() => expect(acks(mesh)).toHaveLength(1));
     expect(handler).not.toHaveBeenCalled(); expect(acks(mesh)[0]!.data).toMatchObject({ errorCode: CONTROL_STALE_INCARNATION });
+  });
+
+  it.each(["origin", "legacy"] as const)("fences an unbound %s request created before reload but published after it", async wire => {
+    const mesh = store(temp()); const at = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+    const previous = plane(mesh, "session:owner");
+    previous.start(() => ({ accepted: true })); previous.pause();
+    const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+    const publish = mesh.publish.bind(mesh); let release!: () => void;
+    const gate = new Promise<void>(done => { release = done; });
+    const blocked = vi.spyOn(mesh, "publish").mockImplementation(async input => {
+      if (input.topic !== "fabric.control.command" || input.kind === "cancel") return publish(input);
+      await gate;
+      // A pre-upgrade sender has no immutable origin field and stamps requestedAt at commit.
+      const data = input.data;
+      return publish(wire === "legacy" ? { ...input, data: (committedAt: number) => {
+        const { requestCreatedAt: _origin, ...legacy } = (typeof data === "function" ? data(committedAt) : data) as Record<string, unknown>;
+        return legacy;
+      } } : input);
+    });
+    clock.mockReturnValue(at + 10);
+    const pending = sender.request("session:owner", "actor:target", "stop", { message: "created before reload" }).catch(error => error);
+    expect(commands(mesh)).toHaveLength(0);
+    clock.mockReturnValue(at + 20);
+    const restarted = plane(mesh, "session:owner");
+    const handler = vi.fn(() => ({ accepted: true })); restarted.start(handler);
+    clock.mockReturnValue(at + 30); release();
+    try {
+      expect(await pending).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+      expect(commands(mesh)).toHaveLength(1);
+      expect(commands(mesh)[0]!.data).toMatchObject({ requestedAt: at + 30, deadlineAt: at + 1_030 });
+      if (wire === "origin") expect(commands(mesh)[0]!.data).toMatchObject({ requestCreatedAt: at + 10 });
+      else expect(commands(mesh)[0]!.data).not.toHaveProperty("requestCreatedAt");
+      expect(handler).not.toHaveBeenCalled();
+      expect(mesh.listAll("topology/control-seen/")).toEqual([]);
+      expect(acks(mesh)[0]!.data).toMatchObject({ accepted: false, ownerIncarnation: restarted.incarnation, errorCode: CONTROL_STALE_INCARNATION });
+    } finally { release(); await pending; blocked.mockRestore(); clock.mockRestore(); }
+  });
+
+  it("keeps a session request's origin through a proven-notRun resend without losing reload delivery", async () => {
+    const mesh = store(temp()); const at = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+    const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
+    const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+    clock.mockReturnValue(at + 10);
+    const pending = sender.request("session:owner", "actor:target", "steer", { message: "logical request" }).catch(error => error);
+    await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); sender.pause();
+    const original = commands(mesh)[0]!.data as { commandId: string };
+    // A notRun receipt must be backed by a terminal create-only claim. Otherwise
+    // the fabricated ACK would falsely permit replay of the still-live original.
+    const { createHash } = await import("node:crypto");
+    await mesh.put({ key: "topology/control-seen/" + createHash("sha256").update(`session:owner\0${original.commandId}`).digest("hex"),
+      identity: identity("session:owner"), value: { format: 1, hostId: "session:owner", commandId: original.commandId,
+        targetId: "actor:target", ownerIncarnation: previous.incarnation, expiresAt: at + 10_000,
+        acceptance: { accepted: false, error: "Fabric control command expired", notRun: true } } });
+    await mesh.publish({ topic: "fabric.control.ack", kind: "rejected", from: identity("session:owner"), to: "session:sender",
+      data: { version: 1, commandId: original.commandId, targetId: "actor:target", accepted: false,
+        error: "Fabric control command expired", notRun: true, ownerIncarnation: previous.incarnation } });
+    clock.mockReturnValue(at + 20);
+    const restarted = plane(mesh, "session:owner"); const handler = vi.fn(() => ({ accepted: true })); restarted.start(handler); restarted.pause();
+    clock.mockReturnValue(at + 30); sender.resume();
+    try {
+      await vi.waitFor(() => expect(commands(mesh)).toHaveLength(2));
+      expect(commands(mesh).map(event => (event.data as { requestCreatedAt: number }).requestCreatedAt)).toEqual([at + 10, at + 10]);
+      restarted.resume();
+      expect(await pending).toMatchObject({ acknowledged: true });
+      expect(handler).toHaveBeenCalledOnce();
+      expect(mesh.listAll("topology/control-seen/")).toHaveLength(2);
+    } finally { restarted.resume(); await pending; clock.mockRestore(); }
+  });
+
+  it.each([-1, 0, 1])("admits origin-less native legacy controls only beyond the maximum window (boundary %s)", async boundary => {
+    const mesh = store(temp()); const at = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+    const owner = plane(mesh, "session:owner"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
+    const requestedAt = at + 24 * 60 * 60 * 1_000 + 60_000 + boundary;
+    clock.mockReturnValue(requestedAt);
+    await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity("session:sender"), to: "session:owner",
+      data: { version: 1, commandId: "legacy-window", targetId: "actor:target", operation: "stop", replyTo: "session:sender", requestedAt, deadlineAt: requestedAt + 5_000 } });
+    await vi.waitFor(() => expect(acks(mesh)).toHaveLength(1));
+    expect(handler).toHaveBeenCalledTimes(boundary > 0 ? 1 : 0);
+    expect(acks(mesh)[0]!.data).toMatchObject(boundary > 0 ? { accepted: true } : { accepted: false, errorCode: CONTROL_STALE_INCARNATION });
   });
 
   it("accepts a fresh unbound native command only after the activation start", async () => {
@@ -196,7 +323,7 @@ it("actual bridge: a mirrored owner restart refuses the queued epoch and a fresh
   bridges.push(bridge); await bridge.start(); await bridge.syncPresence();
   const old = hubDirectory.get("session:remote00", undefined, { fresh: true })!;
   expect(old).toMatchObject({ remoteHost: "Forge", ownerIncarnation: previous.incarnation });
-  const pending = sender.request("session:remote00", old.id, "steer", { message: "old", ownerIncarnation: old.ownerIncarnation }, old.ownerIdentityId,
+  const pending = sender.request("session:remote00", old.id, "stop", { message: "old", ownerIncarnation: old.ownerIncarnation }, old.ownerIdentityId,
     { routedRemoteHost: "Forge" }).catch(error => error);
   await vi.waitFor(() => expect(commands(local)).toHaveLength(1));
   await previous.close();
@@ -205,10 +332,12 @@ it("actual bridge: a mirrored owner restart refuses the queued epoch and a fresh
   await bridge.syncPresence(); await bridge.step();
   await vi.waitFor(() => expect(acks(remote)).toHaveLength(1)); await bridge.step();
   expect(await pending).toMatchObject({ code: CONTROL_STALE_INCARNATION }); expect(handler).not.toHaveBeenCalled();
-  expect(commands(remote)[0]!.data).toMatchObject({ ownerIncarnation: previous.incarnation, bridge: { from: "Dev1" } });
+  const original = commands(local)[0]!.data as { ownerIncarnation: string; requestCreatedAt: number; requestedAt: number; deadlineAt: number };
+  expect(commands(remote)[0]!.data).toMatchObject({ ownerIncarnation: original.ownerIncarnation,
+    requestCreatedAt: original.requestCreatedAt, requestedAt: original.requestedAt, deadlineAt: original.deadlineAt, bridge: { from: "Dev1" } });
   const fresh = hubDirectory.get("session:remote00", undefined, { fresh: true })!;
   expect(fresh.ownerIncarnation).toBe(replacement.incarnation);
-  const live = sender.request("session:remote00", fresh.id, "followUp", { message: "fresh", ownerIncarnation: fresh.ownerIncarnation }, fresh.ownerIdentityId,
+  const live = sender.request("session:remote00", fresh.id, "stop", { message: "fresh", ownerIncarnation: fresh.ownerIncarnation }, fresh.ownerIdentityId,
     { routedRemoteHost: "Forge", idempotencyKey: "fresh" });
   await vi.waitFor(() => expect(commands(local)).toHaveLength(2)); await bridge.step();
   await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce()); await bridge.step();

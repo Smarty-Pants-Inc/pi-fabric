@@ -140,6 +140,7 @@ describe("FabricControlPlane", () => {
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" }).filter(event => event.kind === "cancel")).toHaveLength(1), { timeout: 3_000 });
       const event = sender.mesh.read({ topic: "fabric.control.command" }).find(event => event.kind === "cancel")!;
       const command = event.data as FabricControlCommand;
+      expect(command.requestCreatedAt).toBeLessThanOrEqual(abortedAt);
       expect(command.requestedAt).toBeGreaterThanOrEqual(releasedAt);
       expect(command.requestedAt).toBe(event.createdAt);
       expect(command.deadlineAt! - command.requestedAt).toBe(5_000);
@@ -159,7 +160,7 @@ describe("FabricControlPlane", () => {
     }));
     sender.start(() => ({ accepted: false }));
     const controller = new AbortController();
-    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted" }, "session:owner0000", { signal: controller.signal, timeoutMs: 5_000, detachOnMainCeiling: cause !== "ceiling without policy" }).catch(error => error);
+    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted", ownerIncarnation: owner.incarnation }, "session:owner0000", { signal: controller.signal, timeoutMs: 5_000, detachOnMainCeiling: cause !== "ceiling without policy" }).catch(error => error);
     await vi.waitFor(() => expect(entered).toBe(true));
     const genuine = createMainExecutionCeilingError(700);
     const reason = cause === "ceiling without policy" ? genuine : cause === "cloned ceiling" ? structuredClone(genuine) : cause === "forged ceiling" ? Object.assign(new Error(genuine.message), { name: "MainExecutionCeilingError" }) : new Error(cause);
@@ -180,7 +181,7 @@ describe("FabricControlPlane", () => {
     }));
     sender.start(() => ({ accepted: false }));
     const controller = new AbortController();
-    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted" }, "session:owner0000", { signal: controller.signal, timeoutMs: 500, detachOnMainCeiling: true }).catch(error => error);
+    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted", ownerIncarnation: owner.incarnation }, "session:owner0000", { signal: controller.signal, timeoutMs: 500, detachOnMainCeiling: true }).catch(error => error);
     await vi.waitFor(() => expect(entered).toBe(true));
     const ceiling = createMainExecutionCeilingError(100); controller.abort(ceiling);
     expect(await observation).toBe(ceiling);
@@ -1069,7 +1070,7 @@ describe("FabricControlPlane", () => {
       const ask = {
         topic: "fabric.control.command", kind: operation, from: identity("host:sender"), to: "host:receiver",
         data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation, replyTo: "host:sender",
-          message: "inspect", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
+          message: "inspect", requestCreatedAt: Date.now(), requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
       };
       const acks = () => store.read({ topic: "fabric.control.ack", limit: 100 })
         .filter((event) => (event.data as { commandId?: string }).commandId === "command:ask");

@@ -732,8 +732,9 @@ const main = async (): Promise<void> => {
   const unresolvedToolCalls = new Set<string>();
 
   // Only ordinary tasks with real, completed tool work and retained prose can
-  // return an interrupted report. Never turn cancellation, schema/admission
-  // failures, lost events, or an actor directive into a successful task.
+  // expose an interrupted report without claiming success. Never suppress
+  // recovery for cancellation, schema/admission failures, lost events, actors,
+  // or an interrupted turn with unresolved tool work.
   const canKeepInterruptedOutput = (error: string): boolean => options.runner === "pi" &&
     !options.actorId && !options.actorName && !options.residentStartupProbe &&
     hasCompletedToolTurn && !streamingToolCallInTurn && unresolvedToolCalls.size === 0 &&
@@ -2265,10 +2266,13 @@ const main = async (): Promise<void> => {
         ? `${runnerLabel(options.runner)} agent reported an error before exiting`
         : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);
   }
-  if (record.status === "failed" && canKeepInterruptedOutput(record.error ?? "")) {
+  const interruptedText = record.partialText || record.lastCompleteText;
+  if (record.status === "failed" && interruptedText && canKeepInterruptedOutput(record.error ?? "")) {
     const warning = `final report interrupted by a model stream error; showing the last persisted output: ${record.error}`;
-    record.status = "completed"; // Existing terminal vocabulary: completed with warning.
-    record.text = `${record.partialText || record.lastCompleteText}\n\n[pi-fabric warning] ${warning}`;
+    // Retain the native failure/exit code. Partial prose (even a verdict or
+    // valid JSON prefix) must never pass completed-only consumers.
+    record.partialText = interruptedText;
+    record.text = interruptedText;
     record.warnings = [...(record.warnings ?? []), warning].slice(-20);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }

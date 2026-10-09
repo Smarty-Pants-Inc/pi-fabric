@@ -2743,8 +2743,14 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
-  it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
+  it.each([[undefined, false], ["handoff-review", false], [undefined, true]] as const)("defers handoff until the finalized outer Fabric result and records its class: %s, interrupted=%s", async (routeClass, interrupted) => {
     const { provider, root, agents } = setup();
+    const warning = "final report interrupted by a model stream error; showing the last persisted output";
+    if (interrupted) {
+      const wait = agents.wait.bind(agents);
+      vi.spyOn(agents, "wait").mockImplementation(async (...args) => ({ ...await wait(...args), status: "failed",
+        text: "VERDICT: PASS", partialText: "VERDICT: PASS", error: "stream disconnected", warnings: [warning], exitCode: 1 }));
+    }
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));
     source.appendMessage({
       role: "user",
@@ -2836,9 +2842,10 @@ describe("AgentsProvider runner support", () => {
 
     expect(result).toMatchObject({
       handedOff: true,
-      completed: true,
-      status: "completed",
-      implementation: "fake worker complete",
+      completed: !interrupted,
+      status: interrupted ? "failed" : "completed",
+      implementation: interrupted ? "VERDICT: PASS" : "fake worker complete",
+      ...(interrupted ? { partialText: "VERDICT: PASS", warnings: [warning], exitCode: 1, error: "stream disconnected" } : {}),
       agent: { model: "anthropic/executor" },
     });
     const expectedClass = { routeClass: routeClass ?? "handoff", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
@@ -2846,7 +2853,7 @@ describe("AgentsProvider runner support", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, "runs", result.agent.id, "status.json"), "utf8")))
       .toMatchObject(expectedClass);
     expect(updates).toContainEqual(expect.stringContaining("caller is waiting"));
-    expect(updates).toContainEqual(expect.stringContaining("completed implementation"));
+    expect(updates).toContainEqual(expect.stringContaining(interrupted ? "ended with failed" : "completed implementation"));
     const task = fs.readFileSync(
       path.join(root, "runs", result.agent.id, "task.txt"),
       "utf8",

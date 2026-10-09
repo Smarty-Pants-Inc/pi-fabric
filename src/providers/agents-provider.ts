@@ -246,6 +246,9 @@ const compactHandoffResult = (
     usage: result.usage,
   },
   implementation: result.value ?? result.text,
+  ...(result.partialText !== undefined ? { partialText: result.partialText } : {}),
+  ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+  ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
   ...(result.error ? { error: result.error } : {}),
 });
 

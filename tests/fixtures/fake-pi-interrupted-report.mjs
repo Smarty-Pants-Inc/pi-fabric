@@ -45,7 +45,7 @@ if (tools) {
 }
 // A real durable session makes retry-on-close eligible. Only positive cases need
 // this fence probe; negative cases preserve the current terminal failure path.
-if (["partial", "legacy", "fallback", "raw-cut", "normal", "reply"].includes(mode)) {
+if (["partial", "legacy", "fallback", "raw-cut", "normal", "reply", "error-exit-zero"].includes(mode)) {
   fs.writeFileSync(session, JSON.stringify({ type: "session", version: 3, id: "fake-report-session", timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
 }
 if (mode === "reply" && process.env.PI_FABRIC_REPLY_FILE) fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify({ ok: true }));
@@ -86,5 +86,5 @@ if (mode === "timeout" || mode === "stop") {
 } else {
   emit({ type: "message_end", message: { role: "assistant", content: mode === "normal" ? [{ type: "text", text: final }] : [], stopReason: mode === "normal" ? "stop" : "error", ...(mode === "normal" ? {} : { errorMessage: error }) } });
   emit({ type: "agent_end", messages: [], willRetry: false });
-  process.stdout.write(JSON.stringify({ type: "agent_settled", outcome: mode === "normal" ? "completed" : "error" }) + "\n", () => process.exit(mode === "normal" ? 0 : 1));
+  process.stdout.write(JSON.stringify({ type: "agent_settled", outcome: mode === "normal" ? "completed" : "error" }) + "\n", () => process.exit(mode === "normal" || mode === "error-exit-zero" ? 0 : 1));
 }

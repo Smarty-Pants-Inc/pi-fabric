@@ -70,6 +70,10 @@ const run = async (mode: string, error = "stream disconnected before completion"
   for (const returned of [status, again, record]) {
     expect(returned).toMatchObject({ status: result.status, text: result.text });
     expect(returned.error).toBe(result.error);
+    expect(returned.partialText).toBe(result.partialText);
+    expect(returned.lastCompleteText).toBe(result.lastCompleteText);
+    expect(returned.warnings).toEqual(result.warnings);
+    expect(returned.exitCode).toBe(result.exitCode);
   }
   expect(fs.readFileSync(launches, "utf8")).toBe("launch\n"); // No regeneration or tool replay.
   return { result, streamed };
@@ -78,8 +82,8 @@ const run = async (mode: string, error = "stream disconnected before completion"
 describe("durable interrupted task reports", () => {
   it.each(["stream disconnected before completion", "Error [ERR_STREAM_PREMATURE_CLOSE]: Premature close", "503 server_is_overloaded"])("returns partial text after completed tools: %s", async error => {
     const { result, streamed } = await run("partial", error);
-    expect(result).toMatchObject({ status: "completed", exitCode: 1, lastCompleteText: previous, partialText: final, error });
-    expect(result.text).toBe(`${final}\n\n[pi-fabric warning] ${warning}: ${error}`);
+    expect(result).toMatchObject({ status: "failed", exitCode: 1, lastCompleteText: previous, partialText: final, error });
+    expect(result.text).toBe(final);
     expect(result.warnings).toContain(`${warning}: ${error}`);
     expect(streamed.map(record => record.partialText)).toEqual([undefined, "FINAL: completed", final]);
     expect(streamed.every(record => record.lastCompleteText === previous)).toBe(true);
@@ -87,17 +91,19 @@ describe("durable interrupted task reports", () => {
   });
   it.each(["legacy", "raw-cut"])("retains %s final text without a complete message_end", async mode => {
     const { result } = await run(mode);
-    expect(result.status).toBe("completed");
+    expect(result.status).toBe("failed");
     expect(result.partialText).toBe(final);
-    expect(result.text.startsWith(final + "\n\n")).toBe(true);
+    expect(result.text).toBe(final);
+    expect(result.warnings).toContain(`${warning}: stream disconnected before completion`);
     expect(result.text).not.toContain("not output");
   });
   it("falls back to the preceding complete tool-turn assistant text", async () => {
     const { result } = await run("fallback");
-    expect(result.status).toBe("completed");
-    expect(result.partialText).toBeUndefined();
+    expect(result.status).toBe("failed");
+    expect(result.partialText).toBe(previous);
     expect(result.lastCompleteText).toBe(previous);
-    expect(result.text).toBe(`${previous}\n\n[pi-fabric warning] ${warning}: stream disconnected before completion`);
+    expect(result.text).toBe(previous);
+    expect(result.warnings).toContain(`${warning}: stream disconnected before completion`);
   });
   it.each(["no-output", "tool-less", "unfinished-tool", "unfinished-turn", "no-text"])("preserves failure without completed tool work and output: %s", async mode => {
     const { result } = await run(mode);
@@ -118,15 +124,19 @@ describe("durable interrupted task reports", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toBe("400 invalid_request_error");
   });
-  it("keeps structured reply validation authoritative", async () => {
+  it("keeps an interrupted structured request failed without replacing its native error", async () => {
     const { result } = await run("partial", "stream disconnected before completion", { replyTool: true, schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
     expect(result.status).toBe("failed");
-    expect(result.error).toContain("Directive reply missing");
+    expect(result.error).toBe("stream disconnected before completion");
+    expect(result.value).toBeUndefined();
+    expect(result.partialText).toBe(final);
   });
-  it("retains an actual durable structured reply, never fabricates one", async () => {
+  it("does not promote a durable structured reply when the report stream was cut", async () => {
     const { result } = await run("reply", "stream disconnected before completion", { replyTool: true, schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
-    expect(result).toMatchObject({ status: "completed", value: { ok: true }, replyVia: "tool" });
-    expect(result.text).toContain(warning);
+    expect(result).toMatchObject({ status: "failed", exitCode: 1, partialText: final, error: "stream disconnected before completion" });
+    expect(result.value).toBeUndefined();
+    expect(result.replyVia).toBeUndefined();
+    expect(result.warnings).toContain(`${warning}: stream disconnected before completion`);
   });
   it.each([{ actorId: "interrupted-report-actor" }, { actorName: "legacy-report-actor" }])("does not turn an actor report into success: %j", async request => {
     const { result } = await run("partial", "stream disconnected before completion", request);
@@ -139,6 +149,11 @@ describe("durable interrupted task reports", () => {
     expect(result.status).toBe(mode === "timeout" ? "timed_out" : "stopped");
     expect(result.text).toBe(final);
     expect(result.warnings ?? []).not.toContain(expect.stringContaining(warning));
+  });
+  it("preserves a native zero exit code without accepting an interrupted report", async () => {
+    const { result } = await run("error-exit-zero");
+    expect(result).toMatchObject({ status: "failed", exitCode: 0, text: final, partialText: final, error: "stream disconnected before completion" });
+    expect(result.warnings).toContain(`${warning}: stream disconnected before completion`);
   });
   it("leaves a normal final report unchanged", async () => {
     const { result } = await run("normal");

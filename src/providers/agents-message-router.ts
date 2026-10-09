@@ -119,12 +119,12 @@ export class AgentMessageRouter {
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
   ) {}
-  #get(id: string): FabricParticipantInfo | undefined {
-    // Discovery and admission share this directory/root. A cached negative may predate the
-    // bridge's first presence refresh: re-read its files + state before declaring it unknown.
-    // lastKnown also reads fresh, but deliberately discards newly live records (smarty-dev#2377).
-    const participant = this.#directoryRead(() =>
-      this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true }));
+  #get(id: string, fresh = false): FabricParticipantInfo | undefined {
+    // Discovery can use its cached view, but sender admission must refresh positive records
+    // too: a cached epoch cannot authorize control after a target reloads or downgrades.
+    const participant = this.#directoryRead(() => fresh
+      ? this.participants.get(id, undefined, { fresh: true })
+      : this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true }));
     const reason = !participant ? this.#directoryUnavailable() : undefined;
     if (reason) throw new FabricDirectoryUnavailableError(reason);
     return participant;
@@ -226,13 +226,11 @@ export class AgentMessageRouter {
 
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
     const cached = this.#directoryRead(() => this.participants.get(id));
-    // Keep a mirrored root's original bridge for the control plane's fresh admission check.
-    if (cached?.kind === "root" && cached.remoteHost) return cached;
     const fresh = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true })) ?? this.#lapsedRoot(id);
     if (cached?.kind === "root") {
-      // Refresh native lifecycle state only under the same authority. A replacement mirror
-      // with the same id must never turn a private native delivery into bridge publication.
-      if (!fresh || fresh.kind !== "root" || fresh.remoteHost || fresh.id !== cached.id ||
+      // Refresh the epoch only under the same authority and link. A replacement mirror
+      // must never turn a native send into bridge publication, or redirect an existing link.
+      if (!fresh || fresh.kind !== "root" || fresh.remoteHost !== cached.remoteHost || fresh.id !== cached.id ||
         fresh.rootId !== cached.rootId || fresh.ownerHostId !== cached.ownerHostId ||
         fresh.ownerIdentityId !== cached.ownerIdentityId) throw new FabricRouteAuthorityError(id);
       return fresh;
@@ -303,7 +301,7 @@ export class AgentMessageRouter {
 
   /** Normalize late stop-route reads just like message-route reads. */
   resolveStopParticipant(id: string): FabricParticipantInfo | undefined {
-    return this.#get(id);
+    return this.#get(id, true);
   }
 
   #localMainNonInteractive(): boolean {
@@ -570,7 +568,7 @@ export class AgentMessageRouter {
 
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
-    const remoteAgent = this.#get(id);
+    const remoteAgent = this.#get(id, true);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
       if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
       const ownerIncarnation = controlOwnerIncarnation(remoteAgent);
@@ -613,6 +611,7 @@ export class AgentMessageRouter {
     }
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
     if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
+    const ownerIncarnation = controlOwnerIncarnation(participant);
     const sessionBinding = actor?.binding;
     const ownRoot = participant.rootId === this.mainAgent.id;
     const resolvedBinding = ownRoot ? binding : actor
@@ -626,7 +625,6 @@ export class AgentMessageRouter {
     if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
     }
-    const ownerIncarnation = controlOwnerIncarnation(participant);
     if (!this.control) throw new Error("Fabric control plane is unavailable");
     return this.control.request(
       participant.ownerHostId,
@@ -831,7 +829,7 @@ export class AgentMessageRouter {
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
-    const participant = this.#get(actor?.id ?? id);
+    const participant = this.#get(actor?.id ?? id, true);
     if (!actor && (!participant || participant.kind !== "actor")) {
       throw this.#unknownParticipant(id, "Fabric actor");
     }

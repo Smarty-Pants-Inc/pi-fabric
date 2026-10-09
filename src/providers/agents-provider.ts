@@ -1244,13 +1244,13 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
+        const ownerIncarnation = controlOwnerIncarnation(participant);
         const ownRoot = participant.rootId === this.mainAgent.id;
         const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
         }
-        const ownerIncarnation = controlOwnerIncarnation(participant);
         if (!this.control) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }

@@ -30,6 +30,7 @@ type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
   FABRIC_DIRECTORY_UNAVAILABLE: "FabricDirectoryUnavailableError",
+  FABRIC_CONTROL_INCARNATION_REQUIRED: "FabricControlIncarnationRequiredError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",

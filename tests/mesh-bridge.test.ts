@@ -617,6 +617,38 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
 });
 
 describe("cross-host Main delivery semantics (#3015)", () => {
+  it.each(["legacy", "v1"] as const)("refuses an old %s Main before publishing anything through the real pipe bridge", async controlProtocol => {
+    const { hub, far, bridge } = setup(undefined, { realPipe: true });
+    const source = await addRoot(hub, "fenced-source");
+    const target = await addRoot(far, "old-target");
+    const key = `topology/participants/${hash(target.identity.id)}`;
+    const old: Record<string, unknown> = { ...(far.get(key)!.value as Record<string, unknown>), controlProtocol };
+    delete old.ownerIncarnation;
+    await far.put({ key, identity: target.identity, value: old });
+    const directory = new ParticipantDirectory(hub, { enabled: true, hostId: source.hostId, rootId: source.identity.id, identity: source.identity });
+    const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
+      readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+    const steerRemote = vi.fn();
+    const sending = new AgentsProvider({ cwd: os.tmpdir() } as any, { identity: source.identity, steerRemote } as any, {} as any,
+      { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id } as any,
+      directory, sender, {} as any, () => false, undefined, false);
+    try {
+      await bridge.start(); await bridge.syncPresence();
+      // Old peer presence is still discoverable; only control admission is forbidden.
+      expect(directory.get(target.identity.id, undefined, { fresh: true })?.ownerIncarnation).toBeUndefined();
+      for (const delivery of ["steer", "followUp"] as const) {
+        await expect(sending.invoke(delivery, { id: target.identity.id, message: "must not arrive" }, { cwd: os.tmpdir() } as any))
+          .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
+            message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+      }
+      await bridge.step();
+      expect(steerRemote).not.toHaveBeenCalled();
+      for (const store of [hub, far]) {
+        expect(on(store, "fabric.control.command")).toEqual([]);
+        expect(on(store, "fabric.steer")).toEqual([]);
+      }
+    } finally { await sender.close(); await bridge.stop(); }
+  });
   it("starts a real idle Pi Main through the pipe bridge and returns triggered:true", async () => {
     const { hub, far, bridge } = setup(undefined, { realPipe: true });
     const source = await addRoot(hub, "real-source");

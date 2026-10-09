@@ -206,13 +206,16 @@ describe("owner incarnation admission and durable receipts", () => {
       await gate;
       // A pre-upgrade sender has no immutable origin field and stamps requestedAt at commit.
       const data = input.data;
-      return publish(wire === "legacy" ? { ...input, data: (committedAt: number) => {
-        const { requestCreatedAt: _origin, ...legacy } = (typeof data === "function" ? data(committedAt) : data) as Record<string, unknown>;
+      // Strip the epoch AFTER sender admission to model an old/adversarial wire producer.
+      return publish({ ...input, data: (committedAt: number) => {
+        const { ownerIncarnation: _epoch, ...unbound } = (typeof data === "function" ? data(committedAt) : data) as Record<string, unknown>;
+        if (wire !== "legacy") return unbound;
+        const { requestCreatedAt: _origin, ...legacy } = unbound;
         return legacy;
-      } } : input);
+      } });
     });
     clock.mockReturnValue(at + 10);
-    const pending = sender.request("session:owner", "actor:target", "stop", { message: "created before reload" }).catch(error => error);
+    const pending = sender.request("session:owner", "actor:target", "stop", { message: "created before reload", ownerIncarnation: previous.incarnation }).catch(error => error);
     expect(commands(mesh)).toHaveLength(0);
     clock.mockReturnValue(at + 20);
     const restarted = plane(mesh, "session:owner");
@@ -281,15 +284,18 @@ describe("owner incarnation admission and durable receipts", () => {
       const handler = vi.fn(() => ({ accepted: true })); owner.start(handler); sender.start(() => ({ accepted: false }));
       const publish = mesh.publish.bind(mesh);
       vi.spyOn(mesh, "publish").mockImplementation(input => {
-        if (origin || input.topic !== "fabric.control.command") return publish(input);
+        if (input.topic !== "fabric.control.command") return publish(input);
         const data = input.data;
         return publish({ ...input, data: (at: number) => {
-          const { requestCreatedAt: _origin, ...wire } = (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+          // Receiver regression: corrupt the admitted wire, not the now-fenced sender input.
+          const { ownerIncarnation: _epoch, ...unbound } = (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+          if (origin) return unbound;
+          const { requestCreatedAt: _origin, ...wire } = unbound;
           return wire;
         } });
       });
       await new Promise(done => setTimeout(done, 5));
-      await expect(sender.request("session:owner", "actor:target", operation, { message: "unverifiable" }))
+      await expect(sender.request("session:owner", "actor:target", operation, { message: "unverifiable", ownerIncarnation: owner.incarnation }))
         .rejects.toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
       expect(handler).not.toHaveBeenCalled();
       expect(commands(mesh)).toHaveLength(1);

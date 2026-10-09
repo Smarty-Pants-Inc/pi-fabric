@@ -150,6 +150,30 @@ describe("sender incarnation fencing (#7514)", () => {
     expect(r.actors.steerRemote).not.toHaveBeenCalled();
   });
 
+  it.each(["root", "actor", "agent"] as const)("never uses a cached %s epoch after the directory shows an old peer", async kind => {
+    const id = kind === "root" ? "session:downgraded" : `${kind}:downgraded`;
+    const cached = remote(id, "idle", kind);
+    const fresh = { ...cached }; delete fresh.ownerIncarnation;
+    const get = vi.fn((_id: string, _now?: number, options?: { fresh?: boolean }) => options?.fresh ? fresh : cached);
+    const request = vi.fn();
+    const r = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn() });
+    await expect(r.value.routeMessage(id, "unsafe cached epoch", undefined, "followUp"))
+      .rejects.toMatchObject({ code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
+    expect(request).not.toHaveBeenCalled(); expect(r.actors.steerRemote).not.toHaveBeenCalled();
+    expect(get.mock.calls.some(call => call[2]?.fresh)).toBe(true);
+  });
+
+  it("refreshes a mirrored Main epoch without changing its bridge authority", async () => {
+    const cached = { ...remote("session:mirrored", "idle", "root"), remoteHost: "forge" };
+    const fresh = { ...cached, ownerIncarnation: "current:mirrored" };
+    const get = vi.fn((_id: string, _now?: number, options?: { fresh?: boolean }) => options?.fresh ? fresh : cached);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn() });
+    await r.value.routeMessage(cached.id, "fenced", undefined, "followUp");
+    expect(request.mock.calls[0]![3]).toMatchObject({ ownerIncarnation: fresh.ownerIncarnation });
+    expect(request.mock.calls[0]![5]).toMatchObject({ routedRemoteHost: "forge" });
+  });
+
   it("refuses a legacy protocol even if it advertises an epoch", async () => {
     const target = { ...remote("session:legacy", "idle", "root"), controlProtocol: "legacy" as const };
     const request = vi.fn();

@@ -45,7 +45,7 @@ import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIde
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
-import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
@@ -936,7 +936,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn, ownerIncarnation: target.ownerIncarnation },
+      { message, data: event, triggerTurn: subscription.triggerTurn, ownerIncarnation: controlOwnerIncarnation(target) },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );

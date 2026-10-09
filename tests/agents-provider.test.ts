@@ -2389,6 +2389,7 @@ describe("AgentsProvider runner support", () => {
 
   it.each([
     ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
+    ["incarnation-required", "FabricControlIncarnationRequiredError", "FABRIC_CONTROL_INCARNATION_REQUIRED"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2401,7 +2402,8 @@ describe("AgentsProvider runner support", () => {
       name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
       startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
       role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
-    const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
+    const members = scenario === "incarnation-required" ? [{ ...base, controlProtocol: "legacy" as const }]
+      : scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
     const { provider, participants } = setup(peers, members, undefined, { cwd: lane });

@@ -30,7 +30,7 @@ const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-processed-ke
   return { root, mesh, actors, close };
 };
 const create = (actors: ActorManager, name = "owner-alarm") => actors.create({
-  name, instructions: "Handle the owner alarm.", topics: [topic, "ops.other"], coalesce: false, coalesceKey: "key", residency: "durable",
+  name, instructions: "Handle the owner alarm.", topics: [topic, "ops.other"], coalesce: false, dedupeKey: "data.key", residency: "durable",
 });
 const alarm = (mesh: MeshStore, key: string | number, eventTopic = topic, text?: string) =>
   mesh.publish({ topic: eventTopic, kind: "stuck.work", from, data: { key }, ...(text ? { text } : {}) });
@@ -52,7 +52,34 @@ const queueFile = (root: string, id: string) => {
   return path.join(directory, file!);
 };
 
-describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
+describe("durable actor opt-in occurrence dedupeKey (smarty-dev#7710)", () => {
+  it("runs a new head and security event for the same PR when only coalesceKey is configured", async () => {
+    const first = setup();
+    const { mesh, actors } = first;
+    const actor = await actors.create({
+      name: "pr-review", instructions: "Review each new head and security event.",
+      topics: ["github.demo.pulls"], coalesceKey: "payload.number", residency: "durable",
+    });
+    const publish = (head: string, kind = "pull_request.synchronize") => mesh.publish({
+      topic: "github.demo.pulls", kind, from, data: { payload: { number: 732, head } },
+    });
+    await publish("head-1");
+    await settled(actors, actor.id, 1);
+    await publish("head-2");
+    await settled(actors, actor.id, 2);
+    await publish("head-2", "security.review_requested");
+    await settled(actors, actor.id, 3);
+    expect(outputs(actors, actor.id)).toHaveLength(3);
+    await first.close();
+    const second = setup(first.root);
+    await second.mesh.publish({
+      topic: "github.demo.pulls", kind: "pull_request.synchronize", from,
+      data: { payload: { number: 732, head: "head-3" } },
+    });
+    await settled(second.actors, actor.id, 4);
+    expect(outputs(second.actors, actor.id)).toHaveLength(4);
+  }, 30_000);
+
   it("wakes once for a producer retry with a different event id, but runs a different key", async () => {
     const { mesh, actors } = setup();
     const actor = await create(actors);
@@ -85,9 +112,10 @@ describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
     await settled(first.actors, actor.id, 1);
     const snapshot = JSON.parse(fs.readFileSync(queueFile(first.root, actor.id), "utf8"));
     expect(snapshot.items).toEqual([]);
-    expect(snapshot.processedKeys).toHaveLength(1);
+    expect(snapshot.processedKeys).toEqual([JSON.stringify(["mesh-dedupe", "data.key", topic, "already-told"])]);
     await first.close();
     const second = setup(first.root);
+    expect(second.actors.status(actor.id).dedupeKey).toBe("data.key");
     await alarm(second.mesh, "already-told");
     await alarm(second.mesh, "new-work");
     await settled(second.actors, actor.id, 2);
@@ -104,7 +132,7 @@ describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
     // Populate the intentional persisted queue contract at its retention boundary, avoiding
     // 256 unrelated model launches. New completions must update this state through the manager.
     const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
-    snapshot.processedKeys = Array.from({ length: 256 }, (_, index) => JSON.stringify(["mesh", "key", topic, `old-${index}`]));
+    snapshot.processedKeys = Array.from({ length: 256 }, (_, index) => JSON.stringify(["mesh-dedupe", "data.key", topic, `old-${index}`]));
     fs.writeFileSync(file, JSON.stringify(snapshot));
     const second = setup(first.root);
     await alarm(second.mesh, "old-0"); // ignored; must not move the oldest to the back
@@ -112,17 +140,17 @@ describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
     await settled(second.actors, actor.id, 2);
     let saved = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(saved.processedKeys).toHaveLength(256);
-    expect(saved.processedKeys[0]).toBe(JSON.stringify(["mesh", "key", topic, "old-1"]));
+    expect(saved.processedKeys[0]).toBe(JSON.stringify(["mesh-dedupe", "data.key", topic, "old-1"]));
     await alarm(second.mesh, "old-2"); // retained: does not run
     await alarm(second.mesh, "old-0"); // evicted: runs again
     await settled(second.actors, actor.id, 3);
     expect(outputs(second.actors, actor.id)).toHaveLength(3);
     saved = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(saved.processedKeys).toHaveLength(256);
-    expect(saved.processedKeys.at(-1)).toBe(JSON.stringify(["mesh", "key", topic, "old-0"]));
+    expect(saved.processedKeys.at(-1)).toBe(JSON.stringify(["mesh-dedupe", "data.key", topic, "old-0"]));
   });
 
-  it("keeps actor, topic, scalar type, and configured path boundaries distinct", async () => {
+  it("keeps actor, topic and scalar type boundaries distinct, independent of coalesce changes", async () => {
     const { mesh, actors } = setup();
     const a = await create(actors, "owner-a");
     await alarm(mesh, 42);
@@ -136,9 +164,36 @@ describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
     await settled(actors, a.id, 3);
     await settled(actors, b.id, 3);
     await actors.setCoalesceKey(a.id, "other");
-    await mesh.publish({ topic, kind: "stuck.work", from, data: { other: 42 } });
+    await mesh.publish({ topic, kind: "stuck.work", from, data: { key: 42, other: 42 } });
+    await mesh.publish({ topic, kind: "stuck.work", from, data: { key: "new-occurrence", other: 42 } });
     await settled(actors, a.id, 4);
     expect(outputs(actors, a.id)).toHaveLength(4);
+  });
+
+  it("runs each event when the opted-in occurrence field is missing or non-scalar", async () => {
+    const { mesh, actors } = setup();
+    const actor = await create(actors);
+    for (const key of [undefined, undefined, { value: "same" }, { value: "same" }, ["same"], ["same"]]) {
+      await mesh.publish({ topic, kind: "stuck.work", from, data: { key } });
+    }
+    await settled(actors, actor.id, 6);
+    expect(outputs(actors, actor.id)).toHaveLength(6);
+  });
+
+  it("does not interpret legacy resource completion fences as occurrence keys", async () => {
+    const first = setup();
+    const actor = await create(first.actors);
+    await alarm(first.mesh, "seed");
+    await settled(first.actors, actor.id, 1);
+    const file = queueFile(first.root, actor.id);
+    await first.close();
+    const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+    snapshot.processedKeys = [JSON.stringify(["mesh", "data.key", topic, "legacy-resource"])];
+    fs.writeFileSync(file, JSON.stringify(snapshot));
+    const second = setup(first.root);
+    await alarm(second.mesh, "legacy-resource");
+    await settled(second.actors, actor.id, 2);
+    expect(outputs(second.actors, actor.id)).toHaveLength(2);
   });
 
   it("reads legacy queue snapshots without completion history", async () => {
@@ -177,17 +232,19 @@ describe("durable actor processed coalesceKey (smarty-dev#7710)", () => {
     expect(outputs(second.actors, actor.id)).toHaveLength(2);
   }, 30_000);
 
-  it("drops a completed subject from dead-letter replay after restart", async () => {
+  it("dedupes a completed occurrence from dead-letter replay but runs a new occurrence after restart", async () => {
     const first = setup();
     const actor = await create(first.actors);
-    await alarm(first.mesh, "dead-lettered-repeat");
+    const completed = await alarm(first.mesh, "dead-lettered-repeat");
     await settled(first.actors, actor.id, 1);
     await first.close();
-    const event = await alarm(first.mesh, "dead-lettered-repeat");
     const file = path.join(first.root, "actors", actor.id, "dead-letter.jsonl");
-    fs.writeFileSync(file, JSON.stringify({ at: Date.now(), source: `mesh:${topic}`, event }) + "\n");
+    // Exercise the persisted replay interface only, not live mesh ingress: one producer
+    // retry has a new ID but the completed key, the other has a new occurrence key.
+    const retry = { ...completed, id: "dead-letter-retry" };
+    const fresh = { ...completed, id: "dead-letter-fresh", data: { key: "new-dead-letter-occurrence" } };
+    fs.writeFileSync(file, [retry, fresh].map(event => JSON.stringify({ at: Date.now(), source: `mesh:${topic}`, event }) + "\n").join(""));
     const second = setup(first.root);
-    await alarm(second.mesh, "new-after-dead-letter");
     await settled(second.actors, actor.id, 2);
     expect(outputs(second.actors, actor.id)).toHaveLength(2);
     expect(fs.existsSync(file)).toBe(false);

@@ -1,10 +1,11 @@
 # Durable actor processed-key deduplication
 
-For a persistent actor with `residency: "durable"` and `coalesceKey: "key"`,
-Fabric remembers the last **256 successfully completed mesh subjects** per actor.
-A subject is the configured path, event topic and scalar value at that path in
-`event.data`. Strings and numbers remain distinct. Use an occurrence-specific
-`data.key` for an alarm that should wake once:
+Completed-key deduplication is **opt-in**. For a persistent actor with
+`residency: "durable"` and `dedupeKey: "data.key"`, Fabric remembers the last
+**256 successfully completed mesh occurrences** per actor. An occurrence is the
+configured path, event topic and scalar value at that path in the **full mesh
+event**. Strings and numbers remain distinct. The path is validated as a dotted
+path of at most 200 characters. Missing or non-scalar values are not deduplicated.
 
 ```ts
 await agents.create({
@@ -12,7 +13,7 @@ await agents.create({
   instructions: "Handle owner alarms.",
   residency: "durable",
   topics: ["ops.owner"],
-  coalesceKey: "key",
+  dedupeKey: "data.key",
 });
 ```
 
@@ -20,28 +21,39 @@ If a producer crashes after publishing `stuck.work` and before recording its
 `told` flag, publishing a new event ID with the same `data.key` does not run that
 receiver again. A different key runs normally. A repeat does not refresh its
 retention position; once the oldest key falls out of the 256-key window it may
-run again. Each actor has its own window. Changing the coalesce path or topic
-uses a different subject; missing or non-scalar values are not deduplicated.
+run again. Each actor has its own window. Changing the dedupe path or topic uses
+a different occurrence identity. The option is set at creation and round-trips
+through global templates and actor registry reloads.
 
-Pending items still use existing queued-only coalescing. A duplicate queued
-while the first activation runs is checked again before starting inference.
-Dead-letter replay and restored queues also check completed subjects. Failed,
-interrupted, preparation-only, filtered and parked activations do not create a
-completion entry. Successfully completed inference is terminal even if a later
-ownership or output-delivery check fails, as for existing queue completion.
+## Resource coalescing is not occurrence deduplication
+
+`coalesceKey` is independent and remains **queued-only**. It is a path into
+`event.data`, such as `payload.number`, and lets a newer queued event for a
+resource replace an older queued one. It never supplies a completed dedupe key.
+An actor without `dedupeKey` behaves as before: a durable reviewer with
+`coalesceKey: "payload.number"` runs a new head or security event for the same PR
+after its earlier activation completes. Do not use a PR number as `dedupeKey`:
+that would explicitly opt into suppressing genuinely new work for that resource.
+Both options may be supplied, but they serve different purposes.
+
+With `dedupeKey`, a duplicate queued while the first activation runs is checked
+again before starting inference. Dead-letter replay and restored queues also
+check completed occurrences. Failed, interrupted, preparation-only, filtered and
+parked activations do not create a completion entry. Successfully completed
+inference is terminal even if a later ownership or output-delivery check fails,
+as for existing queue completion.
 
 The bounded window is an optional `processedKeys` array in the existing format-1
 lineage queue snapshot. Empty queues retain this completion fence, successful
 completions durably rewrite it, and restart/adoption restores it with queue and
-revision state. Old snapshots without the array remain valid. Session actors,
-actors without a coalesce key, direct messages and event-ID deduplication keep
-their previous behavior; no new public action or configuration option is needed.
+revision state. Old snapshots without the array remain valid; legacy resource
+completion fences are not occurrence keys. Session actors, actors without
+`dedupeKey`, direct messages and event-ID deduplication keep their previous
+behavior. No separate setter action is added.
 
 This is a bounded receiver replay defense, not a transactional exactly-once
 side-effect guarantee. A receiver crash before its completion checkpoint can
-still replay an interrupted activation. A durable subscription that must run
-again for each revision should include the revision in its subject key, rather
-than use only a long-lived resource identifier such as a pull-request number.
+still replay an interrupted activation.
 
 Regression coverage: `tests/actor-processed-key.test.ts`. Related behavior:
 `tests/actor-coalesce-key.test.ts`, queue/overflow and actor restart suites.

@@ -725,6 +725,9 @@ interface FabricActorRequestBase {
   coalesce?: boolean;
   /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
   /** Per-activation shadow routing; requires explicit model/thinking. */
@@ -766,6 +769,9 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
   runner: FabricAgentRunner;
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
@@ -797,6 +803,9 @@ interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };

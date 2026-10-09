@@ -118,6 +118,14 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
   }
 }
 
+/** An explicit occurrence path into the full mesh event, such as "data.key". */
+export function validateActorDedupeKey(value: unknown): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length > 200 || !COALESCE_KEY_PATTERN.test(value)) {
+    throw new Error(`Invalid actor dedupeKey: ${String(value)} (use a dotted path such as data.key)`);
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
@@ -221,10 +229,12 @@ export interface FabricActorRequest {
   /**
    * A dotted path into a mesh event's data, such as "payload.number". A queued event of the
    * same topic with the same value there is replaced by the newer one, in its queue place.
-   * Persistent durable actors also discard repeats of their last 256 completed subjects;
-   * completion history is scoped by path, topic and scalar type and survives restart.
    */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
   /**
    * Skip-only rules checked before a queued event runs the model: preset names ("hold",
    * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
@@ -296,6 +306,10 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };

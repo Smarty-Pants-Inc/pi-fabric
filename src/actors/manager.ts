@@ -37,7 +37,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
@@ -144,6 +144,7 @@ interface ManagedActor {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  dedupeKey?: string;
   activationFilter?: FabricActorActivationFilter;
   activationFilterExpiresAt?: number;
   filterSkipped?: FabricActorInfo["filterSkipped"];
@@ -296,8 +297,8 @@ function loadedFilterSkipped(value: unknown): FabricActorInfo["filterSkipped"] {
 }
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
 
-// The value at a dotted path in a mesh event's data, when it is a string or a finite number.
-const meshCoalesceValue = (data: unknown, keyPath: string): string | number | undefined => {
+// The value at a dotted path in an event or its data, when it is a string or a finite number.
+const meshScalarValue = (data: unknown, keyPath: string): string | number | undefined => {
   let value: unknown = data;
   for (const segment of keyPath.split(".")) {
     if (typeof value !== "object" || value === null || Array.isArray(value) || !Object.hasOwn(value, segment)) return undefined;
@@ -828,6 +829,7 @@ export class ActorManager {
     }
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
+    validateActorDedupeKey(request.dedupeKey);
     const activationFilter = request.activationFilter === undefined
       ? undefined
       : normalizeActorActivationFilter(request.activationFilter);
@@ -871,6 +873,7 @@ export class ActorManager {
       triggerTurn: deliveryPolicy.triggerTurn,
       coalesce: request.coalesce ?? true,
       ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
+      ...(request.dedupeKey ? { dedupeKey: request.dedupeKey } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       residency,
       runner,
@@ -1684,6 +1687,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
@@ -3681,7 +3685,7 @@ export class ActorManager {
     const now = Date.now();
     const event = item.payload as { id?: unknown; topic?: unknown; data?: unknown } | null | undefined;
     const mesh = item.source.startsWith("mesh:");
-    const value = mesh && actor.coalesceKey ? meshCoalesceValue(event?.data, actor.coalesceKey) : undefined;
+    const value = mesh && actor.coalesceKey ? meshScalarValue(event?.data, actor.coalesceKey) : undefined;
     const key = item.coalesceKey ?? (mesh
       ? value === undefined ? undefined : JSON.stringify(["mesh", event?.topic, value])
       : actor.coalesce ? item.source : undefined);
@@ -3852,13 +3856,13 @@ export class ActorManager {
   }
 
   #processedMeshKey(actor: ManagedActor, source: string, payload: unknown): string | undefined {
-    if (!this.#persistent || actor.residency !== "durable" || !actor.coalesceKey || !source.startsWith("mesh:")) return undefined;
-    const event = payload as { topic?: unknown; data?: unknown } | undefined;
+    if (!this.#persistent || actor.residency !== "durable" || !actor.dedupeKey || !source.startsWith("mesh:")) return undefined;
+    const event = payload as { topic?: unknown } | undefined;
     if (typeof event?.topic !== "string") return undefined;
-    const key = meshCoalesceValue(event.data, actor.coalesceKey);
-    // Include the configured path as well as topic and scalar type, so changing
-    // the subscription does not inherit another subject's completion history.
-    return key === undefined ? undefined : JSON.stringify(["mesh", actor.coalesceKey, event.topic, key]);
+    const key = meshScalarValue(event, actor.dedupeKey);
+    // Occurrence identity is explicitly opted into, never inferred from a resource
+    // coalesceKey. A new namespace also excludes legacy resource completion fences.
+    return key === undefined ? undefined : JSON.stringify(["mesh-dedupe", actor.dedupeKey, event.topic, key]);
   }
 
   #hasProcessedKey(actor: ManagedActor, source: string, payload: unknown): boolean {
@@ -3879,7 +3883,7 @@ export class ActorManager {
   }
 
   #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
-    const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+    const key = actor.coalesceKey ? meshScalarValue(event.data, actor.coalesceKey) : undefined;
     return {
       ...(event.verification === "mesh" || event.verification === "bridge"
         ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
@@ -4401,6 +4405,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activationFilter
         ? { activationFilter: actor.activationFilter }
         : actor.invalidActivationFilter
@@ -4856,6 +4861,9 @@ export class ActorManager {
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
           ? { coalesceKey: record.coalesceKey }
           : {}),
+        ...(typeof record.dedupeKey === "string" && record.dedupeKey.length <= 200 && COALESCE_KEY_LOAD_PATTERN.test(record.dedupeKey)
+          ? { dedupeKey: record.dedupeKey }
+          : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
         ...loadedActivationFilter((record as { activationFilter?: unknown }).activationFilter, { id: record.id, name: record.name }),
         ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
@@ -5117,7 +5125,7 @@ export class ActorManager {
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
-    if (actor.residency === "durable" && Array.isArray(saved.processedKeys)) {
+    if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {
       // Predecessor history precedes locally completed work; never let an old
       // handoff evict a newer local completion. Legacy snapshots have no history.
       const incoming = saved.processedKeys.slice(-PROCESSED_KEY_MEMORY).filter((key): key is string => typeof key === "string");
@@ -5335,6 +5343,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
@@ -5684,7 +5693,7 @@ export class ActorManager {
     if (!actor.coalesceKey || item.resolve || item.reject || !item.source.startsWith("mesh:")) return undefined;
     const event = item.payload as { topic?: unknown; data?: unknown } | undefined;
     if (typeof event?.topic !== "string") return undefined;
-    const value = meshCoalesceValue(event.data, actor.coalesceKey);
+    const value = meshScalarValue(event.data, actor.coalesceKey);
     return value === undefined ? undefined : JSON.stringify(["mesh", event.topic, value]);
   }
 

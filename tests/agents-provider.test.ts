@@ -5292,6 +5292,24 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("create", { name: "bad", instructions: "x", coalesceKey: "" }, context)).rejects.toThrow("Invalid actor coalesceKey");
   });
 
+  it("creates and imports an actor with an explicit dedupeKey independently of coalesceKey", async () => {
+    const { provider } = setup();
+    const actor = await provider.invoke("create", {
+      name: "owner-alarm", instructions: "Handle alarms.", topics: ["ops.owner"],
+      dedupeKey: "data.key", coalesceKey: "payload.number",
+    }, context) as { id: string; dedupeKey?: string; coalesceKey?: string };
+    expect(actor).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number" });
+    await expect(provider.invoke("status", { id: actor.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: null }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    const template = await provider.invoke("create", {
+      name: "alarm-template", instructions: "Handle alarms.", scope: "global", dedupeKey: "data.key",
+    }, context) as { id: string };
+    await expect(provider.invoke("import", { id: template.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    for (const dedupeKey of ["", "not a path", "data..key", "x".repeat(201), 42, null]) {
+      await expect(provider.invoke("create", { name: "bad-dedupe", instructions: "x", dedupeKey }, context)).rejects.toThrow("Invalid actor dedupeKey");
+    }
+  });
+
   // smarty-dev#1579: the skip-only activation filter, set at creation or later, project or global.
   it("creates an actor with an activationFilter and sets, clears and validates it", async () => {
     const { provider } = setup();

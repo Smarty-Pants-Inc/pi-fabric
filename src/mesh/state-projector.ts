@@ -557,6 +557,8 @@ export class StateProjector {
     const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, {
       checkpoint: "client", checkpointBytes: options.checkpointBytes ?? 64 * 1024 * 1024,
       lockTimeoutMs: options.busyBudgetMs ?? 5_000, ...(options.open ? { open: options.open } : {}),
+      // shadow: its own copy, never the fence; sqlite: the mesh root, which only an import initialises (smarty-dev#6477).
+      ...((options.mode ?? "shadow") === "shadow" ? { initialize: "detached" as const } : {}),
     });
     let db: SqliteConnection | undefined;
     try {

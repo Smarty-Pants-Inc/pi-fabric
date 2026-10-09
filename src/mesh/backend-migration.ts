@@ -558,6 +558,17 @@ const holdFence = async <T>(root: string, options: MeshBackendOptions, operation
 const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
   decodeMeshStateFile(path.join(root, STATE_JSON), maxBytesOf(options), false) as FencedFile;
 
+/**
+ * smarty-dev#6477: a zero-length (or whitespace-only) state.json holds nothing, but the strict decoder reads it
+ * as damage. Under `.lock` the import of such a fresh root drops it and proceeds as for a root without one.
+ */
+const dropBlankStateFile = (root: string): void => {
+  const file = path.join(root, STATE_JSON);
+  const stat = fs.statSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size > 4096 || fs.readFileSync(file, "utf8").trim() !== "") return;
+  fs.rmSync(file, { force: true });
+};
+
 const fileEpochOf = (state: FencedFile): number => (state.backendEpoch === undefined ? 0 : storageRevision(state.backendEpoch));
 
 /** The store's own read path (state-file.ts, through the read journal when it applies): its entries' digest. */
@@ -693,6 +704,7 @@ const importConvergedOnMarker = (root: string, options: MeshBackendOptions, fenc
 const importUnderLock = (root: string, options: MeshBackendOptions, fence: FenceDb, lock: MeshLock): MeshImportResult => {
   const marker = readMeshStateMovedMarker(root);
   if (marker) return importConvergedOnMarker(root, options, fence, marker);
+  dropBlankStateFile(root);
   // Under .lock no file-mode writer can commit state.json while it is read and imported.
   const file = readFile(root, options);
   const fileEpoch = fileEpochOf(file);

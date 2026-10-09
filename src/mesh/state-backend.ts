@@ -712,6 +712,8 @@ export class ShadowStateBackend implements StateBackend {
       ...sqliteOptions(shadowOptions, this.#budgetMs),
       // No maintainer runs for the shadow: keep its WAL small without one.
       emergencyCheckpointBytes: 8 * 1024 * 1024,
+      // A copy outside the mesh root, never the fence: it initialises itself (smarty-dev#6477).
+      initialize: "detached",
     });
     const verifyMs = Math.max(0, Math.floor(options.shadowVerifyMs ?? 60_000));
     if (verifyMs > 0) {

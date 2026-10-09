@@ -1592,11 +1592,14 @@ export const ownsFile = (file: string, token: string): boolean => {
 // A checkpoint request's own flag: raising it again refreshes its mtime; lowering it removes only it.
 // An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
 // zero or one) per pending check; a crashed request's flag goes stale and is ignored.
+// An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D);
+// anything else is refused with a clear error and never written through.
 export const raiseCheckpointFlag = (root: string, token: string): string => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   const flag = path.join(dir, token);
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") return ""; }
+  assertPrivatePath(dir, "directory");
   try {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(flag, "", { mode: 0o600 });
     return flag;
   } catch { return ""; }
@@ -1609,13 +1612,33 @@ export const lowerCheckpointFlag = (flag: string): void => {
 export const checkpointFlagRaised = (root: string): boolean => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   let names: string[];
-  try { names = fs.readdirSync(dir); } catch { return false; }
+  try { assertPrivatePath(dir, "directory"); names = fs.readdirSync(dir); } catch { return false; } // a foreign directory raises nothing
   const now = Date.now();
   for (const name of names) {
     const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
     if (stat && now - stat.mtimeMs < CHECKPOINT_FLAG_STALE_MS) return true;
   }
   return false;
+};
+
+/**
+ * pi-fabric#694 P2-D/P2-E: an existing state path (state.db, its -wal/-shm, the flag directory) is used only
+ * when it is ours: lstat, so a symbolic link is never followed; the expected type; owned by this uid; no
+ * group or other write. Anything else is refused (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes.
+ * Windows has no uid or mode bits here, so only the type and symlink checks apply.
+ */
+export const assertPrivatePath = (file: string, kind: "directory" | "file"): void => {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return;
+  const posix = process.platform !== "win32" && typeof process.getuid === "function";
+  const uid = posix ? process.getuid!() : undefined;
+  const why = stat.isSymbolicLink() ? "is a symbolic link"
+    : kind === "directory" && !stat.isDirectory() ? "is not a directory"
+    : kind === "file" && !stat.isFile() ? "is not a regular file"
+    : uid !== undefined && stat.uid !== uid ? `is owned by uid ${stat.uid}, not this process's uid ${uid}`
+    : posix && (stat.mode & 0o022) !== 0 ? `is group or other writable (mode ${(stat.mode & 0o777).toString(8)})`
+    : undefined;
+  if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
 };
 
 // Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one). A

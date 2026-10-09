@@ -405,6 +405,22 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(checkpointFlagRaised(root)).toBe(false);
   });
 
+  // pi-fabric#694 P2-D: an existing flag directory is never followed or written through unless it is ours.
+  it.skipIf(process.platform === "win32")("refuses a symlinked or group-writable flag directory and never writes through it", () => {
+    const root = lockRoot();
+    const elsewhere = lockRoot();
+    fs.symlinkSync(elsewhere, path.join(root, "state-checkpoint.flags"));
+    expect(() => raiseCheckpointFlag(root, ownerToken())).toThrow(/state-checkpoint\.flags: it is a symbolic link/);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    fs.writeFileSync(path.join(elsewhere, "fresh"), ""); // a foreign "flag" never makes writers yield
+    expect(checkpointFlagRaised(root)).toBe(false);
+    const shared = lockRoot();
+    fs.mkdirSync(path.join(shared, "state-checkpoint.flags"), { mode: 0o700 });
+    fs.chmodSync(path.join(shared, "state-checkpoint.flags"), 0o777);
+    expect(() => raiseCheckpointFlag(shared, ownerToken())).toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED" }));
+    expect(fs.readdirSync(path.join(shared, "state-checkpoint.flags"))).toEqual([]);
+  });
+
   it("a release removes only the releaser's own lock, never one another process holds", () => {
     const dir = lockRoot();
     const lock = path.join(dir, "state-wal-reset.lock");

@@ -9,7 +9,7 @@ import { routeAgentCreation, type SpawnRouterRequest } from "../src/agents/spawn
 
 const roots: string[] = [];
 const root = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-router-")); roots.push(dir); return dir; };
-afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 const pick = { model: "provider/model-b", thinking: "high", reason: "normal.policy", policyVersion: "v1" };
 const defaults = { model: "provider/model-a", thinking: "medium" as const };
 const command = (dir: string, body = `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`): string[] => [
@@ -71,7 +71,13 @@ describe("external spawn router behavior", () => {
     vi.stubEnv("PATH", dir); vi.stubEnv("HOME", "/router-home"); vi.stubEnv("LANG", "C"); vi.stubEnv("TZ", "UTC");
     const body = `require('node:fs').writeFileSync(process.argv[1] + '.env', JSON.stringify(process.env)); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
-    expect(JSON.parse(fs.readFileSync(path.join(dir, "request.json.env"), "utf8"))).toEqual({ PATH: "/usr/bin:/bin", HOME: "/router-home", LANG: "C", TZ: "UTC" });
+    const systemRoot = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
+    const platformEnv = process.platform === "win32" ? {
+      SystemRoot: systemRoot,
+      PATH: `${path.win32.join(systemRoot!, "System32")};${systemRoot}`,
+      COMSPEC: path.win32.join(systemRoot!, "System32", "cmd.exe"),
+    } : { PATH: "/usr/bin:/bin" };
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "request.json.env"), "utf8"))).toEqual({ ...platformEnv, HOME: "/router-home", LANG: "C", TZ: "UTC" });
   });
   it("shadow preserves default and logs validated pick beside actual", async () => {
     const dir = root(); const opts = options(dir);
@@ -185,10 +191,13 @@ describe("external spawn router behavior", () => {
 
   it("abort retires a running router and falls back", async () => {
     const dir = root(); const opts = options(dir); const controller = new AbortController();
-    const pending = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, "setInterval(() => {}, 1000);") }, signal: controller.signal });
-    await vi.waitFor(() => expect(fs.existsSync(path.join(dir, "request.json"))).toBe(true));
+    const body = `require('node:fs').writeFileSync(process.argv[1] + '.pid', String(process.pid)); setInterval(() => {}, 1000);`;
+    const pending = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body), timeoutMs: 5000 }, signal: controller.signal });
+    await vi.waitFor(() => expect(fs.existsSync(path.join(dir, "request.json.pid"))).toBe(true), { timeout: 5000 });
+    const pid = Number(fs.readFileSync(path.join(dir, "request.json.pid"), "utf8"));
     controller.abort(); await expect(pending).resolves.toBeUndefined();
     expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: "aborted" });
+    expect(() => process.kill(pid, 0)).toThrow();
   });
   it("a logging failure cannot fail or change an enforce selection", async () => {
     const dir = root(); fs.writeFileSync(path.join(dir, "router"), "not a directory");

@@ -21,8 +21,15 @@ configuration cannot execute a router or opt into task disclosure):
 
 `command` is executable + argv, never shell source. The executable must be an
 absolute path: bare names and relative paths are rejected, with no PATH lookup.
-The router receives only `PATH=/usr/bin:/bin` and, when set, `HOME`, `LANG`, and
-`TZ`; host credentials, agent variables, and loader hooks are not inherited.
+On POSIX the router receives `PATH=/usr/bin:/bin`; on Windows it receives
+`SystemRoot` (resolved case-insensitively from the host), a fixed
+`PATH=<SystemRoot>\System32;<SystemRoot>`, and
+`COMSPEC=<SystemRoot>\System32\cmd.exe`. A missing/relative Windows system root
+fails open without starting a command. On either platform only `HOME`, `LANG`,
+and `TZ` are otherwise copied when set; parent `PATH`/`Path`, `COMSPEC`, host
+credentials, agent variables, and loader hooks are never inherited. Script
+routers must name their interpreter explicitly, for example an absolute
+`node.exe` followed by the `.mjs` script path on Windows; there is no shell repair.
 `timeoutMs` defaults to 1500 and clamps to 200–5000 ms. `mode` defaults to `off` (also the kill switch).
 `shadow` records a validated suggestion but keeps the existing static/default
 binding; `enforce` uses the validated suggestion. A missing/failed command,
@@ -92,9 +99,13 @@ Example output:
 
 `model` and `thinking` are required. `reason` (at most 2000 characters) and
 `policyVersion` (at most 256) are optional strings. Stdout is bounded to 64 KiB;
-stderr is not captured in decisions. Timeout settles immediately without waiting
-for `close`, closes local pipes, and kills the process tree (detached process
-group on POSIX; `taskkill /T /F /PID` on Windows).
+stderr is not captured in decisions. Timeout, abort, and oversized output close
+local pipes and retire the process tree (detached process group on POSIX;
+`taskkill /T /F /PID` on Windows). Fallback joins the Windows helper (bounded to
+1 second, with a direct-child SIGKILL fallback on helper failure) and waits up
+to 1 second for direct-child exit, never for descendant-held `close`. These
+retirement bounds are in addition to the command deadline; a failed native
+tree kill cannot guarantee descendant exit.
 
 ## Decision ledger and rollback
 

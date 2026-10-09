@@ -30,6 +30,16 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 
 const routerEnv = (): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin" };
+  if (process.platform === "win32") {
+    // A copied Windows environment is case-sensitive in JS even though native
+    // environment names are not. Never inherit Path or a caller's COMSPEC.
+    const root = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
+    if (!root || !path.win32.isAbsolute(root)) throw new Error("command-error");
+    const system = path.win32.join(root, "System32");
+    env.SystemRoot = root;
+    env.PATH = `${system};${root}`;
+    env.COMSPEC = path.win32.join(system, "cmd.exe");
+  }
   for (const name of ["HOME", "LANG", "TZ"]) {
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
@@ -81,47 +91,67 @@ const writeDecision = async (dir: string, record: string): Promise<void> => {
   finally { if (ledgerWrites.get(dir) === pending) ledgerWrites.delete(dir); }
 };
 
-// Never wait for close after a timeout: descendants may retain inherited pipes.
+// Join retirement, not close: descendants may retain inherited pipes forever.
 const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: number, signal?: AbortSignal): Promise<string> =>
   new Promise((resolve, reject) => {
     if (!command.length) { reject(new Error("missing-command")); return; }
     if (!path.isAbsolute(command[0]!)) { reject(new Error("invalid-command")); return; }
     if (signal?.aborted) { reject(new Error("aborted")); return; }
     let child: ReturnType<typeof spawn>;
+    let environment: NodeJS.ProcessEnv;
     try {
+      environment = routerEnv();
       child = spawn(command[0]!, command.slice(1), {
-        cwd: input.cwd, shell: false, env: routerEnv(), detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore"],
+        cwd: input.cwd, shell: false, env: environment, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore"],
       });
     } catch { reject(new Error("command-error")); return; }
     let settled = false;
-    let retired = false;
+    let retirement: Promise<void> | undefined;
+    let exited = false;
+    const nativeExit = new Promise<void>(done => {
+      child.once("exit", () => { exited = true; done(); });
+      child.once("error", () => { if (child.pid === undefined) { exited = true; done(); } });
+    });
     let output = "";
     let bytes = 0;
-    const kill = (): void => {
-      if (retired) return;
-      retired = true;
-      try {
-        if (process.platform === "win32" && child.pid) {
-          // Never search PATH for the tree killer either.
-          const root = process.env.SystemRoot;
-          const taskkill = path.win32.join(root && path.win32.isAbsolute(root) ? root : "C:\\Windows", "System32", "taskkill.exe");
-          execFile(taskkill, ["/T", "/F", "/PID", String(child.pid)], {
-            env: routerEnv(), windowsHide: true, timeout: 1000,
-          }, () => {});
-        } else if (child.pid) process.kill(-child.pid, "SIGKILL");
-        else child.kill("SIGKILL");
-      } catch { /* Already retired (or spawn failed). */ }
+    const directKill = (): void => {
+      try { child.kill("SIGKILL"); } catch { /* Already exited (or spawn failed). */ }
     };
+    const kill = (): Promise<void> => retirement ??= Promise.resolve().then(async () => {
+      if (process.platform === "win32" && child.pid) {
+        // Await the closed helper before returning; an asynchronous taskkill
+        // otherwise races the caller's temp cleanup and leaves a live router.
+        const taskkill = path.win32.join(environment.SystemRoot!, "System32", "taskkill.exe");
+        await new Promise<void>(done => {
+          try {
+            execFile(taskkill, ["/T", "/F", "/PID", String(child.pid)], {
+              env: environment, windowsHide: true, timeout: 1000, killSignal: "SIGKILL",
+            }, error => { if (error) directKill(); done(); });
+          } catch { directKill(); done(); }
+        });
+      } else {
+        try { if (child.pid) process.kill(-child.pid, "SIGKILL"); else directKill(); }
+        catch { directKill(); }
+      }
+      if (!exited) {
+        // Do not wait for descendant-held close, or hang on a failed native kill.
+        await new Promise<void>(done => {
+          const timer = setTimeout(done, 1000);
+          void nativeExit.then(() => { clearTimeout(timer); done(); });
+        });
+      }
+    });
     const finish = (error?: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      if (error) reject(new Error(error));
-      else resolve(output);
-      kill();
       child.stdin!.destroy();
       child.stdout!.destroy();
+      void kill().then(() => {
+        if (error) reject(new Error(error));
+        else resolve(output);
+      });
     };
     const stop = (reason: string): void => finish(reason);
     const abort = (): void => stop("aborted");
@@ -138,7 +168,7 @@ const runRouter = (command: string[], input: SpawnRouterRequest, timeoutMs: numb
       else output += chunk;
     });
     // Retire descendants even if a router exits without closing inherited pipes.
-    child.once("exit", kill);
+    child.once("exit", () => { void kill(); });
     child.once("close", (code) => finish(code === 0 ? undefined : "nonzero-exit"));
     child.stdin!.end(`${JSON.stringify(input)}\n`);
     if (signal?.aborted) abort();

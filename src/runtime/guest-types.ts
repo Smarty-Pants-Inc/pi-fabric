@@ -62,8 +62,10 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
-  /** Required placement capabilities; any unmet need keeps process tasks local. */
+  /** Required placement capabilities; local always pins to Main, and unmet needs stay local. */
   needs?: string[];
+  /** Up to 64 absolute selected-host inputs, each at most 4096 UTF-8 bytes and without NUL. */
+  requires?: string[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;

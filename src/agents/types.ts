@@ -72,8 +72,10 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
-  /** Required target capabilities. Unknown needs force configured placement local. */
+  /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
+  /** Absolute inputs that must exist on the selected execution host before starting. */
+  requires?: string[];
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -378,6 +380,7 @@ export interface AgentTransportLaunch {
   workerPath: string;
   workerArguments: string[];
   needs?: string[];
+  requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */

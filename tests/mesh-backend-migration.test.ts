@@ -430,7 +430,7 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
       census: async () => ({ writers: [fileWriter] }), stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe("fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
+    expect(err).toBe(`fabric-mesh-backend: no reader registered in ${other}/readers\nfabric-mesh-backend: advisory: 1 writer, 0 unknown\n`);
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 

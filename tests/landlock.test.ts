@@ -5,7 +5,7 @@ import { exec } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { executeFile, spawnDetached } from "../src/agents/transports/process-utils.js";
+import { executeFile } from "../src/agents/transports/process-utils.js";
 import { groupOperations, LandlockBashConfinement, type LandlockSettings } from "../src/core/landlock.js";
 
 const helper = path.resolve("dist/native/fabric-landlock");
@@ -30,24 +30,6 @@ const fixture = () => {
   return { root, cwd, victim, confinement, audit };
 };
 
-// Exercise the real process-transport execFile path, not a mocked spawn.
-const fileOperations = (executable: string): BashOperations => ({
-  exec: async (command, cwd, options) => {
-    try {
-      const result = await executeFile(executable, ["-c", command], {
-        cwd, ...(options.env ? { env: options.env } : {}),
-        ...(options.signal ? { signal: options.signal } : {}), timeoutMs: 5_000,
-      });
-      options.onData(Buffer.from(result.stdout + result.stderr));
-      return { exitCode: 0 };
-    } catch (error) {
-      const failure = error as Error & { code?: number; stdout?: string; stderr?: string };
-      if (typeof failure.code !== "number") throw error;
-      options.onData(Buffer.from((failure.stdout ?? "") + (failure.stderr ?? "")));
-      return { exitCode: failure.code };
-    }
-  },
-});
 const execOperations = (executable: string): BashOperations => ({
   exec: (command, cwd, options) => new Promise((resolve, reject) => {
     exec(`${quote(executable)} -c ${quote(command)}`, { cwd, env: options.env, timeout: 5_000 },
@@ -58,36 +40,11 @@ const execOperations = (executable: string): BashOperations => ({
       });
   }),
 });
-// Use the actual detached worker launcher shared by process-transport actors and
-// tasks. The worker is benign: only exec the selected shell/helper and write its
-// receipt; it never launches an agent, loads a model or touches credentials.
-const workerOperations = (role: string) => (executable: string): BashOperations => ({
-  exec: async (command, cwd, options) => {
-    const directory = fs.mkdtempSync(path.join(cwd, "probe-worker-"));
-    const worker = path.join(directory, "worker.cjs");
-    const receipt = path.join(directory, "result.json");
-    fs.writeFileSync(worker, `const cp = require('node:child_process');
-const fs = require('node:fs');
-const result = cp.spawnSync(${JSON.stringify(executable)}, ['-c', ${JSON.stringify(command)}],
-  {cwd: ${JSON.stringify(cwd)}, env: process.env, encoding: 'utf8', timeout: 5000});
-fs.writeFileSync(${JSON.stringify(receipt)}, JSON.stringify({status: result.status,
-  output: (result.stdout || '') + (result.stderr || ''), error: result.error?.message}));`);
-    const child = await spawnDetached(worker, [], cwd,
-      { ...(options.signal ? { signal: options.signal } : {}), authorize: () => true },
-      { ...(options.env ?? process.env), SMARTY_ROLE: role });
-    await child.closed; // Never leave a detached worker running after a test.
-    const result = JSON.parse(fs.readFileSync(receipt, "utf8")) as { status: number | null; output: string; error?: string };
-    if (result.error) throw new Error(result.error);
-    options.onData(Buffer.from(result.output));
-    return { exitCode: result.status };
-  },
-});
+// These are test-only Bash operations adapters, not evidence that production
+// actor/task/exec launchers are Landlock-enforced (smarty-dev#7935).
 const routes = [
-  ["process transport execFile", fileOperations],
-  ["child_process.exec", execOperations],
-  ["detached process-group spawn", (executable: string) => groupOperations(executable, ["-c"])],
-  ["actor process-worker spawnDetached", workerOperations("actor")],
-  ["task process-worker spawnDetached", workerOperations("task-agent")],
+  ["Bash exec adapter", execOperations],
+  ["Bash process-group spawn", (executable: string) => groupOperations(executable, ["-c"])],
 ] as const;
 
 const invoke = async (ops: BashOperations, command: string, cwd: string, env?: NodeJS.ProcessEnv) => {
@@ -103,7 +60,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe.skipIf(process.platform !== "linux")("common Landlock launch boundary across process routes", () => {
+describe.skipIf(process.platform !== "linux")("Bash Landlock operations wrapper", () => {
   beforeAll(async () => { expect(Number((await executeFile(helper, ["--abi"])).stdout)).toBeGreaterThanOrEqual(4); });
 
   describe.each(routes)("%s", (_route, operations) => {
@@ -148,7 +105,7 @@ describe.skipIf(process.platform !== "linux")("common Landlock launch boundary a
     });
   });
 
-  it.each(["actor", "task-agent"])("%s-shaped descendants inherit confinement across exec and spawn; a grant is allowed/logged", async role => {
+  it.each(["actor", "task-agent"])("Bash descendants with %s role inherit confinement across exec and spawn", async role => {
     const h = fixture();
     // A benign worker fixture executes actual Node execFileSync/spawnSync child paths;
     // no model, credentials or agent session is launched.

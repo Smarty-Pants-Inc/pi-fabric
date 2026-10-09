@@ -5,7 +5,11 @@ This opt-in Linux feature confines **local `pi.bash` calls through Fabric**
 independent early warning. Native tools outside Fabric, `user_bash`, direct
 `extensions.*`, PowerShell, and trusted Node/Bun/CPython executor escape hatches
 are **not** covered. This is a filesystem safety boundary, not a hostile-code or
-whole-session sandbox. Do not advertise those other execution paths as confined.
+whole-session sandbox. `enforce` applies to the Bash route only: actor/task launches,
+process transports and executor runtimes are not Landlock-enforced. Non-Bash
+enforcement is tracked in [smarty-dev#7935](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7935).
+Reserved `PI_FABRIC_LANDLOCK_*` controls are scrubbed at those child-launch
+boundaries; environment scrubbing is not kernel confinement.
 
 ## Modes and the honest trial
 
@@ -60,9 +64,9 @@ process, and runs the command **confined**; its journal event is `enforce`, not
 or making the policy missing, unsafe or unstable revokes escape authority for
 already-running lanes.
 
-Escape handling lives in the common Landlock operations wrapper, not the
-`pi.bash` action-name branch: every exec/spawn adapter using that wrapper gets
-the same decision. It runs after cooperative preparation and strips repeated
+Escape handling lives in the Bash Landlock operations wrapper, after the
+`pi.bash` route selects it. Its decision does not enforce the production
+actor/task, process-transport or executor launch routes. It runs after cooperative preparation and strips repeated
 leading assignments after exact trusted PID/middleware decorations. Explicit or
 inherited child environment `PI_FABRIC_LANDLOCK_ESCAPE=1` requests the same
 root-gated escape. The reserved variable is removed from child environment for

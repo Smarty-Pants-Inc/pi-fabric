@@ -1,3 +1,4 @@
+import { bashProcessEnvironment, childProcessEnvironment } from "./atomic-write.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -198,7 +199,7 @@ export const groupOperations = (shell: string, args: string[]): BashOperations =
       exitHook = true; // as Pi does for its tracked detached children
       process.once("exit", () => { for (const pgid of foreground) try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } });
     }
-    const child = spawn(shell, [...args, command], { cwd, detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(shell, [...args, command], { cwd, detached: true, env: bashProcessEnvironment(env), stdio: ["ignore", "pipe", "pipe"] });
     const pgid = child.pid;
     // S5: kill/exit custody is established before any fallible observer (ledger) I/O.
     if (pgid) foreground.add(pgid);
@@ -468,7 +469,8 @@ export class LandlockBashConfinement {
       if (this.#closed) throw new Error("Landlock confinement is closed; refusing a late launch");
       // All callers decide here, after spawnHook/middleware preparation. Never trust
       // a provider-side escape boolean or pass a reserved assignment into the shell.
-      const env: NodeJS.ProcessEnv = { ...(options.env ?? process.env), TMPDIR: this.#tmpdir };
+      const requestedEnv = options.env ?? process.env;
+      const env: NodeJS.ProcessEnv = { ...childProcessEnvironment(requestedEnv), TMPDIR: this.#tmpdir };
       // PID tracking and cooperative commandPrefix decoration precede the user
       // command. Peel only exact host-supplied prefixes, then restore them after
       // consuming the control assignment; never inspect arbitrary shell bodies.
@@ -477,14 +479,11 @@ export class LandlockBashConfinement {
       for (const prefix of commandPrefixes) {
         if (prefix && body.startsWith(prefix)) { decoration += prefix; body = body.slice(prefix.length); }
       }
-      const decision = landlockCommand(body, getSettings()?.allowEscape, env.PI_FABRIC_LANDLOCK_ESCAPE === "1");
+      const decision = landlockCommand(body, getSettings()?.allowEscape, requestedEnv.PI_FABRIC_LANDLOCK_ESCAPE === "1");
       const { escape } = decision;
       const launchCommand = decoration + decision.command;
       // Consume the control flag even for an authorized escape: descendants must
       // not turn one granted command into implicit, recursively requested escapes.
-      delete env.PI_FABRIC_LANDLOCK_ESCAPE;
-      delete env.PI_FABRIC_LANDLOCK_SHELL;
-      delete env.PI_FABRIC_LANDLOCK_WRITES;
       // Escape logging is mandatory and happens before spawn. Do not log command
       // text (it may contain secrets); record a digest and nested tool correlation.
       const auditDir = path.join(this.cwd, ".pi");

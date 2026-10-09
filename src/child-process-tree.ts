@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "./core/atomic-write.js";
 import { spawn, type ChildProcess } from "node:child_process";
 
 const treeAlarm = (reason: string): void => {
@@ -89,7 +90,7 @@ export const terminateWindowsTree = (
     let killer: ChildProcess;
     try {
       killer = spawn(["task", "kill"].join(""), ["/pid", String(child.pid), "/T", "/F"], {
-        windowsHide: true, stdio: "ignore",
+        env: childProcessEnvironment(), windowsHide: true, stdio: "ignore",
       });
     } catch {
       fence("Windows tree helper could not start"); attemptClosed(); return;

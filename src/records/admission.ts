@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { execFile } from "node:child_process";
 
 // Record admission gate (smarty-dev#754, contract C2): refuse new records while the gap-free,
@@ -89,7 +90,7 @@ const execFileRunner: CommandRunner = (command, options) =>
 			args,
 			{
 				// ponytail: env extends the process environment so PATH/HOME still reach wal-g.
-				env: options.env ? { ...process.env, ...options.env } : process.env,
+				env: childProcessEnvironment(options.env ? { ...process.env, ...options.env } : process.env),
 				timeout: options.timeoutMs,
 				maxBuffer: 16 * 1024 * 1024,
 				encoding: "utf8",

@@ -20,6 +20,7 @@ import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import type { LandlockBashConfinement, LandlockSettings } from "../core/landlock.js";
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
@@ -468,7 +469,9 @@ export class PiToolsProvider implements FabricProvider {
     const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
     if (name === "bash") {
       const options = middleware?.options;
-      let local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      const nativeLocal = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      let local: typeof nativeLocal = { exec: (command, launchCwd, launchOptions) =>
+        nativeLocal.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) };
       const landlockSettings = this.#getLandlockSettings?.();
       if (process.platform === "linux" && landlockSettings?.mode === "enforce" && !landlockSettings.disabled) {
         const { LandlockBashConfinement, groupOperations } = await import("../core/landlock.js");
@@ -499,8 +502,10 @@ export class PiToolsProvider implements FabricProvider {
       if (job.options.monitor) throw new Error("PowerShell monitors require host shell operations support");
       return this.#definitionFor(name, args);
     }
+    const nativeOperations = operationsFactory();
     return create(cwd, {
-      operations: trackShellOperations(operationsFactory(), job, "powershell"),
+      operations: trackShellOperations({ exec: (command, launchCwd, launchOptions) =>
+        nativeOperations.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) }, job, "powershell"),
     });
   }
 

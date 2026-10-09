@@ -9,7 +9,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { SqliteStateBackend } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshStoreOptions } from "../src/mesh/store.js";
-import { publicationGeneration } from "../src/topology/publication-generation.js";
+import { observeActorOwnership, ownershipPointReads, publicationGeneration } from "../src/topology/publication-generation.js";
 
 // pi-fabric#640 review round 1, P1: on SQLite, state commits never touch state.json, so a
 // publication generation stamped from state.json let ActorManager's registry-save validation pass
@@ -31,6 +31,82 @@ const ownershipChange = (mesh: MeshStore) => mesh.put({ key: "topology/hosts/oth
 const actorOwnershipChange = (mesh: MeshStore, actorId: string) => mesh.put({
   key: `topology/participants/${createHash("sha256").update(actorId).digest("hex")}`, identity: owner,
   value: { format: 1, id: actorId, kind: "actor", rootId: "session:gen", ownerHostId: "session:gen", residency: "session" } });
+
+/** smarty-dev#6477: counts full-state reads (a fresh snapshot, a prefix scan, a SQLite export) on `mesh`. */
+const fullReads = (mesh: MeshStore) => {
+  let count = 0;
+  const spies: Array<{ mockRestore(): void }> = [];
+  const wrap = <T extends object>(target: T, name: string) => {
+    const real = (target as any)[name];
+    if (typeof real !== "function") return;
+    spies.push(vi.spyOn(target as any, name).mockImplementation(function (this: unknown, ...args: unknown[]) { count++; return real.apply(this, args); }));
+  };
+  for (const name of ["stateToken", "listAll", "listAllShared", "list"]) wrap(mesh, name);
+  const backend = mesh.stateBackendHandle;
+  if (backend instanceof SqliteStateBackend) { wrap(backend, "stateToken"); wrap(backend.store, "exportState"); wrap(backend.store, "listAll"); }
+  return { count: () => count, restore: () => { for (const spy of spies.splice(0)) spy.mockRestore(); } };
+};
+const ownerHostKey = (hostId: string) => `topology/hosts/${createHash("sha256").update(hostId).digest("hex")}`;
+const actorParticipant = (mesh: MeshStore, actorId: string, ownerHostId: string) => mesh.put({
+  key: `topology/participants/${createHash("sha256").update(actorId).digest("hex")}`, identity: owner,
+  value: { format: 1, id: actorId, kind: "actor", rootId: "session:gen", ownerHostId, residency: "session" } });
+const ownerHost = (mesh: MeshStore, hostId: string, identityId: string) => mesh.put({ key: ownerHostKey(hostId), identity: owner,
+  value: { format: 1, id: hostId, rootId: "session:gen", identity: { ...owner, id: identityId }, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 } });
+
+describe.each(["sqlite", "file"] as const)("smarty-dev#6477 ownership validation uses point reads (%s)", (stateBackend) => {
+  const options: MeshStoreOptions = { stateBackend };
+  const setup = async () => {
+    const mesh = new MeshStore(path.join(tempRoot(), "mesh"), 64 * 1024, 100, options);
+    closers.push(async () => mesh.closeState());
+    await actorParticipant(mesh, "actor:mine", "host:gen");
+    await ownerHost(mesh, "host:gen", "session:gen");
+    return mesh;
+  };
+
+  it("an unrelated commit moves the stamp; validation passes with no full-state read", async () => {
+    const mesh = await setup();
+    const observed = observeActorOwnership(mesh, ["actor:mine"], ownershipPointReads(mesh));
+    await ownershipChange(mesh);
+    await mesh.put({ key: "work/unrelated", identity: owner, value: { n: 1 } });
+    const full = fullReads(mesh);
+    const get = vi.spyOn(mesh, "get");
+    expect(observed.unchanged()).toBe(true);
+    expect(full.count()).toBe(0);
+    // Exactly the observed keys: participant, owner host record, lineage closure.
+    expect(get.mock.calls.map(([key]) => key.split("/").slice(0, 2).join("/")).sort())
+      .toEqual(["topology/hosts", "topology/lineage-closures", "topology/participants"]);
+    expect(get.mock.calls.every(([, read]) => read?.fresh === true)).toBe(true);
+  });
+
+  it("a concurrent change of the owner's shared host record or the participant vetoes, with no full-state read", async () => {
+    const mesh = await setup();
+    const hostMoved = observeActorOwnership(mesh, ["actor:mine"], ownershipPointReads(mesh));
+    await ownerHost(mesh, "host:gen", "session:gen-2");
+    let full = fullReads(mesh);
+    expect(hostMoved.unchanged()).toBe(false);
+    expect(full.count()).toBe(0);
+    full.restore();
+
+    const participantMoved = observeActorOwnership(mesh, ["actor:mine"], ownershipPointReads(mesh));
+    await actorParticipant(mesh, "actor:mine", "host:elsewhere");
+    full = fullReads(mesh);
+    expect(participantMoved.unchanged()).toBe(false);
+    expect(full.count()).toBe(0);
+    full.restore();
+
+    const closed = observeActorOwnership(mesh, ["actor:mine"], ownershipPointReads(mesh));
+    await mesh.put({ key: `topology/lineage-closures/${createHash("sha256").update("session:gen").digest("hex")}`, identity: owner,
+      value: { closedAt: Date.now() } });
+    expect(closed.unchanged()).toBe(false);
+  });
+
+  it("the observation itself does no full-state read", async () => {
+    const mesh = await setup();
+    const full = fullReads(mesh);
+    observeActorOwnership(mesh, ["actor:mine"], ownershipPointReads(mesh)).unchanged();
+    expect(full.count()).toBe(0);
+  });
+});
 
 describe.each(["sqlite", "file"] as const)("publication generation follows the active state backend (%s)", (stateBackend) => {
   const options: MeshStoreOptions = { stateBackend };
@@ -95,6 +171,7 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
     const realUpdate = ActorRegistryStore.prototype.update;
     const realLock = ActorRegistryStore.prototype.withLock;
     const outcomes: boolean[] = [];
+    let firstValidationFullReads = -1;
     let pending: Promise<unknown> | undefined;
     vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, ...args: any[]) {
       const change = pending;
@@ -111,13 +188,23 @@ describe.each(["sqlite", "file"] as const)("publication generation follows the a
         // revision sees that commit (state.json is untouched), so it must still veto (pi-fabric#640).
         if (outcomes.length === 0 && change === "unrelated") pending = ownershipChange(mesh);
         if (outcomes.length === 0 && change === "owned") pending = actorOwnershipChange(mesh, actor.id);
-        return { ...mutation, validate: () => { const valid = mutation.validate(); outcomes.push(valid); return valid; } };
+        return { ...mutation, validate: () => {
+          // smarty-dev#6477: validation runs under the registry locks; a moved stamp re-reads only
+          // the observed keys (point reads), never a full fresh snapshot of the shared state.
+          const full = fullReads(mesh);
+          const valid = mutation.validate();
+          if (outcomes.length === 0) firstValidationFullReads = full.count();
+          full.restore();
+          outcomes.push(valid);
+          return valid;
+        } };
       });
     } as any);
     await actors.setNice(actor.id, 7);
     // Unchanged: the first validation passes. Changed: it fails, and a fresh selection commits.
     expect(outcomes[0]).toBe(!changed);
     expect(outcomes.at(-1)).toBe(true);
+    expect(firstValidationFullReads).toBe(0);
     expect(new ActorRegistryStore(path.join(dir, "actors")).records().find(row => row.id === actor.id)?.nice).toBe(7);
   });
 });

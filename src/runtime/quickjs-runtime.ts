@@ -545,6 +545,7 @@ globalThis.agents = Object.freeze({
   createActor: (args) => __createActor(args, "agents.createActor"),
   ask: (target, message) => __call("agents.ask", __messageArgs(target, message)),
   tell: (target, message) => __call("agents.tell", __messageArgs(target, message)),
+  send: (target, message) => __call("agents.send", __messageArgs(target, message)),
   steer: (target, message) => __call("agents.steer", __messageArgs(target, message)),
   followUp: (target, message) => __call("agents.followUp", __messageArgs(target, message)),
   cancelFollowUp: (args) => __call("agents.cancelFollowUp", args),

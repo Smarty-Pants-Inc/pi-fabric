@@ -1,5 +1,6 @@
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
+import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -64,6 +65,7 @@ export interface FabricControlCommand {
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
   cancelCommandId?: string;
@@ -192,6 +194,7 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
+    (data.priority !== undefined && (data.priority !== "interrupt" || data.operation !== "steer")) ||
     (data.bindingProvenance !== undefined &&
       (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
         typeof data.bindingProvenance.rootId !== "string")) ||
@@ -260,6 +263,7 @@ export interface FabricControlInput {
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
 }
@@ -414,6 +418,7 @@ export class FabricControlPlane {
     ownerIdentityId = ownerHostId,
     options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    assertSteerPriority(input.priority, operation);
     // One logical message key survives both observation retries and a proven-notRun resend.
     options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID() };
     let notRunAttempt = 0;
@@ -641,6 +646,7 @@ export class FabricControlPlane {
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+          ...(input.priority !== undefined ? { priority: input.priority } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
           ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestedAt: committedAt,

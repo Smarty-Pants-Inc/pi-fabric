@@ -25,6 +25,7 @@ import type {
   FabricAgentMessageResult,
   FabricMainAgentTarget,
   FabricMainAgentBindingResult,
+  FabricSteerPriority,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -375,7 +376,7 @@ const actorRequest = (
 // lexicon; no agents-specific table remains.
 export const normalizeAgentsArgs = actionArgNormalizer(() => AGENTS_ACTION_DESCRIPTORS);
 
-const MESSAGE_ACTIONS = new Set(["ask", "tell", "steer", "followUp"]);
+const MESSAGE_ACTIONS = new Set(["ask", "tell", "send", "steer", "followUp"]);
 
 // Messaging calls accept "to" (the mesh.publish spelling) as an alias of "id".
 // sessionId is rejected with the exact fix: the generic synonym repair would
@@ -1284,6 +1285,7 @@ export class AgentsProvider implements FabricProvider {
           { binding: actorRunBinding(args),
             ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
+      case "send":
       case "steer":
         return this.routeMessage(
           String(args.id),
@@ -1291,7 +1293,8 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "steer",
           context,
-          { ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
+          { ...(args.priority === undefined ? {} : { priority: args.priority as FabricSteerPriority }),
+            ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "cancelFollowUp":
         return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
@@ -1645,6 +1648,7 @@ export class AgentsProvider implements FabricProvider {
     options: {
       from?: MeshIdentity;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;

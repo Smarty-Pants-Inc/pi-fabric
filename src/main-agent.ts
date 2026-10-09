@@ -20,6 +20,14 @@ const promptPending = (ctx: ExtensionContext): boolean =>
 const isCompactionCancelled = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true && !(signal.reason instanceof DOMException && signal.reason.name === "TimeoutError");
 export type FabricAgentMessageDelivery = "steer" | "followUp";
+export type FabricSteerPriority = "interrupt";
+
+/** Public and owner-side validation: priority never changes a followUp into a steer. */
+export function assertSteerPriority(priority: unknown, delivery: string): asserts priority is FabricSteerPriority | undefined {
+  if (priority !== undefined && (priority !== "interrupt" || delivery !== "steer")) {
+    throw new Error('priority must be "interrupt" and is supported only for a steer to Main');
+  }
+}
 /** How a direct agent message goes to Pi: a nextTurn one waits for the next user prompt. */
 export type FabricMainAgentDelivery = FabricAgentMessageDelivery | "nextTurn";
 const DIRECT_DELIVERIES: ReadonlySet<unknown> = new Set(["steer", "followUp", "nextTurn"]);
@@ -51,6 +59,7 @@ export interface FabricMainAgentDeliveryRequest {
   principal?: FabricPrincipal | undefined;
   message: string;
   delivery: FabricMainAgentDelivery;
+  priority?: FabricSteerPriority;
   triggerTurn?: boolean;
   data?: unknown;
   /**
@@ -317,6 +326,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   #consumedDirty = false;
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
+  readonly #tools = new Set<string>();
+  // Only live admission may abort. Journal replay is an ordinary steer, never another abort.
+  readonly #interrupts = new Set<string>();
   #flushMs = 0;
   #flushAll = false;
   #stallS = 600;
@@ -475,6 +487,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Escape can halt an idle Main without producing an aborted run event. */
   halt(): void {
+    this.#interrupts.clear();
     this.#halted = true;
     this.#providerReleaseUntil = undefined;
     this.#consumedDirty = true;
@@ -485,6 +498,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
+    assertSteerPriority(request.priority, request.delivery);
+    if (request.priority && request.triggerTurn === false) throw new Error("interrupt priority requires a triggering steer");
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     if (this.#inboxFence && !this.#inboxFence.active()) throw new Error("Main root rotated; address its successor");
     const message = request.message.trim();
@@ -529,6 +544,22 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#held.push(item);
       try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
       return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
+    }
+    if (request.priority === "interrupt" && triggerTurn && this.#context &&
+      (this.#interrupts.size > 0 || (!this.#context.signal?.aborted && !this.#context.isIdle() && this.#tools.size > 0))) {
+      if (typeof this.#context.abort !== "function") throw new Error("Main host has no tool abort hook");
+      item.deliverAs = "steer";
+      item.triggerTurn = true;
+      this.#admit(item);
+      const index = this.#interrupts.size;
+      this.#held.splice(index, 0, item);
+      try { this.#save(); } catch (error) { this.#held.splice(index, 1); throw error; }
+      const abort = this.#interrupts.size === 0;
+      this.#interrupts.add(item.id);
+      // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
+      // agent_settled hands this message over only after all tool results are persisted.
+      if (abort) this.#context.abort();
+      return { queued: true, messageId: item.id, routed: "main", triggered: false, reason: "interrupt pending settlement" };
     }
     let triggered: boolean | undefined = false;
     let replaced: HeldAgentMessage | undefined;
@@ -1026,24 +1057,40 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#suspended = false;
       this.#trySave();
     });
+    on("tool_execution_start", (event: { toolCallId: string }, ctx) => {
+      this.#context = ctx;
+      this.#tools.add(event.toolCallId);
+    });
+    on("tool_execution_end", (event: { toolCallId: string }) => { this.#tools.delete(event.toolCallId); });
     // Set gates before either drain branch can reconcile a lost Pi handoff. A turn error
     // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
     on("turn_end", (event: { message?: { stopReason?: string } }, ctx) => {
       const reason = event.message?.stopReason;
       this.#compactionDecline = undefined;
-      if (ctx.signal?.aborted || reason === "aborted") this.halt();
+      if (ctx.signal?.aborted || reason === "aborted") { if (!this.#interrupts.size) this.halt(); }
       else if (reason === "error") this.#recordProviderFailure(true);
       else if (reason !== undefined) { this.#recoverProvider(); this.#suspended = false; }
     });
     const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
       if (ctx.signal?.aborted || isCompactionCancelled(this.#compactionDecline) ||
-        (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
+        (event.outcome === "aborted" && !this.#compactionDecline)) { if (!this.#interrupts.size) this.halt(); }
       else if (event.outcome === "error") this.#recordProviderFailure();
       else if (event.outcome === "completed") this.#recoverProvider();
       // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
     };
     on("agent_before_settle", settleGate);
     on("agent_settled", settleGate);
+    let interruptedSettle = false;
+    on("agent_settled", (_event, ctx) => {
+      this.#context = ctx;
+      this.#tools.clear();
+      interruptedSettle = this.#interrupts.size > 0;
+      while (this.#held[0] && this.#interrupts.has(this.#held[0].id)) {
+        const id = this.#held[0].id;
+        if (!this.#handOver(1, "steer", true, false)) break;
+        this.#interrupts.delete(id);
+      }
+    });
     // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
     // decline as aborted, but only the operation signal proves an owner cancellation.
     on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
@@ -1152,7 +1199,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#confirm();
       const completed = !this.#suspended && event.outcome === "completed";
       this.#suspended = false;
-      this.#release(completed);
+      // Pi defers the interrupt prompt until every settled handler returns. Keep older
+      // followUps held for that new run, rather than appending them ahead of the HOLD.
+      if (!interruptedSettle) this.#release(completed);
     });
     // Manual /compact makes Main busy without a run, so no settle follows it. After a compaction
     // that completed, wake Main for what it held; after one that was cancelled or failed, append
@@ -1174,6 +1223,8 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Stop holding; any held followUps go to Pi's own followUp queue, as before the drain. */
   closeFollowUpDrain(): void {
+    this.#tools.clear();
+    this.#interrupts.clear();
     this.#bindingsLive = false;
     this.#stopWake();
     for (const off of this.#unsubscribe.splice(0)) off();
@@ -1475,7 +1526,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   ): boolean | undefined {
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
-    triggerTurn &&= !this.#halted && !this.#providerBackoffActive() && !this.#context?.signal?.aborted;
+    const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
+    triggerTurn &&= !this.#halted && !this.#providerBackoffActive() && (!this.#context?.signal?.aborted || interrupt);
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.

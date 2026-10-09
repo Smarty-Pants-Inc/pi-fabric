@@ -5,11 +5,12 @@ import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import type { MeshStateEntry } from "../mesh/store.js";
+import { withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
 // host now also renews its lease in a file of its own, replaced by an atomic rename without
-// the lock; one host writes each file.
+// the shared lock. Directory claim/renew/remove now serialize by host incarnation (#7313).
 
 /**
  * Host-reserved historical policy key (also used for participant-file migration).
@@ -119,6 +120,61 @@ export const hostLeasePath = (meshRoot: string, hostId: string): string =>
 
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
   writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
+
+export class FabricHostLeaseSupersededError extends Error {
+  override readonly name = "FabricHostLeaseSupersededError";
+  readonly code = "FABRIC_HOST_LEASE_SUPERSEDED";
+  readonly retryable = false;
+  constructor(readonly hostId: string, readonly identityId: string, readonly startedAt: number | undefined) {
+    super(`Fabric host ${hostId}: lease incarnation ${identityId}/${startedAt} no longer owns the lease`);
+  }
+}
+
+export const sameHostLeaseOwner = (left: FabricHostLease, right: FabricHostLease): boolean =>
+  left.id === right.id && left.rootId === right.rootId && left.identityId === right.identityId &&
+  left.startedAt === right.startedAt;
+
+/** Initial claim and renewal are distinct. Once claimed, a missing/different lease is terminal;
+ * an older instance cannot claim over a newer incarnation, even before its first shared commit.
+ * SQLite still uses this JSON lease path (state.db stores keyed state, not host leases). */
+export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease,
+  options: HostLeaseLockOptions & { claim?: boolean } = {}): Promise<void> =>
+  withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {
+    const file = hostLeasePath(mesh.root, lease.id);
+    // Unreadable/invalid is unknown, never absence that authorizes a takeover.
+    let current: FabricHostLease | undefined;
+    try {
+      current = leaseOf(readFileRetrying(file), fileName(lease.id));
+      if (!current) throw new Error(`Invalid host lease: ${file}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const owned = current !== undefined && sameHostLeaseOwner(current, lease);
+    const newer = current?.startedAt !== undefined &&
+      (lease.startedAt === undefined || current.startedAt >= lease.startedAt);
+    if (options.claim ? current && !owned && newer : !owned) {
+      throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
+    }
+    writeHostLease(mesh.root, { ...lease,
+      ...(current && owned && lease.reloadUntil === undefined ? {
+        updatedAt: Math.max(lease.updatedAt, current.updatedAt),
+        expiresAt: Math.max(lease.expiresAt, current.expiresAt),
+        ...(lease.session && current.session?.id === lease.session.id && current.session.startedAt === lease.session.startedAt ? {
+          session: { ...lease.session, updatedAt: Math.max(lease.session.updatedAt, current.session.updatedAt),
+            expiresAt: Math.max(lease.session.expiresAt, current.session.expiresAt) },
+        } : {}),
+      } : {}),
+    });
+  }, options);
+
+/** Directory close uses the same claim/renew receipt, so it cannot remove a successor. */
+export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHostLease): Promise<boolean> =>
+  withHostLeaseLock(mesh, hostLeasePath(mesh.root, owner.id), () => {
+    const current = readHostLeaseCurrent(mesh.root, owner.id);
+    if (!current || !sameHostLeaseOwner(current, owner)) return false;
+    fs.rmSync(hostLeasePath(mesh.root, owner.id), { force: true });
+    return true;
+  });
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });

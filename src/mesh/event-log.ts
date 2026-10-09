@@ -79,6 +79,8 @@ export interface MeshTailResult {
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
+const DEFAULT_DEDUPE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_DEDUPE_RECEIPTS = 100_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 /** First read of the live log's last line (see #readLastEventSequence). */
@@ -142,6 +144,10 @@ export class MeshDedupeRecoveryError extends Error {
 export interface EventLogOptions {
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
+  /** Receipt lifetime from publication; enforced at event-log compaction. Default 7 days. */
+  dedupeReceiptTtlMs?: number;
+  /** Compaction evicts oldest receipts above this cap; unresolved intents are protected. Default 100,000. */
+  maxDedupeReceipts?: number;
 }
 
 export class EventLog {
@@ -154,6 +160,8 @@ export class EventLog {
   readonly #generationPath: string;
   readonly #maxEventLogBytes: number;
   readonly #retainedEventLogBytes: number;
+  readonly #dedupeReceiptTtlMs: number;
+  readonly #maxDedupeReceipts: number;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
@@ -178,6 +186,14 @@ export class EventLog {
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#counterPath = path.join(root, "sequence");
     this.#generationPath = path.join(root, "generation");
+    this.#dedupeReceiptTtlMs = options.dedupeReceiptTtlMs ?? DEFAULT_DEDUPE_RECEIPT_TTL_MS;
+    this.#maxDedupeReceipts = options.maxDedupeReceipts ?? DEFAULT_MAX_DEDUPE_RECEIPTS;
+    if (!Number.isSafeInteger(this.#dedupeReceiptTtlMs) || this.#dedupeReceiptTtlMs < 1) {
+      throw new Error("dedupeReceiptTtlMs must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.#maxDedupeReceipts) || this.#maxDedupeReceipts < 1) {
+      throw new Error("maxDedupeReceipts must be a positive safe integer");
+    }
     this.#maxEventLogBytes = Math.min(
       CURSOR_OFFSET_BASE - 1,
       Math.max(maxEventBytes + 2, Math.floor(options.maxEventLogBytes ?? DEFAULT_MAX_EVENT_LOG_BYTES)),
@@ -1172,6 +1188,40 @@ export class EventLog {
     };
   }
 
+  /** Maintenance only: receipt age is the durable publication time, not a recovery's mtime. */
+  #pruneDedupeReceipts(): void {
+    const directory = path.join(this.root, "event-receipts");
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
+      .map(name => name.slice(0, -".pending.json".length)));
+    const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
+      const file = path.join(directory, name);
+      const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
+      if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
+          typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
+          !Number.isFinite(event.createdAt)) {
+        throw new Error("Invalid event publication receipt");
+      }
+      return { file, createdAt: event.createdAt, sequence: event.sequence };
+    });
+    candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
+    const now = Date.now();
+    let count = receipts.length;
+    try {
+      for (const receipt of candidates) {
+        if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= this.#maxDedupeReceipts) break;
+        fs.rmSync(receipt.file, { force: true });
+        count--;
+      }
+    } finally {
+      // Persist removals once per pass, including any completed before a later unlink failed.
+      if (count < receipts.length) syncPathNamespace(directory);
+    }
+  }
+
   #compactEventLog(): void {
     // Never rewrite away an event named by a durable intent. Resolve every intent while
     // the publish lock is held, before taking the retained tail snapshot.
@@ -1181,6 +1231,7 @@ export class EventLog {
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
       this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
+      this.#pruneDedupeReceipts();
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,

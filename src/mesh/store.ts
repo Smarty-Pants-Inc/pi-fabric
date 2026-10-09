@@ -232,6 +232,10 @@ export interface MeshStoreOptions {
   lockProtocol?: MeshLockProtocol;
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
+  /** Receipt lifetime from publication; enforced at event-log compaction. Default 7 days. */
+  dedupeReceiptTtlMs?: number;
+  /** Compaction evicts oldest receipts above this cap; unresolved intents are protected. Default 100,000. */
+  maxDedupeReceipts?: number;
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;

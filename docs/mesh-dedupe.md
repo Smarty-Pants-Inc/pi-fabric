@@ -110,7 +110,7 @@ without backfilling or scanning historical segments. Old writers ignore the
 sidecars but do not rewrite committed archive lines. An old pending cutback can
 leave an obsolete sidecar at EOF or at a replacement event; direct lookup handles
 those positive absence proofs. New compaction still settles
-all pending intents before rewriting and durably writes retained bytes/rename.
+all pending intents before pruning receipts or rewriting and durably writes retained bytes/rename.
 Tail repair only removes incomplete appends. An abandoned sequence is not reused.
 
 Normal new-key publish work is independent of event-history size. The ordinary
@@ -144,6 +144,37 @@ The deliberate preference is duplicate-free archive delivery over destructive lo
 not replaying an old sequence at the tail. False markers are advisory confirmations
 left by writers that old recovery cannot update, not proof of non-publication.
 
+## Bounded receipt retention and expiry
+
+Host-owned `MeshStoreOptions` (also accepted by `EventLogOptions`) configure:
+
+- `dedupeReceiptTtlMs`: **7 days** by default (`604800000` ms), covering the
+  forwarder restart-duplicate window of smarty-dev#7892. Age is measured from the
+  receipt event's persisted `createdAt`, not file mtime or recovery time.
+- `maxDedupeReceipts`: **100,000** by default. If the directory is over this cap,
+  evict the oldest publications first, even if they are younger than the TTL.
+  Equal publication times are ordered by sequence, then receipt filename.
+
+Both options must be positive safe integers. Both bounds are enforced under the
+mesh lock during the **existing byte-triggered event-log compaction pass**; no
+new timer, receipt-directory scan on ordinary publication, or history lookup is
+added. Compaction first settles all pending intents, then expires receipts at or
+beyond their TTL and evicts oldest remaining receipts until the count cap is met.
+Unresolved pending intents and their receipts are never evicted; failed settlement
+blocks compaction and pruning. Protected receipts may exceed the cap rather than
+lose recovery evidence. Receipt removals are namespace-synced before compaction
+completes. Receipts younger than the TTL remain untouched when below the cap.
+
+**Expiry is maintenance-driven, not a wall-clock timer:** a receipt remains
+authoritative until a compaction pass removes it. Receipts created between passes
+can temporarily exceed the count cap. Once TTL expiry or count eviction removes
+a receipt, that key is **NEW** on its next publication: it gets a new event ID and
+sequence, even if the original event still exists in the live log or archive.
+There is no historical search or receipt resurrection from archived events.
+Choose limits large enough for the producer's uncertain-reply/restart retry
+window; count pressure can shorten that window below seven days. Durable intent
+recovery is not subject to these retention limits while unresolved.
+
 ## Consumer and rollout contract
 
 On an archived mesh, old writers/compactors may continue to rewrite the live log:
@@ -152,8 +183,8 @@ The archive must remain available and its append-only segment offsets and
 sequence sidecars must be retained. Missing/corrupt sidecars never authorize a
 second publish; they fail closed until repaired. A mesh without an archive
 cannot recover bytes discarded by an old compactor and still requires
-intent-aware compaction. Retain receipts indefinitely. Manual deletion or
-rollback of receipts/archive evidence is not a supported recovery action.
+intent-aware compaction. Receipts have bounded retention as described above. Manual
+deletion or rollback of receipts/archive evidence is not a supported recovery action.
 
 The #460 callers (`src/topology/stall-alarms.ts`) publish only:
 

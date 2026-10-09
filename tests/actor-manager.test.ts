@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -3057,7 +3057,7 @@ describe("ActorManager", () => {
     expect(repeats(cleared.id)).toHaveLength(0);           // a cleared actor never re-alarms
   }, 60_000);
 
-  describe("durable re-alarm stamp (smarty-dev#7782 review c6085914061)", () => {
+  describe("shared re-alarm claim (smarty-dev#7782 review c6085914061, c6086965366)", () => {
     const HOUR = 60 * 60 * 1000;
     const fakeClock = () => {
       const realNow = Date.now.bind(Date);
@@ -3067,6 +3067,7 @@ describe("ActorManager", () => {
     };
     const repeats = (mesh: MeshStore, id: string) => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 100 })
       .filter((event) => (event.data as { actorId?: string }).actorId === id && (event.data as { repeat?: boolean }).repeat);
+    const claim = (mesh: MeshStore, id: string) => mesh.get(actorRealarmKey(id))?.value as { since: number; slot: number; owner: string } | undefined;
     const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
     const block = async (manager: ActorManager) => {
       const actor = await manager.create({ name: "stuck", instructions: "Respond.", responseMode: "directive" });
@@ -3077,18 +3078,37 @@ describe("ActorManager", () => {
       expect(manager.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
       return actor;
     };
-    const persistentManager = (s: ReturnType<typeof setup>, extra: Record<string, unknown> = {}) => {
-      const manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+    const persistentManager = (s: ReturnType<typeof setup>, name = "test", extra: Record<string, unknown> = {}) => {
+      const identity: MeshIdentity = name === "test" ? s.identity : { id: `session:${name}`, name: "main", kind: "main", sessionId: name };
+      const manager = new ActorManager(name, identity, s.mesh, s.meshConfig, s.agents, () => {}, {
         actorRoot: path.join(s.root, "actors"), persistent: true, retentionSweepMs: 20, ...extra,
       });
       actorManagers.push(manager);
       return manager;
     };
-    const stampOnDisk = (s: ReturnType<typeof setup>, id: string) => (JSON.parse(fs.readFileSync(
-      path.join(s.root, "actors", "actors.json"), "utf8")).actors as Array<{ id: string; activationBlocked?: { realarmedAt?: number } }>)
-      .find((record) => record.id === id)?.activationBlocked?.realarmedAt;
+    /** Holds every repeat-alarm publish until release(); counts the attempts. */
+    const gatePublish = (mesh: MeshStore) => {
+      const publish = mesh.publish.bind(mesh);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const state = { calls: 0, release: () => release() };
+      vi.spyOn(mesh, "publish").mockImplementation(async (request) => {
+        if ((request.data as { repeat?: boolean } | undefined)?.repeat) { state.calls++; await gate; }
+        return publish(request);
+      });
+      return state;
+    };
+    const startOwned = async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const owns: Record<string, boolean> = { a: true };
+      const a = persistentManager(s, "a", { canManageActor: () => owns.a });
+      const actor = await block(a);
+      return { s, clock, owns, a, actor };
+    };
 
-    it("(a) a restarted manager keeps the 6 h cap from the persisted stamp", async () => {
+    it("(a)+(g) a restarted manager does not re-alarm the claimed slot, and the next slot alarms", async () => {
       const s = setup(true);
       await s.actors.close();
       const clock = fakeClock();
@@ -3096,48 +3116,37 @@ describe("ActorManager", () => {
       const actor = await block(manager);
       clock.skew = 2 * HOUR + 1_000;
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
-      await waitFor(() => manager.status(actor.id).activationBlocked?.realarmedAt !== undefined);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlocked!.since, owner: s.identity.id });
       await manager.close();
-      expect(stampOnDisk(s, actor.id)).toEqual(expect.any(Number));
       manager = persistentManager(s);
-      expect(manager.status(actor.id).activationBlocked?.realarmedAt).toBe(stampOnDisk(s, actor.id));
       clock.skew += 6 * HOUR - 60_000;
       await settle();
-      expect(repeats(s.mesh, actor.id)).toHaveLength(1);    // its first sweeps do not re-alarm
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);    // its sweeps do not re-alarm slot 0
       clock.skew += 120_000;
       await waitFor(() => repeats(s.mesh, actor.id).length === 2);
-    }, 60_000);
-
-    it("(b) a new owner keeps the 6 h cap from the persisted stamp", async () => {
-      const s = setup(true);
-      await s.actors.close();
-      const clock = fakeClock();
-      const owns = { a: true, b: false };
-      const a = persistentManager(s, { canManageActor: () => owns.a });
-      const b = new ActorManager("b", { id: "session:b", name: "main", kind: "main", sessionId: "b" }, s.mesh, s.meshConfig, s.agents, () => {}, {
-        actorRoot: path.join(s.root, "actors"), persistent: true, retentionSweepMs: 20, canManageActor: () => owns.b,
-      });
-      actorManagers.push(b);
-      const actor = await block(a);
-      clock.skew = 2 * HOUR + 1_000;
-      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
-      await waitFor(() => stampOnDisk(s, actor.id) !== undefined, 10_000);
-      await waitFor(() => b.status(actor.id).activationBlocked?.realarmedAt === stampOnDisk(s, actor.id), 10_000);
-      owns.a = false;
-      owns.b = true;
-      b.listOwned();
-      a.listOwned();
-      clock.skew += 6 * HOUR - 60_000;
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 1 });
       await settle();
-      expect(repeats(s.mesh, actor.id)).toHaveLength(1);    // the new owner's sweeps do not re-alarm
-      clock.skew += 120_000;
-      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
-      await settle();
-      expect(repeats(s.mesh, actor.id).at(-1)!.from).toMatchObject({ id: "session:b" });
       expect(repeats(s.mesh, actor.id)).toHaveLength(2);
     }, 60_000);
 
-    it("(c) a rejected publish writes no stamp, and the next sweep retries and stamps", async () => {
+    it("(b) a new owner does not re-alarm the claimed slot", async () => {
+      const { s, clock, owns, a, actor } = await startOwned();
+      owns.b = false;
+      const b = persistentManager(s, "b", { canManageActor: () => owns.b });
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      owns.a = false; owns.b = true;
+      a.listOwned(); b.listOwned();
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      clock.skew += 6 * HOUR - 60_000;
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+      clock.skew += 120_000;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(repeats(s.mesh, actor.id).at(-1)!.from).toMatchObject({ id: "session:b" });
+    }, 60_000);
+
+    it("(c)+(h) a rejected publish releases the claim, and the next sweep retries and claims", async () => {
       const s = setup(true);
       await s.actors.close();
       const clock = fakeClock();
@@ -3145,22 +3154,25 @@ describe("ActorManager", () => {
       const actor = await block(manager);
       const publish = s.mesh.publish.bind(s.mesh);
       let rejected = 0;
-      let stampAtRetry: number | undefined | null = null;
+      let claimAtRetry: unknown = "unset";
       vi.spyOn(s.mesh, "publish").mockImplementation(async (request) => {
-        if ((request.data as { repeat?: boolean } | undefined)?.repeat) {
-          if (rejected++ === 0) throw new Error("mesh down");
-          stampAtRetry = manager.status(actor.id).activationBlocked?.realarmedAt;
+        if ((request.data as { repeat?: boolean } | undefined)?.repeat && rejected++ === 0) {
+          // Released only after this rejection: read the claim at the retry instead.
+          throw new Error("mesh down");
         }
         return publish(request);
       });
+      const del = s.mesh.delete.bind(s.mesh);
+      vi.spyOn(s.mesh, "delete").mockImplementation(async (input) => {
+        const result = await del(input);
+        if (input.key === actorRealarmKey(actor.id)) claimAtRetry = claim(s.mesh, actor.id);
+        return result;
+      });
       clock.skew = 2 * HOUR + 1_000;
-      await waitFor(() => rejected >= 1);
-      expect(repeats(s.mesh, actor.id)).toHaveLength(0);
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
       expect(rejected).toBe(2);
-      expect(stampAtRetry).toBeUndefined();                 // the rejection wrote no stamp
-      await waitFor(() => manager.status(actor.id).activationBlocked?.realarmedAt !== undefined);
-      await waitFor(() => stampOnDisk(s, actor.id) !== undefined, 10_000);
+      expect(claimAtRetry).toBeUndefined();                  // the rejection released the claim
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0 });
       await settle();
       expect(repeats(s.mesh, actor.id)).toHaveLength(1);
     }, 60_000);
@@ -3171,24 +3183,75 @@ describe("ActorManager", () => {
       const clock = fakeClock();
       const manager = persistentManager(s);
       const actor = await block(manager);
-      const publish = s.mesh.publish.bind(s.mesh);
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => { release = resolve; });
-      let calls = 0;
-      vi.spyOn(s.mesh, "publish").mockImplementation(async (request) => {
-        if ((request.data as { repeat?: boolean } | undefined)?.repeat) { calls++; await gate; }
-        return publish(request);
-      });
+      const gated = gatePublish(s.mesh);
       clock.skew = 2 * HOUR + 1_000;
-      await waitFor(() => calls === 1);
+      await waitFor(() => gated.calls === 1);
       await settle();                                        // ~a dozen 20 ms sweeps
-      expect(calls).toBe(1);
-      expect(manager.status(actor.id).activationBlocked?.realarmedAt).toBeUndefined();
-      release();
-      await waitFor(() => manager.status(actor.id).activationBlocked?.realarmedAt !== undefined);
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
       await settle();
-      expect(calls).toBe(1);
+      expect(gated.calls).toBe(1);
+    }, 60_000);
+
+    it("(e) a handoff while the old owner's publish is pending publishes once", async () => {
+      const { s, clock, owns, a, actor } = await startOwned();
+      owns.b = false;
+      const b = persistentManager(s, "b", { canManageActor: () => owns.b });
+      const gated = gatePublish(s.mesh);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => gated.calls === 1);
+      owns.a = false; owns.b = true;                         // A's publish is still pending
+      a.listOwned(); b.listOwned();
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      await settle();
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      await settle();
+      expect(gated.calls).toBe(1);
       expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+    }, 60_000);
+
+    it("(f)+(g) a restart before any save does not re-alarm the slot; the next slot does", async () => {
+      const { s, clock, owns, actor } = await startOwned();
+      const gated = gatePublish(s.mesh);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => gated.calls === 1);
+      // A dies mid-publish: never closed, nothing saved after the claim. Its restart takes over.
+      owns.a = false;
+      const restarted = persistentManager(s, "a", { canManageActor: () => true });
+      expect(restarted.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      await settle();
+      expect(gated.calls).toBe(1);
+      gated.release();
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1);
+      clock.skew += 6 * HOUR;
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(gated.calls).toBe(2);
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(2);
+    }, 60_000);
+
+    it("clears the claim when the block clears, and a new block episode claims and alarms again", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const manager = persistentManager(s);
+      const actor = await block(manager);
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => claim(s.mesh, actor.id) !== undefined && repeats(s.mesh, actor.id).length === 1);
+      await manager.ask(actor.id, "all good");
+      await waitFor(() => claim(s.mesh, actor.id) === undefined);
+      expect(manager.status(actor.id).activationBlocked).toBeUndefined();
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+        await manager.ask(actor.id, "FAIL_DIRECTIVE").catch(() => undefined);
+        await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
+      }
+      const since = manager.status(actor.id).activationBlocked!.since;
+      clock.skew += 2 * HOUR + 1_000;                        // over the deleted claim's tombstone
+      await waitFor(() => repeats(s.mesh, actor.id).length === 2);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ since, slot: 0 });
     }, 60_000);
   });
 

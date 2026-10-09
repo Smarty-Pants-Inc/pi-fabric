@@ -330,7 +330,7 @@ export interface FabricActorInfo {
   capabilityDigest?: string;
   missingCapabilities?: string[];
   /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number; /** Last repeat alarm (ms). */ realarmedAt?: number };
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   validWhile?: FabricActorValidWhileSource;
   queued: number;
   messages: number;

@@ -21,7 +21,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -171,8 +171,7 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** realarmedAt: last published repeat alarm (smarty-dev#7782); persisted, so a restart or new owner keeps the cap. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number; realarmedAt?: number };
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
@@ -396,6 +395,8 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
+export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
@@ -543,8 +544,6 @@ export class ActorManager {
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
-  /** Actors with a repeat activation-block alarm being published: one publish per actor at a time. */
-  readonly #blockRealarmInFlight = new Set<string>();
   readonly #delivered = new Set<string>();
   #closing = false;
   #closePromise: Promise<void> | undefined;
@@ -2340,6 +2339,7 @@ export class ActorManager {
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
+      await this.mesh.delete({ key: actorRealarmKey(cleanup.id) }).catch(() => undefined);
       if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
@@ -3112,7 +3112,11 @@ export class ActorManager {
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
-          delete actor.activationBlocked;
+          if (actor.activationBlocked) {
+            delete actor.activationBlocked;
+            // Best effort: a stale claim names an older since, so it never gates a new block.
+            void this.mesh.delete({ key: actorRealarmKey(actor.id) }).catch(() => undefined);
+          }
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
@@ -3335,7 +3339,6 @@ export class ActorManager {
     actor.activationBlocked = {
       reason, code, since: previous?.code === code ? previous.since : Date.now(),
       count: previous?.code === code ? previous.count + 1 : 1,
-      ...(previous?.code === code && previous.realarmedAt !== undefined ? { realarmedAt: previous.realarmedAt } : {}),
     };
     actor.updatedAt = Date.now();
     void this.#publishPresence(actor).catch(() => undefined);
@@ -4058,28 +4061,47 @@ export class ActorManager {
   }
 
   // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
+  // One durable mesh claim per actor gates each 6 h slot of a block episode, across managers,
+  // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes.
   #realarmBlockedActivation(actor: ManagedActor, now: number): void {
     const blocked = actor.activationBlocked;
     if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
-    if (blocked.realarmedAt !== undefined && now - blocked.realarmedAt < ACTOR_BLOCK_REALARM_EVERY_MS) return;
-    if (this.#blockRealarmInFlight.has(actor.id)) return;
-    this.#blockRealarmInFlight.add(actor.id);
-    // ponytail: publish directly, like the ops.owner alarm: #publishNotification resolves after
-    // a first attempt even when that attempt failed and was dropped, so it cannot gate the stamp.
-    void this.mesh.publish({
-      topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
-        since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
-        pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since },
-    }).then(() => {
-      // Stamp only a published alarm, on the same block this owner still holds; the
-      // durable registry save carries it to a restarted or next owner. A rejection
-      // leaves the stamp unchanged, so the next sweep retries.
-      if (this.#closing || this.#actors.get(actor.id) !== actor || actor.activationBlocked !== blocked ||
-        !this.#canManageCached(actor.id)) return;
-      blocked.realarmedAt = now;
-      this.#scheduleRegistrySave(true);
-    }, () => undefined).finally(() => this.#blockRealarmInFlight.delete(actor.id));
+    const slot = Math.floor((now - blocked.since - ACTOR_BLOCK_REALARM_AFTER_MS) / ACTOR_BLOCK_REALARM_EVERY_MS);
+    const key = actorRealarmKey(actor.id);
+    const covers = (entry: MeshStateEntry | undefined): boolean => {
+      const claimed = entry?.value as { since?: unknown; slot?: unknown } | undefined;
+      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot;
+    };
+    if (covers(this.mesh.get(key))) return;
+    const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+      since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
+    void (async () => {
+      // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
+      // tombstone, so a claim removed when an earlier block cleared can be taken again.
+      let previous: MeshStateEntry | undefined;
+      const results = await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: (view) => {
+        const current = view.get(key);
+        if (covers(current)) return [];
+        previous = current;
+        return [{ kind: "put", key, ifVersion: view.version(key), onConflict: "skip",
+          value: { since: blocked.since, slot, at: now, owner: this.identity.id } }];
+      } }).catch(() => [] as MeshBatchResult[]);
+      // No applied claim: another sweep or owner holds this slot, and only it publishes.
+      const claim = results.find((result) => result.key === key && result.applied);
+      if (!claim) return;
+      // ponytail: claim before publish. A crash between the two loses this slot's alarm and the
+      // next slot alarms; for a repeat alarm that is the safe direction (never a duplicate).
+      // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
+      try {
+        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity, data });
+      } catch {
+        // Release the slot, fenced to our claim, so the next sweep retries.
+        await (previous
+          ? this.mesh.put({ key, identity: previous.updatedBy, value: previous.value, ifVersion: claim.version })
+          : this.mesh.delete({ key, ifVersion: claim.version })).catch(() => undefined);
+      }
+    })();
   }
 
   #startRetentionSweep(): void {
@@ -4861,8 +4883,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count,
-            ...(typeof record.activationBlocked.realarmedAt === "number" ? { realarmedAt: record.activationBlocked.realarmedAt } : {}) } }
+          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"

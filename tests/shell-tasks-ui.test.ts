@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricShellJobStore, type FabricShellJobInfo } from "../src/core/shell-jobs.js";
@@ -23,7 +23,12 @@ const fixture = () => {
     mainAgentInfo: () => ({ id: "main", name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host", cwd: process.cwd(), startedAt: 1, updatedAt: 1, pendingMessages: false, local: true }),
   } as unknown as FabricState;
   const controller = new FabricUiController(state); cleanup.push(() => controller.stop());
-  const setWidget = vi.fn(), notify = vi.fn(), requestRender = vi.fn();
+  const notify = vi.fn(), requestRender = vi.fn();
+  const setWidget = vi.fn((_id: string, content: unknown) => {
+    if (typeof content === "function") {
+      return (content as (tui: TUI, theme: Theme) => FabricWidget)({ requestRender } as unknown as TUI, theme);
+    }
+  });
   const context = { mode: "tui", hasUI: true, ui: { setWidget, notify } } as unknown as ExtensionContext;
   return { jobs, state, controller, context, setWidget, notify, requestRender };
 };
@@ -98,7 +103,10 @@ describe("background shell UI", () => {
     const widget = new FabricWidget(theme, () => h.controller.snapshot(), 5);
     expect(widget.render(80).join("\n")).toContain("/fabric tasks");
     expect(widget.render(80).join("\n")).toContain("Watch CI");
+    const actors = vi.spyOn(h.state.actors, "list");
     await vi.advanceTimersByTimeAsync(3000);
+    expect(actors).not.toHaveBeenCalled();
+    expect(h.requestRender).toHaveBeenCalled();
     expect(widget.render(80).join("\n")).toContain("3s");
     await job.finish(0);
     await vi.advanceTimersByTimeAsync(31000);

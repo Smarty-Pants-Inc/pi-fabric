@@ -42,7 +42,7 @@ const stubState = () =>
   ({
     initialized: true,
     config: {
-      ui: { enabled: true, refreshMs: 60_000, eventHistory: 80, widget: "hidden" },
+      ui: { enabled: true, refreshMs: 60_000, eventHistory: 80, widget: "auto" },
       mesh: { enabled: false },
     },
     activity: { subscribe: vi.fn(() => () => {}), runs: vi.fn(() => []), reset: vi.fn() },
@@ -76,6 +76,7 @@ const stubState = () =>
       setInstructions: vi.fn().mockResolvedValue(undefined),
       clearMessages: vi.fn().mockResolvedValue(undefined),
       subscribe: vi.fn(() => () => {}),
+      subscribeMesh: vi.fn(() => () => {}),
     },
     globalActors: {
       list: vi.fn(() => []),
@@ -90,7 +91,7 @@ const stubState = () =>
   }) as unknown as FabricState;
 
 describe("FabricUiController dashboard wiring", () => {
-  it.each(["poll", "coalesced-refresh"] as const)("contains %s during an activation gap and clears old timers", async (kind) => {
+  it.each(["idle", "coalesced-refresh"] as const)("contains %s during an activation gap and clears old timers", async (kind) => {
     vi.useFakeTimers();
     const state = stubState();
     const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
@@ -101,7 +102,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       if (kind === "coalesced-refresh") changed();
-      expect(vi.getTimerCount()).toBe(kind === "poll" ? 1 : 2);
+      expect(vi.getTimerCount()).toBe(kind === "idle" ? 0 : 1);
       Object.assign(state, { initialized: false });
       // The RC2 mesh getter throws synchronously, before a Promise can catch it.
       Object.defineProperty(state, "mesh", { configurable: true, get() { throw new Error("Pi Fabric has not activated"); } });
@@ -113,7 +114,7 @@ describe("FabricUiController dashboard wiring", () => {
       Object.assign(state, { initialized: true });
       state.config.mesh.enabled = false;
       controller.start(context);
-      expect(vi.getTimerCount()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
       controller.stop();
       expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(60_001);
@@ -121,10 +122,12 @@ describe("FabricUiController dashboard wiring", () => {
     } finally { controller.stop(); vi.useRealTimers(); }
   });
 
-  it("contains a poll scheduling failure even when its host warning throws", async () => {
+  it("contains an event refresh failure even when its host warning throws", async () => {
     vi.useFakeTimers();
     const state = stubState();
     let meshReads = 0;
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
     const mesh = state.mesh;
     Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }] });
     const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn(() => { throw new Error("stale UI"); }) } } as unknown as ExtensionContext;
@@ -132,9 +135,10 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       Object.defineProperty(state, "mesh", { configurable: true, get() {
-        meshReads++; throw new Error("poll mesh read failed");
+        meshReads++; throw new Error("event mesh read failed");
       } });
       state.config.mesh.enabled = true;
+      changed();
       await vi.advanceTimersByTimeAsync(60_001);
       expect(meshReads).toBeGreaterThan(0);
       expect(context.ui.notify).toHaveBeenCalledTimes(1);
@@ -425,47 +429,32 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  // smarty-dev#251: on a shared mesh some peer is always present; polling remote records at
-  // refreshMs kept every idle Pi rebuilding its snapshot and re-rendering twice a second.
-  it("polls remote-only activity at the heartbeat interval and local activity at refreshMs", async () => {
+  it.each(["tui", "rpc"] as const)("arms no hidden dashboard poll with remote peers and local work in %s mode", async mode => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.refreshMs = 500;
-    vi.mocked(state.actors.list).mockReturnValue([]);
-    const remoteAgent = {
-      format: 1, id: "agent:remote", kind: "agent", rootId: "session:other", ownerHostId: "session:other",
-      ownerIdentityId: "session:other", name: "remote", status: "running", runner: "pi", transport: "host",
-      capabilities: [], startedAt: 1, updatedAt: 1, local: false, stale: false,
-    };
-    Object.assign(state, {
-      peerInfos: vi.fn(() => [{ id: "session:other", name: "other", kind: "main", status: "idle" }]),
-      participantInfos: vi.fn(() => [remoteAgent]),
-    });
-    const context = {
-      mode: "tui",
-      ui: { setWidget: vi.fn(), notify: vi.fn() },
-    } as unknown as ExtensionContext;
+    state.config.ui.widget = "hidden";
+    Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", kind: "main", status: "running" }] });
+    vi.mocked(state.activity.runs).mockReturnValue([{
+      id: "live", name: "work", status: "running", phases: [], calls: [], items: [], events: [], startedAt: 0, updatedAt: 0,
+    } as FabricActivityRun]);
+    const context = { mode, ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);
     try {
       controller.start(context);
-      expect(controller.snapshot().agents.map((agent) => agent.id)).toContain("agent:remote");
-      expect(state.activity.runs).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(4_999);
-      expect(state.activity.runs).toHaveBeenCalledTimes(1);          // no 500 ms poll for peers
-      await vi.advanceTimersByTimeAsync(1);
-      expect(state.activity.runs).toHaveBeenCalledTimes(2);          // one per heartbeat
-      vi.mocked(state.activity.runs).mockReturnValue([{
-        id: "local-run", name: "Local", status: "running", phases: [], calls: [], items: [], events: [],
-        startedAt: 0, updatedAt: 0,
-      } as FabricActivityRun]);
-      await vi.advanceTimersByTimeAsync(5_000);                      // picks up the local run
-      expect(state.activity.runs).toHaveBeenCalledTimes(3);
-      await vi.advanceTimersByTimeAsync(500);
-      expect(state.activity.runs).toHaveBeenCalledTimes(4);          // local activity: refreshMs
-    } finally {
-      controller.stop();
-      vi.useRealTimers();
-    }
+      const reads = vi.mocked(state.activity.runs).mock.calls.length;
+      for (let i = 0; i < 100; i++) {
+        vi.mocked(state.activity.subscribe).mock.calls.at(-1)?.[0]?.();
+        vi.mocked(state.actors.subscribe).mock.calls.at(-1)?.[0]?.();
+        vi.mocked(state.agents.subscribeUi).mock.calls.at(-1)?.[0]?.();
+        vi.mocked(state.actors.subscribeMesh).mock.calls.at(-1)?.[0]?.();
+      }
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(state.activity.runs).toHaveBeenCalledTimes(reads);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally { controller.stop(); vi.useRealTimers(); }
   });
 
   it("wakes settled UI state when actors or detached agents change", async () => {
@@ -632,62 +621,65 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  // smarty-dev#1043: each 500 ms poll gathered and deep-compared every input while local work
-  // was active (about 11% of a busy Main). A poll now rebuilds only when a cheap stamp moved.
-  it("rebuilds a polled snapshot only when a stamp moved: Main at once, remote state at most every 5 s", async () => {
+  it.each(["actor", "agent", "activity", "mesh"] as const)("redraws a visible dashboard on %s events at a coalesced minimum 1 s cadence", async domain => {
     vi.useFakeTimers();
     const state = stubState();
-    state.config.ui.refreshMs = 500;
-    vi.mocked(state.actors.list).mockReturnValue([]);
-    const activity = new FabricActivityStore();
-    let stamp = "state-1";
-    const participantInfos = vi.fn(() => []);
-    Object.assign(state, {
-      activity,
-      participantInfos,
-      config: { ...state.config, mesh: { enabled: true } },
-      mesh: {
-        ...state.mesh, tail: vi.fn(() => ({ events: [], nextOffset: 0 })),
-        stateStamp: vi.fn(() => stamp), cachedStateStamp: vi.fn(() => stamp),
-      },
-    });
-    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    state.config.ui.refreshMs = 10;
+    const events: Record<string, () => void> = {};
+    const meshUnsubscribe = vi.fn();
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { events.actor = listener; return () => {}; });
+    vi.mocked(state.agents.subscribeUi).mockImplementation(listener => { events.agent = listener; return () => {}; });
+    vi.mocked(state.activity.subscribe).mockImplementation(listener => { events.activity = listener; return () => {}; });
+    vi.mocked(state.actors.subscribeMesh).mockImplementation(listener => { events.mesh = listener as () => void; return meshUnsubscribe; });
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    let close = () => {};
+    let attached = () => {};
+    const ready = new Promise<void>(resolve => { attached = resolve; });
+    const context = { mode: "tui", modelRegistry: { getAvailable: () => [] }, ui: {
+      notify: vi.fn(), setWidget: vi.fn(),
+      custom: (factory: (tui: TUI, theme: Theme, keys: unknown, done: () => void) => FabricDashboard) =>
+        new Promise<void>(resolve => { close = resolve; factory(tui, theme, {}, resolve); attached(); }),
+    } } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);
-    const gathered = () => participantInfos.mock.calls.length;
+    let pending: Promise<void> | undefined;
     try {
       controller.start(context);
-      activity.start("live", { name: "local work" });            // keeps the poll at refreshMs
-      await vi.advanceTimersByTimeAsync(200);                     // its own event-driven rebuild
-      const settled = gathered();
-      await vi.advanceTimersByTimeAsync(4_000);                   // 8 polls, nothing moved
-      expect(gathered()).toBe(settled);
-      expect(controller.snapshot().now).toBeGreaterThanOrEqual(Date.now() - 500);   // ages still move
-      stamp = "state-2";                                          // remote state changed
+      // Mesh notifications do not even arm a coalescer without a visible surface.
+      events.mesh!();
+      expect(vi.getTimerCount()).toBe(0);
+      pending = controller.openDashboard(context);
+      await ready;
+      vi.mocked(tui.requestRender).mockClear();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, name: "changed", queued: 5 }] as never);
+      for (let i = 0; i < 100; i++) events[domain]!();
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(tui.requestRender).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(tui.requestRender).toHaveBeenCalledTimes(1);
+      expect(controller.snapshot().actors[0]).toMatchObject({ name: "changed", queued: 5 });
+      events[domain]!();
       await vi.advanceTimersByTimeAsync(500);
-      expect(gathered()).toBe(settled);                           // less than 5 s since the last build
-      await vi.advanceTimersByTimeAsync(1_000);
-      expect(gathered()).toBe(settled + 1);                       // then once
-      const afterRemote = gathered();
-      vi.mocked(state.mainAgentInfo).mockReturnValue({
-        ...vi.mocked(state.mainAgentInfo)(), status: "running",
-      } as ReturnType<FabricState["mainAgentInfo"]>);
+      events[domain]!();
       await vi.advanceTimersByTimeAsync(500);
-      expect(gathered()).toBe(afterRemote + 1);                   // Main's own state: at once
-      const afterMain = gathered();
-      await vi.advanceTimersByTimeAsync(14_000);
-      expect(gathered()).toBe(afterMain);
-      await vi.advanceTimersByTimeAsync(1_500);
-      expect(gathered()).toBe(afterMain + 1);                     // a lapsing lease: every 15 s
-    } finally {
+      expect(tui.requestRender).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(tui.requestRender).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+      events[domain]!();
+      close();
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
       controller.stop();
-      vi.useRealTimers();
-    }
+      expect(meshUnsubscribe).toHaveBeenCalledTimes(1);
+    } finally { close(); if (pending) await pending; controller.stop(); vi.useRealTimers(); }
   });
 
   // review/astra F2 on #84: a rebuild must show the state it records as built, even when the mesh
   // read cache was warmed just before a remote write; and a rebuild that consumed an older cached
   // payload must leave the gate open, not wait for the 15 s ceiling.
-  it.each(["a poll's remote rebuild", "an event-driven rebuild"] as const)(
+  it.each(["an explicit refresh", "an event-driven rebuild"] as const)(
     "shows the remote state after %s with a freshly warmed mesh read cache",
     async (order) => {
       vi.useFakeTimers();
@@ -723,6 +715,7 @@ describe("FabricUiController dashboard wiring", () => {
           expect(readCount()).toBe(afterWrite); // Local events retain ordinary warm-cache semantics.
         }
         await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 2_000);
+        controller.setHostStreaming(false); // Next event observes the expired shared view; no idle poll.
         expect(shown()).toBe("B");
         // The journal replays B into a new snapshot; showing the remote value no longer
         // requires another full canonical parse after the writer's locked read.
@@ -736,7 +729,7 @@ describe("FabricUiController dashboard wiring", () => {
     },
   );
 
-  it("idle UI never bypasses the window and sees a change within 5 s of a warmed cache", async () => {
+  it("idle event refreshes retain the shared window and see a change on the next post-expiry event", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-idle-coalesce-"));
     const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5_000 });
@@ -763,16 +756,18 @@ describe("FabricUiController dashboard wiring", () => {
       expect(mesh.get("status", { fresh: true })?.value).toBe("warm");
       await writer.put({ key: "status", value: "after", identity });
       const before = count();
-      await vi.advanceTimersByTimeAsync(3_000); // First UI poll consumes the warm, older snapshot.
+      await vi.advanceTimersByTimeAsync(3_000);
+      controller.setHostStreaming(false); // An event consumes the warm, older snapshot.
       expect(shown()).toBe("warm");
       expect(count()).toBe(before); // Generation change must NOT force an idle parse.
-      await vi.advanceTimersByTimeAsync(2_000); // Fixed deadline, not another full 5 s poll.
+      await vi.advanceTimersByTimeAsync(2_000);
+      controller.setHostStreaming(false); // The next event observes expiry, without a recurring timer.
       expect(shown()).toBe("after");
       // Expiry observes the new generation via the journal, not a redundant full parse.
       expect(count()).toBe(before);
       // Idle metadata observation must not independently parse at expiry before snapshot
       // consumers use the shared reader (#4383); active demand has separate coverage below.
-      expect(observe).toHaveBeenCalledWith(false, false);
+      expect(vi.getTimerCount()).toBe(0);
       expect(observe.mock.calls.some(([fresh]) => fresh === true)).toBe(false);
       expect(context.ui.notify).not.toHaveBeenCalled();
     } finally {
@@ -803,7 +798,7 @@ describe("FabricUiController dashboard wiring", () => {
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...vi.mocked(state.mainAgentInfo)(),
         status: demand === "running" ? "running" : "idle", pendingMessages: demand === "pending",
       } as ReturnType<FabricState["mainAgentInfo"]>);
-      await vi.advanceTimersByTimeAsync(100);
+      controller.setHostStreaming(demand === "running");
       expect(controller.snapshot().state.find(entry => entry.key === "status")?.value).toBe("after");
     } finally {
       controller.stop(); vi.restoreAllMocks(); vi.useRealTimers();
@@ -811,9 +806,9 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("keeps stationary mesh state at zero extra canonical reads across idle UI polls", async () => {
+  it("keeps stationary mesh state at zero extra canonical reads while the UI is silent", async () => {
     vi.useFakeTimers();
-    const scratch = path.resolve(".local/check-temp");
+    const scratch = os.tmpdir();
     fs.mkdirSync(scratch, { recursive: true });
     const root = fs.mkdtempSync(path.join(scratch, "dashboard-stationary-"));
     const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
@@ -849,11 +844,11 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it.each(["ordinary poll consumed latest", "legacy unrelated writer copied marker"] as const)(
+  it.each(["ordinary reader consumed latest", "legacy unrelated writer copied marker"] as const)(
     "remote UI rebuild adds zero canonical reads when %s",
     async (order) => {
       vi.useFakeTimers();
-      const scratch = path.resolve(".local/check-temp");
+      const scratch = os.tmpdir();
       fs.mkdirSync(scratch, { recursive: true });
       const root = fs.mkdtempSync(path.join(scratch, "dashboard-coalesced-"));
       const identity = { id: "session:writer", name: "writer", kind: "main" as const };
@@ -900,6 +895,7 @@ describe("FabricUiController dashboard wiring", () => {
         const beforeUi = readCount();
         const beforeGather = gathered.mock.calls.length;
         await vi.advanceTimersByTimeAsync(1_000);
+        controller.setHostStreaming(false);
         expect(gathered.mock.calls.length).toBe(beforeGather + 1); // Exercise the real remote rebuild.
         expect(shown()).toBe("A");
         expect(mesh.stateToken()).toBe(consumedToken);
@@ -955,6 +951,7 @@ describe("FabricUiController dashboard wiring", () => {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);      // B lands in a later timestamp tick
       writeExternally("B");
       await vi.advanceTimersByTimeAsync(2_500);
+      controller.setHostStreaming(false);
       expect(shown()).toBe("B");
     } finally {
       controller.stop();
@@ -998,8 +995,8 @@ describe("FabricUiController dashboard wiring", () => {
       await vi.advanceTimersByTimeAsync(110);
       expect(mounted.render(80)).toHaveLength(6);
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
-      // No child event follows: the host alone keeps polling until idle.
-      await vi.advanceTimersByTimeAsync(110);
+      // No child event follows: the existing host lifecycle boundary releases the widget.
+      controller.setHostStreaming(false);
       expect(mounted.render(80).length).toBeLessThan(6);
       expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(1);
       // Explicit agent_end releases immediately even before Pi's isIdle flips.
@@ -1110,7 +1107,8 @@ describe("FabricUiController dashboard wiring", () => {
       await vi.advanceTimersByTimeAsync(4_700);
       expect(controller.snapshot().agents).toEqual([]);
       renew(Date.now());
-      await vi.advanceTimersByTimeAsync(1_000); // next 5 s remote refresh, not the 15 s ceiling
+      await vi.advanceTimersByTimeAsync(1_000);
+      controller.setHostStreaming(false); // An explicit event refresh observes the renewed lease.
       expect(controller.snapshot().agents.map(agent => agent.id)).toEqual(["peer-agent"]);
       expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
     } finally {
@@ -1120,7 +1118,34 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
+  it("contains render-only clock faults from a disposed TUI without rearming", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: "auto", maxRows: 6 });
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    activity.start("live", { name: "clock" });
+    Object.assign(state, { activity });
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const context = { mode: "tui", ui: {
+      notify: vi.fn(),
+      setWidget: vi.fn((_id: string, content: unknown) => {
+        if (typeof content === "function") return (content as (tui: TUI, theme: Theme) => FabricWidget)(tui, theme);
+      }),
+    } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      vi.mocked(tui.requestRender).mockImplementation(() => { throw new Error("disposed TUI"); });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(context.ui.notify).toHaveBeenCalledWith(expect.stringContaining("disposed TUI"), "warning");
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(context.ui.notify).toHaveBeenCalledTimes(1);
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+
+  it("animates widget elapsed labels without polling managers while nested calls are idle", async () => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.widget = "auto";
@@ -1167,7 +1192,9 @@ describe("FabricUiController dashboard wiring", () => {
       expect(first).toMatch(/1s/);
       expect(controller.snapshot().runs[0]?.status).toBe("running");
       requestRender.mockClear();
+      vi.mocked(state.actors.list).mockClear();
       await vi.advanceTimersByTimeAsync(5_000);
+      expect(state.actors.list).not.toHaveBeenCalled();
       const elapsedMs =
         controller.snapshot().now - controller.snapshot().runs[0]!.startedAt;
       const second = widget!.render(80).join("\n");

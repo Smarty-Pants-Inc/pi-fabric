@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { copyFabricWakeCause, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -211,6 +212,7 @@ export class ResidencyClient {
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
           options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
+            wakeCause: fabricWakeCause({ id: result.id, name: result.name, kind: "agent" }, "inbox", "agent-completion", result.id),
             verification: "mesh", message: `Fabric agent ${result.name} ${result.status}` +
               (result.completionDelivery?.redeliveredFrom ? ` [re-delivered from dead Main session ${result.completionDelivery.redeliveredFrom}]` : "") +
               `: ${result.error ?? result.text}`, delivery: "followUp", triggerTurn: true, data: result,
@@ -1211,9 +1213,12 @@ export class ResidencyClient {
     // until Main durably admitted it: deliverAgent journals it under the record's stable id before
     // it returns, keeps it until the session holds it, and admits one id once across restarts and
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
+    const wakeCause = copyFabricWakeCause(value.wakeCause) ?? (value.source === "fabric-host"
+      ? fabricWakeCause(entry.updatedBy, "host-event", undefined, value.id) : undefined);
     this.options.mainAgent.deliverAgent({
       from: value.from,
       source: value.source,
+      ...(wakeCause ? { wakeCause } : {}),
       // The authenticated resident writer alone does not prove actor authorship: older
       // hosts also write alarms under the actor label. Require positive classification;
       // unclassified/unknown actor records retain routing/display and durable receipts only.

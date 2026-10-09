@@ -40,7 +40,9 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     const message = { customType: "probe", content: "Paul here", display: true };
     sendFabricMessage(pi, message, { deliverAs: "steer", triggerTurn: true }, host, "steer", "mesh");
     sendFabricUserMessage(pi, "Paul here", host, "followUp", { deliverAs: "followUp" }, "mesh");
-    expect(fake.sendMessage).toHaveBeenCalledWith(message, { deliverAs: "steer", triggerTurn: true,
+    expect(fake.sendMessage).toHaveBeenCalledWith({ ...message, details: { wakeCause: {
+      cause: "steer", from: { id: host.id, name: host.name, kind: host.kind },
+    } } }, { deliverAs: "steer", triggerTurn: true,
       provenance: provenance(host, "steer") });
     expect(fake.sendUserMessage).toHaveBeenCalledWith("Paul here", { deliverAs: "followUp",
       provenance: provenance(host, "followUp") });

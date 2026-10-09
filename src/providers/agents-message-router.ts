@@ -1,5 +1,5 @@
 import { boundAgentSpawner } from "../agents/spawner.js";
-import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
@@ -330,6 +330,7 @@ export class AgentMessageRouter {
     options: {
       principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
+      wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
@@ -344,7 +345,7 @@ export class AgentMessageRouter {
     }
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
-    options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
+    options = { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
@@ -449,6 +450,7 @@ export class AgentMessageRouter {
     options: {
       principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
+      wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
@@ -492,6 +494,7 @@ export class AgentMessageRouter {
           from: options.from ?? this.actorManager.identity,
           verification: "mesh", // In-process registered producer, not a received command.
           principal: options.principal,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -525,6 +528,7 @@ export class AgentMessageRouter {
         kind,
         {
           principal: options.principal,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           data,
           // Carry the local Main default across runtime generations (#3015).
@@ -727,11 +731,13 @@ export class AgentMessageRouter {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
       }
       let result: FabricAgentMessageResult;
+      const wakeCause = copyFabricWakeCause(command.wakeCause);
       try {
         result = this.mainAgent.deliverAgent({
         from,
         ...(verification === undefined ? {} : { verification }),
         principal: provenance?.principal,
+        ...(wakeCause ? { wakeCause } : {}),
         message,
         delivery: command.operation,
         deliveryId: command.commandId,

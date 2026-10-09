@@ -7,7 +7,7 @@ import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
-import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
+import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, fabricWakeMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
 // Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
@@ -52,6 +52,8 @@ export interface FabricMainAgentDeliveryRequest {
   message: string;
   delivery: FabricMainAgentDelivery;
   triggerTurn?: boolean;
+  /** Diagnostic producer metadata, never authority and never sourced from message text. */
+  wakeCause?: FabricWakeCause | undefined;
   data?: unknown;
   /**
    * A stable id of the sender's durable record (a resident actor's delivery record). Main journals
@@ -203,6 +205,7 @@ export interface HeldAgentMessage {
   source?: FabricMainAgentDeliveryRequest["source"];
   /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
   provenance?: FabricTurnProvenance | undefined;
+  wakeCause?: FabricWakeCause;
   message: string;
   /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
   sentAt: number;
@@ -462,7 +465,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const messageId = randomUUID();
     const options = { deliverAs: delivery };
     // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
-    this.pi.sendUserMessage(text, from && (verification === "mesh" || verification === "bridge") ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery, verification)) : options);
+    // The dashboard composer is human input (no Fabric sender). Keep it user.
+    if (from) sendFabricUserMessage(this.pi, text, from, delivery, options, verification);
+    else this.pi.sendUserMessage(text, options);
     return { queued: true, messageId, routed: "main" };
   }
 
@@ -502,6 +507,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
+      wakeCause: copyFabricWakeCause(request.wakeCause) ?? fabricWakeCause(sender,
+        request.source === "fabric-host" ? "host-event" : request.source === "actor-output" ? "actor" :
+          request.delivery === "steer" ? "steer" : "followUp", undefined, deliveryId),
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
@@ -935,11 +943,12 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, source, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, ...rest } = item;
           const via = provenance?.via;
           const verified = provenance?.sender?.verified;
           items.push({
             ...rest, from: sender,
+            ...(copyFabricWakeCause(wakeCause) ? { wakeCause: copyFabricWakeCause(wakeCause)! } : {}),
             // Only a recorded admission method permits a claim. Old journals (native or
             // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
             ...((verified === "mesh" || verified === "bridge") &&
@@ -1497,7 +1506,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const options = { deliverAs, triggerTurn };
     const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
     this.pi.sendMessage(
-      {
+      fabricWakeMessage(this.pi, {
         customType: "pi-fabric-agent-message",
         content: [
           ...(flushed
@@ -1514,7 +1523,9 @@ export class MainAgentController implements FabricMainAgentTarget {
           triggerTurn,
           ...(flushed ? { flushed: true } : {}),
         },
-      },
+      }, options, first.wakeCause ?? fabricWakeCause(first.from,
+        first.source === "fabric-host" ? "host-event" : first.source === "actor-output" ? "actor" :
+          delivery === "steer" ? "steer" : "followUp", undefined, first.deliveryId)),
       provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
     // A fresh delivery can win the deadline without going through #releaseQueue. It is

@@ -309,12 +309,16 @@ export const sendFabricMessage = (
   via: FabricTurnProvenance["via"] = "actor",
   verification?: "mesh" | "bridge",
   principal?: FabricPrincipal,
+  wakeCause?: FabricWakeCause,
 ): void => {
+  const sender = options?.triggerTurn === true && options.deliverAs !== "nextTurn" ? (typeof from === "function" ? from() : from) : undefined;
+  const inbox = isWakeInbox(message.customType);
+  const wake = wakeCause ?? (sender ? fabricWakeCause(sender, inbox ? "inbox" : via === "steer" || via === "followUp" ? via : "actor") : undefined);
   const deliveryOptions = from && (verification === "mesh" || verification === "bridge")
     ? fabricProvenanceOptions(pi, options, () =>
-      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification, principal))
+      fabricTurnProvenance(sender ?? (typeof from === "function" ? from() : from), via, verification, principal))
     : options;
-  pi.sendMessage(message, deliveryOptions);
+  pi.sendMessage(fabricWakeMessage(pi, message, options, wake), deliveryOptions);
 };
 
 export const sendFabricUserMessage = (
@@ -325,12 +329,119 @@ export const sendFabricUserMessage = (
   options?: Parameters<ExtensionAPI["sendUserMessage"]>[1],
   verification?: "mesh" | "bridge",
 ): void => {
+  const state = wakeCaptures.get(pi);
+  const sender = state ? (typeof from === "function" ? from() : from) : undefined;
+  if (state && sender) {
+    const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n");
+    state.pending.push({ text, cause: fabricWakeCause(sender, via === "steer" ? "steer" : via === "actor" ? "actor" : "followUp") });
+    if (state.pending.length > 128) state.pending.shift();
+  }
   const deliveryOptions = verification === "mesh" || verification === "bridge"
     ? fabricProvenanceOptions(pi, options, () =>
-      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification))
+      fabricTurnProvenance(sender ?? (typeof from === "function" ? from() : from), via, verification))
     : options;
   if (deliveryOptions === undefined) pi.sendUserMessage(content);
   else pi.sendUserMessage(content, deliveryOptions);
+};
+
+/** Diagnostic attribution only: this never supplies provenance or authority. */
+export interface FabricWakeCause {
+  cause: "steer" | "followUp" | "actor" | "inbox" | "host-event" | "mesh";
+  from: { id: string; name: string; kind: "main" | "actor" | "agent" | "remote" };
+  topic?: string;
+  key?: string;
+}
+
+export const fabricWakeCause = (
+  from: { id: string; name?: string; kind: FabricWakeCause["from"]["kind"] }, cause: FabricWakeCause["cause"], topic?: string, key?: string,
+): FabricWakeCause => ({
+  cause, from: { id: from.id, name: from.name || from.id, kind: from.kind },
+  ...(topic ? { topic } : {}), ...(key ? { key } : {}),
+});
+
+export const copyFabricWakeCause = (value: unknown): FabricWakeCause | undefined => {
+  const wake = value as Partial<FabricWakeCause> | undefined;
+  if (!wake || !["steer", "followUp", "actor", "inbox", "host-event", "mesh"].includes(String(wake.cause)) ||
+    typeof wake.from?.id !== "string" || typeof wake.from.name !== "string" ||
+    !["main", "actor", "agent", "remote"].includes(wake.from.kind)) return;
+  return fabricWakeCause(wake.from, wake.cause!, typeof wake.topic === "string" ? wake.topic : undefined,
+    typeof wake.key === "string" ? wake.key : undefined);
+};
+
+interface WakeCapture {
+  identity: MeshIdentity;
+  cause?: FabricWakeCause | undefined;
+  user: boolean;
+  recorded: boolean;
+  input?: { text: string; cause: FabricWakeCause } | undefined;
+  pending: Array<{ text: string; cause: FabricWakeCause }>;
+}
+const wakeCaptures = new WeakMap<ExtensionAPI, WakeCapture>();
+const isWakeInbox = (type: string): boolean => type.includes("inbox") || type.includes("completion") ||
+  type === "pi-fabric-agent-complete" || type === "pi-fabric-shell-event" || type === "pi-fabric-records";
+const wakeHost = (pi: ExtensionAPI): MeshIdentity => wakeCaptures.get(pi)?.identity ??
+  { id: "fabric:host", name: "Fabric host", kind: "main" };
+
+/** Preserve model text; persist attribution on the exact native custom-message entry. */
+export const fabricWakeMessage = (
+  pi: ExtensionAPI, message: Parameters<ExtensionAPI["sendMessage"]>[0],
+  options: Parameters<ExtensionAPI["sendMessage"]>[1], wake?: FabricWakeCause,
+): Parameters<ExtensionAPI["sendMessage"]>[0] => {
+  if (options?.triggerTurn !== true || options.deliverAs === "nextTurn") return message;
+  const details = message.details && typeof message.details === "object" ? message.details : {};
+  return { ...message, details: { ...details, wakeCause: wake ?? fabricWakeCause(wakeHost(pi),
+    isWakeInbox(message.customType) ? "inbox" : "host-event") } };
+};
+
+/** One native custom entry per inference boundary with newly admitted Fabric input, not per send attempt. */
+export const registerFabricWakeCapture = (pi: ExtensionAPI): void => {
+  if (wakeCaptures.has(pi)) return;
+  const state: WakeCapture = { identity: wakeHost(pi), user: false, recorded: false, pending: [] };
+  wakeCaptures.set(pi, state);
+  const reset = (): void => { state.cause = undefined; state.user = false; state.recorded = false; };
+  pi.on("session_start", (_event, context) => {
+    reset(); state.pending = []; state.input = undefined;
+    state.identity = fabricHostIdentity(context.sessionManager.getSessionId());
+  });
+  pi.on("session_before_switch", () => { reset(); state.pending = []; state.input = undefined; });
+  pi.on("session_tree", () => { reset(); state.pending = []; state.input = undefined; });
+  pi.on("session_shutdown", () => { reset(); state.pending = []; state.input = undefined; });
+  pi.on("agent_settled", (event, context) => {
+    if (context.signal?.aborted || (event as { outcome?: string }).outcome === "aborted") {
+      reset(); state.pending = []; state.input = undefined;
+    }
+  });
+  pi.on("turn_start", reset);
+  pi.on("input", event => {
+    state.input = undefined;
+    // Equal human text must never consume an extension's queued attribution.
+    if (event.source !== "extension") return;
+    const index = state.pending.findIndex(item => item.text === event.text);
+    if (index >= 0) state.input = state.pending.splice(index, 1)[0];
+  });
+  pi.on("message_start", event => {
+    if (event.message.role === "custom") {
+      const details = event.message.details as { wakeCause?: unknown } | undefined;
+      const cause = copyFabricWakeCause(details?.wakeCause);
+      if (cause) { state.cause = cause; state.user = false; }
+    } else if (event.message.role === "user") {
+      const content = event.message.content;
+      const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n");
+      const receipt = (event.message as { provenance?: FabricTurnProvenance }).provenance;
+      const admitted = copyFabricProvenance(receipt);
+      const input = state.input;
+      const queued = input?.text === text ? input?.cause : undefined;
+      state.input = undefined;
+      state.cause = queued ?? (admitted ? fabricWakeCause(admitted.sender,
+        admitted.via === "steer" ? "steer" : admitted.via === "actor" ? "actor" : "followUp") : undefined);
+      state.user = !state.cause;
+    }
+  });
+  pi.on("context", () => {
+    if (state.recorded || state.user || !state.cause) return;
+    state.recorded = true;
+    pi.appendEntry("pi-fabric.wake-cause", state.cause);
+  });
 };
 
 /** Runtime participant identity, with no human principal. Participant-free notices make no claim. */

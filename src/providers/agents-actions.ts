@@ -9,7 +9,7 @@ import {
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
 
-const MAIN_NAME_TARGET = "Target id. name:<name> selects the one live Main with that published name and refuses (listing candidates) when none or several match.";
+const MAIN_NAME_TARGET = "Target id. name:<name> selects only its durable first-publisher Main binding, never an unbound newcomer during absence/reload. Refuses absent or ambiguous matches; principal names require exact session:<uuid> ids. Bindings are selector custody, not same-UID authentication.";
 
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },

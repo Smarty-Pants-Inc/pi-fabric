@@ -18,6 +18,7 @@ import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
 import { assertTaskMainTarget, readTaskReturnAddress } from "../agents/task-return-address.js";
+import { mainNameOwnerDead, principalMainNames } from "../topology/main-name-binding.js";
 
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
@@ -103,7 +104,7 @@ export interface FabricNameTargetCandidate {
 export class FabricNameTargetError extends Error {
   override readonly name = "FabricNameTargetError";
   readonly code: "FABRIC_NAME_TARGET_ABSENT" | "FABRIC_NAME_TARGET_AMBIGUOUS";
-  constructor(readonly target: string, readonly candidates: FabricNameTargetCandidate[], ambiguous: boolean) {
+  constructor(readonly target: string, readonly candidates: FabricNameTargetCandidate[], ambiguous: boolean, readonly boundSessionId?: string) {
     const listed = candidates.map((candidate) => [
       candidate.id,
       candidate.herdrPane ? `pane ${candidate.herdrPane}` : "",
@@ -112,8 +113,17 @@ export class FabricNameTargetError extends Error {
     ].filter(Boolean).join(" ")).join("; ");
     super(ambiguous
       ? `Ambiguous Fabric Main name: name:${target} matches ${candidates.length} live Mains (${listed}); nothing was sent. Use an exact session:<uuid> id.`
-      : `No live Fabric Main is named ${target}${listed ? ` (non-live: ${listed})` : ""}; nothing was sent. Check agents.sessions.`);
+      : `No live Fabric Main is named ${target}${listed ? ` (non-live: ${listed})` : ""}${boundSessionId ? `; bound Main ${boundSessionId} is absent or reloading` : ""}; nothing was sent. Check agents.sessions.`);
     this.code = ambiguous ? "FABRIC_NAME_TARGET_AMBIGUOUS" : "FABRIC_NAME_TARGET_ABSENT";
+  }
+}
+
+/** Principal selectors are forbidden; exact sessions remain ordinary routing targets. */
+export class FabricPrincipalNameTargetError extends Error {
+  override readonly name = "FabricPrincipalNameTargetError";
+  readonly code = "FABRIC_NAME_TARGET_PRINCIPAL";
+  constructor(readonly target: string) {
+    super(`Principal Main name name:${target} is not addressable by name; nothing was sent. Use an exact session:<uuid> id.`);
   }
 }
 
@@ -140,7 +150,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed" | "mainNameBinding" | "principalName">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -284,6 +294,9 @@ export class AgentMessageRouter {
   #messageTarget(id: string): string {
     if (id.trim().startsWith("name:")) return this.#namedMain(id.trim().slice("name:".length).trim());
     const target = this.#sessionTarget(id);
+    if (!target.startsWith("session:") && (this.participants.principalName?.(target) ?? principalMainNames().has(target))) {
+      throw new FabricPrincipalNameTargetError(target);
+    }
     if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target) || target.trim().startsWith("session:")) return target;
     // A published name survives an ordinary lease lapse just like its exact session id.
     // Use fresh raw presence, but add only eligible retained native roots to the live set.
@@ -313,15 +326,24 @@ export class AgentMessageRouter {
     return root.id;
   }
 
-  // `name:<x>` is a strict Main selector: exactly one live interactive root with that published
-  // name, else a typed refusal listing the candidates. It never falls back to actors, ids or guesses.
+  // `name:<x>` is durable selector custody, never same-UID authentication. Resolve only
+  // the bound session; unknown/absent/reloading owners cannot yield to a sole newcomer.
   #namedMain(name: string): string {
+    if (this.participants.principalName?.(name) ?? principalMainNames().has(name)) throw new FabricPrincipalNameTargetError(name);
+    const binding = this.#directoryRead(() => this.participants.mainNameBinding?.(name));
+    const boundId = binding ? `session:${binding.sessionId}` : undefined;
     const matches = this.participants.list
       ? this.#directoryRead(() => this.participants.list!({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }))
         .filter((participant) => participant.name === name && participant.interactive !== false)
       : [];
-    const live = matches.filter((participant) => !participant.stale || this.#eligibleRetainedRoot(participant));
-    if (live.length === 1) return live[0]!.id;
+    const live = matches.filter((participant) => !["reloading", "stopping"].includes(participant.status) &&
+      // A dead predecessor may still have a fresh lease/presence after rebinding. It must
+      // not make the new bound owner ambiguous, nor be admitted by stale-root grace.
+      (!participant.mainNameOwner || participant.remoteHost || !mainNameOwnerDead({ owner: participant.mainNameOwner })) &&
+      (!participant.stale || this.#eligibleRetainedRoot(participant)));
+    const bound = binding && !mainNameOwnerDead(binding) && live.find((participant) => participant.id === boundId && participant.ownerHostId === binding?.hostId &&
+      participant.herdrPane === binding?.herdrPane);
+    if (bound && live.length === 1) return bound.id;
     const candidates = (live.length ? live : matches).map((participant) => ({
       id: participant.id,
       status: participant.status,
@@ -330,7 +352,7 @@ export class AgentMessageRouter {
       ...(participant.herdrPane ? { herdrPane: participant.herdrPane } : {}),
       ...(participant.remoteHost ? { host: participant.remoteHost } : {}),
     })).sort((a, b) => a.id.localeCompare(b.id));
-    throw new FabricNameTargetError(name, candidates, live.length > 1);
+    throw new FabricNameTargetError(name, candidates, Boolean(bound) && live.length > 1, boundId);
   }
 
   /** Exact process-owned targets need no shared-directory authority or freshness. */

@@ -1471,8 +1471,7 @@ describe("ParticipantDirectory", () => {
 
     it("defers change refreshes during a lock outage and preserves backoff until real heartbeat recovery", async () => {
       vi.useFakeTimers();
-      // Exercise near-ceiling full-jitter draws: spend exactly the four-try heartbeat
-      // budget, without consuming the second outage's doubled path backoff.
+      // No admission callback: exactly one short try at the existing heartbeat.
       vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
@@ -1497,7 +1496,7 @@ describe("ParticipantDirectory", () => {
         const tick = async () => {
           heartbeat();
           const result = runs.mock.results.at(-1)!.value;
-          await vi.advanceTimersByTimeAsync(2_200); // four 100 ms tries + three 600 ms jitter waits
+          await vi.advanceTimersByTimeAsync(100); // one existing short try, no timer retry loop
           return await result;
         };
         const hold = () => {
@@ -1520,7 +1519,7 @@ describe("ParticipantDirectory", () => {
         // become an extra retry. Pending changes ride the next heartbeat.
         expect(runs.mock.calls.length).toBe(attemptsBefore);
         expect(source.mock.calls.length).toBe(readsBefore);
-        expect(confirmations).toHaveBeenCalledTimes(4);
+        expect(confirmations).toHaveBeenCalledOnce();
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
@@ -1530,7 +1529,7 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(confirmations).toHaveBeenCalledTimes(8);
+        expect(confirmations).toHaveBeenCalledTimes(2);
 
         fs.rmSync(lockPath, { recursive: true, force: true });
         await vi.advanceTimersByTimeAsync(retry.waitMs);

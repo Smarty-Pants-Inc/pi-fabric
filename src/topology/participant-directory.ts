@@ -18,7 +18,6 @@ import type {
 import { reapDeadHostRecords } from "./host-reaper.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { delay } from "../mesh/mesh-lock.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
@@ -36,7 +35,7 @@ import {
   readHostLeases,
   removeHostLeaseIf,
   STATE_LEASE_RENEW_MS,
-  writeHostLease,
+  writeHostLeaseIfCurrent,
   meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
@@ -549,7 +548,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
-  readonly #startedAt = Date.now();
+  #startedAt = Date.now();
   readonly #ownIncarnation: Promise<string | undefined>;
   #ownIncarnationValue: string | undefined;
   #prepareFileLocks = false;
@@ -567,6 +566,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #closed = false;
   #superseded: ParticipantLeaseSupersededError | undefined;
   #leaseOwned = false;
+  /** Positive clean release only; disappearance/supersession cannot authorize restart. */
+  #leaseReleased = false;
   #publicationAbort = new AbortController();
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
@@ -577,9 +578,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshScheduled = false;
   #refreshAgain = false;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  #publicationRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetrying: Promise<void> | undefined;
-  #publicationRetryDelay = 750;
   /** When the last change-driven refresh started (the throttle's reference). */
   #changeRefreshAt = 0;
   /** Whether the refresh in flight renews the lease (a heartbeat) or only publishes changes. */
@@ -635,13 +634,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async start(): Promise<void> {
     if (this.#superseded) throw this.#superseded;
+    // A positive clean release may activate a NEW incarnation. Missing bytes
+    // during ownership (including a failed close) never grant this transition.
+    if (this.#closed && this.#leaseReleased) {
+      this.#startedAt = Math.max(Date.now(), this.#startedAt + 1);
+      this.#leaseOwned = false;
+      this.#leaseReleased = false;
+    }
+    if (this.options.enabled && this.#leaseOwned) this.#assertCurrentLease(false);
     if (this.#timer) return;
     if (this.#publicationAbort.signal.aborted) this.#publicationAbort = new AbortController();
     // Restarting this directory is activation too, even if its last local view held a root.
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
     this.#refreshError = undefined;
-    this.#publicationRetryDelay = 750;
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
@@ -662,7 +668,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#backgroundRefresh.failure(error);
           return;
         }
-        if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
+        if (!this.#publicationRetrying) {
           void this.#backgroundRefresh.run(() => this.refresh(), false);
         }
       }, this.#heartbeatMs);
@@ -788,7 +794,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           try { return await this.#refresh(full); }
           catch (error) {
             if (!(error instanceof ParticipantPublicationChangedError) || attempt >= 4 || this.#closed) throw error;
-            await new Promise(resolve => setTimeout(resolve, 0));
+            // Custody has unwound; reselect in a fresh microtask, not a timer poll.
+            await Promise.resolve();
           }
         }
       }, retryDeadline);
@@ -815,8 +822,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
         try { this.#renewFileLease(); } catch { /* the next heartbeat renews it */ }
       }
       this.#refreshError = undefined;
-      this.#cancelPublicationRetry();
-      this.#publicationRetryDelay = 750;
       this.#routingError = undefined;
       if (full) {
         this.#sweepDeadHosts();
@@ -869,17 +874,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt++) {
       this.#assertCurrentLease();
-      if (attempt > 0) {
-        const jitter = 150 + Math.floor(Math.random() * 451);
-        if (this.#closed || this.#quiescing || jitter >= remaining()) throw lastError;
-        await delay(jitter, this.#publicationAbort.signal);
-        this.#assertCurrentLease();
-      }
       try {
         if (attempt > 0) {
           if (this.#closed || this.#quiescing || remaining() <= 0) throw lastError;
           // FIFO admission carries no snapshot, custody, or confirmation receipt.
-          if (this.options.waitForPublicationRetry) await this.#waitForPublicationAdmission(remaining());
+          await this.#waitForPublicationAdmission(remaining());
           this.#assertCurrentLease();
           if (this.#closed || this.#quiescing || remaining() <= 0) throw lastError;
         }
@@ -889,7 +888,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
         return this.options.withPublicationFence ? await publish()
           : await this.mesh.withTryLock(publish, remaining(), this.#publicationAbort.signal);
       } catch (error) {
-        if (!isTypedMeshLockTimeout(error) || error instanceof ParticipantFileLockBusyError || attempt === 3 ||
+        // Named exception: without a native admission callback, do not manufacture
+        // a sleep/retry loop. Surface this try; the existing heartbeat tick retries once.
+        if (!this.options.waitForPublicationRetry || !isTypedMeshLockTimeout(error) || error instanceof ParticipantFileLockBusyError || attempt === 3 ||
           this.#closed || this.#quiescing || remaining() <= 0) throw error;
         lastError = error;
         try { this.#renewFileLease(); }
@@ -920,28 +921,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
   }
 
-  #cancelPublicationRetry(): void {
-    if (this.#publicationRetryTimer) clearTimeout(this.#publicationRetryTimer);
-    this.#publicationRetryTimer = undefined;
-  }
-
   #schedulePublicationRetry(): void {
     if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing || this.#superseded ||
-      !isMeshLockTimeout(this.#refreshError) || this.#publicationRetryTimer || this.#publicationRetrying) return;
-    // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
-    const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
-    this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
-    this.#publicationRetryTimer = setTimeout(() => {
-      this.#publicationRetryTimer = undefined;
-      if (!this.#live()) return;
-      const work = this.#retryPublication();
-      this.#publicationRetrying = work;
-      void work.finally(() => {
-        this.#publicationRetrying = undefined;
-        this.#schedulePublicationRetry();
-      });
-    }, wait);
-    this.#publicationRetryTimer.unref?.();
+      !this.#live() || !isMeshLockTimeout(this.#refreshError) || this.#publicationRetrying) return;
+    // Requeue directly on native FIFO admission AFTER the failed fence unwinds.
+    // One host lane, no retry timer and no recursive rescheduling on timeout.
+    // A spent admission budget retries only at the existing heartbeat tick.
+    const work = Promise.resolve().then(() => this.#retryPublication());
+    this.#publicationRetrying = work;
+    void work.finally(() => { this.#publicationRetrying = undefined; });
   }
 
   async #retryPublication(): Promise<void> {
@@ -952,10 +940,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Retain one FIFO ticket through periodic holds, not a new ticket every 2 s.
       // Freeze the admitted lease's remaining margin; independent renewals cannot
       // slide this wait, and close/supersession still abort its native ticket.
-      const budgetMs = lease
-        ? Math.min(lease.expiresAt, lease.session?.expiresAt ?? Infinity) - Date.now() - 2_000 : 2_000;
-      if (budgetMs <= 0) throw new MeshLockTimeoutError(" before participant admission", 0, 0);
-      await this.#waitForPublicationAdmission(budgetMs);
+      const deadline = performance.now() + (lease
+        ? Math.min(lease.expiresAt, lease.session?.expiresAt ?? Infinity) - Date.now() - 2_000 : 2_000);
+      const remaining = (): number => Math.max(0, deadline - performance.now());
+      if (remaining() <= 0) throw new MeshLockTimeoutError(" before participant admission", 0, 0);
+      await this.#waitForPublicationAdmission(remaining());
+      if (remaining() <= 0) throw new MeshLockTimeoutError(" after participant admission", 0, 0);
       if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
       this.#assertCurrentLease();
       // Release mesh BEFORE taking registries. Re-select every actor under fresh
@@ -1635,7 +1625,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed || this.#quiescing) return;
     this.#quiescing = true;
     this.#publicationAbort.abort(new Error("Participant directory is quiescing"));
-    this.#cancelPublicationRetry();
     if (this.#superseded) throw this.#superseded;
     await this.#publicationRetrying;
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
@@ -1686,7 +1675,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed) return;
     this.#closed = true;
     this.#publicationAbort.abort(new Error("Participant directory is closed"));
-    this.#cancelPublicationRetry();
     await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
@@ -1717,8 +1705,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     // A reload leaves only its root and fixed host lease; the next session_start replaces both.
     if (this.#reloadPublished) return;
-    removeHostLeaseIf(this.mesh.root, this.options.hostId, lease =>
-      lease.identityId === this.options.identity.id && lease.startedAt === this.#startedAt);
+    this.#leaseReleased = removeHostLeaseIf(this.mesh.root, this.options.hostId, lease =>
+      lease.identityId === this.options.identity.id && lease.rootId === this.options.rootId && lease.startedAt === this.#startedAt);
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
     if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
       await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
@@ -2353,26 +2341,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const current = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
     let invalid = false;
     if (!current) {
+      // Absence permits initial ownership only, never recreation by an old owner.
       try { fs.lstatSync(hostLeasePath(this.mesh.root, this.options.hostId)); invalid = true; }
-      catch (error) { invalid = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+      catch (error) { invalid = this.#leaseOwned || (error as NodeJS.ErrnoException).code !== "ENOENT"; }
     }
     if (invalid || current && (current.rootId !== this.options.rootId ||
       current.identityId !== this.options.identity.id || current.startedAt !== this.#startedAt)) {
       if (!invalid && allowReloadHandoff && this.#keepsPredecessorReloadLease(Date.now())) return current;
-      const error = this.#superseded = new ParticipantLeaseSupersededError(this.options.hostId);
-      this.#leaseConfirmed = false;
-      this.#refreshError = error;
-      this.#routingReadAt = 0;
-      this.#publicationAbort.abort(error);
-      this.#cancelPublicationRetry();
-      if (this.#timer) clearInterval(this.#timer);
-      this.#timer = undefined;
-      if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
-      this.#refreshTimer = undefined;
-      this.#refreshScheduled = false;
-      throw error;
+      throw this.#loseLease();
     }
     return current;
+  }
+
+  #loseLease(): ParticipantLeaseSupersededError {
+    const error = this.#superseded ??= new ParticipantLeaseSupersededError(this.options.hostId);
+    this.#leaseConfirmed = false;
+    this.#refreshError = error;
+    this.#routingReadAt = 0;
+    this.#publicationAbort.abort(error);
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    return error;
   }
 
   #renewFileLease(): number {
@@ -2387,10 +2379,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const held = previous?.rootId === this.options.rootId && previous.identityId === this.options.identity.id &&
       previous.startedAt === this.#startedAt ? previous : undefined;
     // A retry/clock adjustment may extend a matching lease, never shorten it.
-    // ponytail: check -> atomic rename is not cross-process CAS. A successor may
-    // claim in that narrow window; its next 5 s renewal wins, and this instance's
-    // next current-file check stops it. No snapshot authorizes later retry writes.
-    writeHostLease(this.mesh.root, {
+    const renewed = writeHostLeaseIfCurrent(this.mesh.root, {
       id: this.options.hostId,
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
@@ -2409,7 +2398,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       } : {}),
       updatedAt: Math.max(leaseAt, held?.updatedAt ?? 0),
       expiresAt: this.#reloadUntil ?? Math.max(leaseAt + this.#leaseMs, held?.expiresAt ?? 0),
-    });
+    }, !this.#leaseOwned);
+    if (!renewed) throw this.#loseLease();
     this.#keptReloadLease = false;
     this.#leaseOwned = true;
     return leaseAt;

@@ -33,7 +33,7 @@ const setup = async (wait: (signal: AbortSignal) => Promise<void>, initialBlocke
     waitForPublicationRetry: vi.fn(async signal => { expect(inFence).toBe(false); await wait(signal!); }),
   });
   directories.push(directory);
-  // Install fake timers before a failed activation schedules its recovery timer.
+  // Install fake timers before activation; admission starts via a microtask, not a timer.
   vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
   vi.spyOn(console, "warn").mockImplementation(() => {});
   if (initialBlocked) await expect(directory.start()).rejects.toBeInstanceOf(MeshLockTimeoutError);
@@ -43,10 +43,12 @@ const setup = async (wait: (signal: AbortSignal) => Promise<void>, initialBlocke
 };
 
 it("recovers prepared cold admission without creating a lease before the shared commit", async () => {
-  const s = await setup(async () => { s.block(false); }, true);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await setup(() => gate, true);
   expect(readHostLeaseCurrent(s.root, s.identity.id)).toBeUndefined();
   expect(s.directory.canConsumeMesh()).toBe(false);
-  await vi.advanceTimersByTimeAsync(50);
+  s.block(false); release(); await vi.advanceTimersByTimeAsync(0);
   expect(s.directory.options.waitForPublicationRetry).toHaveBeenCalledOnce();
   expect(s.directory.canConsumeMesh()).toBe(true);
   expect(s.lease().identityId).toBe(s.identity.id); expect(s.lease().rootId).toBe("session:lineage");
@@ -60,9 +62,9 @@ it("reports the prepared short-try failure, then holds one outside-custody admis
   try {
     s.block(true);
     await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
-    expect(s.directory.options.waitForPublicationRetry).not.toHaveBeenCalled();
+    expect(s.directory.options.waitForPublicationRetry).toHaveBeenCalledOnce();
     expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(2_500);
     expect(s.directory.options.waitForPublicationRetry).toHaveBeenCalledOnce();
     expect(s.fence).toHaveBeenCalledTimes(2); // activation and the failed publication only
@@ -74,21 +76,24 @@ it("reports the prepared short-try failure, then holds one outside-custody admis
   } finally { release(); }
 });
 
-it("refuses a successor seen after prepared background admission without renewing or deleting its lease", async () => {
+it.each(["successor", "missing"] as const)("refuses a %s lease seen after prepared background admission without renewing or deleting it", async interference => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const s = await setup(() => gate);
   try {
     s.block(true); await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(0);
     const successor = { ...s.lease(), startedAt: s.lease().startedAt! + 1 };
-    writeHostLease(s.root, successor);
-    const bytes = fs.readFileSync(hostLeasePath(s.root, successor.id), "utf8");
+    const leasePath = hostLeasePath(s.root, successor.id);
+    if (interference === "missing") fs.unlinkSync(leasePath);
+    else writeHostLease(s.root, successor);
+    const bytes = interference === "missing" ? undefined : fs.readFileSync(leasePath, "utf8");
     s.block(false); release(); await vi.advanceTimersByTimeAsync(0);
     expect(s.fence).toHaveBeenCalledTimes(2); expect(s.directory.canConsumeMesh()).toBe(false);
     await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
     await s.directory.closeLineage();
-    expect(fs.readFileSync(hostLeasePath(s.root, successor.id), "utf8")).toBe(bytes);
+    expect(fs.existsSync(leasePath)).toBe(interference !== "missing");
+    if (bytes !== undefined) expect(fs.readFileSync(leasePath, "utf8")).toBe(bytes);
     expect(s.mesh.listAll("topology/lineage-closures/")).toEqual([]);
   } finally { release(); }
 });
@@ -100,7 +105,7 @@ it.each(["close", "quiesce"] as const)("%s cancels a prepared native FIFO ticket
   fs.writeFileSync(path.join(lock, "owner"), bytes);
   try {
     s.block(true); await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(0);
     expect(s.directory.options.waitForPublicationRetry).toHaveBeenCalledOnce();
     const signal = vi.mocked(s.directory.options.waitForPublicationRetry!).mock.calls[0]![0]!;
     // Actor stop's presence publisher must not join the host's blocked recovery lane.

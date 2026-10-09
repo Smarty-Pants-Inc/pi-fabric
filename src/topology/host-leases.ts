@@ -120,6 +120,48 @@ export const hostLeasePath = (meshRoot: string, hostId: string): string =>
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
   writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
 
+/** Renew only the current incarnation; initial absence is a no-clobber create.
+ * False means ownership was lost, never permission to retry the write. */
+export const writeHostLeaseIfCurrent = (meshRoot: string, lease: FabricHostLease, allowMissing = false): boolean => {
+  const file = hostLeasePath(meshRoot, lease.id);
+  const temporary = path.join(path.dirname(file), `.renew-${randomUUID()}.tmp`);
+  const ours = (current: FabricHostLease | undefined): boolean => current !== undefined &&
+    current.id === lease.id && current.rootId === lease.rootId &&
+    current.identityId === lease.identityId && current.startedAt === lease.startedAt;
+  let fd: number | undefined;
+  // Stage before opening/checking CURRENT, not from an earlier ownership snapshot.
+  writeJsonAtomic(temporary, { format: 1, ...lease });
+  try {
+    try { fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!allowMissing) return false;
+    }
+    if (fd === undefined) {
+      // An intervening successor always wins initial creation, even after absence.
+      try { fs.linkSync(temporary, file); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
+    } else {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (!opened.isFile() || !ours(leaseOf(fs.readFileSync(fd, "utf8"), fileName(lease.id)))) return false;
+      let current: fs.BigIntStats;
+      try { current = fs.lstatSync(file, { bigint: true }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+      if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino ||
+        current.size !== opened.size || current.mtimeNs !== opened.mtimeNs || current.ctimeNs !== opened.ctimeNs) return false;
+      // ponytail: inode check + rename is not a filesystem CAS. A successor in
+      // that final syscall window can be briefly overwritten; its next 5 s renewal
+      // restores it. Re-read immediately: a successor that won publication makes
+      // us stand down, NEVER rewrite/restore our bytes. No retry uses the old fd.
+      fs.renameSync(temporary, file);
+    }
+    return ours(readHostLeaseCurrent(meshRoot, lease.id));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temporary, { force: true });
+  }
+};
+
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
 

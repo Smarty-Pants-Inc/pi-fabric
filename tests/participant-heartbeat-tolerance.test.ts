@@ -18,7 +18,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const timeout = () => new MeshLockTimeoutError(" held by heartbeat test", 1, 0);
-const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000) => {
+const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000, initialPublish = true) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "heartbeat-tolerance-")); roots.push(root);
   const identity: MeshIdentity = { id: "session:live", name: "main", kind: "main", sessionId: "live" };
   const mesh = new MeshStore(root, 65_536, 100, { lockTimeoutMs });
@@ -48,7 +48,7 @@ const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000) =>
   };
   const source = vi.fn(() => [{ ...record, updatedAt: Date.now() }]);
   directory.registerSource(source); directories.push(directory);
-  await directory.refresh();
+  if (initialPublish) await directory.refresh();
   const lockPath = path.join(root, ".lock");
   const hold = () => {
     fs.mkdirSync(lockPath, { mode: 0o700 });
@@ -64,7 +64,7 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     const s = await setup();
     const runner = new MeshBackgroundRetry("heartbeat tolerance test");
     const failure = vi.spyOn(runner, "failure");
-    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0); // minimum 150 ms jitter
+    vi.useFakeTimers();
     const start = Date.now();
     let stop = false, rounds = 0, lostLeases = 0;
     const holder = (async () => {
@@ -119,29 +119,35 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     expect(s.directory.writeStalled()).toBeUndefined(); expect(s.directory.canConsumeMesh()).toBe(true);
   });
 
-  it("bounds typed retries to four tries with 150–600 ms jitter and one counted failure", async () => {
+  it("without an admission callback retries once at the existing heartbeat tick, never a new timer", async () => {
     const s = await setup(true, false);
-    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.999999);
+    vi.useFakeTimers(); await s.directory.start();
     const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
-    const runner = new MeshBackgroundRetry("four tries");
-    const failure = vi.spyOn(runner, "failure"); vi.spyOn(console, "warn").mockImplementation(() => {});
-    const work = runner.run(() => s.directory.refresh(), false);
-    await vi.advanceTimersByTimeAsync(599); expect(confirm).toHaveBeenCalledOnce(); expect(failure).not.toHaveBeenCalled();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    expect(confirm).toHaveBeenCalledOnce(); expect(timers).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(4_999); expect(confirm).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1); expect(confirm).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(1_200); expect(await work).toBe("retry");
-    expect(confirm).toHaveBeenCalledTimes(4); expect(failure).toHaveBeenCalledOnce();
+    expect(s.wait).not.toHaveBeenCalled(); expect(timers).not.toHaveBeenCalled();
   });
 
-  it("reselects sources after jitter/admission without widening registry tries", async () => {
+  it("reselects sources after event admission without widening registry tries", async () => {
     const s = await setup();
-    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.useFakeTimers();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    s.wait.mockImplementation(() => gate);
+    const timers = vi.spyOn(globalThis, "setTimeout");
     const original = s.mesh.confirmWritable.bind(s.mesh);
     const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValueOnce(timeout()).mockImplementation(original);
     const work = s.directory.refresh();
     await vi.advanceTimersByTimeAsync(0);
     const reads = s.source.mock.calls.length;
     s.record.status = "running";
-    await vi.advanceTimersByTimeAsync(150); await work;
+    release(); await work;
+    expect(timers).toHaveBeenCalledOnce(); // only the frozen admission deadline, no retry sleep
+    expect(timers.mock.calls[0]![1]).toBe(13_000);
     expect(s.wait).toHaveBeenCalledOnce(); expect(s.source.mock.calls.length).toBeGreaterThan(reads);
     expect(s.directory.get(s.record.id)?.status).toBe("running");
     expect(confirm).toHaveBeenCalled();
@@ -159,6 +165,136 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     directories.push(newcomer);
     await expect(newcomer.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
     expect(readHostLease(s.root, "new")).toBeUndefined(); expect(newcomer.canConsumeMesh()).toBe(false);
+  });
+
+  it("allows an absent lease before initial ownership and creates it on admission", async () => {
+    const s = await setup(true, true, 20_000, false);
+    expect(readHostLeaseCurrent(s.root, s.record.ownerHostId)).toBeUndefined();
+    await s.directory.refresh();
+    expect(readHostLeaseCurrent(s.root, s.record.ownerHostId)).toMatchObject({
+      identityId: s.record.ownerIdentityId, rootId: s.record.rootId,
+    });
+    expect(s.directory.canConsumeMesh()).toBe(true);
+  });
+
+  it("a positive clean release can start a new incarnation, never resume the released owner", async () => {
+    const s = await setup();
+    const first = s.lease().startedAt;
+    await s.directory.close();
+    expect(readHostLeaseCurrent(s.root, s.record.ownerHostId)).toBeUndefined();
+    await s.directory.start();
+    expect(s.lease().startedAt).toBeGreaterThan(first!);
+    expect(s.directory.canConsumeMesh()).toBe(true);
+  });
+
+  it.each(["refresh", "refreshPresence", "start"] as const)("a missing owned lease supersedes %s without recreating it", async operation => {
+    const s = await setup();
+    const leasePath = hostLeasePath(s.root, s.record.ownerHostId);
+    const prior = s.directory.confirmedAt(), state = fs.readFileSync(path.join(s.root, "state.json"), "utf8");
+    const confirm = vi.spyOn(s.mesh, "confirmWritable");
+    fs.unlinkSync(leasePath);
+    await expect(s.directory[operation]()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    expect(fs.existsSync(leasePath)).toBe(false);
+    expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
+    await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
+    await expect(s.directory.quiesce("reload")).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await s.directory.closeLineage();
+    await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError); // failed close never grants a new incarnation
+    expect(confirm).not.toHaveBeenCalled(); expect(fs.existsSync(leasePath)).toBe(false);
+    expect(fs.readFileSync(path.join(s.root, "state.json"), "utf8")).toBe(state);
+  });
+
+  it.each([true, false])("a lease deleted inside a failed attempt fences retry and failed-write renewal (typed timeout: %s)", async typed => {
+    const s = await setup();
+    const leasePath = hostLeasePath(s.root, s.record.ownerHostId), prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockImplementation(async () => {
+      fs.unlinkSync(leasePath); throw typed ? timeout() : new Error("ENOSPC");
+    });
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    expect(confirm).toHaveBeenCalledOnce(); expect(fs.existsSync(leasePath)).toBe(false);
+    expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
+  });
+
+  it("a lease deleted during event admission stops the old owner before a successor claims it", async () => {
+    const s = await setup();
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
+    const leasePath = hostLeasePath(s.root, s.record.ownerHostId), previous = s.lease(), prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValueOnce(timeout());
+    s.wait.mockImplementation(async () => { fs.unlinkSync(leasePath); });
+    const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await vi.advanceTimersByTimeAsync(0); expect(confirm).toHaveBeenCalledOnce();
+    await failed;
+    expect(fs.existsSync(leasePath)).toBe(false);
+    expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
+    expect(s.wait).toHaveBeenCalledOnce(); expect(confirm).toHaveBeenCalledOnce();
+    writeHostLease(s.root, { ...previous, startedAt: previous.startedAt! + 1 });
+    const bytes = fs.readFileSync(leasePath, "utf8");
+    await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await s.directory.closeLineage();
+    expect(fs.readFileSync(leasePath, "utf8")).toBe(bytes);
+  });
+
+  it("a missing owned lease fences timer renewal and a delayed confirmation callback", async () => {
+    const s = await setup(); vi.useFakeTimers(); await s.directory.start();
+    const leasePath = hostLeasePath(s.root, s.record.ownerHostId), prior = s.directory.confirmedAt();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockImplementation(async callback => {
+      await gate; callback?.(Date.now());
+    });
+    const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    try {
+      await vi.advanceTimersByTimeAsync(0); fs.unlinkSync(leasePath);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fs.existsSync(leasePath)).toBe(false); expect(s.directory.canConsumeMesh()).toBe(false);
+      release(); await failed;
+      expect(s.directory.confirmedAt()).toBe(prior);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(confirm).toHaveBeenCalledOnce(); expect(fs.existsSync(leasePath)).toBe(false);
+    } finally { release(); }
+  });
+
+  it.each(["after-open", "after-rename"] as const)("a successor racing renewal %s fences the loser without a later overwrite", async phase => {
+    const s = await setup();
+    const leasePath = hostLeasePath(s.root, s.record.ownerHostId), previous = s.lease();
+    const successor = { ...previous, identityId: "successor", startedAt: previous.startedAt! + 1 };
+    const prior = s.directory.confirmedAt();
+    const confirm = vi.spyOn(s.mesh, "confirmWritable");
+    let bytes = "", raced = false, loserRenames = 0;
+    const replace = () => { writeHostLease(s.root, successor); bytes = fs.readFileSync(leasePath, "utf8"); };
+    if (phase === "after-open") {
+      const read = fs.readFileSync.bind(fs);
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        const text = (read as (...args: unknown[]) => unknown)(file, ...args);
+        if (typeof file === "number" && !raced) { raced = true; replace(); }
+        return text;
+      }) as typeof fs.readFileSync);
+    } else {
+      const rename = fs.renameSync.bind(fs);
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(to) === leasePath && path.basename(String(from)).startsWith(".renew-")) {
+          loserRenames++;
+          if (!raced) {
+            raced = true;
+            rename(from, to);
+            replace(); // successor wins publication before our post-rename read
+            return;
+          }
+        }
+        rename(from, to);
+      });
+    }
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    expect(raced).toBe(true); expect(loserRenames).toBe(phase === "after-open" ? 0 : 1);
+    expect(confirm).not.toHaveBeenCalled(); expect(s.directory.confirmedAt()).toBe(prior);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    await s.directory.closeLineage();
+    expect(fs.readFileSync(leasePath, "utf8")).toBe(bytes);
+    expect(fs.readdirSync(path.dirname(leasePath)).filter(name => name.startsWith(".renew-"))).toEqual([]);
   });
 
   it("renews a coalesced heartbeat independently and never shortens matching held host/session leases", async () => {
@@ -190,15 +326,18 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     return fs.readFileSync(hostLeasePath(s.root, next.id), "utf8");
   };
 
-  it.each([false, true])("a successor during jitter fences every later renewal and confirmation (identity changes: %s)", async identity => {
+  it.each([false, true])("a successor during event admission fences every later renewal and confirmation (identity changes: %s)", async identity => {
     const s = await setup();
     vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0);
     const prior = s.directory.confirmedAt();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    s.wait.mockImplementation(() => gate);
     const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
     const failed = expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
     await vi.advanceTimersByTimeAsync(0); expect(confirm).toHaveBeenCalledOnce();
     const bytes = replaceLease(s, identity);
-    await vi.advanceTimersByTimeAsync(150); await failed;
+    release(); await failed;
     expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
     await expect(s.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_LEASE_SUPERSEDED" });
     await expect(s.directory.quiesce("reload")).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
@@ -292,9 +431,9 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     let spent = 0;
     const failed = expect(s.directory.refresh().finally(() => { spent = performance.now() - start; }))
       .rejects.toBeInstanceOf(MeshLockTimeoutError);
-    await vi.advanceTimersByTimeAsync(150); // first try failed; now blocked in native FIFO admission
+    await vi.advanceTimersByTimeAsync(0); // first try failed; now blocked in native FIFO admission
     vi.setSystemTime(Date.now() - 60_000);
-    await vi.advanceTimersByTimeAsync(12_850); await failed;
+    await vi.advanceTimersByTimeAsync(13_000); await failed;
     expect(spent).toBe(13_000); expect(s.directory.confirmedAt()).toBe(prior);
     expect(s.directory.canConsumeMesh()).toBe(false);
     expect(readHostLeaseCurrent(s.root, s.lease().id)?.startedAt).toBe(s.lease().startedAt);

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseCurrent, readHostLeaseSnapshot, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseCurrent, readHostLeaseSnapshot, writeHostLease, writeHostLeaseIfCurrent, hostLeasePath, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // Windows fails an open with EPERM while the owner's heartbeat renames a new lease file over the
 // old one. A live host then looked leaseless, and the failed read stayed cached until its next
@@ -33,6 +33,46 @@ describe("host lease files on a transient read failure", () => {
     };
     return { root, lease, failReads };
   };
+
+  it("creates only before ownership, then renews the exact incarnation without temp leaks", () => {
+    const { root, lease } = setup();
+    const original = { ...lease(1_000), startedAt: 1 };
+    expect(writeHostLeaseIfCurrent(root, original, true)).toBe(true);
+    expect(writeHostLeaseIfCurrent(root, { ...original, updatedAt: 2_000 })).toBe(true);
+    expect(readHostLeaseCurrent(root, original.id)?.updatedAt).toBe(2_000);
+    fs.unlinkSync(hostLeasePath(root, original.id));
+    expect(writeHostLeaseIfCurrent(root, original)).toBe(false);
+    expect(fs.existsSync(hostLeasePath(root, original.id))).toBe(false);
+    expect(fs.readdirSync(path.join(root, "host-leases"))).toEqual([]);
+  });
+
+  it("an owned lease unlinked after opening its current inode is not recreated", () => {
+    const { root, lease } = setup();
+    const original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const file = hostLeasePath(root, original.id), read = fs.readFileSync.bind(fs);
+    let removed = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const text = (read as (...args: unknown[]) => unknown)(target, ...args);
+      if (typeof target === "number" && !removed) { removed = true; fs.unlinkSync(file); }
+      return text;
+    }) as typeof fs.readFileSync);
+    expect(writeHostLeaseIfCurrent(root, original)).toBe(false);
+    expect(removed).toBe(true); expect(fs.existsSync(file)).toBe(false);
+    expect(fs.readdirSync(path.dirname(file))).toEqual([]);
+  });
+
+  it("never clobbers an intervening successor during absent initial creation", () => {
+    const { root, lease } = setup();
+    const original = { ...lease(1_000), startedAt: 1 }, successor = { ...original, startedAt: 2 };
+    const link = fs.linkSync.bind(fs);
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      writeHostLease(root, successor); link(from, to);
+    });
+    expect(writeHostLeaseIfCurrent(root, original, true)).toBe(false);
+    expect(readHostLeaseCurrent(root, original.id)).toEqual(successor);
+    expect(fs.readdirSync(path.join(root, "host-leases")).filter(name => name.startsWith(".renew-"))).toEqual([]);
+  });
 
   it("round-trips the optional reload marker without adding it to ordinary leases", () => {
     const { root, lease } = setup();

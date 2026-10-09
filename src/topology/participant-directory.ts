@@ -1687,7 +1687,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#notifications.close();
     if (!this.options.enabled || this.#superseded) return;
     // Never delete successor presence, even if close is the first observation of it.
-    try { this.#assertCurrentLease(); } catch { return; }
+    try { this.#assertCurrentLease(false); } catch { return; }
     const own = (entry: MeshStateEntry): boolean => {
       const participant = participantFromEntry(entry);
       return participant !== undefined && isLocal(participant, this.options.hostId) &&
@@ -2115,7 +2115,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // only the predecessor checked by this preparation, under state custody,
           // then use strict renewal before ANY asynchronous post-commit file work.
           if (this.#keptReloadLease && predecessor && predecessor.startedAt !== this.#startedAt) {
-            const host = hostFromEntry(view.get(keyFor(HOST_PREFIX, this.options.hostId)));
+            const entry = view.get(keyFor(HOST_PREFIX, this.options.hostId));
+            const host = entry && hostFromEntry(entry);
             if (host?.startedAt === this.#startedAt && host.rootId === this.options.rootId &&
               host.identity.id === this.options.identity.id) {
               removeHostLeaseIf(this.mesh.root, this.options.hostId, lease =>
@@ -2290,7 +2291,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       lease.startedAt === host.startedAt && lease.startedAt < this.#startedAt && lease.expiresAt > at &&
       (lease.reloadUntil === lease.expiresAt ||
         // Older releases extended the fixed Main session TTL without an explicit reload marker.
-        (lease.reloadUntil === undefined && lease.session?.id === this.options.identity.sessionId &&
+        (lease.reloadUntil === undefined && lease.session !== undefined && lease.session.id === this.options.identity.sessionId &&
           lease.session.expiresAt === lease.expiresAt &&
           lease.session.expiresAt - lease.session.updatedAt > PARTICIPANT_LEASE_MS &&
           lease.session.expiresAt - lease.session.updatedAt <= MAIN_RELOAD_LEASE_MS &&

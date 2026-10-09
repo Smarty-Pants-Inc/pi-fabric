@@ -128,6 +128,8 @@ export interface AtomicWriteOptions {
   // of times with linear backoff before surfacing the error.
   renameRetries?: number;
   renameRetryDelayMs?: number;
+  /** External ownership CAS after staging, immediately before EACH rename attempt. A throw leaves the target untouched. */
+  beforeRename?: () => void;
 }
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);
@@ -177,6 +179,7 @@ export const renameAtomic = (
   const attempts = Math.max(1, options?.renameRetries ?? 8);
   const delay = options?.renameRetryDelayMs ?? 25;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    options?.beforeRename?.(); // Validation errors are not transient rename failures.
     try {
       fs.renameSync(source, target);
       return;

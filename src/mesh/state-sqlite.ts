@@ -626,6 +626,7 @@ const toEntry = (row: SqliteRow): MeshStateEntry => ({
 interface Slot { present: boolean; version: number; bytes: number; tombstone: boolean }
 
 interface Tx {
+  beforeCommit?: () => void;
   highWater: number;
   commit: number;
   stateBytes: number;
@@ -1014,11 +1015,13 @@ export class SqliteStateStore {
     ops: MeshBatchOperation[];
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
+    beforeCommit?: () => void;
   }): Promise<MeshBatchResult[]> {
     for (const op of input.ops) validateMeshStateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
     let committed: number | undefined;
     const results = await this.#write((tx) => {
+      if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
       const view = this.#view();
       const started = performance.now();
       const prepared = input.prepare?.(view) ?? [];
@@ -1059,8 +1062,12 @@ export class SqliteStateStore {
         results.push({ key: op.key, applied: true, version: plan.version });
       }
       if (tx.changes.length > 0) committed = tx.commit + 1;
-      // A write-free batch cannot fail to commit: run the effect on the exact snapshot.
-      else if (input.afterCommit) this.#timedAfterCommit(input.afterCommit, view);
+      // A write-free batch still validates external ownership before its legacy effect.
+      // Run that effect on the exact snapshot, preserving the write-free contract.
+      else if (input.afterCommit) {
+        input.beforeCommit?.();
+        this.#timedAfterCommit(input.afterCommit, view);
+      }
       return results;
     });
     if (committed !== undefined && input.afterCommit) {
@@ -1471,6 +1478,7 @@ export class SqliteStateStore {
         throw new Error("Fabric mesh state transactions must be synchronous");
       }
       if (tx.changes.length > 0 || tx.finish) { this.#finish(tx); changed = true; }
+      tx.beforeCommit?.();
       this.#db.exec("COMMIT");
       committed = true;
       if (changed) this.#stats.commits += 1;

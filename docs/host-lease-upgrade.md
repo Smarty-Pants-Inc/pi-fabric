@@ -19,6 +19,29 @@ old writer extends the lease in the meantime, it returns `FABRIC_HOST_LEASE_LEGA
 `expiresAt`; it does not poll or rearm itself. Explicit zero-wait callers get that typed busy
 error immediately.
 
+### Residual security gap: a paused old release can outlive its TTL
+
+The precise upgrade-window precondition is an **old-release, pre-UUID process paused for
+longer than its host lease TTL**, then resumed **after a new UUID writer has claimed** the
+expired lease. The old process can execute its unfenced legacy lease write (and potentially
+its old publication code) without taking the new host commit gate. Expiry proves neither
+process exit nor quiescence. This does not describe an in-place `/reload`: that path quiesces
+and fences the old runtime before the successor is admitted.
+
+Every new lease-owned shared-state batch captures its lease UUID and re-validates it with a
+fresh ownership CAS after preparation/operations at the durable commit boundary (file/shadow
+state replacement or SQLite COMMIT). A legacy overwrite observed there aborts the entire batch
+with `FABRIC_HOST_LEASE_CONTESTED`; a different UUID or absent lease aborts with
+`FABRIC_HOST_LEASE_SUPERSEDED`. No post-commit error is presented as rollback. This closes the
+in-flight acquisition/preparation window, not an atomic transaction across a legacy writer's
+lease file and shared state: old code can still overwrite after the final check, or mutate
+state itself. New code cannot retroactively fence that writer, and cannot claim coexistence
+with it is safe.
+
+**Mitigation:** upgrade by stopping all old-release processes sharing the native host lease
+**before** allowing the new claim. Do not rely on waiting one TTL, a stale file, or SIGSTOP as
+proof they have stopped. Keep the old processes stopped until their binaries are upgraded.
+
 After UUID admission, seeing any legacy-format lease is terminal contention
 (`FABRIC_HOST_LEASE_CONTESTED`, non-retryable). The directory stops renewal, publication retries,
 and consumer admission, and never adopts the legacy write as a new migration predecessor.

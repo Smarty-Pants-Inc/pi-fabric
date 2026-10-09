@@ -920,8 +920,8 @@ export class StateFile implements StateBackend {
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
   #commitState(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined, keys: string[], caller: string[] | undefined,
-    namespaces?: Record<string, string>): void {
-    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller);
+    namespaces?: Record<string, string>, beforeCommit?: () => void): void {
+    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller, beforeCommit);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -961,7 +961,7 @@ export class StateFile implements StateBackend {
     return epoch === undefined ? 0 : storageRevision(epoch);
   };
 
-  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
+  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[], beforeCommit?: () => void): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
@@ -975,8 +975,9 @@ export class StateFile implements StateBackend {
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;
     try {
-      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
-      else writeFileAtomic(this.#statePath, encoded.serialized);
+      const commitOptions = beforeCommit ? { beforeRename: beforeCommit } : undefined;
+      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath, commitOptions);
+      else writeFileAtomic(this.#statePath, encoded.serialized, commitOptions);
       if (journal) {
         try { witnessStat = staged !== undefined ? fs.fstatSync(staged, { bigint: true }) : fs.statSync(this.#statePath, { bigint: true }); }
         catch { /* no witness: readers hash */ }
@@ -1148,7 +1149,7 @@ export class StateFile implements StateBackend {
   async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
@@ -1251,12 +1252,13 @@ export class StateFile implements StateBackend {
         changed = true;
       }
       if (!changed) {
+        input.beforeCommit?.();
         this.#cacheState(state, undefined);
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
         const changedKeys = results.filter(result => result.applied).map(result => result.key);
-        this.#commitState(state, reuse, changedKeys, caller, namespaces);
+        this.#commitState(state, reuse, changedKeys, caller, namespaces, input.beforeCommit);
         committed?.(changedKeys);
       }
       input.afterCommit?.(view);

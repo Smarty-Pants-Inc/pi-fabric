@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
-import type { MeshStateEntry } from "../mesh/store.js";
+import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
@@ -172,7 +172,7 @@ export const assertHostLeaseOwner = (meshRoot: string, owner: FabricHostLease): 
 /** Claims/renewals and every owned mutation share this physical-host-qualified commit gate.
  * Hold it THROUGH an awaited state transaction; a paused writer cannot cross a new token CAS.
  * Lock order: participant key (if any), lease commit gate, then shared state. */
-export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh, owner: FabricHostLease,
+export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh & Pick<MeshStore, "withBatchCommitFence">, owner: FabricHostLease,
   operation: () => T | Promise<T>, options: { ownIncarnation?: string | undefined; ownerAfter?: () => FabricHostLease } = {}): Promise<T> => {
   const file = hostLeasePath(mesh.root, owner.id);
   let entered = false;
@@ -180,7 +180,7 @@ export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh, owner: FabricHo
     return await mesh.leaseCustody(file, async () => {
       entered = true;
       assertHostLeaseOwner(mesh.root, owner);
-      const result = await operation();
+      const result = await mesh.withBatchCommitFence(() => assertHostLeaseOwner(mesh.root, owner), operation);
       assertHostLeaseOwner(mesh.root, options.ownerAfter?.() ?? owner);
       return result;
     }, 0, options);
@@ -283,6 +283,15 @@ export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHos
     }, { lease: { incarnationToken: captured.incarnationToken!, expiresAt: captured.expiresAt } });
   } catch (error) { if (error instanceof HostLeaseLockLostError) return false; throw error; }
 };
+
+/** The exact observed renewal version, including deadlines/session metadata, not only its UUID. */
+export const sameHostLeaseVersion = (left: FabricHostLease | undefined, right: FabricHostLease | undefined): boolean =>
+  JSON.stringify(left) === JSON.stringify(right);
+
+/** Reaper compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
+ * The detached-file check also keeps an unfenced historical replacement rather than unlinking it. */
+export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease): boolean =>
+  removeHostLeaseIf(meshRoot, expected.id, current => sameHostLeaseVersion(current, expected));
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });

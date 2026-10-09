@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Linux, foreground, compiled-bundle SIGSTOP proofs for #7313 / PR #742 Round 3.
+// Linux, foreground, compiled-bundle SIGSTOP proofs for #7313 / PR #742 Rounds 3 and 4.
 // Run after `bun run build`: node scripts/probe-host-lease-fence.mjs
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fork, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -25,6 +25,10 @@ async function compiledSymbol(name) {
 const { MeshStore } = await import(pathToFileURL(path.join(dist, "mesh.js")).href);
 const [ParticipantDirectory, renewHostLease, writeHostLease, hostLeasePath, readHostLeaseCurrent, readParticipantFiles] =
   await Promise.all(["ParticipantDirectory", "renewHostLease", "writeHostLease", "hostLeasePath", "readHostLeaseCurrent", "readParticipantFiles"].map(compiledSymbol));
+const [withOwnedHostLease, writeParticipantFileIf] =
+  await Promise.all(["withOwnedHostLease", "writeParticipantFileIf"].map(compiledSymbol));
+const hostKey = id => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
+const participantKey = id => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const hostId = "compiled-r3-host", identity = { id: "compiled-r3-owner", name: "probe", kind: "agent" };
 const options = { enabled: true, hostId, rootId: "compiled-r3-root", identity,
   reapDeadHosts: false, heartbeatMs: 60_000, leaseMs: 120_000 };
@@ -57,9 +61,46 @@ if (mode?.startsWith("child-")) {
       await renewHostLease(mesh, lease, { claim: true });
       await mesh.leaseCustody(hostLeasePath(root, hostId), () => pause("holding-physical-commit-gate"));
       message({ type: "result", code: "gate-released" });
-    } else if (mode === "child-legacy") {
+    } else if (mode === "child-batch-legacy") {
+      const lease = readHostLeaseCurrent(root, hostId);
+      let callbacks = 0, armed = true;
+      const write = fs.writeFileSync;
+      if (backend === "file") fs.writeFileSync = (file, ...args) => {
+        const result = write(file, ...args);
+        if (armed && String(file).startsWith(path.join(root, "state.json."))) {
+          armed = false; pause("v2-batch-after-state-stage-before-commit");
+        }
+        return result;
+      };
+      const error = await withOwnedHostLease(mesh, lease, () => mesh.writeBatch({ identity,
+        prepare: () => [], afterCommit: () => { callbacks++; }, commitOutbox: () => { callbacks++; },
+        ops: [{ kind: "delete", key: "r4/keep" }, { kind: "put", key: "r4/new", value: () => {
+          if (backend === "sqlite") pause("v2-batch-after-prepare-before-commit"); return "must not commit";
+        } }] })).then(() => undefined, error => error);
+      fs.writeFileSync = write;
+      message({ type: "result", code: error?.code, callbacks });
+    } else if (mode === "child-reaper-renew") {
+      const target = JSON.parse(fs.readFileSync(path.join(root, "probe-input.json"), "utf8"));
+      const custody = mesh.leaseCustody.bind(mesh); let armed = true, finished;
+      const swept = new Promise(resolve => { finished = resolve; });
+      mesh.leaseCustody = async (file, operation, timeout, prepared) => {
+        const selected = armed && file === hostLeasePath(root, target.id);
+        if (selected) { armed = false; pause("reaper-after-selection-before-target-gate"); }
+        try { return await custody(file, operation, timeout, prepared); }
+        finally { if (selected) finished(); }
+      };
+      // Exercise the compiled public directory's actual scheduled reaper, not a test-only export.
+      directory = new ParticipantDirectory(mesh, { ...options, heartbeatMs: 10, reapDeadHosts: { sweepMs: 1 } });
+      await directory.start();
+      let timer;
+      try { await Promise.race([swept, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Reaper did not run")), 5_000); })]); }
+      finally { clearTimeout(timer); }
+      await directory.close(); directory = undefined;
+      message({ type: "result", code: "sweep-finished" });
+    } else if (mode === "child-legacy" || mode === "child-legacy-inflight") {
       const legacy = JSON.parse(fs.readFileSync(path.join(root, "probe-input.json"), "utf8"));
       pause("legacy-writer-before-unfenced-overwrite");
+      if (mode === "child-legacy-inflight") { legacy.updatedAt = Date.now(); legacy.expiresAt = Date.now() + 120_000; }
       writeHostLease(root, legacy); // Deliberately models an old release that ignores new custody.
       message({ type: "result", code: "legacy-overwritten" });
     } else throw new Error(`Unknown child mode: ${mode}`);
@@ -161,6 +202,55 @@ if (mode?.startsWith("child-")) {
           assert.deepEqual(mesh.listAll("", { fresh: true }), before); assert.deepEqual(readHostLeaseCurrent(root, hostId), legacy);
           report({ backend, case: paused.point, verdict: "PASS", code: error.code, stateUnchanged: true });
         } finally { await run.stop(); await directory.close(); mesh.closeState(); }
+      }
+      {
+        const root = path.join(base, `${backend}-r4-reaper`); prepareRoot(root, backend);
+        const mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend });
+        let run;
+        try {
+          const now = Date.now(), own = { id: hostId, rootId: options.rootId, identityId: identity.id, incarnationToken: randomUUID(),
+            startedAt: 1, updatedAt: now, expiresAt: now + 120_000 };
+          const target = { ...own, id: "compiled-r4-target", updatedAt: now - 8 * 3_600_000, expiresAt: now - 7 * 3_600_000 };
+          await renewHostLease(mesh, own, { claim: true }); await renewHostLease(mesh, target, { claim: true });
+          await mesh.put({ key: hostKey(target.id), identity, value: { id: target.id, rootId: target.rootId,
+            identity, incarnationToken: target.incarnationToken, expiresAt: target.expiresAt } });
+          const entry = await mesh.put({ key: participantKey("compiled-r4-agent"), identity,
+            value: { id: "compiled-r4-agent", ownerHostId: target.id } });
+          await writeParticipantFileIf(mesh, entry.key, () => entry);
+          const files = readParticipantFiles(root);
+          fs.writeFileSync(path.join(root, "probe-input.json"), JSON.stringify(target));
+          run = child("child-reaper-renew", root, backend); const paused = await run.next("paused"); stopped(run);
+          const targetState = () => mesh.listAll("", { fresh: true }).filter(entry => entry.key !== hostKey(hostId));
+          const before = targetState();
+          const renewed = { ...target, updatedAt: Date.now(), expiresAt: Date.now() + 120_000 };
+          await renewHostLease(mesh, renewed); process.kill(run.process.pid, "SIGCONT");
+          const result = await run.next("result"); await joined(run);
+          assert.equal(result.code, "sweep-finished"); assert.deepEqual(targetState(), before);
+          assert.deepEqual(readParticipantFiles(root), files); assert.deepEqual(readHostLeaseCurrent(root, target.id), renewed);
+          report({ backend, case: paused.point, verdict: "PASS", removed: 0, stateUnchanged: true, filesUnchanged: true, targetRenewalPreserved: true });
+        } finally { if (run) await run.stop(); mesh.closeState(); }
+      }
+      {
+        const root = path.join(base, `${backend}-r4-legacy-inflight`); prepareRoot(root, backend);
+        const mesh = new MeshStore(root, 65_536, 100, { stateBackend: backend });
+        let old, batch;
+        try {
+          // Model an old release paused beyond its TTL, then resumed after UUID admission.
+          const legacy = { id: hostId, rootId: options.rootId, identityId: identity.id, startedAt: 1,
+            updatedAt: Date.now() - 120_000, expiresAt: Date.now() - 1 };
+          writeHostLease(root, legacy); fs.writeFileSync(path.join(root, "probe-input.json"), JSON.stringify(legacy));
+          old = child("child-legacy-inflight", root, backend); await old.next("paused"); stopped(old);
+          const lease = { ...legacy, incarnationToken: randomUUID(), updatedAt: Date.now(), expiresAt: Date.now() + 120_000 };
+          await renewHostLease(mesh, lease, { claim: true }); await mesh.put({ key: "r4/keep", value: "before", identity });
+          const before = mesh.listAll("", { fresh: true }); batch = child("child-batch-legacy", root, backend);
+          const paused = await batch.next("paused"); stopped(batch);
+          process.kill(old.process.pid, "SIGCONT"); await old.next("result"); await joined(old);
+          const overwritten = readHostLeaseCurrent(root, hostId); assert.equal(overwritten.incarnationToken, undefined);
+          process.kill(batch.process.pid, "SIGCONT"); const result = await batch.next("result"); await joined(batch);
+          assert.equal(result.code, "FABRIC_HOST_LEASE_CONTESTED"); assert.equal(result.callbacks, 0);
+          assert.deepEqual(mesh.listAll("", { fresh: true }), before); assert.deepEqual(readHostLeaseCurrent(root, hostId), overwritten);
+          report({ backend, case: paused.point, verdict: "PASS", code: result.code, callbacks: 0, stateUnchanged: true, legacyOverwritePreserved: true });
+        } finally { if (old) await old.stop(); if (batch) await batch.stop(); mesh.closeState(); }
       }
       {
         const root = path.join(base, `${backend}-fresh-legacy`); prepareRoot(root, backend);

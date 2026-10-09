@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
@@ -263,6 +264,7 @@ let unreadableStateRevisions = 0;
 export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
+  readonly #batchCommitFences = new AsyncLocalStorage<readonly (() => void)[]>();
   readonly #events: EventLog;
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
@@ -395,7 +397,16 @@ export class MeshStore {
 
   /** Transaction and callback semantics: StateBackendBatchInput (state-backend.ts). */
   writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
-    return this.#state.writeBatch(input);
+    const checks = [...(this.#batchCommitFences.getStore() ?? [])];
+    if (input.beforeCommit) checks.push(input.beforeCommit);
+    return this.#state.writeBatch(checks.length === 0 ? input : { ...input,
+      beforeCommit: () => { for (const check of checks) check(); } });
+  }
+
+  /** Capture external ownership for every batch submitted in this async scope.
+   * Backends validate after preparation/operations, immediately before durable commit. */
+  withBatchCommitFence<T>(check: () => void, operation: () => T): T {
+    return this.#batchCommitFences.run([...(this.#batchCommitFences.getStore() ?? []), check], operation);
   }
 
   confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

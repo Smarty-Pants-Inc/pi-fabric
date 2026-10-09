@@ -194,14 +194,20 @@ export interface AgentRunRecord {
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
   toolCalls: number;
+  /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
+  /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
+  lastCompleteText?: string;
+  /** Streaming text; on an interrupted failed task, retained partial output (possibly the preceding message), never a successful report. */
+  partialText?: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
   replyVia?: "tool";
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause; watcher/custody failure is not exit proof. */
   errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
-  /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
+  /** Run diagnostics, including partial-report retention and dropped oversized child events (smarty-dev#1907);
+   * warnings never override status. */
   warnings?: string[];
   stderr?: string;
   exitCode?: number | null;

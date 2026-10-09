@@ -6,7 +6,8 @@ create, not invented 1Password provider IDs. After authorized creation, record t
 actual item IDs in private profiles/host receipts. None have been created or read
 by this task. Local guides are `smarty-dev/docs/credentials.md` and
 `.agents/skills/smarty-credentials/SKILL.md`; use the existing **Smarty Development**
-vault (`zpbhoj6yfzevtfaxjswevq66m4`), not a new vault or secret loader.
+vault, not a new vault or secret loader. Its immutable vault ID and all
+provider-issued item IDs belong only in private profiles/host receipts, not Git.
 
 One canonical item per credential, no omnibus bundle. Titles follow
 `NATS — <purpose> (<scope>)`. Tags: `service/nats`, `use/service`, `org/smarty`,

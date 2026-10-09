@@ -5,6 +5,7 @@ import { CapturedToolCatalog } from "../../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../../src/config.js";
 import { FabricRuntimeState } from "../../src/fabric-runtime-state.js";
 import { MeshStore } from "../../src/mesh/store.js";
+import { withStateFence } from "../../src/mesh/commit-outbox.js";
 import { MeshProvider } from "../../src/providers/mesh-provider.js";
 import { QuickJsRuntime } from "../../src/runtime/quickjs-runtime.js";
 import { ParticipantDirectory } from "../../src/topology/participant-directory.js";
@@ -78,7 +79,9 @@ if (mode === "foreground") {
   assert.equal(mesh.get("probe")?.value, 2);
 } else if (mode.startsWith("directory-")) {
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
-    heartbeatMs: mode === "directory-change" ? 60_000 : 100, leaseMs: 180_000 });
+    heartbeatMs: mode === "directory-change" ? 60_000 : 100, leaseMs: 180_000,
+    // Change refreshes do not retry an outage; use the resident host's admission lane.
+    ...(mode === "directory-change" ? { waitForPublicationRetry: () => withStateFence(mesh, identity, () => undefined) } : {}) });
   let name = "before";
   directory.registerSource(() => [{ ...member(identity.id, true), name, label: "probe" }]);
   await directory.start();
@@ -86,11 +89,11 @@ if (mode === "foreground") {
   const release = hold(mesh);
   name = "after";
   if (mode === "directory-change") directory.scheduleRefresh();
-  await sleep(350);
+  await wait(() => directory.writeStalled() !== undefined);
   assert.equal(mesh.listAll("topology/hosts/")[0]!.version, initial);
   release();
-  if (mode === "directory-change") directory.scheduleRefresh();
-  await wait(() => directory.list().some(value => value.name === "after"));
+  await wait(() => !directory.writeStalled() && directory.list().some(value => value.name === "after"));
+  assert.ok(mesh.listAll("topology/hosts/")[0]!.version > initial);
   await directory.close();
 } else if (mode === "actor-presence") {
   const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, enabled: false }, { workerPath: path.join(root, "unused.mjs"), runRoot: path.join(root, "runs") });

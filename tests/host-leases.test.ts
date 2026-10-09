@@ -1,8 +1,11 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import { MeshStore } from "../src/mesh/store.js";
+import { ownProcessIncarnation } from "../src/core/atomic-write.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseCurrent, readHostLeaseSnapshot, writeHostLease, writeHostLeaseIfCurrent, hostLeasePath, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseCurrent, readHostLeaseSnapshot, writeHostLease, writeHostLeaseIfCurrent, hostLeasePath, hostLeasePublishLockPath, acquireHostLeasePublishLock, HostLeasePublishLockBusyError, prepareHostLeasePublishLock, waitForHostLeasePublication, removeHostLease, removeHostLeaseIf, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // Windows fails an open with EPERM while the owner's heartbeat renames a new lease file over the
 // old one. A live host then looked leaseless, and the failed read stayed cached until its next
@@ -62,16 +65,129 @@ describe("host lease files on a transient read failure", () => {
     expect(fs.readdirSync(path.dirname(file))).toEqual([]);
   });
 
-  it("never clobbers an intervening successor during absent initial creation", () => {
+  it("a successor at the final check/rename window waits for publication, then survives every stale renewal", async () => {
     const { root, lease } = setup();
     const original = { ...lease(1_000), startedAt: 1 }, successor = { ...original, startedAt: 2 };
-    const link = fs.linkSync.bind(fs);
-    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
-      writeHostLease(root, successor); link(from, to);
+    writeHostLease(root, original);
+    const file = hostLeasePath(root, original.id), rename = fs.renameSync.bind(fs);
+    const abort = new AbortController();
+    let publication: Promise<void> | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === file && String(from).includes(".renew-") && !publication) {
+        // Exactly the old P1-A syscall gap. The successor CANNOT publish until
+        // the stale holder leaves its exclusive check+rename critical section.
+        expect(() => writeHostLease(root, successor)).toThrow(HostLeasePublishLockBusyError);
+        publication = waitForHostLeasePublication(root, original.id, abort.signal).then(() => writeHostLease(root, successor));
+      }
+      rename(from, to);
     });
-    expect(writeHostLeaseIfCurrent(root, original, true)).toBe(false);
+    try {
+      expect(writeHostLeaseIfCurrent(root, original)).toBe(true);
+      expect(publication).toBeDefined();
+      await publication;
+      expect(writeHostLeaseIfCurrent(root, original)).toBe(false);
+      expect(readHostLeaseCurrent(root, original.id)).toEqual(successor);
+      expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+    } finally { abort.abort(); }
+  });
+
+  it("all publishers/removers share wx exclusion and a held renewal is skipped, not superseded", () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const release = acquireHostLeasePublishLock(root, original.id);
+    try {
+      const owner = JSON.parse(fs.readFileSync(hostLeasePublishLockPath(root, original.id), "utf8"));
+      expect(owner).toMatchObject({ pid: process.pid, token: expect.any(String) });
+      expect(owner).toHaveProperty("startTime");
+      expect(writeHostLeaseIfCurrent(root, original)).toBe("skipped");
+      expect(() => writeHostLease(root, { ...original, startedAt: 2 })).toThrow(HostLeasePublishLockBusyError);
+      expect(() => removeHostLease(root, original.id)).toThrow(HostLeasePublishLockBusyError);
+      expect(() => removeHostLeaseIf(root, original.id, () => true)).toThrow(HostLeasePublishLockBusyError);
+      // It is per LEASE, not global/mesh exclusion.
+      writeHostLease(root, { ...original, id: "host:b" });
+      expect(readHostLeaseCurrent(root, original.id)).toEqual(original);
+    } finally { release(); }
+  });
+
+  it("reclaims a just-crashed holder by pid death without any age threshold", async () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const lock = hostLeasePublishLockPath(root, original.id);
+    const crash = spawnSync(process.execPath, ["-e", `require('node:fs').writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,startTime:null,token:'crashed-holder'}), {flag:'wx'});`, lock]);
+    expect(crash.status).toBe(0);
+    expect(Date.now() - fs.statSync(lock).mtimeMs).toBeLessThan(10_000);
+    await prepareHostLeasePublishLock(new MeshStore(root, 65_536, 100), original.id);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(writeHostLeaseIfCurrent(root, original)).toBe(true);
+  });
+
+  it("never reclaims a live holder by age, including UNKNOWN native start identity", async () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const lock = hostLeasePublishLockPath(root, original.id);
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startTime: null, token: "live-old-holder" }), { flag: "wx" });
+    fs.utimesSync(lock, 1, 1);
+    await prepareHostLeasePublishLock(new MeshStore(root, 65_536, 100), original.id);
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(writeHostLeaseIfCurrent(root, original)).toBe("skipped");
+    fs.unlinkSync(lock);
+  });
+
+  it.skipIf(process.platform !== "linux")("reclaims PID reuse only when native start identity differs", async () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const lock = hostLeasePublishLockPath(root, original.id), start = await ownProcessIncarnation();
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startTime: start, token: "same-start" }), { flag: "wx" });
+    fs.utimesSync(lock, 1, 1);
+    await prepareHostLeasePublishLock(new MeshStore(root, 65_536, 100), original.id);
+    expect(fs.existsSync(lock)).toBe(true);
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startTime: `${BigInt(start!) + 1n}`, token: "reused-pid" }));
+    await prepareHostLeasePublishLock(new MeshStore(root, 65_536, 100), original.id);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("racing dead-holder reclaimers never unlink the next holder's token", async () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 };
+    writeHostLease(root, original);
+    const lock = hostLeasePublishLockPath(root, original.id);
+    const crash = spawnSync(process.execPath, ["-e", `require('node:fs').writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,startTime:null,token:'dead-before-both-reads'}), {flag:'wx'});`, lock]);
+    expect(crash.status).toBe(0);
+    const mesh = new MeshStore(root, 65_536, 100), custody = mesh.custody.bind(mesh);
+    let release: (() => void) | undefined, successorToken = "";
+    vi.spyOn(mesh, "custody").mockImplementation(<T>(operation: () => T) => custody(() => {
+      const result = operation();
+      if (!release) {
+        release = acquireHostLeasePublishLock(root, original.id);
+        successorToken = JSON.parse(fs.readFileSync(lock, "utf8")).token;
+      }
+      return result;
+    }));
+    try {
+      await Promise.all([prepareHostLeasePublishLock(mesh, original.id), prepareHostLeasePublishLock(mesh, original.id)]);
+      expect(JSON.parse(fs.readFileSync(lock, "utf8")).token).toBe(successorToken);
+    } finally { release?.(); }
+  });
+
+  it("a delayed release leaves a replacement publish-lock token intact", () => {
+    const { root, lease } = setup(), original = lease(1_000);
+    writeHostLease(root, original);
+    const release = acquireHostLeasePublishLock(root, original.id), lock = hostLeasePublishLockPath(root, original.id);
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startTime: null, token: "replacement-token" }));
+    release();
+    expect(JSON.parse(fs.readFileSync(lock, "utf8")).token).toBe("replacement-token");
+    fs.unlinkSync(lock);
+  });
+
+  it("reads back after rename and never restores an out-of-protocol successor", () => {
+    const { root, lease } = setup(), original = { ...lease(1_000), startedAt: 1 }, successor = { ...original, startedAt: 2 };
+    writeHostLease(root, original);
+    const file = hostLeasePath(root, original.id), rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to) === file) fs.writeFileSync(file, JSON.stringify({ format: 1, ...successor }));
+    });
+    expect(writeHostLeaseIfCurrent(root, original)).toBe(false);
     expect(readHostLeaseCurrent(root, original.id)).toEqual(successor);
-    expect(fs.readdirSync(path.join(root, "host-leases")).filter(name => name.startsWith(".renew-"))).toEqual([]);
   });
 
   it("round-trips the optional reload marker without adding it to ordinary leases", () => {

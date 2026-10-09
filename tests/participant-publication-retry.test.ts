@@ -57,18 +57,18 @@ it("requeues one host on event admission without timer backoff or duplicate muta
   expect(s.directory.confirmedAt()).toBeGreaterThan(prior); expect(s.directory.canConsumeMesh()).toBe(true);
 });
 
-it("a timed-out admission retries only at the next existing heartbeat tick", async () => {
+it("a timed-out admission retries only at a regular heartbeat at least 60 s later", async () => {
   const s = await setup(async () => { throw timeout(); });
   const timers = vi.spyOn(globalThis, "setTimeout");
   s.block(true);
   await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
   await vi.advanceTimersByTimeAsync(0);
   expect(s.admission).toHaveBeenCalledOnce(); expect(timers).toHaveBeenCalledOnce();
-  await vi.advanceTimersByTimeAsync(4_999);
-  expect(s.admission).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(59_999);
+  expect(s.admission).toHaveBeenCalledOnce(); expect(s.fence).toHaveBeenCalledTimes(2);
   await vi.advanceTimersByTimeAsync(1);
   expect(s.admission).toHaveBeenCalledTimes(2); expect(timers).toHaveBeenCalledTimes(2);
-  expect(s.fence).toHaveBeenCalledTimes(3);
+  expect(s.fence).toHaveBeenCalledTimes(2); // no repeated short tries while admission is unavailable
 });
 
 it("keeps the background admission budget monotonic through wall-clock rollback and independent renewal", async () => {

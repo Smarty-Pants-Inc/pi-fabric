@@ -2,14 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
-// host now also renews its lease in a file of its own, replaced by an atomic rename without
-// the lock; one host writes each file.
+// host renews its own file without the mesh lock. A tiny per-lease publish mutex
+// serializes ALL writers (including takeover/removal), not unrelated hosts.
 
 /**
  * Host-reserved historical policy key (also used for participant-file migration).
@@ -117,31 +117,173 @@ const fileName = (hostId: string): string =>
 export const hostLeasePath = (meshRoot: string, hostId: string): string =>
   path.join(meshRoot, LEASE_DIR, fileName(hostId));
 
+export const hostLeasePublishLockPath = (meshRoot: string, hostId: string): string =>
+  `${hostLeasePath(meshRoot, hostId)}.publish.lock`;
+
+export class HostLeasePublishLockBusyError extends MeshLockTimeoutError {
+  constructor(readonly lock: string) { super(` host lease publish lock ${lock}`, 1, 0); }
+}
+
+interface PublishOwner { pid: number; startTime: string | null; token: string }
+const readPublishOwner = (lock: string): PublishOwner | undefined => {
+  try {
+    const stat = fs.lstatSync(lock);
+    if (!stat.isFile() || stat.nlink !== 1) return undefined;
+    const value = JSON.parse(fs.readFileSync(lock, "utf8")) as PublishOwner;
+    return Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.token === "string" && value.token.length > 0 &&
+      (value.startTime === null || typeof value.startTime === "string") ? value : undefined;
+  } catch { return undefined; }
+};
+
+// Linux's native start identity is a cheap file read. Other platforms use the
+// caller's prepared native identity; UNKNOWN can never prove reuse of a live pid.
+let ownStartTime: string | undefined;
+const publishStartTime = (): string | undefined => {
+  if (ownStartTime !== undefined) return ownStartTime;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const value = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      if (validProcessIncarnation(value)) ownStartTime = value;
+    } catch { /* Unknown is conservative. */ }
+  }
+  return ownStartTime;
+};
+
+/** Zero-wait exclusive publication. No await, sleep, or age-based recovery here.
+ * All lease publishers/removers share this fence; callers unwind custody before admission. */
+export const acquireHostLeasePublishLock = (meshRoot: string, hostId: string): (() => void) => {
+  const lock = hostLeasePublishLockPath(meshRoot, hostId);
+  fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+  const owner: PublishOwner = { pid: process.pid, startTime: publishStartTime() ?? null, token: randomUUID() };
+  let fd: number;
+  try { fd = fs.openSync(lock, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HostLeasePublishLockBusyError(lock);
+    throw error;
+  }
+  try { fs.writeFileSync(fd, JSON.stringify(owner)); }
+  catch (error) {
+    fs.closeSync(fd);
+    // A torn receipt is UNKNOWN, not reclaimable by age or unconditional unlink.
+    if (readPublishOwner(lock)?.token === owner.token) fs.unlinkSync(lock);
+    throw error;
+  }
+  fs.closeSync(fd);
+  return () => {
+    // A delayed release is never permission to unlink a successor's receipt.
+    try { if (readPublishOwner(lock)?.token === owner.token) fs.unlinkSync(lock); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  };
+};
+
+export const withHostLeasePublishLock = <T>(meshRoot: string, hostId: string, operation: () => T): T => {
+  const release = acquireHostLeasePublishLock(meshRoot, hostId);
+  try { return operation(); } finally { release(); }
+};
+
+/** Rare crash recovery is serialized by existing file custody, OUTSIDE registry
+ * custody. Two reclaimers cannot compare the dead token then unlink a fresh holder.
+ * Only ESRCH or a different native process start identity is proof; never age. */
+type LeasePublishCustody = { root: string; custody<T>(operation: () => T): Promise<T> };
+const preparePublishLock = async (mesh: LeasePublishCustody, lock: string): Promise<void> => {
+  const seen = readPublishOwner(lock);
+  ownStartTime ??= publishStartTime() ?? await ownProcessIncarnation();
+  if (!seen) return;
+  let dead = false;
+  try { process.kill(seen.pid, 0); }
+  catch (error) { dead = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  if (!dead && validProcessIncarnation(seen.startTime ?? undefined)) {
+    const actual = await processIncarnation(seen.pid);
+    dead = actual !== undefined && actual !== seen.startTime;
+  }
+  if (!dead) return;
+  await mesh.custody(() => {
+    const current = readPublishOwner(lock);
+    if (current?.token === seen.token && current.pid === seen.pid && current.startTime === seen.startTime) fs.unlinkSync(lock);
+  });
+};
+
+export const prepareHostLeasePublishLock = (mesh: LeasePublishCustody, hostId: string): Promise<void> =>
+  preparePublishLock(mesh, hostLeasePublishLockPath(mesh.root, hostId));
+
+/** Bridge removal/outbox replay can have no live presence id. Prepare only
+ * actual publish-lock receipts, not another shared-state authority snapshot. */
+export const prepareHostLeasePublishLocks = async (mesh: LeasePublishCustody): Promise<void> => {
+  const directory = path.join(mesh.root, LEASE_DIR);
+  let names: string[];
+  try { names = fs.readdirSync(directory); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  await Promise.all(names.filter(name => /^[a-f0-9]{32}\.json\.publish\.lock$/.test(name))
+    .map(name => preparePublishLock(mesh, path.join(directory, name))));
+};
+
+/** Subscribe to a real lease-publisher release after an admission timeout.
+ * No immediate absence probe: already-absent is not a NEW admission event. */
+export const onHostLeasePublication = (meshRoot: string, hostId: string, wake: () => void): (() => void) => {
+  const lock = hostLeasePublishLockPath(meshRoot, hostId);
+  try {
+    let expected = readPublishOwner(lock)?.token;
+    const watcher = fs.watch(path.dirname(lock), { persistent: false }, (event, name) => {
+      if (event !== "rename" || name !== null && String(name) !== path.basename(lock)) return;
+      const current = readPublishOwner(lock);
+      if (current && current.pid !== process.pid) expected = current.token;
+      // Our own ordinary renewal release is NOT an admission event.
+      if (!fs.existsSync(lock) && expected !== undefined) { expected = undefined; wake(); }
+    });
+    watcher.on("error", () => watcher.close());
+    return () => watcher.close();
+  } catch { return () => {}; /* Once-per-minute regular-tick fallback only. */ }
+};
+
+/** Passive lock-release admission, bounded by the caller's existing abort budget.
+ * Watch first, then check absence to cover release during watch setup. No timer/poll. */
+export const waitForHostLeasePublication = (meshRoot: string, hostId: string, signal: AbortSignal): Promise<void> => {
+  const lock = hostLeasePublishLockPath(meshRoot, hostId);
+  return new Promise<void>((resolve, reject) => {
+    let watcher: fs.FSWatcher | undefined;
+    const finish = (error?: unknown): void => {
+      watcher?.close(); signal.removeEventListener("abort", abort);
+      if (error !== undefined) reject(error); else resolve();
+    };
+    const abort = (): void => finish(signal.reason);
+    const check = (): void => { if (!fs.existsSync(lock)) finish(); };
+    try {
+      signal.throwIfAborted();
+      watcher = fs.watch(path.dirname(lock), { persistent: false }, (_event, name) => {
+        if (name === null || String(name) === path.basename(lock)) check();
+      });
+      watcher.on("error", finish);
+      signal.addEventListener("abort", abort, { once: true });
+      check();
+    } catch (error) { finish(error); }
+  });
+};
+
+/** Unconditional successor/mirror publication still takes the SAME exclusive lock.
+ * Busy is a typed admission failure, never a spin or a clobber. */
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
-  writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
+  withHostLeasePublishLock(meshRoot, lease.id, () => writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease }));
 
 /** Renew only the current incarnation; initial absence is a no-clobber create.
- * False means ownership was lost, never permission to retry the write. */
-export const writeHostLeaseIfCurrent = (meshRoot: string, lease: FabricHostLease, allowMissing = false): boolean => {
+ * False means superseded. "skipped" means another publisher holds the lock: next tick retries. */
+export const writeHostLeaseIfCurrent = (meshRoot: string, lease: FabricHostLease, allowMissing = false): boolean | "skipped" => {
+  let release: () => void;
+  try { release = acquireHostLeasePublishLock(meshRoot, lease.id); }
+  catch (error) { if (error instanceof HostLeasePublishLockBusyError) return "skipped"; throw error; }
   const file = hostLeasePath(meshRoot, lease.id);
   const temporary = path.join(path.dirname(file), `.renew-${randomUUID()}.tmp`);
   const ours = (current: FabricHostLease | undefined): boolean => current !== undefined &&
     current.id === lease.id && current.rootId === lease.rootId &&
     current.identityId === lease.identityId && current.startedAt === lease.startedAt;
   let fd: number | undefined;
-  // Stage before opening/checking CURRENT, not from an earlier ownership snapshot.
-  writeJsonAtomic(temporary, { format: 1, ...lease });
   try {
     try { fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0)); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       if (!allowMissing) return false;
     }
-    if (fd === undefined) {
-      // An intervening successor always wins initial creation, even after absence.
-      try { fs.linkSync(temporary, file); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
-    } else {
+    if (fd !== undefined) {
       const opened = fs.fstatSync(fd, { bigint: true });
       if (!opened.isFile() || !ours(leaseOf(fs.readFileSync(fd, "utf8"), fileName(lease.id)))) return false;
       let current: fs.BigIntStats;
@@ -149,51 +291,34 @@ export const writeHostLeaseIfCurrent = (meshRoot: string, lease: FabricHostLease
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
       if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino ||
         current.size !== opened.size || current.mtimeNs !== opened.mtimeNs || current.ctimeNs !== opened.ctimeNs) return false;
-      // ponytail: inode check + rename is not a filesystem CAS. A successor in
-      // that final syscall window can be briefly overwritten; its next 5 s renewal
-      // restores it. Re-read immediately: a successor that won publication makes
-      // us stand down, NEVER rewrite/restore our bytes. No retry uses the old fd.
-      fs.renameSync(temporary, file);
     }
+    // Check + stage + rename are indivisible to ALL cooperating lease publishers.
+    writeJsonAtomic(temporary, { format: 1, ...lease });
+    if (fd === undefined) {
+      try { fs.linkSync(temporary, file); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
+    } else fs.renameSync(temporary, file);
+    // Even an out-of-protocol replacement after rename supersedes us; never restore.
     return ours(readHostLeaseCurrent(meshRoot, lease.id));
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     fs.rmSync(temporary, { force: true });
+    release();
   }
 };
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
-  fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
+  withHostLeasePublishLock(meshRoot, hostId, () => fs.rmSync(hostLeasePath(meshRoot, hostId), { force: true }));
 
-/**
- * Removes a host's file lease only when `owned` accepts it (smarty-dev#6477 L2b owner review): a
- * lease another owner wrote (a replacement that wrote its file before its state record) is kept.
- * An absent, unreadable or invalid file is never removed. The file is renamed aside before the
- * final check, so the lease judged is the lease removed; a lease that changed owner in between is
- * linked back, unless a newer lease already took the name (the newer one wins). Returns whether
- * a lease was removed.
- */
-export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (lease: FabricHostLease) => boolean): boolean => {
-  const current = readHostLeaseCurrent(meshRoot, hostId);
-  if (!current || !owned(current)) return false;
-  const file = hostLeasePath(meshRoot, hostId);
-  // Not a .json name: lease scans never read the aside copy.
-  const aside = path.join(path.dirname(file), `.unlease-${randomUUID()}.tmp`);
-  try {
-    fs.renameSync(file, aside);
-  } catch {
-    return false; // Gone already, or busy (Windows): keep; an unremoved mirror lease lapses.
-  }
-  try {
-    let taken: FabricHostLease | undefined;
-    try { taken = leaseOf(fs.readFileSync(aside, "utf8"), fileName(hostId)); } catch { taken = undefined; }
-    if (taken && owned(taken)) return true;
-    try { fs.linkSync(aside, file); } catch { /* EEXIST: a newer lease holds the name */ }
-    return false;
-  } finally {
-    fs.rmSync(aside, { force: true });
-  }
-};
+/** Exact ownership is re-read under the SAME publish lock immediately before unlink.
+ * Invalid/absent files are kept. A busy removal must unwind into existing admission. */
+export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (lease: FabricHostLease) => boolean): boolean =>
+  withHostLeasePublishLock(meshRoot, hostId, () => {
+    const current = readHostLeaseCurrent(meshRoot, hostId);
+    if (!current || !owned(current)) return false;
+    fs.unlinkSync(hostLeasePath(meshRoot, hostId));
+    return true;
+  });
 
 // A file that could not be read gives no answer to cache (`read: false`): the next lookup reads it
 // again. Only a file that was read, valid or not, is cached by its filesystem identity.

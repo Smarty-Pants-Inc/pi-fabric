@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { MeshLockTicket, meshLockQueueDirectory, onMeshLockAdmission } from "../src/mesh/lock-queue.js";
 
 // Fair mesh lock admission (smarty-dev#6477 L0b): wake-on-handoff, predecessor-only waiting,
 // and no fallback barging while the queue head is alive and making progress.
@@ -30,6 +30,24 @@ afterEach(() => {
 });
 
 describe("fair mesh lock admission", () => {
+  it("a passive timed-out publisher wakes on native lock release, with no timer and no wake from its own cancelled receipt", async () => {
+    const root = scratch(), lock = path.join(root, ".lock");
+    fs.mkdirSync(lock);
+    const ownTicket = ticket(root, 10_000);
+    let admit!: () => void;
+    const admitted = new Promise<void>(resolve => { admit = resolve; });
+    const wake = vi.fn(admit), timers = vi.spyOn(globalThis, "setTimeout");
+    const close = onMeshLockAdmission(root, wake);
+    try {
+      ownTicket.close();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(wake).not.toHaveBeenCalled(); expect(timers).not.toHaveBeenCalled();
+      fs.renameSync(lock, `${lock}.released.passive`);
+      await admitted;
+      expect(wake).toHaveBeenCalled(); expect(timers).not.toHaveBeenCalled();
+    } finally { close(); timers.mockRestore(); }
+  });
+
   it("wakes a waiter as soon as its predecessor's receipt goes, not at its next poll", async () => {
     const root = scratch();
     const head = ticket(root, 10_000);

@@ -6,7 +6,9 @@ import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-wr
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { withStateFence } from "../src/mesh/commit-outbox.js";
 import { ParticipantDirectory, ParticipantLeaseSupersededError } from "../src/topology/participant-directory.js";
-import { hostLeasePath, readHostLease, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, hostLeasePublishLockPath, acquireHostLeasePublishLock, HostLeasePublishLockBusyError, waitForHostLeasePublication, readHostLease, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
+import * as participantFiles from "../src/topology/participant-files.js";
+import { createHash } from "node:crypto";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const roots: string[] = [], directories: ParticipantDirectory[] = [];
@@ -18,7 +20,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const timeout = () => new MeshLockTimeoutError(" held by heartbeat test", 1, 0);
-const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000, initialPublish = true) => {
+const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000, initialPublish = true, heartbeatMs = 5_000, prepared = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "heartbeat-tolerance-")); roots.push(root);
   const identity: MeshIdentity = { id: "session:live", name: "main", kind: "main", sessionId: "live" };
   const mesh = new MeshStore(root, 65_536, 100, { lockTimeoutMs });
@@ -30,13 +32,14 @@ const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000, in
     try { return await mesh.withTryLock(() => { fenceBudgets.push(mesh.tryLockBudgetMs); return publish(); }, 0); }
     finally { inFence = false; }
   };
-  const wait = vi.fn(async () => {
+  const wait = vi.fn(async (_signal?: AbortSignal) => {
     expect(inFence).toBe(false);
     await withStateFence(mesh, identity, () => undefined);
   });
   const directory = new ParticipantDirectory(mesh, {
     enabled: true, identity, hostId: identity.id, rootId: identity.id,
-    heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false,
+    heartbeatMs, leaseMs: 15_000, reapDeadHosts: false,
+    ...(prepared ? { preparePublicationFence: () => () => true } : {}),
     ...(fenced ? { withPublicationFence: publicationFence } : {}),
     ...(fenced && admission ? { waitForPublicationRetry: wait } : {}),
   });
@@ -60,6 +63,170 @@ const setup = async (fenced = true, admission = true, lockTimeoutMs = 20_000, in
 };
 
 describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
+  it("100 ms heartbeats do not start a second admission until 60 s after timeout, then only on the next regular tick", async () => {
+    const s = await setup(true, true, 20_000, true, 100, true);
+    vi.useFakeTimers(); await s.directory.start();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
+    const subscribe = vi.spyOn(s.mesh, "onLockAdmission").mockReturnValue(() => {});
+    let outstanding = 0, maximum = 0;
+    s.wait.mockImplementation(signal => new Promise<void>((_resolve, reject) => {
+      maximum = Math.max(maximum, ++outstanding);
+      signal!.addEventListener("abort", () => { outstanding--; reject(signal!.reason); }, { once: true });
+    }));
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.wait).toHaveBeenCalledOnce(); expect(outstanding).toBe(1);
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(s.wait).toHaveBeenCalledOnce(); expect(outstanding).toBe(0); expect(subscribe).toHaveBeenCalledOnce();
+    const timedOutAt = Date.now();
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(s.wait).toHaveBeenCalledOnce(); expect(confirm).toHaveBeenCalledOnce();
+    expect(s.lease().expiresAt).toBeGreaterThan(Date.now()); // independent renewal kept running
+    await vi.advanceTimersByTimeAsync(1);
+    expect(Date.now() - timedOutAt).toBe(60_000);
+    expect(s.wait).toHaveBeenCalledTimes(2); expect(outstanding).toBe(1); expect(maximum).toBe(1);
+    await s.directory.close(); expect(outstanding).toBe(0);
+  });
+
+  it("an admission event retries immediately after timeout, coalescing repeated wakes into one outstanding wait", async () => {
+    const s = await setup(true, true, 20_000, true, 100, true);
+    vi.useFakeTimers(); await s.directory.start();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let wake!: () => void;
+    vi.spyOn(s.mesh, "onLockAdmission").mockImplementation(callback => { wake = callback; return () => {}; });
+    const original = s.mesh.confirmWritable.bind(s.mesh);
+    const confirm = vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
+    let outstanding = 0, maximum = 0, release!: () => void;
+    s.wait.mockImplementation(signal => new Promise<void>((resolve, reject) => {
+      maximum = Math.max(maximum, ++outstanding);
+      release = () => { outstanding--; resolve(); };
+      signal!.addEventListener("abort", () => { outstanding--; reject(signal!.reason); }, { once: true });
+    }));
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(s.wait).toHaveBeenCalledOnce(); expect(outstanding).toBe(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const eventAt = Date.now();
+    wake(); wake(); await vi.advanceTimersByTimeAsync(0);
+    expect(Date.now()).toBe(eventAt); expect(s.wait).toHaveBeenCalledTimes(2); expect(outstanding).toBe(1);
+    wake(); await vi.advanceTimersByTimeAsync(0); expect(s.wait).toHaveBeenCalledTimes(2);
+    s.record.status = "running"; confirm.mockImplementation(original);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    expect(maximum).toBe(1); expect(outstanding).toBe(0);
+    expect(s.directory.get(s.record.id)?.status).toBe("running"); expect(s.directory.canConsumeMesh()).toBe(true);
+  });
+
+  it("a non-cooperative timed-out callback cannot create a second outstanding native wait", async () => {
+    const s = await setup(true, true, 20_000, true, 100, true);
+    vi.useFakeTimers(); await s.directory.start();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(s.mesh, "onLockAdmission").mockReturnValue(() => {});
+    vi.spyOn(s.mesh, "confirmWritable").mockRejectedValue(timeout());
+    let finish!: () => void;
+    s.wait.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await expect(s.directory.refresh()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+    await vi.advanceTimersByTimeAsync(73_000);
+    expect(s.wait).toHaveBeenCalledOnce(); // fallback joins, never starts a second native callback
+    finish(); await vi.advanceTimersByTimeAsync(0);
+    await s.directory.close();
+  });
+
+  it("the successor attempting publication in the inode-check/rename gap survives and the stale directory stands down", async () => {
+    const s = await setup();
+    const lease = readHostLeaseCurrent(s.root, s.record.ownerHostId)!, successor = { ...lease, startedAt: lease.startedAt! + 1 };
+    const file = hostLeasePath(s.root, lease.id), rename = fs.renameSync.bind(fs), abort = new AbortController();
+    let publication: Promise<void> | undefined;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === file && String(from).includes(".renew-") && !publication) {
+        expect(() => writeHostLease(s.root, successor)).toThrow(HostLeasePublishLockBusyError);
+        publication = waitForHostLeasePublication(s.root, lease.id, abort.signal).then(() => writeHostLease(s.root, successor));
+      }
+      rename(from, to);
+    });
+    try {
+      const refreshing = s.directory.refresh().catch(error => error);
+      expect(publication).toBeDefined();
+      await publication; await refreshing; spy.mockRestore();
+      await expect(s.directory.refresh()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+      expect(s.directory.canConsumeMesh()).toBe(false);
+      await s.directory.closeLineage();
+      expect(readHostLeaseCurrent(s.root, lease.id)).toEqual(successor);
+      await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+    } finally { abort.abort(); }
+  });
+
+  it("a held publish lock skips this tick without losing ownership or creating another admission lane", async () => {
+    const s = await setup(); vi.useFakeTimers(); await s.directory.start();
+    const lease = readHostLeaseCurrent(s.root, s.record.ownerHostId)!;
+    const release = acquireHostLeasePublishLock(s.root, lease.id);
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(readHostLeaseCurrent(s.root, lease.id)).toEqual(lease);
+      expect(s.directory.canConsumeMesh()).toBe(true);
+      expect(s.wait).not.toHaveBeenCalled();
+    } finally { release(); }
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(readHostLeaseCurrent(s.root, lease.id)?.updatedAt).toBe(Date.now());
+    expect(fs.existsSync(hostLeasePublishLockPath(s.root, lease.id))).toBe(false);
+  });
+
+  it("a same-host successor after clean release but before closeLineage resumes receives no stale terminal receipt", async () => {
+    const s = await setup(); vi.useFakeTimers();
+    const close = s.directory.close.bind(s.directory);
+    let successor!: ParticipantDirectory;
+    vi.spyOn(s.directory, "close").mockImplementationOnce(async () => {
+      await close();
+      vi.setSystemTime(Date.now() + 1);
+      successor = new ParticipantDirectory(s.mesh, { ...s.directory.options });
+      directories.push(successor);
+      successor.registerSource(() => [{ ...s.record, status: "running", updatedAt: Date.now() }]);
+      await successor.refresh();
+    });
+    await s.directory.closeLineage();
+    expect(successor.canConsumeMesh()).toBe(true);
+    expect(successor.get(s.record.id)?.status).toBe("running");
+    expect(readHostLeaseCurrent(s.root, s.record.ownerHostId)).toBeDefined();
+    expect(s.mesh.listAll("topology/lineage-closures/")).toEqual([]);
+    await expect(s.directory.start()).rejects.toBeInstanceOf(ParticipantLeaseSupersededError);
+  });
+
+  it.each(["file", "state"] as const)("a same-host successor taking over during awaited %s close cleanup keeps all its records and lease", async phase => {
+    const s = await setup(); vi.useFakeTimers();
+    const old = readHostLeaseCurrent(s.root, s.record.ownerHostId)!;
+    const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
+    let successor!: ParticipantDirectory;
+    const takeover = async (): Promise<void> => {
+      vi.setSystemTime(Date.now() + 1);
+      writeHostLease(s.root, { ...old, expiresAt: Date.now() - 1,
+        ...(old.session ? { session: { ...old.session, expiresAt: Date.now() - 1 } } : {}) });
+      successor = new ParticipantDirectory(s.mesh, { ...s.directory.options });
+      directories.push(successor);
+      successor.registerSource(() => [{ ...s.record, status: "running", updatedAt: Date.now() }]);
+      await successor.refresh();
+    };
+    if (phase === "file") {
+      const remove = participantFiles.removeParticipantFileIf;
+      vi.spyOn(participantFiles, "removeParticipantFileIf").mockImplementationOnce(async (...args) => {
+        await takeover(); return remove(...args);
+      });
+    } else {
+      const batch = s.mesh.writeBatch.bind(s.mesh);
+      vi.spyOn(s.mesh, "writeBatch").mockImplementationOnce(async args => { await takeover(); return batch(args); });
+    }
+    await s.directory.closeLineage();
+    expect(successor).toBeDefined(); expect(successor.canConsumeMesh()).toBe(true);
+    const current = readHostLeaseCurrent(s.root, old.id)!;
+    expect(current.startedAt).toBeGreaterThan(old.startedAt!);
+    expect(s.mesh.get(key("topology/hosts/", old.id))?.value).toMatchObject({ startedAt: current.startedAt });
+    expect(s.mesh.get(key("topology/participants/", s.record.id))?.value).toMatchObject({ ownerStartedAt: current.startedAt, status: "running" });
+    expect(participantFiles.readParticipantFile(s.root, key("topology/participants/", s.record.id))?.value)
+      .toMatchObject({ ownerStartedAt: current.startedAt, status: "running" });
+    expect(s.mesh.get(`sessions/${s.record.sessionId}`)?.value).toMatchObject({ livenessStartedAt: current.startedAt });
+    expect(s.mesh.listAll("topology/lineage-closures/")).toEqual([]);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+  });
+
   it("keeps leases and counts zero heartbeat timeouts under 30–80 ms locks at 50% duty for 10 s", async () => {
     const s = await setup();
     const runner = new MeshBackgroundRetry("heartbeat tolerance test");
@@ -90,6 +257,7 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
       expect(rounds).toBeGreaterThan(80);
       expect(s.wait).toHaveBeenCalled(); // actual typed short tries exercised
       expect(lostLeases).toBe(0); expect(failure).not.toHaveBeenCalled();
+      console.info("heartbeat-contention-probe", JSON.stringify({ durationMs: 10_000, rounds, lostLeases, timeouts: failure.mock.calls.length }));
       expect(s.directory.writeStalled()).toBeUndefined();
     } finally { stop = true; clearInterval(observing); await vi.advanceTimersByTimeAsync(160); await holder; }
   });
@@ -101,6 +269,8 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     const failure = vi.spyOn(runner, "failure");
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const prior = s.directory.confirmedAt(), at = Date.now();
+    let wake: (() => void) | undefined;
+    vi.spyOn(s.mesh, "onLockAdmission").mockImplementation(callback => { wake = callback; return () => {}; });
     s.hold(); const receipt = fs.readFileSync(path.join(s.root, ".lock/owner"), "utf8");
     let spentAt = 0;
     const work = runner.run(() => s.directory.refresh(), false).then(result => { spentAt = Date.now(); return result; });
@@ -115,7 +285,7 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     expect(s.directory.confirmedAt()).toBe(prior); expect(s.directory.canConsumeMesh()).toBe(false);
     expect(s.directory.writeStalled()?.message).toContain("peer visibility is unknown, not empty");
     expect(fs.readFileSync(path.join(s.root, ".lock/owner"), "utf8")).toBe(receipt);
-    s.release(); await s.directory.refresh();
+    s.release(); wake?.(); await s.directory.refresh(); // a real release/admission event, not a heartbeat poll
     expect(s.directory.writeStalled()).toBeUndefined(); expect(s.directory.canConsumeMesh()).toBe(true);
   });
 
@@ -263,7 +433,9 @@ describe("HOT heartbeat tolerance (#6729 / #7176)", () => {
     const prior = s.directory.confirmedAt();
     const confirm = vi.spyOn(s.mesh, "confirmWritable");
     let bytes = "", raced = false, loserRenames = 0;
-    const replace = () => { writeHostLease(s.root, successor); bytes = fs.readFileSync(leasePath, "utf8"); };
+    // Out-of-protocol old writer seam: compliant publishers now take the mutex
+    // (covered above). Preserve round-2 strict inode/read-back defense as well.
+    const replace = () => { fs.writeFileSync(leasePath, JSON.stringify({ format: 1, ...successor })); bytes = fs.readFileSync(leasePath, "utf8"); };
     if (phase === "after-open") {
       const read = fs.readFileSync.bind(fs);
       vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {

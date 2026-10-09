@@ -87,16 +87,19 @@ export const removeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
   decide: (current: MeshStateEntry) => boolean,
-  options: ParticipantFileLockOptions = {},
+  options: ParticipantFileLockOptions & { withRemovalFence?: (remove: () => boolean) => boolean } = {},
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) return false;
   return withKeyLock(mesh, file, () => {
-    const current = readFresh(file);
-    if (!current || !decide(current)) return false;
-    fs.rmSync(file, { force: true });
-    rescan(path.dirname(file));
-    return true;
+    const remove = (): boolean => {
+      const current = readFresh(file);
+      if (!current || !decide(current)) return false;
+      fs.rmSync(file, { force: true });
+      rescan(path.dirname(file));
+      return true;
+    };
+    return options.withRemovalFence ? options.withRemovalFence(remove) : remove();
   }, options);
 };
 

@@ -130,7 +130,11 @@ describe("stale directory bookkeeping", () => {
         const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
         if (kind === "wrong-key") state.entries[entry.key].value.sessionId = "other";
         else state.entries[entry.key].updatedBy = kind === "wrong-writer" ? writer : null;
-        fs.writeFileSync(statePath, JSON.stringify(state));
+        // Publish the corruption as an external writer with a new inode. An
+        // equal-size in-place edit can share the cached millisecond stat stamp.
+        const replacement = `${statePath}.fixture.tmp`;
+        fs.writeFileSync(replacement, JSON.stringify(state));
+        fs.renameSync(replacement, statePath);
       }
       expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
       expect(mesh.get(inboxKey(recipient.id), { fresh: true })).toBeUndefined();

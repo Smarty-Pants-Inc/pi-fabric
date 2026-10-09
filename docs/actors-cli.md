@@ -34,7 +34,7 @@ operation. An absent or expired lease is **not** proof that Main is dead.
 Stop/remove require `--confirm-dead-root <rootId>` equal to the selected
 resident's root ID exactly. **A wrong confirmation can interrupt a live Main's
 actor.** This is accepted operator responsibility; spelling out the root ID
-makes the choice explicit rather than silently inferring death from partial
+makes the choice explicit, so death is never silently inferred from partial
 process evidence. There is no automatic live-Main census, startup marker,
 platform split, or bypass flag. Automated detection/adoption is follow-up work
 under **smarty-dev#5919**, not a safety claim of this command.

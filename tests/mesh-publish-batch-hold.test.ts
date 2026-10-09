@@ -161,6 +161,18 @@ describe("publishBatch hold (smarty-dev#6729)", () => {
     expect(fs.readdirSync(path.join(mesh.root, "event-receipts")).filter(name => name.includes(".pending."))).toEqual([]);
   });
 
+  it("finds the last sequence past the small tail probe: a line longer than it, or junk after it", async () => {
+    const mesh = store();
+    const big = await mesh.publish({ topic: "mesh.batch", from, text: "x".repeat(40 * 1024) });
+    expect(mesh.latestSequence()).toBe(big.sequence);
+    // A complete but unparsable last line inside the probe: the whole window decides.
+    fs.appendFileSync(events(mesh.root), "not json\n\n");
+    expect(mesh.latestSequence()).toBe(big.sequence);
+    const [next] = await mesh.publishBatch([{ topic: "mesh.batch", from, text: "next" }]);
+    expect(next!.sequence).toBe(big.sequence + 1);
+    expect(mesh.latestSequence()).toBe(next!.sequence);
+  });
+
   describe.skipIf(process.platform === "win32")("process death after release, before the barrier", () => {
     const crashBatch = async (root: string, inputs: MeshPublishInput[]) => {
       const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-batch-crash.mjs"), root, JSON.stringify(inputs)], {

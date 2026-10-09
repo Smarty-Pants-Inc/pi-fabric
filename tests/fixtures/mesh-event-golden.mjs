@@ -23,15 +23,18 @@ export const publishGoldenEvents = async ({ MeshStore, StoreBridgeSide }, root) 
   await mesh.publish({ topic: "golden.bridgeish", from, data: { bridge: { from: "old", id: "b-1" }, body: "x" } });
   await mesh.publish({ topic: "golden.stamp", kind: "", from, data: createdAt => ({ createdAt, s: "stamp" }) });
   await mesh.publish({ topic: "golden.null", from, text: "", data: null });
-  await mesh.publishBatch([
+  // A slow disk can end a batch at its 50 ms work bound: publish the rest, as the bridge does.
+  const batch = [
     { topic: "golden.batch", from, text: "one", data: { k: "v" } },
     { topic: "golden.batch", from, dedupeKey: "golden-batch-key", text: "two", data: [1, { "\u00e9": "\u00e8" }], durable: true },
     { topic: "golden.batch", from: { ...from, verified: "bridge" }, text: "three", principal: { id: "p-2", binding: "herdr-client" } },
     { topic: "golden.batch", from, data: createdAt => ({ k: "stamp", createdAt }) },
-  ]);
+  ];
+  for (let index = 0; index < batch.length;) index += (await mesh.publishBatch(batch.slice(index))).length;
   const side = new StoreBridgeSide(mesh, "forge");
   side.holds = () => true;
-  await side.publishBatch([{ event: bridgeEvent("b-2"), held: [remote.id] }, { event: bridgeEvent("b-3", { principal: { id: "p-3", binding: "org-agent" } }) }]);
+  const bridged = [{ event: bridgeEvent("b-2"), held: [remote.id] }, { event: bridgeEvent("b-3", { principal: { id: "p-3", binding: "org-agent" } }) }];
+  for (let index = 0; index < bridged.length;) index += (await side.publishBatch(bridged.slice(index))).length;
   await side.publish(bridgeEvent("b-4"), [remote.id]);
   return fs.readFileSync(path.join(root, "events.jsonl"), "utf8").split("\n").filter(Boolean);
 };

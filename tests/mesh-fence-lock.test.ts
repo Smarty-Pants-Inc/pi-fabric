@@ -115,7 +115,7 @@ describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () =>
     expect(records(root)).toEqual({ ".lock/owner": "C\n" });
   });
 
-  it("a successor that recreates the name after the unlink is never removed (inode check before rmdir)", () => {
+  it.skipIf(!linux)("a successor that recreates the name after the unlink is never removed (inode check before rmdir)", () => {
     const lock = lockIn();
     const root = path.dirname(lock);
     const pin = acquireA(lock);

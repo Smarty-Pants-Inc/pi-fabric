@@ -401,16 +401,16 @@ export class StoreBridgeSide implements BridgeSide {
       // The data is fixed, so the store encodes it before the lock (smarty-dev#6729); the
       // ownership check is its admission step. Evaluated under the mesh lock that commits the
       // event, so the ownership it checks is the ownership at commit: a native takeover before
-      // it refuses the event (security review round 3, F2). Every state writer takes the same lock on the `file` backend. SQLite state
-      // writers do not take `.lock`, so a held event also runs in the state write fence (plan
-      // R20, smarty-dev#6477 L2b owner review P1): with `.lock` held, one `BEGIN IMMEDIATE`, then
-      // this check on that transaction's snapshot and the synchronous append, then ROLLBACK. A
-      // takeover's commit waits for the append, or commits first and this check refuses. Lock
-      // order is `.lock`, then the SQLite write lock, never the reverse (a SQLite transaction is
-      // one synchronous segment and `.lock` is only acquired asynchronously). Under the
-      // participants-files policy a native's first file is written without it; its host record,
-      // which reserves the root id, still goes through the lock, and a mirror never outranks a
-      // native file (#142 S2).
+      // it refuses the event (security review round 3, F2). Every state writer takes the same
+      // lock on the `file` backend. SQLite state writers do not take `.lock`, so a held event
+      // also runs in the state write fence (plan R20, smarty-dev#6477 L2b owner review P1): with
+      // `.lock` held, one `BEGIN IMMEDIATE`, then this check on that transaction's snapshot and
+      // the synchronous append, then ROLLBACK. A takeover's commit waits for the append, or
+      // commits first and this check refuses. Lock order is `.lock`, then the SQLite write lock,
+      // never the reverse (a SQLite transaction is one synchronous segment and `.lock` is only
+      // acquired asynchronously). Under the participants-files policy a native's first file is
+      // written without it; its host record, which reserves the root id, still goes through the
+      // lock, and a mirror never outranks a native file (#142 S2).
       ...(held.length > 0 ? {
         fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit),
         admit: () => {

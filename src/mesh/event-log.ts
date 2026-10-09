@@ -81,6 +81,8 @@ const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
+/** First read of the live log's last line (see #readLastEventSequence). */
+const LAST_LINE_PROBE_BYTES = 16 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
@@ -1228,27 +1230,42 @@ export class EventLog {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size === 0) return 0;
-      const readBytes = Math.min(size, this.maxEventBytes + 1);
-      const tail = Buffer.allocUnsafe(readBytes);
-      fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
-      const lines = tail.toString("utf8").trim().split("\n");
-      for (let index = lines.length - 1; index >= 0; index--) {
-        const line = lines[index];
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as { sequence?: unknown };
-          if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) {
-            return parsed.sequence;
-          }
-        } catch { /* skip malformed sequence line */ }
+      const window = Math.min(size, this.maxEventBytes + 1);
+      // Every publish commit (each event of a batch) calls this under `.lock`. A small probe of
+      // the window's end usually holds the last line; only if none of its complete lines parses
+      // is the whole window read (smarty-dev#6729).
+      if (window > LAST_LINE_PROBE_BYTES) {
+        const found = this.#lastSequenceIn(descriptor, size, LAST_LINE_PROBE_BYTES, false);
+        if (found !== undefined) return found;
       }
-      return 0;
+      return this.#lastSequenceIn(descriptor, size, window, true) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }
+  }
+
+  /** The last parsable sequence among the lines of the file's last `bytes`, last line first,
+   * decoding only the lines it tries. UTF-8 never has a 0x0a byte inside a character, so these
+   * are the lines a whole-text split yields. A probe (`whole` false) never parses its first
+   * segment, which may be a cut line: undefined sends the caller to the whole window. */
+  #lastSequenceIn(descriptor: number, size: number, bytes: number, whole: boolean): number | undefined {
+    const tail = Buffer.allocUnsafe(bytes);
+    fs.readSync(descriptor, tail, 0, bytes, size - bytes);
+    for (let end = bytes; end > 0;) {
+      const newline = tail.lastIndexOf(0x0a, end - 1);
+      if (newline < 0 && !whole) return undefined;
+      const line = tail.toString("utf8", newline + 1, end).trim();
+      end = Math.max(newline, 0);
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as { sequence?: unknown };
+        if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) return parsed.sequence;
+      } catch { /* skip malformed sequence line */ }
+    }
+    return undefined;
   }
 
   #readSequence(): number {

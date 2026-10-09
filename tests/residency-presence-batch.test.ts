@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -48,6 +49,9 @@ const fixture = async (files = false) => {
   }
   if (files) await new MeshStore(config.meshRoot, 256 * 1024, 500).put({ key: LIVENESS_POLICY_KEY,
     value: { version: 1, hostLeases: "files", participants: "files" }, identity: { id: "policy", name: "policy", kind: "agent" } });
+  // These fixtures measure publication/metadata, not autonomous dormancy. Gate
+  // eligibility before startup's first event check can change the seeded statuses.
+  vi.spyOn(ActorDirectory.prototype, "hasDormantIdleActor").mockReturnValue(false);
   const host = new ResidentHost(config); hosts.push(host); const heartbeatStartedAt = Date.now(); await host.start();
   await delay(20); await host.participants.refresh();
   return { root, config, host, records, heartbeatStartedAt };

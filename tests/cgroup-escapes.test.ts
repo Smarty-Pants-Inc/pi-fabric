@@ -33,9 +33,9 @@ describe.skipIf(process.platform !== "linux")("documented same-UID escape residu
       // No out-of-scope PID is discovered or signalled; a matching SID/PGID does
       // not give permission to freeze a sibling scope. Real escape stays alive
       // in cgroup-scope-live.test.ts until explicit fixture-custody cleanup.
-      expect(kill.mock.calls).toEqual([[100, "SIGTERM"]]);
+      expect(kill).not.toHaveBeenCalled();
       expect(write.mock.calls.map(call => String(call[0]))).toEqual([
-        "/proc/self/fd/42/cgroup.freeze", "/proc/self/fd/42/cgroup.freeze", "/proc/self/fd/42/cgroup.kill",
+        "/proc/self/fd/42/cgroup.kill",
       ]);
       expect(scan).not.toHaveBeenCalled();
       expect(read.mock.calls.every(call => String(call[0]).startsWith("/proc/self/fd/42/") || ["/proc/100/stat", "/proc/100/cgroup"].includes(String(call[0])))).toBe(true);

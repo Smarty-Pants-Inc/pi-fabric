@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const CUSTODY_POLL_MS = 1_000;
-export const FREEZE_TIMEOUT_MS = 1_000;
 const ROOT = "/sys/fs/cgroup";
 const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");
 
@@ -84,9 +83,8 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
   } catch (error) { closeFd(); if (gone(error)) markEmpty(); else throw error; }
   if (!empty) {
     try {
-      // ponytail: require both controls up front; old kernels use the existing
-      // legacy custodian, never an unfrozen per-PID fallback inside this receipt.
-      for (const name of ["cgroup.freeze", "cgroup.kill"]) fs.accessSync(file(name), fs.constants.W_OK);
+      // Require atomic membership-only KILL; never substitute numeric PIDs.
+      fs.accessSync(file("cgroup.kill"), fs.constants.W_OK);
     } catch (error) { closeFd(); throw new Error(`Execution cgroup ${directory} controls unavailable: ${String(error)}`); }
   }
   const members = (): number[] => {
@@ -114,62 +112,24 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
       observeEvents(); // close the watch/read race
     } catch { watcher?.close(); watcher = undefined; /* 1s bounded exit fallback */ }
   }
-  const waitFrozen = (): Promise<boolean> => new Promise((resolve, reject) => {
-    const finish = (error?: unknown, frozen = false): void => {
-      clearTimeout(timer); notifications.delete(inspect);
-      if (error) reject(error); else resolve(frozen);
-    };
-    const inspect = (): void => {
-      if (empty) { finish(); return; }
-      try { if (/^frozen 1$/m.test(fs.readFileSync(file("cgroup.events"), "utf8"))) finish(undefined, true); }
-      catch (error) { finish(error); }
-    };
-    const timer = setTimeout(() => finish(new Error(`Execution cgroup ${directory} freeze unconfirmed after ${FREEZE_TIMEOUT_MS}ms`)), FREEZE_TIMEOUT_MS);
-    notifications.add(inspect); inspect();
-  });
-  const frozenSignal = async (signal: NodeJS.Signals): Promise<void> => {
-    try {
-      fs.writeFileSync(file("cgroup.freeze"), "1");
-      if (!await waitFrozen()) return;
-      // ponytail: cgroup.procs contains numeric PIDs, including zombies that an
-      // outside parent can reap despite freezing. Bind live stat/start time ->
-      // exact scope membership -> same live stat/start time before signalling.
-      // A live process inside OUR FROZEN scope at the middle read cannot exit
-      // until thaw, so its PID cannot be reused before kill; the two stat reads
-      // bind that identity across membership validation. An already-reused
-      // outside PID fails the exact path check even if its first stat is live.
-      for (const pid of members()) {
-        let member: LinuxGroupMember | undefined;
-        try {
-          member = linuxGroupMember(pid);
-          if (!member?.started || ["Z", "X"].includes(member.state)) continue;
-          if (processScopePath(pid) !== directory) continue;
-          const current = linuxGroupMember(pid);
-          if (!current || current.started !== member.started || ["Z", "X"].includes(current.state)) continue;
-        } catch { continue; }
-        try { process.kill(pid, signal); }
-        catch (error) { if (!gone(error)) throw error; }
-      }
-    } finally {
-      try { fs.writeFileSync(file("cgroup.freeze"), "0"); }
-      catch (error) { if (!gone(error)) throw error; }
-    }
-  };
   let signalling = Promise.resolve();
   const signal = (value: NodeJS.Signals): Promise<void> => {
     const run = async (): Promise<void> => {
-      if (empty) return;
+      if (empty || value !== "SIGKILL") return;
+      // ponytail: Node/Bun expose no pidfd_send_signal. A frozen member can be
+      // moved by same-UID code, exit, and have its PID reused after ANY /proc
+      // check. Even our recorded PGID can include a migrated, out-of-scope
+      // process. Neither is scope-only signal authority: skip TERM (and other
+      // non-KILL signals). Callers retain the grace deadline, then cgroup.kill
+      // atomically targets current members. Trade-off: no cooperative TERM.
       active++;
       try {
-        if (value === "SIGKILL") {
-          try { fs.writeFileSync(file("cgroup.kill"), "1"); return; }
-          catch (error) { if (gone(error) && !members().length) return; throw error; }
-        }
-        await frozenSignal(value);
+        try { fs.writeFileSync(file("cgroup.kill"), "1"); }
+        catch (error) { if (gone(error) && !members().length) return; throw error; }
       } finally { active--; if (empty) closeFd(); }
     };
     const pending = signalling.then(run);
-    signalling = pending.catch(() => {}); // serialize thaw before any next signal
+    signalling = pending.catch(() => {}); // a failed write must not poison retry
     return pending;
   };
   return {

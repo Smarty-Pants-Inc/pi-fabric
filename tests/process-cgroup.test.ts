@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cgroupCustody, executionCgroups, scopePath, FREEZE_TIMEOUT_MS } from "../src/process-cgroup.js";
+import { cgroupCustody, executionCgroups, scopePath } from "../src/process-cgroup.js";
 import { executionGroup } from "../src/worker/execution-group.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -11,7 +11,6 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
   const pinned = "/proc/self/fd/42";
   const setup = () => {
     let pids = [100, 101], populated = true, missing = false, inode = 1, unreadable = false;
-    let frozen = false, freezes = true, confirmFreeze = true;
     const births = new Map([[100, "1000"], [101, "1001"]]);
     const states = new Map<number, string>();
     const scopes = new Map<number, string>();
@@ -30,7 +29,7 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     const read = vi.spyOn(fs, "readFileSync").mockImplementation(file => {
       const name = String(file);
       if (missing && name.startsWith(pinned)) throw Object.assign(new Error("gone"), { code: "ENOENT" });
-      if (name === `${pinned}/cgroup.events`) return `populated ${populated ? 1 : 0}\nfrozen ${frozen && confirmFreeze ? 1 : 0}\n`;
+      if (name === `${pinned}/cgroup.events`) return `populated ${populated ? 1 : 0}\nfrozen 1\n`;
       if (name === `${pinned}/cgroup.procs`) {
         if (unreadable) throw Object.assign(new Error("unreadable membership"), { code: "EACCES" });
         return pids.join("\n");
@@ -43,12 +42,7 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
       fields[0] = states.get(pid) ?? "S"; fields[2] = String(pid); fields[3] = "100"; fields[19] = births.get(pid)!;
       return `${pid} (fixture) ${fields.join(" ")}`;
     });
-    const write = vi.spyOn(fs, "writeFileSync").mockImplementation((file, value) => {
-      if (String(file).endsWith("cgroup.freeze")) {
-        if (!freezes) throw Object.assign(new Error("no freezer"), { code: "ENOENT" });
-        frozen = value === "1";
-      }
-    });
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
     const scan = vi.spyOn(fs, "readdirSync").mockImplementation(() => { throw new Error("full /proc scan is forbidden on hot path"); });
     const receipt = cgroupCustody(directory, { pid: 100, parent: 1, group: 100, session: 100, started: "1000" });
@@ -60,9 +54,6 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
       pids: (value: number[]) => { pids = value; },
       gone: () => { missing = true; }, recycle: () => { inode++; },
       unknown: () => { unreadable = true; },
-      noFreezer: () => { freezes = false; }, noConfirmation: () => { confirmFreeze = false; },
-      frozen: () => frozen,
-      confirm: () => { confirmFreeze = true; event(); },
       emptyEvent: () => { pids = []; populated = false; event(); },
     };
   };
@@ -88,181 +79,65 @@ describe.skipIf(process.platform !== "linux")("cgroup execution custody", () => 
     expect(f.scan).not.toHaveBeenCalled();
     expect(f.read.mock.calls.map(call => String(call[0]))).toEqual(Array(10).fill(`${pinned}/cgroup.procs`)); f.emptyEvent();
   });
-  it("freezes before TERM and always thaws after signalling frozen members", async () => {
+  it.each(["SIGTERM", "SIGINT", "SIGHUP"] as const)("skips %s without numeric PID/PGID authority or freezer IO", async signal => {
     const f = setup(); f.read.mockClear();
-    const read = f.read.getMockImplementation()!;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      if (/^\/proc\/\d+\/stat$/.test(String(args[0]))) expect(f.frozen()).toBe(true);
-      return read(...args);
-    }) as typeof fs.readFileSync);
-    f.kill.mockImplementation(() => { expect(f.frozen()).toBe(true); return true; });
-    await f.group.signal("SIGTERM");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"], [101, "SIGTERM"]]);
-    expect(f.write.mock.calls).toEqual([[`${pinned}/cgroup.freeze`, "1"], [`${pinned}/cgroup.freeze`, "0"]]);
-    expect(f.read.mock.calls.map(call => String(call[0]))).toEqual([
-      `${pinned}/cgroup.events`, `${pinned}/cgroup.procs`,
-      "/proc/100/stat", "/proc/100/cgroup", "/proc/100/stat",
-      "/proc/101/stat", "/proc/101/cgroup", "/proc/101/stat",
-    ]);
-    expect(f.frozen()).toBe(false); f.emptyEvent();
+    await f.group.signal(signal);
+    expect(f.kill).not.toHaveBeenCalled(); expect(f.write).not.toHaveBeenCalled();
+    expect(f.read).not.toHaveBeenCalled(); expect(f.scan).not.toHaveBeenCalled(); f.emptyEvent();
   });
-  it.each(["Z", "X"])("skips a %s member that an outside parent can reap despite the freezer", async state => {
-    const f = setup(); f.states.set(101, state);
-    f.kill.mockImplementation(pid => { expect(f.frozen()).toBe(true); expect(pid).toBe(100); return true; });
-    await f.group.signal("SIGTERM");
-    expect(f.read).toHaveBeenCalledWith("/proc/101/stat", "utf8");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]);
-    expect(f.frozen()).toBe(false); expect(f.scan).not.toHaveBeenCalled(); f.emptyEvent();
-  });
-  it.each(["ENOENT", "ESRCH", "EACCES", "EIO"])("skips members whose stat read fails with %s without blocking live members", async code => {
-    const f = setup(); f.statErrors.set(100, code);
-    f.kill.mockImplementation(pid => { expect(f.frozen()).toBe(true); expect(pid).toBe(101); return true; });
-    await f.group.signal("SIGTERM");
-    expect(f.kill.mock.calls).toEqual([[101, "SIGTERM"]]);
-    expect(f.frozen()).toBe(false); expect(f.scan).not.toHaveBeenCalled(); f.emptyEvent();
-  });
-  it("skips a listed zombie PID reused by an outside live process before the first stat read", async () => {
-    const f = setup(); f.states.set(101, "Z");
-    const read = f.read.getMockImplementation()!;
+  it.each([false, true])("migration after the exact-path check cannot signal the migrated PID (reuse=%s)", async reuse => {
+    const f = setup(); const read = f.read.getMockImplementation()!;
+    const migrate = () => {
+      f.pids([100]); f.scopes.set(101, "/sys/fs/cgroup/sibling.scope");
+      if (reuse) f.births.set(101, "9999");
+    };
+    let statReads = 0;
     f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
       const value = read(...args);
-      if (String(args[0]) === `${pinned}/cgroup.procs`) {
-        // A frozen zombie can still be reaped by its unfrozen outside parent.
-        f.births.set(101, "9999"); f.states.set(101, "S");
-        f.scopes.set(101, "/sys/fs/cgroup/outside.scope");
-      }
+      // Adversarial same-UID migration immediately AFTER the old path's last
+      // stat check, even if frozen. Returned stat still matches the old birth.
+      if (String(args[0]) === "/proc/101/stat" && ++statReads === 2) migrate();
       return value;
     }) as typeof fs.readFileSync);
+    // Capture a checked member, then request TERM. The new path has no unsafe
+    // check/signal boundary at all; the old numeric path fails this assertion.
+    expect(f.receipt.members()).toContain(101);
+    expect(fs.readFileSync("/proc/101/cgroup", "utf8")).toBe(`0::${directory.slice("/sys/fs/cgroup".length)}\n`);
     await f.receipt.signal("SIGTERM");
-    expect(f.read).toHaveBeenCalledWith("/proc/101/cgroup", "utf8");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]);
-    expect(f.frozen()).toBe(false); f.emptyEvent();
+    expect(f.kill).not.toHaveBeenCalled();
+    // Also migrate after that checked snapshot, immediately before the atomic
+    // kernel KILL. Fake cgroupfs records ONLY the members at the write itself.
+    const killed: number[] = [];
+    f.write.mockImplementation((file, value) => {
+      expect(String(file)).toBe(`${pinned}/cgroup.kill`); expect(value).toBe("1");
+      migrate(); killed.push(...f.receipt.members());
+    });
+    await f.receipt.signal("SIGKILL");
+    expect(killed).toEqual([100]); expect(f.kill).not.toHaveBeenCalled();
+    expect(statReads).toBe(0); f.emptyEvent();
   });
-  it.each([
-    "/sys/fs/cgroup/other.slice/fabric-execution-test.scope",
-    `${directory}/child.scope`,
-  ])("requires the exact execution scope path, not a matching basename or descendant (%s)", async scope => {
-    const f = setup(); f.scopes.set(101, scope);
-    await f.receipt.signal("SIGTERM");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
-  });
-  it("skips a PID whose start time changes across the scope membership read", async () => {
-    const f = setup(); const read = f.read.getMockImplementation()!;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      const value = read(...args);
-      if (String(args[0]) === "/proc/101/cgroup") f.births.set(101, "9999");
-      return value;
-    }) as typeof fs.readFileSync);
-    await f.receipt.signal("SIGTERM");
-    expect(f.read.mock.calls.filter(call => String(call[0]) === "/proc/101/stat")).toHaveLength(2);
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
-  });
-  it.each(["Z", "X", "missing"])("skips a member that becomes %s at identity revalidation", async state => {
-    const f = setup(); const read = f.read.getMockImplementation()!;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      const value = read(...args);
-      if (String(args[0]) === "/proc/101/cgroup") {
-        if (state === "missing") f.births.delete(101); else f.states.set(101, state);
-      }
-      return value;
-    }) as typeof fs.readFileSync);
-    await f.receipt.signal("SIGTERM");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
-  });
-  it.each(["ENOENT", "ESRCH", "EACCES", "EIO"])("skips a member whose scope read fails with %s", async code => {
-    const f = setup(); const read = f.read.getMockImplementation()!;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      if (String(args[0]) === "/proc/101/cgroup") throw Object.assign(new Error("unreadable scope"), { code });
-      return read(...args);
-    }) as typeof fs.readFileSync);
-    await f.receipt.signal("SIGTERM");
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
-  });
-  it("an attempted exit/reuse between membership check and syscall cannot hit a non-member", async () => {
-    const f = setup(); const read = f.read.getMockImplementation()!;
-    let attempted = false, recycled = false;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      const value = read(...args);
-      if (String(args[0]) === `${pinned}/cgroup.procs`) {
-        attempted = true;
-        if (!f.frozen()) { recycled = true; f.births.set(101, "9999"); f.pids([100]); }
-      }
-      return value;
-    }) as typeof fs.readFileSync);
-    f.kill.mockImplementation(pid => { expect(pid === 101 && recycled).toBe(false); return true; });
-    await f.group.signal("SIGTERM");
-    expect(attempted).toBe(true); expect(recycled).toBe(false); f.emptyEvent();
-  });
-  it("does not signal a PID that exits and is reused outside the scope before frozen confirmation", async () => {
-    const f = setup(); f.noConfirmation();
-    const pending = f.receipt.signal("SIGTERM"); await Promise.resolve();
-    f.births.set(101, "9999"); f.pids([100]); f.confirm(); await pending;
-    expect(f.kill.mock.calls).toEqual([[100, "SIGTERM"]]); f.emptyEvent();
-  });
-  it("waits for a frozen 1 watch event, not just successful freezer write", async () => {
-    const f = setup(); f.noConfirmation();
-    const pending = f.receipt.signal("SIGTERM"); await Promise.resolve();
-    expect(f.kill).not.toHaveBeenCalled(); f.confirm(); await pending;
-    expect(f.kill).toHaveBeenCalledTimes(2); expect(f.watch).toHaveBeenCalledOnce(); f.emptyEvent();
-  });
-  it("attempts thaw even when the freezer write reports an error after taking effect", async () => {
-    const f = setup(); const write = f.write.getMockImplementation()!;
-    f.write.mockImplementation(((...args: Parameters<typeof fs.writeFileSync>) => {
-      write(...args); if (args[1] === "1") throw new Error("freeze write failed after effect");
-    }) as typeof fs.writeFileSync);
-    await expect(f.receipt.signal("SIGTERM")).rejects.toThrow("freeze write failed");
-    expect(f.frozen()).toBe(false); expect(f.kill).not.toHaveBeenCalled(); f.emptyEvent();
-  });
-  it("thaws when kill throws, and the failed signal does not poison later cleanup", async () => {
-    const f = setup(); f.kill.mockImplementationOnce(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
-    await expect(f.receipt.signal("SIGTERM")).rejects.toThrow("denied");
-    expect(f.write).toHaveBeenLastCalledWith(`${pinned}/cgroup.freeze`, "0");
-    expect(f.frozen()).toBe(false); await f.receipt.signal("SIGKILL"); f.emptyEvent();
-  });
-  it("thaws on membership failure and never treats unreadable membership as exit", async () => {
+  it("skipped TERM leaves unreadable membership as debt but does not block atomic KILL", async () => {
     const f = setup(); f.unknown();
     expect(() => f.group.exited()).toThrow(/unreadable membership/);
-    await expect(f.group.signal("SIGTERM")).rejects.toThrow(/unreadable membership/);
-    expect(f.kill).not.toHaveBeenCalled(); expect(f.frozen()).toBe(false); f.emptyEvent();
+    await f.group.signal("SIGTERM"); await f.group.signal("SIGKILL");
+    expect(f.kill).not.toHaveBeenCalled(); expect(f.write).toHaveBeenCalledExactlyOnceWith(`${pinned}/cgroup.kill`, "1"); f.emptyEvent();
   });
-  it("bounds unconfirmed freeze latency, thaws on timeout, and leaves no timers", async () => {
-    const f = setup(); vi.useFakeTimers(); f.noConfirmation();
-    const pending = f.receipt.signal("SIGTERM");
-    const rejected = expect(pending).rejects.toThrow(/freeze unconfirmed/);
-    await vi.advanceTimersByTimeAsync(FREEZE_TIMEOUT_MS); await rejected;
-    expect(f.kill).not.toHaveBeenCalled(); expect(f.frozen()).toBe(false);
-    expect(vi.getTimerCount()).toBe(0); f.emptyEvent();
+  it("an atomic KILL failure does not poison retry and never authorizes numeric fallback", async () => {
+    const f = setup();
+    f.write.mockImplementationOnce(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+    await expect(f.receipt.signal("SIGKILL")).rejects.toThrow("denied");
+    await f.receipt.signal("SIGKILL"); expect(f.write).toHaveBeenCalledTimes(2);
+    expect(f.kill).not.toHaveBeenCalled(); f.emptyEvent();
   });
-  it("thaws after an events read error, without signalling before freeze confirmation", async () => {
-    const f = setup(); const read = f.read.getMockImplementation()!;
-    f.read.mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-      if (String(args[0]).endsWith("cgroup.events")) throw new Error("events failed");
-      return read(...args);
-    }) as typeof fs.readFileSync);
-    await expect(f.receipt.signal("SIGTERM")).rejects.toThrow("events failed");
-    expect(f.frozen()).toBe(false); expect(f.kill).not.toHaveBeenCalled(); f.emptyEvent();
-  });
-  it("keeps the pinned fd until finally has thawed a scope emptied during freezing", async () => {
-    const f = setup(); f.noConfirmation();
-    const pending = f.receipt.signal("SIGTERM"); await Promise.resolve();
-    f.emptyEvent(); expect(f.close).not.toHaveBeenCalled(); await pending;
-    expect(f.write).toHaveBeenLastCalledWith(`${pinned}/cgroup.freeze`, "0");
-    expect(f.close).toHaveBeenCalledOnce(); expect(f.kill).not.toHaveBeenCalled();
-  });
-  it.each(["cgroup.freeze", "cgroup.kill"])("rejects custody without %s at admission, closing the rejected fd", control => {
-    const f = setup(); f.watch.mockClear(); f.close.mockClear();
+  it("requires only cgroup.kill at admission, closing an unadmitted fd if unavailable", () => {
+    const f = setup(); f.watch.mockClear(); f.close.mockClear(); f.access.mockClear();
     f.access.mockImplementation(file => {
-      if (String(file).endsWith(control)) throw Object.assign(new Error(`missing ${control}`), { code: "ENOENT" });
+      expect(String(file)).toBe(`${pinned}/cgroup.kill`);
+      throw Object.assign(new Error("missing cgroup.kill"), { code: "ENOENT" });
     });
     expect(() => cgroupCustody(directory)).toThrow(/controls unavailable/);
     expect(f.close).toHaveBeenCalledExactlyOnceWith(42);
-    expect(f.watch).not.toHaveBeenCalled(); expect(f.kill).not.toHaveBeenCalled();
-    f.emptyEvent();
-  });
-  it("never enters an unfrozen per-PID path if the admitted freezer disappears", async () => {
-    const f = setup(); f.noFreezer();
-    await expect(f.group.signal("SIGTERM")).rejects.toThrow("no freezer");
-    expect(f.kill).not.toHaveBeenCalled(); f.emptyEvent();
+    expect(f.watch).not.toHaveBeenCalled(); expect(f.kill).not.toHaveBeenCalled(); f.emptyEvent();
   });
   it("does not replace a disappeared cgroup.kill with numeric KILL", async () => {
     const f = setup();

@@ -45,7 +45,8 @@ describe.skipIf(!available)("real Linux cgroup scope custody", () => {
     }
   });
 
-  it.each(["cgroup.freeze", "cgroup.kill"])("downgrades an admitted worker with missing %s to legacy custody without replay", async control => {
+  it("downgrades an admitted worker with missing cgroup.kill to legacy custody without replay", async () => {
+    const control = "cgroup.kill";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cgroup-downgrade-"));
     const worker = path.join(root, "worker.mjs"), started = path.join(root, "started");
     fs.writeFileSync(worker, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(started)},String(process.pid)+'\\n');setInterval(()=>{},1000);`);

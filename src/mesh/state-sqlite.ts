@@ -183,7 +183,8 @@ const lostDatabase = (root: string): MeshStateUnsupportedError =>
 
 /**
  * Before any side effect. Returns the mode the open runs in: "create" only on a GENUINELY fresh root (no
- * state.db or a zero-length one, and a state.json that is absent or empty); "create" over an imported root (an
+ * state.db, a zero-length one or one with no meta table, and a state.json that is absent or empty: the meta
+ * table is checked on the connection, see hasMeta); "create" over an imported root (an
  * initialised state.db plus the marker) is a default open (undefined), so its database is checked like any
  * other. Everything else refuses with the root untouched: an existing database without the marker (never
  * accepted as imported), file state in state.json, or the marker without its database (review/astra P1).
@@ -194,10 +195,10 @@ const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["init
     const state = classifyStateFile(path.join(root, "state.json"));
     if (stateDbSize(root) > 0) {
       if (state === "marker") return undefined; // the imported shape: open it as a default open does
-      throw importFirst(root, state === "populated"
-        ? "initialize \"create\" found file-backend state in state.json and an existing state.db"
-        : "initialize \"create\" found an existing state.db without the moved marker, so no import created it "
-          + "(inspect state.db and move it aside if it holds nothing)");
+      if (state === "populated") throw importFirst(root, "initialize \"create\" found file-backend state in state.json and an existing state.db");
+      // No marker: only a database nothing initialised (no meta table, e.g. a bare WAL header) may be
+      // created; that needs a SQLite read (never plain fs on state.db), so the open decides on the
+      // connection: an initialised one goes through assertImportedDatabase and refuses without the marker.
     }
     if (state === "populated") throw importFirst(root, "this root has file-backend state");
     if (state === "marker") throw lostDatabase(root);

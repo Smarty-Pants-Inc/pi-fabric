@@ -226,19 +226,23 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
   describe("initialize: \"create\" only on a genuinely fresh root (review/astra P1)", () => {
     const create = (root: string) => SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "create" });
     const createAsync = (root: string) => SqliteStateStore.open(root, 64 * 1024, 1_000, { initialize: "create" });
+    const unmarkedDb = /state\.db says backend=sqlite but state\.json is not the moved marker, so no import created it/;
 
     it("(1) refuses a nonempty state.db without the marker, bytes unchanged", async () => {
       const root = tempRoot("create-unmarked-db");
       SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "detached" }).close();
       const before = snapshot(root);
-      expect(() => create(root)).toThrow(/existing state\.db without the moved marker/);
-      await expect(createAsync(root)).rejects.toThrow(/existing state\.db without the moved marker/);
+      expect(() => create(root)).toThrow(unmarkedDb);
+      await expect(createAsync(root)).rejects.toThrow(unmarkedDb);
       expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
       expect(snapshot(root)).toEqual(before);
       // An empty state.json beside it changes nothing: the database is still not an imported one.
       fs.writeFileSync(path.join(root, "state.json"), "");
-      expect(() => create(root)).toThrow(/existing state\.db without the moved marker/);
+      expect(() => create(root)).toThrow(unmarkedDb);
       expect(fs.statSync(path.join(root, "state.json")).size).toBe(0);
+      const withEmpty = snapshot(root);
+      await expect(createAsync(root)).rejects.toThrow(unmarkedDb);
+      expect(snapshot(root)).toEqual(withEmpty);
     });
 
     it("(2) refuses a populated state.json beside an existing state.db, state.json unchanged", async () => {
@@ -281,6 +285,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
       // "create" again over the now-imported root is a default open: same database, marker untouched.
       const marker = fs.readFileSync(path.join(none, "state.json"));
       const first = sqliteStores[0];
+      if (!first) throw new Error("no store was opened");
       await first.put({ key: "a", value: 1, identity });
       const again = create(none);
       sqliteStores.push(again);

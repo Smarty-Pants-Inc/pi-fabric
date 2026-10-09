@@ -3205,6 +3205,28 @@ describe("Fabric dashboard global actors and instructions editor", () => {
     }
   });
 
+  it("edits global template host events with v", () => {
+    const tui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
+    const onGlobalEvents = vi.fn();
+    const dashboard = new FabricDashboard(tui, theme, baseSnapshot, vi.fn(), {
+      onGlobalEvents,
+    });
+    try {
+      dashboard.handleInput("l");
+      dashboard.handleInput("j");
+      expect(dashboard.render(120).join("\n")).toContain("v events");
+      dashboard.handleInput("\r");
+      expect(dashboard.render(120).join("\n")).toContain("v events");
+      dashboard.handleInput("v");
+      expect(dashboard.render(120).join("\n")).toContain("Host events for template");
+      dashboard.handleInput(" ");
+      dashboard.handleInput("\r");
+      expect(onGlobalEvents).toHaveBeenCalledWith("g-actor-1", ["input", "turn_end"]);
+    } finally {
+      dashboard.dispose();
+    }
+  });
+
   it("lists global templates and offers import/instructions/delete in their detail", () => {
     const tui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
     const onImportActor = vi.fn();

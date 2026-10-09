@@ -93,7 +93,7 @@ it("refuses a successor seen after prepared background admission without renewin
   } finally { release(); }
 });
 
-it("close cancels a prepared native FIFO ticket without awaiting or disturbing the holder", async () => {
+it.each(["close", "quiesce"] as const)("%s cancels a prepared native FIFO ticket without awaiting or disturbing the holder", async operation => {
   const s = await setup(() => withStateFence(s.mesh, s.identity, () => undefined));
   const lock = path.join(s.root, ".lock");
   fs.mkdirSync(lock); const bytes = `held\n${process.pid}\n${Date.now()}\n`;
@@ -103,12 +103,20 @@ it("close cancels a prepared native FIFO ticket without awaiting or disturbing t
     await vi.advanceTimersByTimeAsync(50);
     expect(s.directory.options.waitForPublicationRetry).toHaveBeenCalledOnce();
     const signal = vi.mocked(s.directory.options.waitForPublicationRetry!).mock.calls[0]![0]!;
+    // Actor stop's presence publisher must not join the host's blocked recovery lane.
+    let presenceFinished = false;
+    const presence = s.directory.refreshPresence().then(() => { presenceFinished = true; });
+    await vi.advanceTimersByTimeAsync(0); expect(presenceFinished).toBe(true); await presence;
+    expect(signal.aborted).toBe(false); expect(s.fence).toHaveBeenCalledTimes(2);
     vi.spyOn(s.mesh, "delete").mockResolvedValue({ deleted: false });
-    let closed = false;
-    const closing = s.directory.close().then(() => { closed = true; });
-    await vi.advanceTimersByTimeAsync(0); expect(closed).toBe(true); await closing;
-    expect(signal.aborted).toBe(true);
+    let finished = false;
+    const stopping = (operation === "close" ? s.directory.close() :
+      // Quiesce still reports its original short publication failure, not the retry budget.
+      s.directory.quiesce().catch(error => { expect(error).toBeInstanceOf(MeshLockTimeoutError); }))
+      .then(() => { finished = true; });
+    await vi.advanceTimersByTimeAsync(0); expect(finished).toBe(true); await stopping;
+    expect(signal.aborted).toBe(true); expect(s.directory.canConsumeMesh()).toBe(false);
     expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(bytes);
-    expect(s.fence).toHaveBeenCalledTimes(2);
+    expect(s.fence).toHaveBeenCalledTimes(operation === "close" ? 2 : 3);
   } finally { fs.rmSync(lock, { recursive: true, force: true }); }
 });

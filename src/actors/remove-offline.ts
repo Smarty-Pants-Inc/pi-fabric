@@ -13,6 +13,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { MeshStore } from "../mesh/store.js";
@@ -99,7 +100,46 @@ export const removePinnedActorTree = (tree: PinnedActorTree): void => {
 };
 
 /** Tar the verified actor tree and its registry row, with SHA256SUMS, before any removal step. */
-export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row: Row, tree: PinnedActorTree, at = Date.now()): string => {
+/** Evidence text kept with a --main-stopped assertion is capped at 64 KiB. */
+export const MAIN_STOPPED_EVIDENCE_MAX_BYTES = 64 * 1024;
+
+/** The audit record of a --main-stopped assertion: who, which root, when, and the evidence used. */
+export interface MainStoppedAudit {
+  format: 1;
+  mainStopped: true;
+  rootId: string;
+  assertedAt: string;
+  operator: { user: string | null; agent: string | null; session: string | null; pid: number; host: string };
+  evidence: string;
+}
+
+/** Built by the operator's own CLI process from its environment and the required evidence. */
+export const mainStoppedAudit = (rootId: string, evidence: string, env: NodeJS.ProcessEnv = process.env): MainStoppedAudit => {
+  const text = Buffer.from(evidence, "utf8").subarray(0, MAIN_STOPPED_EVIDENCE_MAX_BYTES).toString("utf8");
+  if (!text.trim()) throw new Error("--main-stopped needs --evidence <text> or --evidence-file <path>: the Herdr pane/agent listing and the process check for that Main's session");
+  return { format: 1, mainStopped: true, rootId, assertedAt: new Date().toISOString(),
+    operator: { user: env.USER ?? env.LOGNAME ?? null, agent: env.PI_FABRIC_AGENT_NAME ?? null,
+      session: env.PI_FABRIC_SESSION_ID ?? env.PI_SESSION_ID ?? null, pid: process.pid, host: os.hostname() },
+    evidence: text };
+};
+
+/** Exact audit shape for this root, with non-empty evidence within the cap. */
+export const validMainStoppedAudit = (value: unknown, rootId: string): value is MainStoppedAudit => {
+  const audit = value as MainStoppedAudit | undefined;
+  const nullableString = (field: unknown): boolean => field === null || typeof field === "string";
+  return !!audit && typeof audit === "object" && audit.format === 1 && audit.mainStopped === true && audit.rootId === rootId &&
+    typeof audit.assertedAt === "string" && Number.isFinite(Date.parse(audit.assertedAt)) &&
+    !!audit.operator && typeof audit.operator === "object" && nullableString(audit.operator.user) &&
+    nullableString(audit.operator.agent) && nullableString(audit.operator.session) &&
+    Number.isSafeInteger(audit.operator.pid) && typeof audit.operator.host === "string" &&
+    typeof audit.evidence === "string" && audit.evidence.trim().length > 0 &&
+    Buffer.byteLength(audit.evidence, "utf8") <= MAIN_STOPPED_EVIDENCE_MAX_BYTES;
+};
+
+export const MAIN_STOPPED_AUDIT_REQUIRED = "--main-stopped needs --evidence <text> or --evidence-file <path>: the Herdr pane/agent listing and the process check for that Main's session";
+
+export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row: Row, tree: PinnedActorTree, at = Date.now(),
+  assertion?: MainStoppedAudit & { requestId?: string }): string => {
   if (!/^[A-Za-z0-9_-]+$/.test(row.id)) throw new Error(`Unsafe actor id for archive: ${row.id}`);
   assertPinned(tree);
   const directory = path.join(archiveRoot, `actors-${rootTag(rootId)}-${stamp(at)}`);
@@ -122,6 +162,11 @@ export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row:
   const rowFile = path.join(directory, `${row.id}.registry.json`);
   writeJsonAtomic(rowFile, row, { durable: true, space: 2 });
   files.push(rowFile);
+  if (assertion) {
+    const assertionFile = path.join(directory, `${row.id}.operator.json`);
+    writeJsonAtomic(assertionFile, assertion, { durable: true, space: 2 });
+    files.push(assertionFile);
+  }
   const sums = path.join(directory, "SHA256SUMS");
   const existing = fs.existsSync(sums) ? fs.readFileSync(sums, "utf8") : "";
   const lines = files.map(file => `${createHash("sha256").update(fs.readFileSync(file)).digest("hex")}  ${path.basename(file)}\n`).join("");
@@ -188,7 +233,7 @@ export interface OfflineRemoveResult {
 }
 
 export const removeActorOffline = async (directory: string, config: ResidentHostConfig, selector: string,
-  options: { dryRun?: boolean; confirmDeadRoot?: string } = {}): Promise<OfflineRemoveResult> => {
+  options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: MainStoppedAudit } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
   assertOwnershipProvable(); // before the fence, any record or any mutation
   const fd = await claimFence(directory);
@@ -205,13 +250,16 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     }
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
-    // The same recorded-absence grace as the live path; no offline shortcut (smarty-dev#7817).
-    const absence = { offline: true, absenceFile: path.join(directory, "main-absence.json"), recordAbsence: !dryRun };
-    const evidence = readResidentOperatorEvidence(config, mesh, undefined, absence);
-    assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, dryRun);
+    // The same operator assertion and live-observation vetoes as the live path (smarty-dev#7956: automatic proof).
+    if (options.mainStoppedAudit !== undefined && !validMainStoppedAudit(options.mainStoppedAudit, config.rootId)) {
+      throw new Error(MAIN_STOPPED_AUDIT_REQUIRED);
+    }
+    const mainStopped = options.mainStoppedAudit !== undefined;
+    const evidence = readResidentOperatorEvidence(config, mesh, undefined, { mainStopped });
+    assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, dryRun, mainStopped);
     const check = (): void => {
       recheck();
-      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!, undefined, absence), options.confirmDeadRoot);
+      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!, undefined, { mainStopped }), options.confirmDeadRoot, false, mainStopped);
     };
     // Exact id/name within this root's durable actors only, as the live operator path.
     const matches: Array<{ store: ActorRegistryStore; root: string; row: Row }> = [];
@@ -244,16 +292,18 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     tree = pinActorTree(actorDirectory);
     if (dryRun) return { offline: true, dryRun, actor: summary, operatorEvidence: evidence };
 
+    const assertion = options.mainStoppedAudit!;
     // 1. Archive first: nothing is deleted or revoked before it is taken.
     check();
-    const archive = archiveActorForRemoval(path.join(directory, "archives"), config.rootId, row, tree);
+    const archive = archiveActorForRemoval(path.join(directory, "archives"), config.rootId, row, tree, Date.now(), assertion);
     // 2. The durable removal record, as #commitRemove: a later owner start finishes from it.
     const presenceKey = `actors/${config.sessionId}/${id}`;
     const marker = path.join(root, `removal-${id}.json`);
     const cleanup = { id, sessionDir: actorDirectory, presenceKey,
       ...(typeof row.lastRunId === "string" ? { lastRunId: row.lastRunId } : {}),
       owner: { name: String(row.name ?? id), rootId: config.rootId, residency: "durable",
-        requestedAt: (row.removal as { requestedAt?: number } | undefined)?.requestedAt ?? Date.now() } };
+        requestedAt: (row.removal as { requestedAt?: number } | undefined)?.requestedAt ?? Date.now() },
+      operatorAssertion: assertion };
     check();
     writeJsonAtomic(marker, cleanup, { durable: true });
     // 3. Revoke the registry row under the registry lock.

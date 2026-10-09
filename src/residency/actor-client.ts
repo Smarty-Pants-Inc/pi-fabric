@@ -141,7 +141,7 @@ export class ResidentActorClient {
 
   /** Same-user operator control; the resident executor requires root confirmation and vetoes live leases. */
   async operatorActor(action: "stop" | "remove", id: string,
-    options: { dryRun?: boolean; confirmDeadRoot?: string } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: unknown } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "operatorActor",
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }

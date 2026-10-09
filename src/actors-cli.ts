@@ -1,11 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
-import { removeActorOffline } from "./actors/remove-offline.js";
+import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
+const help = `${usage}
+
+remove needs --main-stopped: the operator asserts that the root's Main process is gone (automatic proof:
+smarty-dev#7956). It needs --evidence <text> or --evidence-file <path> (read as text, capped at 64 KiB): the
+Herdr pane/agent listing and the process check for that Main's session. The assertion, the operator ($USER,
+PI_FABRIC_AGENT_NAME or the session id), the root id, the time and the evidence are kept in the removal
+archive and record. Only the operator of the dead Main's own fleet (or Light for the #7231 waves) uses it.
+It never overrides a live root lease or a fresh, reloading or doubtful root participant.`;
 
 /** Resolve exactly one resident under the configured residency directory, never the CWD. */
 export function resolveResidentDirectory(selector: string, meshRoot: string): string {
@@ -37,19 +45,34 @@ export function resolveResidentDirectory(selector: string, meshRoot: string): st
 export async function main(argv: string[], io: { out: (text: string) => void; err: (text: string) => void } = { out: (text: string) => process.stdout.write(text),
   err: (text: string) => process.stderr.write(text) }): Promise<number> {
   try {
-    if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(usage + "\n"); return 0; }
+    if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(help + "\n"); return 0; }
     const [action, ...rest] = argv;
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};
     let dryRun = false;
+    // remove: the operator asserts the root's Main process is gone (automatic proof: smarty-dev#7956).
+    let mainStopped = false;
     for (let index = 0; index < rest.length; index++) {
       const option = rest[index]!;
       if (option === "--dry-run") { dryRun = true; continue; }
-      if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root"].includes(option) || values[option] !== undefined ||
+      if (option === "--main-stopped" && !mainStopped) { mainStopped = true; continue; }
+      if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root", "--evidence", "--evidence-file"].includes(option) || values[option] !== undefined ||
           !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
       values[option] = rest[++index]!;
     }
     if (!values["--resident"] || !values["--actor"]) throw new Error(usage);
+    const evidenceGiven = values["--evidence"] !== undefined || values["--evidence-file"] !== undefined;
+    if ((values["--evidence"] !== undefined && values["--evidence-file"] !== undefined) || (evidenceGiven && !mainStopped) ||
+        (mainStopped && action !== "remove")) throw new Error(usage);
+    if (mainStopped && !evidenceGiven) throw new Error(MAIN_STOPPED_AUDIT_REQUIRED);
+    let evidence = values["--evidence"];
+    if (values["--evidence-file"] !== undefined) {
+      const fd = fs.openSync(values["--evidence-file"], "r");
+      try {
+        const buffer = Buffer.alloc(MAIN_STOPPED_EVIDENCE_MAX_BYTES);
+        evidence = buffer.subarray(0, fs.readSync(fd, buffer, 0, buffer.length, 0)).toString("utf8");
+      } finally { fs.closeSync(fd); }
+    }
     const meshRoot = path.resolve(values["--mesh-root"] ?? process.env.PI_FABRIC_MESH_ROOT ??
       path.join(process.env.PI_FABRIC_PROJECT_ROOT ?? process.cwd(), ".pi", "fabric", "mesh"));
     const directory = resolveResidentDirectory(values["--resident"], meshRoot);
@@ -68,7 +91,8 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
         fs.realpathSync(config.residencyRoot) !== directory || fs.realpathSync(residentRoot(config.meshRoot, config.rootId)) !== directory) {
       throw new Error("Resident directory/config/owner identity mismatch");
     }
-    const confirmation = values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {};
+    const confirmation = { ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}),
+      ...(mainStopped ? { mainStoppedAudit: mainStoppedAudit(config.rootId, evidence ?? "") } : {}) };
     if (!residentProcessAlive(owner.pid, owner.processStartTime)) {
       // smarty-dev#7817: a dead resident cannot carry out the removal; do it offline under its host.lock fence.
       if (action !== "remove") throw new Error("Root resident host is not live");

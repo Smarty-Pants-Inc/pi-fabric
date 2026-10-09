@@ -38,15 +38,18 @@ const fixture = async () => {
   const host = new ResidentHost(config, () => {});
   try { await host.start(); } catch (error) { await host.close(); throw error; }
   const confirm = ["--confirm-dead-root", config.rootId];
+  const mainStopped = ["--main-stopped", "--evidence", "herdr agent list / ps: no Main for this session"];
   const cli = async (action: "stop" | "remove", actor: string, flags: string[] = [], resident = config.residencyRoot) => {
     let out = "", err = "";
+    // smarty-dev#7817: a confirmed remove also carries the operator's audited --main-stopped assertion.
+    if (action === "remove" && flags.includes(config.rootId)) flags = [...flags, ...mainStopped];
     const code = await main([action, "--resident", resident, "--actor", actor, "--mesh-root", meshRoot, ...flags],
       { out: text => { out += text; }, err: text => { err += text; } });
     return { code, out, err };
   };
   const create = (name: string) => host.actors.create({ name, instructions: "Run", model: "fixture/visible",
     residency: "durable", transport: "process", extensions: false });
-  return { root, host, config, cli, create, confirm, close: async () => {
+  return { mainStopped, root, host, config, cli, create, confirm, close: async () => {
     for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true);
     await host.close(); fs.rmSync(root, { recursive: true, force: true });
   } };
@@ -198,7 +201,7 @@ describe("same-user resident actor operator", () => {
       }
       for (const action of ["stop", "remove"] as const) {
         const result = await run(process.execPath, [path.resolve("bin/fabric-actors"), action,
-          "--resident", selector, "--actor", target.name, ...f.confirm], {
+          "--resident", selector, "--actor", target.name, ...f.confirm, ...(action === "remove" ? f.mainStopped : [])], {
           cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
         });
         expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
@@ -314,7 +317,7 @@ describe("same-user resident actor operator", () => {
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
       const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run"]);
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
-      const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
+      const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm, ...f.mainStopped]);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
       await f.host.participants.refresh();
       expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();

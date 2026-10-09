@@ -567,6 +567,8 @@ export interface ResidentOperatorActorCommand {
   id: string;
   dryRun?: boolean;
   confirmDeadRoot?: string;
+  /** remove: the operator's audited assertion that the root's Main process is gone (smarty-dev#7817). */
+  mainStoppedAudit?: unknown;
   requestId: string;
   rootId: string;
   createdAt: number;

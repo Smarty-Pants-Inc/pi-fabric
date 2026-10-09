@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import os from "node:os";
-import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree } from "../actors/remove-offline.js";
+import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -1529,18 +1529,20 @@ export class ResidentHost {
         if ((command.action !== "stop" && command.action !== "remove") ||
             typeof command.id !== "string" || !command.id.trim() ||
             (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
-            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean") ||
+            (command.mainStoppedAudit !== undefined && !validMainStoppedAudit(command.mainStoppedAudit, this.config.rootId))) {
           throw new Error("Invalid resident operator actor request");
         }
         // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
         const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
-        // A root participant's absence must hold for the whole grace, recorded here (smarty-dev#7817).
-        const absence = { absenceFile: path.join(this.config.residencyRoot, "main-absence.json"), recordAbsence: command.dryRun !== true &&
-          (command.action !== "remove" || typeof process.getuid === "function") };
-        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, absence);
+        // Remove needs the operator's --main-stopped assertion (smarty-dev#7956 carries automatic proof);
+        // it never overrides a live lease or a fresh, reloading or doubtful root participant.
+        const mainStopped = command.action === "remove" ? command.mainStoppedAudit !== undefined : undefined;
+        const options = { mainStopped: mainStopped === true };
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, options);
         const check = () => assertResidentOperatorConfirmed(
-          readResidentOperatorEvidence(this.config, this.mesh, self, absence), command.confirmDeadRoot);
-        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
+          readResidentOperatorEvidence(this.config, this.mesh, self, options), command.confirmDeadRoot, false, mainStopped);
+        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true, mainStopped);
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
@@ -1572,7 +1574,8 @@ export class ResidentHost {
             if (stopped.sessionFile !== actor.sessionFile || !row) throw new Error(`Actor ${actor.id} registry row not found for its removal archive`);
             // The same lstat-verified, pinned walk as the offline path, taken again after the stop; tar follows nothing.
             const tree = pinActorTree(sessionDir);
-            try { archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, tree); }
+            try { archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, tree,
+              Date.now(), { ...(command.mainStoppedAudit as MainStoppedAudit), requestId }); }
             finally { tree.close(); }
           }
           response = command.action === "stop"

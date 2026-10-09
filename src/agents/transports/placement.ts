@@ -6,6 +6,7 @@ import { writeJsonAtomic } from "../../core/atomic-write.js";
 import { executeFile } from "./process-utils.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
+import { normalizeAgentRequires } from "../input-validation.js";
 
 interface Receipt { rc: number | string; text: string; stderr?: string }
 const render = (template: string, values: Record<string, string>): string => template.replace(/\{([a-zA-Z]+)\}/g, (_match, key: string) => {
@@ -26,6 +27,7 @@ const receipt = (input: unknown): Receipt | undefined => {
  * No timers/processes survive outside manager-owned launch/isAlive/stop operations.
  */
 export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig): Promise<AgentTransportHandle> => {
+  const requires = normalizeAgentRequires(request.requires);
   const args = new Map<string, string>();
   for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
   const required = (flag: string): string => {
@@ -46,8 +48,12 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   const environment = taskAgentEnvironment();
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
-  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal) => {
+  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
     const argv = template.map(entry => render(entry, values));
+    // The fleet launcher calls these --input, not --require. Keep paths literal and
+    // insert before the prompt separator so they cannot become task text.
+    const separator = argv.indexOf("--");
+    argv.splice(separator < 0 ? argv.length : separator, 0, ...extraArguments);
     return executeFile(argv[0]!, argv.slice(1), { cwd: request.cwd, env: environment, timeoutMs: Math.max(1, limit), ...(signal ? { signal } : {}), killSignal: "SIGKILL" });
   };
   const audit = (type: string, data: Record<string, unknown>) => fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id: request.id, ...data }) + "\n", { mode: 0o600 });
@@ -142,7 +148,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   assertTransportLaunchAllowed(request);
   try {
     let output: string;
-    try { output = (await command(config.command, config.commandTimeoutMs, request.signal)).stdout; }
+    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--input", file]))).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
       debt = `Placement launch outcome unknown: ${String(error)}`;

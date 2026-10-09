@@ -15,6 +15,7 @@ import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
+import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -70,10 +71,13 @@ export class ProcessTransport implements AgentTransportAdapter {
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     // Snapshot once before any await: existing handles retain their original policy.
+    const requires = normalizeAgentRequires(request.requires);
+    request = { ...request, ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
     if (placement) {
       const unmet = (request.needs ?? []).filter(need => !placement.capabilities.includes(need));
-      let reason = placement.default === "local" ? "placement default is local"
+      let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
+        : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
       // --src ships the Main's workspace, unlike --cwd which names a target-local
@@ -112,6 +116,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
     }
+    // Check on Main only after the remote decision; required paths may exist solely on the target.
+    assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);

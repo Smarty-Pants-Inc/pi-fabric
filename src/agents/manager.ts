@@ -2,6 +2,7 @@ import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } 
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
+import { normalizeAgentRequires } from "./input-validation.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -1086,7 +1087,8 @@ export class AgentManager {
     }
     assertAgentTask(request);
     if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
-    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}) };
+    const requires = normalizeAgentRequires(request.requires);
+    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}), ...(requires !== undefined ? { requires } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1435,6 +1437,7 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           ...(request.needs ? { needs: [...request.needs] } : {}),
+          ...(request.requires ? { requires: [...request.requires] } : {}),
           placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe

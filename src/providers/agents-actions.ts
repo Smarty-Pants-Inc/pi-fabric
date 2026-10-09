@@ -1,5 +1,6 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
 import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
+import { MAX_AGENT_REQUIRED_INPUTS, MAX_AGENT_REQUIRED_INPUT_BYTES } from "../host-compatibility.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
@@ -12,7 +13,8 @@ import type { FabricActionDescriptor } from "../protocol.js";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; reserved local always pins to the Main host, and any unmet need stays local and is audited." },
+  requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Absolute selected-host input paths, each at most 4096 UTF-8 bytes and without NUL. Local spawns check existence before starting; remote launches preflight via repeated --input PATH arguments." },
   runner: {
     type: "string",
     enum: ["pi", "claude", "veda"],

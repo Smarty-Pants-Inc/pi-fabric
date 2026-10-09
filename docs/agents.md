@@ -39,7 +39,20 @@ const handle = await agents.spawn({ task: "Inspect the private corpus", transpor
 const result = await agents.wait({ id: handle.id });
 ```
 
-Any need absent from the configured target's guaranteed capabilities keeps the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
+The reserved need `needs: ["local"]` **always pins spawn/run to the Main's host**, even when `agents.placement.default` is `"remote"`. `"local"` is never a launcher capability: host config validation refuses `capabilities: ["local"]` with `AgentInputError` (`code: "FABRIC_AGENT_INPUT_ERROR"`, `field: "agents.placement.capabilities"`). Other needs absent from the configured target's guaranteed capabilities keep the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, resolved account pins, effectively disabled extensions (including `agents.extensions: false` when run omits the request setting), recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
+
+`agents.spawn` and `agents.run` also accept optional `requires: [absolutePath, ...]` to preflight named inputs on the **selected execution host** before starting its worker/model. The array may contain at most **64** paths; every entry must be absolute, contain no NUL, and occupy at most **4096 UTF-8 bytes**. Invalid declarations and missing local inputs throw `AgentInputError` (`code: "FABRIC_AGENT_INPUT_ERROR"`, `field: "requires"`, `launchOutcome: "unlaunched"`). Local placement checks existence before worker launch, including placement fallback and unconfigured hosts. Files and directories are both accepted.
+
+```ts
+const result = await agents.run({
+  task: "Inspect this Main-local input",
+  needs: ["local"],
+  requires: ["/absolute/path/to/input"],
+  transport: "process",
+});
+```
+
+For remote placement Fabric passes each path literally as a repeated **`--input PATH`** launcher argument before the prompt's `--` separator. The existing `smarty-task-ryzen2` flag is `--input`, **not `--require`**; its target-side preflight refuses a missing path before starting the model. Main does not check remote input existence. Custom placement launchers must support this flag when `requires` is used. These are target-local inputs, not requests to ship files or to change host selection, and the preflight does not pin their contents against later changes. A launcher refusal is not permission for local fallback/relaunch.
 
 Remote handles still use `agents.status`, `wait`, `run`, and `stop`. `wait` bounds still detach observations without cancelling the task. A terminal native `rc` receipt settles the run; a partial `result.md` does not. A failed filesystem-only startup executable probe keeps tasks local with an audited `placement-probe-failed` reason. Once a launcher is invoked, its failures never cause local fallback or automatic relaunch. Ambiguous launch/exit outcomes retain execution custody and local run files. The configured cancellation command requests stop; only the terminal receipt confirms exit.
 

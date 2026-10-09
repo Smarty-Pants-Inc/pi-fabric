@@ -3,6 +3,22 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
 
+// Shared host/agent input metadata lives beside existing public policy errors so
+// eager configuration and lazy launch validation do not add a startup chunk.
+export const MAX_AGENT_REQUIRED_INPUTS = 64;
+export const MAX_AGENT_REQUIRED_INPUT_BYTES = 4096;
+
+/** Invalid declarations and missing local inputs are known-unlaunched refusals. */
+export class AgentInputError extends Error {
+  readonly code = "FABRIC_AGENT_INPUT_ERROR";
+  readonly launchOutcome = "unlaunched";
+
+  constructor(readonly field: string, message: string) {
+    super(message);
+    this.name = "AgentInputError";
+  }
+}
+
 /** Trusted host policy for every Fabric participant model selection. */
 export interface FabricModelPolicy {
   deniedModels?: readonly string[];

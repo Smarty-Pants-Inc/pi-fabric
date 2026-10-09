@@ -26,6 +26,19 @@ P1-a commit: `de21ea8d6abac9cbb19f18df9d9743b6a9b696f4`.
 - [x] Normal completion, atomic records, retries, reply/schema handling, settlement and selected worker e2e remain unchanged.
 - [x] Final typecheck and fresh build pass.
 
+## Windows hard-stop correction (PR #720, smarty-dev#7403 / #7567)
+
+Baseline: `e3a4d12ce47923a794df8eccd9073527f1fd5caa`. Windows CI job `113793805457` exposed the manager's synthesized stopped result discarding an already persisted final-text checkpoint.
+
+- [x] `failedRecord` reads the latest atomically published record and carries `text`, `partialText`, and `lastCompleteText`, without depending on the worker's signal/exit handlers. Status and error remain host-authoritative; structured values/reply attribution are not copied.
+- [x] Manager status reads use the existing bounded `readFileRetrying` helper. Host publication already uses `writeJsonAtomic`/`renameAtomic`; the plain-Node worker keeps its self-contained bounded rename helper. Injected EPERM/EBUSY replacements preserve the preceding complete JSON until publication; exhausted/nontransient failures remain bounded.
+- [x] Two real SIGKILL regressions fail before the correction with empty stopped/timed_out text, then pass for both source and built workers. Captured native handles report SIGKILL closure; transport teardown still joins the execution tree. No Windows test is skipped.
+- [x] Final source and built interruption suites each pass all 43 tests. Record/Windows-I/O checks pass 31 tests; built interruption/exit/reply/settlement/crash checks pass 75 tests across five suites; manager/close/retention checks pass 173 across three suites; four selected built-worker cancellation/crash e2e checks pass.
+- [x] Direct offline Node probes exercise the freshly built manager and worker with both SIGKILL and EPERM/EBUSY read/replace faults. Repeated wait/status and persisted records agree on retained text and authoritative stopped/timed_out status, with one launch and no structured-result promotion.
+- [x] Whole-program typecheck and full fresh build pass. Intel1's missing compiler is supplied only through the supported CC override using public GCC packages unpacked under task TMPDIR, without installing host packages or bypassing build checks.
+
+Native Windows CI was not rerun from this bounded local task; that remains the caller's verification step. Full head, delta, one proposed PR comment, logs, direct JSON probes and SHA-256 verification are retained under `$TASK_OUT`.
+
 ## Evidence
 
 - P1-a: 39 source interruption tests and typecheck passed before its separate fleet-identity commit. A final no-current-prose case also covers stale preceding text.

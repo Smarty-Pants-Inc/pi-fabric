@@ -312,6 +312,8 @@ export class FabricState {
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] { return this.#current()?.peerInfos(options) ?? []; }
+  /** Existing current runtime only; asking for a hint must never activate anything. */
+  get rootInboxKnownWakeDueAt(): number | undefined { return this.#current()?.rootInboxKnownWakeDueAt; }
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle);
   }

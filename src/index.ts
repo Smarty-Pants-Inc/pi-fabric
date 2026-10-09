@@ -213,8 +213,8 @@ const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined):
   if (inbox?.skippedStale) sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
 };
 
-// Mesh notifications wake idle Main. A >=60 s safety reconcile also matures shadows after
-// steer grace/cooldown with no further append. Tests may explicitly override the cadence.
+// Mesh notifications wake idle Main; a trusted read may arm one known-work grace/cooldown
+// deadline. Unknown idle work has only >=60 s safety reconciliation (explicit test override).
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
 // Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
@@ -650,6 +650,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
     const observer = inboxWake.observer;
+    observer?.cancelKnownDeadline();
     if (!context || !inboxWake.armed || !state.initialized || !hostQueuesTriggeredBehindPreflight(pi)) return;
     if (inboxWake.reading) { inboxWake.requested = true; return; }
     try {
@@ -663,6 +664,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // then is deferred past every agent_settled handler, where neither the transcript nor
     // hasPendingMessages() shows it, and an earlier handler may still precede Fabric's disarm.
     const idle = () => inboxWake.context === context && inboxWake.observer === observer &&
+      state.initialized && state.config.mesh.enabled && state.mainAgentInfo(context).local &&
       hostQueuesTriggeredBehindPreflight(pi) && inboxWake.armed && !inboxWake.settling &&
       context.isIdle() && !hostSettling(context) && !promptPending(context) && !context.hasPendingMessages();
     inboxWake.reading = true;
@@ -679,7 +681,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Records: the same gate, re-checked after the read (F21).
       if (!idle()) return;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
-      if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
+      if (!idle()) return;
+      if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
+      else if (idle()) observer?.armKnownDeadline(state.rootInboxKnownWakeDueAt);
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {

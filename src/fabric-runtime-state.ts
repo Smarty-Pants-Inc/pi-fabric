@@ -360,12 +360,15 @@ export class FabricRuntimeState {
    * The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox.
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
+  get rootInboxKnownWakeDueAt(): number | undefined { return this.#rootInbox?.knownWakeDueAt; }
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+    if (idle && !idle()) return undefined;
     let batch: RootInboxBatch | undefined;
     await this.#inboxRetry.run(async () => {
+      if (idle && !idle()) return;
       batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
     });
-    return batch;
+    return idle && !idle() ? undefined : batch;
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */

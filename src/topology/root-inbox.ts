@@ -129,6 +129,7 @@ export class RootInboxEventWake {
   #watcher: fs.FSWatcher | undefined;
   #rootIdentity: string | undefined;
   #timer: ReturnType<typeof setInterval> | undefined;
+  #deadline: ReturnType<typeof setTimeout> | undefined;
   #running: Promise<void> | undefined;
   #requested = false;
   #closed = false;
@@ -147,7 +148,25 @@ export class RootInboxEventWake {
     void this.request();
   }
 
+  /** Only a completed trusted wake supplies this observation hint; it never admits work. */
+  armKnownDeadline(dueAt: number | undefined): void {
+    this.cancelKnownDeadline();
+    const delay = dueAt === undefined ? 0 : dueAt - Date.now();
+    if (this.#closed || !Number.isFinite(delay) || delay <= 0) return;
+    this.#deadline = setTimeout(() => {
+      this.#deadline = undefined;
+      void this.request();
+    }, Math.min(delay, 2_147_483_647));
+    this.#deadline.unref();
+  }
+
+  cancelKnownDeadline(): void {
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+  }
+
   request(): Promise<void> {
+    this.cancelKnownDeadline();
     if (this.#closed) return Promise.resolve();
     this.#requested = true;
     if (this.#running) return this.#running;
@@ -168,6 +187,7 @@ export class RootInboxEventWake {
   close(): void {
     this.#closed = true;
     this.#requested = false;
+    this.cancelKnownDeadline();
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     this.#retireWatch();
@@ -212,8 +232,9 @@ export class RootInboxEventWake {
 
 export class RootInbox {
   #state: RootInboxState | undefined;
-  #wakeProbe: { stamp: string; names: string; dueAt: number } | undefined;
+  #wakeProbe: { stamp: string; names: string; dueAt: number; knownDueAt: number } | undefined;
   #scanDueAt = Number.POSITIVE_INFINITY;
+  #scanKnownDueAt = Number.POSITIVE_INFINITY;
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
@@ -229,6 +250,12 @@ export class RootInbox {
     readonly names: () => readonly string[],
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
   ) {}
+
+  /** Cached observation only: no stat/read, runtime activation, admission or receipt authority. */
+  get knownWakeDueAt(): number | undefined {
+    const dueAt = this.#wakeProbe?.knownDueAt;
+    return dueAt !== undefined && Number.isFinite(dueAt) ? dueAt : undefined;
+  }
 
   get key(): string {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
@@ -300,6 +327,7 @@ export class RootInbox {
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
   async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
+    if (!idle()) return undefined;
     const now = this.#now();
     const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
     const cooling = now < cooldownEnd;
@@ -308,15 +336,17 @@ export class RootInbox {
     const probe = this.#wakeProbe;
     if (stamp !== undefined && probe?.stamp === stamp && probe.names === names && now < probe.dueAt) return undefined;
     this.#scanDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownDueAt = Number.POSITIVE_INFINITY;
     const peek = this.#peek(session);
     const urgent = peek.some((event) => URGENT_KINDS.has(event.kind));
     const dueAt = Math.min(this.#scanDueAt, cooling ? cooldownEnd : Number.POSITIVE_INFINITY);
+    const knownDueAt = Math.min(this.#scanKnownDueAt, cooling && peek.length ? cooldownEnd : Number.POSITIVE_INFINITY);
     if (cooling && !urgent) {
-      this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt };
+      this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt };
       return undefined;
     }
     const batch = await this.next(session);
-    if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt };
+    if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt };
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
@@ -360,9 +390,20 @@ export class RootInbox {
     const result = (): RootInboxBatch => ({ events, through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
-      for (const event of page) {
+      for (let index = 0; index < page.length; index++) {
+        const event = page[index]!;
         if (event.createdAt > cutoff) {
-          this.#scanDueAt = Math.min(this.#scanDueAt, event.createdAt + (this.options.steerGraceMs ?? STEER_GRACE_MS));
+          const dueAt = event.createdAt + (this.options.steerGraceMs ?? STEER_GRACE_MS);
+          this.#scanDueAt = Math.min(this.#scanDueAt, dueAt);
+          // Observation only: a foreign log head also blocks older own work behind it.
+          // Look no farther than this validated fetched page; never admit an event,
+          // advance the cursor, or fetch another page past the young-head barrier.
+          if (page.some((pending, pendingIndex) => pendingIndex >= index &&
+              pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined && names.has(pending.to) &&
+              !this.#stale(pending) && !this.#steered(pending, session) &&
+              !eventReceipts(pending).some((id) => seen.has(id)))) {
+            this.#scanKnownDueAt = Math.min(this.#scanKnownDueAt, dueAt);
+          }
           return result();
         }
         if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {

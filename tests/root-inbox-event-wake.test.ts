@@ -175,12 +175,12 @@ describe("root mesh event wake observation", () => {
 
 // This uses src/index.ts, not the parent's baseline dist: it exercises the actual changed
 // activation wiring and native gate while leaving build ownership with the integrator.
-const startSession = async (capable = true, tokensPerSecond = 1_000) => {
+const startSession = async (capable = true, tokensPerSecond = 1_000, safetyMs = 100) => {
   const cwd = root(), agentDir = path.join(cwd, "agent"), meshRoot = path.join(cwd, "mesh");
   fs.mkdirSync(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_FABRIC_MESH_ROOT = meshRoot;
-  process.env.PI_FABRIC_INBOX_WAKE_MS = "100";
+  process.env.PI_FABRIC_INBOX_WAKE_MS = String(safetyMs);
   process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
   if (capable) (globalThis as Record<symbol, unknown>)[capabilities] = {
     triggeredMessageQueuesBehindPreflight: true, promptPendingVisible: true,
@@ -199,18 +199,27 @@ const startSession = async (capable = true, tokensPerSecond = 1_000) => {
   await session.prompt("activate");
   const inbox = () => session.messages.filter(message => message.role === "custom" &&
     (message as { customType?: string }).customType === "pi-fabric-inbox");
-  const publish = (text: string) => {
+  const publish = (text: string, ageMs = 120_000) => {
     const log = path.join(meshRoot, "events.jsonl");
     const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
     const sequence = (lines.length ? JSON.parse(lines.at(-1)!).sequence : 0) + 1;
     fs.appendFileSync(log, JSON.stringify({ id: randomUUID(), sequence, topic: "fleet.work.test.1", kind: "ack", from: peer,
-      to: `session:${session.sessionManager.getSessionId()}`, text, createdAt: Date.now() - 120_000 }) + "\n");
+      to: `session:${session.sessionManager.getSessionId()}`, text, createdAt: Date.now() - ageMs }) + "\n");
     fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
   };
   return { session, faux, inbox, publish };
 };
 
 describe("changed source activation and Main gate", () => {
+  it("uses the current runtime's actual grace hint before any 60-second safety tick", async () => {
+    const h = await startSession(true, 1_000, 60_000);
+    h.faux.setResponses([fauxAssistantMessage("deadline received")]);
+    h.publish("near grace maturity", 59_500);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(h.inbox()).toHaveLength(0);
+    await vi.waitFor(() => { expect(h.inbox()).toHaveLength(1); expect(h.session.isStreaming).toBe(false); }, { timeout: 3_000 });
+  }, 60_000);
+
   it("wakes after external publication, then stops the active watcher on shutdown", async () => {
     const h = await startSession();
     h.faux.setResponses([fauxAssistantMessage("woken")]);
@@ -274,6 +283,176 @@ const fixture = (grace = 60_000, cooldown = 300_000) => {
   const work = (text: string, kind = "ack") => mesh.publish({ topic: "fleet.work.test.1", to: me.id, from: peer, text, kind });
   return { mesh, box, work, advance: (ms: number) => { offset += ms; } };
 };
+
+describe("root inbox known-work one-shot deadlines", () => {
+  const observe = (mesh: MeshStore, box: RootInbox, allowed = () => true) => {
+    const delivered: string[] = [];
+    let observer!: RootInboxEventWake;
+    const wake = vi.fn(async () => {
+      observer.cancelKnownDeadline();
+      if (!allowed()) return;
+      const batch = await box.wake(held, allowed);
+      if (!allowed()) return;
+      delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
+      observer.armKnownDeadline(box.knownWakeDueAt);
+    });
+    observer = new RootInboxEventWake(mesh.root, wake);
+    observers.push(observer); observer.start();
+    return { observer, wake, delivered };
+  };
+
+  it("matures actual event grace between safety ticks without another append or safety tick", async () => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box, work } = fixture();
+    const h = observe(mesh, box);
+    await h.observer.request();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await work("young"); await h.observer.request();
+    expect(box.knownWakeDueAt).toBe(Date.now() + 60_000);
+    const read = vi.spyOn(mesh, "read");
+    await vi.advanceTimersByTimeAsync(45_000); // Safety tick sees the same young event.
+    expect(read).not.toHaveBeenCalled();
+    expect(h.delivered).toEqual([]);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(h.delivered).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.delivered).toEqual(["young"]);
+  });
+
+  it("matures actual cooldown before the next safety tick without further publication", async () => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box, work } = fixture(0, 75_000);
+    const h = observe(mesh, box);
+    await h.observer.request();
+    await work("first"); await h.observer.request(); await box.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await work("cooling"); await h.observer.request();
+    const dueAt = box.knownWakeDueAt;
+    expect(dueAt).toBe(Date.now() + 74_000);
+    await vi.advanceTimersByTimeAsync(73_999);
+    expect(h.delivered).toEqual(["first"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.delivered).toEqual(["first", "cooling"]);
+  });
+
+  it("keeps unchanged empty and foreign work on safety cadence only", async () => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box } = fixture();
+    const h = observe(mesh, box); await h.observer.request();
+    expect(box.knownWakeDueAt).toBeUndefined(); expect(vi.getTimerCount()).toBe(1);
+    await mesh.publish({ topic: "fleet.work.test.1", to: peer.id, from: peer, text: "foreign" });
+    await h.observer.request();
+    expect(box.knownWakeDueAt).toBeUndefined(); expect(vi.getTimerCount()).toBe(1);
+    const read = vi.spyOn(mesh, "read");
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(read).not.toHaveBeenCalled(); expect(h.delivered).toEqual([]);
+  });
+
+  it.each(["busy", "preflight", "closed"])("does not rearm or spin an expired hint while %s", async (gate) => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box, work } = fixture(10_000);
+    let idle = true;
+    const h = observe(mesh, box, () => idle); await h.observer.request();
+    await work("waiting"); await h.observer.request();
+    expect(vi.getTimerCount()).toBe(2);
+    idle = false;
+    if (gate === "closed") h.observer.close();
+    await vi.advanceTimersByTimeAsync(10_000);
+    const calls = h.wake.mock.calls.length;
+    h.observer.armKnownDeadline(box.knownWakeDueAt); // Expired hints never rearm.
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.wake).toHaveBeenCalledTimes(calls); expect(h.delivered).toEqual([]);
+    expect(vi.getTimerCount()).toBe(gate === "closed" ? 0 : 1);
+    expect((await box.next(held)).events.map(event => event.text)).toEqual(["waiting"]);
+  });
+
+  it("rechecks the gate after await before delivery or arming", async () => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh, box, work } = fixture(10_000);
+    let idle = true;
+    const h = observe(mesh, box, () => idle); await h.observer.request();
+    await work("waiting");
+    const original = box.wake.bind(box);
+    vi.spyOn(box, "wake").mockImplementation(async (...args) => {
+      const batch = await original(...args); idle = false; return batch;
+    });
+    await h.observer.request();
+    expect(box.knownWakeDueAt).toBeDefined(); expect(vi.getTimerCount()).toBe(1);
+    expect(h.delivered).toEqual([]);
+  });
+});
+
+describe("root inbox foreign-head grace deadlines", () => {
+  const setup = async (backlog: "own" | "foreign" | "stale" | "receipted" | "reserved-name" | "nonwork", pageSize = 500, kind = "ack") => {
+    vi.useFakeTimers(); mockWatch();
+    const { mesh } = fixture();
+    const session = { holdsBatch: () => true, holdsSteer: (_from: string, key: string) => key === "received" };
+    const box = new RootInbox(mesh, me, () => [me.id, peer.id], { pageSize });
+    boxes.push(box); box.start();
+    const delivered: string[] = [];
+    let observer!: RootInboxEventWake;
+    const wake = vi.fn(async () => {
+      const batch = await box.wake(session, () => true);
+      delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
+      observer.armKnownDeadline(box.knownWakeDueAt);
+    });
+    observer = new RootInboxEventWake(mesh.root, wake);
+    observers.push(observer); observer.start(); await observer.request();
+    await vi.advanceTimersByTimeAsync(15_000);
+    const headAt = Date.now();
+    // One validated fetched page, sequence order deliberately unlike timestamp order.
+    const rows = [
+      { id: randomUUID(), sequence: 1, topic: "fleet.work.test.1", kind: "ack", from: peer,
+        to: "session:other", text: "foreign head", createdAt: headAt },
+      { id: randomUUID(), sequence: 2, topic: backlog === "nonwork" ? "fabric.other" : "fleet.work.test.1",
+        kind, from: peer, to: backlog === "foreign" ? "session:other" : backlog === "reserved-name" ? peer.id : me.id,
+        text: "older backlog", createdAt: headAt - (backlog === "stale" ? 3 * 60 * 60_000 : 120_000),
+        ...(backlog === "receipted" ? { data: { key: "received" } } : {}) },
+    ];
+    fs.appendFileSync(path.join(mesh.root, "events.jsonl"), rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    fs.writeFileSync(path.join(mesh.root, "sequence"), "2");
+    const read = vi.spyOn(mesh, "read");
+    await observer.request();
+    return { mesh, box, observer, wake, delivered, read, dueAt: headAt + 60_000 };
+  };
+
+  it.each(["ack", "p0"])("wakes at exact foreign head maturity for older own %s backlog without admitting or skipping the head early", async (kind) => {
+    const h = await setup("own", 500, kind);
+    expect(h.box.knownWakeDueAt).toBe(h.dueAt);
+    expect(h.delivered).toEqual([]);
+    expect(h.mesh.get(h.box.key)?.value).toMatchObject({ after: 0 });
+    expect(h.mesh.get(h.box.key)?.value).not.toHaveProperty("pending");
+    expect(h.read).toHaveBeenCalledTimes(2); // Peek and trusted empty drain, no extra page.
+    const readdir = vi.spyOn(fs, "readdirSync");
+    const readFile = vi.spyOn(fs, "readFileSync");
+    await vi.advanceTimersByTimeAsync(59_999); // Includes safety tick at t=60s.
+    expect(h.delivered).toEqual([]);
+    expect(h.read).toHaveBeenCalledTimes(2);
+    expect(readdir).not.toHaveBeenCalled(); expect(readFile).not.toHaveBeenCalled();
+    expect(h.wake).toHaveBeenCalledTimes(3); // Start, notification, safety.
+    await vi.advanceTimersByTimeAsync(1); // t=75s, not next safety at t=120s.
+    expect(h.wake).toHaveBeenCalledTimes(4);
+    expect(h.delivered).toEqual(["older backlog"]);
+    expect(h.mesh.get(h.box.key)?.value).toMatchObject({ after: 0, pending: { through: 2 } });
+  });
+
+  it.each(["foreign", "stale", "receipted", "reserved-name", "nonwork"] as const)("has no short timer for %s backlog behind a foreign head", async (backlog) => {
+    const h = await setup(backlog);
+    expect(h.box.knownWakeDueAt).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.delivered).toEqual([]);
+    expect(h.wake).toHaveBeenCalledTimes(3); // No head-maturity wake.
+  });
+
+  it("does not fetch another page to discover own backlog behind a foreign head", async () => {
+    const h = await setup("own", 1);
+    expect(h.box.knownWakeDueAt).toBeUndefined();
+    expect(h.read).toHaveBeenCalledTimes(2);
+    expect(h.read.mock.calls.every(([input]) => input?.after === 0 && input.limit === 1)).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+  });
+});
 
 describe("root inbox unchanged-log deadline reconciliation", () => {
   it("does not rescan a young shadow on unchanged ticks, but matures it with no new append", async () => {

@@ -17,9 +17,6 @@ import {
   runTreeResourceVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
-  pruneActorSessionBackups,
-  claimMeshRetentionSweep,
-  removeUnreferencedRun,
   compactTerminalRunEvents,
   RUN_ROOT_SWEEP_MARKER,
   sweepTempRunRoots,
@@ -893,27 +890,5 @@ describe("temporal retention", () => {
     expect(fs.existsSync(expired)).toBe(false);
     expect(fs.existsSync(latest)).toBe(true);
     expect(fs.existsSync(fresh)).toBe(true);
-  });
-});
-
-describe("owner proof (smarty-dev#7766, Windows cut to smarty-dev#7858)", () => {
-  it("deletes nothing when process.getuid is absent, including the actor manager's ungated session-backup prune", () => {
-    const directory = temporaryDirectory();
-    const session = path.join(directory, "session.jsonl");
-    fs.writeFileSync(session, "live");
-    const backups = ["20260927T150000000Z", "20260928T150000000Z", "20260929T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
-    for (const backup of backups) fs.writeFileSync(backup, "x");
-    const run = path.join(directory, "run");
-    fs.mkdirSync(run);
-    const getuid = process.getuid;
-    Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
-    try {
-      // Exactly as ActorManager calls it (src/actors/manager.ts): no options, no gate.
-      expect(pruneActorSessionBackups(session)).toEqual([]);
-      expect(removeUnreferencedRun(run)).toBe(false);
-      expect(claimMeshRetentionSweep(directory, 60_000)).toBe(false);
-    } finally { Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }); }
-    for (const file of [session, ...backups, run]) expect(fs.existsSync(file), file).toBe(true);
-    if (typeof getuid === "function") expect(pruneActorSessionBackups(session)).toEqual(backups.slice(0, -1));
   });
 });

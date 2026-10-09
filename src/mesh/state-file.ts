@@ -66,7 +66,7 @@ const commitTraceCaller = (): string[] | undefined => process.env.PI_FABRIC_COMM
   ? new Error().stack?.split("\n").slice(3, 11).map(line => line.trim()) : undefined;
 
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
-export const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 // ponytail: every tombstone is rewritten with the whole shared state on every write, and read
 // by every process (smarty-dev#251, dev1 load P0: 4,787 tombstones were 40% of a 2.3 MB file).
 // The persistent revision clock makes eviction safe: an evicted key is recreated above every
@@ -91,7 +91,7 @@ export const jsonClone = <T>(value: T): T => {
   return JSON.parse(serialized) as T;
 };
 
-export const isMeshStateFile = (value: unknown): value is MeshStateFile => {
+const isMeshStateFile = (value: unknown): value is MeshStateFile => {
   if (
     typeof value !== "object" ||
     value === null ||

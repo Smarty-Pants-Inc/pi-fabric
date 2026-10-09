@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { ownedStat, ownershipProvable, processAlive } from "./scratch.js";
+import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
@@ -323,7 +323,7 @@ export const canRemoveManagedRunRoot = (root: string): boolean => {
 };
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
-    if (!ownershipProvable() || !ownedStat(root)?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
+    if (!ownedStat(root)?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
     if (fs.readdirSync(root).some((name) => name !== RUN_ROOT_OWNER_FILE)) return false;
     fs.rmSync(root, { recursive: true, force: true });
     return true;
@@ -334,7 +334,6 @@ const pruneClosedRunRoot = (
   eventsRetention: TerminalRunEventsRetention,
 ): string[] => {
   const removed: string[] = [];
-  if (!ownershipProvable()) return removed;
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
   if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000)) return removed;
   let entries: fs.Dirent[];
@@ -366,7 +365,7 @@ export const MESH_RETENTION_SWEEP_PREFIX = ".mesh-retention-sweep-";
  * same interval. Older slot files are dropped once a newer slot is claimed.
  */
 export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, now = Date.now()): boolean => {
-  if (!ownershipProvable() || !Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
   const slot = Math.floor(now / intervalMs);
   const name = `${MESH_RETENTION_SWEEP_PREFIX}${slot}.json`;
   try {
@@ -420,7 +419,6 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     options.budgetMs !== undefined && performance.now() - startedAt >= options.budgetMs;
   const now = options.now ?? Date.now();
   const result: RetentionSweepResult = { removedRoots: [], removedRuns: [] };
-  if (!ownershipProvable()) return result;
   if (options.minIntervalMs !== undefined && !claimTempRunSweep(options.tempRoot, options.minIntervalMs, now)) return result;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.tempRoot, { withFileTypes: true }); } catch { return result; }
@@ -551,7 +549,7 @@ export const compactTerminalRunEvents = (
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
   const expired = options.expired ?? noDeadline;
   const directoryStat = ownedStat(directory);
-  if (!ownershipProvable() || !Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
+  if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
       maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
@@ -642,7 +640,7 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
   stop?: () => boolean;
 } = {}): string[] => {
   const directory = path.dirname(sessionFile);
-  if (!ownershipProvable() || !ownedStat(directory)?.isDirectory()) return [];
+  if (!ownedStat(directory)?.isDirectory()) return [];
   const prefix = `${path.basename(sessionFile)}.`;
   try {
     const backups = fs.readdirSync(directory).flatMap(name => {
@@ -689,7 +687,7 @@ export const pruneActorRunArchives = (options: {
 }): string[] => {
   const now = options.now ?? Date.now();
   const removed: string[] = [];
-  if (!ownershipProvable() || !ownedStat(options.runsDirectory)?.isDirectory()) return removed;
+  if (!ownedStat(options.runsDirectory)?.isDirectory()) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -728,7 +726,7 @@ export const pruneActorRunArchives = (options: {
  * next sweep treats it as an ordinary run entry. */
 export const removeUnreferencedRun = (directory: string, referenced?: () => boolean, dryRun = false): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
-  if (!ownershipProvable() || check()) return false;
+  if (check()) return false;
   if (dryRun) return true;
   if (!referenced) {
     try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }

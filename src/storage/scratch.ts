@@ -31,11 +31,6 @@ export const processAlive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 };
-/** Whether this process can prove who owns a file: it needs a uid to compare. Every retention deletion asks this
- * first and deletes nothing when it is false (smarty-dev#7766).
- * ponytail: without process.getuid (Windows) nothing is provable, so retention there deletes nothing at all;
- * owner proof through Windows ACLs is cut to smarty-dev#7858. */
-export const ownershipProvable = (): boolean => typeof process.getuid === "function";
 export const ownedStat = (file: string): fs.Stats | undefined => {
   try {
     const stat = fs.lstatSync(file);

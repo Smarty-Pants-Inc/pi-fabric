@@ -6,6 +6,7 @@ import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention, write
 import { pruneActorSessionBackups } from "../src/storage/retention.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { spawnSync } from "node:child_process";
+import { meshRetentionSweepArgs } from "../src/actors/manager.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -220,33 +221,23 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
   });
 
-  it("reads state.json itself: a link, malformed JSON, an unknown shape or a writable file refuses --apply; a legacy file state is unswitched (smarty-dev#7766)", async () => {
-    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
-    const marker = JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" });
-    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-state-")); roots.push(elsewhere);
-    write(path.join(elsewhere, "marker.json"), marker);
-    const cases: Array<[string, (file: string) => void, RegExp]> = [
-      ["symlink to a valid marker", file => fs.symlinkSync(path.join(elsewhere, "marker.json"), file), /symbolic link/],
-      ["malformed JSON", file => write(file, "{\"format\":1,"), /malformed JSON/],
-      ["foreign-shaped object", file => write(file, JSON.stringify({ format: "other", entries: [] })), /neither a file-backend state nor a moved marker/],
-      ["mode 0666 file", file => { write(file, JSON.stringify({ format: 1, entries: {} })); fs.chmodSync(file, 0o666); }, /group- or world-writable/],
-    ];
-    for (const [name, place, reason] of cases) {
-      const { root } = make();
-      place(path.join(root, "state.json"));
-      const before = snapshot(root);
-      const result = await sweepMeshRetention(root, options);
-      expect(result.changes, name).toEqual([]);
-      expect(result.skipped, name).toEqual([{ path: root, reason: expect.stringMatching(reason) }]);
-      expect(snapshot(root), name).toEqual(before);
+  it("--apply is disabled: the CLI exits 2 before touching the mesh, and the hourly ActorManager sweep is a dry run (smarty-dev#7916)", () => {
+    const { root } = make();
+    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
+    const before = snapshot(root);
+    const cli = path.resolve("src/storage/retention-cli.ts");
+    const runner = `const { createJiti } = require("jiti"); const { pathToFileURL } = require("node:url");
+process.argv = [process.argv[0], ${JSON.stringify(cli)}, ...process.argv.slice(1)];
+createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.stringify(cli)}).catch(error => { console.error(error); process.exitCode = 1; });`;
+    for (const args of [[root, "--apply"], [root, "--apply", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, "report.json")]]) {
+      const result = spawnSync(process.execPath, ["-e", runner, ...args], { encoding: "utf8", timeout: 60_000 });
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain("retention --apply is disabled until smarty-dev#7916 (verified-inode deletion); run --dry-run");
+      expect(snapshot(root)).toEqual(before);
     }
-    // A valid legacy file-backend state is an unswitched mesh: --apply proceeds as before.
-    const { root: legacy } = make();
-    write(path.join(legacy, "state.json"), JSON.stringify({ readGeneration: "00000000-0000-4000-8000-000000000000", backendEpoch: 1, format: 2, entries: {} }));
-    fs.chmodSync(path.join(legacy, "state.json"), 0o600);
-    const applied = await sweepMeshRetention(legacy, options);
-    expect(applied.skipped).toEqual([]);
-    expect(applied.changes.length).toBeGreaterThan(0);
+    const argv = meshRetentionSweepArgs(root, 7 * 86400000);
+    expect(argv).toEqual([root, "--dry-run", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, ".mesh-retention-report.json")]);
+    expect(argv).not.toContain("--apply");
   });
 
   it("refuses ambiguous identities and linked actor-reference trees without changing them", async () => {

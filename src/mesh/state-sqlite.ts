@@ -374,7 +374,7 @@ export interface SqliteStateStoreOptions {
    * checkpoint, so the WAL only grows. Once a commit leaves the WAL above this size, this store's later
    * write transactions refuse before BEGIN with `MeshStateWalCapError` (reads keep working). Each refused
    * write first tries ONE non-blocking TRUNCATE, so writes recover by themselves once the reader lets go.
-   * Default 256 MiB; 0 disables.
+   * Default 96 MiB; 0 disables.
    */
   walHardCapBytes?: number;
   /** `journal_size_limit`. Default 16 MiB. */
@@ -476,7 +476,9 @@ const WAL_RESET_LOCK_STALE_MS = 2_000;
 // A busy reset: this process's next attempt waits for a commit at least this much later.
 const WAL_RESET_BACKOFF_MS = 2_000;
 const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
-const DEFAULT_WAL_HARD_CAP_BYTES = 256 * 1024 * 1024;
+// ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
+// within minutes (~6-7 min at 2.5 commits/s); normal peaks are ~6-11 MiB (smarty-dev#6477).
+const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
 const PREFIX_END = "\u007f";
@@ -1671,10 +1673,13 @@ export const checkpointFlagRaised = (root: string): boolean => {
 };
 
 /**
- * pi-fabric#694 P2-D/P2-E: an existing state path (state.db, its -wal/-shm, the flag directory) is used only
- * when it is ours: lstat, so a symbolic link is never followed; the expected type; owned by this uid; no
- * group or other write. Anything else is refused (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes.
- * Windows has no uid or mode bits here, so only the type and symlink checks apply.
+ * pi-fabric#694 P2-D/P2-E (+ astra c6076385095): an existing state path (state.db, its -wal/-shm, the flag
+ * directory, the root) is used only when it is ours: lstat, so a symbolic link is never followed; the expected
+ * type; owned by this uid; no group or other write. A state FILE must also be owner-only (0600): mesh state holds
+ * credentials (smarty-dev#6787). An owned file with group/other bits is tightened in place, through an
+ * O_NOFOLLOW descriptor whose dev/ino must match the lstat, then re-checked. Anything else is refused
+ * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits here, so only the
+ * type and symlink checks apply.
  */
 export const assertPrivatePath = (file: string, kind: "directory" | "file"): void => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
@@ -1686,11 +1691,27 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): voi
     : kind === "file" && !stat.isFile() ? "is not a regular file"
     : uid !== undefined && stat.uid !== uid ? `is owned by uid ${stat.uid}, not this process's uid ${uid}`
     : posix && (stat.mode & 0o022) !== 0 ? `is group or other writable (mode ${(stat.mode & 0o777).toString(8)})`
+    : posix && kind === "file" && (stat.mode & 0o077) !== 0 && !tightenOwnerOnly(file, stat)
+      ? `is group or other readable (mode ${(stat.mode & 0o777).toString(8)}) and could not be made 0600`
     : undefined;
   if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
 };
 
+// chmod 0600 the very file that was checked: O_NOFOLLOW never follows a swapped-in link, and dev/ino must match.
+const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const opened = fs.fstatSync(fd);
+    if (opened.dev !== checked.dev || opened.ino !== checked.ino || !opened.isFile()) return false;
+    fs.fchmodSync(fd, 0o600);
+    return (fs.fstatSync(fd).mode & 0o077) === 0;
+  } catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
 const assertPrivateStateFiles = (file: string): void => {
+  assertPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
   for (const name of [file, `${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
 };
 

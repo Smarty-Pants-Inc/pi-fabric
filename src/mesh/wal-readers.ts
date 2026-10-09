@@ -60,11 +60,9 @@ const procDetails = (pid: number, uptimeSec: number | undefined): Pick<WalReader
         if (Number.isFinite(age) && age >= 0) out.ageMs = age;
       }
     }
-    const raw = readText(`/proc/${pid}/cmdline`);
-    if (raw !== undefined) {
-      const cmd = raw.split("\0").filter((part) => part.length > 0).join(" ");
-      if (cmd.length > 0) out.cmd = cmd.length > CMD_MAX ? `${cmd.slice(0, CMD_MAX - 3)}...` : cmd;
-    }
+    // comm only (the executable's short name), never cmdline: arguments may hold secrets (smarty-dev#6787).
+    const comm = readText(`/proc/${pid}/comm`)?.trim();
+    if (comm) out.cmd = comm.length > CMD_MAX ? comm.slice(0, CMD_MAX) : comm;
   } catch { /* report what we have */ }
   return out;
 };

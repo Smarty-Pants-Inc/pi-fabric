@@ -322,6 +322,37 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
     expect(await refused(root, true)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
   });
 
+  it("tightens an owned 0644/0640 state.db, -wal and -shm to 0600 before opening (astra c6076385095)", async () => {
+    const root = await prepared("db-readable");
+    const db = path.join(root, "state.db");
+    const held = await openStore(root); // keeps -wal and -shm present
+    for (const [name, mode] of [[db, 0o644], [db + "-wal", 0o640], [db + "-shm", 0o644]] as const) fs.chmodSync(name, mode);
+    const second = await openStore(root);
+    for (const name of [db, db + "-wal", db + "-shm"]) expect(fs.statSync(name).mode & 0o777).toBe(0o600);
+    second.close(); held.close();
+    fs.chmodSync(db, 0o640);
+    sqlite.push(SqliteStateStore.openSync(root, 256 * 1024, 1_000, { initialize: "create" }));
+    expect(fs.statSync(db).mode & 0o777).toBe(0o600);
+  });
+
+  it("creates a new state.db and its -wal/-shm owner-only", async () => {
+    const root = tempRoot("db-new-mode");
+    const store = await openStore(root);
+    await store.put({ key: "k", value: { v: 1 }, identity: { id: "t", name: "t" } } as never).catch(() => undefined);
+    for (const name of ["state.db", "state.db-wal", "state.db-shm"]) {
+      const st = fs.statSync(path.join(root, name), { throwIfNoEntry: false });
+      if (st) expect(st.mode & 0o077).toBe(0);
+    }
+    store.close();
+  });
+
+  it("refuses a root directory that others can write", async () => {
+    const root = await prepared("root-mode");
+    fs.chmodSync(root, 0o777);
+    try { expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/group or other writable/) }); }
+    finally { fs.chmodSync(root, 0o700); }
+  });
+
   it("refuses a symlinked state.db and a symlinked -wal, never following them", async () => {
     const root = await prepared("db-link");
     const target = path.join(tempRoot("db-target"), "state.db");

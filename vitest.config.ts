@@ -6,6 +6,9 @@ const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
 const fleet = isolateTestFleetEnvironment();
 
+// GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
+const ci = process.env.CI === "true";
+
 const sharedTests = {
   environment: "node",
   env: { ...temp, ...fleet },
@@ -18,13 +21,13 @@ const sharedTests = {
   // ponytail: CI-only retries for load-timing flakes on 2-core hosted runners (three runs of pi-fabric#694 each failed
   // one different timing test). Every retried test is listed by scripts/ci-retry-reporter.ts; smarty-dev#7651 fixes
   // them and removes this retry. Local runs never retry.
-  retry: process.env.CI ? 2 : 0,
+  retry: ci ? 2 : 0,
 } satisfies NonNullable<UserConfig["test"]>;
 
 export default {
   test: {
     ...sharedTests,
-    reporters: process.env.CI ? ["default", "./scripts/ci-retry-reporter.ts"] : ["default"],
+    reporters: ci ? ["default", "./scripts/ci-retry-reporter.ts"] : ["default"],
     maxWorkers: 2,
     // Expose GC only for retention tests: application worker_threads reject this flag.
     // Explicit shared options avoid extends merging the broad include into the GC project.

@@ -54,6 +54,12 @@ const runProperties = {
     maximum: 19,
     description: "Unix niceness for this child and its tools. Only raises agents.nice, never lowers it.",
   },
+  bashIdleSeconds: {
+    type: "integer",
+    minimum: 0,
+    maximum: MAX_ACTOR_BASH_TIMEOUT_S,
+    description: "Pi runs: kill a blocking bash call after this many seconds with no output (default 180), also when the call sets its own timeout; 0 = no idle limit.",
+  },
   timeoutMs: {
     type: "number",
     description:

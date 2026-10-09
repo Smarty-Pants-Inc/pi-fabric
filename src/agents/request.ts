@@ -1,6 +1,7 @@
 import type { AgentRunRequest } from "./types.js";
 import { isFabricThinking } from "../thinking.js";
 import { parseAgentNice } from "./priority.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
@@ -44,6 +45,11 @@ export const normalizeAgentRunRequest = (
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
+  const bashIdleSeconds = args.bashIdleSeconds;
+  if (bashIdleSeconds !== undefined && (typeof bashIdleSeconds !== "number" || !Number.isInteger(bashIdleSeconds) ||
+    bashIdleSeconds < 0 || bashIdleSeconds > MAX_ACTOR_BASH_TIMEOUT_S)) {
+    throw new Error(`bashIdleSeconds must be a non-negative integer at most ${MAX_ACTOR_BASH_TIMEOUT_S} (0 = no idle limit)`);
+  }
   if (args.recursive === true && args.extensions === false) {
     throw new Error("Recursive Fabric requires extensions enabled; omit recursive or extensions: false");
   }
@@ -66,6 +72,7 @@ export const normalizeAgentRunRequest = (
       : {}),
     ...(thinking ? { thinking } : {}),
     ...(nice !== undefined ? { nice } : {}),
+    ...(bashIdleSeconds !== undefined ? { bashIdleSeconds } : {}),
     ...(tools ? { tools } : {}),
     ...(args.needs !== undefined ? { needs: [...args.needs as string[]] } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),

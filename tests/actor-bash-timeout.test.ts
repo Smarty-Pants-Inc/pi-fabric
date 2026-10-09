@@ -7,7 +7,11 @@ import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { actorBashTimeout, DEFAULT_ACTOR_BASH_TIMEOUT_S, MAX_ACTOR_BASH_TIMEOUT_S } from "../src/guards/actor-bash-timeout.js";
+import {
+  actorBashTimeout, applyRunBashDefaults, BASH_IDLE_MARKER, bashIdleSeconds, DEFAULT_ACTOR_BASH_TIMEOUT_S, DEFAULT_BASH_IDLE_S,
+  MAX_ACTOR_BASH_TIMEOUT_S,
+} from "../src/guards/actor-bash-timeout.js";
+import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { parseBashTimeoutSeconds } from "../src/actors/manager.js";
 import { foregroundWaitRefusal } from "../src/guards/foreground-wait.js";
@@ -26,6 +30,50 @@ describe("actor bash timeout (smarty-dev#2184)", () => {
   it("leaves non-actor sessions and explicit timeouts alone", () => {
     expect(actorBashTimeout({}, undefined)).toBeUndefined();
     expect(actorBashTimeout(actor, 30)).toBeUndefined();
+  });
+
+  it("smarty-dev#6137: a worker-launched task run gets the cap and a 180 s idle limit; a Main gets neither", () => {
+    const task = { PI_FABRIC_BASH_IDLE_S: "180" };
+    expect(DEFAULT_BASH_IDLE_S).toBe(180);
+    expect(actorBashTimeout(task, undefined)).toBe(600);
+    expect(bashIdleSeconds(task)).toBe(180);
+    expect(bashIdleSeconds({ PI_FABRIC_BASH_IDLE_S: "45" })).toBe(45);
+    expect(bashIdleSeconds({ PI_FABRIC_BASH_IDLE_S: "0" })).toBeUndefined();
+    expect(bashIdleSeconds({ PI_FABRIC_BASH_IDLE_S: "junk" })).toBe(180);
+    expect(bashIdleSeconds(actor)).toBe(180);
+    const explicit = { command: "git log --all -S needle", timeout: 1000 };
+    applyRunBashDefaults(task, explicit);
+    expect(explicit.timeout).toBe(1000);
+    expect(explicit.command.startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    expect(bashIdleSeconds({})).toBeUndefined();
+    const main = { command: "sleep 300" };
+    applyRunBashDefaults({}, main);
+    expect(main).toEqual({ command: "sleep 300" });
+    for (const detached of [{ background: true }, { monitor: { delivery: "wake" } }]) {
+      const input = { command: "npm run dev", ...detached };
+      applyRunBashDefaults(task, input);
+      expect(input).toEqual({ command: "npm run dev", ...detached, timeout: 600 });
+    }
+    const windows = { command: "sleep 300" };
+    applyRunBashDefaults(task, windows, "win32");
+    expect(windows).toEqual({ command: "sleep 300", timeout: 600 });
+  });
+
+  it("smarty-dev#6137: the wrapped command trips no shell guard and spawn validates bashIdleSeconds", async () => {
+    const guards = await import("../src/core/pattern-kill.js");
+    const input = { command: "ls" };
+    applyRunBashDefaults({ PI_FABRIC_BASH_IDLE_S: "180" }, input);
+    expect(guards.killsByPattern(input.command)).toBe(false);
+    expect(guards.wipesTmp(input.command)).toBe(false);
+    expect(foregroundWaitRefusal(input.command, 600)).toBeUndefined();
+    const defaults = { runner: "pi" as const, timeoutMs: 60_000 };
+    expect(normalizeAgentRunRequest({ task: "t", bashIdleSeconds: 0 }, defaults).bashIdleSeconds).toBe(0);
+    expect(normalizeAgentRunRequest({ task: "t", bashIdleSeconds: 45 }, defaults).bashIdleSeconds).toBe(45);
+    for (const bad of [-1, 1.5, "60", 2_147_484]) {
+      expect(() => normalizeAgentRunRequest({ task: "t", bashIdleSeconds: bad }, defaults)).toThrow(/bashIdleSeconds/);
+    }
+    const spawn = AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === "spawn")!;
+    expect(spawn.inputSchema).toMatchObject({ properties: { bashIdleSeconds: { type: "integer", minimum: 0 } } });
   });
 
   it("takes the actor's override, and 0 turns the default off", () => {
@@ -178,9 +226,24 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
     expect((await bashCall({ command: "ls" })).input.timeout).toBeUndefined();
   });
 
-  it("leaves a non-actor session's bash call alone", async () => {
+  it("leaves a Main session's bash call alone (smarty-dev#6137: no cap, no idle watchdog)", async () => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
-    expect((await bashCall({ command: "ls" })).input.timeout).toBeUndefined();
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", undefined);
+    expect((await bashCall({ command: "ls" })).input).toEqual({ command: "ls" });
+  });
+
+  it("smarty-dev#6137: gives a task agent's bash call the cap and the idle watchdog after the guards", async () => {
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", undefined);
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
+    const { input } = await bashCall({ command: "git log --all -S needle" });
+    expect(input.timeout).toBe(600);
+    expect(String(input.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    expect(input.command).toContain("\ngit log --all -S needle\n");
+    expect((await bashCall({ command: "while true; do sleep 5; done" })).blocked).toBe(true);
+    const explicit = (await bashCall({ command: "ls", timeout: 5 })).input;
+    expect(explicit.timeout).toBe(5);
+    expect(String(explicit.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
   });
 });
 
@@ -215,10 +278,23 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
     expect((await hookCall({ command: "sleep 30" })).timeout).toBeUndefined();
     vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", undefined);
     expect((await hookCall({ command: "sleep 30" })).timeout).toBeUndefined();
   });
 
-  it("the real worker loads it into a native-tool actor run with --no-extensions, and only into actor runs", { timeout: 20_000 }, async () => {
+  it("smarty-dev#6137: wraps once, so the second hook leaves the first hook's call alone", async () => {
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
+    const once = { ...(await hookCall({ command: "sleep 30" })) };
+    expect(once.timeout).toBeUndefined();
+    expect(String(once.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    expect(await hookCall({ ...once })).toEqual(once);
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "0");
+    expect(await hookCall({ command: "sleep 30" })).toEqual({ command: "sleep 30" });
+  });
+
+  it("the real worker loads it into native-tool actor and task runs with --no-extensions (smarty-dev#6137)", { timeout: 20_000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-bash-hook-"));
     roots.push(root);
     const fakePi = path.join(root, "fake-pi.mjs");
@@ -226,7 +302,7 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
       "#!/usr/bin/env node",
       "import readline from 'node:readline';",
       "const send = (event) => process.stdout.write(JSON.stringify(event) + '\\n');",
-      "const text = JSON.stringify({ argv: process.argv.slice(2), timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S });",
+      "const text = JSON.stringify({ argv: process.argv.slice(2), timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S, idle: process.env.PI_FABRIC_BASH_IDLE_S });",
       "const message = { role: 'assistant', content: [{ type: 'text', text }], provider: 'fake', model: 'fake', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: 'stop' };",
       "let started = false;",
       "readline.createInterface({ input: process.stdin }).on('line', (line) => {",
@@ -241,13 +317,14 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
       workerPath: path.resolve("src/worker.ts"), piBinary: fakePi, runRoot: path.join(root, "runs"),
     });
     closers.push(() => agents.close());
-    const surface = async (actorId?: string) => {
+    const surface = async (actorId?: string, bashIdleSeconds?: number) => {
       const result = await agents.run({
         task: "report", transport: "process", runner: "pi", extensions: false, tools: ["bash"], timeoutMs: 10_000,
         ...(actorId ? { actorId, bashTimeoutSeconds: 2 } : {}),
+        ...(bashIdleSeconds !== undefined ? { bashIdleSeconds } : {}),
       });
       expect(result.status).toBe("completed");
-      return JSON.parse(result.text) as { argv: string[]; timeout?: string };
+      return JSON.parse(result.text) as { argv: string[]; timeout?: string; idle?: string };
     };
     const hook = path.resolve("src/guards/actor-bash-hook.ts");
     const actor = await surface("actor:native");
@@ -255,7 +332,13 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
     expect(actor.argv[actor.argv.indexOf(hook) - 1]).toBe("-e");
     expect(actor.argv[actor.argv.indexOf("--tools") + 1]).toBe("bash"); // tools are not widened
     expect(actor.timeout).toBe("2");
-    expect((await surface()).argv).not.toContain(hook);
+    expect(actor.idle).toBe(String(DEFAULT_BASH_IDLE_S));
+    const task = await surface();
+    expect(task.argv[task.argv.indexOf(hook) - 1]).toBe("-e");
+    expect(task).toMatchObject({ idle: "180" });
+    expect(task.timeout).toBeUndefined();
+    expect(await surface(undefined, 0)).toMatchObject({ idle: "0" });
+    expect(await surface(undefined, 45)).toMatchObject({ idle: "45" });
   });
 });
 

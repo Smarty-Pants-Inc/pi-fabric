@@ -5,7 +5,7 @@
 // written under the migration fence; the switch re-checks them under that fence right before each
 // flag commit. File format and the writer protocol: docs/mesh-backend.md.
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -282,6 +282,18 @@ export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}):
   catch (error) { return unavailable(`statfs ${root} failed (${errno(error)})`); }
   const helper = probe.helper ?? leaseHelperPath();
   try { fs.accessSync(helper, fs.constants.X_OK); } catch { return unavailable(`helper ${helper} is missing (bun run build)`); }
+  // Runtime integrity: the helper must be the twice-built binary the package's build manifest records
+  // (scripts/build-landlock.mjs). A missing manifest or another sha256 fails closed.
+  const manifestFile = path.join(path.dirname(helper), "manifest.json");
+  let expected: unknown;
+  try { expected = (JSON.parse(fs.readFileSync(manifestFile, "utf8")) as { helpers?: Record<string, unknown> }).helpers?.["fabric-mesh-lease"]; }
+  catch (error) { return unavailable(`helper integrity: build manifest ${manifestFile} unreadable (${errno(error)})`); }
+  let actual: string;
+  try { actual = createHash("sha256").update(fs.readFileSync(helper)).digest("hex"); }
+  catch (error) { return unavailable(`helper integrity: ${helper} unreadable (${errno(error)})`); }
+  if (typeof expected !== "string" || expected !== actual) {
+    return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the build manifest (${String(expected)})`);
+  }
   const result = spawnSync(helper, files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] });
   if (result.error || (result.status !== 0 && result.status !== 3)) {
     return unavailable(`helper failed (${result.error?.message ?? `exit ${String(result.status)}`}${result.stdout ? `: ${result.stdout.trim()}` : ""})`);

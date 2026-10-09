@@ -100,9 +100,20 @@ const required = [
   ...declarations,
   ...declarations.map((file) => `${file}.map`),
 ];
-if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease");
+if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease", "native/manifest.json");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
+if (process.platform === "linux") {
+  // The native helpers are the twice-built, byte-identical outputs recorded in the manifest (build-landlock.mjs).
+  const manifest = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
+  if (!/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? ""))) throw new Error(`Native manifest names no gcc or clang compiler: ${manifest.compiler}`);
+  for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
+    const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
+    if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {
+      throw new Error(`Native helper ${helper} sha256 ${actual} differs from the build manifest (${manifest.helpers?.[helper]})`);
+    }
+  }
+}
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
 const workerProtocol = JSON.parse(readFileSync(join(dist, "worker-protocol.json"), "utf8"));

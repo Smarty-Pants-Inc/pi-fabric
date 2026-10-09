@@ -251,9 +251,14 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   const outerOpen = library.beforeOpen;
   library.beforeOpen = async () => {
     await outerOpen?.();
-    // ponytail: residual (smarty-dev#7936): a holder that opens state.db AFTER this probe and before the
-    // commit, under the fence, is seen only by the fd scan and /proc/locks (not if it is non-dumpable and lock-free).
+    // ponytail: accepted gap smarty-dev#8116 (from smarty-dev#7936): the window runs from THIS probe to each commit,
+    // under the fence. A holder that opens state.db, -wal or -shm in that window is seen only by the fd scan and
+    // /proc/locks before the commit, so a non-dumpable, lock-free one is missed. No re-probe after our own
+    // open (our fd makes the probe refuse), and the lease cannot be held through the commit: our own open
+    // conflicts with it (EAGAIN, or a 45 s lease break).
     fencedLeases = probeStateDbLeases(options.root, leaseProbe);
+    warn("fabric-mesh-backend: accepted gap smarty-dev#8116: a lock-free holder whose /proc/<pid>/fd is unreadable and that opens state.db "
+      + "between the lease probe and the commit (under the fence) is not detected\n");
     underFence = true;
   };
   const outer = library.beforeCommit;

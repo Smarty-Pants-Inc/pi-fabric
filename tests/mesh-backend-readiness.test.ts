@@ -371,9 +371,12 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
 
   // smarty-dev#7936: the write-lease probe. Real holders are python3 children (os.open, prctl, mmap);
   // the fd scan is narrowed to no pid so that only the lease probe can see them.
-  const leaseSkip = process.platform !== "linux" ? "not Linux"
+  // On Linux CI (ubuntu-latest builds first) these never skip: a missing python3 or helper fails them there.
+  const leaseSkip = process.platform !== "linux" ? "not Linux" : process.env.CI ? ""
     : spawnSync("python3", ["-c", "pass"]).status !== 0 ? "python3 missing"
       : !fs.existsSync(leaseHelperPath()) ? `lease helper ${leaseHelperPath()} missing (bun run build)` : "";
+  const BIN = path.resolve("bin/fabric-mesh-backend");
+  const binSkip = leaseSkip || (process.env.CI || fs.existsSync(path.resolve("dist/mesh/mesh-backend-cli.js")) ? "" : "dist/ not built (bun run build)");
   /** A python3 child that holds `file` open (no lock), says "ready" on stdout and waits on stdin. */
   const pythonHolder = async (file: string, mode: "fd" | "nondumpable" | "mmap"): Promise<{ child: ChildProcess; release: () => Promise<void> }> => {
     const code = `
@@ -427,6 +430,53 @@ sys.stdin.readline()`;
     expect(await backendOf(root)).toBe("sqlite");
   });
 
+  it.skipIf(leaseSkip !== "")(`runs the REAL helper: free on an unheld file (exit 0), held while another process has it open (exit 3)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const file = path.join(tempDir("lease"), "state.db");
+    fs.writeFileSync(file, "x", { mode: 0o600 });
+    const free = spawnSync(leaseHelperPath(), [file], { encoding: "utf8", timeout: 10_000 });
+    expect({ status: free.status, stdout: free.stdout }).toEqual({ status: 0, stdout: `free ${file}\n` });
+    const holder = await pythonHolder(file, "fd");
+    try {
+      const held = spawnSync(leaseHelperPath(), [file], { encoding: "utf8", timeout: 10_000 });
+      expect({ status: held.status, stdout: held.stdout }).toEqual({ status: 3, stdout: `held ${file}\n` });
+    } finally { await holder.release(); }
+  });
+
+  it.skipIf(binSkip !== "")(`end to end through the operator's bin: a lock-free holder refuses, without it the switch is ready${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    // The operator's entry point (package bin -> dist), as a child; the real census, fd scan, /proc/locks and lease probe.
+    const cli = (...argv: string[]) => spawnSync(process.execPath, [BIN, ...argv], { encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      const refused = cli("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown");
+      expect(refused.status).toBe(3);
+      expect(refused.stderr).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db`);
+    } finally { await holder.release(); }
+    const ready = cli("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown");
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
+  });
+
+  it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper or a missing manifest${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const copy = tempDir("helper");
+    const helper = path.join(copy, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    fs.copyFileSync(path.join(path.dirname(leaseHelperPath()), "manifest.json"), path.join(copy, "manifest.json"));
+    expect(probeStateDbLeases(root, { helper })).toEqual([]); // the untouched copy matches
+    fs.appendFileSync(helper, "\0");
+    const tampered = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper } });
+    expect(tampered.code).toBe(3);
+    expect(tampered.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper integrity: ${helper} sha256 `);
+    expect(tampered.err).toContain("does not match the build manifest");
+    fs.rmSync(path.join(copy, "manifest.json"));
+    expect(probeStateDbLeases(root, { helper })[0]!.reason).toContain(`helper integrity: build manifest ${path.join(copy, "manifest.json")} unreadable (ENOENT)`);
+  });
+
+  // ponytail: the remaining fail-closed branches (not Linux, leases-enable=0, a missing helper) cannot run end to
+  // end on a Linux CI host with leases enabled and the helper built, so they are injected here.
   it.skipIf(process.platform !== "linux")("fails closed when the lease probe cannot run: a missing helper, leases disabled, not Linux", async () => {
     const root = await crashedImport();
     const missing = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });

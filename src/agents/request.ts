@@ -11,7 +11,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
-  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
+  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; configuredThinking?: AgentRunRequest["thinking"]; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
   if (args.model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
@@ -29,13 +29,15 @@ export const normalizeAgentRunRequest = (
       ? args.runner
       : defaults.runner;
   const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
-  // The caller's admitted Pi binding wins over package/workspace defaults, also in
-  // actor/task processes whose Main target is remote. Never infer from that target.
-  const inheritedModel = runner === "pi" && !explicitModel && defaults.inheritedModel
+  const configuredModel = runner === "pi" ? defaults.model : undefined;
+  // Configured defaults win. Otherwise inherit the caller's admitted Pi binding,
+  // also in actor/task processes whose Main target is remote. Never infer from that target.
+  const inheritedModel = runner === "pi" && !explicitModel && !configuredModel && defaults.inheritedModel
     ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}` : undefined;
-  const requestedModel = explicitModel ?? inheritedModel ?? (runner === "pi" ? defaults.model : undefined);
+  const requestedModel = explicitModel ?? configuredModel ?? inheritedModel;
   const thinking = isFabricThinking(args.thinking) ? args.thinking
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
+    : isFabricThinking(defaults.configuredThinking) ? defaults.configuredThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
   if (args.needs !== undefined && (!Array.isArray(args.needs) || !args.needs.every(entry => typeof entry === "string" && !!entry.trim()))) {

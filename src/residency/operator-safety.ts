@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { ResidentActorAuthorizationError, residentHostId, type ResidentHostConfig } from "./protocol.js";
+import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { participantFilePresent, readParticipantFile } from "../topology/participant-files.js";
-import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
+import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, STATE_LEASE_RENEW_MS, type FabricHostLease } from "../topology/host-leases.js";
 
 export interface ResidentOperatorEvidence {
   rootId: string;
@@ -13,6 +13,8 @@ export interface ResidentOperatorEvidence {
   liveLease: boolean;
   /** A live root lease that this root's own resident host writes, with no live Main session in it (smarty-dev#7817). */
   residentRenewedLease?: true;
+  /** Why a resident-renewed lease was or was not set aside. */
+  mainLiveness?: string;
   operatorCheck: string;
 }
 
@@ -34,6 +36,7 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
   let mainLive = false;
   let selfIncarnation: number | undefined;
   let selfWindow = 0;
+  let rootLease: FabricHostLease | undefined;
   const record = (updatedAt: number, expiresAt: number, self = false) => {
     evidence.lastLeaseTime = Math.max(evidence.lastLeaseTime ?? updatedAt, updatedAt);
     evidence.leaseExpiresAt = Math.max(evidence.leaseExpiresAt ?? expiresAt, expiresAt);
@@ -54,6 +57,7 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
     const self = resident !== undefined && writer !== undefined && writer.pid === resident.pid &&
       writer.host === resident.host && writer.startedAt === resident.startedAt &&
       (lease!.session === undefined || lease!.session.expiresAt < Date.now());
+    rootLease = lease!;
     if (self) { selfIncarnation = lease!.startedAt; selfWindow = Math.max(0, lease!.expiresAt - lease!.updatedAt); }
     record(lease!.updatedAt, lease!.expiresAt, self);
   }
@@ -67,24 +71,12 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
     record(lease.updatedAt, lease.expiresAt, selfIncarnation !== undefined &&
       (value as { startedAt?: number }).startedAt === selfIncarnation);
   }
-  // A resident-renewed lease is set aside only when no Main presence for the root is live in that
-  // lease window: the root's participant record, unless the resident itself owns it (smarty-dev#7817).
+  // A resident-renewed lease is set aside only on a positive proof that no Main serves the root
+  // (smarty-dev#7817). Absent within the grace, unreadable, invalid or any doubt is unknown: refuse.
   if (!mainLive && evidence.residentRenewedLease) {
-    const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
-    const now = Date.now();
-    let entries: Array<MeshStateEntry | undefined>;
-    try { entries = [readParticipantFile(config.meshRoot, key), mesh.get(key, { fresh: true })]; }
-    catch { entries = []; mainLive = true; }
-    for (const entry of entries) {
-      if (!entry) continue;
-      const value = entry.value as { id?: unknown; ownerHostId?: unknown; status?: unknown; reloadUntil?: unknown } | null;
-      if (!value || value.id !== config.rootId || typeof value.ownerHostId !== "string") { mainLive = true; continue; }
-      if (value.ownerHostId === residentHostId(config.rootId)) continue;
-      const owner = value.ownerHostId === config.rootId ? undefined : readHostLeaseCurrent(config.meshRoot, value.ownerHostId);
-      if (entry.updatedAt + selfWindow >= now || (owner !== undefined && owner.expiresAt >= now) ||
-          (value.status === "reloading" && typeof value.reloadUntil === "number" && value.reloadUntil >= now)) mainLive = true;
-    }
-    if (!entries[0] && participantFilePresent(config.meshRoot, key)) mainLive = true; // present but unreadable: doubt
+    const verdict = mainDeadProof(config, mesh, rootLease!, selfWindow);
+    evidence.mainLiveness = verdict;
+    if (verdict !== "dead: stale root participant, owner lease expired" && verdict !== "dead: no root participant after the grace") mainLive = true;
     if (mainLive) evidence.liveLease = true;
   }
   if (!mainLive && evidence.liveLease) evidence.liveLease = false;
@@ -92,10 +84,50 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
   return evidence;
 }
 
+/** A root participant record is republished at least every STATE_LEASE_RENEW_MS by a live Main; a
+ * restarted Main publishes within it. Twice that, and never less than the lease window, is the grace. */
+export const MAIN_PUBLISH_GRACE_MS = 2 * STATE_LEASE_RENEW_MS;
+
+/** Positive dead proof of the root's Main for a resident-renewed lease; any other answer is unknown. */
+function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">, rootLease: FabricHostLease, window: number): string {
+  const now = Date.now();
+  const grace = Math.max(MAIN_PUBLISH_GRACE_MS, window);
+  const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
+  let entries: MeshStateEntry[];
+  try {
+    const file = readParticipantFile(config.meshRoot, key);
+    if (!file && participantFilePresent(config.meshRoot, key)) return "unknown: root participant record is unreadable";
+    entries = [file, mesh.get(key, { fresh: true })].filter((entry): entry is MeshStateEntry => entry !== undefined);
+  } catch (error) { return `unknown: root participant record is unreadable (${error instanceof Error ? error.message : String(error)})`; }
+  if (!entries.length) {
+    // (b) A restarted Main publishes its record within the grace; this incarnation has run longer.
+    // The live executor re-reads this before every mutation, after its registry and fence checks.
+    if (rootLease.startedAt === undefined || !Number.isFinite(rootLease.startedAt)) return "unknown: resident incarnation start is unrecorded";
+    if (now - rootLease.startedAt <= grace) return `unknown: no root participant yet, resident started ${Math.round((now - rootLease.startedAt) / 1000)} s ago (grace ${grace / 1000} s)`;
+    return "dead: no root participant after the grace";
+  }
+  for (const entry of entries) {
+    // (a) Readable, valid, not reloading, stale, and its owner's lease expired.
+    const value = entry.value as { id?: unknown; rootId?: unknown; ownerHostId?: unknown; status?: unknown } | null;
+    if (!value || typeof value !== "object" || value.id !== config.rootId || typeof value.ownerHostId !== "string" ||
+        !value.ownerHostId || !Number.isFinite(entry.updatedAt)) return "unknown: root participant record is invalid";
+    if (value.status === "reloading") return "unknown: root participant is reloading";
+    if (now - entry.updatedAt <= grace) return "live: root participant published within the grace";
+    // The root lease itself is the resident's heartbeat; the Main's own liveness is its session in it.
+    const ownerUntil = value.ownerHostId === config.rootId
+      ? rootLease.session?.expiresAt
+      : readHostLeaseCurrent(config.meshRoot, value.ownerHostId)?.expiresAt;
+    if (value.ownerHostId !== config.rootId && ownerUntil === undefined) return "unknown: participant owner lease is unreadable";
+    if (ownerUntil !== undefined && ownerUntil >= now) return "live: participant owner lease is live";
+  }
+  return "dead: stale root participant, owner lease expired";
+}
+
 export function assertResidentOperatorConfirmed(evidence: ResidentOperatorEvidence, confirmation?: string, dryRun = false): void {
   if (dryRun && confirmation === undefined) return;
   if (confirmation !== evidence.rootId) refuse(evidence, confirmation === undefined
     ? "Missing --confirm-dead-root: operator confirmation is required"
     : "Mismatched --confirm-dead-root: value must equal the selected resident's root id exactly");
-  if (!dryRun && evidence.liveLease) refuse(evidence, "Main has a live root lease; confirmation cannot override a live owner lease");
+  if (!dryRun && evidence.liveLease) refuse(evidence, "Main has a live root lease; confirmation cannot override a live owner lease" +
+    (evidence.mainLiveness ? ` (${evidence.mainLiveness})` : ""));
 }

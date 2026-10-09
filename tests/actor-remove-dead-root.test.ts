@@ -8,9 +8,10 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { main } from "../src/actors-cli.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { meshProcessStartedAt } from "../src/mesh/store.js";
+import { MAIN_PUBLISH_GRACE_MS } from "../src/residency/operator-safety.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
@@ -45,9 +46,9 @@ const fixture = async () => {
     const dir = path.join(config.residencyRoot, "archives");
     return fs.existsSync(dir) ? fs.readdirSync(dir).flatMap(name => fs.readdirSync(path.join(dir, name)).map(file => path.join(name, file))) : [];
   };
-  const mainParticipant = (updatedAt: number) => writeParticipantFile(meshRoot, {
+  const mainParticipant = (updatedAt: number, ownerHostId = config.rootId) => writeParticipantFile(meshRoot, {
     key: "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex"),
-    value: { id: config.rootId, rootId: config.rootId, kind: "root", ownerHostId: config.rootId, ownerIdentityId: config.rootId },
+    value: { id: config.rootId, rootId: config.rootId, kind: "root", ownerHostId, ownerIdentityId: ownerHostId },
     version: 1, updatedAt, updatedBy: { id: config.rootId, name: "main", kind: "main" },
   });
   const killResident = async () => {
@@ -65,34 +66,119 @@ const fixture = async () => {
 };
 
 describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead root (smarty-dev#7817)", () => {
-  it("case 1: removes under a lease its own resident renews with no Main, and still refuses with a live Main", async () => {
+  const selfLease = (f: Awaited<ReturnType<typeof fixture>>, incarnationAgeMs: number) =>
+    writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
+      startedAt: Date.now() - incarnationAgeMs, updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
+      writer: { pid: process.pid, host: os.hostname(), releaseSha: "test", lockProtocol: 1, stateBackend: "file", startedAt: meshProcessStartedAt } });
+  const grace = MAIN_PUBLISH_GRACE_MS;
+
+  it.each([
+    ["no participant, resident incarnation younger than the grace", grace / 2, undefined, "unknown: no root participant yet"],
+    ["a participant record fresher than the grace", 2 * grace, grace / 2, "live: root participant published within the grace"],
+    ["no participant, resident incarnation older than the grace", 2 * grace, undefined, undefined],
+    ["a stale participant whose owner lease expired", 2 * grace, 2 * grace, undefined],
+  ] as const)("case 1: a resident-renewed lease with %s", async (_name, incarnationAgeMs, participantAgeMs, refusal) => {
     const f = await fixture();
     try {
       const actor = await f.create("leftover");
       // The root lease, renewed by the resident host itself (this process), with no Main session.
-      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
-        startedAt: meshProcessStartedAt, updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
-        writer: { pid: process.pid, host: os.hostname(), releaseSha: "test", lockProtocol: 1, stateBackend: "file", startedAt: meshProcessStartedAt } });
-      // A live Main participant record for the root still refuses.
-      f.mainParticipant(Date.now());
-      const refused = await f.cli(actor.id);
-      expect(refused.code).toBe(1); expect(refused.err).toContain("live root lease");
-      expect(f.registered(actor.id)).toBe(true);
-      expect(f.archives()).toEqual([]);
-      // No Main within the lease window: the resident's own lease does not block.
-      f.mainParticipant(Date.now() - 10 * 60_000);
-      const removed = await f.cli(actor.id);
-      expect(removed).toMatchObject({ code: 0, err: "" });
+      selfLease(f, incarnationAgeMs);
+      if (participantAgeMs !== undefined) f.mainParticipant(Date.now() - participantAgeMs);
+      const result = await f.cli(actor.id);
+      if (refusal) {
+        expect(result.code).toBe(1); expect(result.err).toContain("live root lease"); expect(result.err).toContain(refusal);
+        expect(f.registered(actor.id)).toBe(true);
+        expect(f.archives()).toEqual([]);
+        return;
+      }
+      expect(result).toMatchObject({ code: 0, err: "" });
       await f.host.actors.removalSettled(actor.id);
       expect(f.registered(actor.id)).toBe(false);
       expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining(["SHA256SUMS", `${actor.id}.registry.json`]));
-      // A lease written by another process (a Main) is never set aside.
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 1: a fresh root participant owned by the resident host id is Main evidence, not set aside", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("resident-owned");
+      selfLease(f, 2 * grace);
+      f.mainParticipant(Date.now(), residentHostId(f.config.rootId));
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1); expect(result.err).toContain("live: root participant published within the grace");
+      expect(f.registered(actor.id)).toBe(true);
+      expect(f.archives()).toEqual([]);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("live path: a symlink in the actor tree refuses before the stop; nothing changed", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("live-linked");
+      const actorDir = path.dirname(f.host.actors.status(actor.id).sessionFile!);
+      fs.mkdirSync(actorDir, { recursive: true });
+      fs.symlinkSync(path.join(f.config.meshRoot, "elsewhere"), path.join(actorDir, "escape"));
+      const before = f.host.actors.status(actor.id).status;
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1); expect(result.err).toContain("symlink");
+      expect(f.host.actors.status(actor.id).status).toBe(before);
+      expect(f.registered(actor.id)).toBe(true);
+      expect(f.archives()).toEqual([]);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 1: a live root lease written by another process (a Main) is never set aside", async () => {
+    const f = await fixture();
+    try {
       const other = await f.create("kept");
       writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
-        updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
+        startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
         writer: { pid: 1, host: os.hostname(), releaseSha: "test", lockProtocol: 1, stateBackend: "file", startedAt: 1 } });
       expect((await f.cli(other.id)).err).toContain("live root lease");
       expect(f.registered(other.id)).toBe(true);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 2: a symlink in the actor tree refuses before the archive; nothing deleted, registry untouched", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("linked");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      const outside = path.join(f.config.meshRoot, "outside.txt"); fs.writeFileSync(outside, "keep");
+      fs.symlinkSync(outside, path.join(actorDir, "escape"));
+      await f.killResident();
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1); expect(result.err).toContain("symlink");
+      expect(f.registered(actor.id)).toBe(true);
+      expect(f.archives()).toEqual([]);
+      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.readFileSync(outside, "utf8")).toBe("keep");
+      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 2: a file swapped between the walk and the removal stops the removal and keeps the marker", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("swapped");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      await f.killResident();
+      const withLock = ActorRegistryStore.prototype.withLock;
+      const spy = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, ...args) {
+        // After the walk and the archive, before the tree removal: replace a walked file.
+        const replacement = path.join(actorDir, "replacement");
+        fs.writeFileSync(replacement, "swapped\n"); fs.renameSync(replacement, path.join(actorDir, "session.jsonl"));
+        return withLock.apply(this, args as Parameters<typeof withLock>);
+      });
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { spy.mockRestore(); }
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.out)).toMatchObject({ cleaned: false, pending: expect.stringContaining("changed before removal") });
+      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
+      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("swapped\n");
+      expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining([`${actor.id}.tar`, "SHA256SUMS"]));
     } finally { await f.close(); }
   }, 40_000);
 

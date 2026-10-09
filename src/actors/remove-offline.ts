@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { MeshStore } from "../mesh/store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence } from "../residency/operator-safety.js";
@@ -29,16 +29,81 @@ type Row = Record<string, unknown> & { id: string };
 const stamp = (at: number): string => new Date(at).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 const rootTag = (rootId: string): string => rootId.replace(/^session:/, "").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 8);
 
-/** Tar the actor directory and its registry row, with SHA256SUMS, before any removal step. */
-export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row: Row, actorDirectory: string, at = Date.now()): string => {
+/** One lstat-verified entry of an actor tree: never followed, compared by identity before removal. */
+interface TreeEntry { path: string; dev: number; ino: number; directory: boolean }
+
+/** The actor directory, walked with lstat and pinned by an O_NOFOLLOW directory descriptor. */
+export interface PinnedActorTree { directory: string; entries: TreeEntry[]; fd?: number; close(): void }
+
+const uid = process.getuid?.();
+const verifiedEntry = (file: string): TreeEntry => {
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink()) throw new Error(`Actor tree has a symlink: ${file}`);
+  if (!stat.isFile() && !stat.isDirectory()) throw new Error(`Actor tree has a special file: ${file}`);
+  if (uid !== undefined && stat.uid !== uid) throw new Error(`Actor tree entry is not owned by this OS user: ${file}`);
+  return { path: file, dev: stat.dev, ino: stat.ino, directory: stat.isDirectory() };
+};
+const sameEntry = (entry: TreeEntry, stat: fs.Stats): boolean =>
+  stat.dev === entry.dev && stat.ino === entry.ino && stat.isDirectory() === entry.directory && !stat.isSymbolicLink();
+
+/** Walk the actor directory (parents first) and pin it; refuses symlinks, special files and other owners. */
+export const pinActorTree = (directory: string): PinnedActorTree => {
+  const tree: PinnedActorTree = { directory, entries: [], close() { if (this.fd !== undefined) { fs.closeSync(this.fd); delete this.fd; } } };
+  try { fs.lstatSync(directory); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return tree; throw error; }
+  const root = verifiedEntry(directory);
+  if (!root.directory) throw new Error(`Actor directory is not a directory: ${directory}`);
+  // Windows has no O_DIRECTORY/O_NOFOLLOW; the lstat-then-fstat identity check below still refuses a swapped-in link.
+  tree.fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!sameEntry(root, fs.fstatSync(tree.fd))) throw new Error(`Actor directory changed while it was pinned: ${directory}`);
+    const walk = (entry: TreeEntry, depth: number): void => {
+      tree.entries.push(entry);
+      if (!entry.directory) return;
+      if (depth > 64) throw new Error(`Actor tree is too deep: ${entry.path}`);
+      for (const name of fs.readdirSync(entry.path).sort()) walk(verifiedEntry(path.join(entry.path, name)), depth + 1);
+    };
+    walk(root, 0);
+  } catch (error) { tree.close(); throw error; }
+  return tree;
+};
+
+/** The pinned descriptor and path still name the walked actor directory. */
+const assertPinned = (tree: PinnedActorTree): void => {
+  const root = tree.entries[0];
+  if (!root || tree.fd === undefined) return;
+  if (!sameEntry(root, fs.fstatSync(tree.fd)) || !sameEntry(root, fs.lstatSync(tree.directory))) {
+    throw new Error(`Actor directory was replaced: ${tree.directory}`);
+  }
+};
+
+/** Remove only the walked entries, children first, each re-verified by identity; any mismatch stops. */
+export const removePinnedActorTree = (tree: PinnedActorTree): void => {
+  assertPinned(tree);
+  for (const entry of [...tree.entries].reverse()) {
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(entry.path); }
+    catch (error) { throw new Error(`Actor tree entry vanished before removal: ${entry.path} (${(error as Error).message})`); }
+    if (!sameEntry(entry, stat)) throw new Error(`Actor tree entry changed before removal: ${entry.path}`);
+    if (entry.directory) fs.rmdirSync(entry.path); else fs.unlinkSync(entry.path);
+  }
+};
+
+/** Tar the verified actor tree and its registry row, with SHA256SUMS, before any removal step. */
+export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row: Row, tree: PinnedActorTree, at = Date.now()): string => {
   if (!/^[A-Za-z0-9_-]+$/.test(row.id)) throw new Error(`Unsafe actor id for archive: ${row.id}`);
+  assertPinned(tree);
   const directory = path.join(archiveRoot, `actors-${rootTag(rootId)}-${stamp(at)}`);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const tar = path.join(directory, `${row.id}.tar`);
   if (fs.existsSync(tar)) throw new Error(`Actor archive already exists: ${tar}`);
   const files: string[] = [];
-  if (fs.existsSync(actorDirectory)) {
-    const result = spawnSync("tar", ["-cf", tar, "-C", path.dirname(actorDirectory), path.basename(actorDirectory)], { stdio: ["ignore", "ignore", "pipe"] });
+  if (tree.entries.length) {
+    // Exactly the verified list: no recursion and no -h, so tar follows nothing.
+    const parent = path.dirname(tree.directory);
+    const list = tree.entries.map(entry => path.relative(parent, entry.path) + "\0").join("");
+    const result = spawnSync("tar", ["-cf", tar, "-C", parent, "--no-recursion", "--null", "-T", "-"],
+      { input: list, stdio: ["pipe", "ignore", "pipe"] });
     if (result.status !== 0) {
       fs.rmSync(tar, { force: true });
       throw new Error(`Actor archive failed (tar ${result.status ?? result.error}): ${String(result.stderr ?? "").trim()}`);
@@ -51,11 +116,9 @@ export const archiveActorForRemoval = (archiveRoot: string, rootId: string, row:
   const sums = path.join(directory, "SHA256SUMS");
   const existing = fs.existsSync(sums) ? fs.readFileSync(sums, "utf8") : "";
   const lines = files.map(file => `${createHash("sha256").update(fs.readFileSync(file)).digest("hex")}  ${path.basename(file)}\n`).join("");
-  fs.writeFileSync(sums, existing + lines, { mode: 0o600 });
-  for (const file of [tar, sums]) {
-    if (!fs.existsSync(file)) continue;
-    const fd = fs.openSync(file, "r"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  }
+  // Windows refuses fsync on a read-only handle (EPERM): sync the tar through a writable one.
+  if (files.includes(tar)) { const fd = fs.openSync(tar, "r+"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  writeFileAtomic(sums, existing + lines, { durable: true });
   return directory;
 };
 
@@ -117,6 +180,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
   const dryRun = options.dryRun === true;
   const fd = await claimFence(directory);
   let mesh: MeshStore | undefined;
+  let tree: PinnedActorTree | undefined;
   try {
     const recheck = (): void => {
       if (lockWaiter(fd)) throw new Error("A host is waking on this root (host.lock has a waiter); it wins");
@@ -161,11 +225,13 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
       const veto = !/^[A-Za-z0-9_-]+$/.test(inFlight) || absent(run) ? "run directory missing" : runTreeExitVeto(run, 0, undefined, true, true);
       if (veto) throw new Error(`Actor ${id} in-flight run ${inFlight} is not proven exited: ${veto}`);
     }
+    // Walk and pin the actor tree first: a symlink, special file or foreign entry refuses before any archive.
+    tree = pinActorTree(actorDirectory);
     if (dryRun) return { offline: true, dryRun, actor: summary, operatorEvidence: evidence };
 
     // 1. Archive first: nothing is deleted or revoked before it is taken.
     check();
-    const archive = archiveActorForRemoval(path.join(directory, "archives"), config.rootId, row, actorDirectory);
+    const archive = archiveActorForRemoval(path.join(directory, "archives"), config.rootId, row, tree);
     // 2. The durable removal record, as #commitRemove: a later owner start finishes from it.
     const presenceKey = `actors/${config.sessionId}/${id}`;
     const marker = path.join(root, `removal-${id}.json`);
@@ -186,7 +252,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     // 4. Cleanup, then the record goes. A failure keeps the record for the next owner start.
     try {
       await new ActorBindingStore(config.sessionId, root).delete(id);
-      fs.rmSync(actorDirectory, { recursive: true, force: true });
+      removePinnedActorTree(tree);
       await mesh.delete({ key: presenceKey });
       fs.rmSync(marker, { force: true });
       return { offline: true, dryRun, actor: summary, operatorEvidence: evidence, archive, cleaned: true };
@@ -195,6 +261,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
         pending: `removal cleanup failed: ${error instanceof Error ? error.message : String(error)} (the next resident start finishes it)` };
     }
   } finally {
+    tree?.close();
     mesh?.closeState();
     fs.closeSync(fd);
   }

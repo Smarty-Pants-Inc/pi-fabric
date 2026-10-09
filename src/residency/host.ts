@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import os from "node:os";
-import { archiveActorForRemoval } from "../actors/remove-offline.js";
+import { archiveActorForRemoval, pinActorTree } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -1549,15 +1549,26 @@ export class ResidentHost {
         } else {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
+          // smarty-dev#7817: verify the actor tree's containment and ownership before any mutation (stop included).
+          const sessionDir = path.dirname(actor.sessionFile ?? "");
+          if (command.action === "remove") {
+            if (!actor.sessionFile || path.basename(sessionDir) !== actor.id ||
+                !Object.values(residentActorRoots(this.config)).includes(path.dirname(sessionDir))) {
+              throw new Error(`Actor ${actor.id} session is outside this resident's actor roots`);
+            }
+            pinActorTree(sessionDir).close();
+          }
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
-          // smarty-dev#7817: archive first, before the removal deletes or revokes anything.
+          // Archive first, before the removal deletes or revokes anything.
           if (command.action === "remove") {
-            const sessionDir = path.dirname(stopped.sessionFile ?? "");
             const row = new ActorRegistryStore(path.dirname(sessionDir)).snapshot().actors.find(entry => entry.id === actor.id);
-            if (!stopped.sessionFile || !row) throw new Error(`Actor ${actor.id} registry row not found for its removal archive`);
-            archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, sessionDir);
+            if (stopped.sessionFile !== actor.sessionFile || !row) throw new Error(`Actor ${actor.id} registry row not found for its removal archive`);
+            // The same lstat-verified, pinned walk as the offline path, taken again after the stop; tar follows nothing.
+            const tree = pinActorTree(sessionDir);
+            try { archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, tree); }
+            finally { tree.close(); }
           }
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }

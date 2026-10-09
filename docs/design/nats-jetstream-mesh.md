@@ -94,6 +94,74 @@ dd if=/dev/zero of="$B/probe" bs=4k count=300 oflag=dsync   # raw fsync; control
 smarty-reap stop "$B/rec$i.json"; rm -rf -- "$B"
 ```
 
+### NVMe rerun (lane fs-7504b, 2026-10-09)
+
+Same binary (v2.14.7, SHA-256 checked), same scripts and cells, same `nats` 2.29.3 and Node
+24.19.0. Only the host and disks change.
+
+**(A) Single host: `intel1`, bare metal** (`systemd-detect-virt`: none), Intel Core i9-14900K,
+32 threads, 184 GiB, Ubuntu 26.04.1, kernel 7.0.0-38-generic. Load 6–12 and IO pressure ~1–2 %
+from other lanes during the run. Nodes spread over both NVMe devices:
+
+| Node | Device | Model | fs | `dd bs=4k oflag=dsync` |
+|---|---|---|---|---|
+| n1, n3 | nvme0n1p2 (`/`) | Samsung SSD 990 EVO Plus 4TB (fw 2B2QKXG7) | ext4, relatime | 1.27 ms per write |
+| n2 | nvme1n1 (pool `work`, `/srv/scratch`) | Samsung SSD 990 EVO Plus 4TB (fw 2B2QKXG7) | ZFS, sync=standard, lz4, recordsize 128K | 0.58 ms per write |
+
+Listeners on 127.0.0.1 only (client 24620–24622, routes 24623–24625; control 24630–24635).
+The first stream run timed out on stream create 4 s after start (meta leader just elected); the
+rerun 3 s later is the one below.
+
+**(B) 3 hosts: not run.** From `intel1` the names `ryzen4-agent`, `ryzen5-agent`,
+`epyc1-agent` and `forge-agent` do not resolve, `~/.ssh` has no config and no key for them, and
+ssh to their Tailscale addresses (100.105.145.68, 100.86.144.100, 100.100.180.46, 100.78.65.112)
+fails `Host key verification failed`. Enabling it is new access (ask first), so no RTT and no
+cross-host numbers yet; the 3 target hosts (CT4000P3) are still unmeasured.
+
+#### Stream publish, R3 file stream (6 s per cell; control 4 s)
+
+| Payload | Publishers | msg/s | p50 ms | p99 ms | Control: default sync (msg/s, p50, p99) |
+|---|---|---|---|---|---|
+| 256 B | 1 | 208 | 4.61 | 7.70 | 4602, 0.20, 0.32 |
+| 256 B | 16 | 429 | 36.9 | 51.2 | 18766, 0.73, 1.87 |
+| 256 B | 64 | 434 | 146 | 165 | 18000, 3.94, 8.23 |
+| 4 KB | 1 | 205 | 4.67 | 7.94 | 3342, 0.28, 0.46 |
+| 4 KB | 16 | 422 | 37.6 | 50.7 | 17865, 0.76, 2.36 |
+| 4 KB | 64 | 422 | 150 | 174 | 19611, 3.30, 8.62 |
+
+Errors 0 and stored = acked in every cell. About 4× the virtual disk, but the rate stops at
+~430 msg/s from 16 publishers on: payload size does not matter, so the limit is the number of
+synced writes, not bytes. The control column is the same hosts and
+disks with the default `sync_interval`, on fresh stores.
+
+#### KV (R3 bucket, history 1, 256 B values, 3 s per cell)
+
+| Operation | Clients | ops | p50 ms | p99 ms |
+|---|---|---|---|---|
+| put | 1 / 16 | 925 / 1349 | 3.05 / 35.9 | 5.96 / 43.3 |
+| get, direct (any replica) | 1 / 16 | 19374 / 39188 | 0.15 / 0.88 | 0.33 / 18.3 |
+| get, leader (`STREAM.MSG.GET`) | 1 / 16 | 14350 / 57074 | 0.21 / 0.88 | 0.35 / 2.06 |
+| CAS `update(key, v, rev)` | 1 / 16 | 942 / 1216 | 3.02 / 37.6 | 6.06 / 76.7 |
+| CAS, 16 clients on 1 key | 16 | 657 wins, 15638 conflicts | 3.89 | 12.5 |
+
+CAS errors 1 / 16 are each client's first update on revision 0 (a bench artifact, one per
+client); no other errors.
+
+#### Leader kill under load (SIGKILL, 16 publishers + 6 lease contenders, 25 s run)
+
+| Trial | Killed | Resume (largest ack gap after kill) | Acked / stored / read back | Lost | Dup stored | Dup acks (deduped retries) | Client retries | Lease result |
+|---|---|---|---|---|---|---|---|---|
+| 1 | n1: stream leader | 5.85 s (first ack after kill: 0 ms, in flight) | 9849 / 9849 / 9849 | 0 | 0 | 12 | 1216 | lease leader (n2) not hit; 1 holder |
+| 2 | n3: stream + lease leader | 7.82 s | 10899 / 10899 / 10899 | 0 | 0 | 14 | 1840 | holder 5 lost renewal; holder 1 took it 7.96 s after the old TTL ended; no overlap, no two grants on one revision |
+| 3 | n1: lease leader only | 0.03 s (25 ms gap) | 13054 / 13054 / 13054 | 0 | 0 | 2 | 2 | holder 3 lost renewal; holder 5 took it 7.94 s after the old TTL ended; no overlap, no two grants on one revision |
+
+Two holders: 0 in all trials. Trial 2's 7.82 s resume is above the 7.5 s limit of section 6
+(one trial; the soak decides).
+
+Commands: as above, with `B=$(mktemp -d -p "$HOME/.cache" ...)` for n1, n3 and a second
+`mktemp -d` under `/srv/scratch/paul` for n2's `store_dir`; base 24620; control on base 24630
+without `sync_interval`, `DUR=4000`; `dd ... count=1000 oflag=dsync` in each store's directory.
+
 ## 2. Shape: one stream for state and events, local projection for sync reads
 
 `StateBackend` reads are synchronous (`state-backend.ts:173-199`); `writeBatch` is atomic over
@@ -227,10 +295,15 @@ time, grants per expected revision, hold overlap) and the issue's acceptance.
 
 ## 8. Top risks
 
-1. **fsync budget.** Here, `sync_interval: always` gives 47–113 msg/s for the whole cluster,
-   19 ms CAS p50, and 0.5–0.7 s waits at 64 publishers; all writes share one stream. This was a
-   virtual disk with 3 replicas on one device: rerun on the 3 target hosts' NVMe before adapter
-   work. If the soak's commit rate exceeds that budget, the design does not hold.
+1. **fsync budget.** On the virtual disk, `sync_interval: always` gave 47–113 msg/s for the
+   whole cluster, 19 ms CAS p50, and 0.5–0.7 s waits at 64 publishers. On bare-metal NVMe
+   (`intel1`, 990 EVO Plus, 0.6–1.3 ms per dsync write, 3 nodes on one host) the budget is
+   ~205 msg/s at 1 publisher and a flat **~430 msg/s at 16 and 64 publishers**, CAS p50 3.0 ms
+   (1 client) / 37.6 ms (16 clients), put p50 3.1 / 35.9 ms; all writes share one stream.
+   **Verdict: no. `sync_interval: always` R3 does not reach 1,000 msg/s at 16 publishers on
+   NVMe (429 msg/s, 43 %).** The 3-host run (Tailscale RTT, CT4000P3) is still open. If the
+   soak's commit rate exceeds ~430/s, the design does not hold with one stream and fsync on
+   every write.
 2. **Failover window.** Publishes stopped 4.5 s and 7.6 s after a stream-leader kill. Lease TTL
    and renewals must cover that, and callers must treat a timeout as unknown (12 and 11 retried
    publishes had landed and were deduped only by Msg-Id).

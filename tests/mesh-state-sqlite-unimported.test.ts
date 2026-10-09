@@ -124,7 +124,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
   });
 
   /** Fresh roots: none, an empty state file, a zero-length one, a file store's untouched root, a missing directory. */
-  const freshRoots = (): string[] => {
+  const freshRoots = (): [string, string, string, string] => {
     const none = tempRoot("fresh");
     const emptyJson = tempRoot("empty-json");
     fs.writeFileSync(path.join(emptyJson, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));

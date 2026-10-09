@@ -37,6 +37,17 @@ describe("handoff completion message", () => {
     expect(send("").details.displayText).toContain("No conclusion returned");
   });
 
+  it("marks interrupted handoff output partial and carries the separate warning", () => {
+    const sendMessage = vi.fn();
+    const warning = "final report interrupted by a model stream error; showing the last persisted output";
+    queueHandoffCompletion({ sendMessage } as unknown as ExtensionAPI, {},
+      { completed: false, status: "failed", implementation: "VERDICT: PASS", partialText: "VERDICT: PASS", error: "stream disconnected", warnings: [warning] });
+    const message = sendMessage.mock.calls[0]![0];
+    expect(message.details).toMatchObject({ status: "failed", completed: false });
+    expect(message.content).toContain("Partial output (not a completed report):\nVERDICT: PASS");
+    expect(message.content).toContain(`[pi-fabric warning] ${warning}`);
+    expect(message.content).toContain("The handoff ended without completing");
+  });
   it("bounds large reports without losing the continuation instruction", () => {
     const message = send("start " + "x".repeat(20000) + " end abc123");
     expect(message.content.length).toBeLessThan(10000);

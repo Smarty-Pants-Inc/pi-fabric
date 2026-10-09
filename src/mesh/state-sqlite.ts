@@ -117,7 +117,7 @@ export class MeshStateUnsupportedError extends Error {
  * state: refuse BEFORE creating state.db, so the root is left byte-identical (no db, no fence, no epoch).
  * The import tool (backend-migration.ts) opens the database itself and never comes through here.
  */
-export const assertSqliteRootImported = (root: string): void => {
+const assertSqliteRootImported = (root: string): void => {
   try {
     if (fs.statSync(path.join(root, "state.db")).size > 0) return; // initialised (or being initialised): its meta decides
   } catch (error) {

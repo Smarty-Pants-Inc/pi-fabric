@@ -96,6 +96,10 @@ interface ActorQueueItem {
   images?: ImageContent[];
   createdAt: number;
   coalesceKey?: string;
+  /** Receipt for a held agent_settled transfer, independent of the ordinary queue id. */
+  settledDeliveryId?: string;
+  /** Superseded receipts still owed while absorbed predecessor files remain on disk. */
+  settledDeliveryIds?: string[];
   activation: FabricActorActivation;
   /** Supplied fields, interpreted according to bindingMode (including absent fields). */
   binding: FabricActorRunBinding;
@@ -127,7 +131,7 @@ import type { FabricPythonRuntime } from "../config.js";
 interface SettledWindow {
   acceptedAt: number;
   intervalMs: number;
-  pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string; observedAt: number };
+  pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string; observedAt: number; deliveryId?: string };
   /** Only a successful durable write of this exact pending snapshot grants durability. */
   pendingCheckpointed?: boolean;
   timer?: NodeJS.Timeout;
@@ -560,6 +564,8 @@ export class ActorManager {
   // Only windows with undelivered work survive in the lineage's existing queue file.
   readonly #settledWindows = new Map<string, Map<string, SettledWindow>>();
   #settledRestoreReady = false;
+  /** A failed close barrier keeps custody and pending memory, but never rearms settlement. */
+  #settledClosePending = false;
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
@@ -1936,7 +1942,7 @@ export class ActorManager {
     let windows = pendingSourceId === undefined ? undefined : this.#settledWindows.get(actor.id);
     const now = Date.now();
     if (interval > 0) {
-      if (this.#closing || this.#halted) return false;
+      if (this.#closing || this.#settledClosePending || this.#halted) return false;
       // Host envelopes carry the real observed agent in session.id. In particular,
       // signal.payload.source is only an input origin (user/extension), not an agent.
       const sessionId = typeof payload === "object" && payload !== null
@@ -1950,7 +1956,8 @@ export class ActorManager {
         }
         const window = windows.get(sourceId);
         if (window && now - window.acceptedAt < window.intervalMs) {
-          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now };
+          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now,
+            deliveryId: window.pending?.deliveryId ?? randomUUID() };
           window.pendingCheckpointed = false;
           // Latest payload wins, but subsequent arrivals never move the original boundary.
           this.#persistQueue(actor.id);
@@ -1959,7 +1966,8 @@ export class ActorManager {
         }
         if (window?.pending && pendingSourceId === undefined) {
           // An overdue fresh arrival supersedes the held payload even if admission fails.
-          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now };
+          window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now,
+            deliveryId: window.pending.deliveryId ?? randomUUID() };
           window.pendingCheckpointed = false;
         }
       }
@@ -1969,6 +1977,7 @@ export class ActorManager {
     this.#enqueue(actor, `host:${event}`, payload, {
       ...(actor.coalesce ? { coalesceKey: `host:${event}` } : {}),
       ...(images.length > 0 ? { images } : {}),
+      ...(transferPending?.deliveryId ? { settledDeliveryId: transferPending.deliveryId } : {}),
       ownershipChecked: true,
       ...(sourceId !== undefined ? {
         // Keep pending work on failed admission, including a full queue/overflow.
@@ -1997,7 +2006,7 @@ export class ActorManager {
   #resumeSettledWindows(onlyActorId?: string): void {
     // The host calls resumeQueued/resumeAfterRelease after providers and ownership
     // bootstrap. Registry construction/polls must only retain, not activate, work.
-    if (!this.#settledRestoreReady || this.#closing || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!this.#settledRestoreReady || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     for (const [actorId, sources] of this.#settledWindows) {
       if ((onlyActorId !== undefined && actorId !== onlyActorId) || !this.#canManageCached(actorId)) continue;
       for (const [sourceId, window] of sources) {
@@ -2009,6 +2018,7 @@ export class ActorManager {
   }
 
   #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
+    if (this.#settledClosePending) return;
     // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
     const remaining = Math.max(0, window.intervalMs - (Date.now() - window.acceptedAt));
     window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
@@ -2018,7 +2028,7 @@ export class ActorManager {
   #flushSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
     if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
     delete window.timer;
-    if (!window.pending || this.#closing || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!window.pending || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(actorId);
     // Reload/reacquisition can replace every registry object. Resolve only after fencing.
@@ -2050,27 +2060,40 @@ export class ActorManager {
     }
   }
 
-  #clearSettledWindows(actorId?: string, suspend = false, persist = true): void {
+  #clearSettledWindows(actorId?: string, suspend = false, persist = true): boolean {
     const ids = actorId === undefined ? [...new Set([
       ...this.#settledWindows.keys(), ...(suspend ? this.#queueCancellationDirty : []),
     ])] : [actorId];
+    // Stop every deadline before attempting any storage boundary.
     for (const id of ids) {
-      const sources = this.#settledWindows.get(id);
-      const pending = [...(sources?.values() ?? [])].some(window => window.pending);
-      for (const window of sources?.values() ?? []) {
+      for (const window of this.#settledWindows.get(id)?.values() ?? []) {
         if (window.timer) clearTimeout(window.timer);
         delete window.timer;
       }
-      // Suspend may discard memory only after the latest snapshot is saved. A failed
-      // final save keeps it here, timer-free, and leaves the earlier committed file intact.
-      if (suspend && this.#persistent && (this.#queueCancellationDirty.has(id) ||
-          [...(sources?.values() ?? [])].some(window => window.pending && !window.pendingCheckpointed)) &&
-          !this.#persistQueue(id, true)) continue;
+    }
+    let checkpointed = true;
+    if (suspend && this.#persistent) {
+      for (const id of ids) {
+        const sources = this.#settledWindows.get(id);
+        if ((this.#queueCancellationDirty.has(id) ||
+            [...(sources?.values() ?? [])].some(window => window.pending && !window.pendingCheckpointed)) &&
+            !this.#persistQueue(id, true) &&
+            [...(sources?.values() ?? [])].some(window => window.pending && !window.pendingCheckpointed)) checkpointed = false;
+        // A halt's durable same-file cancellation receipt already fences empty
+        // cancelled work. Failure of its canonical retry alone does not block close.
+      }
+    }
+    // All-or-nothing memory suspension: even a successfully saved actor must retain
+    // pending while another actor blocks close. An intervening rewrite needs that memory.
+    if (!checkpointed) return false;
+    for (const id of ids) {
+      const pending = [...(this.#settledWindows.get(id)?.values() ?? [])].some(window => window.pending);
       if (pending && !suspend) this.#queueCancellationDirty.add(id);
       this.#settledWindows.delete(id);
       // Close suspends the persisted queue; stop/halt/removal cancel its pending work.
       if (pending && !suspend && persist) this.#persistQueue(id, true);
     }
+    return true;
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
@@ -2596,9 +2619,23 @@ export class ActorManager {
     this.#meshMonitor.checkpointForRelease();
   }
 
+  /**
+   * Close releases custody only after held settlements have a durable checkpoint.
+   * Storage failure rejects before shutdown cleanup: custody and all pending memory
+   * remain here, settlement timers stay stopped, and an explicit later close retries
+   * the barrier without caching its rejection. The caller must retain this manager
+   * and host custody on rejection; total-storage caller shutdown handling is the
+   * separate smarty-dev#7706 boundary, not a guarantee this manager can make.
+   */
   close(): Promise<void> {
     if (!this.#closePromise) {
-      this.#clearSettledWindows(undefined, true);
+      this.#settledClosePending = true;
+      if (!this.#clearSettledWindows(undefined, true)) {
+        const failures = [...this.#actors.values()].filter(actor =>
+          [...(this.#settledWindows.get(actor.id)?.values() ?? [])].some(window => window.pending && !window.pendingCheckpointed));
+        return Promise.reject(new Error(`Fabric actor close not durably checkpointed; custody retained: ${failures.map(actor =>
+          actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
+      }
       this.#closing = true;
       this.#closePromise = this.#close();
       // Retention/presence joins may yield before #close reaches its owned rows.
@@ -2787,6 +2824,22 @@ export class ActorManager {
     this.#persistQueue(actor.id, true);
   }
 
+  #settledDeliveryReceipts(item: Partial<ActorQueueItem>): string[] {
+    return [...new Set([item.settledDeliveryId, ...(Array.isArray(item.settledDeliveryIds) ? item.settledDeliveryIds : [])]
+      .filter((id): id is string => typeof id === "string" && id.length > 0))];
+  }
+
+  /** Keep superseded transfer evidence only while a predecessor can still replay it. */
+  #replaceSettledDelivery(actorId: string, item: ActorQueueItem, deliveryId?: string, inherited: string[] = []): void {
+    const receipts = this.#takenOver.get(actorId)?.size
+      ? [...new Set([...this.#settledDeliveryReceipts(item), ...inherited])].filter(id => id !== deliveryId)
+      : [];
+    if (deliveryId) item.settledDeliveryId = deliveryId;
+    else delete item.settledDeliveryId;
+    if (receipts.length) item.settledDeliveryIds = receipts;
+    else delete item.settledDeliveryIds;
+  }
+
   #enqueue(
     actor: ManagedActor,
     source: string,
@@ -2795,6 +2848,7 @@ export class ActorManager {
       resolve?: (message: FabricActorMessage) => void;
       reject?: (error: Error) => void;
       coalesceKey?: string;
+      settledDeliveryId?: string;
       images?: readonly ImageContent[];
       ownershipChecked?: boolean;
       /** A full queue and overflow reject the item instead of recording it dropped. */
@@ -2845,6 +2899,7 @@ export class ActorManager {
         const previous = options.checkpoint ? { ...existing } : undefined;
         try {
           existing.payload = structuredClone(payload);
+          this.#replaceSettledDelivery(actor.id, existing, options.settledDeliveryId);
           existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
           if (options.images && options.images.length > 0) {
             existing.images = options.images.map((image) => ({ ...image }));
@@ -2896,6 +2951,7 @@ export class ActorManager {
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
+      ...(options.settledDeliveryId ? { settledDeliveryId: options.settledDeliveryId } : {}),
     };
     if (options.deadLetter && !options.replaying && this.#persistent && (this.#deadLetterCount(actor.id) > 0 ||
       (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
@@ -5210,6 +5266,8 @@ export class ActorManager {
             ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
+            ...(item.settledDeliveryId ? { settledDeliveryId: item.settledDeliveryId } : {}),
+            ...(item.settledDeliveryIds?.length ? { settledDeliveryIds: item.settledDeliveryIds } : {}),
             attempts: item.attempts ?? 0,
             launchEvidenceVersion: 1,
             executionStarted: item.executionStarted === true,
@@ -5394,6 +5452,32 @@ export class ActorManager {
       }
       if (fences.size) this.#cancelledPredecessors.set(actor.id, fences);
     }
+    const heldItems = [
+      ...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+      ...(this.#deferredHandoffs.get(actor.id) ?? []),
+      ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : []),
+    ];
+    const settledReceipts = new Set(heldItems.flatMap(item => this.#settledDeliveryReceipts(item)));
+    // Index this snapshot's accepted queue receipts before importing pending. Own
+    // work loads before predecessors; the same index also covers mixed queue/pending
+    // snapshots without allowing a restore-time rewrite to drop unimported work.
+    for (const record of records) {
+      if (typeof record !== "object" || record === null) continue;
+      const value = record as Partial<ActorQueueItem>;
+      if (typeof value.id !== "string" || typeof value.source !== "string" ||
+          typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null ||
+          (saved.cancelled === true && !(value.source === "child-completion" && value.deferredHandoff === true))) continue;
+      for (const id of this.#settledDeliveryReceipts(value)) settledReceipts.add(id);
+    }
+    // A later predecessor may carry the destination queue rather than pending.
+    // Clear only matching held pending; a distinct source delivery remains intact.
+    for (const window of this.#settledWindows.get(actor.id)?.values() ?? []) {
+      if (typeof window.pending?.deliveryId !== "string" || !settledReceipts.has(window.pending.deliveryId)) continue;
+      if (window.timer) clearTimeout(window.timer);
+      delete window.timer;
+      delete window.pending;
+      delete window.pendingCheckpointed;
+    }
     // Import before any queue rewrite (including dropped restart attempts) and
     // before predecessor deletion. Never replace newer same-process pending work.
     if (saved.cancelled !== true && actor.status !== "stopped" && !actor.removal && Array.isArray(saved.settledWindows)) {
@@ -5407,8 +5491,13 @@ export class ActorManager {
             !Number.isSafeInteger(value.pending.observedAt) || !Array.isArray(value.pending.images) ||
             !value.pending.images.every(image => image?.type === "image" && typeof image.data === "string" && typeof image.mimeType === "string")) continue;
         let windows = this.#settledWindows.get(actor.id);
+        const existing = windows?.get(value.sourceId);
+        if (typeof value.pending.deliveryId === "string" && settledReceipts.has(value.pending.deliveryId)) {
+          // A destination receipt wins over the predecessor's still-unlinked pending
+          // copy. Do not erase independent/newer pending belonging to this source.
+          continue;
+        }
         if (!windows) this.#settledWindows.set(actor.id, windows = new Map());
-        const existing = windows.get(value.sourceId);
         if (existing?.pending && existing.pending.observedAt >= value.pending.observedAt) continue;
         if (existing?.timer) clearTimeout(existing.timer);
         windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending, pendingCheckpointed: false });
@@ -5431,10 +5520,7 @@ export class ActorManager {
             taskRevision: activation.taskRevision + this.#taskRevision - savedTask,
           }
         : activation;
-    const held = new Set([
-      ...actor.queue, ...(this.#parked.get(actor.id) ?? []), ...(this.#deferredHandoffs.get(actor.id) ?? []),
-      ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : []),
-    ].map((item) => item.id));
+    const held = new Set(heldItems.map((item) => item.id));
     const restored: ActorQueueItem[] = [];
     for (const record of records) {
       if (typeof record !== "object" || record === null) continue;
@@ -5485,6 +5571,8 @@ export class ActorManager {
         bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
+        ...(typeof value.settledDeliveryId === "string" && value.settledDeliveryId ? { settledDeliveryId: value.settledDeliveryId } : {}),
+        ...(Array.isArray(value.settledDeliveryIds) ? { settledDeliveryIds: this.#settledDeliveryReceipts({ settledDeliveryIds: value.settledDeliveryIds }) } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
         launchEvidenceVersion: 1,
@@ -6019,7 +6107,9 @@ export class ActorManager {
         kept.set(key, item);
         continue;
       }
-      if (this.#newerEvent(item, first)) {
+      const newer = this.#newerEvent(item, first);
+      this.#replaceSettledDelivery(actor.id, first, newer ? item.settledDeliveryId : first.settledDeliveryId, this.#settledDeliveryReceipts(item));
+      if (newer) {
         first.payload = item.payload;
         first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;

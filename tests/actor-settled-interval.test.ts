@@ -396,7 +396,7 @@ describe("actor settled round 3 event-driven regressions", () => {
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
     candidates.length = 0;
-    await first.close();
+    await expect(first.close()).rejects.toThrow(/r3 final pending checkpoint unavailable/);
     expect.soft(candidates.length, "final persistence must be attempted even when the sink remains unavailable").toBeGreaterThan(0);
     for (const candidate of candidates) {
       // The only allowed final snapshot still contains the latest in-memory
@@ -407,7 +407,9 @@ describe("actor settled round 3 event-driven regressions", () => {
       .toEqual(expect.stringMatching(/r3 final pending checkpoint unavailable/));
     expect(fs.readFileSync(file, "utf8")).toBe(committed);
     vi.advanceTimersByTime(20_000);
-    expect(first.markers()).toEqual(["leading"]); // Closed-manager timers cannot admit the retained work.
+    expect(first.markers()).toEqual(["leading"]); // Failed-close timers cannot admit the retained work.
+    vi.restoreAllMocks();
+    await first.close(); // Explicit retry after storage recovery releases the fixture.
   });
 });
 
@@ -870,12 +872,13 @@ describe("actor settled round 4 durability and cancellation regressions", () => 
       if (target === file) attempts.push(options?.durable === true);
       write(target, value, options);
     });
-    await second.close();
+    await expect(second.close()).rejects.toThrow(/restored queue barrier unavailable/);
     expect(attempts).toEqual([true]);
     expect(second.actors.status(first.actor.id).lastError).toMatch(/restored queue barrier unavailable/);
     failed.mockRestore();
     vi.advanceTimersByTime(20_000);
     expect(second.markers()).toEqual(["leading"]);
+    await second.close(); // Recovered barrier permits explicit cleanup.
   });
 
   it("r4: one failed close save sets lastError even after an ordinary pending save succeeded", async () => {
@@ -892,7 +895,7 @@ describe("actor settled round 4 durability and cancellation regressions", () => 
       }
       return rename(from, to);
     });
-    await first.close();
+    await expect(first.close()).rejects.toThrow(/r4 final close save unavailable/);
     expect.soft(snapshots, "close must attempt stable storage once after a non-durable pending save").toHaveLength(1);
     for (const snapshot of snapshots) {
       expect(snapshot.settledWindows?.[0]?.pending?.payload.marker).toBe("latest");
@@ -900,6 +903,374 @@ describe("actor settled round 4 durability and cancellation regressions", () => 
     expect.soft(first.actors.status(first.actor.id).lastError).toEqual(expect.stringMatching(/r4 final close save unavailable/));
     vi.advanceTimersByTime(20_000);
     expect(first.markers()).toEqual(["leading"]);
+    vi.restoreAllMocks();
+    await first.close(); // Restore fault hooks, then retry cleanup explicitly.
+  });
+});
+
+describe("actor settled round 5 close and delivery identity regressions", () => {
+  type Snapshot = {
+    items: Array<{ id: string; source: string; payload: { marker?: string }; settledDeliveryId?: string }>;
+    settledWindows?: Array<{ sourceId: string; acceptedAt: number; intervalMs: number;
+      pending: { payload: { marker?: string }; observedAt: number; deliveryId?: string } }>;
+  };
+  const readQueue = (file: string): Snapshot => JSON.parse(fs.readFileSync(file, "utf8"));
+  const fixture = async (root?: string, actorId?: string) => {
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const current = setup(root, undefined, { releasePaused: true });
+    const actor = actorId ? current.actors.status(actorId) : await current.actors.create({
+      name: "r5-regression", instructions: "Observe.", events: ["agent_settled"],
+      coalesce: false, activation: { minIntervalMs: 1_000 },
+    });
+    current.actors.resumeQueued();
+    await Promise.resolve();
+    if (!root) {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      vi.setSystemTime(10_000);
+    }
+    const directory = path.join(current.root, "actors", actor.id);
+    const queueFile = () => path.join(directory, fs.readdirSync(directory).find(file => /^queue-.*\.json$/.test(file))!);
+    const markers = () => incoming(current.actors, actor.id).filter(message => !message.reason)
+      .map(message => (message.data as { marker?: string }).marker);
+    return { ...current, actor, directory, queueFile, markers };
+  };
+
+  it("r5-close: failed ordinary pending and durable close saves reject without release; recovery retry restores latest once", async () => {
+    const first = await fixture();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    const file = first.queueFile();
+    const original = fs.readFileSync(file, "utf8");
+    const write = atomicWrite.writeJsonAtomic;
+    const attempts: Array<{ durable: boolean; snapshot: Snapshot }> = [];
+    let unavailable = true;
+    const fault = vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      if (target === file) {
+        attempts.push({ durable: options?.durable === true, snapshot: JSON.parse(JSON.stringify(value)) });
+        if (unavailable) throw new Error("r5 all pending storage unavailable");
+      }
+      write(target, value, options);
+    });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "superseded" });
+    const latest = { ...payload(), marker: "latest" };
+    first.actors.dispatchHostEvent("agent_settled", latest);
+    latest.marker = "caller-mutation";
+    expect(attempts.filter(entry => !entry.durable).length).toBeGreaterThanOrEqual(2);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+    const monitorClose = vi.spyOn(ActorMeshMonitor.prototype, "close");
+    const agentsClose = vi.spyOn(first.agents, "close");
+    const release = vi.fn(); // The enclosing host may release custody only after close resolves.
+    const close = first.close().then(release);
+    await expect.soft(close).rejects.toThrow(/r5 all pending storage unavailable/);
+    expect.soft(release).not.toHaveBeenCalled();
+    expect.soft(monitorClose, "failed durable barrier must not release monitor/cleanup ownership").not.toHaveBeenCalled();
+    expect.soft(agentsClose).not.toHaveBeenCalled();
+    expect.soft(first.actors.listOwned().map(actor => actor.id)).toContain(first.actor.id);
+    expect.soft(first.actors.status(first.actor.id).queued, "failed close must retain the leading queue too").toBe(1);
+    expect(first.actors.status(first.actor.id).lastError).toMatch(/r5 all pending storage unavailable/);
+    expect(attempts.filter(entry => entry.durable)).toHaveLength(1);
+    expect(attempts.at(-1)?.snapshot.settledWindows?.[0]?.pending.payload.marker).toBe("latest");
+    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    vi.advanceTimersByTime(20_000);
+    expect(first.markers()).toEqual(["leading"]);
+    expect(scheduled.mock.calls, "failed close retains pending without a storage retry timer").toHaveLength(0);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+    unavailable = false;
+    fault.mockRestore();
+    await first.close().then(release); // An explicit retry, not an autonomous recovery timer.
+    expect.soft(release).toHaveBeenCalledTimes(1);
+    expect.soft(readQueue(file).settledWindows?.[0]?.pending.payload.marker).toBe("latest");
+    const second = await fixture(first.root, first.actor.id);
+    expect.soft(second.markers()).toEqual(["leading", "latest"]);
+    expect.soft(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "latest"]);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(second.markers()).toEqual(["leading", "latest"]);
+    await second.close();
+    const third = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect.soft(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "latest"]);
+    expect.soft(third.actors.status(first.actor.id).queued).toBe(2);
+    console.info("r5-close evidence", JSON.stringify({ releasedAfterFailure: release.mock.calls.length > 1,
+      durableAttempts: attempts.filter(entry => entry.durable).length,
+      restoredMarkers: readQueue(file).items.map(item => item.payload.marker) }));
+  });
+
+  it("r5-dup: transfer-before-predecessor-unlink crash executes latest exactly once with a real worker", async () => {
+    const first = await fixture();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "superseded" });
+    const file = first.queueFile();
+    const initialId = readQueue(file).settledWindows?.[0]?.pending.deliveryId;
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    await first.close();
+    const predecessorRoot = "session:r5-predecessor";
+    const key = createHash("sha256").update([predecessorRoot, "session"].join("\0")).digest("hex").slice(0, 16);
+    const predecessorFile = path.join(first.directory, `queue-${key}.json`);
+    // Transfer the existing accepted queue into the predecessor lineage. No fabricated
+    // pending identity or transferred queue item: ActorManager generates both.
+    fs.renameSync(file, predecessorFile);
+    const predecessor = readQueue(predecessorFile);
+    const deliveryId = predecessor.settledWindows?.[0]?.pending.deliveryId;
+    expect.soft(deliveryId, "pending must get a nonempty identity once").toEqual(expect.any(String));
+    expect.soft(deliveryId).not.toBe("");
+    expect.soft(deliveryId, "latest replacement must preserve the original pending identity").toBe(initialId);
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((row: { id: string }) => row.id === first.actor.id).adoptedFrom = [predecessorRoot];
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const remove = fs.rmSync;
+    const unlinkFailure = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === predecessorFile) throw new Error("r5 crash boundary before predecessor unlink");
+      remove(target, options);
+    });
+    const write = atomicWrite.writeJsonAtomic;
+    const transfers: Array<{ durable: boolean; snapshot: Snapshot }> = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      write(target, value, options);
+      if (target === file) transfers.push({ durable: options?.durable === true, snapshot: JSON.parse(JSON.stringify(value)) });
+    });
+    vi.setSystemTime(11_000);
+    const second = await fixture(first.root, first.actor.id);
+    const transfer = transfers.find(entry => entry.durable && entry.snapshot.items.some(item => item.payload.marker === "latest"));
+    expect(transfer, "must reach the real durable transfer before the injected unlink failure").toBeDefined();
+    expect(transfer!.snapshot.settledWindows).toBeUndefined();
+    const latest = transfer!.snapshot.items.find(item => item.payload.marker === "latest")!;
+    expect.soft(latest.settledDeliveryId, "queue receipt carries the predecessor's delivery identity").toEqual(expect.any(String));
+    expect.soft(latest.settledDeliveryId).toBe(deliveryId);
+    expect(fs.existsSync(predecessorFile)).toBe(true);
+    expect(readQueue(predecessorFile)).toEqual(predecessor); // Source pending is unchanged.
+    expect(second.actors.status(first.actor.id).lastError).toMatch(/before predecessor unlink/);
+    await second.close(); // Quiesce the old process with the failed unlink still installed.
+    expect(fs.existsSync(file) && fs.existsSync(predecessorFile)).toBe(true);
+    const crashOwn = fs.readFileSync(file, "utf8");
+    const crashPredecessor = fs.readFileSync(predecessorFile, "utf8");
+    unlinkFailure.mockRestore();
+    // Restart from BOTH existing files; no queue rewriting or synthetic dedup metadata.
+    const third = await fixture(first.root, first.actor.id);
+    vi.useRealTimers();
+    third.actors.resumeAfterRelease();
+    await waitFor(() => third.actors.status(first.actor.id).status === "idle" &&
+      third.actors.status(first.actor.id).queued === 0 && third.actors.inFlightCount() === 0);
+    const transcript = fs.readFileSync(path.join(first.directory, "session.jsonl"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)) as Array<{ message?: { role?: string; content?: unknown } }>;
+    const executed = transcript.filter(entry => entry.message?.role === "user")
+      .flatMap(entry => [...String(entry.message?.content).matchAll(/"marker":\s*"([^"]+)"/g)].map(match => match[1]));
+    expect.soft(executed.filter(marker => marker === "latest"), "actual worker transcript, not pending/queue counts").toHaveLength(1);
+    expect.soft(executed.filter(marker => marker === "leading")).toHaveLength(1);
+    expect.soft(executed).not.toContain("superseded");
+    console.info("r5-dup evidence", JSON.stringify({ deliveryId, settledDeliveryId: latest.settledDeliveryId, executed,
+      ownCrashHash: createHash("sha256").update(crashOwn).digest("hex"),
+      predecessorCrashHash: createHash("sha256").update(crashPredecessor).digest("hex") }));
+  });
+
+  it("r5-compat: legacy pending without deliveryId still restores at its original deadline exactly once", async () => {
+    const first = await fixture();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "legacy-latest" });
+    const file = first.queueFile();
+    await first.close();
+    const saved = readQueue(file);
+    delete saved.settledWindows![0]!.pending.deliveryId;
+    for (const item of saved.items) delete item.settledDeliveryId;
+    fs.writeFileSync(file, JSON.stringify(saved));
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(899);
+    expect(second.markers()).toEqual(["leading"]);
+    vi.advanceTimersByTime(1);
+    expect(second.markers()).toEqual(["leading", "legacy-latest"]);
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "legacy-latest"]);
+    await second.close();
+    const third = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(20_000);
+    expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "legacy-latest"]);
+    expect(third.actors.status(first.actor.id).queued).toBe(2);
+  });
+
+  it("r5-independent: fresh pending sources and subsequent windows do not inherit a prior delivery identity", async () => {
+    const first = await fixture();
+    first.actors.dispatchHostEvent("agent_settled", { ...payload("source-a"), marker: "a-leading" });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload("source-b"), marker: "b-leading" });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload("source-a"), marker: "a-latest" });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload("source-b"), marker: "b-latest" });
+    const file = first.queueFile();
+    const windows = readQueue(file).settledWindows!;
+    const ids = windows.map(window => window.pending.deliveryId);
+    expect.soft(ids).toEqual([expect.any(String), expect.any(String)]);
+    expect.soft(new Set(ids).size, "independent source windows need distinct identities").toBe(2);
+    await first.close();
+    const second = await fixture(first.root, first.actor.id);
+    vi.advanceTimersByTime(900);
+    expect(second.markers()).toEqual(["a-leading", "b-leading", "a-latest", "b-latest"]);
+    vi.advanceTimersByTime(100);
+    second.actors.dispatchHostEvent("agent_settled", { ...payload("source-a"), marker: "a-next-window" });
+    const nextId = readQueue(file).settledWindows![0]!.pending.deliveryId;
+    expect.soft(nextId).toEqual(expect.any(String));
+    expect.soft(ids).not.toContain(nextId);
+    vi.advanceTimersByTime(900);
+    expect(readQueue(file).items.map(item => item.payload.marker))
+      .toEqual(["a-leading", "b-leading", "a-latest", "b-latest", "a-next-window"]);
+  });
+});
+
+describe("actor settled round 5 bounded counterexamples", () => {
+  const fixture = async (root?: string, actorId?: string, coalesce = false) => {
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const current = setup(root, undefined, { releasePaused: true });
+    const actor = actorId ? current.actors.status(actorId) : await current.actors.create({
+      name: "r5-counterexample", instructions: "Observe.", events: ["agent_settled"],
+      coalesce, activation: { minIntervalMs: 1_000 },
+    });
+    current.actors.resumeQueued();
+    await Promise.resolve();
+    if (!root) {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      vi.setSystemTime(10_000);
+    }
+    const directory = path.join(current.root, "actors", actor.id);
+    const file = () => path.join(directory, fs.readdirSync(directory).find(name => /^queue-.*\.json$/.test(name))!);
+    return { ...current, actor, directory, file };
+  };
+  type Snapshot = {
+    items: Array<{ id: string; payload: { marker?: string }; settledDeliveryId?: string; settledDeliveryIds?: string[] }>;
+    mainRevision: number;
+    settledWindows?: Array<{ pending: { deliveryId?: string; payload: { marker?: string } } }>;
+  };
+  const readQueue = (file: string): Snapshot => JSON.parse(fs.readFileSync(file, "utf8"));
+
+  it("r5-partial-close: second actor barrier failure retains both pending through a revision rewrite and explicit retry", async () => {
+    const first = await fixture();
+    const other = await first.actors.create({ name: "r5-second-barrier", instructions: "Observe.",
+      events: ["agent_settled"], coalesce: false, activation: { minIntervalMs: 1_000 } });
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "latest" });
+    const otherDirectory = path.join(first.root, "actors", other.id);
+    const files = [first.file(), path.join(otherDirectory,
+      fs.readdirSync(otherDirectory).find(name => /^queue-.*\.json$/.test(name))!)];
+    const ids = files.map(file => readQueue(file).settledWindows![0]!.pending.deliveryId);
+    const write = atomicWrite.writeJsonAtomic;
+    const barriers: string[] = [];
+    let unavailable = true;
+    const fault = vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      if (files.includes(target) && options?.durable) {
+        barriers.push(target);
+        if (target === files[1] && unavailable) throw new Error("r5 second actor barrier unavailable");
+      }
+      write(target, value, options);
+    });
+    const monitorClose = vi.spyOn(ActorMeshMonitor.prototype, "close");
+    const agentsClose = vi.spyOn(first.agents, "close");
+    const released = vi.fn();
+    await expect(first.close().then(released)).rejects.toThrow(/second actor barrier unavailable/);
+    expect(barriers).toEqual(files); // First durable save succeeded before the second failed.
+    expect(released).not.toHaveBeenCalled();
+    expect(monitorClose).not.toHaveBeenCalled();
+    expect(agentsClose).not.toHaveBeenCalled();
+    expect(first.actors.listOwned().map(actor => actor.id)).toEqual(expect.arrayContaining([first.actor.id, other.id]));
+    const revisions = files.map(file => readQueue(file).mainRevision);
+    // Production revision persistence must serialize retained memory, including the
+    // first actor whose barrier already succeeded; do not manufacture pending bytes.
+    first.actors.dispatchHostEvent("input", payload("source-a", "user", "input"));
+    files.forEach((file, index) => {
+      const saved = readQueue(file);
+      expect(saved.mainRevision).toBeGreaterThan(revisions[index]!);
+      expect(saved.settledWindows).toEqual([expect.objectContaining({ pending: expect.objectContaining({
+        deliveryId: ids[index], payload: expect.objectContaining({ marker: "latest" }),
+      }) })]);
+    });
+    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    vi.advanceTimersByTime(20_000);
+    first.actors.resumeQueued();
+    expect(scheduled.mock.calls, "failed partial close cannot rearm a retry/deadline timer").toHaveLength(0);
+    for (const id of [first.actor.id, other.id]) {
+      expect(incoming(first.actors, id).map(message => (message.data as { marker: string }).marker)).toEqual(["leading"]);
+    }
+    unavailable = false;
+    fault.mockRestore();
+    await first.close().then(released);
+    expect(released).toHaveBeenCalledTimes(1);
+    const second = await fixture(first.root, first.actor.id);
+    for (const file of files) {
+      expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "latest"]);
+      expect(readQueue(file).settledWindows).toBeUndefined();
+    }
+    vi.advanceTimersByTime(20_000);
+    await second.close();
+    const third = await fixture(first.root, first.actor.id);
+    for (const id of [first.actor.id, other.id]) expect(third.actors.status(id).queued).toBe(2);
+    for (const file of files) expect(readQueue(file).items.map(item => item.payload.marker)).toEqual(["leading", "latest"]);
+    console.info("r5-partial-close evidence", JSON.stringify({ barriers: barriers.length, ids,
+      recovered: files.map(file => readQueue(file).items.map(item => item.payload.marker)) }));
+  });
+
+  it("r5-coalesce: superseding transfer retains unresolved predecessor receipt and real restart executes only current latest", async () => {
+    const first = await fixture(undefined, undefined, true);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    vi.advanceTimersByTime(100);
+    first.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "stale-predecessor" });
+    const file = first.file();
+    await first.close();
+    const predecessorRoot = "session:r5-coalesce-predecessor";
+    const key = createHash("sha256").update([predecessorRoot, "session"].join("\0")).digest("hex").slice(0, 16);
+    const predecessorFile = path.join(first.directory, `queue-${key}.json`);
+    fs.renameSync(file, predecessorFile);
+    const predecessorBytes = fs.readFileSync(predecessorFile, "utf8");
+    const oldId = readQueue(predecessorFile).settledWindows![0]!.pending.deliveryId;
+    expect(oldId).toEqual(expect.any(String));
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((row: { id: string }) => row.id === first.actor.id).adoptedFrom = [predecessorRoot];
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const remove = fs.rmSync;
+    const unlinkFailure = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === predecessorFile) throw new Error("r5 coalesce predecessor unlink unavailable");
+      remove(target, options);
+    });
+    const write = atomicWrite.writeJsonAtomic;
+    const transfers: Snapshot[] = [];
+    vi.spyOn(atomicWrite, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      write(target, value, options);
+      if (target === file && options?.durable) transfers.push(JSON.parse(JSON.stringify(value)));
+    });
+    vi.setSystemTime(11_000);
+    const second = await fixture(first.root, first.actor.id);
+    expect(transfers.some(saved => saved.items[0]?.settledDeliveryId === oldId &&
+      saved.items[0]?.payload.marker === "stale-predecessor" && !saved.settledWindows)).toBe(true);
+    expect(readQueue(file).items).toHaveLength(1);
+    vi.advanceTimersByTime(100);
+    second.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "current-latest" });
+    const newId = readQueue(file).settledWindows![0]!.pending.deliveryId;
+    expect(newId).toEqual(expect.any(String));
+    expect(newId).not.toBe(oldId);
+    vi.advanceTimersByTime(900);
+    const saved = readQueue(file);
+    expect(saved.items).toHaveLength(1);
+    expect(saved.items[0]).toMatchObject({ payload: { marker: "current-latest" },
+      settledDeliveryId: newId, settledDeliveryIds: expect.arrayContaining([oldId]) });
+    expect(saved.settledWindows).toBeUndefined();
+    expect(fs.readFileSync(predecessorFile, "utf8")).toBe(predecessorBytes);
+    await second.close();
+    expect(fs.existsSync(file) && fs.existsSync(predecessorFile)).toBe(true);
+    const ownCrashHash = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    unlinkFailure.mockRestore();
+    const third = await fixture(first.root, first.actor.id); // BOTH actual files, untouched destination metadata.
+    vi.useRealTimers();
+    third.actors.resumeAfterRelease();
+    await waitFor(() => third.actors.status(first.actor.id).status === "idle" &&
+      third.actors.status(first.actor.id).queued === 0 && third.actors.inFlightCount() === 0);
+    const transcript = fs.readFileSync(path.join(first.directory, "session.jsonl"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)) as Array<{ message?: { role?: string; content?: unknown } }>;
+    const executed = transcript.filter(entry => entry.message?.role === "user")
+      .flatMap(entry => [...String(entry.message?.content).matchAll(/"marker":\s*"([^"]+)"/g)].map(match => match[1]));
+    expect(executed).toEqual(["current-latest"]); // Coalescing legitimately supersedes old work, not two forced runs.
+    console.info("r5-coalesce evidence", JSON.stringify({ oldId, newId,
+      receipts: saved.items[0]!.settledDeliveryIds, ownCrashHash, executed }));
   });
 });
 
@@ -1174,8 +1545,9 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     second.actors.resumeQueued();
     await Promise.resolve();
     expect(fs.existsSync(predecessorFile)).toBe(true);
-    await second.close();
+    await expect(second.close()).rejects.toThrow(/checkpoint unavailable/);
     failed.mockRestore();
+    await second.close(); // Recovered storage must checkpoint before releasing this owner.
     const third = setup(first.root, undefined, { releasePaused: true });
     third.actors.resumeQueued();
     await Promise.resolve();

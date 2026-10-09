@@ -1227,6 +1227,9 @@ export class ResidentHost {
     // actor archives and agent collectors hold this same policy object.
     Object.assign(this.#retention, this.#currentRetention(now));
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
+    // Retained/uncertain writer custody is real preparation debt: progress its
+    // checked-exit cursor even between collection samples, never for an empty host.
+    if (live.size > 0) this.#armMaintenanceContinuation();
     if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
@@ -1242,13 +1245,16 @@ export class ResidentHost {
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
     // Continue only a bounded collector that actually has scan debt. An empty
     // host waits for the 60-second sample or a request/configuration event.
-    if (this.#requestRetention.due(now) && !this.#maintenanceContinuation) {
-      this.#maintenanceContinuation = setTimeout(() => {
-        this.#maintenanceContinuation = undefined;
-        this.#maintainRequests();
-      }, 100);
-      this.#maintenanceContinuation.unref?.();
-    }
+    if (this.#requestRetention.due(now)) this.#armMaintenanceContinuation();
+  }
+
+  #armMaintenanceContinuation(): void {
+    if (this.#closed || this.#maintenanceContinuation) return;
+    this.#maintenanceContinuation = setTimeout(() => {
+      this.#maintenanceContinuation = undefined;
+      this.#maintainRequests();
+    }, 100);
+    this.#maintenanceContinuation.unref?.();
   }
 
   /** The accepted retention overlay, re-read only when config.json was replaced or changed:

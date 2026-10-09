@@ -58,56 +58,91 @@ const tryMeshLock = (lock: string, record: string): boolean => {
   }
 };
 
+/** `pinFenceLock`'s verdict for a lock whose directory no longer holds our record: we do not hold it. */
+export const FOREIGN_LOCK = -1;
+const PIN_ROOT = "/proc/self/fd";
+
 /**
- * Release by a verified take of the owner file, then `rmdir` (pi-fabric#694 P1, smarty-dev#6477). The lock
- * DIRECTORY is never renamed, so a successor's lock is never detached.
- *
- * 1. Read `<lock>/owner`; anything but our exact record (a unique token) means it is not ours: return.
- * 2. Take the owner file by rename to a private name beside the lock (the only atomic conditional unlink:
- *    a path unlink cannot check what it removes). Re-read the taken file: it is the verdict.
- * 3. Ours: unlink the taken file, then `rmdir(<lock>)`. rmdir fails closed (ENOTEMPTY) if a successor
- *    already published its owner there; a successor still between its mkdir and its owner write loses its
- *    directory and its `wx` owner write fails (ENOENT), so it never enters (tryMeshLock above,
- *    mesh-lock.ts:254-268). Protocol-2 and custody acquirers publish complete directories by rename.
- *    The directory is ownerless only between the take and the rmdir; the take itself refreshes its mtime,
- *    so the ownerless-directory grace (mesh-lock.ts:353) cannot pass inside that window.
- * 4. Not ours (only if the precondition below was broken): put the foreign record back with a no-clobber
- *    hard link and leave its directory in place; if the name has another owner now, keep the taken file.
- *
- * Precondition (why the step 1 -> 2 gap is not a real window): a LIVE owner's lock is never replaced. Only
- * three code paths remove a canonical `.lock` or `custody.lock` that holds an owner record, in this tree and
- * in the 13d1bbef release (byte-identical mesh-lock.ts, custody-lock.ts and core/atomic-write.ts):
- * - the holder's own release, gated on its unique token (here; mesh-lock.ts:217-229; custody-lock.ts:91-101);
- * - MeshLock #clearStaleLock (mesh-lock.ts:343-413): renames a complete receipt only if its pid is dead
- *   (`process.kill(pid, 0)` gives ESRCH, :86-96) or alive with a VALID recorded incarnation that differs
- *   from the native reading, i.e. pid reuse (:378-398). A live pid with no incarnation line (the fence's
- *   three-line wire) returns at :379. Age (staleLockMs) gates only the EMPTY ownerless directory (:352-353),
- *   removed by rmdir (:359), which fails on a directory that holds an owner file;
- * - clearDeadCustodyLock (custody-lock.ts:107-134): the same dead/different-incarnation rule (:119-126), no
- *   age rule, never an ownerless directory (:113).
- * The age-based reapers (core/atomic-write.ts withExclusiveFileLock, state-sqlite.ts tryLockFile) never
- * name `.lock` or `custody.lock`. The fence's synchronous acquirer recovers nothing (holdMeshFenceSync
- * below). So while the owner's pid is alive in the same pid namespace, its record stays at `<lock>/owner`
- * until it releases (tests/mesh-fence-lock.test.ts proves it for both trees). `hooks` is a test seam for
- * the interleavings.
+ * Pin the lock DIRECTORY we just created (pi-fabric#694 P1, smarty-dev#6477): an fd on it, verified to hold our
+ * record through `/proc/self/fd/<fd>/owner`. The fd follows the directory inode, never the shared name, so every
+ * later step on `<pin>/owner` can only touch the file inside OUR directory. Returns the fd; `undefined` where
+ * `/proc/self/fd` cannot traverse a directory (not Linux): the release falls back to the shared path;
+ * FOREIGN_LOCK when the directory at the name does not hold our record (then we never held it).
  */
-export const releaseFenceLock = (lock: string, token: string, record: string,
-  hooks: { afterCheck?: () => void; afterTake?: () => void } = {}): void => {
+export const pinFenceLock = (lock: string, record: string): number | undefined => {
+  if (process.platform !== "linux") return undefined;
+  let fd: number;
+  try { fd = fs.openSync(lock, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)); } catch { return FOREIGN_LOCK; }
+  let owner: string | undefined;
+  try { owner = fs.readFileSync(path.join(PIN_ROOT, String(fd), "owner"), "utf8"); } catch (error) {
+    if (codeOf(error) !== "ENOENT" || !fs.existsSync(path.join(PIN_ROOT, String(fd)))) { fs.closeSync(fd); return undefined; }
+  }
+  if (owner === record) return fd;
+  fs.closeSync(fd);
+  return FOREIGN_LOCK;
+};
+
+const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undefined && a.isDirectory() && a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * Release without any step that can detach a successor (pi-fabric#694 P1, smarty-dev#6477, third design).
+ * The shared name is never renamed, and no file is ever moved out of `<lock>`.
+ *
+ * Pinned (Linux, `pin` from pinFenceLock):
+ * 1. `<pin>/owner` must be our record (a unique token). It is read through the fd: OUR directory inode, wherever
+ *    it is now. Nothing ever takes an owner file out of a directory: every recoverer renames or rmdirs the whole
+ *    directory (mesh-lock.ts:359,408; custody-lock.ts:96,129; the same in 13d1bbef), and every writer of
+ *    `owner` uses `wx`, which fails while ours exists. So our verified record stays our record until we unlink it.
+ * 2. Our directory must still be at `<lock>` (same dev and inode). Moved away (a recoverer's `.dead.` receipt) or
+ *    replaced: leave everything alone, the receipt stays non-empty and the successor untouched.
+ * 3. Unlink `<pin>/owner`: through the fd, so it can only remove the file verified in step 1.
+ * 4. `rmdir(<lock>)` only while the name still holds our inode. rmdir fails closed (ENOTEMPTY) on any record,
+ *    so it can never remove a recorded successor; at worst it removes the EMPTY directory of a protocol-1
+ *    acquirer between its mkdir and its owner write, whose `wx` write then fails (ENOENT) and it never enters.
+ * Residual: only step 3 can follow a broken precondition, and only when our directory is renamed to a `.dead.`
+ * receipt between steps 2 and 3, i.e. a recoverer removed a LIVE owner's lock (no code path does: mesh-lock.ts:
+ * 343-413, custody-lock.ts:107-134, proven by tests/mesh-fence-lock.test.ts for both trees). Even then it
+ * empties our own receipt; it never touches a successor's record.
+ *
+ * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `owner.released.<token>`, never
+ * out of the directory), verified, and either removed with an rmdir or linked back without clobbering; a foreign
+ * record that cannot go back stays in `<lock>`, so the directory stays non-empty and nobody else can mkdir,
+ * publish into or rmdir it. Residual there: only after a live owner's lock was replaced (the same precondition)
+ * and only against a protocol-1 writer paused since an mkdir whose directory was reaped.
+ * `hooks` is a test seam for the interleavings.
+ */
+export const releaseFenceLock = (lock: string, record: string,
+  hooks: { afterCheck?: () => void; afterTake?: () => void } = {}, pin?: number): void => {
+  if (pin === FOREIGN_LOCK) return;
+  if (pin !== undefined) {
+    try {
+      const pinned = path.join(PIN_ROOT, String(pin));
+      try { if (fs.readFileSync(path.join(pinned, "owner"), "utf8") !== record) return; } catch { return; }
+      const ours = fs.fstatSync(pin);
+      hooks.afterCheck?.();
+      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return; // moved or replaced: not ours to touch
+      try { fs.unlinkSync(path.join(pinned, "owner")); } catch { return; }
+      hooks.afterTake?.();
+      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return;
+      try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
+    } finally { try { fs.closeSync(pin); } catch { /* already closed */ } }
+    return;
+  }
   const ownerPath = path.join(lock, "owner");
-  try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; /* already recovered or replaced */ }
+  try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; }
   hooks.afterCheck?.();
-  const taken = `${lock}.released.${token}`;
-  try { fs.renameSync(ownerPath, taken); } catch { return; /* already recovered or replaced */ }
+  const taken = path.join(lock, `owner.released.${record.split("\n")[0] ?? ""}`);
+  try { fs.renameSync(ownerPath, taken); } catch { return; }
   hooks.afterTake?.();
   let ours = false;
   try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
   if (ours) {
-    try { fs.unlinkSync(taken); } catch { /* private name; best effort */ }
-    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it, or it is gone: never ours to remove */ }
+    try { fs.unlinkSync(taken); } catch { /* best effort */ }
+    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
     return;
   }
   try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
-  catch { /* the name has another owner or is gone: keep the foreign record, never overwrite one */ }
+  catch { /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }
 };
 
 /**
@@ -138,7 +173,10 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, now - last);
       attempts += 1;
       last = now;
-      if (attempt(token, record)) return () => releaseFenceLock(lock, token, record);
+      if (attempt(token, record)) {
+        const pin = pinFenceLock(lock, record);
+        if (pin !== FOREIGN_LOCK) return () => releaseFenceLock(lock, record, {}, pin);
+      }
       if (Date.now() >= deadline) {
         let pid: string | undefined;
         try { pid = fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[1]; } catch { /* ownerless or gone */ }

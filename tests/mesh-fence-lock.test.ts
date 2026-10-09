@@ -6,16 +6,18 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { processIncarnation } from "../src/core/atomic-write.js";
 import * as currentCustody from "../src/mesh/custody-lock.js";
-import { holdMeshFenceSync, releaseFenceLock } from "../src/mesh/fence-lock.js";
+import { FOREIGN_LOCK, holdMeshFenceSync, MeshFenceBusyError, pinFenceLock, releaseFenceLock } from "../src/mesh/fence-lock.js";
 import * as currentMeshLock from "../src/mesh/mesh-lock.js";
 
-// pi-fabric#694 P1 (smarty-dev#6477): a release takes its own owner file and rmdirs the lock; it never renames
-// the lock directory, so a successor that appears at any interleaving point keeps its lock and its owner file.
-// The precondition, that no acquirer recovers a LIVE owner's fence locks, is proven below for this tree and
-// for the 13d1bbef release that can run on the same root during the cutover.
+// pi-fabric#694 P1 (smarty-dev#6477), third design: the release pins its OWN lock directory by an fd and removes only
+// `<pin>/owner` (through /proc/self/fd), then rmdirs the name only while it still holds that inode. No step moves
+// a file out of `<lock>` or renames the shared name, so a successor's record never leaves `<lock>/owner` and no
+// two parties ever both hold the lock. The precondition (no acquirer recovers a LIVE owner's fence locks) is proven
+// below for this tree and for the 13d1bbef release that can run on the same root during the cutover.
 
 const OLD_TREE = process.env.PI_FABRIC_OLD_RELEASE_TREE ?? "/home/paul/lanes/r13d1";
 const oldTree = fs.existsSync(path.join(OLD_TREE, "src/mesh/mesh-lock.ts")) ? OLD_TREE : undefined;
+const linux = process.platform === "linux";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -30,64 +32,128 @@ const hold = (lock: string, record: string): void => {
   fs.writeFileSync(path.join(lock, "owner"), record, { mode: 0o600 });
 };
 const owner = (lock: string): string => fs.readFileSync(path.join(lock, "owner"), "utf8");
+/** A protocol-1 acquirer (mkdir, then a `wx` owner): true only when it now holds the lock. */
+const tryAcquire = (lock: string, record: string): boolean => {
+  try { fs.mkdirSync(lock, { mode: 0o700 }); } catch { return false; }
+  try { fs.writeFileSync(path.join(lock, "owner"), record, { flag: "wx" }); return true; } catch { return false; }
+};
+/** A protocol-1 acquirer paused since an earlier mkdir: it resumes with its `wx` owner write into whatever is at `<lock>`. */
+const resumeWrite = (lock: string, record: string): boolean => {
+  try { fs.writeFileSync(path.join(lock, "owner"), record, { flag: "wx" }); return true; } catch { return false; }
+};
+/** Every owner record under the root, by relative path: the no-overlap and no-detach ledger. */
+const records = (root: string): Record<string, string> => {
+  const found: Record<string, string> = {};
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else found[path.relative(root, full)] = fs.readFileSync(full, "utf8");
+    }
+  };
+  walk(root);
+  return found;
+};
+const acquireA = (lock: string): number | undefined => {
+  hold(lock, "A\n");
+  const pin = pinFenceLock(lock, "A\n");
+  expect(pin).not.toBe(FOREIGN_LOCK);
+  return pin;
+};
 
-describe("releaseFenceLock (pi-fabric#694 P1)", () => {
-  it("removes the releaser's own lock", () => {
+describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () => {
+  it("pins the lock directory on Linux and removes the releaser's own lock", () => {
     const lock = lockIn();
-    hold(lock, "mine\n");
-    releaseFenceLock(lock, "t1", "mine\n");
+    const pin = acquireA(lock);
+    if (linux) expect(pin).toBeGreaterThanOrEqual(0);
+    releaseFenceLock(lock, "A\n", {}, pin);
     expect(fs.readdirSync(path.dirname(lock))).toEqual([]);
   });
 
-  it("a successor that replaces the lock between the owner check and the take keeps its lock and owner", () => {
+  it("a directory without our record is never pinned (we never held it)", () => {
     const lock = lockIn();
-    hold(lock, "mine\n");
-    releaseFenceLock(lock, "t1", "mine\n", { afterCheck: () => {
-      // Only possible if the precondition breaks: a recoverer removed ours and a successor holds the lock.
-      fs.rmSync(lock, { recursive: true });
-      hold(lock, "successor\n");
-    } });
-    expect(owner(lock)).toBe("successor\n");
-    expect(fs.readdirSync(path.dirname(lock))).toEqual([".lock"]);
+    hold(lock, "B\n");
+    expect(pinFenceLock(lock, "A\n")).toBe(linux ? FOREIGN_LOCK : undefined);
+    expect(owner(lock)).toBe("B\n");
   });
 
-  it("a successor that publishes into the directory after the take keeps its lock and owner (rmdir fails closed)", () => {
-    const lock = lockIn();
-    hold(lock, "mine\n");
-    releaseFenceLock(lock, "t1", "mine\n", { afterTake: () => {
-      // A resumed protocol-1 initializer writes its owner into the (now ownerless) canonical directory.
-      fs.writeFileSync(path.join(lock, "owner"), "successor\n", { flag: "wx" });
-    } });
-    expect(owner(lock)).toBe("successor\n");
-    expect(fs.readdirSync(path.dirname(lock))).toEqual([".lock"]);
-  });
-
-  it("a successor that recreates the lock after the take (ours already gone) keeps it", () => {
-    const lock = lockIn();
-    hold(lock, "mine\n");
-    releaseFenceLock(lock, "t1", "mine\n", { afterTake: () => {
-      fs.rmdirSync(lock);
-      hold(lock, "successor\n");
-    } });
-    expect(owner(lock)).toBe("successor\n");
-    expect(fs.readdirSync(path.dirname(lock))).toEqual([".lock"]);
-  });
-
-  it("a foreign record taken by mistake is never deleted nor written over a newer owner", () => {
-    const lock = lockIn();
-    hold(lock, "mine\n");
-    releaseFenceLock(lock, "t1", "mine\n", {
-      afterCheck: () => { fs.rmSync(lock, { recursive: true }); hold(lock, "successor\n"); },
-      afterTake: () => fs.writeFileSync(path.join(lock, "owner"), "newer\n", { flag: "wx" }),
+  // The reviewer's interleaving: B replaces the lock after A's check, C tries to publish before A finishes.
+  for (const how of ["renamed to a .dead receipt", "removed"] as const) {
+    it.skipIf(!linux)(`A release vs B acquire vs C acquire, A's directory ${how} after the check: B alone holds, its record stays in <lock>`, () => {
+      const lock = lockIn();
+      const root = path.dirname(lock);
+      const pin = acquireA(lock);
+      let bHolds = false;
+      let cHolds = false;
+      releaseFenceLock(lock, "A\n", {
+        afterCheck: () => {
+          // Only possible if the precondition breaks: a recoverer took A's live lock.
+          if (how === "removed") fs.rmSync(lock, { recursive: true });
+          else fs.renameSync(lock, `${lock}.dead.x`);
+          bHolds = tryAcquire(lock, "B\n");
+          cHolds = tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
+        },
+      }, pin);
+      cHolds ||= tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
+      expect([bHolds, cHolds]).toEqual([true, false]);
+      expect(records(root)).toEqual(how === "removed" ? { ".lock/owner": "B\n" } : { ".lock/owner": "B\n", ".lock.dead.x/owner": "A\n" });
     });
-    expect(owner(lock)).toBe("newer\n");
-    expect(fs.readFileSync(`${lock}.released.t1`, "utf8")).toBe("successor\n");
+  }
+
+  it("a paused protocol-1 writer that publishes into the emptied directory alone holds it (rmdir fails closed)", () => {
+    const lock = lockIn();
+    const root = path.dirname(lock);
+    const pin = acquireA(lock);
+    let cHolds = false;
+    let bHolds = false;
+    releaseFenceLock(lock, "A\n", { afterTake: () => {
+      cHolds = resumeWrite(lock, "C\n");
+      bHolds = tryAcquire(lock, "B\n") || resumeWrite(lock, "B\n");
+    } }, pin);
+    bHolds ||= tryAcquire(lock, "B\n");
+    expect([cHolds, bHolds]).toEqual([true, false]);
+    expect(records(root)).toEqual({ ".lock/owner": "C\n" });
   });
 
-  it("holdMeshFenceSync leaves a lock that replaced its own during the operation", () => {
+  it("a successor that recreates the name after the unlink is never removed (inode check before rmdir)", () => {
+    const lock = lockIn();
+    const root = path.dirname(lock);
+    const pin = acquireA(lock);
+    let bHolds = false;
+    let cHolds = false;
+    releaseFenceLock(lock, "A\n", { afterTake: () => {
+      fs.rmdirSync(lock); // an aged-grace recoverer removes the empty directory
+      bHolds = tryAcquire(lock, "B\n");
+      cHolds = tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
+    } }, pin);
+    cHolds ||= tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
+    expect([bHolds, cHolds]).toEqual([true, false]);
+    expect(records(root)).toEqual({ ".lock/owner": "B\n" });
+  });
+
+  it("unpinned fallback: a successor's record taken inside <lock> goes back and C never enters", () => {
+    const lock = lockIn();
+    const root = path.dirname(lock);
+    hold(lock, "A\n");
+    let bHolds = false;
+    let cHolds = false;
+    releaseFenceLock(lock, "A\n", {
+      afterCheck: () => { fs.rmSync(lock, { recursive: true }); bHolds = tryAcquire(lock, "B\n"); },
+      afterTake: () => {
+        expect(Object.keys(records(root)).every((name) => name.startsWith(".lock/"))).toBe(true); // never out of <lock>
+        cHolds = tryAcquire(lock, "C\n");
+      },
+    }, undefined);
+    cHolds ||= tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
+    expect([bHolds, cHolds]).toEqual([true, false]);
+    expect(records(root)).toEqual({ ".lock/owner": "B\n" });
+  });
+
+  it("holdMeshFenceSync excludes a second holder and leaves a lock that replaced its own during the operation", () => {
     const lock = lockIn();
     const root = path.dirname(lock);
     holdMeshFenceSync(root, 0, () => {
+      expect(() => holdMeshFenceSync(root, 0, () => undefined)).toThrow(MeshFenceBusyError);
       fs.rmSync(lock, { recursive: true });
       hold(lock, "successor\n");
     });

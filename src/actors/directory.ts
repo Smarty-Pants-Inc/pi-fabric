@@ -98,7 +98,7 @@ export class ActorDirectory extends ActorManager {
       : this.#secondary.create(request, fencedOptions);
   }
   override list(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
-  override listOwned(): FabricActorInfo[] { return [...super.listOwned(), ...this.#secondary.listOwned()]; }
+  override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);

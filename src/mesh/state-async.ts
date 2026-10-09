@@ -2,7 +2,7 @@ import type { MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import type { StateBackendDeleteInput, StateBackendPutInput } from "./state-backend.js";
-import { NatsKvStateStore, type NatsKvStateStoreOptions } from "./state-nats-kv.js";
+import { NatsKvStateStore, type NatsKvListPage, type NatsKvStateStoreOptions } from "./state-nats-kv.js";
 import { MeshStore } from "./store.js";
 
 /** Common SINGLE-KEY contract. Not a substitute for StateBackend's sync reads or writeBatch. */
@@ -12,6 +12,8 @@ export interface AsyncMeshStateStore {
   put(input: StateBackendPutInput): Promise<MeshStateEntry>;
   delete(input: StateBackendDeleteInput): Promise<{ deleted: boolean; version?: number }>;
   list(prefix?: string, limit?: number): Promise<MeshStateEntry[]>;
+  /** Optional bounded-enumeration capability; required by the explicit NATS mesh provider. */
+  listPage?(prefix?: string, limit?: number, startRevision?: number): Promise<NatsKvListPage>;
   listAll(prefix?: string): Promise<MeshStateEntry[]>;
   close(): Promise<void>;
 }

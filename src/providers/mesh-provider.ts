@@ -8,6 +8,7 @@ import { invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-p
 import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import type { AsyncMeshStateStore, AsyncMeshStateStoreOptions } from "../mesh/state-async.js";
+import { MeshListingIncompleteError } from "../mesh/listing.js";
 
 /** Audited independent single-key state only; host/typed state never moves with this opt-in. */
 const ASYNC_STATE_PREFIX = "shared/";
@@ -181,6 +182,10 @@ export class MeshProvider implements FabricProvider {
     // Optional network/client work starts only after this explicitly awaited factory call.
     const { openAsyncMeshStateStore } = await import("../mesh/state-async.js");
     const state = await openAsyncMeshStateStore(store.root, options);
+    if (!state.listPage) {
+      await state.close();
+      throw new Error("Async mesh tools require bounded listPage capability");
+    }
     const provider = new MeshProvider(store, identity, participants);
     provider.#asyncState = state;
     return provider;
@@ -190,9 +195,18 @@ export class MeshProvider implements FabricProvider {
     return this.#asyncState !== undefined && key.startsWith(ASYNC_STATE_PREFIX);
   }
 
+  async #listAsyncState(prefix: string, limit: number) {
+    // Factory requires this capability. Never discard the backend's exhaustion signal.
+    const page = await this.#asyncState!.listPage!(prefix, limit);
+    if (page.nextRevision !== undefined) {
+      throw new MeshListingIncompleteError(prefix, limit, page.examined, page.nextRevision);
+    }
+    return page.entries;
+  }
+
   async #listState(prefix: string, limit: number) {
     if (this.#asyncState && prefix.startsWith(ASYNC_STATE_PREFIX)) {
-      return (await this.#asyncState.list(prefix, limit))
+      return (await this.#listAsyncState(prefix, limit))
         .filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix))
         .sort((a, b) => a.key.localeCompare(b.key));
     }
@@ -200,7 +214,7 @@ export class MeshProvider implements FabricProvider {
     if (!this.#asyncState) return local;
     const selected = local.filter(entry => !entry.key.startsWith(ASYNC_STATE_PREFIX));
     if (prefix.startsWith(ASYNC_STATE_PREFIX) || ASYNC_STATE_PREFIX.startsWith(prefix)) {
-      const remote = await this.#asyncState.list(prefix.length < ASYNC_STATE_PREFIX.length ? ASYNC_STATE_PREFIX : prefix, limit);
+      const remote = await this.#listAsyncState(prefix.length < ASYNC_STATE_PREFIX.length ? ASYNC_STATE_PREFIX : prefix, limit);
       selected.push(...remote.filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix)));
     }
     // Mixed listings are not atomic cross-backend snapshots; remote values cannot shadow host state.

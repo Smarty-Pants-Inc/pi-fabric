@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, MeshBatchConflictError, type MeshStateEntry } from "../src/mesh/store.js";
 import { openNatsMeshProvider } from "../src/mesh/state-async.js";
+import { MeshListingIncompleteError } from "../src/mesh/listing.js";
 import type { MeshProvider } from "../src/providers/mesh-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -42,6 +43,21 @@ describe.skipIf(!servers)("real loopback R3 async mesh provider (no mocks)", () 
     await expect(provider.invoke("put", { key, value: 2, ifVersion: 0 }, context)).rejects.toBeInstanceOf(MeshBatchConflictError);
     const recreated = await provider.invoke("put", { key, value: 2, ifVersion: deleted.version }, context) as MeshStateEntry;
     expect(await provider.invoke("get", { key }, context)).toEqual(recreated);
+  });
+  it.each(["sibling", "tombstone"])("raises a typed incomplete-list error when an earlier %s hides a later partial-prefix match", async mode => {
+    const { local, provider } = await open();
+    const earlier = await provider.invoke("put", { key: "shared/a", value: "earlier", ifVersion: 0 }, context) as MeshStateEntry;
+    if (mode === "tombstone") await provider.invoke("delete", { key: earlier.key, ifVersion: earlier.version }, context);
+    const match = await provider.invoke("put", { key: "shared/match", value: "later match", ifVersion: 0 }, context) as MeshStateEntry;
+    expect(await provider.invoke("get", { key: match.key }, context)).toEqual(match);
+    const pending = provider.invoke("list", { prefix: "shared/m", limit: 1 }, context);
+    await expect(pending).rejects.toBeInstanceOf(MeshListingIncompleteError);
+    await expect(pending).rejects.toMatchObject({ code: "MESH_LISTING_INCOMPLETE", prefix: "shared/m", limit: 1, examined: 1, nextRevision: match.version });
+    expect(await provider.invoke("list", { prefix: "shared/m", limit: 2 }, context)).toEqual([match]);
+    expect(await provider.invoke("list", { prefix: "shared/missing/", limit: 1 }, context)).toEqual([]);
+    await local.put({ key: "local/a", value: "must not mask incomplete remote scan", identity });
+    await expect(provider.invoke("list", { prefix: "", limit: 1 }, context)).rejects.toBeInstanceOf(MeshListingIncompleteError);
+    if (process.env.FABRIC_NATS_EVIDENCE_DIR) fs.writeFileSync(path.join(process.env.FABRIC_NATS_EVIDENCE_DIR, `provider-list-incomplete-${mode}.json`), JSON.stringify({ mode, earlier, match, code: "MESH_LISTING_INCOMPLETE", examined: 1, nextRevision: match.version, completeAtLimit: 2, mixedRejected: true }, null, 2) + "\n");
   });
   it("fences eight independent provider connections, retaining only one stale-CAS winner", async () => {
     const first = await open(); const peers = [first, ...await Promise.all(Array.from({ length: 7 }, () => open(first.root)))];

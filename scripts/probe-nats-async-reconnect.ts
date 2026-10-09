@@ -50,12 +50,27 @@ export async function probeNatsAsyncReconnect(options: {
     // Exercise the BUILT public export, not just source transpilation.
     const builtPath = path.resolve("dist/mesh.js"); assert.ok(fs.existsSync(builtPath), `Build first: ${builtPath}`);
     const built = await import(builtPath);
-    for (const name of ["openNatsMeshProvider", "openAsyncMeshStateStore", "NatsKvStateStore", "MeshStore"]) assert.equal(typeof built[name], "function", `built public symbol ${name}`);
+    for (const name of ["openNatsMeshProvider", "openAsyncMeshStateStore", "NatsKvStateStore", "MeshStore", "MeshListingIncompleteError"]) assert.equal(typeof built[name], "function", `built public symbol ${name}`);
     const builtLocal = new built.MeshStore(root, 128 * 1024, 100);
     const builtProvider = await built.openNatsMeshProvider(builtLocal, identity, participants, { backend: "nats-kv", nats: { servers: options.servers, experimentalNatsKv: true } });
-    try { assert.deepEqual(await builtProvider.invoke("get", { key }, context), next); }
+    try {
+      assert.deepEqual(await builtProvider.invoke("get", { key }, context), next);
+      const match = await builtProvider.invoke("put", { key: "shared/match", value: "built later match", ifVersion: 0 }, context) as MeshStateEntry;
+      assert.deepEqual(await builtProvider.invoke("get", { key: match.key }, context), match);
+      await assert.rejects(builtProvider.invoke("list", { prefix: "shared/m", limit: 1 }, context), (error: unknown) => {
+        assert.ok(error instanceof built.MeshListingIncompleteError);
+        assert.equal((error as { code: string }).code, "MESH_LISTING_INCOMPLETE");
+        return true;
+      });
+      const firstPage = await reopened.listPage("shared/m", 1);
+      assert.equal(firstPage.examined, 1); assert.deepEqual(firstPage.entries, []); assert.ok(firstPage.nextRevision);
+      const continued = await reopened.listPage("shared/m", 1, firstPage.nextRevision);
+      assert.deepEqual(continued.entries, [match]); assert.equal(continued.nextRevision, undefined);
+      assert.deepEqual(await builtProvider.invoke("list", { prefix: "shared/m", limit: 2 }, context), [match]);
+      fs.writeFileSync(path.join(options.output, "built-provider-list-incomplete.json"), JSON.stringify({ result: "PASS", code: "MESH_LISTING_INCOMPLETE", firstPage, continued, match }, null, 2) + "\n");
+    }
     finally { await builtProvider.close(); builtLocal.closeState(); }
-    fs.writeFileSync(path.join(options.output, "async-reconnect.json"), JSON.stringify({ result: "PASS", allThreeNodesRestarted: true, sameClientReconnected: true, offlineError, transport, before: first, after: next, reopened: await reopened.get(key), builtPublicProbe: "PASS", faultDomains: "one physical host only" }, null, 2) + "\n");
+    fs.writeFileSync(path.join(options.output, "async-reconnect.json"), JSON.stringify({ result: "PASS", allThreeNodesRestarted: true, sameClientReconnected: true, offlineError, transport, before: first, after: next, reopened: await reopened.get(key), builtPublicProbe: "PASS", builtIncompleteListingProbe: "PASS", faultDomains: "one physical host only" }, null, 2) + "\n");
   } finally {
     await status.return?.(); await provider?.close(); await reopened?.close(); await store.close();
     local.closeState(); fs.rmSync(root, { recursive: true, force: true });

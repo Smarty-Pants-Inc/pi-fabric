@@ -1,3 +1,4 @@
+export { MeshListingIncompleteError } from "./mesh/listing.js";
 export { openAsyncMeshStateStore, openNatsMeshProvider } from "./mesh/state-async.js";
 export type { AsyncMeshStateStore, AsyncMeshStateStoreOptions } from "./mesh/state-async.js";
 export { NatsKvStateStore, NatsKvListTimeoutError, encodeNatsKvKey, decodeNatsKvKey, natsKvPrefixFilter, natsKvBucketForRoot,

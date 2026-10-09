@@ -50,11 +50,9 @@ const port = async () => {
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-u2-r3-"));
 const ports = await Promise.all(Array.from({ length: 9 }, port));
 if (new Set(ports).size !== 9) throw new Error("Ephemeral ports collided; retry runner with a new allocation");
-type RunningNode = { child: ReturnType<typeof spawn>; done: Promise<void>; ready: Promise<void> };
+type RunningNode = { child: ReturnType<typeof spawn>; done: Promise<void>; ready: Promise<void>; metadata: Promise<void> };
 const nodes: RunningNode[] = [], current: RunningNode[] = [];
 const streamLeaderWaiters = new Map<string, () => void>();
-let leaderReady!: () => void;
-let metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
 const env = { ...process.env, FABRIC_NATS_TEST_SERVERS: ports.slice(0, 3).map(p => `nats://127.0.0.1:${p}`).join(","),
   FABRIC_NATS_TEST_MONITORS: ports.slice(3, 6).map(p => `http://127.0.0.1:${p}`).join(","), FABRIC_NATS_EVIDENCE_DIR: output };
 const run = async (command: string, args: string[], name: string, extra: Record<string, string> = {}) => {
@@ -71,13 +69,14 @@ const startNode = (n: number) => {
   execFileSync(binary!, ["-t", "-c", configPath], { stdio: "pipe" });
   const log = fs.createWriteStream(path.join(output, `nats-node-${n}.log`), { flags: "a" });
   const child = spawn(binary!, ["-c", configPath], { stdio: ["ignore", "pipe", "pipe"] });
-  let ready!: () => void, failed!: (error: Error) => void;
+  let ready!: () => void, metadataReady!: () => void, failed!: (error: Error) => void;
+  const metadata = new Promise<void>(resolve => { metadataReady = resolve; });
   const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; }); started.catch(() => undefined);
   let tail = "";
   const consume = (data: Buffer) => {
     log.write(data); tail = (tail + data.toString()).slice(-8_192);
     if (/Server is ready/.test(tail)) ready();
-    if (/JetStream cluster new metadata leader/.test(tail)) leaderReady();
+    if (/JetStream cluster new metadata leader|Self is new JetStream cluster metadata leader/.test(tail)) metadataReady();
     for (const [stream, ready] of streamLeaderWaiters) {
       if (tail.split("\n").some(line => line.includes("JetStream cluster new stream leader") && line.includes(stream))) {
         streamLeaderWaiters.delete(stream); ready();
@@ -89,7 +88,7 @@ const startNode = (n: number) => {
     child.once("error", error => { failed(error); log.end(); reject(error); });
     child.once("close", code => { failed(new Error(`Node ${n} exited ${code} before ready`)); log.end(resolve); });
   }); done.catch(() => undefined);
-  const node = { child, done, ready: started };
+  const node = { child, done, ready: started, metadata };
   nodes.push(node); current[n] = node;
   return node;
 };
@@ -106,7 +105,8 @@ const stopNodes = async (owned: RunningNode[]) => {
 
 try {
   for (let n = 0; n < 3; n++) startNode(n);
-  await deadline(Promise.all([...nodes.map(node => node.ready), metadataLeader]), 60_000);
+  // Every client endpoint must know current-generation metadata authority, not just one node.
+  await deadline(Promise.all(nodes.flatMap(node => [node.ready, node.metadata])), 60_000);
   fs.writeFileSync(path.join(output, "cluster-topology.json"), JSON.stringify({ hostname: os.hostname(), nodes: ports.slice(0, 3), replicas: 3,
     sync_interval: "always", faultDomain: "ONE HOST: local R3 functional conformance only; NOT three-host production durability proof" }, null, 2) + "\n");
   console.log("R3 ready: running dedicated live-NATS backend and async provider cases");
@@ -121,11 +121,10 @@ try {
       stopCluster: () => stopNodes(current),
       restartCluster: async stream => {
         const elected = new Promise<void>(resolve => { streamLeaderWaiters.set(stream, resolve); });
-        // A restored stream can elect before metadata. Wait for BOTH current-generation
-        // events before a reopened client asks JetStreamManager for account/stream authority.
-        metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
+        // A restored stream can elect before metadata. Wait for the stream election AND
+        // metadata authority on every current-generation endpoint before reopening clients.
         for (let n = 0; n < 3; n++) startNode(n);
-        await deadline(Promise.all([...current.map(node => node.ready), elected, metadataLeader]), 60_000);
+        await deadline(Promise.all([...current.flatMap(node => [node.ready, node.metadata]), elected]), 60_000);
       },
     });
   }

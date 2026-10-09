@@ -23,6 +23,21 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types records-backed validity and registers the option (fullCodeMode=%s)", fullCodeMode => {
+    const code = `return agents.create({ name: "org", instructions: "Work.", records: { topic: "org.records", maxEntries: 32 },
+      validWhile: ({ activation, current }) => {
+        if (activation.kind !== "mesh" || typeof activation.data?.key !== "string") return true;
+        const record = current.records?.get(activation.data.key);
+        const at: string | undefined = record?.at;
+        return record?.state !== "answered";
+      } });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "create")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.records).toMatchObject({ type: "object", required: ["topic"], additionalProperties: false });
+    expect(typeCheckFabricCode(`await agents.create({ name: "bad", instructions: "Work.", validWhile: ({ current }) => {
+      current.records?.set("key", { state: "open" }); return true; } });`, guestTypeDeclarations(fullCodeMode), true).errors.map(e => e.message))
+      .toEqual([expect.stringContaining("Property 'set' does not exist")]);
+  });
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });

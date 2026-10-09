@@ -487,6 +487,16 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
             ],
           },
         },
+        records: {
+          type: "object",
+          description: "Host-maintained records topic for validWhile; default 512 entries, capped at 4096.",
+          properties: {
+            topic: { type: "string", pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$" },
+            maxEntries: { type: "integer", minimum: 1 },
+          },
+          required: ["topic"],
+          additionalProperties: false,
+        },
         validWhile: {
           type: "object",
           properties: { version: { const: 1 }, source: { type: "string" } },

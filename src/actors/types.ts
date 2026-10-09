@@ -10,6 +10,8 @@ import type { FabricActorActivationFilter } from "./activation-filter.js";
 import type { ActorWakeText } from "./wake-text.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
+export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -185,6 +187,8 @@ export type FabricActorActivation =
       sequence: number;
       createdAt: number;
       topic: string;
+      /** Immutable triggering mesh data, separate from current records. */
+      data?: unknown;
     };
 
 export interface FabricActorValidityFacts {
@@ -195,6 +199,7 @@ export interface FabricActorValidityFacts {
     taskRevision: number;
     idle: boolean;
     now: number;
+    records?: FabricActorRecordsView;
   };
   /** Untrusted, bounded GitHub text from the local ingress receipt, when agents.wakeText hydrated it (smarty-dev#6144). */
   wakeText?: ActorWakeText;
@@ -287,6 +292,8 @@ export interface FabricActorRequest {
   requires?: readonly (string | FabricCapabilityRequirement)[];
   /** Serialized guest predicate evaluated before work and before delivery. */
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
 }
 
 export interface FabricActorInfo {
@@ -354,6 +361,8 @@ export interface FabricActorInfo {
   /** Persistent reason an activation is blocked; cleared after a later successful activation. */
   activationBlocked?: { reason: string; code: string; since: number; count: number };
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
   queued: number;
   messages: number;
   createdAt: number;

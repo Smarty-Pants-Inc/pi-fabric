@@ -679,10 +679,13 @@ interface FabricActorHostSignal {
 type FabricActorActivation =
   | { readonly kind: "hostEvent"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly event: FabricActorHostEvent; readonly mainRevision: number; readonly taskRevision: number; readonly signal?: FabricActorHostSignal }
   | { readonly kind: "direct"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number }
-  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string };
+  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string; readonly data?: any };
+interface FabricActorRecordsOptions { topic: string; maxEntries?: number }
+interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string }
+interface FabricActorRecordsView { readonly get: (key: string) => Readonly<FabricActorRecord> | undefined }
 interface FabricActorValidityFacts {
   readonly activation: Readonly<FabricActorActivation>;
-  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number }>;
+  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number; records?: FabricActorRecordsView }>;
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
@@ -753,6 +756,8 @@ interface FabricActorRequestBase {
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
+  /** Bounded host projection; default 512 entries, cap 4096. */
+  records?: FabricActorRecordsOptions;
   residency?: FabricParticipantResidency;
 }
 type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource & (
@@ -776,6 +781,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   runner: FabricAgentRunner;
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
@@ -832,6 +838,7 @@ interface FabricActorInfo {
   activationBlocked?: { reason: string; code: string; since: number; count: number };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
   residency: FabricParticipantResidency;
   queued: number;
   messages: number;

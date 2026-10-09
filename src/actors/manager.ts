@@ -63,6 +63,7 @@ import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
+import { ActorRecords, normalizeActorRecords, type FabricActorRecordsOptions } from "./records.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
@@ -190,6 +191,7 @@ interface ManagedActor {
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
+  records?: FabricActorRecordsOptions;
   latestActivationSequence: number;
   sessionFile: string;
   queue: ActorQueueItem[];
@@ -501,6 +503,7 @@ export class ActorManager {
   readonly #project: string | undefined;
   readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
+  readonly #records = new Map<string, ActorRecords>();
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
@@ -741,6 +744,10 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
+        for (const [id, records] of this.#records) {
+          if (this.#actors.has(id)) records.accept(event);
+          else this.#records.delete(id);
+        }
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
@@ -846,6 +853,7 @@ export class ActorManager {
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid Fabric actor residency: ${String(request.residency)}`);
     }
+    const records = normalizeActorRecords(request.records);
     await validateActorValidWhile(request.validWhile);
     const runner = request.runner ?? this.agents.config.runner;
     if (runner !== "pi" && runner !== "claude") {
@@ -917,6 +925,7 @@ export class ActorManager {
       ...(request.inferenceContext !== undefined ? { inferenceContext: request.inferenceContext } : {}),
       requirements,
       ...(request.validWhile ? { validWhile: structuredClone(request.validWhile) } : {}),
+      ...(records ? { records } : {}),
       latestActivationSequence: 0,
       sessionFile: path.join(actorDirectory, "session.jsonl"),
       queue: [],
@@ -925,6 +934,9 @@ export class ActorManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    // Replay may fail; prepare the projection before any create receipt or directory effect.
+    const recordProjection = records ? new ActorRecords(records) : undefined;
+    recordProjection?.replay(this.mesh);
     // Validate the complete public value before any directory, predecessor or registry effect.
     this.#assertPresenceValue(this.#publicInfo(actor, false));
     await beforeCommit?.(id);
@@ -934,6 +946,7 @@ export class ActorManager {
     // Receipt registration and insertion cannot yield after the cancellation fence.
     onCommit?.(id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
+    if (recordProjection) this.#records.set(id, recordProjection);
     this.#actors.set(id, actor);
     this.#locallyCreated.add(id);
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
@@ -1717,6 +1730,7 @@ export class ActorManager {
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
         : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
+      ...(actor.records ? { records: { ...actor.records } } : {}),
     };
   }
 
@@ -2576,6 +2590,7 @@ export class ActorManager {
       try {
         await this.#saveActors(new Set([actor.id]), { removedLineages: new Map([[actor.id, this.#lineage(actor)]]) });
         if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
+        this.#records.delete(actor.id);
       } catch (error) {
         // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
         if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
@@ -3811,9 +3826,22 @@ export class ActorManager {
       };
     }
     if (source.startsWith("mesh:")) {
-      return { kind: "mesh", id, source, sequence, createdAt, topic: source.slice(5) };
+      const data = typeof payload === "object" && payload !== null
+        ? (payload as { data?: unknown }).data : undefined;
+      return { kind: "mesh", id, source, sequence, createdAt, topic: source.slice(5),
+        ...(data !== undefined ? { data: structuredClone(data) } : {}) };
     }
     return { kind: "direct", id, source, sequence, createdAt };
+  }
+
+  #installRecords(actor: ManagedActor): void {
+    const options = actor.records;
+    if (!options) { this.#records.delete(actor.id); return; }
+    const existing = this.#records.get(actor.id);
+    if (existing?.options.topic === options.topic && existing.options.maxEntries === options.maxEntries) return;
+    const records = new ActorRecords(options);
+    records.replay(this.mesh);
+    this.#records.set(actor.id, records);
   }
 
   async #validity(
@@ -3832,7 +3860,7 @@ export class ActorManager {
           now: Date.now(),
         },
         ...(item.wakeText ? { wakeText: structuredClone(item.wakeText) } : {}),
-      });
+      }, this.#records.get(actor.id)?.snapshot());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       actor.lastError = `validWhile: ${message}`;
@@ -4646,6 +4674,7 @@ export class ActorManager {
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
+      ...(actor.records ? { records: { ...actor.records } } : {}),
       sessionFile: actor.sessionFile,
       ...(this.#lazyMessages.has(actor)
         ? this.#lazyMessages.get(actor)!.messageHistory !== undefined
@@ -5024,7 +5053,9 @@ export class ActorManager {
       let activation: FabricActorActivationPolicy | undefined;
       // An unreadable optional policy must not remove an otherwise usable actor.
       try { activation = normalizeActorActivation(record.activation); } catch { /* off */ }
+      let records: FabricActorRecordsOptions | undefined;
       try {
+        records = normalizeActorRecords(record.records);
         validateActorInferenceContext(record.inferenceContext, record.runner ?? "pi");
         requirements = normalizeCapabilityRequirements(
           Array.isArray(record.requirements) ? record.requirements : [],
@@ -5116,6 +5147,7 @@ export class ActorManager {
           typeof record.failureStreak?.notified === "boolean"
           ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
+        ...(records ? { records } : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }
           : {}),
@@ -5139,6 +5171,7 @@ export class ActorManager {
           : {}),
       };
       this.#installLazyMessages(actor, source);
+      this.#installRecords(actor);
       this.#actors.set(actor.id, actor);
       if (actor.status === "stopped" || actor.removal) this.#clearSettledWindows(actor.id);
       // Once per process: later a live process's memory, not the file, holds its work.
@@ -5730,6 +5763,7 @@ export class ActorManager {
         : {}),
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
+      ...(actor.records ? { records: { ...actor.records } } : {}),
       queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
       messages: this.#messageCount(actor),
       createdAt: actor.createdAt,

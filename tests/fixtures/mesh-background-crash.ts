@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { EventEmitter, once } from "node:events";
 import path from "node:path";
 import { CapturedToolCatalog } from "../../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../../src/config.js";
@@ -27,12 +28,30 @@ process.env.PI_FABRIC_PROJECT_ROOT = root;
 process.env.PI_FABRIC_MESH_ROOT = path.join(root, "mesh");
 process.env.PI_FABRIC_RUN_ROOT = path.join(root, "runs");
 const identity = { id: "session:crash-probe", name: "main", kind: "main" as const, sessionId: "crash-probe" };
+const mutations = new EventEmitter();
+const nextMutation = async (event: "lock-timeout" | "commit") => {
+  const controller = new AbortController();
+  // Keep the probe alive even when the directory's own retry timers are unref'd.
+  const deadline = setTimeout(() => controller.abort(new Error(`No ${event} for ${mode}`)), 5_000);
+  try { await once(mutations, event, { signal: controller.signal }); }
+  finally { clearTimeout(deadline); }
+};
 // Real acquisitions, with a short deadline even for runtime-owned stores. Never touch fleet locks.
 for (const method of ["publish", "put", "delete", "writeBatch"] as const) {
   const original = MeshStore.prototype[method] as Function;
-  (MeshStore.prototype[method] as Function) = function(this: MeshStore, ...args: unknown[]) {
+  (MeshStore.prototype[method] as Function) = async function(this: MeshStore, ...args: unknown[]) {
     const impatient = new MeshStore(this.root, this.maxEventBytes, this.maxReadEvents, { lockTimeoutMs: 40, lockProtocol: this.lockProtocol });
-    return original.apply(impatient, args);
+    try {
+      const result = await original.apply(impatient, args);
+      // Notify after the directory has consumed the mutation's settlement.
+      setImmediate(() => mutations.emit("commit"));
+      return result;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "FABRIC_MESH_LOCK_TIMEOUT") {
+        setImmediate(() => mutations.emit("lock-timeout"));
+      }
+      throw error;
+    }
   };
 }
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -88,11 +107,16 @@ if (mode === "foreground") {
   const initial = mesh.listAll("topology/hosts/")[0]!.version;
   const release = hold(mesh);
   name = "after";
+  const stalled = nextMutation("lock-timeout");
   if (mode === "directory-change") directory.scheduleRefresh();
-  await wait(() => directory.writeStalled() !== undefined);
+  await stalled;
+  assert.ok(directory.writeStalled());
   assert.equal(mesh.listAll("topology/hosts/")[0]!.version, initial);
+  const committed = nextMutation("commit");
   release();
-  await wait(() => !directory.writeStalled() && directory.list().some(value => value.name === "after"));
+  await committed;
+  assert.equal(directory.writeStalled(), undefined);
+  assert.ok(directory.list().some(value => value.name === "after"));
   assert.ok(mesh.listAll("topology/hosts/")[0]!.version > initial);
   await directory.close();
 } else if (mode === "actor-presence") {

@@ -60,6 +60,7 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #safetyNetTimer: NodeJS.Timeout | undefined;
+  #watchRepairTimer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
   #blocked = false;
@@ -147,6 +148,8 @@ export class ActorMeshMonitor {
     this.#closed = true;
     if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
     this.#safetyNetTimer = undefined;
+    if (this.#watchRepairTimer) clearTimeout(this.#watchRepairTimer);
+    this.#watchRepairTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -188,6 +191,18 @@ export class ActorMeshMonitor {
     watcher.close();
     this.#watcher = undefined;
     // Watch loss is attachment repair only, never delivery admission.
+    this.#repairWatchers();
+  }
+
+  #repairWatchers(): void {
+    if (this.#closed || this.#watchRepairTimer) return;
+    // Windows can report EPERM/null rename before the replacement exists.
+    // One event-owned deadline repairs attachment without a periodic drain.
+    this.#watchRepairTimer = setTimeout(() => {
+      this.#watchRepairTimer = undefined;
+      this.#attachWatcher(true);
+    }, 100);
+    this.#watchRepairTimer.unref();
   }
 
   #attachWatcher(reconcile = false): void {
@@ -205,9 +220,13 @@ export class ActorMeshMonitor {
       if (this.#directoryWatchers.has(directory)) continue;
       try {
         const recursive = directory === path.join(this.mesh.root, "actors") || this.callbacks.watchDirectories?.includes(directory);
-        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: Boolean(recursive) }, (_event, filename) => {
+        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: Boolean(recursive) }, (event, filename) => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          if (filename !== null && path.basename(filename.toString()) === "mesh-cursor.json") return;
+          if (filename !== null && ["mesh-cursor.json", ".claim.lock"].includes(path.basename(filename.toString()))) return;
+          if (filename === null || (event === "rename" && !path.extname(filename.toString()))) {
+            this.#attachWatcher(true); // Attach new completion directories before their first write.
+            this.#repairWatchers();
+          }
           this.#schedule(false, true);
         });
         if (!watcher) continue;
@@ -215,8 +234,9 @@ export class ActorMeshMonitor {
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           watcher.close(); this.#directoryWatchers.delete(directory); // Attachment safety only.
+          this.#repairWatchers();
         });
-      } catch { /* Platforms without recursive watches retain bounded reconciliation. */ }
+      } catch { /* Reattach on the next native event or attachment safety check. */ }
     }
     if (this.#watcher && reconcile && !meshObserverWatchCurrent(this.#watcher, this.mesh.root)) {
       const previous = this.#watcher; this.#watcher = undefined; previous.close();
@@ -225,9 +245,11 @@ export class ActorMeshMonitor {
     try {
       const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#watcher !== watcher) return;
+        if (filename === null) this.#attachWatcher(true);
+        if (!meshObserverWatchCurrent(watcher!, this.mesh.root)) this.#repairWatchers();
         if (filename !== null) {
           const file = path.basename(filename.toString());
-          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
+          if (OBSERVED_DIRECTORIES.includes(file)) { this.#attachWatcher(true); this.#repairWatchers(); }
           else if (!OBSERVED_FILES.includes(file)) return;
         }
         const file = filename === null ? undefined : path.basename(filename.toString());

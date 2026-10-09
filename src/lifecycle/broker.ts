@@ -48,6 +48,7 @@ export class LifecycleBroker {
   readonly #maxReadEvents: number;
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
+  #watchRepairTimer: NodeJS.Timeout | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
   #running = false;
   #failedStamp: string | undefined;
@@ -195,6 +196,8 @@ export class LifecycleBroker {
 
   pause(): void {
     this.#paused = true;
+    if (this.#watchRepairTimer) clearTimeout(this.#watchRepairTimer);
+    this.#watchRepairTimer = undefined;
   }
   resume(): void { if (!this.#closed) { this.#paused = false; this.#schedulePoll(); } }
   async checkpointForRelease(): Promise<void> {
@@ -211,6 +214,8 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#watchRepairTimer) clearTimeout(this.#watchRepairTimer);
+    this.#watchRepairTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -218,6 +223,15 @@ export class LifecycleBroker {
     await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
+  }
+
+  #repairWatchers(): void {
+    if (this.#closed || this.#paused || this.#watchRepairTimer) return;
+    this.#watchRepairTimer = setTimeout(() => {
+      this.#watchRepairTimer = undefined;
+      this.#attachWatcher(true); // Event-owned attachment repair, never a drain.
+    }, 100);
+    this.#watchRepairTimer.unref();
   }
 
   #attachWatcher(reconcile = false): void {
@@ -238,7 +252,7 @@ export class LifecycleBroker {
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          watcher.close(); this.#directoryWatchers.delete(directory); this.#schedulePoll();
+          watcher.close(); this.#directoryWatchers.delete(directory); this.#repairWatchers(); this.#schedulePoll();
         });
       } catch { /* The safety witness also retries directory attachment. */ }
     }
@@ -249,10 +263,12 @@ export class LifecycleBroker {
     try {
       const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#watcher !== watcher) return;
+        if (filename === null) this.#attachWatcher(true);
+        if (!meshObserverWatchCurrent(watcher!, this.mesh.root)) this.#repairWatchers();
         if (filename !== null) {
           const file = path.basename(filename.toString());
           if (!OBSERVED_FILES.includes(file)) return;
-          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
+          if (OBSERVED_DIRECTORIES.includes(file)) { this.#attachWatcher(true); this.#repairWatchers(); }
         }
         // A failed receipt put can itself produce a native notification.
         // Do not turn those same failed bytes into a self-sustaining drain.
@@ -265,6 +281,7 @@ export class LifecycleBroker {
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;
         watcher.close(); this.#watcher = undefined;
+        this.#repairWatchers();
         this.#schedulePoll();
       });
     } catch { /* The fixed-file safety witness covers unavailable watches. */ }

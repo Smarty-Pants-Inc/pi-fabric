@@ -548,6 +548,8 @@ export class ActorManager {
   readonly #meshRetentionSweepPath: string | undefined;
   #retentionSweep: Promise<void> | undefined;
   #initialRetentionPending = true;
+  #initialRetentionRetry: NodeJS.Timeout | undefined;
+  #initialRetentionRetryUsed = false;
   readonly #pendingPresence = new Set<string>();
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
@@ -2705,6 +2707,8 @@ export class ActorManager {
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
+    if (this.#initialRetentionRetry) clearTimeout(this.#initialRetentionRetry);
+    this.#initialRetentionRetry = undefined;
     // Cancellation is monotonic: pending claims must settle before the enclosing
     // runtime releases host custody or certifies terminal lineage closure.
     await Promise.allSettled([...this.#adoptionPending.values()]);
@@ -4473,7 +4477,23 @@ export class ActorManager {
     if (this.#retentionSweep || this.#closing) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
     this.#retentionSweep = sweep;
-    void sweep.finally(() => { if (this.#retentionSweep === sweep) this.#retentionSweep = undefined; });
+    void sweep.finally(() => {
+      if (this.#retentionSweep === sweep) this.#retentionSweep = undefined;
+      if (!this.#initialRetentionPending) {
+        if (this.#initialRetentionRetry) clearTimeout(this.#initialRetentionRetry);
+        this.#initialRetentionRetry = undefined;
+      } else if (!this.#closing && !this.#initialRetentionRetryUsed) {
+        // Known startup maintenance may lose its first publication race. One
+        // deadline covers that race; later publication/resume events own retries.
+        // Never turn an unpublished or idle manager into a periodic mesh drain.
+        this.#initialRetentionRetryUsed = true;
+        this.#initialRetentionRetry = setTimeout(() => {
+          this.#initialRetentionRetry = undefined;
+          if (this.#initialRetentionPending) this.#startRetentionSweep();
+        }, 1_000);
+        this.#initialRetentionRetry.unref();
+      }
+    });
   }
 
   async #sweepRetainedRuns(now = Date.now()): Promise<void> {

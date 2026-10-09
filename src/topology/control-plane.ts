@@ -359,6 +359,7 @@ export class FabricControlPlane {
   #lastSequence: number;
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
+  #watchRepairTimer: NodeJS.Timeout | undefined;
   #stamp: string | undefined;
   #dirty = false;
   #running = false;
@@ -868,6 +869,8 @@ export class FabricControlPlane {
     this.#paused = true;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.#watchRepairTimer) clearTimeout(this.#watchRepairTimer);
+    this.#watchRepairTimer = undefined;
   }
 
   resume(): void {
@@ -895,6 +898,8 @@ export class FabricControlPlane {
     for (const cancel of this.#resendWaits) cancel();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.#watchRepairTimer) clearTimeout(this.#watchRepairTimer);
+    this.#watchRepairTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     await this.#polling?.catch(() => undefined);
@@ -933,6 +938,15 @@ export class FabricControlPlane {
     }
   }
 
+  #repairWatchers(): void {
+    if (this.#closed || this.#paused || this.#watchRepairTimer) return;
+    this.#watchRepairTimer = setTimeout(() => {
+      this.#watchRepairTimer = undefined;
+      this.#attachWatcher(true); // Event-owned attachment repair, never a drain.
+    }, 100);
+    this.#watchRepairTimer.unref();
+  }
+
   #attachWatcher(reconcile = false): void {
     if (this.#closed || this.#paused) return;
     if (this.#watcher && reconcile && !meshObserverWatchCurrent(this.#watcher, this.mesh.root)) {
@@ -942,6 +956,8 @@ export class FabricControlPlane {
     try {
       const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#paused || this.#watcher !== watcher) return;
+        if (filename === null) this.#attachWatcher(true);
+        if (!meshObserverWatchCurrent(watcher!, this.mesh.root)) this.#repairWatchers();
         if (filename !== null && !OBSERVED_FILES.includes(path.basename(filename.toString()))) return;
         this.#wake();
       });
@@ -950,6 +966,7 @@ export class FabricControlPlane {
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;
         watcher.close(); this.#watcher = undefined;
+        this.#repairWatchers();
         this.#wake();
       });
     } catch { /* Reattach at the safety deadline; no fast idle fallback. */ }

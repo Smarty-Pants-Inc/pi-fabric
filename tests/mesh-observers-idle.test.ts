@@ -135,6 +135,39 @@ describe("event-driven mesh observers", () => {
     await vi.waitFor(() => { expect(beforePoll).toHaveBeenCalled(); expect(lists).toHaveBeenCalled(); });
     expect(tails).not.toHaveBeenCalled();
   });
+  it("repairs Windows-style replacement errors once and admits only NEW notifications, not repair deadlines", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    fs.mkdirSync(path.join(mesh.root, "participants"));
+    const delivered = vi.fn(); const broker = await lifecycle(mesh, delivered); broker.start();
+    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    closers.push(() => control.close()); control.start(() => ({ accepted: true }));
+    const beforePoll = vi.fn(() => true); const seen = vi.fn();
+    const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
+      { beforePoll, onEvent: seen });
+    closers.push(() => actor.close()); actor.start(); await vi.advanceTimersByTimeAsync(0); await flush();
+    const retired = [...watches];
+    fs.renameSync(mesh.root, mesh.root + ".retired");
+    for (const watch of retired) watch.emitter.emit("error", Object.assign(new Error("replacement gap"), { code: "EPERM" }));
+    await vi.advanceTimersByTimeAsync(50);
+    fs.cpSync(mesh.root + ".retired", mesh.root, { recursive: true });
+    const tails = vi.spyOn(mesh, "tail"); const lists = vi.spyOn(mesh, "listAll");
+    beforePoll.mockClear(); tails.mockClear(); lists.mockClear();
+    await vi.advanceTimersByTimeAsync(50); await flush();
+    expect(watches).toHaveLength(retired.length * 2);
+    expect(beforePoll).not.toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled(); expect(lists).not.toHaveBeenCalled();
+    for (const watch of retired) { watch.notify("change", null); watch.emitter.emit("error", new Error("late retired error")); }
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(watches).toHaveLength(retired.length * 2);
+    expect(beforePoll).not.toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled(); expect(lists).not.toHaveBeenCalled();
+    await publish(mesh);
+    for (const watch of watches.slice(retired.length).filter(watch => watch.directory === mesh.root)) watch.notify("change", "events.jsonl");
+    await vi.advanceTimersByTimeAsync(0); await flush();
+    expect(delivered).toHaveBeenCalledOnce(); expect(seen).toHaveBeenCalledOnce();
+    for (const watch of watches.slice(retired.length).filter(watch => watch.directory === mesh.root)) watch.notify("change", null);
+    actor.close(); await broker.close(); await control.close();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("does not scan lifecycle subscriptions or reread the unchanged control/actor tail during idle safety checks", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
     const broker = await lifecycle(mesh); broker.start();

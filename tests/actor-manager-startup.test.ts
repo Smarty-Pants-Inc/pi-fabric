@@ -309,6 +309,29 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     await eventually(() => !fs.existsSync(f.runDir(0, 8)));
   });
 
+  it("uses one startup retention deadline, then requires a publication event after a denied retry", async () => {
+    vi.useFakeTimers();
+    const f = fixture(1); let published = false;
+    const admission = vi.fn(() => published);
+    const manager = f.make({ canConsumeMesh: admission });
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      expect(fs.existsSync(f.runDir(0, 8))).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_010);
+      const checks = admission.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(admission).toHaveBeenCalledTimes(checks);
+      expect(fs.existsSync(f.runDir(0, 8))).toBe(true);
+      published = true; manager.resumeQueued();
+      expect(fs.existsSync(f.runDir(0, 8))).toBe(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    } finally {
+      await manager.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("rechecks publication between maintenance slices and retries an interrupted startup sweep", async () => {
     const f = fixture(17); let published = true;
     const manager = f.make({ canConsumeMesh: () => published });

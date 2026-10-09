@@ -287,10 +287,13 @@ describe("ActorMeshMonitor", () => {
     s.monitor.start(); await flush();
     s.watcher.emit("error", new Error("watch failed")); await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2); // Safety attachment plus one error-owned repair.
     const count = s.mesh.tail.mock.calls.length;
     fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fs.watch).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(59_900);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
     expect(fs.watch).toHaveBeenCalledTimes(2);
     s.monitor.schedule(); await flush();

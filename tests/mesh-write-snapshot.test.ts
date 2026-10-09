@@ -155,7 +155,10 @@ describe("optimistic mesh write snapshots", () => {
     await new MeshStore(root, 65536, 100).writeBatch({ identity, ops: [
       { kind: "put", key: "other/heartbeat/a", value: (now: number) => ({ now }) },
     ] });
-    expect(reads).toBe(3); expect(parses).toBe(3); expect(encodings).toBe(2);
+    // Both cold stores parse; the same-store delete reuses its frozen committed
+    // tree only after a fresh exact-byte read. Every observed operation stays
+    // outside custody, including the two retained-entry encodings.
+    expect(reads).toBe(3); expect(parses).toBe(2); expect(encodings).toBe(2);
     assertNoStaging(root);
   });
 

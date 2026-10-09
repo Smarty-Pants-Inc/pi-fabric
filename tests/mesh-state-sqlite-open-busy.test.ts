@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -303,30 +304,81 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
   const lockRoot = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-lock-")); roots.push(root); return root; };
   const age = (file: string, ms: number) => { const at = new Date(Date.now() - ms); fs.utimesSync(file, at, at); };
 
-  it("reclaims a stale lock and refuses a fresh one", () => {
+  it("reclaims an ownerless stale lock and refuses a fresh one", () => {
     const lock = path.join(lockRoot(), "state-wal-reset.lock");
-    expect(tryLockFile(lock, 2_000, ownerToken())).toBe(true);
+    fs.writeFileSync(lock, "crashed\n");
     expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
     age(lock, 5_000);
     expect(tryLockFile(lock, 2_000, ownerToken())).toBe(true);
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
   });
 
+  // pi-fabric#694 P2-C: liveness, not age, decides a lock with a readable owner.
+  it("never reclaims a live owner's lock on age alone", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    const live = ownerToken();
+    expect(tryLockFile(lock, 2_000, live)).toBe(true);
+    age(lock, 60_000);
+    expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${live}\n`);
+  });
+
+  it("reclaims a fresh lock whose owner is dead on this host (pid gone, or pid reused)", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid; // exited and reaped
+    fs.writeFileSync(lock, `${gone}.12345.00000000-0000-0000-0000-000000000000\n`);
+    const mine = ownerToken();
+    expect(tryLockFile(lock, 2_000, mine)).toBe(true);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${mine}\n`);
+    if (process.platform !== "linux") return; // start ticks come from /proc
+    fs.rmSync(lock);
+    fs.writeFileSync(lock, `${process.pid}.1.00000000-0000-0000-0000-000000000000\n`); // this pid, another start
+    expect(tryLockFile(lock, 2_000, mine)).toBe(true);
+    expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("never unlinks a lock whose inode changed since it was read, even when it cannot go back", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    fs.writeFileSync(lock, "crashed\n");
+    age(lock, 5_000);
+    const live = ownerToken();
+    const renameSync = fs.renameSync.bind(fs);
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(from) === lock && String(to).endsWith(".stale")) {
+        fs.rmSync(lock); // another reclaimer took it and holds a live lock now
+        fs.writeFileSync(lock, `${live}\n`);
+        renameSync(from, to);
+        fs.writeFileSync(lock, "third\n"); // and a third process holds the name before any link-back
+        return;
+      }
+      renameSync(from, to);
+    }) as typeof fs.renameSync);
+    try {
+      expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readFileSync(lock, "utf8")).toBe("third\n");
+    const moved = fs.readdirSync(path.dirname(lock)).filter((name) => name.endsWith(".stale"));
+    expect(moved).toHaveLength(1);
+    expect(fs.readFileSync(path.join(path.dirname(lock), moved[0]!), "utf8")).toBe(`${live}\n`);
+  });
+
   it("never deletes a fresh lock that another reclaimer created after this process saw the stale one", () => {
     const lock = path.join(lockRoot(), "state-wal-reset.lock");
     fs.writeFileSync(lock, "crashed\n");
     age(lock, 5_000);
-    const statSync = fs.statSync.bind(fs);
+    const lstatSync = fs.lstatSync.bind(fs);
     let raced = false;
-    const spy = vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
-      const result = statSync(file, options as fs.StatSyncOptions & { throwIfNoEntry: false });
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const result = lstatSync(file, options as fs.StatSyncOptions & { throwIfNoEntry: false });
       if (!raced && String(file) === lock) {
         raced = true; // another process reclaims the stale lock and holds a fresh one
         fs.rmSync(lock);
         fs.writeFileSync(lock, "other holder\n");
       }
       return result;
-    }) as typeof fs.statSync);
+    }) as typeof fs.lstatSync);
     try {
       expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
     } finally {

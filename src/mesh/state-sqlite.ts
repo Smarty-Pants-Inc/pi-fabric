@@ -89,6 +89,7 @@ import { captureStorageDelete, captureStoragePut, storageRevision, type StorageT
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { MeshLockTicket } from "./lock-queue.js";
+import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
@@ -1531,13 +1532,22 @@ export class SqliteStateStore {
   }
 }
 
-// An advisory try-lock file (O_EXCL). One older than `staleMs` belongs to a crashed holder. It is reclaimed by
-// renaming it aside and checking that the moved file is the stale one this process stat'ed (inode and mtime):
-// a fresh lock another reclaimer created meanwhile is linked back (never overwriting a newer one) and this
-// process backs off, so it never deletes a live holder's lock (pi-fabric#691 review).
-// ponytail: one remaining interleaving (a third process creating a lock between the rename and the link-back)
-// can start a second resetter; that is harmless, because SQLite's own checkpoint lock serializes TRUNCATE
-// checkpoints and the second one only sees busy. The file sheds load; SQLite provides the exclusion.
+// The holder an owner token names (`ownerToken`): its pid and, when recorded, its start ticks. Undefined
+// for an unreadable record. A pre-#694 token (`pid.uuid`) names the pid only.
+const lockHolder = (record: string): { pid: number; started?: string | undefined } | undefined => {
+  const parts = (record.split("\n")[0] ?? "").split(".");
+  if (parts.length < 2 || !/^\d+$/.test(parts[0] ?? "")) return undefined;
+  const pid = Number(parts[0]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return { pid, started: parts.length >= 3 && /^\d+$/.test(parts[1] ?? "") ? parts[1] : undefined };
+};
+
+// An advisory try-lock file (O_EXCL). It is reclaimed only from a holder proven dead on this host (its pid
+// gone, or alive with other start ticks: the host-lease rule, residentProcessAlive), or, with no readable
+// owner, when it is older than `staleMs` (pi-fabric#694 P2-C: never on age alone from a live owner). The
+// reclaim renames it aside and checks that the moved file is the one this process read (inode, mtime and
+// record). Anything else is linked back, and when a newer lock holds the name the moved file is left in
+// place, never deleted: a lock whose inode changed since this process read it is never unlinked.
 export const tryLockFile = (file: string, staleMs: number, token: string): boolean => {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -1546,16 +1556,24 @@ export const tryLockFile = (file: string, staleMs: number, token: string): boole
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-      const stat = fs.statSync(file, { throwIfNoEntry: false });
+      const stat = fs.lstatSync(file, { throwIfNoEntry: false });
       if (!stat) continue;
-      if (Date.now() - stat.mtimeMs <= staleMs) return false;
+      let record: string;
+      try { record = fs.readFileSync(file, "utf8"); } catch { continue; }
+      const holder = lockHolder(record);
+      const dead = holder ? !residentProcessAlive(holder.pid, holder.started) : Date.now() - stat.mtimeMs > staleMs;
+      if (!dead) return false;
       const aside = `${file}.${process.pid}.${randomUUID()}.stale`;
       try { fs.renameSync(file, aside); } catch { return false; }
-      const moved = fs.statSync(aside, { throwIfNoEntry: false });
-      const same = moved !== undefined && moved.ino === stat.ino && moved.dev === stat.dev && moved.mtimeMs === stat.mtimeMs;
-      if (!same) try { fs.linkSync(aside, file); } catch { /* a newer lock holds the name */ }
-      try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ }
-      if (!same) return false;
+      const moved = fs.lstatSync(aside, { throwIfNoEntry: false });
+      let movedRecord: string | undefined;
+      try { movedRecord = fs.readFileSync(aside, "utf8"); } catch { /* unreadable: not the one read */ }
+      const same = moved !== undefined && moved.ino === stat.ino && moved.dev === stat.dev && moved.mtimeMs === stat.mtimeMs
+        && movedRecord === record;
+      if (same) { try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ } continue; }
+      try { fs.linkSync(aside, file); } catch { return false; /* a newer lock holds the name: leave the moved one */ }
+      try { fs.rmSync(aside, { force: true }); } catch { /* the second link of a restored lock; best effort */ }
+      return false;
     }
   }
   return false;
@@ -1564,7 +1582,8 @@ export const tryLockFile = (file: string, staleMs: number, token: string): boole
 // The checkpoint flag and the reset lock carry their writer's token, and only that writer removes them:
 // a process never clears a flag or lock that another process raised or reclaimed (pi-fabric#691 review).
 // A flag raised by two processes belongs to the last writer; the first one's next attempt raises it again.
-export const ownerToken = (): string => `${process.pid}.${randomUUID()}`;
+// `pid.startTicks.uuid` ("-" without /proc): a reclaimer proves the holder dead by pid and start ticks.
+export const ownerToken = (): string => `${process.pid}.${processStartTime(process.pid) ?? "-"}.${randomUUID()}`;
 
 export const ownsFile = (file: string, token: string): boolean => {
   try { return fs.readFileSync(file, "utf8") === `${token}\n`; } catch { return false; }
@@ -1599,11 +1618,13 @@ export const checkpointFlagRaised = (root: string): boolean => {
   return false;
 };
 
-// Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one).
+// Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one). A
+// foreign file that cannot go back (a newer one holds the name) is left in place, never deleted (#694 P2-C).
 export const removeOwnedFile = (file: string, token: string): void => {
+  if (!ownsFile(file, token)) return; // plainly not ours: never displace it
   const aside = `${file}.${process.pid}.${randomUUID()}.release`;
   try { fs.renameSync(file, aside); } catch { return; }
-  if (!ownsFile(aside, token)) try { fs.linkSync(aside, file); } catch { /* a newer file holds the name */ }
+  if (!ownsFile(aside, token)) try { fs.linkSync(aside, file); } catch { return; /* a newer file holds the name */ }
   try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ }
 };
 

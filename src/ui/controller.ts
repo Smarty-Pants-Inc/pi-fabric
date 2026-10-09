@@ -21,7 +21,7 @@ import { participantFilesCachedStamp, participantFilesStamp, readParticipantFile
 import { hostLeasesStamp } from "../topology/host-leases.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
-import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
+import { createDashboardSnapshot, FabricDashboardSnapshotCache, SHELL_DISPLAY_EXPIRY_MS } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
@@ -70,6 +70,8 @@ export class FabricUiController {
   #events: MeshEvent[] = [];
   #meshOffset = 0;
   #timer: NodeJS.Timeout | undefined;
+  #expiryTimer: NodeJS.Timeout | undefined;
+  #expiryAt: number | undefined;
   #activityUnsubscribe: (() => void) | undefined;
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
@@ -168,6 +170,9 @@ export class FabricUiController {
     this.#conversationState = undefined;
     if (this.#timer) clearTimeout(this.#timer);
     if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+    this.#expiryTimer = undefined;
+    this.#expiryAt = undefined;
     this.#timer = undefined;
     this.#scheduledRefresh = undefined;
     this.#widget = undefined;
@@ -691,7 +696,7 @@ export class FabricUiController {
     if (this.#timer || !this.#context || !this.state.initialized) return;
     const localActive =
       this.#snapshot.main.status === "running" ||
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
+      this.#snapshot.shells?.some(job => job.finishedAt === undefined) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(
@@ -721,8 +726,7 @@ export class FabricUiController {
   #needsFallbackRefresh(): boolean {
     const snapshot = this.#snapshot;
     if (this.#conversationOpen || snapshot.main.status === "running" ||
-      snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000 ||
-        snapshot.now - job.finishedAt < 30000) || // one final refresh removes the expired shell widget
+      snapshot.shells?.some(job => job.finishedAt === undefined) ||
       snapshot.runs.some(run => run.status === "running") ||
       snapshot.agents.some(agent => agent.local !== false && isActiveStatus(agent.status)) ||
       snapshot.actors.some(actor => isActiveStatus(actor.status) ||
@@ -737,6 +741,41 @@ export class FabricUiController {
       this.state.globalActors.stamp?.(),
     ]);
     return remote !== this.#builtRemote;
+  }
+
+  /** Display expiry is a deadline, not a polling interval or a cache-recovery wake. */
+  #scheduleExpiry(): void {
+    if (!this.#context || !this.state.initialized) return;
+    let deadline: number | undefined;
+    const consider = (at: unknown): void => {
+      // Already consumed deadlines must not create a zero-delay refresh loop if a source
+      // retains expired records. A late timer still refreshes once at its original deadline.
+      if (typeof at === "number" && Number.isFinite(at) && at > this.#snapshot.now &&
+        (deadline === undefined || at < deadline)) deadline = at;
+    };
+    for (const job of this.#snapshot.shells ?? []) {
+      if (job.finishedAt !== undefined) consider(job.finishedAt + SHELL_DISPLAY_EXPIRY_MS);
+    }
+    // Honor explicit expiry metadata on any top-level snapshot item, without walking
+    // arbitrary activity payloads. Sources own how those items change after expiration.
+    for (const value of Object.values(this.#snapshot)) {
+      for (const item of Array.isArray(value) ? value : [value]) {
+        if (item !== null && typeof item === "object" && "expiresAt" in item) consider(item.expiresAt);
+      }
+    }
+    if (deadline === this.#expiryAt) return;
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+    this.#expiryTimer = undefined;
+    this.#expiryAt = deadline;
+    if (deadline === undefined) return;
+    const epoch = this.#epoch;
+    this.#expiryTimer = setTimeout(() => this.#runBackground(epoch, () => {
+      this.#expiryTimer = undefined;
+      this.#expiryAt = undefined;
+      this.#refresh(); // Force a rebuild: expiry may not move any input revision or stamp.
+      this.#schedulePoll(true);
+    }), Math.max(0, deadline - Date.now()));
+    this.#expiryTimer.unref();
   }
 
   #scheduleRefresh(): void {
@@ -910,6 +949,7 @@ export class FabricUiController {
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
+      this.#scheduleExpiry();
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.

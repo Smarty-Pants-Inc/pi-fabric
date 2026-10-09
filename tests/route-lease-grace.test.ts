@@ -29,7 +29,7 @@ const fixture = async (late = 2000, kind: "root" | "actor" = "root") => {
   const root = temp(), mesh = new MeshStore(root, 65536, 1000, { readCacheMs: 60_000 });
   let now = Date.now(), renew = false, polls = 0;
   const target = kind === "actor" ? "actor:target" : "session:target", who = identity(target), reader = identity("session:reader");
-  const presence: FabricParticipantRecord = { format: 1, id: target, kind, rootId: target,
+  const presence: FabricParticipantRecord = { ownerIncarnation: "fixture:owner", format: 1, id: target, kind, rootId: target,
     ownerHostId: target, ownerIdentityId: target, name: "lead", status: "running", runner: "pi", transport: "host",
     capabilities: ["followUp", "steer"], controlProtocol: "v1", startedAt: 1, updatedAt: now - 20000 };
   const host = { format: 1, id: target, rootId: target, identity: who, startedAt: 1, updatedAt: now - late - 15000, expiresAt: now - late };
@@ -180,7 +180,7 @@ describe("native route lease grace (#4383)", () => {
       directories.push(d); return d;
     };
     const main = directory(mainId, mainId), resident = directory(residentId, mainId), peer = directory(peerId, peerId);
-    const records = ["actor", "agent"].map(kind => ({ format: 1, id: `${kind}:survivor`, kind, rootId: mainId,
+    const records = ["actor", "agent"].map(kind => ({ ownerIncarnation: "fixture:owner", format: 1, id: `${kind}:survivor`, kind, rootId: mainId,
       ownerHostId: residentId, ownerIdentityId: residentId, name: kind, status: "running", residency: "durable", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now() } as FabricParticipantRecord));
     main.registerSource(() => [{ ...records[0]!, id: mainId, kind: "root", rootId: mainId, ownerHostId: mainId, ownerIdentityId: mainId }]);
@@ -223,7 +223,7 @@ describe("native route lease grace (#4383)", () => {
   it("rejects a beyond-grace owner before publishing a new command", async () => {
     const root = temp();
     const sender = control(root, "sender", { captureOwnerLease: () => () => Date.now() - 120000 });
-    await expect(sender.request("owner", "session:target", "followUp"))
+    await expect(sender.request("owner", "session:target", "followUp", { ownerIncarnation: "fixture:owner" }))
       .rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: expect.any(String) });
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(0);
   });
@@ -237,7 +237,7 @@ describe("native route lease grace (#4383)", () => {
 });
 
 const control = (root: string, id: string, options: Partial<FabricControlPlaneOptions> = {}) => {
-  const p = new FabricControlPlane(new MeshStore(root, 65536, 1000), identity(id), { enabled: true, hostId: id, pollMs: 20, ...options });
+  const p = new FabricControlPlane(new MeshStore(root, 65536, 1000), identity(id), { enabled: true, hostId: id, ownerIncarnation: "fixture:owner", pollMs: 20, ...options });
   planes.push(p); return p;
 };
 const command = (sender: FabricControlPlane) => sender.mesh.read({ topic: "fabric.control.command", limit: 20 })
@@ -250,7 +250,7 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     const sender = control(root, "sender", { now: () => Date.now(), captureOwnerLease: () => () => expiresAt });
     sender.start(() => ({ accepted: false }));
     let settled = false;
-    const outcome = sender.request("owner", "session:target", "followUp", { message: "later" }).finally(() => { settled = true; });
+    const outcome = sender.request("owner", "session:target", "followUp", { message: "later", ownerIncarnation: "fixture:owner" }).finally(() => { settled = true; });
     await drainMicrotasks();
     const sent = command(sender);
     expect(sent.deadlineAt! - sent.requestedAt).toBe(60000);
@@ -267,7 +267,7 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     vi.useFakeTimers(); const root = temp(); let expiresAt = Date.now() + 60000;
     const sender = control(root, "sender", { captureOwnerLease: () => () => expiresAt });
     sender.start(() => ({ accepted: false }));
-    const outcome = sender.request("owner", "session:target", "steer", {}, "owner", { idempotencyKey: "stable-key" }).catch(e => e);
+    const outcome = sender.request("owner", "session:target", "steer", { ownerIncarnation: "fixture:owner" }, "owner", { idempotencyKey: "stable-key" }).catch(e => e);
     await drainMicrotasks(); expiresAt = Date.now() - 45001;
     await vi.advanceTimersByTimeAsync(20);
     expect(await outcome).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: "stable-key" });
@@ -284,14 +284,14 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
       if (drop && input.topic === "fabric.control.ack") return { sequence: 0 } as Awaited<ReturnType<typeof owner.mesh.publish>>;
       return publish(input);
     });
-    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged" }, "owner", explicit ? { idempotencyKey: "same-message" } : {}).catch(e => e);
+    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", explicit ? { idempotencyKey: "same-message" } : {}).catch(e => e);
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(100);
     expect(deliver).toHaveBeenCalledOnce(); const firstId = command(sender).commandId;
     expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
     const stale = await first;
     expect(stale).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: explicit ? "same-message" : expect.any(String) });
     expiresAt = Date.now() + 120000; drop = false;
-    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged" }, "owner", { idempotencyKey: stale.idempotencyKey });
+    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: stale.idempotencyKey });
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(100);
     await expect(retry).resolves.toMatchObject({ messageId: "one-delivery" });
     expect(command(sender).commandId).toBe(firstId); expect(deliver).toHaveBeenCalledOnce();
@@ -310,7 +310,7 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
         return { sequence: 0 } as Awaited<ReturnType<typeof owner.mesh.publish>>;
       return publish(input);
     });
-    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged" }, "owner", { idempotencyKey: "resend-key" }).catch(e => e);
+    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" }).catch(e => e);
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(60001);
     owner.start(deliver); await vi.advanceTimersByTimeAsync(500);
     expect(deliver).toHaveBeenCalledOnce(); const admittedId = command(sender).commandId;
@@ -318,7 +318,7 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
     expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
     expect(await first).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: "resend-key" });
     expiresAt = Date.now() + 120000; drop = false;
-    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged" }, "owner", { idempotencyKey: "resend-key" });
+    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" });
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(500);
     await expect(retry).resolves.toMatchObject({ messageId: "one-resend" });
     expect(command(sender).commandId).toBe(admittedId); expect(deliver).toHaveBeenCalledOnce();

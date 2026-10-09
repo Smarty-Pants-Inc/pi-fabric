@@ -633,7 +633,7 @@ describe("FabricControlPlane", () => {
           await vi.advanceTimersByTimeAsync(30_001);
           await f.sender.mesh.publish({
             topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
-            data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: false,
+            data: { version: 1, commandId: command.commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: false,
               error: "Fabric control command expired", notRun: true, bridge: { from: "forge" } },
           });
           await vi.advanceTimersByTimeAsync(20);

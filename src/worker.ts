@@ -728,13 +728,16 @@ const main = async (): Promise<void> => {
   let producedFinalAnswer = false;
   let completedToolInTurn = false;
   let hasCompletedToolTurn = false;
+  let streamingToolCallInTurn = false;
+  const unresolvedToolCalls = new Set<string>();
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // return an interrupted report. Never turn cancellation, schema/admission
   // failures, lost events, or an actor directive into a successful task.
   const canKeepInterruptedOutput = (error: string): boolean => options.runner === "pi" &&
     !options.actorId && !options.actorName && !options.residentStartupProbe &&
-    hasCompletedToolTurn && Boolean(record.partialText || record.lastCompleteText) &&
+    hasCompletedToolTurn && !streamingToolCallInTurn && unresolvedToolCalls.size === 0 &&
+    Boolean(record.partialText || record.lastCompleteText) &&
     modelControl.ready && !providerAborted && !lostResult && !record.errorCode &&
     terminalStatus !== "stopped" && terminalStatus !== "timed_out" &&
     record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight" &&
@@ -1464,17 +1467,25 @@ const main = async (): Promise<void> => {
     if (event.type === "message_start" && !terminalStatus &&
         (event.message as Record<string, unknown> | undefined)?.role === "assistant") {
       delete record.partialText;
+      streamingToolCallInTurn = false;
       hasFinalText = false;
       hasFinalResult = false;
       update(); // Keep lastCompleteText from the previous turn on disk.
     }
     if (event.type === "message_update" && !terminalStatus) {
       const delta = (event.assistantMessageEvent ?? event.event) as Record<string, unknown> | undefined;
+      if (delta && ["toolcall_start", "toolcall_delta", "toolcall_end"].includes(String(delta.type))) {
+        // A generated call is unresolved until its execution ends, not merely
+        // until its argument stream ends. A prior completed turn cannot bless it.
+        streamingToolCallInTurn = true;
+      }
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
           typeof delta.delta === "string" && delta.delta.length > 0) {
         if (!record.inferenceStarted) { record.inferenceStarted = true; update(); }
       }
       const message = event.message as Record<string, unknown> | undefined;
+      if (message?.role === "assistant" && Array.isArray(message.content) && message.content.some(block =>
+        typeof block === "object" && block !== null && block.type === "toolCall")) streamingToolCallInTurn = true;
       // Native Pi repeats the complete partial message; legacy frames may only
       // carry a delta. Never append both, or include thinking/tool arguments.
       const text = message?.role === "assistant" ? extractText(message)
@@ -1548,6 +1559,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
       if (typeof event.toolName === "string") {
@@ -1559,6 +1571,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {
         emitLifecycle("pi.tool_error", {
@@ -1572,7 +1585,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "turn_end") {
-      hasCompletedToolTurn ||= completedToolInTurn;
+      hasCompletedToolTurn ||= completedToolInTurn && !streamingToolCallInTurn && unresolvedToolCalls.size === 0;
       completedToolInTurn = false;
       emitLifecycle("pi.turn_end", {
         ...(typeof event.turnIndex === "number" ? { turnIndex: event.turnIndex } : {}),
@@ -1598,6 +1611,15 @@ const main = async (): Promise<void> => {
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
+      const toolCalls = Array.isArray(messageRecord.content)
+        ? messageRecord.content.filter((block): block is Record<string, unknown> =>
+          typeof block === "object" && block !== null && block.type === "toolCall") : [];
+      for (const call of toolCalls) unresolvedToolCalls.add(stringField(call.id) ?? "unknown-tool-call");
+      if (toolCalls.length > 0 && messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+        // The complete message identifies every generated call; pending IDs now
+        // carry the obligation until matching tool_execution_end frames arrive.
+        streamingToolCallInTurn = false;
+      }
       const text = extractText(messageRecord);
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
@@ -1946,6 +1968,9 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    streamingToolCallInTurn = false;
+    unresolvedToolCalls.clear();
+    completedToolInTurn = false;
     sawAgentError = false;
     retryPending = false;
     terminalError = undefined;

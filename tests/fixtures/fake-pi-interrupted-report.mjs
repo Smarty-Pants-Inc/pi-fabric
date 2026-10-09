@@ -34,7 +34,9 @@ const tools = !["no-output", "tool-less"].includes(mode);
 if (tools) {
   emit({ type: "message_start", message: { role: "assistant", content: [] } });
   if (mode !== "no-text") {
-    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: previous }], stopReason: "toolUse" } });
+    emit({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 } });
+    emit({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 1 } });
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: previous }, { type: "toolCall", id: "completed-work", name: "fabric_exec", arguments: {} }], stopReason: "toolUse" } });
     await snapshot("lastCompleteText", previous);
   }
   emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "completed-work", args: {} });
@@ -53,7 +55,6 @@ if (!["fallback", "no-output", "no-text"].includes(mode)) {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "FINAL: completed" } });
     await snapshot("partialText", "FINAL: completed");
     emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "not output" } });
-    emit({ type: "message_update", assistantMessageEvent: { type: "toolcall_delta", delta: "not output either" } });
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: " the patch. 🦄" } });
   } else {
     emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "FINAL: completed" }] }, assistantMessageEvent: { type: "text_delta", delta: "FINAL: completed" } });
@@ -61,6 +62,20 @@ if (!["fallback", "no-output", "no-text"].includes(mode)) {
     emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: final }] }, event: { type: "text_delta", delta: " the patch. 🦄" } });
   }
   await snapshot("partialText", final);
+}
+if (["later-tool-start", "later-tool-delta", "later-tool-end"].includes(mode)) {
+  emit({ type: "message_update", assistantMessageEvent: { type: mode === "later-tool-start" ? "toolcall_start" : mode === "later-tool-end" ? "toolcall_end" : "toolcall_delta", contentIndex: 1, delta: "not report text" } });
+} else if (mode === "later-tool-snapshot") {
+  emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: final }, { type: "toolCall", id: "unresolved-work", name: "fabric_exec", arguments: {} }] } });
+} else if (mode === "later-tool-use") {
+  emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: final }, { type: "toolCall", id: "unresolved-work", name: "fabric_exec", arguments: {} }], stopReason: "toolUse" } });
+} else if (mode === "later-tool-execution" || mode === "later-parallel-tools") {
+  emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "unresolved-work", args: {} });
+  if (mode === "later-parallel-tools") {
+    emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "resolved-work", args: {} });
+    emit({ type: "tool_execution_end", toolName: "fabric_exec", toolCallId: "resolved-work", result: {}, isError: false });
+    emit({ type: "turn_end", toolResults: [] }); // An end frame must not discard a pending sibling.
+  }
 }
 if (mode === "timeout" || mode === "stop") {
   process.stderr.write(error); // A prior stream error must not override a stop/deadline.

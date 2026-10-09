@@ -106,6 +106,13 @@ describe("durable interrupted task reports", () => {
     expect(result.warnings ?? []).not.toContain(expect.stringContaining(warning));
     if (mode === "no-output") expect(result.text).toBe("");
   });
+  it.each(["later-tool-start", "later-tool-delta", "later-tool-end", "later-tool-snapshot", "later-tool-use", "later-tool-execution", "later-parallel-tools"])("does not retain a cut unresolved tool-call turn after completed work: %s", async mode => {
+    const { result } = await run(mode);
+    expect(result).toMatchObject({ status: "failed", exitCode: 1, error: "stream disconnected before completion" });
+    expect(result.lastCompleteText).toBe(mode === "later-tool-use" ? final : previous);
+    expect(result.warnings ?? []).not.toContain(expect.stringContaining(warning));
+    expect(result.text).not.toContain("not report text");
+  });
   it("does not mask a deterministic provider error", async () => {
     const { result } = await run("partial", "400 invalid_request_error");
     expect(result.status).toBe("failed");

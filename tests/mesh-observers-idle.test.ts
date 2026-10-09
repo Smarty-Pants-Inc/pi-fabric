@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
+import { ActorMeshMonitor, meshObserverWatch } from "../src/actors/mesh-monitor.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../src/lifecycle/types.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -32,10 +32,10 @@ function store() {
   return new MeshStore(path.join(root, "mesh"), 65_536, 100);
 }
 function mockWatch() {
-  const watchers: Array<{ notify: (event: string, filename: string | null) => void; emitter: EventEmitter; close: ReturnType<typeof vi.fn> }> = [];
+  const watchers: Array<{ directory: string; notify: (event: string, filename: string | null) => void; emitter: EventEmitter; close: ReturnType<typeof vi.fn> }> = [];
   vi.spyOn(fs, "watch").mockImplementation((...args: unknown[]) => {
     const emitter = new EventEmitter(); const close = vi.fn();
-    watchers.push({ notify: args.at(-1) as typeof watchers[number]["notify"], emitter, close });
+    watchers.push({ directory: String(args[0]), notify: args.at(-1) as typeof watchers[number]["notify"], emitter, close });
     return Object.assign(emitter, { close }) as unknown as FSWatcher;
   });
   return watchers;
@@ -52,8 +52,91 @@ async function lifecycle(mesh: MeshStore, deliver = vi.fn()) {
 }
 
 describe("event-driven mesh observers", () => {
+  it("rejects a watch when its directory changes during attachment", () => {
+    const mesh = store(); const close = vi.fn();
+    vi.spyOn(fs, "watch").mockImplementation(() => {
+      fs.renameSync(mesh.root, mesh.root + ".retired"); fs.mkdirSync(mesh.root);
+      return Object.assign(new EventEmitter(), { close }) as unknown as FSWatcher;
+    });
+    expect(meshObserverWatch(mesh.root, { persistent: false }, () => {})).toBeUndefined();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("retires missing roots, ignores retired callbacks, and attaches a recreated root at safety cadence", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    const broker = await lifecycle(mesh); broker.start();
+    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    closers.push(() => control.close()); control.start(() => ({ accepted: true }));
+    const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
+      { beforePoll: () => true, onEvent: () => {} });
+    closers.push(() => actor.close()); actor.start(); await vi.advanceTimersByTimeAsync(0); await flush();
+    const retired = [...watches]; fs.renameSync(mesh.root, mesh.root + ".retired");
+    await vi.advanceTimersByTimeAsync(60_000);
+    for (const watch of retired) expect(watch.close).toHaveBeenCalledOnce();
+    fs.cpSync(mesh.root + ".retired", mesh.root, { recursive: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(watches.length).toBe(retired.length * 2);
+    const tails = vi.spyOn(mesh, "tail"); const lists = vi.spyOn(mesh, "listAll");
+    for (const watch of retired) { watch.notify("change", null); watch.emitter.emit("error", new Error("late")); }
+    await vi.advanceTimersByTimeAsync(0); await flush();
+    expect(tails).not.toHaveBeenCalled(); expect(lists).not.toHaveBeenCalled();
+  });
+
+  it("reconciles silently replaced ancillary directories without churning the unchanged root", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    const directory = path.join(mesh.root, "participants"); fs.mkdirSync(directory);
+    const broker = await lifecycle(mesh); broker.start(); const beforePoll = vi.fn(() => true);
+    const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
+      { beforePoll, onEvent: () => {} });
+    closers.push(() => actor.close()); actor.start(); await flush();
+    const rootWatches = watches.filter(watch => watch.directory === mesh.root);
+    const retired = watches.filter(watch => watch.directory === directory);
+    const count = watches.length;
+    fs.renameSync(directory, directory + ".retired"); fs.mkdirSync(directory);
+    await vi.advanceTimersByTimeAsync(60_000); await flush();
+    expect(watches).toHaveLength(count + 2);
+    for (const watch of retired) expect(watch.close).toHaveBeenCalledOnce();
+    for (const watch of rootWatches) expect(watch.close).not.toHaveBeenCalled();
+    const lists = vi.spyOn(mesh, "listAll"); const tails = vi.spyOn(mesh, "tail"); beforePoll.mockClear();
+    for (const watch of retired) watch.notify("change", "late.json");
+    await flush(); expect(lists).not.toHaveBeenCalled(); expect(beforePoll).not.toHaveBeenCalled();
+    for (const watch of watches.slice(count)) watch.notify("change", "new.json");
+    await flush(); expect(lists).toHaveBeenCalled(); expect(beforePoll).toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled();
+  });
+
+  it("reattaches native root and ancillary inode replacements and wakes on NEW writes before another safety tick", async () => {
+    vi.useFakeTimers(); const mesh = store();
+    for (const directory of ["actors", "participants", "host-leases"]) fs.mkdirSync(path.join(mesh.root, directory));
+    const delivered = vi.fn(); const broker = await lifecycle(mesh, delivered); broker.start();
+    const handled = vi.fn(() => ({ accepted: true }));
+    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    closers.push(() => control.close()); control.start(handled);
+    const seen = vi.fn(); const beforePoll = vi.fn(() => true);
+    const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
+      { beforePoll, onEvent: event => { if (event.topic === "fleet.work.replaced") seen(event); } });
+    closers.push(() => actor.close()); actor.start(); await vi.advanceTimersByTimeAsync(0); await flush();
+    fs.renameSync(mesh.root, mesh.root + ".retired"); fs.cpSync(mesh.root + ".retired", mesh.root, { recursive: true });
+    await vi.advanceTimersByTimeAsync(60_000); await flush(); vi.useRealTimers();
+    await publish(mesh); await mesh.publish({ topic: "fleet.work.replaced", from: identity });
+    await mesh.publish({ topic: "fabric.control.command", from: { ...identity, id: "sender" }, to: "target",
+      data: { version: 1, commandId: "replaced", targetId: "target", operation: "steer", replyTo: "sender",
+        requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+    await vi.waitFor(() => { expect(delivered).toHaveBeenCalledOnce(); expect(seen).toHaveBeenCalledOnce(); expect(handled).toHaveBeenCalledOnce(); });
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    // Ancillary-only replacement, independent of the root identity.
+    for (const directory of ["actors", "participants", "host-leases"]) {
+      fs.renameSync(path.join(mesh.root, directory), path.join(mesh.root, directory + ".retired"));
+      fs.mkdirSync(path.join(mesh.root, directory));
+    }
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    const lists = vi.spyOn(mesh, "listAll"); const tails = vi.spyOn(mesh, "tail");
+    beforePoll.mockClear();
+    fs.writeFileSync(path.join(mesh.root, "participants", "new.json"), "{}");
+    await vi.waitFor(() => { expect(beforePoll).toHaveBeenCalled(); expect(lists).toHaveBeenCalled(); });
+    expect(tails).not.toHaveBeenCalled();
+  });
   it("does not scan lifecycle subscriptions or reread the unchanged control/actor tail during idle safety checks", async () => {
-    vi.useFakeTimers(); mockWatch(); const mesh = store();
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
     const broker = await lifecycle(mesh); broker.start();
     const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(() => ({ accepted: true }));
@@ -62,7 +145,9 @@ describe("event-driven mesh observers", () => {
     closers.push(() => actor.close()); actor.start();
     await vi.advanceTimersByTimeAsync(0); await flush();
     const lists = vi.spyOn(mesh, "listAll"); const tails = vi.spyOn(mesh, "tail"); const reads = vi.spyOn(fs, "readFileSync");
+    const attached = watches.length;
     await vi.advanceTimersByTimeAsync(180_000);
+    expect(watches).toHaveLength(attached); for (const watch of watches) expect(watch.close).not.toHaveBeenCalled();
     expect(lists).not.toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled(); expect(reads).not.toHaveBeenCalled();
   });
 

@@ -4,8 +4,8 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import fs, { type FSWatcher } from "node:fs";
-import { meshObserverStamp } from "../actors/mesh-monitor.js";
+import type { FSWatcher } from "node:fs";
+import { meshObserverStamp, meshObserverWatch, meshObserverWatchCurrent } from "../actors/mesh-monitor.js";
 
 const OBSERVED_FILES = ["events.jsonl", "generation"];
 const IDLE_SAFETY_MS = 60_000;
@@ -933,13 +933,19 @@ export class FabricControlPlane {
     }
   }
 
-  #attachWatcher(): void {
-    if (this.#closed || this.#paused || this.#watcher) return;
+  #attachWatcher(reconcile = false): void {
+    if (this.#closed || this.#paused) return;
+    if (this.#watcher && reconcile && !meshObserverWatchCurrent(this.#watcher, this.mesh.root)) {
+      const previous = this.#watcher; this.#watcher = undefined; previous.close();
+    }
+    if (this.#watcher) return;
     try {
-      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+      const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        if (this.#closed || this.#paused || this.#watcher !== watcher) return;
         if (filename !== null && !OBSERVED_FILES.includes(path.basename(filename.toString()))) return;
         this.#wake();
       });
+      if (!watcher) return;
       this.#watcher = watcher;
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;
@@ -961,7 +967,7 @@ export class FabricControlPlane {
     const timer = setTimeout(() => {
       if (this.#timer !== timer || this.#closed || this.#paused) return;
       this.#timer = undefined;
-      this.#attachWatcher();
+      this.#attachWatcher(waitMs >= IDLE_SAFETY_MS);
       const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
       const active = this.#retryNeeded || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size;
       if (!this.#dirty && !active && stamp !== undefined && stamp === this.#stamp) {

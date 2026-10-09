@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import fs, { type FSWatcher } from "node:fs";
+import type { FSWatcher } from "node:fs";
 import path from "node:path";
-import { meshObserverStamp } from "../actors/mesh-monitor.js";
+import { meshObserverStamp, meshObserverWatch, meshObserverWatchCurrent } from "../actors/mesh-monitor.js";
 
 const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
 const OBSERVED_DIRECTORIES = ["participants", "host-leases"];
@@ -80,7 +80,7 @@ export class LifecycleBroker {
     this.#attachWatcher();
     this.#timer = setInterval(() => {
       if (this.#closed || this.#paused) return;
-      this.#attachWatcher();
+      this.#attachWatcher(true);
       const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
       if (stamp === undefined || stamp !== this.#stamp) this.#schedulePoll();
     }, Math.max(IDLE_SAFETY_MS, this.#pollMs));
@@ -225,12 +225,21 @@ export class LifecycleBroker {
     await this.#polling?.catch(() => undefined);
   }
 
-  #attachWatcher(): void {
+  #attachWatcher(reconcile = false): void {
     if (this.#closed || this.#paused) return;
     for (const directory of OBSERVED_DIRECTORIES) {
-      if (this.#directoryWatchers.has(directory) || !fs.existsSync(path.join(this.mesh.root, directory))) continue;
+      const watchedPath = path.join(this.mesh.root, directory);
+      const previous = this.#directoryWatchers.get(directory);
+      if (previous && reconcile && !meshObserverWatchCurrent(previous, watchedPath)) {
+        this.#directoryWatchers.delete(directory); previous.close();
+      }
+      if (this.#directoryWatchers.has(directory)) continue;
       try {
-        const watcher = fs.watch(path.join(this.mesh.root, directory), { persistent: false }, () => this.#schedulePoll());
+        const watcher = meshObserverWatch(watchedPath, { persistent: false }, () => {
+          if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
+          this.#schedulePoll();
+        });
+        if (!watcher) continue;
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
@@ -238,16 +247,21 @@ export class LifecycleBroker {
         });
       } catch { /* The safety witness also retries directory attachment. */ }
     }
+    if (this.#watcher && reconcile && !meshObserverWatchCurrent(this.#watcher, this.mesh.root)) {
+      const previous = this.#watcher; this.#watcher = undefined; previous.close();
+    }
     if (this.#watcher) return;
     try {
-      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+      const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        if (this.#closed || this.#watcher !== watcher) return;
         if (filename !== null) {
           const file = path.basename(filename.toString());
           if (!OBSERVED_FILES.includes(file)) return;
-          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher();
+          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
         }
         this.#schedulePoll();
       });
+      if (!watcher) return;
       this.#watcher = watcher;
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;

@@ -21,6 +21,30 @@ export function meshObserverStamp(root: string, files: readonly string[]): strin
     }).join(";");
   } catch { return undefined; } // An unreadable witness must request a trusted drain.
 }
+/** Native watches follow inodes, not paths. Check attachment races and idle replacements. */
+const watchIdentities = new WeakMap<FSWatcher, string>();
+function directoryIdentity(directory: string): string | undefined {
+  try {
+    const stat = fs.statSync(directory, { bigint: true });
+    return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : undefined;
+  } catch { return undefined; }
+}
+export function meshObserverWatchCurrent(watcher: FSWatcher, directory: string): boolean {
+  const identity = directoryIdentity(directory);
+  return identity !== undefined && identity === watchIdentities.get(watcher);
+}
+export function meshObserverWatch(
+  directory: string,
+  options: { persistent: boolean; recursive?: boolean },
+  notify: (event: string, filename: string | Buffer | null) => void,
+): FSWatcher | undefined {
+  const identity = directoryIdentity(directory);
+  if (identity === undefined) return undefined;
+  const watcher = fs.watch(directory, options, notify);
+  if (directoryIdentity(directory) !== identity) { watcher.close(); return undefined; }
+  watchIdentities.set(watcher, identity);
+  return watcher;
+}
 const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
 const OBSERVED_DIRECTORIES = ["actors", "participants", "host-leases"];
 const MESH_BACKGROUND_POLL_MS = 1_000;
@@ -195,17 +219,24 @@ export class ActorMeshMonitor {
     this.schedule();
   }
 
-  #attachWatcher(): void {
+  #attachWatcher(reconcile = false): void {
     if (this.#closed) return;
     // These changes are not necessarily mesh appends. Notifications only request
     // the existing manager-owned registry/completion/ownership checks.
     for (const directory of OBSERVED_DIRECTORIES) {
-      if (this.#directoryWatchers.has(directory) || !fs.existsSync(path.join(this.mesh.root, directory))) continue;
+      const watchedPath = path.join(this.mesh.root, directory);
+      const previous = this.#directoryWatchers.get(directory);
+      if (previous && reconcile && !meshObserverWatchCurrent(previous, watchedPath)) {
+        this.#directoryWatchers.delete(directory); previous.close();
+      }
+      if (this.#directoryWatchers.has(directory)) continue;
       try {
-        const watcher = fs.watch(path.join(this.mesh.root, directory), { persistent: false, recursive: directory === "actors" }, (_event, filename) => {
+        const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: directory === "actors" }, (_event, filename) => {
+          if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           if (filename !== null && path.basename(filename.toString()) === "mesh-cursor.json") return;
           this.#scheduleBackground(false);
         });
+        if (!watcher) continue;
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
@@ -213,17 +244,22 @@ export class ActorMeshMonitor {
         });
       } catch { /* Platforms without recursive watches retain bounded reconciliation. */ }
     }
+    if (this.#watcher && reconcile && !meshObserverWatchCurrent(this.#watcher, this.mesh.root)) {
+      const previous = this.#watcher; this.#watcher = undefined; previous.close();
+    }
     if (this.#watcher) return;
     try {
-      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+      const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        if (this.#closed || this.#watcher !== watcher) return;
         if (filename !== null) {
           const file = path.basename(filename.toString());
-          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher();
+          if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
           else if (!OBSERVED_FILES.includes(file)) return;
         }
         const file = filename === null ? undefined : path.basename(filename.toString());
         this.#scheduleBackground(file === undefined || file === "events.jsonl" || file === "generation");
       });
+      if (!watcher) return;
       this.#watcher = watcher;
       watcher.on("error", () => this.#fallback(watcher));
     } catch { /* Retry attachment at the bounded safety check, never fast idle polling. */ }
@@ -232,7 +268,7 @@ export class ActorMeshMonitor {
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = setInterval(() => {
-      this.#attachWatcher();
+      this.#attachWatcher(true);
       const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
       if (stamp === undefined || stamp !== this.#stamp) this.schedule(false);
       else if (!this.#closed) void this.#backgroundPoll.run(() => this.callbacks.beforePoll()).then(result => {

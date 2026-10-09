@@ -63,19 +63,36 @@ describe("external spawn router behavior", () => {
     expect(fs.existsSync(path.join(dir, "request.json"))).toBe(false);
     expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: "invalid-command" });
   });
-  it("passes only the minimal explicit environment, never credentials or loader hooks", async () => {
+  it.each([...new Set([process.platform, "win32"])])("passes only the minimal explicit environment, never credentials or loader hooks (%s)", async platform => {
     const dir = root(); const opts = options(dir);
-    for (const name of ["SMARTY_AUTH", "GITHUB_TOKEN", "MY_TOKEN", "API_KEY", "PI_CODING_AGENT_DIR", "NODE_OPTIONS", "LD_PRELOAD"]) {
+    for (const name of ["SMARTY_AUTH", "GITHUB_TOKEN", "MY_TOKEN", "API_KEY", "PI_CODING_AGENT_DIR", "NODE_OPTIONS", "LD_PRELOAD", "COMSPEC", "PATHEXT"]) {
       vi.stubEnv(name, "must-not-reach-router");
     }
     vi.stubEnv("PATH", dir); vi.stubEnv("HOME", "/router-home"); vi.stubEnv("LANG", "C"); vi.stubEnv("TZ", "UTC");
+    const systemRoot = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1] ?? "C:\\Windows";
+    const essentials = {
+      HOMEDRIVE: "C:", HOMEPATH: "\\router-home", LOGONSERVER: "\\\\router-host", SYSTEMDRIVE: "C:",
+      TEMP: dir, USERDOMAIN: "router-domain", USERNAME: "router-user", USERPROFILE: dir, WINDIR: systemRoot,
+    };
+    // Exercise case-insensitive Windows lookup without leaking these keys on POSIX.
+    for (const [name, value] of Object.entries({ ...essentials, SYSTEMROOT: systemRoot })) {
+      const keys = Object.keys(process.env).filter(key => key.toUpperCase() === name);
+      for (const key of keys.length ? keys : [name.toLowerCase()]) vi.stubEnv(key, value);
+    }
     const body = `require('node:fs').writeFileSync(process.argv[1] + '.env', JSON.stringify(process.env)); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`;
-    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
-    const systemRoot = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
-    const platformEnv = process.platform === "win32" ? {
-      SystemRoot: systemRoot,
-      PATH: `${path.win32.join(systemRoot!, "System32")};${systemRoot}`,
-      COMSPEC: path.win32.join(systemRoot!, "System32", "cmd.exe"),
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let routed: ReturnType<typeof routeAgentCreation>;
+    try {
+      // Inject only while the hook constructs env/spawn options; restore before
+      // asynchronous process retirement so a Linux child is retired on Linux.
+      Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+      routed = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } });
+    } finally { Object.defineProperty(process, "platform", descriptor); }
+    expect(await routed).toEqual({ model: pick.model, thinking: pick.thinking });
+    const platformEnv = platform === "win32" ? {
+      ...essentials, SystemRoot: systemRoot,
+      PATH: `${path.win32.join(systemRoot, "System32")};${systemRoot}`,
+      COMSPEC: path.win32.join(systemRoot, "System32", "cmd.exe"),
     } : { PATH: "/usr/bin:/bin" };
     expect(JSON.parse(fs.readFileSync(path.join(dir, "request.json.env"), "utf8"))).toEqual({ ...platformEnv, HOME: "/router-home", LANG: "C", TZ: "UTC" });
   });

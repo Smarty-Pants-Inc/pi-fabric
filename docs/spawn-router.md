@@ -24,10 +24,16 @@ absolute path: bare names and relative paths are rejected, with no PATH lookup.
 On POSIX the router receives `PATH=/usr/bin:/bin`; on Windows it receives
 `SystemRoot` (resolved case-insensitively from the host), a fixed
 `PATH=<SystemRoot>\System32;<SystemRoot>`, and
-`COMSPEC=<SystemRoot>\System32\cmd.exe`. A missing/relative Windows system root
-fails open without starting a command. On either platform only `HOME`, `LANG`,
-and `TZ` are otherwise copied when set; parent `PATH`/`Path`, `COMSPEC`, host
-credentials, agent variables, and loader hooks are never inherited. Script
+`COMSPEC=<SystemRoot>\System32\cmd.exe`. Windows also explicitly copies the
+process essentials that libuv would otherwise add to the child: `HOMEDRIVE`,
+`HOMEPATH`, `LOGONSERVER`, `SYSTEMDRIVE`, `TEMP`, `USERDOMAIN`, `USERNAME`,
+`USERPROFILE`, and `WINDIR`, when set (case-insensitive host lookup, canonical
+uppercase child keys). Together with `PATH` and `SystemRoot`, these are libuv's
+Windows required-variable allowlist; no other Windows variables, including
+parent `PATHEXT`, are copied. A missing/relative Windows system root fails open
+without starting a command. On either platform only `HOME`, `LANG`, and `TZ`
+are otherwise copied when set; parent `PATH`/`Path`, `COMSPEC`, host credentials,
+agent variables, and loader hooks are never inherited. Script
 routers must name their interpreter explicitly, for example an absolute
 `node.exe` followed by the `.mjs` script path on Windows; there is no shell repair.
 `timeoutMs` defaults to 1500 and clamps to 200–5000 ms. `mode` defaults to `off` (also the kill switch).

@@ -33,12 +33,19 @@ const routerEnv = (): NodeJS.ProcessEnv => {
   if (process.platform === "win32") {
     // A copied Windows environment is case-sensitive in JS even though native
     // environment names are not. Never inherit Path or a caller's COMSPEC.
-    const root = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
+    const hostEnv = new Map(Object.entries(process.env).map(([name, value]) => [name.toUpperCase(), value]));
+    const root = hostEnv.get("SYSTEMROOT");
     if (!root || !path.win32.isAbsolute(root)) throw new Error("command-error");
     const system = path.win32.join(root, "System32");
     env.SystemRoot = root;
     env.PATH = `${system};${root}`;
     env.COMSPEC = path.win32.join(system, "cmd.exe");
+    // libuv adds these Windows process essentials even with an explicit env.
+    // Make that exact allowlist explicit; never inherit the rest of the host.
+    for (const name of ["HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "SYSTEMDRIVE", "TEMP", "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR"]) {
+      const value = hostEnv.get(name);
+      if (value !== undefined) env[name] = value;
+    }
   }
   for (const name of ["HOME", "LANG", "TZ"]) {
     if (process.env[name] !== undefined) env[name] = process.env[name];

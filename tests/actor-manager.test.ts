@@ -211,14 +211,110 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     return registry.actors.find((actor: { id: string }) => actor.id === id);
   };
 
+  it("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
+    const state = setup(true);
+    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "project policy", thinking: "medium" as const };
+    const actor = await state.actors.create({ name: "rollback-defaults", instructions: "Observe.", ...defaults });
+    await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+      binding: { model: "provider/foreign", modelReason: "one run only", thinking: "low" },
+    });
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    // The pre-#741 writer rebuilt rows from these known fields. It did not
+    // preserve unknown fields, including projectDefaults or resolvedBinding.
+    const oldFields = new Set([
+      "id", "name", "rootId", "adoptedAt", "adoptedFrom", "project", "instructions", "status",
+      "events", "topics", "delivery", "responseMode", "triggerTurn", "coalesce", "residency", "runner",
+      "kernel", "pythonRuntime", "runnerSessionId", "model", "modelReason", "thinking", "routeClass",
+      "protected", "tools", "transport", "timeoutMs", "nice", "bashTimeoutSeconds", "extensions",
+      "inferenceContext", "coalesceKey", "activationFilter", "filterSkipped", "activationFilterExpiresAt",
+      "filteredCount", "lastFilteredAt", "requirements", "capabilityDigest", "activationBlocked",
+      "failureStreak", "validWhile", "sessionFile", "messages", "messageHistory", "createdAt",
+      "updatedAt", "lastRunId", "removal", "presenceError",
+    ]);
+    const store = new ActorRegistryStore(path.join(state.root, "actors"));
+    registry.actors = registry.actors.map((source: Record<string, unknown>) => Object.fromEntries(
+      Object.entries({ ...source, instructions: store.instructions(source) }).filter(([key]) => oldFields.has(key)),
+    ));
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project", ...defaults });
+    expect(restored.resolveBinding(actor.id)).toEqual(defaults);
+    // An old save may lose knowledge of the last run, never the defaults.
+    expect(restored.listOwned(true)[0]?.model).toBeUndefined();
+  });
+
+  it.each([false, true])("round 2 keeps legacy shared views unknown with project defaults=%s and reader overlays", async hasDefaults => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "legacy-reader", instructions: "Observe.",
+      ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
+    });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].projectDefaults;
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    for (const sessionId of ["reader-a", "reader-b"]) {
+      const bindings = new ActorBindingStore(sessionId, path.join(state.root, "actors"));
+      await bindings.setModel(actor.id, `provider/${sessionId}`);
+      await bindings.setThinking(actor.id, "high");
+      const reader = new ActorManager(sessionId, { ...state.identity, id: `session:${sessionId}`, sessionId },
+        state.mesh, state.meshConfig, state.agents, () => {}, {
+          actorRoot: path.join(state.root, "actors"), persistent: true, canManageActor: () => true,
+        });
+      actorManagers.push(reader);
+      const before = fs.readFileSync(file, "utf8");
+      expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
+      const shared = reader.listOwned(true)[0]!;
+      expect(shared.model).toBeUndefined();
+      expect(shared.thinking).toBeUndefined();
+      expect(shared.binding).toBeUndefined();
+      const member = actorParticipantRecord(shared, `session:${sessionId}`, "host", `session:${sessionId}`, `session:${sessionId}`);
+      expect(member.model).toBeUndefined();
+      expect(member.thinking).toBeUndefined();
+      expect(fs.readFileSync(file, "utf8")).toBe(before);
+      // A binding-only presence publication also must not stamp the overlay
+      // into either shared presence or the registry.
+      await reader.setModel(actor.id, `provider/${sessionId}-new`);
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
+      expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+      expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
+      expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
+      await reader.close();
+    }
+  });
+
+  it("round 2 never derives missing project defaults from a persisted known binding", async () => {
+    const state = setup(true, undefined, undefined, undefined, {}, { model: "provider/config", thinking: "high" });
+    const actor = await state.actors.create({ name: "binding-without-default", instructions: "Observe." });
+    await state.actors.close();
+    const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.listOwned(true)[0]).toMatchObject({ model: "provider/config", thinking: "high" });
+    expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project" });
+    expect(restored.resolveBinding(actor.id)).toEqual({});
+  });
+
   it("records a known configuration binding at create without pinning project defaults", async () => {
     const state = setup(true, undefined, undefined, {
       resolvePiModel: model => model === "luna" ? "cliproxyapi/gpt-6-luna" : model,
     }, {}, { model: "luna", thinking: "xhigh" });
     const actor = await state.actors.create({ name: "known-binding", instructions: "Observe." });
     expect(row(state.root, actor.id)).toMatchObject({
-      model: "cliproxyapi/gpt-6-luna", thinking: "xhigh", projectDefaults: { scope: "project" },
+      resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" },
     });
+    expect(row(state.root, actor.id).model).toBeUndefined();
+    expect(row(state.root, actor.id).thinking).toBeUndefined();
+    expect(row(state.root, actor.id).projectDefaults).toBeUndefined();
     expect(state.actors.status(actor.id).projectDefaults?.model).toBeUndefined();
     expect(state.actors.resolveBinding(actor.id)).toEqual({});
     await state.actors.stop(actor.id);
@@ -243,8 +339,8 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     };
     try {
       const changed = await runOnce("first");
-      expect(row(state.root, actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh",
-        projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+      expect(row(state.root, actor.id)).toMatchObject({ model: "anthropic/claude-opus-5-5", thinking: "medium",
+        resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" } });
       expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
       const unchanged = await runOnce("unchanged");
       // The first run may also initialize lifecycle state; a stable binding must
@@ -262,7 +358,8 @@ describe("ActorManager bound registry metadata (#7682)", () => {
         binding: { model: "provider/foreign", thinking: "low" },
       });
       await waitFor(() => state.actors.status(actor.id).status === "idle");
-      expect(row(state.root, actor.id)).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      expect(row(state.root, actor.id)).toMatchObject({ model: "anthropic/claude-opus-5-5", thinking: "medium",
+        resolvedBinding: { model: "provider/foreign", thinking: "low" } });
       const participant = actorParticipantRecord(state.actors.listOwned(true)[0]!, state.identity.id, "host", state.identity.id, state.identity.id);
       expect(participant).toMatchObject({ model: "provider/foreign", thinking: "low" });
       expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "provider/foreign", thinking: "low" });
@@ -285,7 +382,8 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     const actor = await state.actors.create({ name: "admitted-binding", instructions: "Observe.", model: "provider/selector" });
     await state.actors.ask(actor.id, "first");
     await waitFor(() => state.actors.status(actor.id).status === "idle");
-    expect(row(state.root, actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: state.agents.config.thinking });
+    expect(row(state.root, actor.id)).toMatchObject({ model: "provider/selector",
+      resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: state.agents.config.thinking } });
     expect(state.actors.status(actor.id).projectDefaults?.model).toBe("provider/selector");
     // Do not republish the pre-admission selector on every run: an unchanged
     // canonical binding must not be flipped back to the selector while preparing.
@@ -296,7 +394,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       await waitFor(() => state.actors.status(actor.id).status === "idle");
       expect(advertised.length).toBeGreaterThan(0);
       expect(advertised.every(model => model === "cliproxyapi/gpt-6-luna")).toBe(true);
-      expect(row(state.root, actor.id).model).toBe("cliproxyapi/gpt-6-luna");
+      expect(row(state.root, actor.id).resolvedBinding.model).toBe("cliproxyapi/gpt-6-luna");
     } finally { unsubscribe(); }
   });
 });

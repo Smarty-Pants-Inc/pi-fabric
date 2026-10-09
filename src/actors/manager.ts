@@ -4612,7 +4612,6 @@ export class ActorManager {
   }
 
   #serializedActor(actor: ManagedActor): Record<string, unknown> {
-    const binding = actor.resolvedBinding ?? this.#runBinding(actor);
     return {
       id: actor.id,
       name: actor.name,
@@ -4633,15 +4632,12 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(binding.model ? { model: binding.model } : {}),
-      ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
-      ...(binding.thinking ? { thinking: binding.thinking } : {}),
-      projectDefaults: {
-        scope: "project",
-        ...(actor.model ? { model: actor.model } : {}),
-        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
-        ...(actor.thinking ? { thinking: actor.thinking } : {}),
-      },
+      // Keep defaults in the pre-existing fields: rollback writers rebuild
+      // known fields and may discard the optional last-run binding.
+      ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+      ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
@@ -5019,11 +5015,11 @@ export class ActorManager {
       try { instructions = this.#registry.instructions(source); }
       catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
       const record = { ...source, instructions } as Partial<ManagedActor>;
-      // Legacy rows stored defaults at the top level. New rows preserve them
-      // separately so a last-run pin never becomes a future project default.
-      const hasDefaults = typeof source.projectDefaults === "object" &&
-        source.projectDefaults !== null && !Array.isArray(source.projectDefaults);
-      const defaults = hasDefaults ? source.projectDefaults as FabricActorRunBinding : record;
+      // Top-level model/thinking are always project defaults, including after
+      // an old writer drops unknown fields. Never infer defaults from a run pin.
+      const binding = typeof source.resolvedBinding === "object" &&
+        source.resolvedBinding !== null && !Array.isArray(source.resolvedBinding)
+        ? source.resolvedBinding as FabricActorRunBinding : undefined;
       if (
         typeof record.id !== "string" ||
         !/^[a-f0-9]{32}$/.test(record.id) ||
@@ -5095,13 +5091,13 @@ export class ActorManager {
         ...(typeof record.runnerSessionId === "string" && record.runnerSessionId.trim()
           ? { runnerSessionId: record.runnerSessionId }
           : {}),
-        ...(typeof defaults.model === "string" ? { model: defaults.model } : {}),
-        ...(typeof defaults.modelReason === "string" ? { modelReason: defaults.modelReason } : {}),
-        ...(isFabricThinking(defaults.thinking) ? { thinking: defaults.thinking } : {}),
-        ...(hasDefaults ? { resolvedBinding: {
-          ...(typeof record.model === "string" ? { model: record.model } : {}),
-          ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
-          ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        ...(typeof record.model === "string" ? { model: record.model } : {}),
+        ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
+        ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        ...(binding ? { resolvedBinding: {
+          ...(typeof binding.model === "string" ? { model: binding.model } : {}),
+          ...(typeof binding.modelReason === "string" ? { modelReason: binding.modelReason } : {}),
+          ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
         } } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
@@ -5704,8 +5700,10 @@ export class ActorManager {
   }
 
   #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
-    const session = this.#bindings.get(actor.id);
-    const effective = registryView && actor.resolvedBinding ? actor.resolvedBinding : this.#runBinding(actor);
+    const session = registryView ? undefined : this.#bindings.get(actor.id);
+    // Shared observers cannot know a legacy row's last admitted binding. An
+    // omitted model/thinking means unknown, not this reader's session overlay.
+    const effective = registryView ? actor.resolvedBinding ?? {} : this.#runBinding(actor);
     return {
       id: actor.id,
       scope: this.#actorScope,
@@ -5744,14 +5742,14 @@ export class ActorManager {
       ...(effective.model ? { model: effective.model } : {}),
       ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
-      binding: {
-        scope: "session",
+      ...(!registryView ? { binding: {
+        scope: "session" as const,
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
         ...(session?.modelReason !== undefined ? { modelReason: session.modelReason } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
-      },
+      } } : {}),
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),

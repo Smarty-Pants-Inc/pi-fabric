@@ -64,7 +64,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
-import { observeActorOwnership } from "../topology/publication-generation.js";
+import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
@@ -4539,10 +4539,9 @@ export class ActorManager {
       // not the fleet-wide directory stamps every heartbeat anywhere on the mesh changes.
       // pi-fabric#640: pass the store, not its root, so the shared-state stamp is the ACTIVE
       // backend's revision (SQLite commits never touch state.json); reads go through the store.
-      const ownership = observeActorOwnership(this.mesh, [...this.#actors.keys(), ...removedIds], () => {
-        const snapshot = this.mesh.stateToken({ fresh: true });
-        return key => this.mesh.get(key, { snapshot });
-      });
+      // smarty-dev#6477: point reads of the few observed keys, never a full fresh snapshot: the
+      // validation re-reads them under the registry locks whenever any hub commit moved the stamp.
+      const ownership = observeActorOwnership(this.mesh, [...this.#actors.keys(), ...removedIds], ownershipPointReads(this.mesh));
       return this.#withOwnershipRead(() => {
         // Source selection is speculative. update validates the atomic registry
         // generation AND the ownership observation after acquisition, or retries.

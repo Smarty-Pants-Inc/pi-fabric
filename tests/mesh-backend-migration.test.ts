@@ -178,7 +178,13 @@ describe("mesh backend rollback fence (R1)", () => {
 
     // The sqlite store that was open fails closed; a new one cannot open; the file store has every write.
     await expect(live.put({ key: "live/late", value: 1, identity })).rejects.toThrow(MeshStateRetiredError);
-    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(MeshStateRetiredError);
+    // Production's default open, without the suite's fixture "create" (tests/fleet-isolation-setup.ts), which
+    // refuses this populated root before it reads the flag (smarty-dev#6477).
+    const fixtureDefault = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+    const saved = (globalThis as Record<symbol, unknown>)[fixtureDefault];
+    delete (globalThis as Record<symbol, unknown>)[fixtureDefault];
+    try { await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(MeshStateRetiredError); }
+    finally { (globalThis as Record<symbol, unknown>)[fixtureDefault] = saved; }
     const files = fileStore(root);
     expect(files.get("live/after-import", { fresh: true })?.value).toEqual({ from: "sqlite" });
     expect(resolveMeshStateSource(root)).toEqual({ source: "file", backend: "file", epoch: 2, fileEpoch: 2 });

@@ -9,7 +9,7 @@ import { censusSync as writerCensusSync, type CensusWriter } from "./writer-cens
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
-import { BUILTIN_READERS, installReaderProof, scanStateDbHolders, type ProcScanOptions, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
+import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHolders, type LeaseProbeOptions, type ProcScanOptions, type StateDbHolder, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
   type InstalledReader, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
 
 const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof"] as const;
@@ -187,7 +187,8 @@ interface Gate { ownStateDbFds?: string[]; switchId: string; required: RequiredR
  * `beforeCommit`: the whole check again under the fence right before each flag commit, crash reruns too.
  */
 const openGate = async (options: Options, library: MeshBackendOptions, builtins: readonly InstalledReader[],
-  gateCensus: MeshWriterCensusSync, procScan: ProcScanOptions, warn: (text: string) => void): Promise<Gate | undefined> => {
+  gateCensus: MeshWriterCensusSync, procScan: ProcScanOptions, leaseProbe: LeaseProbeOptions,
+  warn: (text: string) => void): Promise<Gate | undefined> => {
   // No mesh root: the switch itself refuses with nothing changed.
   if (!fs.statSync(options.root, { throwIfNoEntry: false })?.isDirectory()) return undefined;
   const { backend, epoch } = await meshBackendStatus(options.root);
@@ -196,6 +197,13 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   // The whole inventory, recomputed for every check (pre-fence and under the fence before each commit).
   // Evidence the census cannot attribute, and a failed census, are required as fabric@unknown.
   let ownFds: string[] | undefined;
+  // smarty-dev#7936: the write-lease probe runs while this process holds no fd on state.db: before the
+  // fence (the preflight) and under it before the switch opens state.db (beforeOpen). Its result stands
+  // for the checks before each commit, where our own connection would make a new probe refuse.
+  let fencedLeases: StateDbHolder[] | undefined;
+  let underFence = false;
+  const leaseHolders = (): StateDbHolder[] => !underFence ? probeStateDbLeases(options.root, leaseProbe)
+    : fencedLeases ?? [{ pid: 0, name: "holder@lease-probe", reason: "the state.db lease probe did not run under the fence (smarty-dev#7936)" }];
   const inventory = (): RequiredReader[] => {
     let writers: MeshCensusWriter[];
     let unattributed: MeshCensusWriter[] = [];
@@ -213,7 +221,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     const scan = scanStateDbHolders(options.root, procScan);
     if (scan) ownFds = scan.own;
     if (scan) unattributed = unattributed.filter(writer => !writer.mode.startsWith("unknown state-database "));
-    return requiredReaders(writers, unattributed, builtins, options.requireReaders, scan?.holders ?? []);
+    return requiredReaders(writers, unattributed, builtins, options.requireReaders, [...scan?.holders ?? [], ...leaseHolders()]);
   };
   const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory()): ReaderReadiness => {
     let readiness: ReaderReadiness;
@@ -240,8 +248,17 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
   }
+  const outerOpen = library.beforeOpen;
+  library.beforeOpen = async () => {
+    await outerOpen?.();
+    // ponytail: residual (smarty-dev#7936): a holder that opens state.db AFTER this probe and before the
+    // commit, under the fence, is seen only by the fd scan and /proc/locks (not if it is non-dumpable and lock-free).
+    fencedLeases = probeStateDbLeases(options.root, leaseProbe);
+    underFence = true;
+  };
   const outer = library.beforeCommit;
   library.beforeCommit = (commit) => {
+    underFence = true;
     outer?.(commit);
     gate.final = evaluate(commit, ` (under the fence, before the ${commit.phase} commit)`);
     gate.checked.push(commit.phase);
@@ -267,6 +284,8 @@ export const main = async (argv: string[], io: {
   gateCensus?: MeshWriterCensusSync;
   /** Injection points of the state.db holder scan (tests). */
   procScan?: ProcScanOptions;
+  /** Injection points of the state.db lease probe (tests). */
+  leaseProbe?: LeaseProbeOptions;
   /** The built-in installed readers; default BUILTIN_READERS (tests replace them). */
   builtinReaders?: readonly InstalledReader[];
   /** Extra library options (tests: onStep, open). */
@@ -323,7 +342,7 @@ export const main = async (argv: string[], io: {
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
     if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
-      io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, warn);
+      io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, io.leaseProbe ?? {}, warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)

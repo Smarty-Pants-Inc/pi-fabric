@@ -42,7 +42,18 @@ The gate decides from an inventory, never from what readers chose to register:
    then an ambiguous holder. The gate's own connection is not evidence: with no other holder, a
    switch needs no override for the SQLite files.
 
-   Known limit (smarty-dev#7936, accepted security gap: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): a process whose fd directory this user cannot read and that holds `state.db` open WITHOUT any SQLite lock (not a WAL connection) is not detected; WAL connections always hold a lock on `-shm`.
+   **Lease probe** (smarty-dev#7936). While the switch process holds none of those files open (the
+   preflight, and under the fence before the switch opens `state.db`), the helper
+   `dist/native/fabric-mesh-lease` (built beside `fabric-landlock`) opens each existing file
+   `O_RDONLY|O_NOFOLLOW` and tries a write lease (`F_SETLEASE F_WRLCK`), then releases it and closes
+   at once. The kernel refuses that lease (EAGAIN) while ANY other open file description of the inode
+   exists: a holder that is non-dumpable, sandboxed, lock-free or holds only an mmap is caught too.
+   Each such file is `holder@lease:<file>` ("unidentified holder of <file>"), never ready. If the probe
+   cannot run (not Linux, the mesh on NFS, `/proc/sys/fs/leases-enable` not 1, a missing helper, any
+   helper error, or the switch process itself holding one of the files), it is `holder@lease-probe`,
+   never ready: the gate fails closed. Both pass only with `--accept-unready` of that name.
+
+   Known limit (smarty-dev#7936, accepted security gap: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187), narrowed by the lease probe: a process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock AFTER the probe under the fence and before the commit is not detected; WAL connections always hold a lock on `-shm`.
 
    On Linux, the census's SQLite-file evidence (`state-database`) is replaced by this scan, so
    `fabric@unknown` no longer covers it: each holder is named and accepted only by its own

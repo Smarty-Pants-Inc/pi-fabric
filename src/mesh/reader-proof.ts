@@ -4,10 +4,12 @@
 // non-Fabric readers with trusted install roots. Each one needs a valid proof in `<mesh>/readers/`,
 // written under the migration fence; the switch re-checks them under that fence right before each
 // flag commit. File format and the writer protocol: docs/mesh-backend.md.
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { importMeshState, meshBackendStatus, readMeshStateMovedMarker } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
 import { MeshStore } from "./store.js";
@@ -106,12 +108,12 @@ export const requiredReaders = (writers: ReadonlyArray<{ pid: number; release: s
   }
   for (const [release, list] of [...releases].sort()) required.push({ name: `fabric@${release}`, kind: "fabric", release, writers: list });
   if (unattributed.length > 0) required.push({ name: "fabric@unknown", kind: "unattributed", writers: unattributed });
-  for (const holder of holders) required.push({ name: `holder@${holder.pid}`, kind: "holder", pid: holder.pid, reason: holder.reason });
+  for (const holder of holders) required.push({ name: holder.name ?? `holder@${holder.pid}`, kind: "holder", pid: holder.pid, reason: holder.reason });
   return required;
 };
 
 /** A process other than the gate that holds (or may hold) the mesh's SQLite files open. */
-export interface StateDbHolder { pid: number; reason: string }
+export interface StateDbHolder { pid: number; reason: string; /** Required-reader name; default holder@<pid>. */ name?: string }
 
 /** Injection points of the holder scan (tests). */
 export interface ProcScanOptions {
@@ -218,7 +220,9 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
       // ponytail: known limit, an accepted security gap (smarty-dev#7936,
       // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187):
       // an unreadable fd dir whose process holds state.db open WITHOUT any SQLite lock (not a WAL
-      // connection) is not detected here; WAL connections always hold a lock on -shm, which /proc/locks shows.
+      // connection) is not detected HERE; WAL connections always hold a lock on -shm, which /proc/locks shows.
+      // The write-lease probe (probeStateDbLeases) catches such a holder when it opened before the probe;
+      // one that opens after it, under the fence and before the commit, remains undetected.
       // Without /proc/locks an unreadable fd directory may hide a holder: fail closed.
       if (locksError !== undefined) {
         hold(pid, `ambiguous state.db holder: pid ${pid} (${comm(pid)}) ${fdDir} unreadable (${errno(error)}) and /proc/locks unusable (${locksError})`);
@@ -236,6 +240,65 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
     }
   }
   return { own, holders: [...holders.values()] };
+};
+
+/** Injection points of the lease probe (tests). */
+export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string }
+
+/** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
+export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
+const NFS_SUPER_MAGIC = 0x6969;
+const LEASE_DOC = "smarty-dev#7936";
+
+/**
+ * smarty-dev#7936: a write-lease probe of state.db, -wal and -shm (and under state-shadow/). The kernel
+ * refuses a write lease (EAGAIN) while ANY other open file description of the inode exists, whatever the
+ * holder's dumpability and with or without SQLite locks; the helper releases it and closes at once. Run it
+ * only while THIS process holds none of those files open: its own fd would make the probe refuse too, so
+ * that case fails closed. Each held file is the holder `holder@lease:<file>` ("unidentified holder");
+ * a probe that cannot run (not Linux, NFS, leases-enable=0, a missing helper, any helper error) is the
+ * holder `holder@lease-probe`. Both are never ready; only --accept-unready by name passes them.
+ */
+export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}): StateDbHolder[] => {
+  const files = SQLITE_FILES.map(name => path.join(root, name)).filter(file => fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined);
+  if (files.length === 0) return [];
+  const unavailable = (why: string): StateDbHolder[] =>
+    [{ pid: 0, name: "holder@lease-probe", reason: `state.db lease probe unavailable (${LEASE_DOC}): ${why}` }];
+  if ((probe.platform ?? process.platform) !== "linux") return unavailable("not Linux");
+  const procRoot = probe.procRoot ?? "/proc";
+  const ownFds = path.join(procRoot, "self", "fd");
+  for (const fd of (() => { try { return fs.readdirSync(ownFds); } catch { return []; } })()) {
+    let link: string;
+    try { link = fs.readlinkSync(path.join(ownFds, fd)); } catch { continue; }
+    if (files.includes(link)) return unavailable(`this process itself holds ${link} open (fd ${fd}) at the probe`);
+  }
+  let enable = probe.leasesEnable;
+  if (enable === undefined) {
+    try { enable = fs.readFileSync(path.join(procRoot, "sys/fs/leases-enable"), "utf8").trim(); }
+    catch (error) { return unavailable(`/proc/sys/fs/leases-enable unreadable (${errno(error)})`); }
+  }
+  if (enable !== "1") return unavailable(`/proc/sys/fs/leases-enable is ${enable}`);
+  try { if (fs.statfsSync(root).type === NFS_SUPER_MAGIC) return unavailable(`${root} is on NFS`); }
+  catch (error) { return unavailable(`statfs ${root} failed (${errno(error)})`); }
+  const helper = probe.helper ?? leaseHelperPath();
+  try { fs.accessSync(helper, fs.constants.X_OK); } catch { return unavailable(`helper ${helper} is missing (bun run build)`); }
+  const result = spawnSync(helper, files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] });
+  if (result.error || (result.status !== 0 && result.status !== 3)) {
+    return unavailable(`helper failed (${result.error?.message ?? `exit ${String(result.status)}`}${result.stdout ? `: ${result.stdout.trim()}` : ""})`);
+  }
+  const holders: StateDbHolder[] = [];
+  const seen = new Set<string>();
+  for (const line of result.stdout.split("\n").filter(Boolean)) {
+    const match = /^(free|held|absent) (.+)$/.exec(line);
+    if (!match || !files.includes(match[2]!)) return unavailable(`unexpected helper output: ${line}`);
+    seen.add(match[2]!);
+    if (match[1] === "held") {
+      holders.push({ pid: 0, name: `holder@lease:${path.relative(root, match[2]!)}`,
+        reason: `unidentified holder of ${match[2]} (a write lease was refused: another process has it open; ${LEASE_DOC})` });
+    }
+  }
+  if (seen.size !== files.length) return unavailable("the helper did not report every file");
+  return holders;
 };
 
 /**

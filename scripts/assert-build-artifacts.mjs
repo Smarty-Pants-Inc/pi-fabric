@@ -100,7 +100,7 @@ const required = [
   ...declarations,
   ...declarations.map((file) => `${file}.map`),
 ];
-if (process.platform === "linux") required.push("native/fabric-landlock");
+if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
 

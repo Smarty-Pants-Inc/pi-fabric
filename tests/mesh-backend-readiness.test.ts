@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
-import { proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
+import { leaseHelperPath, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#7815: the switch refuses unless every REQUIRED reader (the inventory: live Fabric releases,
@@ -60,7 +60,8 @@ const placeProof = (root: string, proof: Record<string, unknown>): void => {
 type Writer = { pid: number; release: string; mode: string };
 interface Harness { census: () => Promise<{ writers: Writer[] }>; builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[] | (() => Writer[]); options: Partial<MeshBackendOptions>;
   /** Default: scan no other pid (this host's own ssh sessions would be ambiguous holders). */
-  procScan: ProcScanOptions }
+  procScan: ProcScanOptions;
+  leaseProbe: LeaseProbeOptions }
 const run = async (argv: string[], harness: Partial<Harness> = {}): Promise<{ code: number; out: string; err: string }> => {
   let out = "";
   let err = "";
@@ -68,7 +69,7 @@ const run = async (argv: string[], harness: Partial<Harness> = {}): Promise<{ co
   const code = await main(argv, { census: harness.census ?? (async () => ({ writers: writers() })), gateCensus: () => ({ writers: writers(),
     unknown: typeof harness.unknown === "function" ? harness.unknown() : harness.unknown ?? [] }),
     builtinReaders: harness.builtins ?? [],
-    procScan: harness.procScan ?? { listPids: () => [] }, options: harness.options ?? {}, stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
+    procScan: harness.procScan ?? { listPids: () => [] }, ...(harness.leaseProbe ? { leaseProbe: harness.leaseProbe } : {}), options: harness.options ?? {}, stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
   return { code, out, err };
 };
 
@@ -366,6 +367,76 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
       expect(result.err).toMatch(new RegExp(`holder@${holder.child.pid} \\(foreign state\\.db holder: pid ${holder.child.pid} \\(\\S+\\) holds a POSIX lock on ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/state\\.db`));
       expect(await backendOf(root)).toBe("importing");
     } finally { await holder.close(); }
+  });
+
+  // smarty-dev#7936: the write-lease probe. Real holders are python3 children (os.open, prctl, mmap);
+  // the fd scan is narrowed to no pid so that only the lease probe can see them.
+  const leaseSkip = process.platform !== "linux" ? "not Linux"
+    : spawnSync("python3", ["-c", "pass"]).status !== 0 ? "python3 missing"
+      : !fs.existsSync(leaseHelperPath()) ? `lease helper ${leaseHelperPath()} missing (bun run build)` : "";
+  /** A python3 child that holds `file` open (no lock), says "ready" on stdout and waits on stdin. */
+  const pythonHolder = async (file: string, mode: "fd" | "nondumpable" | "mmap"): Promise<{ child: ChildProcess; release: () => Promise<void> }> => {
+    const code = `
+import ctypes, mmap, os, sys
+if sys.argv[2] == "nondumpable": ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+fd = os.open(sys.argv[1], os.O_RDWR)
+if sys.argv[2] == "mmap":
+    held = mmap.mmap(fd, 1); os.close(fd)
+print("ready", flush=True)
+sys.stdin.readline()`;
+    const child = spawn("python3", ["-c", code, file, mode], { stdio: ["pipe", "pipe", "inherit"] });
+    await new Promise<void>((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error("python3 holder not ready within 10 s")), 10_000);
+      child.stdout!.once("data", (data: Buffer) => { clearTimeout(deadline); if (String(data).startsWith("ready")) resolve(); else reject(new Error(String(data))); });
+    });
+    const release = (): Promise<void> => new Promise((resolve) => {
+      if (child.exitCode !== null) { resolve(); return; }
+      const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
+      child.once("exit", () => { clearTimeout(deadline); resolve(); });
+      child.stdin!.end("\n");
+    });
+    return { child, release };
+  };
+
+  for (const mode of ["fd", "nondumpable", "mmap"] as const) {
+    it.skipIf(leaseSkip !== "")(`refuses a lock-free ${mode} holder of state.db through the lease probe alone${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const holder = await pythonHolder(path.join(root, "state.db"), mode);
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+        expect(result.code).toBe(3);
+        expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (a write lease was refused: another process has it open; smarty-dev#7936))`);
+        expect(await backendOf(root)).toBe("importing");
+        // Accept-only, by name.
+        expect((await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { procScan: { listPids: () => [] } })).code).toBe(3);
+      } finally { await holder.release(); }
+    });
+  }
+
+  it.skipIf(leaseSkip !== "")(`passes with nobody holding state.db, and the probe releases its lease at once${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    expect(probeStateDbLeases(root)).toEqual([]);
+    // A second open right after the probe does not wait for a lease break (lease-break-time is 45 s).
+    const started = Date.now();
+    const opened = spawnSync("python3", ["-c", "import os, sys; os.close(os.open(sys.argv[1], os.O_RDWR)); print('opened')", path.join(root, "state.db")],
+      { encoding: "utf8", timeout: 5_000 });
+    expect(opened.stdout.trim()).toBe("opened");
+    expect(Date.now() - started).toBeLessThan(3_000);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(result.code, result.err).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  it.skipIf(process.platform !== "linux")("fails closed when the lease probe cannot run: a missing helper, leases disabled, not Linux", async () => {
+    const root = await crashedImport();
+    const missing = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });
+    expect(missing.code).toBe(3);
+    expect(missing.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper ${path.join(root, "no-helper")} is missing (bun run build))`);
+    expect(probeStateDbLeases(root, { leasesEnable: "0" })[0]!.reason).toContain("/proc/sys/fs/leases-enable is 0");
+    expect(probeStateDbLeases(root, { platform: "darwin" })[0]!.reason).toContain("not Linux");
+    const accepted = await run(["cutover", "--root", root, "--accept-unready", "holder@lease-probe"],
+      { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });
+    expect(accepted.code, accepted.err).toBe(0);
   });
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it

@@ -300,6 +300,49 @@ describe("a busy WAL reset defers to a later commit (pi-fabric#694 P1-B)", () =>
   });
 });
 
+// pi-fabric#694 P2-E: an existing state.db (and its -wal/-shm) is opened only when it is ours.
+describe.skipIf(process.platform === "win32")("an existing state.db must be private (pi-fabric#694 P2-E)", () => {
+  const refused = async (root: string, sync = false): Promise<unknown> => {
+    try {
+      if (sync) sqlite.push(SqliteStateStore.openSync(root, 256 * 1024, 1_000, { initialize: "create" }));
+      else await openStore(root);
+    } catch (error) { return error; }
+    throw new Error("expected a refusal");
+  };
+  const prepared = async (label: string): Promise<string> => {
+    const root = tempRoot(label);
+    (await openStore(root)).close();
+    return root;
+  };
+
+  it("refuses a group- or other-writable state.db, sync and async", async () => {
+    const root = await prepared("db-mode");
+    fs.chmodSync(path.join(root, "state.db"), 0o666);
+    expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/state\.db: it is group or other writable/) });
+    expect(await refused(root, true)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+  });
+
+  it("refuses a symlinked state.db and a symlinked -wal, never following them", async () => {
+    const root = await prepared("db-link");
+    const target = path.join(tempRoot("db-target"), "state.db");
+    fs.renameSync(path.join(root, "state.db"), target);
+    fs.symlinkSync(target, path.join(root, "state.db"));
+    expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/symbolic link/) });
+    const other = await prepared("wal-link");
+    const victim = path.join(tempRoot("wal-target"), "victim");
+    fs.writeFileSync(victim, "untouched");
+    fs.rmSync(path.join(other, "state.db-wal"), { force: true });
+    fs.symlinkSync(victim, path.join(other, "state.db-wal"));
+    expect(await refused(other)).toMatchObject({ message: expect.stringMatching(/state\.db-wal: it is a symbolic link/) });
+    expect(fs.readFileSync(victim, "utf8")).toBe("untouched");
+  });
+
+  it("still opens a private existing state.db", async () => {
+    const root = await prepared("db-ok");
+    expect(await openStore(root)).toBeInstanceOf(SqliteStateStore);
+  });
+});
+
 describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
   const lockRoot = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-lock-")); roots.push(root); return root; };
   const age = (file: string, ms: number) => { const at = new Date(Date.now() - ms); fs.utimesSync(file, at, at); };

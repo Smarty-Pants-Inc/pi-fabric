@@ -276,7 +276,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
 
     it("(4) initialises a fresh root (absent, empty or zero-length state.json, zero-length db); an imported root opens normally", async () => {
       const zeroDb = tempRoot("create-zero-db");
-      fs.writeFileSync(path.join(zeroDb, "state.db"), "");
+      fs.writeFileSync(path.join(zeroDb, "state.db"), "", { mode: 0o600 }); // private, as P2-E requires
       const [none, emptyJson, zeroLength] = freshRoots();
       for (const root of [none, emptyJson, zeroLength, zeroDb]) {
         sqliteStores.push(create(root));

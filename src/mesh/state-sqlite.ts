@@ -738,6 +738,7 @@ export class SqliteStateStore {
     // succeeds no connection in this process can have the file open, so closing drops no lock.
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
     const db = (options.open ?? openNodeSqlite)(file);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
@@ -786,6 +787,7 @@ export class SqliteStateStore {
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    assertPrivateStateFiles(file);
     const db = (options.open ?? openNodeSqlite)(file);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
@@ -1639,6 +1641,10 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): voi
     : posix && (stat.mode & 0o022) !== 0 ? `is group or other writable (mode ${(stat.mode & 0o777).toString(8)})`
     : undefined;
   if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
+};
+
+const assertPrivateStateFiles = (file: string): void => {
+  for (const name of [file, `${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
 };
 
 // Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one). A

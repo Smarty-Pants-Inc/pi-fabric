@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ResidentActorAuthorizationError, type ResidentHostConfig } from "./protocol.js";
 import type { MeshStateEntry, MeshStore } from "../mesh/store.js";
@@ -95,16 +96,20 @@ export function readResidentOperatorEvidence(config: ResidentHostConfig, mesh: P
  * restarted Main publishes within it. Twice that, and never less than the lease window, is the grace. */
 export const MAIN_PUBLISH_GRACE_MS = 2 * STATE_LEASE_RENEW_MS;
 
+/** The absence window's clock; tests inject one instead of rewriting the bound record. */
+export const mainAbsenceClock: { now: () => number } = { now: () => Date.now() };
+
 export interface MainAbsenceOptions {
   /** Durable record of when the root participant was first seen absent (live executor only). */
   absenceFile?: string;
   /** Record a first absence (a dry run only reads). */
   recordAbsence?: boolean;
-  /** The resident is dead: an absent participant with no live lease is no Main. */
+  /** The resident is dead: the participant check runs without a resident-renewed lease (same grace rule). */
   offline?: boolean;
 }
 
-interface MainAbsence { format: 1; rootId: string; absentSince: number; lease: string }
+interface MainAbsence { format: 1; rootId: string; absentSince: number; generation: string; nonce: string }
+interface MainAbsenceNonce { format: 1; generation: string; nonce: string }
 
 /** Positive dead proof of the root's Main; any other answer is unknown or live. */
 function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">, rootLease: FabricHostLease | undefined,
@@ -112,8 +117,13 @@ function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
   const now = Date.now();
   const grace = Math.max(MAIN_PUBLISH_GRACE_MS, window);
   const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
+  // Clearing the absence record removes no root data, so a dry run clears it too: an observed
+  // participant must never let a later absence reuse an older timestamp.
+  // The nonce rotates (both files go) on any observed reappearance.
+  const nonceFile = options.absenceFile ? `${options.absenceFile}.nonce` : undefined;
   const resetAbsence = (): void => {
-    if (options.absenceFile && options.recordAbsence) fs.rmSync(options.absenceFile, { force: true });
+    if (options.absenceFile) fs.rmSync(options.absenceFile, { force: true });
+    if (nonceFile) fs.rmSync(nonceFile, { force: true });
   };
   let entries: MeshStateEntry[];
   try {
@@ -122,18 +132,41 @@ function mainDeadProof(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">,
     entries = [file, mesh.get(key, { fresh: true })].filter((entry): entry is MeshStateEntry => entry !== undefined);
   } catch (error) { resetAbsence(); return `unknown: root participant record is unreadable (${error instanceof Error ? error.message : String(error)})`; }
   if (!entries.length) {
-    if (options.offline) return "dead: no root participant and no live lease";
-    // (b) Absence itself must hold for the whole grace, observed durably: a restarting Main has no
-    // record for a moment, whatever the lease age. A lease incarnation change restarts the window.
+    const now = mainAbsenceClock.now();
+    // (b) Absence itself must hold for the whole grace, observed durably, live or offline alike: a
+    // starting Main has no record for a moment. The record is bound to the root's current generation:
+    // the Main generation (main-generation.json, rewritten on every Main start) and the root lease
+    // incarnation, and to a random nonce stored with that generation and rotated on any reappearance.
+    // A record without the current generation/nonce pair, a future time, or a time before the
+    // generation began is unverifiable: "just started" (absentSince = now).
+    // ponytail: a same-UID writer can still forge both files; that is the accepted same-UID gap every
+    // mesh and residency file shares (smarty-dev#820: each org runs as its own OS user and mesh root).
     if (!options.absenceFile) return "unknown: root participant absence is not established";
-    const lease = JSON.stringify([rootLease?.startedAt ?? null, rootLease?.writer?.pid ?? null, rootLease?.writer?.host ?? null, rootLease?.writer?.startedAt ?? null]);
+    const generationFile = path.join(config.residencyRoot, "main-generation.json");
+    let main: { nonce?: unknown; pid?: unknown; processStartTime?: unknown } | undefined;
+    let generationStart = rootLease?.startedAt ?? 0;
+    try {
+      main = JSON.parse(fs.readFileSync(generationFile, "utf8"));
+      generationStart = Math.max(generationStart, fs.statSync(generationFile).mtimeMs);
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown: Main generation record is unreadable"; }
+    const generation = JSON.stringify([main?.nonce ?? null, main?.pid ?? null, main?.processStartTime ?? null,
+      rootLease?.startedAt ?? null, rootLease?.writer?.pid ?? null, rootLease?.writer?.host ?? null, rootLease?.writer?.startedAt ?? null]);
     let seen: MainAbsence | undefined;
-    try { seen = JSON.parse(fs.readFileSync(options.absenceFile, "utf8")) as MainAbsence; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown: root participant absence record is unreadable"; }
-    if (!seen || seen.format !== 1 || seen.rootId !== config.rootId || seen.lease !== lease ||
-        !Number.isFinite(seen.absentSince) || seen.absentSince > now) {
-      seen = { format: 1, rootId: config.rootId, absentSince: now, lease };
-      if (options.recordAbsence) writeJsonAtomic(options.absenceFile, seen, { durable: true });
+    let current: MainAbsenceNonce | undefined;
+    try {
+      seen = JSON.parse(fs.readFileSync(options.absenceFile, "utf8")) as MainAbsence;
+      current = JSON.parse(fs.readFileSync(nonceFile!, "utf8")) as MainAbsenceNonce;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown: root participant absence record is unreadable"; }
+    if (!seen || !current || seen.format !== 1 || current.format !== 1 || seen.rootId !== config.rootId ||
+        seen.generation !== generation || current.generation !== generation ||
+        typeof current.nonce !== "string" || current.nonce.length < 32 || seen.nonce !== current.nonce ||
+        !Number.isFinite(seen.absentSince) || seen.absentSince > now || seen.absentSince < generationStart) {
+      const nonce = randomBytes(32).toString("hex");
+      seen = { format: 1, rootId: config.rootId, absentSince: now, generation, nonce };
+      if (options.recordAbsence) {
+        writeJsonAtomic(nonceFile!, { format: 1, generation, nonce } satisfies MainAbsenceNonce, { durable: true });
+        writeJsonAtomic(options.absenceFile, seen, { durable: true });
+      }
     }
     if (now - seen.absentSince < grace) {
       return `unknown: root participant absence not yet established (absent since ${new Date(seen.absentSince).toISOString()}); retry after ${new Date(seen.absentSince + grace).toISOString()}`;

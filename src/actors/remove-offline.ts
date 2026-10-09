@@ -35,12 +35,20 @@ interface TreeEntry { path: string; dev: number; ino: number; directory: boolean
 /** The actor directory, walked with lstat and pinned by an O_NOFOLLOW directory descriptor. */
 export interface PinnedActorTree { directory: string; entries: TreeEntry[]; fd?: number; close(): void }
 
-const uid = process.getuid?.();
+/** Removal archives and deletes only what this OS user provably owns; without getuid it cannot. */
+export const assertOwnershipProvable = (): void => {
+  if (typeof process.getuid !== "function") {
+    throw new Error("actor removal is not supported where file ownership cannot be proven (smarty-dev#7858)");
+  }
+};
+
 const verifiedEntry = (file: string): TreeEntry => {
+  assertOwnershipProvable();
+  const uid = process.getuid!();
   const stat = fs.lstatSync(file);
   if (stat.isSymbolicLink()) throw new Error(`Actor tree has a symlink: ${file}`);
   if (!stat.isFile() && !stat.isDirectory()) throw new Error(`Actor tree has a special file: ${file}`);
-  if (uid !== undefined && stat.uid !== uid) throw new Error(`Actor tree entry is not owned by this OS user: ${file}`);
+  if (stat.uid !== uid) throw new Error(`Actor tree entry is not owned by this OS user: ${file}`);
   return { path: file, dev: stat.dev, ino: stat.ino, directory: stat.isDirectory() };
 };
 const sameEntry = (entry: TreeEntry, stat: fs.Stats): boolean =>
@@ -48,6 +56,7 @@ const sameEntry = (entry: TreeEntry, stat: fs.Stats): boolean =>
 
 /** Walk the actor directory (parents first) and pin it; refuses symlinks, special files and other owners. */
 export const pinActorTree = (directory: string): PinnedActorTree => {
+  assertOwnershipProvable();
   const tree: PinnedActorTree = { directory, entries: [], close() { if (this.fd !== undefined) { fs.closeSync(this.fd); delete this.fd; } } };
   try { fs.lstatSync(directory); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return tree; throw error; }
@@ -181,6 +190,7 @@ export interface OfflineRemoveResult {
 export const removeActorOffline = async (directory: string, config: ResidentHostConfig, selector: string,
   options: { dryRun?: boolean; confirmDeadRoot?: string } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
+  assertOwnershipProvable(); // before the fence, any record or any mutation
   const fd = await claimFence(directory);
   let mesh: MeshStore | undefined;
   let tree: PinnedActorTree | undefined;
@@ -195,11 +205,13 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     }
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
-    const evidence = readResidentOperatorEvidence(config, mesh, undefined, { offline: true });
+    // The same recorded-absence grace as the live path; no offline shortcut (smarty-dev#7817).
+    const absence = { offline: true, absenceFile: path.join(directory, "main-absence.json"), recordAbsence: !dryRun };
+    const evidence = readResidentOperatorEvidence(config, mesh, undefined, absence);
     assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, dryRun);
     const check = (): void => {
       recheck();
-      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!, undefined, { offline: true }), options.confirmDeadRoot);
+      assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, mesh!, undefined, absence), options.confirmDeadRoot);
     };
     // Exact id/name within this root's durable actors only, as the live operator path.
     const matches: Array<{ store: ActorRegistryStore; root: string; row: Row }> = [];

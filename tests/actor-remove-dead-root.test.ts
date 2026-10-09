@@ -10,7 +10,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { offlineRemovalHooks } from "../src/actors/remove-offline.js";
 import { MeshStore, meshProcessStartedAt } from "../src/mesh/store.js";
-import { MAIN_PUBLISH_GRACE_MS } from "../src/residency/operator-safety.js";
+import { MAIN_PUBLISH_GRACE_MS, mainAbsenceClock } from "../src/residency/operator-safety.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -61,7 +61,19 @@ const fixture = async () => {
       fs.writeFileSync(path.join(config.residencyRoot, name), JSON.stringify({ ...owner, pid: 2147483647, processStartTime: "1" }));
     }
   };
-  return { config, host, cli, create, registered, archives, mainParticipant, killResident, close: async () => {
+  const absenceFile = path.join(config.residencyRoot, "main-absence.json");
+  /** The absence clock moves past the grace; the bound record itself is never rewritten. */
+  const advanceClock = () => { mainAbsenceClock.now = () => Date.now() + MAIN_PUBLISH_GRACE_MS + 1_000; };
+  /** First attempt refuses and records the absence; then the recorded absence is aged past the grace. */
+  const establishAbsence = async (actor: string) => {
+    const first = await cli(actor);
+    expect(first.code).toBe(1); expect(first.err).toContain("absence not yet established");
+    const record = JSON.parse(fs.readFileSync(absenceFile, "utf8"));
+    expect(Date.now() - record.absentSince).toBeLessThan(60_000);
+    advanceClock();
+  };
+  return { config, host, cli, create, registered, archives, mainParticipant, killResident, establishAbsence, advanceClock, absenceFile, close: async () => {
+    mainAbsenceClock.now = () => Date.now();
     if (!closed) { for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true); await host.close(); }
     fs.rmSync(root, { recursive: true, force: true });
   } };
@@ -125,12 +137,13 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const recorded = fs.readFileSync(absence, "utf8");
       expect((await f.cli(actor.id, ["--dry-run"])).code).toBe(0);
       expect(fs.readFileSync(absence, "utf8")).toBe(recorded);
-      // A lease incarnation change restarts the window too.
-      fs.writeFileSync(absence, JSON.stringify({ ...JSON.parse(recorded), absentSince: Date.now() - grace - 1_000, lease: "other" }));
+      // A lease incarnation change restarts the window, even once the clock has passed the grace.
+      f.advanceClock();
+      selfLease(f, 3 * grace);
       await refusedWith("absence not yet established");
-      // Only an absence held for the full grace, same lease incarnation, proceeds.
-      const current = JSON.parse(fs.readFileSync(absence, "utf8"));
-      fs.writeFileSync(absence, JSON.stringify({ ...current, absentSince: Date.now() - grace - 1_000 }));
+      expect(JSON.parse(fs.readFileSync(absence, "utf8")).absentSince).toBeGreaterThan(JSON.parse(recorded).absentSince);
+      // Only an absence held for the full grace, same incarnation, proceeds.
+      mainAbsenceClock.now = () => Date.now() + 2 * grace + 2_000;
       const removed = await f.cli(actor.id);
       expect(removed).toMatchObject({ code: 0, err: "" });
       await f.host.actors.removalSettled(actor.id);
@@ -179,6 +192,86 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     } finally { await f.close(); }
   }, 40_000);
 
+  it("case 2 offline: the absence record needs the full grace in the current generation; forged, future and stale records are fresh; a dry run seeing Main clears it", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("absent-offline");
+      await f.killResident();
+      const read = () => JSON.parse(fs.readFileSync(f.absenceFile, "utf8"));
+      const refusesFresh = async () => {
+        const result = await f.cli(actor.id);
+        expect(result.code).toBe(1); expect(result.err).toContain("absence not yet established");
+        expect(Date.now() - read().absentSince).toBeLessThan(60_000);
+        expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
+      };
+      // First offline absence: no shortcut; it refuses and records.
+      await refusesFresh();
+      // Still inside the grace: refuses again with the same record.
+      const since = read().absentSince;
+      await refusesFresh(); expect(read().absentSince).toBe(since);
+      const generation = read().generation;
+      // A pre-seeded record of another generation is ignored and rewritten fresh.
+      fs.writeFileSync(f.absenceFile, JSON.stringify({ format: 1, rootId: f.config.rootId, absentSince: 1, generation: "forged" }));
+      await refusesFresh(); expect(read().generation).toBe(generation);
+      // A record whose nonce is not the current one (rotated or forged) is fresh.
+      fs.writeFileSync(f.absenceFile, JSON.stringify({ ...read(), absentSince: Date.now() - 2 * MAIN_PUBLISH_GRACE_MS, nonce: "f".repeat(64) }));
+      await refusesFresh();
+      // A future-dated record is fresh.
+      fs.writeFileSync(f.absenceFile, JSON.stringify({ ...read(), absentSince: Date.now() + MAIN_PUBLISH_GRACE_MS }));
+      await refusesFresh();
+      // A record older than the current Main generation's start is fresh.
+      fs.writeFileSync(path.join(f.config.residencyRoot, "main-generation.json"), JSON.stringify({ nonce: "n1", pid: 2147483647 }));
+      await refusesFresh();
+      const started = fs.statSync(path.join(f.config.residencyRoot, "main-generation.json")).mtimeMs;
+      fs.writeFileSync(f.absenceFile, JSON.stringify({ ...read(), absentSince: started - 1_000 }));
+      await refusesFresh();
+      // A dry run that sees Main clears the record.
+      f.mainParticipant(Date.now());
+      expect((await f.cli(actor.id, ["--dry-run"])).code).toBe(0);
+      expect(fs.existsSync(f.absenceFile)).toBe(false);
+      expect(fs.existsSync(`${f.absenceFile}.nonce`)).toBe(false);
+      fs.unlinkSync(path.join(f.config.meshRoot, "participants", createHash("sha256").update(f.config.rootId).digest("hex") + ".json"));
+      // Only an absence held for the full grace in this generation proceeds (the generation began long ago).
+      await f.establishAbsence(actor.id);
+      expect(await f.cli(actor.id)).toMatchObject({ code: 0, err: "" });
+      expect(f.registered(actor.id)).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("case 2 offline: a dead resident while a Main is starting (no participant yet) refuses, even with an old record", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("starting-main");
+      await f.killResident();
+      // The Main is starting: it has written its generation, not yet its participant record.
+      fs.writeFileSync(f.absenceFile, JSON.stringify({ format: 1, rootId: f.config.rootId, absentSince: Date.now() - 2 * MAIN_PUBLISH_GRACE_MS, generation: "x", nonce: "n" }));
+      fs.writeFileSync(path.join(f.config.residencyRoot, "main-generation.json"), JSON.stringify({ nonce: "starting", pid: process.pid }));
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1); expect(result.err).toContain("absence not yet established");
+      expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it.each(["live", "offline"] as const)("%s: without provable file ownership (no getuid) removal refuses before any change", async mode => {
+    const f = await fixture();
+    const getuid = process.getuid;
+    try {
+      const actor = await f.create("no-owner-proof");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      if (mode === "offline") await f.killResident();
+      const status = mode === "live" ? f.host.actors.status(actor.id).status : undefined;
+      (process as { getuid?: unknown }).getuid = undefined;
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { (process as { getuid?: unknown }).getuid = getuid; }
+      expect(result.code).toBe(1); expect(result.err).toContain("file ownership cannot be proven (smarty-dev#7858)");
+      expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
+      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.existsSync(f.absenceFile)).toBe(false);
+      if (mode === "live") expect(f.host.actors.status(actor.id).status).toBe(status);
+    } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }
+  }, 40_000);
+
   it("case 2: a symlink in the actor tree refuses before the archive; nothing deleted, registry untouched", async () => {
     const f = await fixture();
     try {
@@ -188,6 +281,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const outside = path.join(f.config.meshRoot, "outside.txt"); fs.writeFileSync(outside, "keep");
       fs.symlinkSync(outside, path.join(actorDir, "escape"));
       await f.killResident();
+      await f.establishAbsence(actor.id);
       const result = await f.cli(actor.id);
       expect(result.code).toBe(1); expect(result.err).toContain("symlink");
       expect(f.registered(actor.id)).toBe(true);
@@ -205,6 +299,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       await f.killResident();
+      await f.establishAbsence(actor.id);
       const bindings = vi.spyOn(ActorBindingStore.prototype, "delete");
       const presence = vi.spyOn(MeshStore.prototype, "delete");
       offlineRemovalHooks.afterStep = done => {
@@ -231,6 +326,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       await f.killResident();
+      await f.establishAbsence(actor.id);
       const withLock = ActorRegistryStore.prototype.withLock;
       const spy = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, ...args) {
         // After the walk and the archive, before the tree removal: replace a walked file.
@@ -255,6 +351,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       await f.killResident();
+      await f.establishAbsence(actor.id);
       const lock = path.join(f.config.residencyRoot, "host.lock");
 
       // Held: a live holder of the kernel fence.

@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import os from "node:os";
-import { archiveActorForRemoval, pinActorTree } from "../actors/remove-offline.js";
+import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -1535,7 +1535,8 @@ export class ResidentHost {
         // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
         const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
         // A root participant's absence must hold for the whole grace, recorded here (smarty-dev#7817).
-        const absence = { absenceFile: path.join(this.config.residencyRoot, "main-absence.json"), recordAbsence: command.dryRun !== true };
+        const absence = { absenceFile: path.join(this.config.residencyRoot, "main-absence.json"), recordAbsence: command.dryRun !== true &&
+          (command.action !== "remove" || typeof process.getuid === "function") };
         const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, absence);
         const check = () => assertResidentOperatorConfirmed(
           readResidentOperatorEvidence(this.config, this.mesh, self, absence), command.confirmDeadRoot);
@@ -1558,6 +1559,8 @@ export class ResidentHost {
                 !Object.values(residentActorRoots(this.config)).includes(path.dirname(sessionDir))) {
               throw new Error(`Actor ${actor.id} session is outside this resident's actor roots`);
             }
+            // Refuses where file ownership cannot be proven (smarty-dev#7858), before the stop.
+            assertOwnershipProvable();
             pinActorTree(sessionDir).close();
           }
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);

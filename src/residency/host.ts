@@ -33,6 +33,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -86,15 +87,10 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
+// ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
-// The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
-// fleet-wide actor ownership view that often: that view lists every project participant and
-// stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
-// Requests, admissions and agents are still checked on every tick; the actor check is
-// reused for at most this long, and an exit is always confirmed by a current actor check.
-// Every actor change signal (create, run start and end, stop, ownership) restarts the idle
-// window and drops the reused observation, so a run that starts and ends between two samples
-// still counts: the window always runs from the last real actor activity.
+// Dormancy is driven by actor/delivery/settlement signals. A single bounded safety
+// re-check covers a missed signal for each eligibility transition; there is no dormancy poll.
 const IDLE_ACTOR_CHECK_MS = 1_000;
 // A stat stamp of config.json proves it unchanged only once the file is older than the
 // coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
@@ -215,6 +211,15 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #idleCheckQueued = false;
+  #idleCheckRequested = false;
+  #idleCheckPending: Promise<void> | undefined;
+  #dormancySafetyTimer: NodeJS.Timeout | undefined;
+  #dormancyEligible = false;
+  #dormancySafetyUsed = false;
+  #wakeWatchReprobeUsed = false;
+  #wakeWatchErrorUnsubscribe: (() => void) | undefined;
+  #wakeWatchNeedsReprobe = false;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
@@ -228,6 +233,9 @@ export class ResidentHost {
   #started = false;
   #ready = false;
   #idleSince = Date.now();
+  #sleeping = false;
+  #wakeRoutesJson: string | undefined;
+  #wakeWatchSupported: boolean | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
   #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
@@ -461,6 +469,7 @@ export class ResidentHost {
       },
       onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onSettled: (result) => {
+        this.#scheduleIdleCheck();
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
@@ -632,9 +641,16 @@ export class ResidentHost {
           ),
         ),
       );
-      this.agents.subscribeUi(() => this.participants.scheduleRefresh());
+      this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.#noteActorActivity());
+      this.#wakeWatchErrorUnsubscribe = subscribeResidentWakeWatchErrors(this.config.residencyRoot, () => {
+        if (this.#wakeWatchSupported !== true) return; // probe-time errors settle through the promise
+        this.#wakeWatchSupported = undefined;
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchNeedsReprobe = true;
+        this.#scheduleIdleCheck();
+      });
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
@@ -688,6 +704,9 @@ export class ResidentHost {
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      this.#scheduleIdleCheck();
+      this.#writeWakeRoutes();
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
@@ -708,6 +727,9 @@ export class ResidentHost {
         });
         void this.#retryDeliveries();
       }
+      // The spawned process, not a watched file, owns the startup outcome.
+      if (process.connected && process.send) process.send({ event: "resident-ready",
+        root: this.config.residencyRoot, token: this.#token }, () => {});
     } catch (error) {
       await this.close();
       throw error;
@@ -747,6 +769,10 @@ export class ResidentHost {
     this.#requestTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
+    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
+    this.#dormancySafetyTimer = undefined;
+    this.#wakeWatchErrorUnsubscribe?.();
+    this.#wakeWatchErrorUnsubscribe = undefined;
     this.#requestRetention.close();
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
@@ -989,12 +1015,17 @@ export class ResidentHost {
       } catch { /* no commit: the original mailbox below */ }
       if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.
     } else persist(rootId);
+    this.#scheduleIdleCheck();
     await this.#retryDeliveries();
   }
 
   #retryDeliveries(): Promise<unknown> {
     if (this.#closed || this.#staged) return Promise.resolve();
     if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    // An empty maintenance retry is not delivery custody. Avoid creating a pending
+    // promise on every request tick which can falsely restart the host idle window.
+    if (this.#deliveryCommitsRecovered && (!fs.existsSync(this.#deliveryOutboxPath) ||
+        !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) return Promise.resolve();
     const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {
@@ -1091,7 +1122,7 @@ export class ResidentHost {
     } finally {
       this.#pollingRequests = false;
       if (!retentionV2Enabled()) this.#maintainRequests();
-      this.#checkIdle();
+      await this.#checkIdle(false);
     }
   }
 
@@ -1136,11 +1167,11 @@ export class ResidentHost {
     return retention;
   }
 
-  /** Actor activity seen through the manager's change signal: count the idle window from now and
-   * take a current actor observation at the next idle check instead of the reused one. */
+  /** Actor activity restarts the idle window and requests an immediate event-driven check. */
   #noteActorActivity(): void {
     this.#idleSince = Date.now();
     this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
+    this.#scheduleIdleCheck();
   }
 
   #hasActiveActor(now: number, current = false): boolean {
@@ -1150,9 +1181,145 @@ export class ResidentHost {
     return this.#activeActor.active;
   }
 
-  #checkIdle(): void {
-    if (this.#closed || this.#staged || this.#handover) return;
+  #scheduleIdleCheck(): void {
+    this.#idleCheckRequested = true;
+    if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
+    this.#idleCheckQueued = true;
+    queueMicrotask(() => {
+      this.#idleCheckQueued = false;
+      if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckPending || !this.#idleCheckRequested) return;
+      this.#idleCheckRequested = false;
+      const pending = this.#checkIdle();
+      this.#idleCheckPending = pending;
+      void pending.finally(() => {
+        if (this.#idleCheckPending === pending) this.#idleCheckPending = undefined;
+        if (this.#idleCheckRequested) this.#scheduleIdleCheck();
+      }).catch(() => undefined);
+    });
+  }
+
+  #clearDormancySafetyTimer(): void {
+    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
+    this.#dormancySafetyTimer = undefined;
+  }
+
+  #armDormancySafetyTimer(): void {
+    if (this.#dormancySafetyUsed || this.#closed) return;
+    this.#dormancySafetyUsed = true;
+    this.#dormancySafetyTimer = setTimeout(() => {
+      this.#dormancySafetyTimer = undefined;
+      this.#scheduleIdleCheck();
+    }, IDLE_ACTOR_CHECK_MS);
+    this.#dormancySafetyTimer.unref?.();
+  }
+
+  async #ensureWakeWatch(): Promise<boolean> {
+    if (this.#wakeWatchSupported !== undefined) return this.#wakeWatchSupported;
+    try {
+      await assertResidentWakeWatch(this.config.residencyRoot);
+      this.#wakeWatchSupported = true;
+      this.#wakeWatchReprobeUsed = false;
+      this.#wakeWatchNeedsReprobe = false;
+      return true;
+    } catch (error) {
+      const watcherError = error instanceof ResidentWakeWatchError;
+      if (watcherError && !this.#wakeWatchReprobeUsed) {
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchSupported = undefined;
+        console.warn(`[pi-fabric] resident dormancy watcher failed for ${this.config.residencyRoot}: ${String(error)}`);
+        // An error event authorizes exactly one re-probe. Silent and synchronous
+        // failures remain cached as unsupported for this process and root.
+        this.#scheduleIdleCheck();
+        return false;
+      }
+      this.#wakeWatchSupported = false;
+      console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+      return false;
+    }
+  }
+
+  #writeWakeRoutes(): void {
+    const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
+      actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
+        .map(actor => {
+          // Preserve the host's actual published owner/capability/ACK advertisement for
+          // dormant command admission after close withdraws its live directory records.
+          const participant = this.participants.get(actor.id) ??
+            readWakeJson<ResidentWakeRoutes>(path.join(this.config.residencyRoot, "wake-routes.json"))?.actors
+              .find(entry => entry.id === actor.id)?.participant;
+          return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}) };
+        }) };
+    const serialized = JSON.stringify(routes);
+    if (serialized === this.#wakeRoutesJson) return;
+    writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });
+    this.#wakeRoutesJson = serialized;
+  }
+
+  #expectedActors(): Set<string> {
+    const protectedIds = new Set<string>();
+    const actors = this.actors.listOwned();
+    try {
+      const main = this.participants.get(this.config.rootId, undefined, { fresh: true });
+      for (const actor of actors) {
+        // A live Main's supervisor is expected, even between its activations.
+        if (main && (actor.events.length > 0 || actor.delivery !== "mailbox" || actor.topics.includes("fabric.participant.lifecycle"))) {
+          protectedIds.add(actor.id);
+        }
+      }
+      // A subscribed live participant can still owe this actor a reply.
+      for (const subscription of this.lifecycle.list()) {
+        if (actors.some(actor => actor.id === subscription.to) && this.participants.get(subscription.from, undefined, { fresh: true })) {
+          protectedIds.add(subscription.to);
+        }
+      }
+    } catch { for (const actor of actors) protectedIds.add(actor.id); } // uncertainty is not idle
+    return protectedIds;
+  }
+
+  async #checkIdle(includeDormancy = true): Promise<void> {
+    if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
     const now = Date.now();
+    if (!includeDormancy && this.#idleCheckPending) return;
+    if (includeDormancy) {
+      if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
+      const owned = this.actors.listOwned();
+      const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
+      const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
+      const eligible = hasIdleActor && this.actors.hasDormantIdleActor(protectedIds);
+      if (!eligible) {
+        this.#dormancyEligible = false;
+        this.#dormancySafetyUsed = false;
+        this.#clearDormancySafetyTimer();
+      } else {
+        const firstEligibility = !this.#dormancyEligible;
+        this.#dormancyEligible = true;
+        if (!await this.#ensureWakeWatch()) {
+          this.#idleSince = now;
+          return;
+        }
+        if (firstEligibility) {
+          // Probe on the edge, but give actor/delivery settlement signals a chance
+          // to make the eligibility decision current before dormancy is committed.
+          this.#armDormancySafetyTimer();
+        } else {
+          try {
+            this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
+            await this.actors.dormantIdleActors(protectedIds);
+          } catch {
+            this.#idleSince = now;
+            this.#armDormancySafetyTimer();
+            return;
+          }
+        }
+      }
+    }
+    // A previously dormant actor still needs a working watcher before this host
+    // can release its final consumer gate after a failed re-probe.
+    if (this.#wakeWatchSupported === false && this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped")) {
+      this.#idleSince = now;
+      return;
+    }
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
@@ -1161,24 +1328,65 @@ export class ResidentHost {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
+    const pendingDelivery = this.#publications.size > 0 || this.#flushingDeliveries !== undefined ||
+      (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")));
+    if (activeActor || activeAgent || pendingRequest || pendingDelivery || this.#admissions || this.#publicationFailed) {
       this.#idleSince = now;
       return;
     }
     if (now - this.#idleSince < IDLE_EXIT_MS) return;
-    // Never exit on a reused actor observation: confirm with a current one.
+    // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
       this.#idleSince = now;
       return;
     }
-    this.onIdle();
+    // Publish the closing boundary before shutting any consumer gate: a racing publisher
+    // now queues a wake whose one-shot launcher waits for this exact owner to exit.
+    this.#sleeping = true;
+    try {
+      // A bounded live log alone cannot retain a long sleeping actor's deliveries.
+      // Enable the existing file archive under the same publication lock before sleeping.
+      if (this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
+        await ensureResidentWakeArchive(this.mesh);
+      }
+      writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+        request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
+      this.#ready = false;
+      this.actors.pauseForRelease();
+      this.control.pause();
+      this.lifecycle.pause();
+      await this.control.checkpointForRelease();
+      await this.lifecycle.checkpointForRelease();
+      await this.#backgroundDeliveries.checkpointForRelease();
+      await this.actors.checkpointForRelease();
+      if (this.#closed || this.#admissions || this.#publications.size || this.actors.hasActiveDurableActor() ||
+          !this.actors.meshCaughtUp() || [this.#requestsPath, this.#processingPath].some(directory =>
+            fs.readdirSync(directory).some(entry => entry.endsWith(".json")))) throw new Error("Resident acquired work before dormancy");
+      this.onIdle();
+    } catch {
+      this.#sleeping = false;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      if (!this.#closed) {
+        this.#ready = true;
+        this.actors.resumeAfterRelease();
+        this.control.resume();
+        this.lifecycle.resume();
+        this.#idleSince = Date.now();
+        this.#scheduleIdleCheck();
+      }
+    }
   }
 
   #trackPublication(promise: Promise<unknown>): void {
     this.#publications.add(promise);
-    void promise.then(() => this.#publications.delete(promise), () => {
+    this.#scheduleIdleCheck();
+    void promise.then(() => {
+      this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
+    }, () => {
       this.#publicationFailed = true;
       this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
     });
   }
 

@@ -32,6 +32,20 @@ const fixture = () => {
 };
 
 describe("resident watchdog", () => {
+  it.each(["actor", "session actor"])("never keeps dormant %s definitions warm", async kind => {
+    const { root, config, client } = fixture();
+    const directory = kind === "actor" ? config.actorRoot : config.sessionActorRoot!;
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "actors.json"), JSON.stringify({ actors: [
+      { id: "dormant", rootId: config.rootId, residency: "durable", status: "dormant" },
+    ] }));
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start(); await vi.advanceTimersByTimeAsync(180_000);
+      expect(start).not.toHaveBeenCalled();
+    } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("F6 pending completion outbox alone owns automatic recovery with unchanged-work backoff", async () => {
     const { root, config, client } = fixture();
     const outbox = path.join(config.residencyRoot, "delivery-outbox");

@@ -169,7 +169,8 @@ export class EventLog {
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
-  constructor(context: MeshStoreContext, options: EventLogOptions) {
+  constructor(context: MeshStoreContext, options: EventLogOptions,
+    readonly indexCommittedDelivery?: (event: MeshEvent) => void) {
     const { root, maxEventBytes } = context;
     this.root = root;
     this.maxEventBytes = maxEventBytes;
@@ -555,6 +556,9 @@ export class EventLog {
         }
         // This distinct fence leaves the live event complete but the sidecar unconfirmed.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
+        // Same archival path and lock: preserve a bounded retry watermark before wake
+        // dispatch can see this delivery (even if BOTH root-local wake writes later fail).
+        this.indexCommittedDelivery?.(event);
         if (pending) archive!.commit(pending);
         return { event, line, bytes };
       };

@@ -717,6 +717,26 @@ describe("ActorMeshMonitor work-topic reconciliation", () => {
     for (let index = 0; index < 20; index++) { value.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
   };
 
+  it("replays a dormant resident's ordinary subscriptions from the archive, without expiry or duplicates", async () => {
+    const { mesh, cursorPath } = store({ archive: true, maxEventLogBytes: 6_000, retainedEventLogBytes: 1_500 });
+    const before = monitor(mesh, cursorPath, []);
+    await mesh.publish({ topic: "team.wake", from, text: "anchor" });
+    await drain(before);
+    before.close();
+    for (let n = 1; n <= 40; n++) await mesh.publish({ topic: "team.wake", from, text: `event ${n}` });
+    expect(mesh.oldestSequence()).toBeGreaterThan(10);
+    const seen: MeshEvent[] = [];
+    const resumed = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, {
+      cursorPath, replayAll: true, maxReplayAgeMs: -60_000, beforePoll: () => true,
+      onEvent: event => { seen.push(event); },
+    });
+    monitors.push(resumed);
+    await drain(resumed);
+    expect(seen.map(event => event.text)).toEqual(Array.from({ length: 40 }, (_, n) => `event ${n + 1}`));
+    expect(new Set(seen.map(event => event.id)).size).toBe(40);
+    expect(resumed.caughtUp()).toBe(true);
+  });
+
   it("delivers a work event older than the replay window, and still skips an old ordinary one", async () => {
     const { mesh, cursorPath } = store();
     const first: MeshEvent[] = [];

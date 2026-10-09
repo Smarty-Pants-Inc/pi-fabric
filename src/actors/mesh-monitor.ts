@@ -85,22 +85,21 @@ export class ActorMeshMonitor {
   start(): void {
     if (this.#started || this.#closed || !this.config.enabled) return;
     this.#started = true;
-    // Windows retains its no-watch path, but never a fast polling cadence.
-    if (process.platform !== "win32") {
-      try {
-        const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
-          const name = filename === null ? undefined : path.basename(filename.toString());
-          if (name !== undefined && name !== "events.jsonl" && name !== "generation") return;
-          this.#schedule();
-        });
-        this.#watcher = watcher;
-        watcher.on("error", () => this.#fallback(watcher));
-      } catch {
-        // The same slow safety net covers an unavailable watch.
-      }
+    try {
+      // Watch the existing parent directory, not files replaced by atomic rename.
+      // Non-recursive directory watches work on Windows too; a nameless rename
+      // is a wake, not evidence that nothing changed. The stamp filters duplicates.
+      const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
+        const name = filename == null ? undefined : path.basename(filename.toString());
+        if (name !== undefined && name !== "events.jsonl" && name !== "generation") return;
+        this.#schedule();
+      });
+      this.#watcher = watcher;
+      watcher.on("error", () => this.#fallback(watcher));
+    } catch {
+      // An unsupported watch (including a missing directory) takes the fallback.
     }
-    this.#safetyNetTimer = setInterval(() => this.#schedule(false, true), Math.max(MESH_MONITOR_SAFETY_NET_MS, this.config.actorPollMs));
-    this.#safetyNetTimer.unref();
+    this.#startSafetyNet();
     this.schedule();
   }
 
@@ -151,8 +150,18 @@ export class ActorMeshMonitor {
     if (this.#closed || this.#watcher !== watcher) return;
     watcher.close();
     this.#watcher = undefined;
-    // Do not turn a watch error into actorPollMs polling.
-    this.#schedule(false, true);
+    this.#startSafetyNet();
+    this.schedule();
+  }
+
+  #startSafetyNet(): void {
+    if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
+    // ponytail: keep one bounded timer, not a watcher-retry subsystem. Healthy
+    // watches use slow, stamp-gated recovery; ONLY a failed/unsupported watch
+    // restores the pre-event-driven actorPollMs polling contract.
+    const delay = this.#watcher ? Math.max(MESH_MONITOR_SAFETY_NET_MS, this.config.actorPollMs) : this.config.actorPollMs;
+    this.#safetyNetTimer = setInterval(() => this.#schedule(this.#watcher === undefined, true), delay);
+    this.#safetyNetTimer.unref();
   }
 
   #meshStamp(): string | undefined {

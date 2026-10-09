@@ -39,7 +39,7 @@ function setup(cursor?: string) {
 const flush = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
-  it.skipIf(process.platform === "win32").each([50, 1_600])("delivers every changed watch burst within 100 ms without an actorPollMs=%i trailing timer", async actorPollMs => {
+  it.each([50, 1_600])("delivers every changed watch burst within 100 ms without an actorPollMs=%i trailing timer", async actorPollMs => {
     const s = setup();
     s.monitor.config.actorPollMs = actorPollMs;
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
@@ -83,7 +83,7 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.latestOffset).toHaveBeenCalledOnce(); // no log-derived stamp
   });
 
-  it.skipIf(process.platform === "win32")("checks stamps before noisy notifications and detects same-size rewrites and generation changes", async () => {
+  it("checks stamps before noisy notifications and detects same-size rewrites and generation changes", async () => {
     const s = setup();
     fs.writeFileSync(path.join(s.root, "events.jsonl"), "old");
     s.monitor.start(); await flush();
@@ -103,22 +103,73 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
   });
 
-  it("uses the same slow safety net on Windows while explicit delivery wakes remain immediate", async () => {
+  it.each(["linux", "win32"])("watches the parent directory on %s and delivers nameless rename-only replacements without rearming", async platformName => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    Object.defineProperty(process, "platform", { ...platform, value: platformName });
     try {
-      const s = setup(); s.monitor.start(); await flush();
-      expect(fs.watch).not.toHaveBeenCalled();
-      fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-      await vi.advanceTimersByTimeAsync(4_999);
-      expect(s.mesh.tail).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+      const s = setup();
+      s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+      // The watched directory exists, but the log and generation file do not yet.
+      s.monitor.start(); await flush();
+      expect(fs.watch).toHaveBeenCalledExactlyOnceWith(s.root, { persistent: false }, expect.any(Function));
+      const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+      for (let index = 0; index < 3; index++) {
+        const event = { topic: `replacement-${index}` } as MeshEvent;
+        s.mesh.tail.mockReturnValue({ events: [event], nextOffset: 20 + index });
+        fs.writeFileSync(path.join(s.root, "replacement"), `new-${index}`);
+        fs.renameSync(path.join(s.root, "replacement"), path.join(s.root, "events.jsonl"));
+        const startedAt = Date.now();
+        notify("rename", null); // Windows need not supply a filename or a change edge.
+        await flush();
+        expect(s.onEvent).toHaveBeenLastCalledWith(event);
+        expect(s.mesh.tail).toHaveBeenCalledTimes(index + 2);
+        expect(Date.now() - startedAt).toBeLessThan(100);
+        notify("rename", null); await flush();
+        expect(s.mesh.tail).toHaveBeenCalledTimes(index + 2); // duplicate edge
+      }
+      fs.writeFileSync(path.join(s.root, "replacement"), "1");
+      fs.renameSync(path.join(s.root, "replacement"), path.join(s.root, "generation"));
+      notify("rename", null); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5);
+      notify("rename", "registry.json"); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5);
+      expect(fs.watch).toHaveBeenCalledOnce(); // replacing files never detaches a directory watch
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5); // no healthy-watch idle polling
       s.monitor.schedule(); await flush();
-      expect(s.mesh.tail).toHaveBeenCalledTimes(3);
-      await vi.advanceTimersByTimeAsync(5_000);
-      expect(s.mesh.tail).toHaveBeenCalledTimes(3);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(6); // explicit capacity wake still forces a read
     } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("delivers through a real directory watcher after log and generation replacements", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-watch-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const seen: MeshEvent[] = [];
+    const watch = vi.spyOn(fs, "watch"); // wrap, do not inject, the native watcher
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 },
+      { beforePoll: () => true, onEvent: event => { seen.push(event); } });
+    monitors.push(monitor);
+    try {
+      monitor.start(); await flush();
+      expect(watch).toHaveBeenCalledExactlyOnceWith(mesh.root, { persistent: false }, expect.any(Function));
+      const from = { id: "session:peer", name: "peer", kind: "main" as const };
+      const first = await mesh.publish({ topic: "fleet.work.watch", from, text: "first" });
+      // Less than the five-second safety net: this must be native watch delivery.
+      await vi.waitFor(() => expect(seen.map(event => event.id)).toEqual([first.id]), { timeout: 1_000, interval: 10 });
+      for (const name of ["events.jsonl", "generation"]) {
+        const file = path.join(mesh.root, name);
+        fs.writeFileSync(`${file}.tmp`, fs.existsSync(file) ? fs.readFileSync(file) : "0");
+        fs.renameSync(`${file}.tmp`, file);
+      }
+      const second = await mesh.publish({ topic: "fleet.work.watch", from, text: "after replacement" });
+      await vi.waitFor(() => expect(seen.map(event => event.id)).toEqual([first.id, second.id]), { timeout: 1_000, interval: 10 });
+      expect(watch).toHaveBeenCalledOnce();
+    } finally {
+      monitor.close();
+      mesh.closeState();
+    }
   });
 
   it("does not treat unreadable metadata as an unchanged mesh", async () => {
@@ -221,25 +272,29 @@ describe("ActorMeshMonitor", () => {
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
 
-  it.skipIf(process.platform === "win32")("falls back after watcher errors and closes timers and queued work", async () => {
+  it("restores bounded polling only after watcher errors and closes timers and queued work", async () => {
     const s = setup();
     s.monitor.start();
     await flush();
     s.watcher.emit("error", new Error("watch failed"));
     await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1); // replaces, never adds to, the safety timer
     const count = s.mesh.tail.mock.calls.length;
-    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(4_999);
+    // With a broken watch, even an unchanged stamp must retain the old poll contract.
+    await vi.advanceTimersByTimeAsync(49);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
+    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
+    await vi.advanceTimersByTimeAsync(50);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2);
     s.monitor.schedule();
     s.monitor.close();
     s.monitor.close();
     s.watcher.emit("error", new Error("late error"));
     await vi.advanceTimersByTimeAsync(5000);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2);
     expect(vi.getTimerCount()).toBe(0);
     expect(s.watcher.close).toHaveBeenCalledOnce();
   });
@@ -356,20 +411,21 @@ describe("ActorMeshMonitor", () => {
     expect(reads).toBe(1);
   });
 
-  it("uses the slow safety net when watch creation fails and ignores malformed cursors", async () => {
+  it.each(["unsupported", "ENOENT"])("uses bounded polling when watch creation fails (%s) and ignores malformed cursors", async reason => {
     const s = setup('{"format":2,"cursor":3}');
-    vi.mocked(fs.watch).mockImplementation(() => { throw new Error("unsupported"); });
+    vi.mocked(fs.watch).mockImplementation(() => { throw new Error(reason); });
     s.monitor.start();
     s.monitor.start();
     await flush();
+    expect(fs.watch).toHaveBeenCalledOnce();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
-    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(49);
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
+    await vi.advanceTimersByTimeAsync(50);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(3);
     expect(vi.getTimerCount()).toBe(1);
   });
 

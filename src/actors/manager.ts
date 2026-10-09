@@ -543,6 +543,7 @@ export class ActorManager {
   readonly #adoptionRetryAt = new Map<string, number>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
+  readonly #meshListeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   readonly #meshRetentionSweepPath: string | undefined;
   #retentionSweep: Promise<void> | undefined;
@@ -760,6 +761,11 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
+        // Reuse this monitor's accepted events for UI observers; never start a
+        // second reader/poll loop merely to keep an idle dashboard current.
+        for (const listener of this.#meshListeners) {
+          try { listener(); } catch { /* Observers must not interrupt delivery. */ }
+        }
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
@@ -782,6 +788,12 @@ export class ActorManager {
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  /** Events already consumed by the actor monitor, including topics with no actor subscriber. */
+  subscribeMesh(listener: () => void): () => void {
+    this.#meshListeners.add(listener);
+    return () => this.#meshListeners.delete(listener);
   }
 
   retryCapabilityWaiters(): void {
@@ -2667,7 +2679,7 @@ export class ActorManager {
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
       this.#closing = true;
-      this.#closePromise = this.#close();
+      this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
@@ -2701,6 +2713,7 @@ export class ActorManager {
     await this.#notifications.close();
     await this.#retentionSweep;
     this.#listeners.clear();
+    this.#meshListeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
       const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
@@ -2742,6 +2755,7 @@ export class ActorManager {
     await Promise.allSettled(
       [...this.#actors.values()].map((actor) => actor.drain ?? Promise.resolve()),
     );
+    this.#registry.releaseReadCache();
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 

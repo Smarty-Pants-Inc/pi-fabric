@@ -5,7 +5,9 @@ import path from "node:path";
 const mode = process.env.FAKE_PI_REPORT_MODE ?? "partial";
 const error = process.env.FAKE_PI_REPORT_ERROR ?? "stream disconnected before completion";
 const session = process.argv[process.argv.indexOf("--session") + 1];
-const statusFile = path.join(path.dirname(session), "status.json");
+const runRoot = process.env.FAKE_PI_REPORT_RUN_ROOT;
+const runId = fs.readdirSync(runRoot).find(id => fs.existsSync(path.join(runRoot, id, "status.json")));
+const statusFile = path.join(runRoot, runId, "status.json");
 const emit = event => process.stdout.write(JSON.stringify(event) + "\n");
 const previous = "Tool work finished: patched worker and tests.";
 const final = "FINAL: completed the patch. 🦄";
@@ -60,7 +62,10 @@ if (!["fallback", "no-output", "no-text"].includes(mode)) {
   }
   await snapshot("partialText", final);
 }
-if (mode === "raw-cut") {
+if (mode === "timeout" || mode === "stop") {
+  process.stderr.write(error); // A prior stream error must not override a stop/deadline.
+  setInterval(() => {}, 60000);
+} else if (mode === "raw-cut") {
   // No message_end at all: stdout must be drained and stderr retained.
   process.stderr.write(error, () => process.exit(1));
 } else {

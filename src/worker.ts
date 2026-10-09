@@ -733,7 +733,8 @@ const main = async (): Promise<void> => {
   // return an interrupted report. Never turn cancellation, schema/admission
   // failures, lost events, or an actor directive into a successful task.
   const canKeepInterruptedOutput = (error: string): boolean => options.runner === "pi" &&
-    !options.actorId && hasCompletedToolTurn && Boolean(record.partialText || record.lastCompleteText) &&
+    !options.actorId && !options.actorName && !options.residentStartupProbe &&
+    hasCompletedToolTurn && Boolean(record.partialText || record.lastCompleteText) &&
     modelControl.ready && !providerAborted && !lostResult && !record.errorCode &&
     terminalStatus !== "stopped" && terminalStatus !== "timed_out" &&
     record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight" &&

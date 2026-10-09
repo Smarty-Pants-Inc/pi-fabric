@@ -38,13 +38,24 @@ const run = async (mode: string, error = "stream disconnected before completion"
   vi.stubEnv("FAKE_PI_REPORT_ERROR", error);
   vi.stubEnv("FAKE_PI_REPORT_LAUNCHES", launches);
   vi.stubEnv("FAKE_PI_REPORT_SNAPSHOTS", snapshots);
+  vi.stubEnv("FAKE_PI_REPORT_RUN_ROOT", path.join(root, "runs"));
   vi.stubEnv("PI_FABRIC_TEST_RECOVERY_TIME_SCALE", "0.001");
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 10000, retainRuns: true }, {
     workerPath: path.resolve(process.env.FABRIC_INTERRUPTED_REPORT_WORKER ?? "src/worker.ts"),
     piBinary: path.resolve("tests/fixtures/fake-pi-interrupted-report.mjs"),
     runRoot: path.join(root, "runs"),
   }); managers.push(manager);
-  const handle = await manager.spawn({ task: "Finish the patch and return only actual output", transport: "process", extensions: false, ...request });
+  const actorSession = request.actorId || request.actorName ? path.join(root, "actor-session.jsonl") : undefined;
+  if (actorSession) fs.writeFileSync(actorSession, JSON.stringify({ type: "session", version: 3, id: "fake-actor-session", timestamp: new Date().toISOString(), cwd: root }) + "\n");
+  const handle = await manager.spawn({ task: "Finish the patch and return only actual output", transport: "process", extensions: false, ...(actorSession ? { sessionFile: actorSession } : {}), ...request });
+  if (mode === "stop") {
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(snapshots) || !fs.readFileSync(snapshots, "utf8").includes(JSON.stringify(final))) {
+      if (Date.now() >= deadline) throw new Error("Final text did not arrive before stop probe");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await manager.stop(handle.id);
+  }
   const result = await manager.wait(handle.id);
   const status = manager.status(handle.id);
   const again = await manager.wait(handle.id); // agents.join shares this wait path.
@@ -53,7 +64,8 @@ const run = async (mode: string, error = "stream disconnected before completion"
   const evidence = process.env.FABRIC_INTERRUPTED_REPORT_EVIDENCE_DIR;
   if (evidence) {
     fs.mkdirSync(evidence, { recursive: true });
-    fs.writeFileSync(path.join(evidence, `${mode}-${error.replace(/[^a-z0-9]+/gi, "-")}.json`), JSON.stringify({ result, status, record, streamed, launches: fs.readFileSync(launches, "utf8") }, null, 2));
+    const variant = request.replyTool ? "-reply-tool" : request.actorId ? "-actor-id" : request.actorName ? "-actor-name" : "";
+    fs.writeFileSync(path.join(evidence, `${mode}${variant}-${error.replace(/[^a-z0-9]+/gi, "-")}.json`), JSON.stringify({ result, status, record, streamed, launches: fs.readFileSync(launches, "utf8") }, null, 2));
   }
   for (const returned of [status, again, record]) {
     expect(returned).toMatchObject({ status: result.status, text: result.text });
@@ -108,6 +120,18 @@ describe("durable interrupted task reports", () => {
     const { result } = await run("reply", "stream disconnected before completion", { replyTool: true, schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
     expect(result).toMatchObject({ status: "completed", value: { ok: true }, replyVia: "tool" });
     expect(result.text).toContain(warning);
+  });
+  it.each([{ actorId: "interrupted-report-actor" }, { actorName: "legacy-report-actor" }])("does not turn an actor report into success: %j", async request => {
+    const { result } = await run("partial", "stream disconnected before completion", request);
+    expect(result.status).toBe("failed");
+    expect(result.text).toBe(final);
+    expect(result.warnings ?? []).not.toContain(expect.stringContaining(warning));
+  });
+  it.each(["timeout", "stop"])("keeps %s authoritative after persisted text and tools", async mode => {
+    const { result } = await run(mode, "stream disconnected before completion", { timeoutMs: 2000 });
+    expect(result.status).toBe(mode === "timeout" ? "timed_out" : "stopped");
+    expect(result.text).toBe(final);
+    expect(result.warnings ?? []).not.toContain(expect.stringContaining(warning));
   });
   it("leaves a normal final report unchanged", async () => {
     const { result } = await run("normal");

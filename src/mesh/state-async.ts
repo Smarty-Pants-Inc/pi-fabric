@@ -19,7 +19,6 @@ export type AsyncMeshStateStoreOptions =
   | { backend?: "file" | "sqlite" }
   | { backend: "nats-kv"; nats: NatsKvStateStoreOptions };
 
-/** Explicit experimental selector, independent of mesh.stateBackend (unchanged). Default is file. */
 /** Opt-in mesh tools for independent shared/ keys. All other state/events stay on the supplied store. */
 export const openNatsMeshProvider = async (
   store: MeshStore,
@@ -34,6 +33,7 @@ export const openNatsMeshProvider = async (
   return MeshProvider.withStateBackend(store, identity, participants, options);
 };
 
+/** Explicit experimental selector, independent of mesh.stateBackend (unchanged). Default is file. */
 export const openAsyncMeshStateStore = async (root: string, options: AsyncMeshStateStoreOptions = {}): Promise<AsyncMeshStateStore> => {
   if (options.backend === "nats-kv") {
     if (options.nats.experimentalNatsKv !== true) throw new Error("NATS KV state requires experimentalNatsKv: true");

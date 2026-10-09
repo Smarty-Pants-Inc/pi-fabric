@@ -63,6 +63,12 @@ describe("explicit NATS async mesh-tool seam (mock adapter, no live durability c
     expect((await provider.invoke("list", { prefix: "sha", limit: 1 }, context) as MeshStateEntry[]).map(e => e.key)).toEqual(["shared/a"]);
     expect((await provider.invoke("list", { prefix: "shared/b" }, context) as MeshStateEntry[]).map(e => e.key)).toEqual(["shared/b"]);
   });
+  it("does not consult legacy state at all for a wholly shared remote listing", async () => {
+    const provider = await open(); vi.mocked(remote.listAll).mockResolvedValueOnce([entry("shared/a")]);
+    const read = vi.spyOn(local, "listAll").mockImplementationOnce(() => { throw new Error("broken unrelated local state"); });
+    expect(await provider.invoke("list", { prefix: "shared/" }, context)).toEqual([entry("shared/a")]);
+    expect(read).not.toHaveBeenCalled();
+  });
   it("keeps non-shared typed/host state on the original backend and preserves reserved guards", async () => {
     const provider = await open();
     await provider.invoke("put", { key: "state/current", value: "local typed state" }, context);

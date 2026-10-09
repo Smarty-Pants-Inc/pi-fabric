@@ -1,6 +1,6 @@
 # Async store seam — U2 (held, opt-in)
 
-Refs smarty-dev#6477; continues #716's design in [nats-kv-state.md](../nats-kv-state.md). No GitHub was contacted. Main inspected at `efa1c0c925305212368f8a804933cc96a84356fc`; its existing `src/` files are byte-identical to this branch (the branch only adds experimental NATS modules/exports).
+Refs smarty-dev#6477; continues #716's design in [nats-kv-state.md](../nats-kv-state.md). No GitHub was contacted. Main inspected at `efa1c0c925305212368f8a804933cc96a84356fc`. At task start (`6e5f8496`), its existing `src/` files were byte-identical to this branch, apart from added experimental NATS modules/exports. The census uses an exact local main archive, so references below are pre-seam main lines.
 
 ## Decision: (a), async authority, migrated by capability
 
@@ -10,7 +10,7 @@ This is the least-code correct seam, **not a whole-runtime NATS cutover**. The a
 
 ### Cost and alternatives
 
-A TypeScript-symbol census finds **286** relevant main state method/property references: **223** outside the four store implementations, including **161** consuming the synchronous surface (transaction-view reads, cache properties and close included). Unrelated Map/SQLite-statement methods are excluded. There are **15** external `writeBatch` sites; migration needs transaction design, not just `await`. Exact annotated inventory: retained `main-store-call-sites.txt`. This bounded implementation migrates the mesh provider's two async-capable read sites, routes its already-async put/delete, and owns awaited shutdown. Full (a) migration also propagates promises through the families below and their callers/tests; `prepare`, delete conditions, outbox effects and event-append fencing must be redesigned or kept transactional. Costs: one leader RPC/get, one RPC/scanned key, explicit errors/deadlines and awaited teardown.
+A TypeScript-symbol census finds **284** relevant main state method/property references: **221** outside the four store implementations, including **159** consuming the synchronous surface (transaction-view reads, cache properties and close included). Unrelated Map/SQLite-statement methods are excluded. There are **15** external `writeBatch` sites; migration needs transaction design, not just `await`. Exact annotated inventory: retained `main-store-call-sites.txt`. This bounded implementation migrates the mesh provider's two async-capable read sites, routes its already-async put/delete, and owns awaited shutdown. Full (a) migration also propagates promises through the families below and their callers/tests; `prepare`, delete conditions, outbox effects and event-append fencing must be redesigned or kept transactional. Costs: one leader RPC/get, one RPC/scanned key, explicit errors/deadlines and awaited teardown.
 
 (b) A write-through/watch cache is rejected: sync `fresh` reads cease being leader authority; cross-host batch replication can partially commit. #708 leases alone do not fence protected writes: the resource must persist/enforce the lease token on **every** write, and checking a lease before a separate KV put has a TOCTOU gap. Correct replication needs durable intents/cursors, provisional-vs-acknowledged versions, conflict/offline policy and downstream fencing. The local #708 lease design explicitly keeps that integration held. More code, weaker semantics.
 
@@ -38,7 +38,7 @@ Combine each file with each line in its cell (`file:line`). Every external synch
 | `src/residency/host.ts` | 725, 777, 1011 |
 | `src/residency/operator-safety.ts` | 41 |
 | `src/schema/controller.ts` | 109, 254, 321, 515, 542, 562, 793, 797 |
-| `src/state/store.ts` | 531, 572, 605, 811, 840, 851, 896, 897, 1086, 1117, 1130, 1181, 1223, 1265 |
+| `src/state/store.ts` | 531, 572, 605, 811, 840, 851, 1086, 1117, 1130, 1181, 1223, 1265 |
 | `src/topology/control-plane.ts` | 758, 999, 1046, 1069, 1079, 1306, 1316, 1345, 1350 |
 | `src/topology/host-reaper.ts` | 55, 63, 87, 90, 114, 115, 118, 131, 205 |
 | `src/topology/host-record-compaction.ts` | 32 |
@@ -81,4 +81,22 @@ The public factory and provider's `withStateBackend` require both selector and e
 
 Caller-staged official `nats-server-v2.14.7-linux-amd64.tar.gz` / `SHA256SUMS`: verify archive SHA256 **before extraction/use**, verify executable against the archive member and require exact `v2.14.7` for this task. Extract only beneath `$TMPDIR`. Runner owns only loopback listeners, uses always-sync R3, retains logs/configs/check evidence under `$TASK_OUT`, and stops/waits children in `finally`.
 
-Evidence required: async get/null/list/namespace/error/shutdown regressions; real read-your-writes/concurrent CAS; disconnect/same-client reconnect/persisted reopen; shared async single-key conformance/eight-process writers; unchanged legacy batch conformance; typecheck/fresh build. Retained ledger/result records exact outcomes. No push, GitHub, credentials, services or fleet backend mutation.
+Observed on **intel1, 2026-10-09**: 75 final provider/protocol unit tests; 3 ordinary-provider membership/guard tests; 56 startup/event principal regressions; 6 real R3 backend/provider cases; **46** shared/legacy conformance cases (NATS enabled, no skip), including eight independent NATS processes with 200 unique acknowledged updates and eight provider connections with one stale-CAS winner. The probe restarts **all three** nodes, observes disconnect/reconnect on the same handle, rejects offline get with TIMEOUT, retains revision 1 after reopen, commits revision 2 with CAS, and exercises the **built** public factory successfully. All six server-process incarnations exited 0 and their PIDs were checked absent. No latency/three-host/power-loss/partition admission is claimed.
+
+Project typecheck, a separate typecheck of the normally excluded runner/probe scripts, fresh `bun run build` (proof artifact + declarations + native Landlock + artifact/lazy-startup assertions), and `bun run assert:lazy-graph` passed. The stock legacy conformance log has a non-failing MaxListeners warning; it is retained, not suppressed. The first build failed because intel1 lacks `cc`; seven checksum-verified **public Ubuntu compiler packages** were extracted only under `$TMPDIR`, then the unchanged build ran with per-command `CC`/library wrapper. No system compiler install, alternate NATS release, credentials or remote host was used.
+
+```sh
+bun run typecheck
+bunx vitest run tests/mesh-provider-async-state.test.ts tests/mesh-state-nats-kv.test.ts
+# Use the installed local compiler, or a private scratch CC wrapper when needed:
+bun run build
+bun run assert:lazy-graph
+FABRIC_NATS_EVIDENCE_DIR="$TASK_OUT/live-r3" \
+  bun scripts/run-nats-kv-conformance.ts \
+  "$TMPDIR/nats-server/nats-server-v2.14.7-linux-amd64/nats-server" \
+  /home/paul/lanes/nats-release/nats-server-v2.14.7-linux-amd64.tar.gz \
+  /home/paul/lanes/nats-release/SHA256SUMS --async-seam
+```
+
+`--async-seam` requires the fresh build and substitutes restart/public-entry probes for the unrelated latency benchmark. Exact logs/official release verification/topology/fencing/reconnect/shutdown evidence and the head receipt are retained under `$TASK_OUT`. No push, GitHub, credentials, services or fleet backend mutation.
+

@@ -1,5 +1,6 @@
 // No download/auth plumbing: all three inputs must already be local, verified official release files.
-// Usage: bun scripts/run-nats-kv-conformance.ts /abs/nats-server /abs/release.tar.gz /abs/SHA256SUMS
+// Usage: bun scripts/run-nats-kv-conformance.ts /abs/nats-server /abs/release.tar.gz /abs/SHA256SUMS [--async-seam]
+// --async-seam requires a fresh build; substitutes full R3 restart/reconnect/public-entry probes for latency.
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -7,6 +8,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { isSupportedNatsKvServer } from "../src/mesh/state-nats-kv.ts";
+import { probeNatsAsyncReconnect } from "./probe-nats-async-reconnect.ts";
+const asyncSeam = process.argv.includes("--async-seam");
 
 const [binary, archive, sums] = process.argv.slice(2);
 const output = process.env.FABRIC_NATS_EVIDENCE_DIR ?? process.env.TASK_OUT;
@@ -47,7 +50,9 @@ const port = async () => {
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-u2-r3-"));
 const ports = await Promise.all(Array.from({ length: 9 }, port));
 if (new Set(ports).size !== 9) throw new Error("Ephemeral ports collided; retry runner with a new allocation");
-const nodes: Array<{ child: ReturnType<typeof spawn>; done: Promise<void>; ready: Promise<void> }> = [];
+type RunningNode = { child: ReturnType<typeof spawn>; done: Promise<void>; ready: Promise<void> };
+const nodes: RunningNode[] = [], current: RunningNode[] = [];
+const streamLeaderWaiters = new Map<string, () => void>();
 let leaderReady!: () => void;
 const metadataLeader = new Promise<void>(resolve => { leaderReady = resolve; });
 const env = { ...process.env, FABRIC_NATS_TEST_SERVERS: ports.slice(0, 3).map(p => `nats://127.0.0.1:${p}`).join(","), FABRIC_NATS_EVIDENCE_DIR: output };
@@ -59,43 +64,76 @@ const run = async (command: string, args: string[], name: string, extra: Record<
     await new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", code => code === 0 ? resolve() : reject(new Error(`${name} exit ${code}`))); });
   } finally { await new Promise<void>(resolve => log.end(resolve)); }
 };
+const startNode = (n: number) => {
+  const config = `server_name: "fabric-u2-${n}"\nhost: "127.0.0.1"\nport: ${ports[n]}\nhttp: "127.0.0.1:${ports[n + 3]}"\nmax_payload: 2097152\njetstream {\n store_dir: ${JSON.stringify(path.join(scratch, `node-${n}`))}\n max_memory_store: 67108864\n max_file_store: 1073741824\n sync_interval: always\n}\ncluster {\n name: "fabric-u2"\n host: "127.0.0.1"\n port: ${ports[n + 6]}\n routes: [${ports.slice(6).filter((_, i) => i !== n).map(p => `"nats://127.0.0.1:${p}"`).join(",")} ]\n}\n`;
+  const configPath = path.join(output, `nats-node-${n}.conf`); fs.writeFileSync(configPath, config);
+  execFileSync(binary!, ["-t", "-c", configPath], { stdio: "pipe" });
+  const log = fs.createWriteStream(path.join(output, `nats-node-${n}.log`), { flags: "a" });
+  const child = spawn(binary!, ["-c", configPath], { stdio: ["ignore", "pipe", "pipe"] });
+  let ready!: () => void, failed!: (error: Error) => void;
+  const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; }); started.catch(() => undefined);
+  let tail = "";
+  const consume = (data: Buffer) => {
+    log.write(data); tail = (tail + data.toString()).slice(-8_192);
+    if (/Server is ready/.test(tail)) ready();
+    if (/JetStream cluster new metadata leader/.test(tail)) leaderReady();
+    for (const [stream, ready] of streamLeaderWaiters) {
+      if (tail.split("\n").some(line => line.includes("JetStream cluster new stream leader") && line.includes(stream))) {
+        streamLeaderWaiters.delete(stream); ready();
+      }
+    }
+  };
+  child.stdout!.on("data", consume); child.stderr!.on("data", consume);
+  const done = new Promise<void>((resolve, reject) => {
+    child.once("error", error => { failed(error); log.end(); reject(error); });
+    child.once("close", code => { failed(new Error(`Node ${n} exited ${code} before ready`)); log.end(resolve); });
+  }); done.catch(() => undefined);
+  const node = { child, done, ready: started };
+  nodes.push(node); current[n] = node;
+  return node;
+};
+const stopNodes = async (owned: RunningNode[]) => {
+  const running = (node: RunningNode) => node.child.exitCode === null && node.child.signalCode === null;
+  for (const node of owned) if (running(node)) node.child.kill("SIGTERM");
+  const kill = setTimeout(() => { for (const node of owned) if (running(node)) node.child.kill("SIGKILL"); }, 10_000);
+  try {
+    const stopped = await Promise.allSettled(owned.map(node => node.done));
+    const failed = stopped.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  } finally { clearTimeout(kill); }
+};
+
 try {
-  for (let n = 0; n < 3; n++) {
-    const config = `server_name: "fabric-u2-${n}"\nhost: "127.0.0.1"\nport: ${ports[n]}\nhttp: "127.0.0.1:${ports[n + 3]}"\nmax_payload: 2097152\njetstream {\n store_dir: ${JSON.stringify(path.join(scratch, `node-${n}`))}\n max_memory_store: 67108864\n max_file_store: 1073741824\n sync_interval: always\n}\ncluster {\n name: "fabric-u2"\n host: "127.0.0.1"\n port: ${ports[n + 6]}\n routes: [${ports.slice(6).filter((_, i) => i !== n).map(p => `"nats://127.0.0.1:${p}"`).join(",")} ]\n}\n`;
-    const configPath = path.join(output, `nats-node-${n}.conf`); fs.writeFileSync(configPath, config);
-    execFileSync(binary!, ["-t", "-c", configPath], { stdio: "pipe" });
-    const log = fs.createWriteStream(path.join(output, `nats-node-${n}.log`));
-    const child = spawn(binary!, ["-c", configPath], { stdio: ["ignore", "pipe", "pipe"] });
-    let ready!: () => void, failed!: (error: Error) => void;
-    const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; }); started.catch(() => undefined);
-    let tail = "";
-    const consume = (data: Buffer) => {
-      log.write(data); tail = (tail + data.toString()).slice(-8_192);
-      if (/Server is ready/.test(tail)) ready();
-      if (/JetStream cluster new metadata leader/.test(tail)) leaderReady();
-    };
-    child.stdout!.on("data", consume); child.stderr!.on("data", consume);
-    const done = new Promise<void>((resolve, reject) => {
-      child.once("error", error => { failed(error); log.end(); reject(error); });
-      child.once("close", code => { failed(new Error(`Node ${n} exited ${code} before ready`)); log.end(resolve); });
-    }); done.catch(() => undefined);
-    nodes.push({ child, done, ready: started });
-  }
+  for (let n = 0; n < 3; n++) startNode(n);
   await deadline(Promise.all([...nodes.map(node => node.ready), metadataLeader]), 60_000);
   fs.writeFileSync(path.join(output, "cluster-topology.json"), JSON.stringify({ hostname: os.hostname(), nodes: ports.slice(0, 3), replicas: 3,
     sync_interval: "always", faultDomain: "ONE HOST: local R3 functional conformance only; NOT three-host production durability proof" }, null, 2) + "\n");
-  console.log("R3 ready: running four dedicated live-NATS cases");
-  await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-nats-kv-live.test.ts"], "live-r3.log");
+  console.log("R3 ready: running dedicated live-NATS backend and async provider cases");
+  await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-nats-kv-live.test.ts", "tests/mesh-provider-nats-live.test.ts"], "live-r3.log");
   console.log("Live cases passed: running complete targeted state conformance (including five formerly skipped NATS cases)");
   await run("bunx", ["vitest", "run", "--reporter=verbose", "tests/mesh-state-async-contract.test.ts", "tests/mesh-state-async-multiprocess.test.ts",
-    "tests/mesh-state-nats-kv.test.ts", "tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts"], "conformance-r3.log");
-  console.log("Conformance passed: measuring file/SQLite/NATS get/put/CAS at 1 KiB and 100 KiB");
-  await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-1024.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "1024" });
-  await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-102400.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "102400" });
-  console.log("PASS: official binary verified; local R3 conformance and latency artifacts retained");
+    "tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts"], "conformance-r3.log");
+  if (asyncSeam) {
+    console.log("Conformance passed: restarting all R3 nodes and proving same-client reconnect + built public API");
+    await probeNatsAsyncReconnect({
+      servers: env.FABRIC_NATS_TEST_SERVERS.split(","), output,
+      stopCluster: () => stopNodes(current),
+      restartCluster: async stream => {
+        const elected = new Promise<void>(resolve => { streamLeaderWaiters.set(stream, resolve); });
+        for (let n = 0; n < 3; n++) startNode(n);
+        await deadline(Promise.all([...current.map(node => node.ready), elected]), 60_000);
+      },
+    });
+  }
+  if (!asyncSeam) {
+    console.log("Conformance passed: measuring file/SQLite/NATS get/put/CAS at 1 KiB and 100 KiB");
+    await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-1024.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "1024" });
+    await run("bun", ["scripts/benchmark-state-kv.ts"], "latency-r3-102400.log", { FABRIC_STATE_BENCH_VALUE_BYTES: "102400" });
+  }
+  console.log(`PASS: official binary verified; local R3 conformance and ${asyncSeam ? "async restart/built-entry" : "latency"} artifacts retained`);
 } finally {
-  for (const node of nodes) if (node.child.exitCode === null) node.child.kill("SIGTERM");
-  const kill = setTimeout(() => { for (const node of nodes) if (node.child.exitCode === null) node.child.kill("SIGKILL"); }, 10_000);
-  try { await Promise.allSettled(nodes.map(node => node.done)); } finally { clearTimeout(kill); }
-  fs.rmSync(scratch, { recursive: true, force: true });
+  try { await stopNodes(nodes); } finally {
+    fs.writeFileSync(path.join(output, "server-shutdown.json"), JSON.stringify(nodes.map(node => ({ pid: node.child.pid, exitCode: node.child.exitCode, signal: node.child.signalCode })), null, 2) + "\n");
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
 }

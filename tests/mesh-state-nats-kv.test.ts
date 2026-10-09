@@ -291,7 +291,7 @@ describe("NATS KV single-key adapter (mock protocol, NOT real R3 evidence)", () 
   });
   it("returns one shared close promise and awaits the transport even for concurrent closers", async () => {
     const store = await open(); let release!: () => void;
-    const closed = new Promise<void>(resolve => { release = resolve; }); broker.close.mockReturnValueOnce(closed);
+    const closed = new Promise<undefined>(resolve => { release = () => resolve(undefined); }); broker.close.mockReturnValueOnce(closed);
     const first = store.close(), second = store.close(); expect(first).toBe(second);
     let finished = false; second.then(() => { finished = true; }); await Promise.resolve(); expect(finished).toBe(false);
     await expect(store.get("a")).rejects.toThrow(/closed/);

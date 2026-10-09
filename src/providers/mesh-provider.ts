@@ -191,6 +191,11 @@ export class MeshProvider implements FabricProvider {
   }
 
   async #listState(prefix: string) {
+    if (this.#asyncState && prefix.startsWith(ASYNC_STATE_PREFIX)) {
+      return (await this.#asyncState.listAll(prefix))
+        .filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix))
+        .sort((a, b) => a.key.localeCompare(b.key));
+    }
     const local = this.store.listAll(prefix, { fresh: true });
     if (!this.#asyncState) return local;
     const selected = local.filter(entry => !entry.key.startsWith(ASYNC_STATE_PREFIX));

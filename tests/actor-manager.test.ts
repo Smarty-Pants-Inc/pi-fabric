@@ -19,6 +19,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 
@@ -202,6 +203,102 @@ describe("ActorManager idle observer versus canonical authority (#4383)", () => 
       }
     } finally { start.mockRestore(); schedule.mockRestore(); read.mockRestore(); }
   }, 30_000);
+});
+
+describe("ActorManager bound registry metadata (#7682)", () => {
+  const row = (root: string, id: string) => {
+    const registry = JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8"));
+    return registry.actors.find((actor: { id: string }) => actor.id === id);
+  };
+
+  it("records a known configuration binding at create without pinning project defaults", async () => {
+    const state = setup(true, undefined, undefined, {
+      resolvePiModel: model => model === "luna" ? "cliproxyapi/gpt-6-luna" : model,
+    }, {}, { model: "luna", thinking: "xhigh" });
+    const actor = await state.actors.create({ name: "known-binding", instructions: "Observe." });
+    expect(row(state.root, actor.id)).toMatchObject({
+      model: "cliproxyapi/gpt-6-luna", thinking: "xhigh", projectDefaults: { scope: "project" },
+    });
+    expect(state.actors.status(actor.id).projectDefaults?.model).toBeUndefined();
+    expect(state.actors.resolveBinding(actor.id)).toEqual({});
+    await state.actors.stop(actor.id);
+    const recreated = await state.actors.create({ name: "known-binding", instructions: "Observe.", model: "provider/new", thinking: "low" });
+    expect(recreated.id).not.toBe(actor.id);
+    expect(row(state.root, recreated.id)).toMatchObject({ model: "provider/new", thinking: "low" });
+  });
+
+  it("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+    await state.actors.setThinking(actor.id, "xhigh");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+    const publish = vi.spyOn(state.mesh, "publish");
+    const runOnce = async (message: string) => {
+      saves.mockClear(); publish.mockClear();
+      await state.actors.ask(actor.id, message);
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      return { saves: saves.mock.calls.length, events: publish.mock.calls.length };
+    };
+    try {
+      const changed = await runOnce("first");
+      expect(row(state.root, actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh",
+        projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+      expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+      const unchanged = await runOnce("unchanged");
+      // The first run may also initialize lifecycle state; a stable binding must
+      // never add a write or notification compared with a changed binding.
+      expect(unchanged.saves).toBeLessThanOrEqual(changed.saves);
+      expect(unchanged.events).toBe(changed.events);
+      saves.mockClear(); publish.mockClear();
+      const unchangedBytes = fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8");
+      for (let i = 0; i < 20; i++) state.actors.listOwned(true);
+      await new Promise(resolve => setTimeout(resolve, 80));
+      expect(saves).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8")).toBe(unchangedBytes);
+      await state.actors.ask(actor.id, "foreign pin", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      expect(row(state.root, actor.id)).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      const participant = actorParticipantRecord(state.actors.listOwned(true)[0]!, state.identity.id, "host", state.identity.id, state.identity.id);
+      expect(participant).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "provider/foreign", thinking: "low" });
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+      await state.actors.close();
+      const restored = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true,
+      });
+      actorManagers.push(restored);
+      expect(restored.listOwned(true)[0]).toMatchObject({ model: "provider/foreign", thinking: "low",
+        projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+      expect(restored.resolveBinding(actor.id)).toEqual({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    } finally { saves.mockRestore(); publish.mockRestore(); }
+  });
+
+  it("records the post-admission model rather than a pre-launch selector", async () => {
+    const state = setup(true, undefined, undefined, {
+      preparePiModel: async model => model === "provider/selector" ? "cliproxyapi/gpt-6-luna" : model,
+    });
+    const actor = await state.actors.create({ name: "admitted-binding", instructions: "Observe.", model: "provider/selector" });
+    await state.actors.ask(actor.id, "first");
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    expect(row(state.root, actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: state.agents.config.thinking });
+    expect(state.actors.status(actor.id).projectDefaults?.model).toBe("provider/selector");
+    // Do not republish the pre-admission selector on every run: an unchanged
+    // canonical binding must not be flipped back to the selector while preparing.
+    const advertised: Array<string | undefined> = [];
+    const unsubscribe = state.actors.subscribe(() => advertised.push(state.actors.listOwned(true)[0]?.model));
+    try {
+      await state.actors.ask(actor.id, "same selector, same admitted model");
+      await waitFor(() => state.actors.status(actor.id).status === "idle");
+      expect(advertised.length).toBeGreaterThan(0);
+      expect(advertised.every(model => model === "cliproxyapi/gpt-6-luna")).toBe(true);
+      expect(row(state.root, actor.id).model).toBe("cliproxyapi/gpt-6-luna");
+    } finally { unsubscribe(); }
+  });
 });
 
 describe("ActorManager idle registry writes (#4383)", () => {

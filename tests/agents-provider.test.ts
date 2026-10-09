@@ -4340,6 +4340,37 @@ describe("AgentsProvider retained run authorization", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
+  it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => state.actors.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+      await state.actors.setThinking(actor.id, "xhigh");
+      await state.actors.ask(actor.id, "first run");
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" }),
+      ]);
+      await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "provider/foreign", thinking: "low" }),
+      ]);
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna",
+        projectDefaults: { model: "anthropic/claude-opus-5-5" } });
+    } finally { await directory.close(); }
+  });
+
   it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
     const { provider, actors } = setup();
     const actor = await actors.create(createRequest as FabricActorRequest);
@@ -4819,7 +4850,8 @@ describe("AgentsProvider shared actor definitions", () => {
       fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };
     expect(registry.actors).toContainEqual(
-      expect.objectContaining({ id: actor.id, model: "provider/project-default" }),
+      expect.objectContaining({ id: actor.id, model: "provider/model-b",
+        projectDefaults: { scope: "project", model: "provider/project-default", thinking: "medium" } }),
     );
   });
 

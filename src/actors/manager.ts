@@ -156,6 +156,8 @@ interface ManagedActor {
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
+  /** Last resolved runtime binding; model/thinking below remain project defaults. */
+  resolvedBinding?: FabricActorRunBinding;
   model?: string;
   modelReason?: string;
   thinking?: FabricThinking;
@@ -894,8 +896,13 @@ export class ActorManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    this.#rememberResolvedBinding(actor, {
+      ...(admittedModel ? { model: admittedModel } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
+      thinking: request.thinking ?? this.agents.config.thinking,
+    });
     // Validate the complete public value before any directory, predecessor or registry effect.
-    this.#assertPresenceValue(this.#publicInfo(actor, false));
+    this.#assertPresenceValue(this.#publicInfo(actor, false, true));
     await beforeCommit?.(id);
     checkActive?.();
     if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
@@ -934,12 +941,13 @@ export class ActorManager {
     );
   }
 
-  listOwned(): FabricActorInfo[] {
+  /** Registry publishers report the resolved binding, not this reader's private overlay. */
+  listOwned(registryView = false): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
-      .map((actor) => this.#publicInfo(actor));
+      .map((actor) => this.#publicInfo(actor, true, registryView));
   }
 
   /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
@@ -3008,6 +3016,13 @@ export class ActorManager {
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
+              // AgentManager can canonicalize a selector after permit admission. Use
+              // its actual handle, then piggyback on the existing running publication.
+              this.#rememberResolvedBinding(actor, {
+                ...(handle.model ? { model: handle.model } : {}),
+                ...(launchBinding.modelReason !== undefined ? { modelReason: launchBinding.modelReason } : {}),
+                ...(handle.thinking ? { thinking: handle.thinking } : {}),
+              });
               workerLaunched = true;
               item.launchEvidenceVersion = 1;
               item.executionStarted = true;
@@ -4198,7 +4213,7 @@ export class ActorManager {
     let value: FabricActorInfo;
     try {
       // Exclude our own diagnostic so a repaired value can fit again.
-      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false);
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false, true);
       value = legacy;
       this.#assertPresenceValue(value);
     } catch (error) {
@@ -4320,6 +4335,7 @@ export class ActorManager {
   }
 
   #serializedActor(actor: ManagedActor): Record<string, unknown> {
+    const binding = actor.resolvedBinding ?? this.#runBinding(actor);
     return {
       id: actor.id,
       name: actor.name,
@@ -4340,9 +4356,15 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(actor.model ? { model: actor.model } : {}),
-      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
-      ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      ...(binding.model ? { model: binding.model } : {}),
+      ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
+      ...(binding.thinking ? { thinking: binding.thinking } : {}),
+      projectDefaults: {
+        scope: "project",
+        ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+        ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      },
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
@@ -4716,6 +4738,11 @@ export class ActorManager {
       try { instructions = this.#registry.instructions(source); }
       catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
       const record = { ...source, instructions } as Partial<ManagedActor>;
+      // Legacy rows stored defaults at the top level. New rows preserve them
+      // separately so a last-run pin never becomes a future project default.
+      const hasDefaults = typeof source.projectDefaults === "object" &&
+        source.projectDefaults !== null && !Array.isArray(source.projectDefaults);
+      const defaults = hasDefaults ? source.projectDefaults as FabricActorRunBinding : record;
       if (
         typeof record.id !== "string" ||
         !/^[a-f0-9]{32}$/.test(record.id) ||
@@ -4784,9 +4811,14 @@ export class ActorManager {
         ...(typeof record.runnerSessionId === "string" && record.runnerSessionId.trim()
           ? { runnerSessionId: record.runnerSessionId }
           : {}),
-        ...(typeof record.model === "string" ? { model: record.model } : {}),
-        ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
-        ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        ...(typeof defaults.model === "string" ? { model: defaults.model } : {}),
+        ...(typeof defaults.modelReason === "string" ? { modelReason: defaults.modelReason } : {}),
+        ...(isFabricThinking(defaults.thinking) ? { thinking: defaults.thinking } : {}),
+        ...(hasDefaults ? { resolvedBinding: {
+          ...(typeof record.model === "string" ? { model: record.model } : {}),
+          ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
+          ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        } } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
         ...(Array.isArray(record.tools)
@@ -5210,9 +5242,25 @@ export class ActorManager {
     };
   }
 
-  #publicInfo(actor: ManagedActor, includePresenceError = true): FabricActorInfo {
+  #rememberResolvedBinding(actor: ManagedActor, binding: FabricActorRunBinding): void {
+    const live = this.#actors.get(actor.id);
+    // Model admission may await while a registry reload replaces the executing
+    // object. Carry only the binding to the same lineage, never its defaults.
+    const targets = live && live !== actor && this.#lineage(live) === this.#lineage(actor)
+      ? [actor, live] : [actor];
+    for (const target of targets) {
+      const previous = target.resolvedBinding;
+      if (previous && previous.model === binding.model && previous.thinking === binding.thinking &&
+          previous.modelReason === binding.modelReason) continue;
+      target.resolvedBinding = { ...binding };
+    }
+    // No save, notification, or wake: create/run lifecycle publications already
+    // persist and advertise this value. Unchanged bindings do no extra work.
+  }
+
+  #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
     const session = this.#bindings.get(actor.id);
-    const effective = this.#runBinding(actor);
+    const effective = registryView && actor.resolvedBinding ? actor.resolvedBinding : this.#runBinding(actor);
     return {
       id: actor.id,
       scope: this.#actorScope,

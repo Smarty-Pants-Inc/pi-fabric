@@ -162,6 +162,35 @@ Commands: as above, with `B=$(mktemp -d -p "$HOME/.cache" ...)` for n1, n3 and a
 `mktemp -d` under `/srv/scratch/paul` for n2's `store_dir`; base 24620; control on base 24630
 without `sync_interval`, `DUR=4000`; `dd ... count=1000 oflag=dsync` in each store's directory.
 
+### 3-host NVMe (lane fs-7504c, 2026-10-09): blocked, cluster did not form
+
+Orchestrated from Ryzen 1 over ssh only. One node per host, bare metal (`systemd-detect-virt`:
+none), store in a `mktemp -d` under `~/.cache` on the root ext4 NVMe. Same v2.14.7 tarball on every
+host (SHA-256 `e5c20b1c…b8be2`, matches `SHA256SUMS`). Listeners on the host's Tailscale IPv4
+only (client 28604, route 28605, no monitor port, no auth), `sync_interval: always`, routes to the
+other two Tailscale IPs.
+
+| Node | Host | Tailscale IPv4 | CPU | Load (1 min) | Store device | Model | fs | `dd bs=4k count=2000 oflag=dsync` |
+|---|---|---|---|---|---|---|---|---|
+| n1 | ryzen4 | 100.105.145.68 | Ryzen 9 7950X3D | 25–29 | nvme0n1p2 (`/`) | Crucial P3 4TB (CT4000P3PSSD8) | ext4, noatime | 3.21 ms per write |
+| n2 | ryzen5 | 100.86.144.100 | Ryzen 9 7950X3D | 22–30 | nvme1n1p2 (`/`) | Crucial P3 4TB (CT4000P3PSSD8) | ext4, relatime | 2.87 ms per write |
+| n3 | epyc1 | 100.100.180.46 | EPYC 4545P | 0.6 | nvme0n1p2 (`/`) | Crucial P3 4TB (CT4000P3PSSD8) | ext4, relatime | 2.72 ms per write |
+
+RTT over Tailscale (`ping -c 20`, min / avg / max ms): ryzen4–ryzen5 0.50 / 0.89 / 1.31;
+ryzen4–epyc1 0.32 / 0.79 / 1.16; ryzen5–ryzen4 0.58 / 0.85 / 1.17; ryzen5–epyc1 0.55 / 0.92 /
+1.17; epyc1–ryzen4 0.49 / 16.6 / 66.5 (rerun 0.46 / 9.95 / 50.4); epyc1–ryzen5 0.69 / 1.00 / 1.18.
+
+**No bench numbers.** All 3 nodes started and listened on their Tailscale IPs, but no route
+formed: every route dial failed `i/o timeout`. Between these hosts only ICMP and TCP 22 pass over
+Tailscale; TCP 80, 28604 and 28605 time out (dropped, not refused) in all 6 directions. The drop
+is in the tailnet policy or the host firewalls (neither is readable without root); opening a port
+range is new access, so the stream, KV and leader-kill cells were not run. Also, the 3 hosts
+cannot ssh to each other (names do not resolve), so leader kills would have to go from Ryzen 1.
+
+Verdict: no throughput verdict versus the single-host ~430 msg/s / CAS p50 3 ms. The disks alone
+predict lower: each CT4000P3 fsync costs 2.7–3.2 ms, 2–5× the 990 EVO Plus (0.58–1.27 ms), with
+sub-ms RTT, so a 3-host R3 sync-always run would likely be disk-bound below intel1.
+
 ## 2. Shape: one stream for state and events, local projection for sync reads
 
 `StateBackend` reads are synchronous (`state-backend.ts:173-199`); `writeBatch` is atomic over

@@ -42,9 +42,7 @@ The gate decides from an inventory, never from what readers chose to register:
    then an ambiguous holder. The gate's own connection is not evidence: with no other holder, a
    switch needs no override for the SQLite files.
 
-   Residual (smarty-dev#7936): a process whose fd directory this user cannot read and that holds
-   `state.db` open WITHOUT any SQLite lock (not a WAL connection) is not detected; WAL connections
-   always hold a lock on `-shm`.
+   Known limit (smarty-dev#7936, accepted security gap: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): a process whose fd directory this user cannot read and that holds `state.db` open WITHOUT any SQLite lock (not a WAL connection) is not detected; WAL connections always hold a lock on `-shm`.
 
    On Linux, the census's SQLite-file evidence (`state-database`) is replaced by this scan, so
    `fabric@unknown` no longer covers it: each holder is named and accepted only by its own

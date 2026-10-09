@@ -215,6 +215,10 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
     let fds: string[];
     try { fds = readFdDir(fdDir); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // exited
+      // ponytail: known limit, an accepted security gap (smarty-dev#7936,
+      // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187):
+      // an unreadable fd dir whose process holds state.db open WITHOUT any SQLite lock (not a WAL
+      // connection) is not detected here; WAL connections always hold a lock on -shm, which /proc/locks shows.
       // Without /proc/locks an unreadable fd directory may hide a holder: fail closed.
       if (locksError !== undefined) {
         hold(pid, `ambiguous state.db holder: pid ${pid} (${comm(pid)}) ${fdDir} unreadable (${errno(error)}) and /proc/locks unusable (${locksError})`);

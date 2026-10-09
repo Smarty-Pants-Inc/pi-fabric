@@ -58,14 +58,14 @@ const placeProof = (root: string, proof: Record<string, unknown>): void => {
 };
 
 type Writer = { pid: number; release: string; mode: string };
-interface Harness { builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[] | (() => Writer[]); options: Partial<MeshBackendOptions>;
+interface Harness { census: () => Promise<{ writers: Writer[] }>; builtins: InstalledReader[]; writers: Writer[] | (() => Writer[]); unknown: Writer[] | (() => Writer[]); options: Partial<MeshBackendOptions>;
   /** Default: scan no other pid (this host's own ssh sessions would be ambiguous holders). */
   procScan: ProcScanOptions }
 const run = async (argv: string[], harness: Partial<Harness> = {}): Promise<{ code: number; out: string; err: string }> => {
   let out = "";
   let err = "";
   const writers = (): Writer[] => typeof harness.writers === "function" ? harness.writers() : harness.writers ?? [];
-  const code = await main(argv, { census: async () => ({ writers: writers() }), gateCensus: () => ({ writers: writers(),
+  const code = await main(argv, { census: harness.census ?? (async () => ({ writers: writers() })), gateCensus: () => ({ writers: writers(),
     unknown: typeof harness.unknown === "function" ? harness.unknown() : harness.unknown ?? [] }),
     builtinReaders: harness.builtins ?? [],
     procScan: harness.procScan ?? { listPids: () => [] }, options: harness.options ?? {}, stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
@@ -292,49 +292,46 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect((outcome.ownStateDbFds as string[]).some(fd => fd.includes(`${root}/state.db `))).toBe(true);
   });
 
-  // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
-  // fails closed, covered by "fails closed off Linux" below.
-  it.skipIf(process.platform !== "linux")("refuses a second process that opens state.db between the preflight and the commit, naming its pid", async () => {
-    const root = await fileRoot();
-    const trigger = path.join(tempDir("trigger"), "go");
-    const ready = `${trigger}.ready`;
-    const child: ChildProcess = spawn(process.execPath, ["-e", `
-      const fs = require("node:fs");
-      const timer = setInterval(() => {
-        if (!fs.existsSync(${JSON.stringify(trigger)})) return;
-        clearInterval(timer);
-        globalThis.held = fs.openSync(${JSON.stringify(path.join(root, "state.db"))}, "r");
-        fs.writeFileSync(${JSON.stringify(ready)}, "1");
-        setInterval(() => {}, 1000);
-      }, 5);`], { stdio: "ignore" });
-    try {
-      const wait = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
-      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [process.pid, child.pid!] },
-        options: { beforeCommit: () => {
-          fs.writeFileSync(trigger, "1");
-          for (let index = 0; index < 400 && !fs.existsSync(ready); index++) wait(10);
-        } } });
-      expect(result.code, `${result.err} ready=${fs.existsSync(ready)}`).toBe(3);
-      expect(result.err).toContain(`(under the fence, before the importing commit): holder@${child.pid} (foreign state.db holder: pid ${child.pid} (`);
-      expect(result.err).toContain(`) holds ${root}/state.db)`);
-      expect(await backendOf(root)).toBe("file");
-    } finally { child.kill("SIGKILL"); }
-  });
+  /**
+   * A child that opens `<root>/state.db` (a plain fd, or a node:sqlite connection) when the parent sends
+   * "open", answers "ready" over IPC, and exits on "exit". It stays alive on the IPC channel: no timers.
+   */
+  const holderChild = (root: string, kind: "fd" | "sqlite") => {
+    const file = JSON.stringify(path.join(root, "state.db"));
+    const child = spawn(process.execPath, ["-e", `
+      let held;
+      process.on("message", (message) => {
+        if (message === "exit") process.exit(0);
+        if (message !== "open") return;
+        ${kind === "fd" ? `held = require("node:fs").openSync(${file}, "r");`
+          : `const { DatabaseSync } = require("node:sqlite"); held = new DatabaseSync(${file}); held.prepare("SELECT count(*) AS n FROM meta").get();`}
+        process.send("ready");
+      });`], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    /** Sends "open" and awaits the ONE "ready" reply, with one deadline. */
+    const open = (): Promise<void> => new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error("holder child not ready within 10 s")), 10_000);
+      child.once("message", (message) => { clearTimeout(deadline); if (message === "ready") resolve(); else reject(new Error(`holder child: ${String(message)}`)); });
+      child.send("open");
+    });
+    const close = (): Promise<void> => new Promise((resolve) => {
+      if (child.exitCode !== null || !child.connected) { child.kill("SIGKILL"); resolve(); return; }
+      const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
+      child.once("exit", () => { clearTimeout(deadline); resolve(); });
+      child.send("exit");
+    });
+    return { child, open, close };
+  };
 
-  /** A child that opens state.db with node:sqlite (WAL) once `trigger` exists, then writes `${trigger}.ready`. */
-  const sqliteHolder = (root: string, trigger: string): ChildProcess => spawn(process.execPath, ["-e", `
-    const fs = require("node:fs");
-    const timer = setInterval(() => {
-      if (!fs.existsSync(${JSON.stringify(trigger)})) return;
-      clearInterval(timer);
-      const { DatabaseSync } = require("node:sqlite");
-      globalThis.db = new DatabaseSync(${JSON.stringify(path.join(root, "state.db"))}, { readOnly: true });
-      globalThis.db.prepare("SELECT count(*) AS n FROM meta").get();
-      fs.writeFileSync(${JSON.stringify(`${trigger}.ready`)}, "1");
-      setInterval(() => {}, 1000);
-    }, 5);`], { stdio: "ignore" });
-  const waitFor = (file: string): void => {
-    for (let index = 0; index < 500 && !fs.existsSync(file); index++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  /**
+   * A root left at backend=importing by a crash (state.db exists, in WAL mode). The rerun's census hook runs
+   * under the fence before the redo commit, so a holder opened there appears after the preflight.
+   */
+  const crashedImport = async (): Promise<string> => {
+    const root = await fileRoot();
+    const crashed = await run(["cutover", "--root", root], { options: { onStep: (step) => { if (step === "import-commit") throw new Error("killed"); } } });
+    expect(crashed.code).toBe(1);
+    expect(await backendOf(root)).toBe("importing");
+    return root;
   };
   const denied = (pid: number) => (dir: string): string[] => {
     if (dir === `/proc/${pid}/fd`) throw Object.assign(new Error("denied"), { code: "EACCES" });
@@ -343,17 +340,32 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
   // fails closed, covered by "fails closed off Linux" below.
-  it.skipIf(process.platform !== "linux")("finds a SQLite connection whose /proc/<pid>/fd is unreadable through /proc/locks alone", async () => {
-    const root = await fileRoot();
-    const trigger = path.join(tempDir("trigger"), "go");
-    const child = sqliteHolder(root, trigger);
+  it.skipIf(process.platform !== "linux")("refuses a second process that opens state.db between the preflight and the commit, naming its pid", async () => {
+    const root = await crashedImport();
+    const holder = holderChild(root, "fd");
     try {
-      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [process.pid, child.pid!], readFdDir: denied(child.pid!) },
-        options: { beforeCommit: () => { fs.writeFileSync(trigger, "1"); waitFor(`${trigger}.ready`); } } });
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [process.pid, holder.child.pid!] },
+        census: async () => { await holder.open(); return { writers: [] }; } });
       expect(result.code).toBe(3);
-      expect(result.err).toMatch(new RegExp(`holder@${child.pid} \\(foreign state\\.db holder: pid ${child.pid} \\(\\S+\\) holds a POSIX lock on ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/state\\.db`));
-      expect(await backendOf(root)).toBe("file");
-    } finally { child.kill("SIGKILL"); }
+      expect(result.err).toContain(`(under the fence, before the importing commit): holder@${holder.child.pid} (foreign state.db holder: pid ${holder.child.pid} (`);
+      expect(result.err).toContain(`) holds ${root}/state.db)`);
+      expect(await backendOf(root)).toBe("importing");
+    } finally { await holder.close(); }
+  });
+
+  // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
+  // fails closed, covered by "fails closed off Linux" below.
+  it.skipIf(process.platform !== "linux")("finds a SQLite connection whose /proc/<pid>/fd is unreadable through /proc/locks alone", async () => {
+    const root = await crashedImport();
+    const holder = holderChild(root, "sqlite");
+    try {
+      const result = await run(["cutover", "--root", root], {
+        procScan: { listPids: () => [process.pid, holder.child.pid!], readFdDir: denied(holder.child.pid!) },
+        census: async () => { await holder.open(); return { writers: [] }; } });
+      expect(result.code).toBe(3);
+      expect(result.err).toMatch(new RegExp(`holder@${holder.child.pid} \\(foreign state\\.db holder: pid ${holder.child.pid} \\(\\S+\\) holds a POSIX lock on ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/state\\.db`));
+      expect(await backendOf(root)).toBe("importing");
+    } finally { await holder.close(); }
   });
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
@@ -483,6 +495,10 @@ describe("fabric-mesh-backend readiness gate: proofs that cannot be trusted", ()
     const builtins = [{ name: "factory", installRoot: factory }];
     const withProof = await fileRoot();
     placeProof(withProof, factoryProof());
+    // An UNSAFE (group/world-writable) readers/ as well.
+    const unsafe = await fileRoot();
+    placeProof(unsafe, factoryProof());
+    fs.chmodSync(path.join(unsafe, "readers"), 0o777);
     const saved = Object.getOwnPropertyDescriptor(process, "geteuid");
     Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
     try {
@@ -494,7 +510,7 @@ describe("fabric-mesh-backend readiness gate: proofs that cannot be trusted", ()
       fs.writeFileSync(file, JSON.stringify(factoryProof()));
       expect((await run(["reader-proof", "--root", root, "--name", "factory", "--proof-file", file])).code).toBe(1);
       const everyName = "factory,fabric@unknown,fabric@fabric-rel-a,holder@1,holder@-1";
-      for (const [mesh, command] of [[root, "cutover"], [root, "import"], [withProof, "cutover"]] as const) {
+      for (const [mesh, command] of [[root, "cutover"], [root, "import"], [withProof, "cutover"], [unsafe, "cutover"], [unsafe, "import"]] as const) {
         const refused = await run([command, "--root", mesh, "--accept-unready", everyName],
           { builtins, writers: [{ pid: 9, release: "fabric-rel-a", mode: "sqlite" }], unknown: [{ pid: 0, release: "unknown", mode: "unknown lock-owner" }] });
         expect(refused.code).toBe(3);

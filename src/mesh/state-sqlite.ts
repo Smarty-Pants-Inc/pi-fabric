@@ -1478,8 +1478,14 @@ export class SqliteStateStore {
   }
 }
 
-// An advisory try-lock file (O_EXCL); one older than `staleMs` belongs to a crashed holder and is replaced.
-const tryLockFile = (file: string, staleMs: number): boolean => {
+// An advisory try-lock file (O_EXCL). One older than `staleMs` belongs to a crashed holder. It is reclaimed by
+// renaming it aside and checking that the moved file is the stale one this process stat'ed (inode and mtime):
+// a fresh lock another reclaimer created meanwhile is linked back (never overwriting a newer one) and this
+// process backs off, so it never deletes a live holder's lock (pi-fabric#691 review).
+// ponytail: one remaining interleaving (a third process creating a lock between the rename and the link-back)
+// can start a second resetter; that is harmless, because SQLite's own checkpoint lock serializes TRUNCATE
+// checkpoints and the second one only sees busy. The file sheds load; SQLite provides the exclusion.
+export const tryLockFile = (file: string, staleMs: number): boolean => {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       fs.closeSync(fs.openSync(file, "wx", 0o600));
@@ -1487,8 +1493,15 @@ const tryLockFile = (file: string, staleMs: number): boolean => {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
       const stat = fs.statSync(file, { throwIfNoEntry: false });
-      if (stat && Date.now() - stat.mtimeMs <= staleMs) return false;
-      if (stat) try { fs.rmSync(file, { force: true }); } catch { return false; }
+      if (!stat) continue;
+      if (Date.now() - stat.mtimeMs <= staleMs) return false;
+      const aside = `${file}.${process.pid}.${randomUUID()}.stale`;
+      try { fs.renameSync(file, aside); } catch { return false; }
+      const moved = fs.statSync(aside, { throwIfNoEntry: false });
+      const same = moved !== undefined && moved.ino === stat.ino && moved.dev === stat.dev && moved.mtimeMs === stat.mtimeMs;
+      if (!same) try { fs.linkSync(aside, file); } catch { /* a newer lock holds the name */ }
+      try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ }
+      if (!same) return false;
     }
   }
   return false;

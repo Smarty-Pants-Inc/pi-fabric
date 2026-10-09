@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { SqliteStateStore, tryLockFile } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // smarty-dev#6477 P0 (sqlite soak): wal_autocheckpoint=0 and no production checkpointer let the hub's WAL grow
@@ -249,4 +249,43 @@ describe("WAL stays bounded with constant concurrent readers (full-load soak def
     // window; 9.6 MB seen at load 30): bounded well below the starved WAL, which keeps growing.
     expect(fixed.max).toBeLessThan(control.max * 0.6);
   }, 60_000);
+});
+
+describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
+  const lockRoot = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-lock-")); roots.push(root); return root; };
+  const age = (file: string, ms: number) => { const at = new Date(Date.now() - ms); fs.utimesSync(file, at, at); };
+
+  it("reclaims a stale lock and refuses a fresh one", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    expect(tryLockFile(lock, 2_000)).toBe(true);
+    expect(tryLockFile(lock, 2_000)).toBe(false);
+    age(lock, 5_000);
+    expect(tryLockFile(lock, 2_000)).toBe(true);
+    expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("never deletes a fresh lock that another reclaimer created after this process saw the stale one", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    fs.writeFileSync(lock, "crashed\n");
+    age(lock, 5_000);
+    const statSync = fs.statSync.bind(fs);
+    let raced = false;
+    const spy = vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const result = statSync(file, options as fs.StatSyncOptions & { throwIfNoEntry: false });
+      if (!raced && String(file) === lock) {
+        raced = true; // another process reclaims the stale lock and holds a fresh one
+        fs.rmSync(lock);
+        fs.writeFileSync(lock, "other holder\n");
+      }
+      return result;
+    }) as typeof fs.statSync);
+    try {
+      expect(tryLockFile(lock, 2_000)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(raced).toBe(true);
+    expect(fs.readFileSync(lock, "utf8")).toBe("other holder\n");
+    expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
+  });
 });

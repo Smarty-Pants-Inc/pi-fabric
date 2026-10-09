@@ -7,6 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 
 const roots: string[] = [];
+const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+const localFilesystemTypes = [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x794C7630, 0xF2F52010, 0x2FC12FC1];
+const mockFilesystemType = (type: number, platform = "linux") => {
+  Object.defineProperty(process, "platform", { ...nativePlatform, value: platform });
+  return vi.spyOn(fs, "statfsSync").mockReturnValue({ type } as fs.StatsFs);
+};
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-registry-cache-"));
   roots.push(root);
@@ -20,16 +26,112 @@ const setup = () => {
   let cacheable: boolean;
   try {
     const stat = fs.fstatSync(fd, { bigint: true });
-    cacheable = stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n;
+    cacheable = process.platform === "linux" && localFilesystemTypes.includes(fs.statfsSync(root).type) &&
+      stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n;
   } finally { fs.closeSync(fd); }
   return { root, file, value, cacheable, store: new ActorRegistryStore(root) };
 };
 afterEach(() => {
   vi.restoreAllMocks();
+  Object.defineProperty(process, "platform", nativePlatform);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
 describe("ActorRegistryStore cached read (#7791)", () => {
+  it.each(localFilesystemTypes)("shares mature cache hits on Linux local filesystem type %i with one directory probe", type => {
+    const statfs = mockFilesystemType(type);
+    const { root, value, store } = setup();
+    statfs.mockClear(); // Exclude the fixture's native-cacheability check.
+    const alias = new ActorRegistryStore(path.join(root, "."));
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: 1n, ctimeNs: 1n,
+      })) as typeof fs.fstatSync);
+    const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+    const first = store.read();
+    expect(first).toEqual(value);
+    for (let i = 1; i < 100; i++) expect((i % 2 ? alias : store).read()).toBe(first);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(disk).toHaveBeenCalledTimes(1);
+    expect(statfs).toHaveBeenCalledExactlyOnceWith(path.resolve(root));
+  });
+
+  it.each([
+    ["NFS", 0x6969, "linux"], ["SMB", 0x517B, "linux"],
+    ["CIFS", 0xFF534D42, "linux"], ["FUSE", 0x65735546, "linux"],
+    ["unknown", 0, "linux"], ["unavailable", 0, "linux"],
+    ["Windows magic collision", 0xEF53, "win32"], ["macOS magic collision", 0xEF53, "darwin"],
+  ] as const)("always re-reads %s despite negative server-clock skew and identical metadata", (name, type, platform) => {
+    const statfs = mockFilesystemType(type, platform);
+    const { root, file, value, store } = setup();
+    if (name === "unavailable") statfs.mockImplementation(() => { throw new Error("statfs unavailable"); });
+    statfs.mockClear();
+    const alias = new ActorRegistryStore(path.join(root, "."));
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    const bytes = JSON.stringify(replacement);
+    expect(bytes).toHaveLength(JSON.stringify(value).length);
+    const clientNowMs = 1_700_000_010_100;
+    vi.spyOn(Date, "now").mockReturnValue(clientNowMs);
+    const stampNs = BigInt(clientNowMs - 10_100) * 1_000_000n; // Fresh server mtime, client clock > 2 s ahead.
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: stampNs, ctimeNs: stampNs,
+      })) as typeof fs.fstatSync);
+    const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+    const before = store.read();
+    expect(before).toEqual(value);
+    const unchanged = alias.read();
+    fs.writeFileSync(file, bytes); // Same inode, size, and server timestamp bucket.
+    const after = store.read();
+    expect(after).toEqual(replacement);
+    expect(after).not.toBe(before);
+    expect(unchanged).not.toBe(before); // Even unchanged remote bytes are decoded again.
+    expect(Object.isFrozen(after)).toBe(true);
+    expect(alias.read()).toEqual(replacement);
+    expect(alias.read()).not.toBe(after);
+    fs.writeFileSync(file, "!".repeat(bytes.length));
+    expect(() => store.read()).toThrow(SyntaxError);
+    expect(parse).toHaveBeenCalledTimes(6);
+    expect(disk).toHaveBeenCalledTimes(6);
+    expect(statfs).toHaveBeenCalledTimes(platform === "linux" ? 1 : 0);
+  });
+
+  it("bounds filesystem verdicts to 64 directories and re-probes an evicted directory", () => {
+    const statfs = mockFilesystemType(0xEF53);
+    const fixtures = Array.from({ length: 65 }, () => setup());
+    statfs.mockClear();
+    for (const { store } of fixtures) store.read();
+    expect(statfs).toHaveBeenCalledTimes(65);
+    fixtures[64]!.store.read();
+    expect(statfs).toHaveBeenCalledTimes(65);
+    fixtures[0]!.store.read();
+    expect(statfs).toHaveBeenCalledTimes(66);
+  });
+
+  it("re-probes the directory after release instead of retaining a previous local-clock verdict", () => {
+    const statfs = mockFilesystemType(0xEF53);
+    const { root, file, value, store } = setup();
+    statfs.mockClear();
+    const alias = new ActorRegistryStore(root);
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
+        ino: 1n, mtimeNs: 1n, ctimeNs: 1n,
+      })) as typeof fs.fstatSync);
+    const before = store.read();
+    expect(alias.read()).toBe(before);
+    alias.releaseReadCache();
+    statfs.mockReturnValue({ type: 0x6969 } as fs.StatsFs);
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    fs.writeFileSync(file, JSON.stringify(replacement));
+    const after = store.read();
+    expect(after).toEqual(replacement);
+    expect(alias.read()).not.toBe(after);
+    expect(statfs).toHaveBeenCalledTimes(2);
+  });
+
   it("bounds decoded generations to 64 paths and promotes hits before LRU eviction", () => {
     const fixtures = Array.from({ length: 65 }, () => setup());
     const views = fixtures.slice(0, 64).map(({ store }) => store.read());
@@ -90,6 +192,7 @@ describe("ActorRegistryStore cached read (#7791)", () => {
   });
 
   it.each([1_000, 2_000])("re-reads same-size in-place updates within a coarse %i ms timestamp quantum", quantumMs => {
+    mockFilesystemType(0xEF53);
     const { file, value, store } = setup();
     const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
     const bytes = JSON.stringify(replacement);
@@ -132,6 +235,7 @@ describe("ActorRegistryStore cached read (#7791)", () => {
   });
 
   it.each([1_000, 2_000])("hits an untouched coarse %i ms generation older than two seconds", quantumMs => {
+    mockFilesystemType(0xEF53);
     const { value, store } = setup();
     const now = 1_700_000_004_001;
     vi.spyOn(Date, "now").mockReturnValue(now);
@@ -272,6 +376,7 @@ describe("ActorRegistryStore cached read (#7791)", () => {
   });
 
   it("includes descriptor ctime in a generation with unchanged inode, size and mtime", () => {
+    mockFilesystemType(0xEF53);
     const { file, value, store } = setup();
     const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
     expect(JSON.stringify(replacement)).toHaveLength(JSON.stringify(value).length);

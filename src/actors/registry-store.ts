@@ -69,6 +69,34 @@ const freezeRegistryValue = <T>(value: T): T => {
 const REGISTRY_READ_CACHE_LIMIT = 64;
 const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
 const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
+// The racy-file age proof compares filesystem mtime with the client's clock.
+// Linux local filesystems share that clock; remote/unknown filesystems do not.
+// Probe lazily once per normalized directory while retained. Keep verdicts bounded
+// too, and drop them on release so a removed/recreated root is checked again.
+const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
+  0xEF53, // ext2/3/4
+  0x58465342, // XFS
+  0x9123683E, // btrfs
+  0x01021994, // tmpfs
+  0x794C7630, // overlayfs
+  0xF2F52010, // f2fs
+  0x2FC12FC1, // ZFS
+]);
+const registryLocalClockCache = new Map<string, boolean>();
+const registryHasLocalClock = (directory: string): boolean => {
+  // Other platforms' statfs type values are not comparable to Linux magic values.
+  if (process.platform !== "linux") return false;
+  const known = registryLocalClockCache.get(directory);
+  if (known !== undefined) return known;
+  let local = false;
+  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(directory).type); }
+  catch { /* An unavailable filesystem identity cannot prove a host-local clock. */ }
+  registryLocalClockCache.set(directory, local);
+  if (registryLocalClockCache.size > REGISTRY_READ_CACHE_LIMIT) {
+    registryLocalClockCache.delete(registryLocalClockCache.keys().next().value!);
+  }
+  return local;
+};
 
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
@@ -91,6 +119,7 @@ export interface ActorRegistryMutation<T> {
 /** Disk protocol shared by registry merges and fenced lineage adoption. */
 export class ActorRegistryStore {
   readonly #registryPath: string;
+  readonly #registryDirectory: string;
   readonly #actorRoot: string;
   readonly #writer: AtomicFileWriter;
   readonly #payloads: ActorRegistryPayloads;
@@ -107,6 +136,7 @@ export class ActorRegistryStore {
     this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
     this.#registryPath = path.resolve(actorRoot, "actors.json");
+    this.#registryDirectory = path.dirname(this.#registryPath);
     this.#writer = new AtomicFileWriter(this.#registryPath);
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
@@ -442,6 +472,7 @@ export class ActorRegistryStore {
   /** Release shared decoded state when its manager closes or its root is removed. */
   releaseReadCache(): void {
     registryReadCache.delete(this.#registryPath);
+    registryLocalClockCache.delete(this.#registryDirectory);
     this.#snapshot = undefined;
   }
 
@@ -453,13 +484,15 @@ export class ActorRegistryStore {
     try {
       const readTimeMs = Date.now();
       const stat = fs.fstatSync(fd, { bigint: true });
-      const generation = stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
+      const generation = registryHasLocalClock(this.#registryDirectory) &&
+        stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
         ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
         : undefined;
       const cached = registryReadCache.get(this.#registryPath);
       // Delete/reinsert promotes both unchanged and replaced generations.
       registryReadCache.delete(this.#registryPath);
-      // Coarse timestamps can hide same-size in-place writes within a 2 s quantum.
+      // On host-local filesystems, coarse timestamps can hide same-size in-place
+      // writes within a 2 s quantum. Remote/unknown clocks never reach this hit path.
       // Prove the bytes against their original read-start time, not the current
       // clock: a racy entry must be re-read once settled, never merely age into a hit.
       if (generation !== undefined && cached?.generation === generation &&

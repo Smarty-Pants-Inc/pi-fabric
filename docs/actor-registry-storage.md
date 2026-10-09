@@ -16,8 +16,19 @@ read opens the file and checks its descriptor's device, inode, size, nanosecond
 mtime and ctime. Zero inode or timestamp identities are unproven and always
 re-read; atomic replacements remain bound to the descriptor actually opened.
 
-Nonzero timestamps can still be coarse (up to a two-second quantum). Each
-cached generation therefore records its wall-clock read-start time. Its bytes
+The read-start age proof requires the filesystem clock to be the host's own.
+On Linux, the registry directory is lazily checked with `statfsSync` and only
+ext2/3/4, XFS, btrfs, tmpfs, overlayfs, f2fs and ZFS are trusted. Normalized aliases
+share a verdict, with at most 64 directory verdicts retained; an evicted or
+explicitly released directory is checked again. NFS, SMB/CIFS, FUSE, unknown or
+unavailable types, and non-Linux platforms (including Windows/macOS, whose type
+values are not comparable) always re-read/re-validate and never retain decoded
+cache entries. Thus a remote server clock behind the client cannot make a fresh
+same-size, same-timestamp-bucket rewrite look old enough for a stale cache hit.
+
+On trusted local filesystems, nonzero timestamps can still be coarse (up to a
+two-second quantum). Each cached generation therefore records its wall-clock
+read-start time. Its bytes
 are reusable only when the descriptor mtime is **strictly older** than that
 recorded time minus two seconds. Recent, exactly-two-second-old and future
 mtimes re-read and re-validate JSON rather than returning cached bytes, even if

@@ -9,6 +9,7 @@ import type { AgentRunResult } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { RESIDENCY_NOTIFICATION_DIR, residencyNotificationName } from "../src/mesh/residency-notifications.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import * as kernelFence from "../src/residency/file-lock.js";
 import { residentHostId, residentDeliveryPrefix, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -16,14 +17,14 @@ import type { FabricParticipantSource } from "../src/topology/types.js";
 
 const roots: string[] = [], clients: ResidencyClient[] = [];
 afterEach(async () => { for (const client of clients.splice(0)) await client.close(); vi.restoreAllMocks(); vi.useRealTimers(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
-const fixture = () => {
+const fixture = (stateBackend: "file" | "sqlite" = "file") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "residency-events-")); roots.push(root);
   const meshRoot = path.join(root, "mesh"), rootId = "session:event-idle";
   const config: ResidentHostConfig = { format: 1, rootId, sessionId: "event-idle", mainName: "main", mainStartedAt: 1, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId), fullCodeMode: true,
     agents: { ...DEFAULT_FABRIC_CONFIG.agents }, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "unused", fabricExtensionPath: "unused", piBinary: "unused", claudeBinary: "unused", vedaBinary: "unused" };
-  const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 2_000 });
+  const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 2_000, stateBackend });
   const participants = { list: () => [], get: () => undefined, lastKnown: () => undefined, self: () => { throw new Error("no owner"); } } as unknown as FabricParticipantSource;
   const deliverAgent = vi.fn(), complete = vi.fn();
   const client = new ResidencyClient({ config, mesh, participants, mainAgent: { id: rootId, local: true, deliverAgent } as unknown as FabricMainAgentTarget, onBackgroundComplete: complete }); clients.push(client);
@@ -115,6 +116,70 @@ describe("ResidencyClient event-driven idle", () => {
     }
     expect(drain).toHaveBeenCalledOnce(); expect(open).not.toHaveBeenCalled(); expect(read).not.toHaveBeenCalled(); expect(readdir).not.toHaveBeenCalled();
     await h.client.close(); expect(events.watches.every(watch => watch.watcher.close.mock.calls.length > 0)).toBe(true);
+  });
+
+  it("never retries pending deliveries or turns Main on lease renewals, then retries one real receipt", async () => {
+    const h = fixture(), events = fakeWatches(), own = await seedLegacy(h), unread = await seedLegacy(h, 2);
+    const receipts = path.join(h.meshRoot, "agent-completions", "receipts"); fs.mkdirSync(receipts, { recursive: true });
+    h.client.start(); await vi.waitFor(() => expect(h.complete).toHaveBeenCalledTimes(2)); await settled();
+    const original = h.mesh.get(own.key, { fresh: true })!;
+    const remove = vi.spyOn(h.mesh, "delete").mockResolvedValueOnce({ deleted: false });
+    h.complete.mock.calls[0]![1](); await settled();
+    expect(remove).toHaveBeenCalledOnce(); expect(h.mesh.get(own.key, { fresh: true })).toEqual(original);
+    remove.mockClear(); h.complete.mockClear(); h.deliverAgent.mockClear();
+    const get = vi.spyOn(h.mesh, "get"), select = vi.spyOn(h.mesh, "listAllShared");
+    for (let n = 1; n <= 12; n++) {
+      await h.mesh.writeBatch({ identity: { id: "lease-owner", name: "lease-owner", kind: "main" }, ops: [
+        { kind: "put", key: "topology/hosts/lease-owner", value: { updatedAt: n * 60_000, expiresAt: (n + 2) * 60_000 } },
+        { kind: "put", key: "topology/participants/lease-owner", value: { status: "idle", updatedAt: n * 60_000 } },
+      ] });
+      for (const file of ["state.json", "state.read-journal.jsonl", "state.read-signal.json"]) events.fire(h.meshRoot, file);
+      await settled();
+    }
+    expect(get.mock.calls.filter(([key]) => key.startsWith("residency/deliveries/"))).toEqual([]);
+    expect(select).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled();
+    expect(h.complete).not.toHaveBeenCalled(); expect(h.deliverAgent).not.toHaveBeenCalled();
+    get.mockClear();
+    const filename = `${createHash("sha256").update(own.result.id).digest("hex")}.json`;
+    events.fire(receipts, filename); events.fire(receipts, filename); await settled();
+    expect(get.mock.calls.filter(([key]) => key.startsWith("residency/deliveries/")).map(([key]) => key)).toEqual([own.key]);
+    expect(remove).toHaveBeenCalledOnce(); expect(h.mesh.get(own.key, { fresh: true })).toBeUndefined();
+    expect(h.mesh.get(unread.key, { fresh: true })).toBeDefined();
+    expect(h.complete).not.toHaveBeenCalled(); expect(h.deliverAgent).not.toHaveBeenCalled();
+  });
+
+  it.each(["file", "sqlite"] as const)("admits only a changed delivery key, not lease writes or another delivery, on %s", async backend => {
+    const h = fixture(backend), events = fakeWatches();
+    const key = residentDeliveryPrefix(h.config.rootId) + "failed";
+    const writer = { id: residentHostId(h.config.rootId), name: "host", kind: "main" as const };
+    const value = { format: 1, id: "failed", rootId: h.config.rootId, from: { id: "actor", name: "actor", kind: "actor" },
+      message: "failed", delivery: "followUp", triggerTurn: true, createdAt: 1 };
+    await h.mesh.put({ key, identity: writer, value });
+    h.deliverAgent.mockImplementationOnce(() => { throw new Error("Main busy"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      h.client.start(); await vi.waitFor(() => expect(h.deliverAgent).toHaveBeenCalledOnce()); await settled();
+      h.deliverAgent.mockClear(); const select = vi.spyOn(h.mesh, "listAllShared");
+      for (let n = 1; n <= 12; n++) {
+        await h.mesh.put({ key: "topology/hosts/lease-owner", identity: writer, value: { updatedAt: n * 60_000, expiresAt: (n + 2) * 60_000 } });
+        for (const file of ["state.json", "state.read-journal.jsonl", "state.read-signal.json"]) events.fire(h.meshRoot, file);
+        await settled();
+      }
+      expect(h.deliverAgent).not.toHaveBeenCalled(); expect(h.complete).not.toHaveBeenCalled(); expect(select).not.toHaveBeenCalled();
+      const other = residentDeliveryPrefix(h.config.rootId) + "new";
+      await h.mesh.put({ key: other, identity: writer, value: { ...value, id: "new", message: "new" } });
+      const notifications = path.join(h.meshRoot, RESIDENCY_NOTIFICATION_DIR);
+      events.fire(notifications, residencyNotificationName(other)); await settled();
+      expect(h.deliverAgent).toHaveBeenCalledOnce(); expect(h.deliverAgent.mock.calls[0]![0].message).toBe("new");
+      expect(h.mesh.get(key, { fresh: true })).toBeDefined(); expect(select).not.toHaveBeenCalled();
+      h.deliverAgent.mockClear();
+      // A duplicate/adversarial notification is not a state change or retry grant.
+      events.fire(notifications, residencyNotificationName(key)); await settled(); expect(h.deliverAgent).not.toHaveBeenCalled();
+      await h.mesh.put({ key, identity: writer, value: { ...value, message: "repaired" } });
+      events.fire(notifications, residencyNotificationName(key)); events.fire(notifications, residencyNotificationName(key)); await settled();
+      expect(h.deliverAgent).toHaveBeenCalledOnce(); expect(h.deliverAgent.mock.calls[0]![0].message).toBe("repaired");
+      expect(select).not.toHaveBeenCalled(); expect(h.mesh.get(key, { fresh: true })).toBeUndefined();
+    } finally { warn.mockRestore(); await h.client.close(); h.mesh.closeState(); }
   });
 
   it("retains a trailing filename notification during an awaited initial drain and close joins it", async () => {
@@ -291,7 +356,7 @@ describe("ResidencyClient event-driven idle", () => {
       vi.useFakeTimers();
       await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
       expect(h.mesh.get(own.key, { fresh: true })).toBeDefined(); // No retry tick.
-      events.fire(h.meshRoot, "state.json"); await settled();
+      h.client.retryDeliveries(); await settled();
       expect(h.mesh.get(own.key, { fresh: true })).toBeUndefined();
     }
     expect(h.complete).toHaveBeenCalledOnce();

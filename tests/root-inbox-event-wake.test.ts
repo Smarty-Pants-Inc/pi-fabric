@@ -271,6 +271,22 @@ describe("changed source activation and Main gate", () => {
     expect(order.slice(0, 2)).toEqual(["settled", "inbox"]);
   }, 60_000);
 
+  it("rearms a young event arriving while Main is busy for its exact due time after settlement", async () => {
+    const h = await startSession(true, 80, 60_000);
+    let dueAt = 0;
+    h.faux.setResponses([() => {
+      dueAt = Date.now() + 2_000;
+      h.publish("young while busy", 58_000);
+      return fauxAssistantMessage("working ".repeat(20));
+    }, fauxAssistantMessage("young deadline received")]);
+    await h.session.prompt("work");
+    expect(Date.now()).toBeLessThan(dueAt); expect(h.inbox()).toHaveLength(0);
+    await vi.waitFor(() => { expect(h.inbox()).toHaveLength(1); expect(h.session.isStreaming).toBe(false); }, { timeout: 4_000 });
+    expect(Date.now()).toBeGreaterThanOrEqual(dueAt);
+    expect(JSON.stringify(h.inbox()[0])).toContain("young while busy");
+    await new Promise(resolve => setTimeout(resolve, 100)); expect(h.inbox()).toHaveLength(1);
+  }, 60_000);
+
   it("disarms owner-aborted work and rearms on the next start", async () => {
     const h = await startSession(true, 40);
     h.faux.setResponses([() => { h.publish("busy and aborted"); return fauxAssistantMessage("long answer ".repeat(300)); }]);

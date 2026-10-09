@@ -887,6 +887,21 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
+      else if (!inbox?.events.length && inboxWake.armed && hostQueuesTriggeredBehindPreflight(pi)) {
+        // A watch request while Main was busy canceled the old one-shot. The
+        // completed-settlement receipt owns one gated reconciliation, so a young
+        // item gets its exact known-work deadline back without unrelated input.
+        const observer = inboxWake.observer;
+        const canReconcile = () => inboxWake.context === context && inboxWake.observer === observer &&
+          state.initialized && state.config.mesh.enabled && state.mainAgentInfo(context).local &&
+          inboxWake.armed && context.isIdle() && !promptPending(context) && !context.hasPendingMessages();
+        const pending = await state.nextRootInbox(inboxHeldBy(context), canReconcile).catch(() => undefined);
+        if (canReconcile()) {
+          reportInboxExpiry(pi, pending);
+          if (pending?.events.length) deliverRootInbox(pi, pending.events);
+          else observer?.armKnownDeadline(state.rootInboxKnownWake);
+        }
+      }
     }
   };
 

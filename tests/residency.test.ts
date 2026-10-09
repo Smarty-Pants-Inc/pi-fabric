@@ -979,6 +979,7 @@ describe("durable completion receipts", () => {
         expect(state.mesh.get(key)).toBeDefined();
         expect(main.sent).toHaveLength(0);
         fail = false;
+        client.retryDeliveries(); // Explicit barrier recovery, never a heartbeat retry.
         await waitFor(() => state.mesh.get(key) === undefined);
         expect(main.sent).toHaveLength(1);
       } finally { fail = false; synced.mockRestore(); await client.close(); main.main.closeFollowUpDrain(); await state.participants.close(); }
@@ -1016,6 +1017,8 @@ describe("durable completion receipts", () => {
       const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
       try {
         client.start();
+        await waitFor(() => deliver.mock.results.length >= 1);
+        client.retryDeliveries(); // Explicitly verify the still-failed second attempt.
         await waitFor(() => deliver.mock.results.length >= 2);
         expect(fs.statSync(leaf).isDirectory()).toBe(true); // Retry sees the failed attempt's existing leaf.
         expect(deliver.mock.results.every((result) => result.type === "throw")).toBe(true);
@@ -1025,6 +1028,7 @@ describe("durable completion receipts", () => {
         expect(main.sent).toHaveLength(0);
         events.length = 0;
         fail = false;
+        client.retryDeliveries(); // Explicit barrier recovery, never a heartbeat retry.
         await waitFor(() => state.mesh.get(key) === undefined);
         expect(events.indexOf("containing-directory")).toBeGreaterThanOrEqual(0);
         expect(events.indexOf("source-delete")).toBeGreaterThan(events.indexOf("containing-directory"));
@@ -1073,6 +1077,7 @@ describe("durable completion receipts", () => {
           main.emit("turn_end", { context: { pendingMessages: [] } });
           for (const item of main.sent) main.append(item);
           main.emit("turn_end", { context: { pendingMessages: [] } });
+          client.retryDeliveries(); // The native boundary owns explicit recovery.
           await waitFor(() => state.mesh.get(`${prefix}a-refused`) === undefined);
           expect(deliver.mock.results.some((result) => result.type === "throw")).toBe(true);
           expect(deliver.mock.calls.filter(([request]) => request.message === "a-refused").length).toBeGreaterThan(1);
@@ -1124,6 +1129,9 @@ describe("durable completion receipts", () => {
       const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
       try {
         client.start();
+        await waitFor(() => failures <= 0);
+        expect(state.mesh.get(key)).toBeDefined();
+        client.retryDeliveries();
         await waitFor(() => state.mesh.get(key) === undefined);
         await new Promise((resolve) => setTimeout(resolve, 200));
         expect(main.sent).toHaveLength(1);
@@ -1325,6 +1333,8 @@ describe("durable completion receipts", () => {
       const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
       try {
         client.start();
+        await waitFor(() => keptAtRefusal);
+        client.retryDeliveries();
         await waitFor(() => main.sent.length > 0 && state.mesh.get(key) === undefined);
         expect(keptAtRefusal).toBe(true);
         await new Promise((resolve) => setTimeout(resolve, 200));

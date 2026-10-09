@@ -494,6 +494,7 @@ export class CompletionJournal {
   readonly #dirty = new Set<string>();
   readonly #dirtyReceipts = new Set<string>();
   readonly #pendingAttempts = new Set<string>();
+  readonly #pendingReceipts = new Set<string>();
   readonly #projects = new Map<string, { path: string; canonical: string }>();
   readonly #quietPending = new Set<string>();
   #deliveryPolicy: boolean | undefined;
@@ -519,7 +520,7 @@ export class CompletionJournal {
   }
 
   get hasPendingAttempts(): boolean { return this.#pendingAttempts.size > 0; }
-  get hasPendingChanges(): boolean { return this.#pendingAttempts.size > 0 || this.#dirty.size > 0; }
+  get hasPendingChanges(): boolean { return this.#pendingAttempts.size > 0 || this.#pendingReceipts.size > 0 || this.#dirty.size > 0; }
 
   async #stamp(target: string): Promise<string> {
     try { return recipientStamp(await fs.promises.stat(target, { bigint: true })); }
@@ -583,7 +584,10 @@ export class CompletionJournal {
         }
       }
     }
-    if (options.retryPending) for (const target of this.#pendingAttempts) this.#dirty.add(target);
+    if (options.retryPending) {
+      for (const target of this.#pendingAttempts) this.#dirty.add(target);
+      for (const filename of this.#pendingReceipts) this.changed("receipts", filename);
+    }
     if (options.claims) for (const claim of options.claims) {
       if (!await this.#canRetireClaimAsync(claim)) continue;
       this.changed("receipts", `${claim.key.slice(claimPrefix.length)}.json`);
@@ -591,6 +595,8 @@ export class CompletionJournal {
     const changed = [...this.#dirty], receipts = [...this.#dirtyReceipts];
     this.#dirty.clear();
     this.#dirtyReceipts.clear();
+    for (const target of changed) this.#pendingAttempts.delete(target);
+    for (const filename of receipts) this.#pendingReceipts.delete(filename);
     if (!changed.length && !options.claims?.length) return;
     try {
       // A repaired receipt can retire a bodyless claim too. Re-read only its
@@ -609,8 +615,10 @@ export class CompletionJournal {
       }
       await this.#drain(deliver, changed, [...claims.values()]);
     } catch (error) {
-      for (const target of changed) this.#dirty.add(target);
-      for (const filename of receipts) this.#dirtyReceipts.add(filename);
+      // Retain failure as known work, not as admission for an unrelated file
+      // event. Only this file/receipt changing or explicit recovery retries it.
+      for (const target of changed) this.#pendingAttempts.add(target);
+      for (const filename of receipts) this.#pendingReceipts.add(filename);
       throw error;
     }
   }
@@ -715,7 +723,7 @@ export class CompletionJournal {
         // A failed CAS/delete must leave its evidence for the next pass, not retry
         // a replacement version through the envelope-pruning loop below.
         if (!await this.#retireClaim(receipt.id, claim)) {
-          if (changed) this.changed("receipts", `${key(receipt.id)}.json`);
+          if (changed) this.#pendingReceipts.add(`${key(receipt.id)}.json`);
           return;
         }
         if (++retired === 128) {
@@ -753,7 +761,7 @@ export class CompletionJournal {
         if (!await this.#canRetireClaimAsync(claim)) continue;
         await this.#retireClaim(receipt.id, claim);
         if (this.mesh.get(claimKey(receipt.id), { fresh: true })) {
-          if (changed) this.#dirty.add(target);
+          if (changed) this.#pendingReceipts.add(file);
           continue;
         }
       } else {
@@ -787,7 +795,7 @@ export class CompletionJournal {
             identity: { id: this.recipient.rootId, name: "main", kind: "main" },
             value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
         } catch {
-          if (changed) this.#dirty.add(envelopePath(this.meshRoot, envelope.result.id));
+          if (changed) this.#pendingAttempts.add(envelopePath(this.meshRoot, envelope.result.id));
           continue;
         } // Another admission changed the claim; leave the source pending.
       }
@@ -808,7 +816,7 @@ export class CompletionJournal {
         });
       } catch {
         this.#enqueued.delete(envelope.result.id);
-        if (changed) this.#dirty.add(envelopePath(this.meshRoot, envelope.result.id));
+        if (changed) this.#pendingAttempts.add(envelopePath(this.meshRoot, envelope.result.id));
       } // Source stays pending if admission failed.
     }
   }

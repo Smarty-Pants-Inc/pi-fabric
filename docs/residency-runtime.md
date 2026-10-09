@@ -52,6 +52,34 @@ budgets remain unchanged. A client attaching between owner publication and the
 maintenance receipt waits for that existing generation and does not launch
 a competitor.
 
+## Event-driven completion retries
+
+Main's residency client observes `residency-notifications/<sha256(key)>.json`
+under the mesh root. `MeshStore.put`, successful deletes and applied batch
+operations publish/remove these advisory per-key files only for
+`residency/deliveries/` and `residency/completion-claims/`. File, shadow and SQLite
+backends share that path; a lease-only batch adds no notification or outbox
+snapshot. State, ownership, receipts and versioned CAS remain authoritative.
+Malformed/spoofed hints never authorize delivery.
+
+Generic `state.json`, read-journal/signal, heartbeat and lease writes do not retry
+pending work. A changed key re-reads just that exact key, compares its attempted
+signature and validates ownership. Completion/receipt and legacy producer-file
+notifications retry only the corresponding known items. Unchanged failed work
+is retained separately from admitted dirty work, including in the completion
+journal. `ResidencyClient.retryDeliveries()` is an explicit recovery hook;
+startup/reconnection also reconciles durable state. Lost notification publication
+or a process crash can be recovered there, not by an idle timer. The minute
+safety timer only repairs watch attachment, never discovers/delivers work.
+
+Successful Main settlement also reconciles young inbox work and re-arms its
+exact known-item one-shot grace/cooldown deadline. A busy-time watch event cannot
+cancel that hint permanently; the deadline still passes all normal idle,
+preflight, capability and ownership gates, and does not admit unrelated records.
+
+See [Linux idle CPU replay](idle-cpu-benchmark.md) for the 300-second same-seed
+measurement and 600-second duration bounds.
+
 ## Context and lifecycle
 
 Residency does not share agent contexts. Each actor or agent retains its own

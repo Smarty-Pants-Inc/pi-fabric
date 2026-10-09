@@ -4,6 +4,8 @@
 // Examples:
 //   node scripts/benchmark-idle-cpu.mjs --label baseline
 //   node scripts/benchmark-idle-cpu.mjs --label after --compare .local/repro-baseline-.../result.json
+//   node scripts/benchmark-idle-cpu.mjs --seconds 300 --no-profile --label replay
+// Duration options accept up to 600 seconds; see docs/idle-cpu-benchmark.md.
 //   node scripts/benchmark-idle-cpu.mjs --self-test
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,16 +26,16 @@ const warmup = Number(option('--warmup-seconds', '5'));
 const label = option('--label', 'baseline');
 assert(/^[a-zA-Z0-9_-]+$/.test(label), 'label must be a filename-safe token');
 assert(process.platform === 'linux', 'This probe requires Linux /proc');
-for (const seconds of [duration, profileSeconds, warmup]) assert(Number.isFinite(seconds) && seconds > 0 && seconds <= 120);
+for (const seconds of [duration, profileSeconds, warmup]) assert(Number.isFinite(seconds) && seconds > 0 && seconds <= 600, "duration options must be > 0 and <= 600 seconds");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const json = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 }); };
 const hash = text => createHash('sha256').update(text).digest('hex');
 const started = new Date().toISOString();
-const out = path.join(repo, '.local', `repro-${label}-${Date.now()}-${process.pid}`);
+const out = path.resolve(option('--output-dir', path.join(repo, '.local', `repro-${label}-${Date.now()}-${process.pid}`)));
 fs.mkdirSync(out, { mode: 0o700, recursive: true });
-const helper = path.join(repo, '.local', 'repro-idle-preload.cjs');
-const fake = path.join(repo, '.local', 'repro-idle-pi.mjs');
-const provider = path.join(repo, '.local', 'repro-idle-provider.mjs');
+const helper = path.join(out, 'repro-idle-preload.cjs');
+const fake = path.join(out, 'repro-idle-pi.mjs');
+const provider = path.join(out, 'repro-idle-provider.mjs');
 const cleanEnv = root => ({ PATH: process.env.PATH, HOME: path.join(root, 'home'), TMPDIR: root,
   PI_CODING_AGENT_DIR: path.join(root, 'profile'), PI_OFFLINE: '1',
   PI_FABRIC_MESH_ROOT: path.join(root, 'mesh'), PI_FABRIC_PROJECT_ROOT: root,
@@ -255,7 +257,7 @@ async function runPass(root, pass, instrumented) {
   nativeBirthFiles.push(birthFile);
   const env = cleanEnv(root);
   const flags = { id: path.basename(run), name: 'idle-durable-probe', runner: 'pi', transport: 'process', 'task-file': task, 'status-file': path.join(run, 'status.json'), 'lifecycle-file': path.join(run, 'lifecycle.jsonl'), 'log-file': path.join(run, 'events.jsonl'), cwd: root,
-    'pi-binary': fake, 'claude-binary': 'unused-claude', 'veda-binary': 'unused-veda', 'veda-backend': 'unused', 'veda-persona': 'unused', 'timeout-ms': '180000', depth: '1', 'full-code-mode': 'false', extensions: 'true', tools: '[]', 'granted-risks': '[]',
+    'pi-binary': fake, 'claude-binary': 'unused-claude', 'veda-binary': 'unused-veda', 'veda-backend': 'unused', 'veda-persona': 'unused', 'timeout-ms': String(Math.ceil((Math.max(duration, profileSeconds) + warmup + 120) * 1000)), depth: '1', 'full-code-mode': 'false', extensions: 'true', tools: '[]', 'granted-risks': '[]',
     'fabric-extension': path.join(repo, 'dist/index.js'), 'actor-id': 'a'.repeat(32), 'actor-name': 'idle-durable-probe', 'session-file': session, 'inference-context': 'full-history', 'steer-file': steer,
     'mesh-root': env.PI_FABRIC_MESH_ROOT, 'project-root': root, 'main-agent-id': 'session:probe-worker-owner', 'run-root': env.PI_FABRIC_RUN_ROOT, model: 'idle-probe/offline', thinking: 'high' };
   const worker = startChild(pass + '-worker', [path.join(repo, 'dist/worker.js'), ...Object.entries(flags).flatMap(([key, value]) => ['--' + key, value])],
@@ -303,7 +305,7 @@ const metadata = { version: 1, started, label, node: process.version, kernel: os
   procPopulation: fs.readdirSync('/proc').filter(name => /^\d+$/.test(name)).length, command: [process.execPath, ...process.argv.slice(1)] };
 try {
   const scratchFile = path.join(repo, '.local', 'idle-scratch');
-  const parent = fs.existsSync(scratchFile) ? fs.readFileSync(scratchFile, 'utf8').trim() : os.tmpdir();
+  const parent = option('--scratch-dir', fs.existsSync(scratchFile) ? fs.readFileSync(scratchFile, 'utf8').trim() : os.tmpdir());
   assert(fs.statSync(parent).isDirectory(), 'scratch parent does not exist');
   const fixture = () => { const root = fs.mkdtempSync(path.join(parent, 'repro-idle-')); roots.push(root); return { root, seeded: seed(root) }; };
   if (argv.includes('--self-test')) {

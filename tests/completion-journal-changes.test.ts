@@ -135,7 +135,8 @@ describe("completion journal changed-path drains", () => {
     const remove = vi.spyOn(h.mesh, "delete").mockRejectedValueOnce(new Error("CAS refused"));
     h.journal.changed("receipts", path.basename(receipt)); await h.journal.drainChanged();
     expect(h.mesh.get(ck)).toBeDefined(); expect(fs.existsSync(receipt)).toBe(true); expect(h.journal.hasPendingChanges).toBe(true);
-    remove.mockRestore(); await h.journal.drainChanged(); expect(h.mesh.get(ck)).toBeUndefined(); expect(fs.existsSync(receipt)).toBe(true);
+    remove.mockRestore(); await h.journal.drainChanged(); expect(h.mesh.get(ck)).toBeDefined();
+    await h.journal.drainChanged(true, { retryPending: true }); expect(h.mesh.get(ck)).toBeUndefined(); expect(fs.existsSync(receipt)).toBe(true);
   });
 
   it("revisits only known own quiet work when notification policy turns on", async () => {
@@ -155,7 +156,10 @@ describe("completion journal changed-path drains", () => {
     h.enqueue.mockImplementationOnce(() => { throw new Error("inbox admission refused"); });
     await h.journal.drainChanged(); expect(h.journal.hasPendingChanges).toBe(true);
     const readdir = vi.spyOn(fs.promises, "readdir"), open = vi.spyOn(fs.promises, "open");
-    await h.journal.drainChanged();
+    await h.journal.drainChanged(); expect(h.enqueue).toHaveBeenCalledOnce();
+    h.seed(3); h.journal.changed("envelopes", hash(h.result(3).id)); await h.journal.drainChanged();
+    expect(h.enqueue).toHaveBeenCalledOnce(); // An unrelated completion is not retry admission.
+    h.journal.changed("envelopes", hash(h.result(1).id)); await h.journal.drainChanged();
     expect(h.enqueue).toHaveBeenCalledTimes(2); expect(h.journal.hasPendingChanges).toBe(false); expect(readdir).not.toHaveBeenCalled();
     expect(open.mock.calls.some(([file]) => String(file) === h.file(h.result(2).id))).toBe(false);
   });

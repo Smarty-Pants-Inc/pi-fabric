@@ -815,7 +815,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Pi awaits this boundary before consuming queued followUps in the same running loop.
       // Never start a retry when this turn failed or the owner cancelled it.
       await reconcileRootInbox(context, { turnEnd: true, commitOnly: context.signal?.aborted ||
-        (event.message.role === "assistant" && (event.message.stopReason === "aborted" || event.message.stopReason === "error")) });
+        (event?.message?.role === "assistant" && (event.message.stopReason === "aborted" || event.message.stopReason === "error")) });
     }
   });
 

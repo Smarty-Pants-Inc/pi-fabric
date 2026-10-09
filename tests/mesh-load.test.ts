@@ -4,7 +4,8 @@ import path from "node:path";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { MeshStore } from "../src/mesh/store.js";
+import { MeshStore, type MeshStateBackendKind } from "../src/mesh/store.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
 
 const script = fileURLToPath(new URL("../scripts/mesh-load.ts", import.meta.url));
 const roots: string[] = [];
@@ -16,15 +17,16 @@ const tempRoot = () => {
 };
 afterEach(async () => {
   // Stop leftovers through stdin, never a signal, so this also holds on Windows.
-  await Promise.all(running.splice(0).map(child => child.exitCode !== null ? undefined : new Promise<void>(resolve => {
+  await Promise.all(running.splice(0).map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise<void>(resolve => {
     child.once("exit", () => resolve());
     child.stdin.end("stop\n");
   })));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-const start = (args: string[], env: NodeJS.ProcessEnv = {}) => {
-  const child = spawn("bun", [script, ...args], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } });
+const start = (args: string[], env: NodeJS.ProcessEnv = {}, timeout?: number) => {
+  const child = spawn("bun", [script, ...args], { stdio: ["pipe", "pipe", "pipe"], timeout,
+    env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "file", ...env } });
   running.push(child);
   const out = { stdout: "", stderr: "" };
   child.stdout.setEncoding("utf8").on("data", chunk => { out.stdout += chunk; });
@@ -41,10 +43,22 @@ const runId = async (out: { stderr: string }) => {
   expect(id, out.stderr).toMatch(/^[0-9a-f]{8}$/);
   return id!;
 };
-const keysOf = (root: string, run: string) => new MeshStore(root, 64 * 1024, 100).listAll()
+const entriesOf = (root: string, stateBackend: MeshStateBackendKind = "file") => {
+  const store = new MeshStore(root, 64 * 1024, 100, { stateBackend });
+  try {
+    expect(store.stateBackend, JSON.stringify(store.stateDiagnostics())).toBe(stateBackend);
+    expect(store.stateDiagnostics().fallback).toBeUndefined();
+    return store.listAll("", { fresh: true });
+  } finally { store.closeState(); }
+};
+const keysOf = (root: string, run: string) => entriesOf(root)
   .filter(entry => JSON.stringify(entry).includes(`mesh-load-${run}-`)).map(entry => entry.key).sort();
-const synthetic = (root: string) => new MeshStore(root, 64 * 1024, 100).listAll()
+const synthetic = (root: string, stateBackend: MeshStateBackendKind = "file") => entriesOf(root, stateBackend)
   .filter(entry => JSON.stringify(entry).includes("mesh-load-")).map(entry => entry.key);
+const finalReport = (out: { stdout: string }) => JSON.parse(out.stdout.trim().split("\n").at(-1)!) as {
+  final: boolean; backend: MeshStateBackendKind; workers: number; writesPerMin: number;
+  custodyReads: number; custodyEntries: number; seededStateBytes: number; maxInFlight: number;
+};
 const waitFor = async (check: () => boolean, ms = 20_000) => {
   const deadline = Date.now() + ms;
   while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
@@ -90,24 +104,119 @@ describe("mesh-load", () => {
       "--seed-state-mb", "0.3", "--put-share", "0.4", "--custody-share", "0.4", "--duration", "6", "--control-interval", "1"], { PI_FABRIC_LOCK_STATS: "1" });
     expect(await exit, out.stderr).toBe(0);
     expect(out.stderr).toMatch(/seeded \d+ records; state\.json is \d+ bytes/);
-    const final = JSON.parse(out.stdout.trim().split("\n").at(-1)!) as { final: boolean; workers: number; skipped: number; maxInFlight: number; writesPerMin: number };
-    expect(final).toMatchObject({ final: true, workers: 2, maxInFlight: 1 });
+    const final = JSON.parse(out.stdout.trim().split("\n").at(-1)!) as { final: boolean; backend: string; workers: number; skipped: number; maxInFlight: number; writesPerMin: number;
+      custodyReads: number; custodyEntries: number; seededStateBytes: number };
+    expect(final).toMatchObject({ final: true, backend: "file", workers: 2, maxInFlight: 1 });
+    expect(out.stderr).toMatch(/run [0-9a-f]{8} root .+ backend=file/);
+    expect(final.seededStateBytes).toBeGreaterThanOrEqual(300_000);
+    expect(final.custodyReads).toBeGreaterThan(0);
     expect(final.skipped).toBeGreaterThan(0);
     expect(final.writesPerMin).toBeGreaterThan(0);
     expect(fs.statSync(path.join(root, "state.json")).size).toBeGreaterThanOrEqual(300_000);
     // L8 records all three paced kinds plus heartbeats: keyed puts and heartbeats are writeBatch, custody ops custody.
     const stats = fs.readdirSync(path.join(root, "lock-stats")).map(file => fs.readFileSync(path.join(root, "lock-stats", file), "utf8")).join("");
     for (const lockClass of ["writeBatch", "custody", "publish"]) expect(stats).toContain(`"${lockClass}"`);
-    const store = new MeshStore(root, 64 * 1024, 100);
-    const seeds = store.listAll().filter(entry => entry.key.startsWith("fleet/actors/load-seed-a")).length;
+    const seeds = entriesOf(root).filter(entry => entry.key.startsWith("fleet/actors/load-seed-a")).length;
     expect(seeds).toBeGreaterThan(0);
+    expect(final.custodyEntries).toBeGreaterThanOrEqual(seeds);
     // Run keys (presence, actor, keyed puts) are gone; the seed stays, and a second seed is a no-op.
     expect(synthetic(root)).toEqual([]);
     const again = start(["--root", root, "--target-writes-per-min", "60", "--target-processes", "1", "--seed-state-mb", "0.3", "--duration", "1"]);
     expect(await again.exit, again.out.stderr).toBe(0);
     expect(again.out.stderr).toContain("seeded 0 records");
-    expect(new MeshStore(root, 64 * 1024, 100).listAll().filter(entry => entry.key.startsWith("fleet/actors/load-seed-a")).length).toBe(seeds);
+    expect(entriesOf(root).filter(entry => entry.key.startsWith("fleet/actors/load-seed-a")).length).toBe(seeds);
   }, 60_000);
+
+  it("seeds the effective SQLite backend and custody scans its retained records, not the moved marker", async () => {
+    const root = tempRoot();
+    // Production sqlite mode requires an imported root, including for a fresh private mesh.
+    expect(await importMeshState(root)).toMatchObject({ backend: "sqlite", entries: 0 });
+    const statePath = path.join(root, "state.json");
+    const marker = fs.readFileSync(statePath, "utf8");
+    expect(JSON.parse(marker)).toMatchObject({ format: "sqlite", movedTo: "state.db" });
+    expect(JSON.parse(marker).entries).toBeUndefined();
+    expect(entriesOf(root, "sqlite")).toEqual([]);
+
+    const env = { PI_FABRIC_MESH_STATE_BACKEND: "sqlite" };
+    const run = start(["--root", root, "--target-writes-per-min", "1200", "--target-processes", "1", "--max-workers", "1",
+      "--seed-state-mb", "0.3", "--put-share", "0.25", "--custody-share", "0.5", "--duration", "4"], env, 15_000);
+    expect(await run.exit, run.out.stderr).toBe(0);
+    expect(run.out.stderr).toMatch(/run [0-9a-f]{8} root .+ backend=sqlite/);
+    expect(run.out.stderr).not.toMatch(/fallback|mesh-load worker .*:/);
+    const seeded = /seeded (\d+) records; backend=sqlite state\.db is (\d+) bytes \+ wal (\d+) bytes \((\d+) bytes total\)/.exec(run.out.stderr);
+    expect(seeded, run.out.stderr).not.toBeNull();
+    const final = finalReport(run.out);
+    expect(final).toMatchObject({ final: true, backend: "sqlite", workers: 1, maxInFlight: 1 });
+    expect(final.writesPerMin).toBeGreaterThan(0);
+    expect(final.custodyReads).toBeGreaterThan(0);
+    expect(final.seededStateBytes).toBeGreaterThanOrEqual(300_000);
+    expect(final.seededStateBytes).toBe(Number(seeded![2]) + Number(seeded![3]));
+    expect(final.seededStateBytes).toBe(Number(seeded![4]));
+    expect(Number(seeded![2])).toBeGreaterThan(0);
+    // The marker never grows or acquires seed entries; all retained live records are in SQLite.
+    expect(fs.readFileSync(statePath, "utf8")).toBe(marker);
+    const seeds = entriesOf(root, "sqlite");
+    expect(seeds.length).toBe(Number(seeded![1]));
+    expect(seeds.length).toBeGreaterThan(0);
+    expect(seeds.every(entry => entry.key.startsWith("fleet/actors/load-seed-a"))).toBe(true);
+    expect(seeds[0]!.value).toMatchObject({ kind: "actor", model: "load-seed-model", summary: "s".repeat(820) });
+    expect(final.custodyEntries).toBeGreaterThanOrEqual(seeds.length);
+    // One worker has at most eight rotating put keys and two heartbeat keys in addition to seeds.
+    expect(final.custodyEntries).toBeLessThanOrEqual(seeds.length + 10);
+    expect(synthetic(root, "sqlite")).toEqual([]);
+
+    // Last-handle close checkpoints/removes the WAL. Test idempotence against the now-stable DB
+    // size, not a transient WAL high-water mark that may legitimately need another seed batch.
+    const stableBytes = fs.statSync(path.join(root, "state.db")).size;
+    const repeatMb = Math.min(0.3, Math.floor(stableBytes / 1000) / 1000);
+    expect(repeatMb).toBeGreaterThan(0);
+    const again = start(["--root", root, "--target-writes-per-min", "12", "--target-processes", "1",
+      "--seed-state-mb", String(repeatMb), "--duration", "1"], env, 5_000);
+    expect(await again.exit, again.out.stderr).toBe(0);
+    expect(again.out.stderr).toContain("seeded 0 records; backend=sqlite");
+    expect(finalReport(again.out)).toMatchObject({ final: true, backend: "sqlite", custodyReads: 0, custodyEntries: 0 });
+    expect(finalReport(again.out).seededStateBytes).toBeGreaterThanOrEqual(repeatMb * 1e6);
+    expect(entriesOf(root, "sqlite")).toEqual(seeds);
+    expect(synthetic(root, "sqlite")).toEqual([]);
+    expect(fs.readFileSync(statePath, "utf8")).toBe(marker);
+  }, 30_000);
+
+  it.each([
+    ["state.db", "ENOENT"], ["state.db", "EACCES"], ["state.db-wal", "EACCES"],
+  ] as const)("fails loudly and promptly when SQLite seed measurement of %s raises %s", async (file, code) => {
+    const root = tempRoot();
+    await importMeshState(root);
+    const marker = fs.readFileSync(path.join(root, "state.json"), "utf8");
+    const preload = path.join(root, "measurement-failure.ts");
+    // Only the script's direct stat caller is faulted. Store open/guards still use real fs and
+    // SQLite, so this proves measurement failure rather than failing before the real seed path.
+    fs.writeFileSync(preload, `import fs from "node:fs";
+const original = fs.statSync;
+const target = ${JSON.stringify(path.join(root, file))};
+const script = ${JSON.stringify(script.replace(/\\/g, "/"))};
+fs.statSync = function(file, ...args) {
+  const caller = new Error().stack?.split("\\n")[2]?.replace(/\\\\/g, "/") ?? "";
+  if (String(file) === target && caller.includes(script)) {
+    throw Object.assign(new Error("injected seed measurement ${code}"), { code: ${JSON.stringify(code)} });
+  }
+  return original.call(fs, file, ...args);
+};
+`);
+    const result = spawnSync("bun", ["--preload", preload, script, "--root", root, "--target-writes-per-min", "12",
+      "--target-processes", "1", "--seed-state-mb", "0.3", "--duration", "1"], {
+      encoding: "utf8", timeout: 5_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "sqlite" },
+    });
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain("failed to measure SQLite seed state");
+    expect(result.stderr).toContain(`injected seed measurement ${code}`);
+    expect(result.stderr).toContain(path.join(root, file));
+    expect(result.stderr).not.toMatch(/mesh-load: (?:seeded|run)/);
+    expect(result.stdout).not.toContain('"final":true');
+    expect(entriesOf(root, "sqlite")).toEqual([]);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(marker);
+  }, 15_000);
 
   it("does not add workers once the target rate is met", async () => {
     const root = tempRoot();
@@ -122,7 +231,8 @@ describe("mesh-load", () => {
 
   it("rejects an invalid --duration and an unreachable --target-writes-per-min", () => {
     const root = tempRoot();
-    const run = (...extra: string[]) => spawnSync("bun", [script, "--root", root, "--target-processes", "1", "--dry-run", ...extra], { encoding: "utf8" });
+    const env = { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "file" };
+    const run = (...extra: string[]) => spawnSync("bun", [script, "--root", root, "--target-processes", "1", "--dry-run", ...extra], { encoding: "utf8", env });
     for (const duration of ["-1", "abc"]) {
       const result = run("--target-writes-per-min", "60", "--duration", duration);
       expect(result.status, result.stderr).toBe(2);
@@ -142,7 +252,7 @@ describe("mesh-load", () => {
       expect(result.status, result.stderr).toBe(2);
       expect(result.stderr).toContain(message);
     }
-    const help = spawnSync("bun", [script, "--help"], { encoding: "utf8" });
+    const help = spawnSync("bun", [script, "--help"], { encoding: "utf8", env });
     expect(help.status).toBe(0);
     expect(help.stdout).toContain("0 (default) is explicit unbounded mode");
     expect(synthetic(root)).toEqual([]);

@@ -60,6 +60,7 @@
  * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: asynchronous attempts with a 2 ms busy handler,
  * outside any transaction, so no client stalls on it. While attempts are busy it raises the checkpoint
  * flag: writers yield, no new frames arrive, and the readers that pin old frames drain within one read.
+ * It gives up after 300 ms and then keeps the lock for 2 s, so writers pause at most ~13% of the time.
  *
  * Rules (design §3B, review-opus P0-1/P3-8): never open `state*.db*` with plain `fs` calls in the
  * same process (closing any descriptor drops that process's POSIX locks; only `stat` is used here);
@@ -428,8 +429,9 @@ const CHECKPOINT_FLAG_STALE_MS = 1_000;
 const MAX_TRUNCATE_BUDGET_MS = 400;
 // The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, short attempts.
 const WAL_RESET_LOCK = "state-wal-reset.lock";
-const WAL_RESET_LOCK_STALE_MS = 5_000;
-const WAL_RESET_BUDGET_MS = 750;
+// A reset that ran out of budget keeps the lock: no process tries again (and pauses writers) for this long.
+const WAL_RESET_LOCK_STALE_MS = 2_000;
+const WAL_RESET_BUDGET_MS = 300;
 const WAL_RESET_BUSY_MS = 2;
 const WAL_RESET_RETRY_MS = 5;
 const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
@@ -1427,29 +1429,31 @@ export class SqliteStateStore {
     if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS)) return;
     this.#walResetting = true;
     void this.#resetWal()
-      .catch(() => { this.#stats.checkpoints.failed += 1; })
-      .finally(() => {
+      .catch(() => { this.#stats.checkpoints.failed += 1; return false; })
+      .then((reset) => {
         this.#walResetting = false;
-        try { fs.rmSync(lock, { force: true }); } catch { /* stale after WAL_RESET_LOCK_STALE_MS */ }
+        // A failed reset leaves a fresh lock as a fleet-wide back-off, so readers that outlast the budget
+        // (a saturated host) never keep writers yielding back to back.
+        try { if (reset) fs.rmSync(lock, { force: true }); else fs.writeFileSync(lock, `${process.pid}\n`); } catch { /* stale */ }
       });
   }
 
   // Short TRUNCATE attempts between event-loop turns, for at most WAL_RESET_BUDGET_MS. A busy attempt
   // raises the checkpoint flag (writers yield), so no new frames arrive and the old readers drain.
-  async #resetWal(): Promise<void> {
+  async #resetWal(): Promise<boolean> {
     const flag = path.join(this.root, CHECKPOINT_FLAG);
     const deadline = performance.now() + WAL_RESET_BUDGET_MS;
     let flagged = false;
     try {
       await new Promise<void>((resolve) => setImmediate(resolve)); // after the writer's own continuation
       for (;;) {
-        if (this.#closed) return;
+        if (this.#closed) return true;
         if (!this.#inTransaction && !this.#db.isTransaction && this.#tryTruncate()) {
           this.#stats.checkpoints.walResets += 1;
           this.#lastWalBytes = 0;
-          return;
+          return true;
         }
-        if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return; }
+        if (performance.now() >= deadline) { this.#stats.checkpoints.walResetBusy += 1; return false; }
         try { fs.writeFileSync(flag, `${process.pid}\n`, { mode: 0o600 }); flagged = true; } catch { /* advisory */ }
         await delay(WAL_RESET_RETRY_MS);
       }

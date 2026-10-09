@@ -226,7 +226,7 @@ describe("WAL stays bounded with constant concurrent readers (full-load soak def
     const stop = overlappingReaders(root);
     let max = 0;
     try {
-      for (let n = 0; n < 700; n += 1) { // ~8 MiB of commits, below the 64 MiB emergency threshold
+      for (let n = 0; n < 1_400; n += 1) { // ~16 MiB of commits, below the 64 MiB emergency threshold
         await store.put({ key: `k${n % 50}`, value: { n, pad }, identity });
         max = Math.max(max, walBytes(root));
         if (n % 25 === 0) await sleep(1); // let the readers' timer and an in-flight reset run
@@ -239,12 +239,13 @@ describe("WAL stays bounded with constant concurrent readers (full-load soak def
   it("the client-side TRUNCATE resets the WAL that overlapping readers keep PASSIVE checkpoints from restarting", async () => {
     const control = await run(0); // the reset off: starvation reproduces
     console.info(`WAL with readers: control max ${control.max}`);
-    expect(control.max).toBeGreaterThan(6 * 1024 * 1024);
+    expect(control.max).toBeGreaterThan(12 * 1024 * 1024);
     const fixed = await run(1024 * 1024);
     expect(fixed.stats.checkpoints.walResets).toBeGreaterThan(0);
     expect(fixed.stats.checkpoints.emergency).toBe(0);
     console.info(`WAL with readers: reset max ${fixed.max}, resets ${fixed.stats.checkpoints.walResets}`);
-    // The 1 MiB threshold plus what this tight loop commits in one 250 ms check window and one reset.
-    expect(fixed.max).toBeLessThan(5 * 1024 * 1024);
+    // The 1 MiB threshold plus what this tight loop commits during a reset and, on a loaded host, one
+    // failed reset's 2 s back-off: bounded, and at most half the starved WAL.
+    expect(fixed.max).toBeLessThan(Math.min(8 * 1024 * 1024, control.max / 2));
   }, 60_000);
 });

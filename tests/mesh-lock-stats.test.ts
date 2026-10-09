@@ -49,7 +49,7 @@ afterEach(() => {
 });
 
 describe("mesh lock stats recorder", () => {
-  it("aggregates wait and hold per class and wall-clock minute and writes after the minute", () => {
+  it("aggregates wait and hold per class and flushes after the minute only on real work", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const root = temp();
@@ -63,11 +63,15 @@ describe("mesh lock stats recorder", () => {
     stats.acquired(root, "heartbeat/confirm", 50, 0.2);
     stats.failed(root, "custody", 10_000, false);
     stats.failed(root, "custody", 50, true);
-    expect(vi.getTimerCount()).toBe(1);
+    // Even dirty startup samples have no scheduled flush: a minute boundary is not work.
+    expect(vi.getTimerCount()).toBe(0);
     expect(process.listenerCount("exit")).toBe(exitListeners + 1);
     vi.advanceTimersByTime(49_000);
     expect(fs.existsSync(ownFile(root))).toBe(false);
-    vi.advanceTimersByTime(14_000); // past the minute plus the pid spread (<= 2.5 s)
+    vi.advanceTimersByTime(14_000); // past the minute, still no idle diagnostic wake
+    expect(fs.existsSync(ownFile(root))).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush(); // An explicit diagnostic request publishes the samples.
     const file = read(root);
     expect(file).toMatchObject({ version: 1, host: lockStatsHost(), pid: process.pid, root: fs.realpathSync.native(root) });
     expect(file.minutes).toHaveLength(1);
@@ -261,7 +265,7 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(stale)).toBe(false);
   });
 
-  it("prunes a quiet root hourly without new acquisitions and drops a removed root", () => {
+  it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const parent = temp();
@@ -269,7 +273,8 @@ describe("mesh lock stats recorder", () => {
     fs.mkdirSync(root);
     const stats = createLockStats("1")!;
     stats.acquired(root, "custody", 1, 1);
-    vi.advanceTimersByTime(63_000); // written and pruned once; the root is quiet from now on
+    registry[lockKey]!.flush(); // written and pruned once; the root is quiet from now on
+    vi.advanceTimersByTime(63_000);
     const written = fs.statSync(ownFile(root)).mtimeMs;
     const stale = path.join(root, "lock-stats", "gone-1.json");
     const fresh = path.join(root, "lock-stats", "alive-2.json");
@@ -278,22 +283,28 @@ describe("mesh lock stats recorder", () => {
     fs.utimesSync(stale, (T0 - 25 * 60 * 60_000) / 1000, (T0 - 25 * 60 * 60_000) / 1000);
     fs.utimesSync(fresh, T0 / 1000, T0 / 1000);
     vi.advanceTimersByTime(30 * 60_000);
-    expect(fs.existsSync(stale)).toBe(true); // hourly, not every minute
+    registry[lockKey]!.flush();
+    expect(fs.existsSync(stale)).toBe(true); // throttled to at most hourly during actual work
     vi.advanceTimersByTime(31 * 60_000);
+    expect(fs.existsSync(stale)).toBe(true); // no idle pruning timer
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush();
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(fresh)).toBe(true);
     expect(fs.statSync(ownFile(root)).mtimeMs).toBe(written); // pruning did not rewrite
     fs.rmSync(root, { recursive: true, force: true });
-    expect(() => vi.advanceTimersByTime(61 * 60_000)).not.toThrow();
+    vi.advanceTimersByTime(61 * 60_000);
+    expect(() => registry[lockKey]!.flush()).not.toThrow();
     expect(fs.existsSync(root)).toBe(false);
-    // Dropped from tracking: later hourly flushes no longer touch it.
+    // Dropped from tracking: later explicit flushes no longer touch it.
     const readdir = vi.spyOn(fs, "readdirSync");
     vi.advanceTimersByTime(61 * 60_000);
+    registry[lockKey]!.flush();
     expect(readdir.mock.calls.filter(([target]) => String(target).startsWith(root))).toHaveLength(0);
     expect(fs.existsSync(root)).toBe(false);
   });
 
-  it("prunes its own file by age: kept while fresh, removed after 24 h without acquisitions", () => {
+  it("prunes its own file by age on real work: kept while fresh, removed by flush after 24 h", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const parent = temp();
@@ -301,12 +312,17 @@ describe("mesh lock stats recorder", () => {
     fs.mkdirSync(root);
     const stats = createLockStats("1")!;
     stats.acquired(root, "custody", 1, 1);
-    vi.advanceTimersByTime(63_000); // written (and pruned once); quiet from now on
+    registry[lockKey]!.flush(); // written (and pruned once); quiet from now on
+    vi.advanceTimersByTime(63_000);
     // File times follow the real clock; pin the own file to the fake write time.
     fs.utimesSync(ownFile(root), T0 / 1000, T0 / 1000);
-    vi.advanceTimersByTime(23 * 60 * 60_000); // several hourly prunes within the retention
+    vi.advanceTimersByTime(23 * 60 * 60_000);
+    registry[lockKey]!.flush(); // within the retention: kept
     expect(fs.existsSync(ownFile(root))).toBe(true);
-    vi.advanceTimersByTime(2 * 60 * 60_000); // past 24 h with no acquisition
+    vi.advanceTimersByTime(2 * 60 * 60_000); // past 24 h with no acquisition: still no wake
+    expect(fs.existsSync(ownFile(root))).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush();
     expect(fs.existsSync(ownFile(root))).toBe(false);
     // Still tracked: the next acquisition recreates the file.
     stats.acquired(root, "publish", 1, 2);

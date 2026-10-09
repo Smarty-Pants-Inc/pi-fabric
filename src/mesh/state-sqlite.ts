@@ -42,7 +42,7 @@
  * keeps SQLite's built-in autocheckpoint (`WAL_AUTOCHECKPOINT_PAGES`, ~4 MiB). It is PASSIVE and runs on
  * the committing connection right after its COMMIT, so it never blocks another writer; with it off and
  * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
- * maintenance holder, tests) checkpoints on an unref'd timer: PASSIVE first (copies and fsyncs
+ * maintenance holder, tests) checkpoints on WAL/store notifications (coalesced by a one-shot deadline): PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
  * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
  * few ms, so the checkpointer raises its own flag in `state-checkpoint.flags/` and writers yield while any is fresh
@@ -357,13 +357,13 @@ export interface SqliteStateStoreOptions {
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
-  /** "maintainer" runs the checkpoint timer (projector or maintenance holder). Default "client". */
+  /** "maintainer" watches WAL commits (projector or maintenance holder). Default "client". */
   checkpoint?: "maintainer" | "client";
   /** A WAL file above this size that grew since the last checkpoint escalates PASSIVE to TRUNCATE. Default 4 MiB. */
   checkpointBytes?: number;
   /** WAL size above which any writer checkpoints after its COMMIT. Default 64 MiB. */
   emergencyCheckpointBytes?: number;
-  /** Maintainer timer period. Default 1,000 ms. */
+  /** Minimum spacing of notification-driven maintenance and one busy retry. Default 1,000 ms. */
   checkpointIntervalMs?: number;
   /** First busy budget of a TRUNCATE attempt; doubles after each busy attempt up to 400 ms. Default 50 ms. */
   checkpointBusyMs?: number;
@@ -704,6 +704,12 @@ export class SqliteStateStore {
     walBytes: 0, maxWalBytes: 0,
   };
   #timer: NodeJS.Timeout | undefined;
+  #maintenanceWatcher: fs.FSWatcher | undefined;
+  #maintainer = false;
+  #maintenanceIntervalMs = 1_000;
+  #maintenanceAt = 0;
+  #maintenanceVersion = -1;
+  #maintenanceRetry = false;
   #inTransaction = false;
   #closed = false;
   #dataVersion = -1;
@@ -737,11 +743,29 @@ export class SqliteStateStore {
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
     this.#walHardCapBytes = walHardCapOf(options);
     if (options.checkpoint === "maintainer") {
-      const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
-      this.#timer = setInterval(() => {
-        try { if (this.walBytes() > 0) this.checkpoint(); } catch { this.#stats.checkpoints.failed += 1; }
-      }, interval);
-      this.#timer.unref();
+      this.#maintainer = true;
+      this.#maintenanceIntervalMs = Math.max(10, options.checkpointIntervalMs ?? 1_000);
+      this.#maintenanceVersion = this.dataVersion();
+      // Watch the directory, not a WAL inode: SQLite can remove/recreate it. Never open a
+      // database file with fs (POSIX lock rule). data_version ignores our own checkpoints
+      // and commits, so delayed own-write events cannot create a notification feedback loop.
+      this.#maintenanceWatcher = fs.watch(this.root, { persistent: false }, (_event, name) => {
+        if (name !== null && String(name) !== "state.db" && String(name) !== "state.db-wal") return;
+        if (this.#closed) return;
+        try {
+          const version = this.dataVersion();
+          if (version === this.#maintenanceVersion) return;
+          this.#maintenanceVersion = version;
+          this.#queueMaintenance();
+        } catch { this.#stats.checkpoints.failed += 1; }
+      });
+      this.#maintenanceWatcher.on("error", () => {
+        this.#stats.checkpoints.failed += 1;
+        this.#maintenanceWatcher?.close();
+        this.#maintenanceWatcher = undefined;
+        // Own commits still drive maintenance; client emergency checkpoints remain enabled.
+      });
+      this.#queueMaintenance(); // Existing WAL work at open, not an idle recurring timer.
     }
   }
 
@@ -1193,6 +1217,29 @@ export class SqliteStateStore {
 
   // ---------------------------------------------------------------- maintenance
 
+  #queueMaintenance(retry = false): void {
+    if (this.#closed) return;
+    if (!retry) this.#maintenanceRetry = false;
+    if (this.#timer) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#closed) return;
+      this.#maintenanceAt = Date.now();
+      try {
+        this.assertLive(); // A rollback/retirement is never checkpointed by the maintainer.
+        if (this.walBytes() === 0) return;
+        const result = this.checkpoint();
+        // One retry belongs to unfinished checkpoint work, not to an idle WAL-size poll.
+        // A long-lived pinned reader exhausts this retry; the next commit tries again.
+        if (!this.#maintenanceRetry && (result.busy > 0 || result.checkpointed < result.log)) {
+          this.#maintenanceRetry = true;
+          this.#queueMaintenance(true);
+        }
+      } catch { this.#stats.checkpoints.failed += 1; }
+    }, Math.max(0, this.#maintenanceAt + this.#maintenanceIntervalMs - Date.now()));
+    this.#timer.unref?.();
+  }
+
   /** `<state.db>-wal` size by stat only (never an fd on the database files). */
   walBytes(): number {
     const size = fs.statSync(`${this.file}-wal`, { throwIfNoEntry: false })?.size ?? 0;
@@ -1273,7 +1320,10 @@ export class SqliteStateStore {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#maintenanceWatcher?.close();
+    this.#maintenanceWatcher = undefined;
     try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* closing anyway */ }
     this.#db.close();
   }
@@ -1481,7 +1531,13 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); }
+      if (committed && changed) {
+        // data_version does not change for this connection's own commits. Metadata-only
+        // imports also notify, but write-free fences never schedule unnecessary maintenance.
+        if (this.#maintainer) this.#queueMaintenance();
+        this.#emergencyCheckpoint();
+        this.#maybeResetWal();
+      }
     }
   }
 

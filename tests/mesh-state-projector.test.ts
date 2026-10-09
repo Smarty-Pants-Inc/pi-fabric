@@ -26,7 +26,7 @@ const openProjector = async (root: string, options: Partial<StateProjectorOption
 };
 
 const openStore = async (root: string, databaseRoot = projectorDatabaseRoot(root)): Promise<SqliteStateStore> => {
-  const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000);
+  const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, databaseRoot === root ? {} : { initialize: "detached" });
   stores.push(store);
   return store;
 };

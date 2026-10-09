@@ -1,0 +1,12 @@
+# nats sync_interval=always
+{"acked_at_kill_signal":3200,"acked_this_round":3200,"acked_total":3200,"bucket_values":3201,"killed_pid":1816566,"missing":0,"restart_ready_ms":10,"restart_tcp_ms":9,"round":1,"wrong_value":0}
+{"acked_at_kill_signal":3428,"acked_this_round":3428,"acked_total":6628,"bucket_values":6631,"killed_pid":1816913,"missing":0,"restart_ready_ms":27,"restart_tcp_ms":26,"round":2,"wrong_value":0}
+{"acked_at_kill_signal":4869,"acked_this_round":4869,"acked_total":11497,"bucket_values":11504,"killed_pid":1817320,"missing":0,"restart_ready_ms":30,"restart_tcp_ms":29,"round":3,"wrong_value":0}
+# sqlite FULL (writer process killed)
+{"round":1,"killed_pid":1817751,"acked_this_round":2534,"acked_total":2534,"missing":0,"wrong_value":0,"rows":2535,"integrity":"ok","reopen_ready_ms":0.89}
+{"round":2,"killed_pid":1817827,"acked_this_round":2726,"acked_total":5260,"missing":0,"wrong_value":0,"rows":5262,"integrity":"ok","reopen_ready_ms":0.5}
+{"round":3,"killed_pid":1818044,"acked_this_round":4166,"acked_total":9426,"missing":0,"wrong_value":0,"rows":9429,"integrity":"ok","reopen_ready_ms":0.77}
+# control: nats default sync (process kill only, page cache survives)
+{"acked_at_kill_signal":375216,"acked_this_round":375220,"acked_total":375220,"bucket_values":375222,"killed_pid":1818397,"missing":0,"restart_ready_ms":259,"restart_tcp_ms":258,"round":1,"wrong_value":0}
+{"acked_at_kill_signal":381508,"acked_this_round":381508,"acked_total":756728,"bucket_values":756731,"killed_pid":1818749,"missing":0,"restart_ready_ms":486,"restart_tcp_ms":484,"round":2,"wrong_value":0}
+{"acked_at_kill_signal":404517,"acked_this_round":404524,"acked_total":1161252,"bucket_values":1161255,"killed_pid":1820191,"missing":0,"restart_ready_ms":744,"restart_tcp_ms":743,"round":3,"wrong_value":0}

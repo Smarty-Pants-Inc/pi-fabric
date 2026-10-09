@@ -99,4 +99,3 @@ FABRIC_NATS_EVIDENCE_DIR="$TASK_OUT/live-r3" \
 ```
 
 `--async-seam` requires the fresh build and substitutes restart/public-entry probes for the unrelated latency benchmark. Exact logs/official release verification/topology/fencing/reconnect/shutdown evidence and the head receipt are retained under `$TASK_OUT`. No push, GitHub, credentials, services or fleet backend mutation.
-

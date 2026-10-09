@@ -33,7 +33,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
-import { ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, type ResidentWakeRoutes } from "./wake.js";
+import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -233,6 +233,7 @@ export class ResidentHost {
   #dormancyAt = Number.NEGATIVE_INFINITY;
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
+  #wakeWatchSupported: boolean | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
   #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
@@ -715,6 +716,9 @@ export class ResidentHost {
         });
         void this.#retryDeliveries();
       }
+      // The spawned process, not a watched file, owns the startup outcome.
+      if (process.connected && process.send) process.send({ event: "resident-ready",
+        root: this.config.residencyRoot, token: this.#token }, () => {});
     } catch (error) {
       await this.close();
       throw error;
@@ -1198,6 +1202,15 @@ export class ResidentHost {
   async #checkIdle(): Promise<void> {
     if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
     const now = Date.now();
+    if (this.#wakeWatchSupported !== false && now - this.#dormancyAt >= IDLE_ACTOR_CHECK_MS &&
+        this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
+      try { await assertResidentWakeWatch(this.config.residencyRoot); this.#wakeWatchSupported = true; }
+      catch (error) {
+        this.#wakeWatchSupported = false;
+        console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+      }
+    }
+    if (this.#wakeWatchSupported === false) { this.#idleSince = now; return; }
     if (now - this.#dormancyAt >= IDLE_ACTOR_CHECK_MS) {
       this.#dormancyAt = now;
       try {

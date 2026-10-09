@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -67,6 +68,37 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(archive?.version).toBe(1);
       expect(fs.statSync(archive!.dir).isDirectory()).toBe(true);
       expect(fs.existsSync(path.join(config.residencyRoot, "wake-routes.json"))).toBe(true);
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["error", "throw", "silent"] as const)("keeps the actor warm and logs the reason when its root watcher is %s", async failure => {
+    const { root, config, host, idle } = fixture();
+    const originalWatch = fs.watch;
+    const watchers: fs.FSWatcher[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await host.start();
+      vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+        if (args[0] !== config.residencyRoot) return originalWatch(...args);
+        if (failure === "throw") throw new Error("watch unavailable for root");
+        const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
+        watchers.push(watcher);
+        if (failure === "error") queueMicrotask(() => watcher.emit("error", new Error("watch failed for root")));
+        return watcher;
+      });
+      const dormant = vi.spyOn(host.actors, "dormantIdleActors");
+      const actor = await host.actors.create({ name: "unsupported-root", instructions: "wait", residency: "durable" });
+      await until(() => warn.mock.calls.some(([message]) => String(message).includes("resident dormancy disabled")));
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 60_000);
+      await sleep(1_200);
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      expect(idle).not.toHaveBeenCalled();
+      expect(dormant).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(config.residencyRoot));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(failure === "silent" ? "did not notify" : "watch"));
+      expect(watchers.every(watcher => vi.mocked(watcher.close).mock.calls.length === 1)).toBe(true);
+      expect(fs.readdirSync(config.residencyRoot).some(name => name.startsWith(".wake-watch-"))).toBe(false);
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -223,6 +255,43 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { vi.restoreAllMocks(); await sender.close(); await host.close(); await woken?.close(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15_000);
 
+  it.skipIf(process.platform === "win32").each(["error", "deadline"] as const)("retains committed intent after external-owner watcher %s and replays on the next start", async failure => {
+    const { root, config } = fixture();
+    const configPath = path.join(config.residencyRoot, "config.json");
+    const ownerFile = path.join(config.residencyRoot, "owner.json");
+    const requestFile = residentWakeRequestPath(config.residencyRoot);
+    const wake = await import("../src/residency/wake.js");
+    const originalWait = wake.waitResidentChange;
+    const close = vi.fn();
+    const watcher = Object.assign(new EventEmitter(), { close }) as unknown as fs.FSWatcher;
+    try {
+      fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, processStartTime: processStartTime(process.pid), token: "external" }));
+      fs.writeFileSync(residentSleepingPath(config.residencyRoot), JSON.stringify({ token: "external", request: { id: "covered" } }));
+      fs.writeFileSync(requestFile, JSON.stringify({ format: 1, id: "committed", sequence: 7, requestedAt: Date.now() }));
+      const retained = fs.readFileSync(requestFile, "utf8");
+      vi.spyOn(wake, "waitResidentChange").mockImplementation((root, ready, _timeout, message) => originalWait(root, ready, 10, message));
+      vi.spyOn(fs, "watch").mockImplementation(() => {
+        if (failure === "error") queueMicrotask(() => watcher.emit("error", new Error("watch failed")));
+        return watcher;
+      });
+      const run = vi.fn(async () => {
+        fs.writeFileSync(residentSleepingPath(config.residencyRoot), JSON.stringify({ request: readWakeJson(requestFile) }));
+      });
+      await expect(superviseWake(configPath, run, { wakeOnly: true })).resolves.toMatchObject({
+        status: "wake-pending", root: config.residencyRoot, reason: "Resident sleep/wake owner did not release",
+      });
+      expect(run).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledOnce();
+      expect(fs.readFileSync(requestFile, "utf8")).toBe(retained);
+      fs.rmSync(ownerFile);
+      await superviseWake(configPath, run, { wakeOnly: true });
+      expect(run).toHaveBeenCalledOnce();
+      expect(fs.readFileSync(requestFile, "utf8")).toBe(retained);
+      await superviseWake(configPath, run, { wakeOnly: true });
+      expect(run).toHaveBeenCalledOnce(); // the replayed nudge is now covered
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.skipIf(process.platform === "win32")("a delivery crossing the final sleep boundary starts exactly one successor generation", async () => {
     const { root, config } = fixture();
     const configPath = path.join(config.residencyRoot, "config.json");
@@ -311,7 +380,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const configPath = path.join(config.residencyRoot, "config.json");
     let finish!: () => void;
     const gate = new Promise<void>(resolve => { finish = resolve; });
-    let active: Promise<void> | undefined;
+    let active: ReturnType<typeof superviseWake> | undefined;
     try {
       fs.writeFileSync(residentWakeRequestPath(config.residencyRoot), JSON.stringify({ id: "first" }));
       const run = vi.fn(async () => {

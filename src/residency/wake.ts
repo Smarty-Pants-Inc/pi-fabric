@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { MeshEvent, MeshStore } from "../mesh/store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../mesh/archive.js";
@@ -86,8 +88,55 @@ export function dormantActorRoute(meshRoot: string, actor: FabricActorInfo): Fab
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
-/** Subscribe before reading, so atomic rename/readiness writes cannot fall between check and watch. */
-export function waitResidentChange(root: string, ready: () => boolean, timeoutMs: number, failure: string): Promise<void> {
+/** The committed wake intent still owns work; lack of notification is not cancellation. */
+export class ResidentWakePending extends Error {
+  readonly code = "RESIDENT_WAKE_PENDING";
+  constructor(readonly root: string, message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "ResidentWakePending";
+  }
+}
+
+/** Prove this root can notify before releasing any actor's warm runtime. */
+export async function assertResidentWakeWatch(root: string): Promise<void> {
+  const name = `.wake-watch-${randomUUID()}`;
+  const probe = path.join(root, name);
+  let watcher: fs.FSWatcher | undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      watcher = fs.watch(root, (_event, filename) => {
+        if ((filename === null || String(filename) === name) && fs.existsSync(probe)) resolve();
+      });
+      watcher.once("error", reject);
+      deadline = setTimeout(() => reject(new Error("Resident wake watcher did not notify")), 1_000);
+      fs.writeFileSync(probe, "", { flag: "wx", mode: 0o600 });
+    });
+  } finally {
+    watcher?.close();
+    if (deadline) clearTimeout(deadline);
+    fs.rmSync(probe, { force: true });
+  }
+}
+
+export class ResidentWakeStartupFailed extends Error {
+  readonly code = "RESIDENT_WAKE_STARTUP_FAILED";
+  constructor(readonly root: string, message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "ResidentWakeStartupFailed";
+  }
+}
+
+export const residentStartupReady = (root: string): boolean => {
+  const owner = readWakeJson<ResidentHostOwner>(path.join(root, "owner.json"));
+  const receipt = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
+  return !!owner && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
+    (owner.maintenanceReady !== 1 || receipt?.token === owner.token);
+};
+
+/** Subscribe before reading. Owned child IPC/exit survives unavailable or silent fs.watch. */
+export function waitResidentChange(root: string, ready: () => boolean, timeoutMs: number, failure: string,
+  child?: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => {
     let watcher: fs.FSWatcher | undefined;
     let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -96,16 +145,52 @@ export function waitResidentChange(root: string, ready: () => boolean, timeoutMs
       if (settled) return;
       settled = true;
       watcher?.close();
+      child?.removeListener("message", message);
+      child?.removeListener("exit", exited);
+      child?.removeListener("error", failed);
       if (deadline) clearTimeout(deadline);
       if (error) reject(error); else resolve();
     };
-    const check = (): void => { try { if (ready()) finish(); } catch (error) { finish(error); } };
+    const check = (): void => {
+      if (settled) return;
+      try { if (ready()) finish(); } catch (error) { finish(error); }
+    };
+    const reread = (cause: unknown): void => {
+      if (settled) return;
+      // One direct state read covers lost events and watcher failure. Never poll.
+      try { finish(ready() ? undefined : new ResidentWakePending(root, failure, cause)); }
+      catch (error) { finish(new ResidentWakePending(root, failure, error)); }
+    };
+    const message = (value: unknown): void => {
+      const receipt = value as { event?: string; root?: string; token?: string; reason?: string } | null;
+      if (!receipt || receipt.root !== root) return;
+      if (receipt.event === "resident-ready" && typeof receipt.token === "string" && receipt.token.length) finish();
+      else if (receipt.event === "resident-startup-failed") failed(new Error(receipt.reason ?? failure));
+      else if (receipt.event === "resident-wake-pending") finish(new ResidentWakePending(root, receipt.reason ?? failure));
+    };
+    const failed = (error: Error): void => finish(new ResidentWakeStartupFailed(root, error.message, error));
+    const exited = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      try {
+        if (ready()) finish();
+        else failed(new Error(`Resident startup child exited (${signal ?? code ?? "unknown"}) before ready`));
+      } catch (error) { failed(error instanceof Error ? error : new Error(String(error))); }
+    };
+    child?.on("message", message);
+    child?.once("exit", exited);
+    child?.once("error", failed);
+    // A failed watch is only a failed notification channel. Keep native child outcomes armed.
+    const watchFailed = (error: unknown): void => {
+      if (child) { watcher?.close(); watcher = undefined; }
+      else reread(error);
+    };
+    deadline = setTimeout(() => reread(new Error(failure)), timeoutMs);
     try {
       watcher = fs.watch(root, check);
-      watcher.once("error", finish);
-      deadline = setTimeout(() => finish(new Error(failure)), timeoutMs);
+      watcher.once("error", watchFailed);
       check();
-    } catch (error) { finish(error); }
+    } catch (error) { watchFailed(error); }
+    if (child && (child.exitCode !== null || child.signalCode !== null)) exited(child.exitCode, child.signalCode);
   });
 }
 
@@ -131,9 +216,19 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   // Spawn is outside the short transaction. A busy contender is covered by the holder's final check.
   if (launch) return launch(configPath, config);
-  const { spawnDetached } = await import("../agents/transports/process-utils.js");
-  await spawnDetached(path.join(path.dirname(config.fabricExtensionPath), "residency", "launcher.js"),
-    ["--config", configPath, "--wake"], config.cwd);
+  const { scriptSpawnArgs } = await import("../agents/transports/process-utils.js");
+  const [runtime, ...args] = await scriptSpawnArgs(path.join(path.dirname(config.fabricExtensionPath), "residency", "launcher.js"),
+    ["--config", configPath, "--wake"]);
+  const child = spawn(runtime!, args, { cwd: config.cwd, detached: process.platform !== "win32",
+    stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  try {
+    await waitResidentChange(root, () => residentStartupReady(root), 90_000,
+      "Resident wake startup pending", child);
+  } finally {
+    // The lifetime launcher retains host custody. Only this bounded startup channel ends.
+    if (child.connected) child.disconnect();
+    child.unref();
+  }
 }
 
 /** Called only after the event log's durability barrier, including batch/bridge publishers. */

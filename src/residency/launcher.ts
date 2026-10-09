@@ -9,7 +9,7 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange } from "./wake.js";
+import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
@@ -291,7 +291,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
     const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
-      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
+      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe", "ipc"],
       env: { ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
@@ -305,6 +305,22 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
+    if (process.connected && process.send) {
+      // Report startup from this exact spawned host. Do not poll owner/readiness files.
+      void waitResidentChange(root, () => {
+        const owner = readOwner();
+        const receipt = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
+        return !!owner && owner.pid === child.pid && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
+          (owner.maintenanceReady !== 1 || receipt?.token === owner.token);
+      }, 90_000, "Resident host startup pending", child).then(() => {
+        const owner = readOwner();
+        if (process.connected && process.send) process.send({ event: "resident-ready", root, token: owner?.token ?? launcher.token }, () => {});
+      }, error => {
+        if (process.connected && process.send) process.send({ event: error instanceof ResidentWakePending
+          ? "resident-wake-pending" : "resident-startup-failed", root, reason: String(error) }, () => {});
+        trace("startup-outcome", { reason: String(error), pending: error instanceof ResidentWakePending });
+      });
+    }
     void attempt.native.exit.then(({ code, signal }) => {
       // #2010: after a clean owned release this directory may already belong
       // to the next generation. Do not make a late diagnostic mutation there.
@@ -625,9 +641,11 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   }
 }
 
+export interface ResidentWakePendingResult { status: "wake-pending"; root: string; reason: string }
+
 /** Event-owned launcher: one child owner, no process survives an idle host. */
 export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = supervise,
-  options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void> {
+  options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void | ResidentWakePendingResult> {
   const root = path.dirname(configPath);
   let fd: number | undefined;
   try { fd = await lockFile(path.join(root, "wake.lock"), 0, process.platform === "linux"); }
@@ -638,7 +656,13 @@ export async function superviseWake(configPath: string, run: (configPath: string
     // This notification wait is only for a pre-upgrade/external closing owner.
     if (residentOwnerLive(root)) {
       if (!residentOwnerSleeping(root)) return;
-      await waitResidentChange(root, () => !residentOwnerLive(root), 90_000, "Resident sleep/wake owner did not release");
+      try {
+        await waitResidentChange(root, () => !residentOwnerLive(root), 90_000, "Resident sleep/wake owner did not release");
+      } catch (error) {
+        if (!(error instanceof ResidentWakePending)) throw error;
+        // Leave wake-request.json untouched; another delivery/start replays it.
+        return { status: "wake-pending", root, reason: error.message };
+      }
     }
     if (options.wakeOnly) {
       const intent = await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
@@ -678,7 +702,11 @@ if (isMain) {
   const configPath = parseConfigPath(process.argv);
   try {
     if (process.platform === "win32" && !process.argv.includes("--wake")) await supervise(configPath);
-    else await superviseWake(configPath, supervise, { wakeOnly: process.argv.includes("--wake") });
+    else {
+      const result = await superviseWake(configPath, supervise, { wakeOnly: process.argv.includes("--wake") });
+      if (result && process.connected && process.send) process.send({ event: "resident-wake-pending", root: result.root, reason: result.reason }, () => {});
+      if (result) appendResidentLog(path.join(result.root, "launcher.log"), `${JSON.stringify({ event: result.status, at: Date.now(), reason: result.reason })}\n`);
+    }
   }
   catch (error) { writeFailure(path.dirname(configPath), error); process.exitCode = 1; }
 }

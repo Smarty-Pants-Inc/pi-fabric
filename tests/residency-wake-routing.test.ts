@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { residentRoot } from "../src/residency/protocol.js";
@@ -214,6 +215,50 @@ describe("resident event wake routing", () => {
       expect(fs.existsSync(path.join(roots[0]!, "wake-failure.json"))).toBe(false);
       expect(mesh.read().filter(event => event.topic === "retry.topic")).toHaveLength(1);
     } finally { vi.restoreAllMocks(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["deadline", "error", "throw"] as const)("re-reads readiness once after watcher %s and proceeds without polling", async failure => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-reread-"));
+    const readyFile = path.join(root, "maintenance-ready.json");
+    const close = vi.fn();
+    const watcher = Object.assign(new EventEmitter(), { close }) as unknown as fs.FSWatcher;
+    const interval = vi.spyOn(globalThis, "setInterval");
+    const ready = vi.fn(() => wake.readWakeJson<{ token: string }>(readyFile)?.token === "ready");
+    vi.spyOn(fs, "watch").mockImplementation(() => {
+      if (failure === "throw") {
+        fs.writeFileSync(readyFile, JSON.stringify({ token: "ready" }));
+        throw new Error("watch unavailable");
+      }
+      return watcher;
+    });
+    try {
+      const waiting = wake.waitResidentChange(root, ready, 10, "wake pending");
+      fs.writeFileSync(readyFile, JSON.stringify({ token: "ready" }));
+      if (failure === "error") watcher.emit("error", new Error("watch failed"));
+      await waiting;
+      expect(ready).toHaveBeenCalledTimes(failure === "throw" ? 1 : 2);
+      expect(interval).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledTimes(failure === "throw" ? 0 : 1);
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["deadline", "error", "throw"] as const)("returns typed pending after watcher %s when its single re-read is unsatisfied", async failure => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wake-pending-"));
+    const close = vi.fn();
+    const watcher = Object.assign(new EventEmitter(), { close }) as unknown as fs.FSWatcher;
+    const ready = vi.fn(() => false);
+    vi.spyOn(fs, "watch").mockImplementation(() => {
+      if (failure === "throw") throw new Error("watch unavailable");
+      return watcher;
+    });
+    try {
+      const waiting = wake.waitResidentChange(root, ready, 10, "wake pending");
+      const rejected = expect(waiting).rejects.toMatchObject({ name: "ResidentWakePending", code: "RESIDENT_WAKE_PENDING", root });
+      if (failure === "error") watcher.emit("error", new Error("watch failed"));
+      await rejected;
+      expect(ready).toHaveBeenCalledTimes(failure === "throw" ? 1 : 2);
+      expect(close).toHaveBeenCalledTimes(failure === "throw" ? 0 : 1);
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("observes atomic ready-file writes without an interval and closes its bounded watch", async () => {

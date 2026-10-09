@@ -665,7 +665,6 @@ const main = async (): Promise<void> => {
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
       observe(): void {},
-      inspectIdle(): "active" { return "active"; }, // No Windows tree/sole-leader receipt.
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
         if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
@@ -698,9 +697,7 @@ const main = async (): Promise<void> => {
   };
   let child = spawnChild();
   retainExecutionCustody(child);
-  let inputSinceStart = false;
   const writeChildInput = (message: string): void => {
-    inputSinceStart = true;
     executionObservers.get(child)?.arm();
     child.stdin?.write(message);
   };
@@ -1471,7 +1468,6 @@ const main = async (): Promise<void> => {
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
       executionObservers.get(child)?.arm();
-      inputSinceStart = false;
       nativeActivity = true;
       deferredFollowUpSettle = false;
       if (options.runner === "pi" && replayAfterStart) {
@@ -1620,13 +1616,6 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "agent_settled") {
-      // Only an admitted native Pi work/settle boundary can pause the census.
-      // agent_end, a quiet stream, or a pending activation is not idle proof.
-      if (options.runner === "pi" && nativeActivity && modelControl.ready && !inputSinceStart && !replayAfterStart &&
-          !retryPending && !terminalStatus && !record.pendingMessages?.steering.length && !record.pendingMessages?.followUp.length &&
-          !hasUnsettledFollowUps() && record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight") {
-        executionObservers.get(child)?.idle();
-      }
       nativeActivity = false;
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {

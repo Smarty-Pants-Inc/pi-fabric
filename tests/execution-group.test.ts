@@ -63,7 +63,7 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     vi.mocked(fs.readFileSync).mockClear();
     processes.set(100, { started: "recycled-birth", group: 100 });
     group.observe();
-    expect(group.inspectIdle()).toBe("empty");
+    expect(group.exited()).toBe(true);
     group.signal("SIGKILL");
     expect(group.exited()).toBe(true);
     expect(kill).not.toHaveBeenCalled();

@@ -13,11 +13,7 @@ describe("native-child legacy observation", () => {
     const child = new EventEmitter() as ChildProcess;
     let closed = false;
     child.once("close", () => { closed = true; });
-    const observer = executionObserver(child, {
-      exited: () => closed,
-      inspectIdle: () => "active",
-    });
-    observer.idle();
+    const observer = executionObserver(child, { exited: () => closed });
     child.emit("exit", 0);
     expect(observer.exited()).toBe(false);
     expect(vi.getTimerCount()).toBe(1);
@@ -82,22 +78,21 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("performs one checked census at positive native idle, then no reads for a LIVE sole Pi leader", () => {
+  it("continues the full 100ms census for a LIVE sole Pi leader after settlement", () => {
     const { observer, census, reads, child } = setup();
-    observer.idle();
-    expect(census).toHaveBeenCalledTimes(1);
+    child.emit("agent_settled"); // Settlement is not execution emptiness.
+    expect(census).not.toHaveBeenCalled();
     expect(child.exitCode).toBeNull();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
     reads.mockClear(); census.mockClear();
     vi.advanceTimersByTime(30_000);
-    expect(reads).not.toHaveBeenCalled();
-    expect(census).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(census).toHaveBeenCalledTimes(300);
+    expect(reads).toHaveBeenCalled();
+    expect(observer.exited()).toBe(false);
   });
 
   it("re-arms before work and discovers a new descendant before leader exit", () => {
     const { observer, processes, leaderExit, group, kill, census } = setup();
-    observer.idle();
     observer.arm(); observer.arm();
     expect(vi.getTimerCount()).toBe(1);
     processes.set(101, { started: "refusing-birth", group: 100 });
@@ -115,19 +110,19 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("keeps active custody at native idle until a recorded descendant drains", () => {
+  it("keeps the full census after a descendant drains while its leader is live", () => {
     const { processes, observer, census, reads } = setup();
     processes.set(101, { started: "descendant-birth", group: 100 });
-    observer.idle();
     expect(vi.getTimerCount()).toBe(1);
     vi.advanceTimersByTime(100);
     processes.delete(101);
     vi.advanceTimersByTime(100);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
     census.mockClear(); reads.mockClear();
     vi.advanceTimersByTime(30_000);
-    expect(census).not.toHaveBeenCalled();
-    expect(reads).not.toHaveBeenCalled();
+    expect(census).toHaveBeenCalledTimes(300);
+    expect(reads).toHaveBeenCalled();
+    expect(observer.exited()).toBe(false);
   });
 
   it("does not disarm while a recorded same-birth descendant survives in a foreign PGID", () => {
@@ -135,7 +130,6 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
     processes.set(101, { started: "descendant-birth", group: 100 });
     group.observe();
     processes.set(101, { started: "descendant-birth", group: 200 });
-    observer.idle();
     vi.advanceTimersByTime(30_000);
     expect(vi.getTimerCount()).toBe(1);
     expect(observer.exited()).toBe(false);
@@ -143,7 +137,7 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
 
   it("retains the active fallback for silent external CLI / unproved Pi handshake", () => {
     const { census, observer } = setup();
-    // Without an admitted work -> positive native idle boundary, do not idle().
+    // An unproved handshake remains on the full census.
     vi.advanceTimersByTime(30_000);
     expect(census).toHaveBeenCalledTimes(300);
     expect(observer.exited()).toBe(false);
@@ -158,7 +152,7 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
       processes.set(100, { started: "leader-birth", group: 200 });
       processes.set(101, { started: "foreign-birth", group: 100 });
     }
-    expect(() => observer.idle()).not.toThrow();
+    expect(() => observer.arm()).not.toThrow();
     child.emit("exit", 0);
     vi.advanceTimersByTime(100);
     expect(vi.getTimerCount()).toBe(1);
@@ -177,17 +171,39 @@ describe.skipIf(process.platform !== "linux")("owned execution observation lifet
     expect(vi.getTimerCount()).toBe(1);
   });
 
-  it("fails closed if a background extension forks after positive idle then the leader exits before work resumes", () => {
-    const { observer, processes, leaderExit, group, kill } = setup();
-    observer.idle();
-    expect(vi.getTimerCount()).toBe(0);
+  it("observes a post-settle background fork with no new work before leader exit", () => {
+    const { observer, processes, leaderExit, group, kill, child, census } = setup();
+    child.emit("agent_settled");
+    expect(vi.getTimerCount()).toBe(1);
     processes.set(101, { started: "late-background-birth", group: 100 });
+    vi.advanceTimersByTime(99);
+    expect(census).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(census).toHaveBeenCalledTimes(1);
     leaderExit();
-    // Native exit re-arms the census, but cannot adopt an unanchored orphan.
+    expect(observer.exited()).toBe(false);
+    group.signal("SIGTERM");
+    expect(kill).toHaveBeenCalledWith(-100, "SIGTERM");
+    group.signal("SIGKILL");
+    expect(kill).toHaveBeenCalledWith(-100, "SIGKILL");
+    census.mockClear();
+    vi.advanceTimersByTime(300);
+    expect(census).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(1); // Refusing descendant survives both signals.
+    processes.clear();
+    vi.advanceTimersByTime(100);
+    expect(observer.exited()).toBe(true);
+    expect(child.listenerCount("close")).toBe(1); // Native pipe close still pending.
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fails closed when a background fork remains unanchored before leader exit", () => {
+    const { observer, processes, leaderExit, group, kill } = setup();
+    processes.set(101, { started: "unobserved-background-birth", group: 100 });
+    leaderExit();
     expect(() => observer.exited()).toThrow(/no surviving owned birth/);
     expect(() => group.signal("SIGTERM")).toThrow(/no surviving owned birth/);
     expect(kill).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(30_000);
     expect(vi.getTimerCount()).toBe(1);
   });
 

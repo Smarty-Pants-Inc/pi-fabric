@@ -165,7 +165,8 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     }
   });
 
-  it("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("imports a fresh root (no state.json, empty, zero-length) to an empty db plus the marker at epoch 1; then sqlite works", async () => {
     const [none, emptyJson, zeroLength, touched] = freshRoots();
     for (const root of [none, emptyJson, zeroLength]) {
       const result = await importMeshState(root);
@@ -177,7 +178,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
       expect(sqlite.listAll("").map((entry) => entry.key)).toEqual(["a"]);
     }
     let err = "";
-    const code = await main(["import", "--root", touched], { stdout: () => {}, stderr: (text) => { err += text; } });
+    const code = await main(["import", "--root", touched, "--accept-unready", "factory,fabric@unknown"], { stdout: () => {}, stderr: (text) => { err += text; } });
     expect(code, err).toBe(0);
     const viaCli = open(touched, { stateBackend: "sqlite" });
     await viaCli.put({ key: "b", value: 1, identity });
@@ -388,7 +389,8 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     });
   });
 
-  it("opens an imported root, and the import CLI still imports a populated root", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("opens an imported root, and the import CLI still imports a populated root", async () => {
     const imported = tempRoot("imported");
     await seedFileRoot(imported);
     await importMeshState(imported);
@@ -400,7 +402,7 @@ describe("sqlite mode on an unimported root (smarty-dev#6477)", () => {
     const viaCli = tempRoot("cli");
     await seedFileRoot(viaCli);
     let err = "";
-    const code = await main(["import", "--root", viaCli], { stdout: () => {}, stderr: (text) => { err += text; } });
+    const code = await main(["import", "--root", viaCli, "--accept-unready", "factory,fabric@unknown"], { stdout: () => {}, stderr: (text) => { err += text; } });
     expect(code, err).toBe(0);
     const after = open(viaCli, { stateBackend: "sqlite" });
     expect(after.listAll("").length).toBe(24);

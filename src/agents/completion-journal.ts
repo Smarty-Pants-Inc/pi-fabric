@@ -50,6 +50,7 @@ const key = (id: string): string => createHash("sha256").update(id).digest("hex"
 const directory = (meshRoot: string): string => path.join(meshRoot, "agent-completions");
 const envelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), `${key(id)}.json`);
 const archivedEnvelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "archive", `${key(id)}.json`);
+const archivingEnvelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "archive-pending", `${key(id)}.json`);
 const candidatePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "attempts", `${key(id)}.json`);
 const receiptPath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), "receipts", `${key(id)}.json`);
 const claimPrefix = "residency/completion-claims/";
@@ -109,23 +110,89 @@ async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
 interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
 // Only callers that have written a durable receipt or re-confirmed an existing
-// receipt's durability may archive. Receipt-then-rename preserves crash-left
-// sources for recovery; rename keeps the body/inode on the same filesystem. The
-// receipt is the replay fence, so archive maintenance owes no file fsync/rewrite.
-const archiveCompletion = (source: string): void => {
-  if (!fs.existsSync(source)) return;
-  const archive = path.join(path.dirname(source), "archive");
-  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
-  try { renameAtomic(source, path.join(archive, path.basename(source))); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  recipientCache.delete(source);
+// receipt's durability may archive. Rename preserves the already-durable body/inode,
+// but the replay fence is not proof that its new name is durable. Confirm the archive
+// directory AND its parent (the source directory), including their ancestor links,
+// before retiring recovery evidence. A durable hard link keeps the body discoverable
+// even without a claim/attempt, or if a crash loses both unsynced rename names. Only
+// this pending namespace is scanned, never archive history; no body rewrite is needed.
+const archiveStat = (file: string): fs.Stats | undefined => {
+  try { return fs.statSync(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 };
-const archiveCompletionAsync = async (source: string): Promise<void> => {
-  const archive = path.join(path.dirname(source), "archive");
-  await fs.promises.mkdir(archive, { recursive: true, mode: 0o700 });
-  try { await fs.promises.rename(source, path.join(archive, path.basename(source))); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+const archiveStatAsync = async (file: string): Promise<fs.Stats | undefined> => {
+  try { return await fs.promises.stat(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+};
+const sameArchiveInode = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino === b.ino;
+const archiveCompletion = (source: string): boolean => {
+  const target = path.join(path.dirname(source), "archive", path.basename(source));
+  const evidence = path.join(path.dirname(source), "archive-pending", path.basename(source));
+  const sourceStat = archiveStat(source);
+  if (sourceStat) {
+    fs.mkdirSync(path.dirname(evidence), { recursive: true, mode: 0o700 });
+    try { fs.linkSync(source, evidence); }
+    catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+  }
+  const evidenceStat = archiveStat(evidence);
+  if (sourceStat && evidenceStat && !sameArchiveInode(sourceStat, evidenceStat)) throw new Error(`Completion archive evidence changed at ${evidence}`);
+  if (evidenceStat) {
+    try { syncPathNamespace(evidence, evidenceStat); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } // A sibling may finish archiving.
+    if (!sourceStat && !archiveStat(target)) {
+      try { fs.linkSync(evidence, source); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    }
+  }
+  if (archiveStat(source)) {
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    try { renameAtomic(source, target); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  const stat = archiveStat(target);
+  if (!stat) return false;
+  if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
+  // POSIX rename is a no-op when crash recovery/concurrent linking left both names.
+  const leftover = archiveStat(source);
+  if (leftover && sameArchiveInode(leftover, stat)) fs.rmSync(source, { force: true });
+  syncPathNamespace(target, stat); // Archive directory, source directory, then ancestors.
+  if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  fs.rmSync(evidence, { force: true });
   recipientCache.delete(source);
+  return true;
+};
+const archiveCompletionAsync = async (source: string): Promise<boolean> => {
+  const target = path.join(path.dirname(source), "archive", path.basename(source));
+  const evidence = path.join(path.dirname(source), "archive-pending", path.basename(source));
+  const sourceStat = await archiveStatAsync(source);
+  if (sourceStat) {
+    await fs.promises.mkdir(path.dirname(evidence), { recursive: true, mode: 0o700 });
+    try { await fs.promises.link(source, evidence); }
+    catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+  }
+  const evidenceStat = await archiveStatAsync(evidence);
+  if (sourceStat && evidenceStat && !sameArchiveInode(sourceStat, evidenceStat)) throw new Error(`Completion archive evidence changed at ${evidence}`);
+  if (evidenceStat) {
+    try { await syncPathNamespaceAsync(evidence, evidenceStat); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!sourceStat && !await archiveStatAsync(target)) {
+      try { await fs.promises.link(evidence, source); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    }
+  }
+  await fs.promises.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  try { await fs.promises.rename(source, target); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const stat = await archiveStatAsync(target);
+  if (!stat) return false;
+  if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
+  const leftover = await archiveStatAsync(source);
+  if (leftover && sameArchiveInode(leftover, stat)) await fs.promises.rm(source, { force: true });
+  await syncPathNamespaceAsync(target, stat);
+  if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  await fs.promises.rm(evidence, { force: true });
+  recipientCache.delete(source);
+  return true;
 };
 // Journal writers put the address before the result. Read only that bounded prefix,
 // including old pretty-printed envelopes; never parse a foreign result body.
@@ -603,10 +670,11 @@ export class CompletionJournal {
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
       sameRecipient(address, recipient);
     // Bound crash-left cleanup. A readable receipt may have failed its rename
-    // barrier, so re-confirm it before cleanup. Archived history stays untouched.
+    // barrier, so re-confirm it before cleanup. Scan only pending archive evidence,
+    // never archived history.
     let pruned = 0;
     const project = await canonicalAsync(recipient.projectRoot);
-    for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
+    for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts"), path.join(directory(this.meshRoot), "archive-pending")])) {
       const file = path.basename(target);
       let address = await readRecipientAsync(target, true);
       if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
@@ -620,15 +688,10 @@ export class CompletionJournal {
       // Keep crash-left evidence while a foreign claim remains. Only its exact
       // authenticated owner can retire that claim; no lease-based inheritance.
       const claim = this.mesh.get(claimKey(receipt.id), { fresh: true });
-      if (claim) {
-        if (!await this.#canRetireClaimAsync(claim)) continue;
-        await this.#retireClaim(receipt.id, claim);
-        if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
-      } else {
-        await syncCompletionFileAsync(fence, receipt);
-        if (path.dirname(target) === directory(this.meshRoot)) await archiveCompletionAsync(target);
-        else await fs.promises.rm(target, { force: true });
-      }
+      if (claim && !await this.#canRetireClaimAsync(claim)) continue;
+      // The same barrier orders both claimed and claimless attempt cleanup. A crash
+      // may have moved the envelope already; retirement re-confirms that archive.
+      if (!await this.#retireClaim(receipt.id, claim)) return;
       if (++pruned === 128) break;
     }
     // The inbox already owns enqueued notices until its durable carrier confirms
@@ -686,22 +749,31 @@ export class CompletionJournal {
     // barriers authorize claim retirement and source cleanup after a restart.
     await syncCompletionFileAsync(file, receipt);
     const recipient = this.recipient;
+    const source = envelopePath(this.meshRoot, id);
+    const archive = archivedEnvelopePath(this.meshRoot, id);
+    const attempt = candidatePath(this.meshRoot, id);
+    const evidence = archivingEnvelopePath(this.meshRoot, id);
     const targets: string[] = [];
-    for (const target of [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)]) {
+    for (const target of [source, archive, attempt, evidence]) {
       const address = await readRecipientAsync(target);
       if (address && await canonicalAsync(address.projectRoot) === await canonicalAsync(recipient.projectRoot) &&
         sameRecipient(address, recipient)) targets.push(target);
     }
-    // Consumption already retains the envelope in archive. A failed/interrupted
-    // versioned deletion is still retried by its exact owner, never a foreign Main.
+    // A readable archive may be a crash-left rename whose directory barriers never
+    // completed. Re-archive a restored source or confirm its archived name BEFORE
+    // deleting the claim/attempt that directs recovery to this exact result.
+    if (targets.includes(source) || ((targets.includes(archive) || targets.includes(evidence)) && !fs.existsSync(source))) {
+      if (!await archiveCompletionAsync(source)) return false;
+    } else if (targets.includes(attempt) || targets.includes(evidence)) {
+      return false; // Never discard the only remaining result evidence.
+    }
+    // The versioned delete still cannot erase a replacement owner/version. A refused
+    // deletion leaves the durable archive and attempt for the next exact-owner pass.
     if (snapshot) {
       try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); }
       catch { return false; }
     }
-    for (const target of targets) {
-      if (target === envelopePath(this.meshRoot, id)) await archiveCompletionAsync(target);
-      else await fs.promises.rm(target, { force: true });
-    }
+    if (targets.includes(attempt)) await fs.promises.rm(attempt, { force: true });
     return true;
   }
   #canRead(envelope: CompletionEnvelope): boolean {

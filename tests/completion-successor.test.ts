@@ -692,7 +692,7 @@ describe("Astra round 3 legacy retirement ordering", () => {
   };
 
   // #3178: legacy CAS retries retain evidence; retirement retries remain exact-root/session.
-  it.each([false, true])("pre-commit lock timeout retains legacy evidence; fresh journal=%s reclaims capacity", async fresh => {
+  it.each([false, true])("pre-commit lock timeout retains durably archived legacy evidence; fresh journal=%s reclaims capacity", async fresh => {
     const h = harness(true); const enqueue = vi.fn();
     const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue);
     const retry = fresh ? new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue) : b;
@@ -706,7 +706,9 @@ describe("Astra round 3 legacy retirement ordering", () => {
       await b.drain();
       expect(fault).toHaveBeenCalledExactlyOnceWith({ key: claim.key, ifVersion: claim.version });
       expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim);
-      expect(fs.existsSync(bodyPath(h, result.id))).toBe(true);
+      expect(fs.existsSync(bodyPath(h, result.id))).toBe(false);
+      expect(fs.existsSync(path.join(path.dirname(bodyPath(h, result.id)), "archive", path.basename(bodyPath(h, result.id))))).toBe(true);
+      expect(b.result(result.id)).toMatchObject({ id: result.id, text: result.text });
       expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
       fault.mockRestore();
       h.setLive([h.participant("A", 100)]);
@@ -722,24 +724,25 @@ describe("Astra round 3 legacy retirement ordering", () => {
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
       expect(fs.statSync(path.join(h.meshRoot, "state.json")).size).toBeLessThan(4096);
     }
-  });
+  }, 60_000); // Twelve real-storage fsync/CAS cycles; do not impose a latency budget on this recovery proof.
 
-  // #3178: only the returning exact owner may finish an interrupted unlink.
-  it("a crash after the legacy claim delete leaves a receipt-authorized envelope for the same Main to archive", async () => {
+  // #3178: only the returning exact owner may confirm an interrupted archive before CAS.
+  it("a crash after archive rename retains the legacy claim until the same Main confirms its namespace", async () => {
     const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
     const claim = await legacyClaim(h, h.result.id); receiptBeforeArchive(h.meshRoot, h.result.id, "B");
     h.setLive([h.participant("B", 200)]);
     const body = bodyPath(h, h.result.id); const rename = fs.promises.rename;
     const crash = vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-      if (String(source) === body) {
-        expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
-        throw new Error("stop after committed delete, before archive");
-      }
       await rename(source, target);
+      if (String(source) === body) {
+        expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim);
+        throw new Error("stop after archive rename, before directory barriers");
+      }
     });
     const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
-    await expect(b.drain()).rejects.toThrow("stop after committed delete, before archive");
-    expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined(); expect(fs.existsSync(body)).toBe(true);
+    await expect(b.drain()).rejects.toThrow("stop after archive rename, before directory barriers");
+    expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim); expect(fs.existsSync(body)).toBe(false);
+    expect(fs.existsSync(path.join(path.dirname(body), "archive-pending", path.basename(body)))).toBe(true);
     crash.mockRestore();
     const receipt = path.join(path.dirname(body), "receipts", path.basename(body));
     const read = vi.spyOn(fs.promises, "readFile"); const enqueue = vi.fn(); h.setLive([h.participant("C", 300)]);

@@ -71,8 +71,9 @@ the epoch the switch starts from (or the epoch it commits, for a proof made whil
 sits at `importing`), and has `provedAt` at most 24 h old and at most 5 min in the future.
 The `readers/` directory itself must be a directory owned by the gate's user and not
 group/other-writable: otherwise the switch refuses and no override lifts that. Windows has no
-POSIX owner or mode bits: these owner and mode checks are not applied there (Windows ACLs:
-smarty-dev#7548).
+POSIX owner (no `process.geteuid`), so nothing can be verified there and the gate fails closed:
+`reader-proof` refuses to write, and every listed proof is unready ("unverifiable"); only
+`--accept-unready NAME` passes a reader there (Windows ACL checks: smarty-dev#7548).
 
 `--accept-unready NAME,...` is the only override.
 
@@ -137,8 +138,9 @@ Run as each installed Fabric release that reads the mesh:
 fabric-mesh-backend reader-proof --root <mesh> --backend sqlite
 ```
 
-It copies `state.json` to a scratch directory, imports it there with the cutover's own code, lists
-every entry through MeshStore and checks the count, then under the fence writes
+It takes the migration fence, samples the epoch, then copies `state.json` to a scratch directory, imports it there with the cutover's own code, lists
+every entry through MeshStore and checks the count. It samples the epoch again and refuses if it
+changed (the proof records only an epoch that bracketed the read); then, still under the fence, it writes
 `readers/fabric-<release>.json` with this release: `PI_FABRIC_RELEASE_SHA` (else
 `PI_FABRIC_BUILD_SHA`, `GITHUB_SHA`, else the package directory name): the same value its writer
 records carry. The live root is never changed.

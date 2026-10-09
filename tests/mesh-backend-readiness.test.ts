@@ -5,7 +5,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
-import { procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
+import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
+import { proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#7815: the switch refuses unless every REQUIRED reader (the inventory: live Fabric releases,
@@ -84,7 +85,9 @@ const records = (root: string): Array<Record<string, unknown>> => {
 };
 const backendOf = async (root: string): Promise<string> => (await meshBackendStatus(root)).backend;
 
-describe("fabric-mesh-backend readiness gate", () => {
+// ponytail: these tests need proofs, which fail closed without POSIX owners (Windows ACLs: smarty-dev#7548);
+// the fail-closed behaviour itself is covered below on every platform.
+describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gate", () => {
   it("requires the built-in installed reader: no proof, or a proof without sqlite, refuses with nothing changed", async () => {
     const root = await fileRoot();
     const builtins = [{ name: "factory", installRoot: installRoot("r1") }];
@@ -459,5 +462,41 @@ describe("fabric-mesh-backend readiness gate", () => {
     const extra = await run(["cutover", "--root", root, "--require-reader", `forwarder=${forwarder}`]);
     expect(extra.code).toBe(3);
     expect(extra.err).toContain("no proof from installed reader forwarder (release f1)");
+  });
+});
+
+describe("fabric-mesh-backend readiness gate: proofs that cannot be trusted", () => {
+  it.skipIf(process.platform === "win32")("refuses a proof whose read the epoch did not bracket, and writes nothing", async () => {
+    const root = await fileRoot();
+    expect((await run(["cutover", "--root", root])).code).toBe(0); // epoch 1; reader-proof then reads in place
+    const bump = (): void => {
+      const db = openNodeSqlite(path.join(root, "state.db"));
+      try { db.prepare("UPDATE meta SET value = ? WHERE name = 'epoch'").run(7); } finally { db.close(); }
+    };
+    await expect(proveFabricReader(root, { backend: "sqlite", afterRead: bump })).rejects.toThrow("the mesh epoch changed during the read (1 -> 7): proof not written");
+    expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
+  });
+
+  it("fails closed without process.geteuid (Windows): writing a proof refuses, a present proof is unready", async () => {
+    const root = await fileRoot();
+    const factory = installRoot("r1");
+    const builtins = [{ name: "factory", installRoot: factory }];
+    const saved = Object.getOwnPropertyDescriptor(process, "geteuid");
+    Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
+    try {
+      const write = await run(["reader-proof", "--root", root, "--backend", "sqlite"]);
+      expect(write.code).toBe(1);
+      expect(write.err).toContain("unverifiable: this platform has no POSIX owner (smarty-dev#7548): proof not written");
+      placeProof(root, factoryProof());
+      const required = requiredReaders([], [], builtins, []);
+      expect(readerReadiness(root, "sqlite", required, { fromEpoch: 0, toEpoch: 1 }).unready).toEqual([
+        { name: "factory", reason: "proof file is unverifiable: this platform has no POSIX owner (smarty-dev#7548)" }]);
+      const refused = await run(["cutover", "--root", root], { builtins });
+      expect(refused.code).toBe(3);
+      expect(refused.err).toContain("factory (proof file is unverifiable");
+      expect((await run(["cutover", "--root", root, "--accept-unready", "factory"], { builtins })).code).toBe(0);
+    } finally {
+      if (saved) Object.defineProperty(process, "geteuid", saved);
+    }
   });
 });

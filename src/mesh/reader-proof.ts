@@ -234,9 +234,12 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
   return { own, holders: [...holders.values()] };
 };
 
-/** Owned by this user and not group/other-writable, or why not. Windows has no POSIX owner. */
+/**
+ * Owned by this user and not group/other-writable, or why not. Without process.geteuid (Windows) nothing can
+ * be verified, so it fails closed (Windows ACL checks: smarty-dev#7548).
+ */
 const ownership = (stat: fs.Stats, euid: number | undefined): string | undefined => {
-  if (euid === undefined) return undefined;
+  if (euid === undefined) return "unverifiable: this platform has no POSIX owner (smarty-dev#7548)";
   if (stat.uid !== euid) return `owned by uid ${stat.uid}, not ${euid}`;
   if ((stat.mode & 0o022) !== 0) return `group/other-writable (mode ${(stat.mode & 0o777).toString(8)})`;
   return undefined;
@@ -273,7 +276,8 @@ const loadRegistry = (root: string, euid: number | undefined): Map<string, Reade
     throw new Error(`reader registry ${dir} is unreadable (${errno(error)})`);
   }
   if (!stat.isDirectory()) throw new Error(`reader registry ${dir} is not a directory`);
-  const bad = ownership(stat, euid);
+  // Without an euid the directory cannot be verified either; each proof below is then unready (accept-only).
+  const bad = euid === undefined ? undefined : ownership(stat, euid);
   if (bad) throw new Error(`reader registry ${dir} is ${bad}`);
   for (const file of fs.readdirSync(dir).filter(item => item.endsWith(".json"))) {
     const name = file.slice(0, -5);
@@ -393,14 +397,21 @@ const provedRead = async (root: string, backend: ReaderBackend): Promise<number>
  * `reader-proof --backend B`: THIS Fabric release reads B for real, then writes `readers/<name>.json`
  * (default `fabric-<release>`) with its release, under the migration fence.
  */
-export const proveFabricReader = async (root: string, input: { backend: ReaderBackend; name?: string; version?: string; now?: Date }):
+export const proveFabricReader = async (root: string, input: { backend: ReaderBackend; name?: string; version?: string; now?: Date;
+  /** Test hook: runs between the read and the epoch re-sample. */
+  afterRead?: () => void }):
   Promise<{ file: string; proof: ReaderProof; entries: number }> => {
   const release = ownFabricRelease();
   const name = input.name ?? `fabric-${release.slice(0, 40)}`.slice(0, 64);
   if (!isReaderName(name) || !name.startsWith("fabric")) throw new Error(`Bad Fabric reader name ${JSON.stringify(name)} (fabric*, letters, digits, . _ -)`);
-  const entries = await provedRead(root, input.backend);
+  // The fence first, then the epoch, the read and the epoch again: the proof records only an epoch that
+  // bracketed the read (a switch needs the same fence, so a change means the read is not that epoch's).
   return holdMeshFence(root, { lockTimeoutMs: FENCE_MS }, async () => {
     const { epoch } = await meshBackendStatus(root);
+    const entries = await provedRead(root, input.backend);
+    input.afterRead?.();
+    const after = (await meshBackendStatus(root)).epoch;
+    if (after !== epoch) throw new Error(`the mesh epoch changed during the read (${epoch} -> ${after}): proof not written`);
     const proof: ReaderProof = { name, implementation: FABRIC_IMPLEMENTATION, version: input.version ?? packageVersion(), release,
       backends: [input.backend], provedAt: (input.now ?? new Date()).toISOString(), provedEpoch: epoch };
     return { file: writeProof(root, proof), proof, entries };

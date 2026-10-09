@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { withMeshCustody } from "./custody-lock.js";
+import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
@@ -447,6 +447,15 @@ export class MeshStore {
    * transition-safe "dual" mode. For operations that guard only files beside the mesh. */
   async custody<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return withMeshCustody(this, operation, lockTimeoutMs);
+  }
+
+  /** Per-host lease commits and recovery serialize without the shared state/custody lock.
+   * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
+   * before recovery can change its receipt. Dead gates are recovered only on their own host. */
+  async leaseCustody<T>(file: string, operation: () => T, lockTimeoutMs = 0): Promise<T> {
+    const domain = path.join(this.root, "host-lease-commits", createHash("sha256").update(path.basename(file)).digest("hex"));
+    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { hostQualified: true });
+    try { return operation(); } finally { release(); }
   }
 
   /** The active withTryLock budget in this async context, if any. */

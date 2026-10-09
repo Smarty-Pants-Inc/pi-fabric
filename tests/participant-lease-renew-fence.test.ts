@@ -20,8 +20,8 @@ const hostKey = "topology/hosts/" + createHash("sha256").update(hostId).digest("
 const setup = async (stateBackend: "file" | "sqlite") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lease-renew-fence-")); roots.push(root);
   let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
-  const make = async (identityId = "7313-owner") => {
-    now += 10;
+  const make = async (identityId = "7313-owner", clockStep = 10) => {
+    now += clockStep;
     const mesh = new MeshStore(root, 65_536, 100, { stateBackend, readCacheMs: 60_000 }); stores.push(mesh);
     expect(mesh.stateBackend).toBe(stateBackend);
     const directory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: "7313-root",
@@ -51,6 +51,31 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
     expect(s.old.directory.canConsumeMesh()).toBe(false);
   });
 
+  it.each([0, -100])("fences same-identity incarnations despite a repeated/backwards clock (%s ms)", async clockStep => {
+    const s = await setup(stateBackend);
+    const successor = await s.make("7313-owner", clockStep);
+    const lease = s.read(), host = successor.mesh.get(hostKey, { fresh: true });
+    expect(lease.startedAt).toBe(s.predecessor.startedAt! + clockStep);
+    expect(lease.incarnationToken).not.toBe(s.predecessor.incarnationToken);
+    expect(lease.incarnationToken).toMatch(/^[0-9a-f-]{36}$/);
+    const prior = s.old.directory.confirmedAt();
+    await expect(s.old.directory.refresh()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
+    expect(s.old.directory.confirmedAt()).toBe(prior);
+    expect(s.old.directory.canConsumeMesh()).toBe(false);
+    await s.old.directory.close();
+    expect(s.read()).toEqual(lease); expect(successor.mesh.get(hostKey, { fresh: true })).toEqual(host);
+  });
+
+  it("fences an incarnation constructed before a successor but not yet started", async () => {
+    const s = await setup(stateBackend);
+    const stale = new ParticipantDirectory(s.old.mesh, { ...s.old.directory.options });
+    directories.push(stale);
+    const successor = await s.make("7313-owner", 0);
+    const lease = s.read(), host = successor.mesh.get(hostKey, { fresh: true });
+    await expect(stale.start()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
+    expect(stale.canConsumeMesh()).toBe(false);
+    expect(s.read()).toEqual(lease); expect(successor.mesh.get(hostKey, { fresh: true })).toEqual(host);
+  });
   it("does not renew from a superseded timer, and close keeps the successor lease", async () => {
     const s = await setup(stateBackend);
     const successor = await s.make(); const lease = s.read();

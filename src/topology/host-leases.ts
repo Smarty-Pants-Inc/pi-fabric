@@ -5,12 +5,12 @@ import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import type { MeshStateEntry } from "../mesh/store.js";
-import { withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
 // host now also renews its lease in a file of its own, replaced by an atomic rename without
-// the shared lock. Directory claim/renew/remove now serialize by host incarnation (#7313).
+// the shared state lock. Claim/renew/remove and recovery serialize in a per-host commit domain (#7313).
 
 /**
  * Host-reserved historical policy key (also used for participant-file migration).
@@ -101,8 +101,10 @@ export interface FabricHostLease {
   identityId: string;
   updatedAt: number;
   expiresAt: number;
-  /** Incarnation fence; absent on pre-lease-capability writers. */
+  /** Start-time metadata only; clocks can repeat. */
   startedAt?: number;
+  /** Unique incarnation fence; absent only on historical writers. */
+  incarnationToken?: string;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
@@ -132,49 +134,74 @@ export class FabricHostLeaseSupersededError extends Error {
 
 export const sameHostLeaseOwner = (left: FabricHostLease, right: FabricHostLease): boolean =>
   left.id === right.id && left.rootId === right.rootId && left.identityId === right.identityId &&
-  left.startedAt === right.startedAt;
+  left.incarnationToken !== undefined && left.incarnationToken === right.incarnationToken;
 
-/** Initial claim and renewal are distinct. Once claimed, a missing/different lease is terminal;
- * an older instance cannot claim over a newer incarnation, even before its first shared commit.
- * SQLite still uses this JSON lease path (state.db stores keyed state, not host leases). */
+/** Capture once, before any acquisition wait. Unknown bytes never authorize a claim. */
+export const hostLeasePredecessor = (meshRoot: string, hostId: string): FabricHostLease | undefined => {
+  const file = hostLeasePath(meshRoot, hostId);
+  try {
+    const lease = leaseOf(readFileRetrying(file), fileName(hostId));
+    if (!lease) throw new Error(`Invalid host lease: ${file}`);
+    return lease;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return undefined;
+  }
+};
+
+/** Historical predecessors have no UUID; their metadata may be compared for the one-time
+ * migration claim, but can never authorize a renewal/release by a token-bearing writer. */
+const samePredecessor = (left: FabricHostLease | undefined, right: FabricHostLease | undefined): boolean =>
+  left === undefined || right === undefined ? left === right :
+    left.incarnationToken !== undefined || right.incarnationToken !== undefined ? sameHostLeaseOwner(left, right) :
+      left.id === right.id && left.rootId === right.rootId && left.identityId === right.identityId && left.startedAt === right.startedAt;
+
+/** Initial claim is a predecessor-token CAS, not wall-clock ordering. A directory passes the
+ * predecessor captured at incarnation creation; direct callers capture it before waiting.
+ * Once claimed, a missing/different lease is terminal on BOTH state backends. */
 export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease,
-  options: HostLeaseLockOptions & { claim?: boolean } = {}): Promise<void> =>
-  withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {
-    const file = hostLeasePath(mesh.root, lease.id);
-    // Unreadable/invalid is unknown, never absence that authorizes a takeover.
-    let current: FabricHostLease | undefined;
-    try {
-      current = leaseOf(readFileRetrying(file), fileName(lease.id));
-      if (!current) throw new Error(`Invalid host lease: ${file}`);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    const owned = current !== undefined && sameHostLeaseOwner(current, lease);
-    const newer = current?.startedAt !== undefined &&
-      (lease.startedAt === undefined || current.startedAt >= lease.startedAt);
-    if (options.claim ? current && !owned && newer : !owned) {
-      throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
-    }
-    writeHostLease(mesh.root, { ...lease,
-      ...(current && owned && lease.reloadUntil === undefined ? {
-        updatedAt: Math.max(lease.updatedAt, current.updatedAt),
-        expiresAt: Math.max(lease.expiresAt, current.expiresAt),
-        ...(lease.session && current.session?.id === lease.session.id && current.session.startedAt === lease.session.startedAt ? {
-          session: { ...lease.session, updatedAt: Math.max(lease.session.updatedAt, current.session.updatedAt),
-            expiresAt: Math.max(lease.session.expiresAt, current.session.expiresAt) },
+  options: HostLeaseLockOptions & { claim?: boolean; expected?: FabricHostLease | undefined } = {}): Promise<void> => {
+  if (!lease.incarnationToken) throw new TypeError("Host lease mutation requires an incarnation token");
+  const expected = options.claim
+    ? Object.hasOwn(options, "expected") ? options.expected : hostLeasePredecessor(mesh.root, lease.id)
+    : undefined;
+  try {
+    await withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {
+      const current = hostLeasePredecessor(mesh.root, lease.id);
+      const owned = current !== undefined && sameHostLeaseOwner(current, lease);
+      if (!owned && (!options.claim || !samePredecessor(current, expected))) {
+        throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
+      }
+      writeHostLease(mesh.root, { ...lease,
+        ...(current && owned && lease.reloadUntil === undefined ? {
+          updatedAt: Math.max(lease.updatedAt, current.updatedAt),
+          expiresAt: Math.max(lease.expiresAt, current.expiresAt),
+          ...(lease.session && current.session?.id === lease.session.id && current.session.startedAt === lease.session.startedAt ? {
+            session: { ...lease.session, updatedAt: Math.max(lease.session.updatedAt, current.session.updatedAt),
+              expiresAt: Math.max(lease.session.expiresAt, current.session.expiresAt) },
+          } : {}),
         } : {}),
-      } : {}),
-    });
-  }, options);
+      });
+    }, { ...options, lease: { incarnationToken: lease.incarnationToken, expiresAt: lease.expiresAt } });
+  } catch (error) {
+    if (error instanceof HostLeaseLockLostError) throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
+    throw error;
+  }
+};
 
 /** Directory close uses the same claim/renew receipt, so it cannot remove a successor. */
-export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHostLease): Promise<boolean> =>
-  withHostLeaseLock(mesh, hostLeasePath(mesh.root, owner.id), () => {
-    const current = readHostLeaseCurrent(mesh.root, owner.id);
-    if (!current || !sameHostLeaseOwner(current, owner)) return false;
-    fs.rmSync(hostLeasePath(mesh.root, owner.id), { force: true });
-    return true;
-  });
+export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHostLease): Promise<boolean> => {
+  const captured = readHostLeaseCurrent(mesh.root, owner.id);
+  if (!captured || !sameHostLeaseOwner(captured, owner)) return false;
+  try {
+    return await withHostLeaseLock(mesh, hostLeasePath(mesh.root, owner.id), () => {
+      const current = readHostLeaseCurrent(mesh.root, owner.id);
+      if (!current || !sameHostLeaseOwner(current, owner)) return false;
+      fs.rmSync(hostLeasePath(mesh.root, owner.id), { force: true });
+      return true;
+    }, { lease: { incarnationToken: captured.incarnationToken!, expiresAt: captured.expiresAt } });
+  } catch (error) { if (error instanceof HostLeaseLockLostError) return false; throw error; }
+};
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
@@ -233,12 +260,14 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
       typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt) ||
       (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt))) ||
+      (value.incarnationToken !== undefined && (typeof value.incarnationToken !== "string" || value.incarnationToken.length === 0)) ||
       (value.reloadUntil !== undefined && (typeof value.reloadUntil !== "number" || !Number.isFinite(value.reloadUntil)))
     ) return undefined;
     return {
       id: value.id, rootId: value.rootId, identityId: value.identityId,
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
+      ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validWriter(value.writer) ? { writer: value.writer } : {}),
@@ -406,11 +435,12 @@ const validSession = (value: unknown): value is NonNullable<FabricHostLease["ses
 /** Matching identity and incarnation only; an old file cannot revive a takeover. */
 export const hostLiveness = (
   leases: ReadonlyMap<string, FabricHostLease>,
-  host: { id: string; rootId: string; identity: { id: string }; startedAt?: number; updatedAt?: number; expiresAt: number },
+  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number; updatedAt?: number; expiresAt: number },
 ): Liveness => {
   const lease = leases.get(host.id);
   const matching = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-    (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt);
+    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
+      (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt));
   return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, matching ? lease : undefined);
 };
 
@@ -422,7 +452,8 @@ export const hostEntryLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<str
   if (typeof value.id !== "string") return stored;
   if (typeof value.rootId === "string" && typeof identity.id === "string") return hostLiveness(leases, {
     id: value.id, rootId: value.rootId, identity: { id: identity.id },
-    ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}), ...stored,
+    ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}),
+    ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}), ...stored,
   });
   return effectiveLiveness(stored, leases.get(value.id));
 };
@@ -430,7 +461,7 @@ export const hostEntryLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<str
 /** Compatibility alias: every host reader uses the same effective-liveness rule. */
 export const hostLeaseExpiry = (
   leases: ReadonlyMap<string, FabricHostLease>,
-  host: { id: string; rootId: string; identity: { id: string }; startedAt?: number; updatedAt?: number; expiresAt: number },
+  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number; updatedAt?: number; expiresAt: number },
 ): number => hostLiveness(leases, host).expiresAt;
 
 /** Whether the fleet owner has moved lease renewals to files (see LIVENESS_POLICY_KEY). */

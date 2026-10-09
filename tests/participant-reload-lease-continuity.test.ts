@@ -268,7 +268,7 @@ describe("root Main stays in the directory listing through a reload under lock l
     await old.quiesce("reload").catch(() => undefined);
     await old.close();
     const reload = readHostLeases(f.meshRoot).get(identity.id)!;
-    const predecessor = kind === "ordinary heartbeat" ? ordinary : { ...reload, startedAt: reload.startedAt! + 1 };
+    const predecessor = kind === "ordinary heartbeat" ? ordinary : { ...reload, incarnationToken: "unpaired-incarnation" };
     writeHostLease(f.meshRoot, predecessor);
     f.advance(1_000);
     const next = await reimport();
@@ -276,7 +276,7 @@ describe("root Main stays in the directory listing through a reload under lock l
     expect((await fresh.start().then(() => undefined, (error: unknown) => error) as { code?: string })?.code)
       .toBe("FABRIC_MESH_LOCK_TIMEOUT");
     // Ordinary/unpaired evidence cannot withhold the new incarnation's liveness file.
-    expect(readHostLeases(f.meshRoot).get(identity.id)!.startedAt).not.toBe(predecessor.startedAt);
+    expect(readHostLeases(f.meshRoot).get(identity.id)!.incarnationToken).not.toBe(predecessor.incarnationToken);
     f.releaseLock();
     await fresh.refresh();
     expect(f.sample()).toMatchObject({ root: true, leaseExpired: false });

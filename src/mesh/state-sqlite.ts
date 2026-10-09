@@ -371,10 +371,12 @@ export interface SqliteStateStoreOptions {
   walResetBytes?: number;
   /**
    * WAL hard cap (smarty-dev#6477 security pass P1). A reader that pins one snapshot defeats every
-   * checkpoint, so the WAL only grows. Once a commit leaves the WAL above this size, this store's later
-   * write transactions refuse before BEGIN with `MeshStateWalCapError` (reads keep working). Each refused
-   * write first tries ONE non-blocking TRUNCATE, so writes recover by themselves once the reader lets go.
-   * Default 96 MiB; 0 disables.
+   * checkpoint, so the WAL only grows. Before EVERY write transaction (pi-fabric#694 P1 1) the store stats
+   * the shared `state.db-wal`; above this size it makes ONE non-blocking TRUNCATE attempt and, if the WAL is
+   * still above it, refuses before BEGIN with `MeshStateWalCapError` (reads keep working). The check reads
+   * the shared file, so every store and process sharing the root refuses, a fresh or restarted one included,
+   * and writes recover by themselves once the reader lets go. Default 96 MiB. Must be a finite number
+   * greater than 0: 0 (formerly "disabled"), NaN, Infinity and negative values throw a TypeError at open.
    */
   walHardCapBytes?: number;
   /** `journal_size_limit`. Default 16 MiB. */
@@ -479,6 +481,14 @@ const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
 // ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
 // within minutes (~6-7 min at 2.5 commits/s); normal peaks are ~6-11 MiB (smarty-dev#6477).
 const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
+/** `walHardCapBytes`, validated: a finite number greater than 0 (pi-fabric#694: 0 no longer disables the cap). */
+const walHardCapOf = (options: SqliteStateStoreOptions): number => {
+  const cap = options.walHardCapBytes ?? DEFAULT_WAL_HARD_CAP_BYTES;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new TypeError(`Fabric mesh SQLite walHardCapBytes must be a finite number greater than 0 (got ${String(cap)})`);
+  }
+  return Math.max(1, Math.floor(cap));
+};
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
 const PREFIX_END = "\u007f";
@@ -702,7 +712,6 @@ export class SqliteStateStore {
   #lastWalBytes = 0;
   readonly #walResetBytes: number;
   readonly #walHardCapBytes: number;
-  #walCapped = false;
   #walResetting = false;
   #walResetBusyAt = Number.NEGATIVE_INFINITY;
   #lastWalResetCheck = 0;
@@ -726,7 +735,7 @@ export class SqliteStateStore {
     this.#truncateBudgetMs = this.#checkpointBusyMs;
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
-    this.#walHardCapBytes = Math.max(0, Math.floor(options.walHardCapBytes ?? DEFAULT_WAL_HARD_CAP_BYTES));
+    this.#walHardCapBytes = walHardCapOf(options);
     if (options.checkpoint === "maintainer") {
       const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
       this.#timer = setInterval(() => {
@@ -743,6 +752,7 @@ export class SqliteStateStore {
    */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
+    walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     const requested = initializeOf(options);
@@ -795,6 +805,7 @@ export class SqliteStateStore {
    */
   static openSync(root: string, maxEventBytes: number, maxReadEvents: number,
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
+    walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     const requested = initializeOf(options);
@@ -1470,7 +1481,7 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); this.#checkWalCap(); }
+      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); }
     }
   }
 
@@ -1511,16 +1522,12 @@ export class SqliteStateStore {
     } catch { this.#stats.checkpoints.failed += 1; }
   }
 
-  // The WAL hard cap's post-commit check: a commit that leaves the WAL above the cap arms the refusal.
-  #checkWalCap(): void {
-    if (this.#walHardCapBytes <= 0 || this.#walCapped) return;
-    try { if (this.walBytes() > this.#walHardCapBytes) this.#walCapped = true; } catch { /* stat failed: next commit */ }
-  }
-
-  // Before BEGIN, while armed: ONE non-blocking TRUNCATE (busy_timeout 0), then re-check by stat.
-  // Still above the cap: refuse. Back under it: disarm. No loop, no timer; the next write re-checks.
+  // Admission before EVERY write transaction (pi-fabric#694 P1 1): one stat of the SHARED state.db-wal, so a
+  // fresh or restarted store, and every other store or process on the root, sees the same over-cap WAL (no
+  // per-store latch to arm). Above the cap: ONE non-blocking TRUNCATE (busy_timeout 0), then re-stat; still
+  // above it: refuse. No loop, no timer; the next write re-checks. A write already admitted may land at most
+  // one commit past the cap per store.
   #refuseAboveWalCap(): void {
-    if (!this.#walCapped) return;
     let size = this.walBytes();
     if (size > this.#walHardCapBytes && !this.#db.isTransaction) {
       try {
@@ -1530,7 +1537,6 @@ export class SqliteStateStore {
       size = this.walBytes();
     }
     if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(walReaderPids(this.file)));
-    this.#walCapped = false;
   }
 
   // Reader starvation (see the module comment): after a COMMIT, throttled to 4/s, a WAL above

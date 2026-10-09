@@ -4,6 +4,7 @@ import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, 
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import childProcess from "node:child_process";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -514,6 +515,31 @@ export interface StateFileOptions {
   writeReadJournal?: boolean;
 }
 
+const PREPARED_SWEEP_MS = 10 * 60_000;
+const PREPARED_REUSE_AGE_MS = 60 * 60_000;
+const PREPARED_STATE_NAME = /^([1-9]\d*)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.prepared\.tmp$/i;
+
+// ponytail: native process tools already report wall-clock birth time; avoid a second
+// /proc tick/boot-time conversion. Unknown or second-resolution evidence stays conservative.
+const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
+  try {
+    let executable: string;
+    let args: string[];
+    if (process.platform === "linux" || process.platform === "darwin") {
+      executable = "/bin/ps";
+      args = ["-p", String(pid), "-o", "lstart="];
+    } else if (process.platform === "win32" && process.env.SystemRoot) {
+      executable = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`];
+    } else return false;
+    const start = childProcess.execFileSync(executable, args, { encoding: "utf8", timeout: 2_000,
+      maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+    return Date.parse(process.platform === "win32" ? start : `${start} UTC`) > modifiedAt;
+  } catch { return false; }
+};
+
 export class StateFile implements StateBackend {
   readonly kind = "file" as const;
   /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
@@ -541,6 +567,7 @@ export class StateFile implements StateBackend {
   #stateCache: ParsedStateSnapshot | undefined;
   #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
   #journalBase: JournalBase | undefined;
+  #lastPreparedSweep = -Infinity;
 
   constructor(context: MeshStoreContext, options: StateFileOptions) {
     const { root, maxEventBytes } = context;
@@ -563,6 +590,40 @@ export class StateFile implements StateBackend {
       : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, Math.floor(options.backgroundReadCacheMs));
     this.#readActive = options.readActive;
     this.#writeReadJournal = options.writeReadJournal !== false;
+    this.#sweepPreparedState();
+  }
+
+  #sweepPreparedState(): void {
+    const now = Date.now();
+    if (now - this.#lastPreparedSweep < PREPARED_SWEEP_MS) return;
+    this.#lastPreparedSweep = now;
+    let removed = 0;
+    try {
+      const prefix = `${path.basename(this.#statePath)}.`;
+      for (const entry of fs.readdirSync(this.root, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+        const match = PREPARED_STATE_NAME.exec(entry.name.slice(prefix.length));
+        if (!match) continue;
+        const pid = Number(match[1]);
+        if (!Number.isSafeInteger(pid) || pid === process.pid) continue;
+        const file = path.join(this.root, entry.name);
+        try {
+          let dead = false;
+          try { process.kill(pid, 0); }
+          catch (error) {
+            if (errorCode(error) !== "ESRCH") continue;
+            dead = true;
+          }
+          if (!dead) {
+            const modifiedAt = fs.statSync(file).mtimeMs;
+            if (now - modifiedAt <= PREPARED_REUSE_AGE_MS || !processStartedAfter(pid, modifiedAt)) continue;
+          }
+          fs.unlinkSync(file);
+          removed++;
+        } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
+      }
+    } catch { /* Best-effort cleanup; ordinary state operations retain their own errors. */ }
+    if (removed) console.info(`[mesh] Removed ${removed} abandoned prepared state file(s)`);
   }
 
   /** A failed locked operation means this store's view is behind (see MeshLock.withLock). */
@@ -779,6 +840,7 @@ export class StateFile implements StateBackend {
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
     commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other"): Promise<T> {
     const scope = this.#lock.tryLockScope.getStore();
+    if (!scope?.active) this.#sweepPreparedState();
     const deadline = Date.now() + this.#lock.lockTimeoutMs;
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
     // write into a bounded custody try. Await constructor preparation outside custody;

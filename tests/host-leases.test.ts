@@ -34,6 +34,27 @@ describe("host lease files on a transient read failure", () => {
     return { root, lease, failReads };
   };
 
+  it("round-trips the optional reload marker without adding it to ordinary leases", () => {
+    const { root, lease } = setup();
+    const reload = { ...lease(1_000), reloadUntil: lease(1_000).expiresAt };
+    writeHostLease(root, reload);
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(reload);
+    expect(readHostLease(root, "host:a")).toEqual(reload);
+    expect(readHostLeases(root).get("host:a")).toEqual(reload);
+    writeHostLease(root, lease(2_000));
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(lease(2_000));
+  });
+
+  it.each(["invalid", null])("rejects a malformed reload marker (%s)", (reloadUntil) => {
+    const { root, lease } = setup();
+    writeHostLease(root, lease(1_000));
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    fs.writeFileSync(file, JSON.stringify({ format: 1, ...lease(1_000), reloadUntil }));
+    expect(readHostLeaseCurrent(root, "host:a")).toBeUndefined();
+    expect(readHostLease(root, "host:a")).toBeUndefined();
+    expect(readHostLeases(root).size).toBe(0);
+  });
+
   it.each(["single", "all"])("reparses equal-size atomic replacements with preserved mtime through %s", (reader) => {
     const { root, lease } = setup();
     writeHostLease(root, lease(1_000));

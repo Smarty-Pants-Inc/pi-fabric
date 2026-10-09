@@ -71,6 +71,79 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("does no probe and arms no dormancy timer for 30 seconds with only ineligible actors, then probes once on eligibility", async () => {
+    const { root, config, host } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    const probes = vi.spyOn(wake, "assertResidentWakeWatch");
+    const timers: string[] = [];
+    const timeout = globalThis.setTimeout;
+    try {
+      await host.start();
+      const get = host.participants.get.bind(host.participants);
+      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+        ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : get(id, ...rest));
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+        timers.push(new Error().stack ?? "");
+        return timeout(...args);
+      }) as typeof setTimeout);
+      const actor = await host.actors.create({ name: "expected-30s", instructions: "wait", events: ["agent_settled"], residency: "durable" });
+      await sleep(30_000);
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      expect(probes).not.toHaveBeenCalled();
+      expect(timers.filter(stack => stack.includes("armDormancySafetyTimer") || stack.includes("assertResidentWakeWatch"))).toHaveLength(0);
+      const eligibleAt = performance.now();
+      await host.actors.setEvents(actor.id, []);
+      await until(() => host.actors.status(actor.id).status === "dormant", 2_500);
+      expect(performance.now() - eligibleAt).toBeLessThan(2_500);
+      expect(probes).toHaveBeenCalledTimes(1);
+      fakeRun(host);
+      host.actors.tell(actor.id, "wake again");
+      await until(() => host.actors.status(actor.id).status === "dormant", 3_000);
+      expect(probes).toHaveBeenCalledTimes(1);
+      expect(fs.readdirSync(config.residencyRoot).some(name => name.startsWith(".wake-watch-"))).toBe(false);
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it("re-probes exactly once after a proven native watcher emits error", async () => {
+    const { root, config, host } = fixture();
+    const watch = fs.watch;
+    const watchers: fs.FSWatcher[] = [];
+    const wake = await import("../src/residency/wake.js");
+    const probes = vi.spyOn(wake, "assertResidentWakeWatch");
+    try {
+      await host.start();
+      vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+        const watcher = watch(...args);
+        if (args[0] === config.residencyRoot) watchers.push(watcher);
+        return watcher;
+      });
+      const actor = await host.actors.create({ name: "watch-error", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(probes).toHaveBeenCalledTimes(1);
+      watchers[0]!.emit("error", new Error("native watcher failed after proof"));
+      await until(() => watchers.length === 2);
+      await sleep(1_200);
+      expect(probes).toHaveBeenCalledTimes(2);
+      expect(watchers).toHaveLength(2);
+      expect(host.actors.status(actor.id).status).toBe("dormant");
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("uses at most one safety timer while the same eligibility edge cannot commit dormancy", async () => {
+    const { root, host } = fixture();
+    try {
+      await host.start();
+      const attempts = vi.spyOn(host.actors, "dormantIdleActors").mockResolvedValue(0);
+      const actor = await host.actors.create({ name: "bounded-recheck", instructions: "wait", residency: "durable" });
+      await sleep(1_400);
+      const count = attempts.mock.calls.length;
+      expect(count).toBeGreaterThan(0);
+      await sleep(2_200);
+      expect(attempts).toHaveBeenCalledTimes(count);
+      expect(host.actors.status(actor.id).status).toBe("idle");
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["error", "throw", "silent"] as const)("keeps the actor warm and logs the reason when its root watcher is %s", async failure => {
     const { root, config, host, idle } = fixture();
     const originalWatch = fs.watch;

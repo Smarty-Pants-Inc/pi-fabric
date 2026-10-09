@@ -33,7 +33,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
-import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, type ResidentWakeRoutes } from "./wake.js";
+import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
@@ -89,14 +89,8 @@ export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
-// The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
-// fleet-wide actor ownership view that often: that view lists every project participant and
-// stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
-// Requests, admissions and agents are still checked on every tick; the actor check is
-// reused for at most this long, and an exit is always confirmed by a current actor check.
-// Every actor change signal (create, run start and end, stop, ownership) restarts the idle
-// window and drops the reused observation, so a run that starts and ends between two samples
-// still counts: the window always runs from the last real actor activity.
+// Dormancy is driven by actor/delivery/settlement signals. A single bounded safety
+// re-check covers a missed signal for each eligibility transition; there is no dormancy poll.
 const IDLE_ACTOR_CHECK_MS = 1_000;
 // A stat stamp of config.json proves it unchanged only once the file is older than the
 // coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
@@ -217,6 +211,15 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #idleCheckQueued = false;
+  #idleCheckRequested = false;
+  #idleCheckPending: Promise<void> | undefined;
+  #dormancySafetyTimer: NodeJS.Timeout | undefined;
+  #dormancyEligible = false;
+  #dormancySafetyUsed = false;
+  #wakeWatchReprobeUsed = false;
+  #wakeWatchErrorUnsubscribe: (() => void) | undefined;
+  #wakeWatchNeedsReprobe = false;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
@@ -230,7 +233,6 @@ export class ResidentHost {
   #started = false;
   #ready = false;
   #idleSince = Date.now();
-  #dormancyAt = Number.NEGATIVE_INFINITY;
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
   #wakeWatchSupported: boolean | undefined;
@@ -467,6 +469,7 @@ export class ResidentHost {
       },
       onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onSettled: (result) => {
+        this.#scheduleIdleCheck();
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
@@ -638,9 +641,16 @@ export class ResidentHost {
           ),
         ),
       );
-      this.agents.subscribeUi(() => this.participants.scheduleRefresh());
+      this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.#noteActorActivity());
+      this.#wakeWatchErrorUnsubscribe = subscribeResidentWakeWatchErrors(this.config.residencyRoot, () => {
+        if (this.#wakeWatchSupported !== true) return; // probe-time errors settle through the promise
+        this.#wakeWatchSupported = undefined;
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchNeedsReprobe = true;
+        this.#scheduleIdleCheck();
+      });
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
@@ -695,6 +705,7 @@ export class ResidentHost {
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
       fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      this.#scheduleIdleCheck();
       this.#writeWakeRoutes();
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
@@ -758,6 +769,10 @@ export class ResidentHost {
     this.#requestTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
+    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
+    this.#dormancySafetyTimer = undefined;
+    this.#wakeWatchErrorUnsubscribe?.();
+    this.#wakeWatchErrorUnsubscribe = undefined;
     this.#requestRetention.close();
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
@@ -1000,6 +1015,7 @@ export class ResidentHost {
       } catch { /* no commit: the original mailbox below */ }
       if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.
     } else persist(rootId);
+    this.#scheduleIdleCheck();
     await this.#retryDeliveries();
   }
 
@@ -1102,7 +1118,7 @@ export class ResidentHost {
     } finally {
       this.#pollingRequests = false;
       if (!retentionV2Enabled()) this.#maintainRequests();
-      await this.#checkIdle();
+      await this.#checkIdle(false);
     }
   }
 
@@ -1147,11 +1163,11 @@ export class ResidentHost {
     return retention;
   }
 
-  /** Actor activity seen through the manager's change signal: count the idle window from now and
-   * take a current actor observation at the next idle check instead of the reused one. */
+  /** Actor activity restarts the idle window and requests an immediate event-driven check. */
   #noteActorActivity(): void {
     this.#idleSince = Date.now();
     this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
+    this.#scheduleIdleCheck();
   }
 
   #hasActiveActor(now: number, current = false): boolean {
@@ -1159,6 +1175,63 @@ export class ResidentHost {
       this.#activeActor = { at: now, active: this.actors.hasActiveDurableActor() };
     }
     return this.#activeActor.active;
+  }
+
+  #scheduleIdleCheck(): void {
+    this.#idleCheckRequested = true;
+    if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
+    this.#idleCheckQueued = true;
+    queueMicrotask(() => {
+      this.#idleCheckQueued = false;
+      if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckPending || !this.#idleCheckRequested) return;
+      this.#idleCheckRequested = false;
+      const pending = this.#checkIdle();
+      this.#idleCheckPending = pending;
+      void pending.finally(() => {
+        if (this.#idleCheckPending === pending) this.#idleCheckPending = undefined;
+        if (this.#idleCheckRequested) this.#scheduleIdleCheck();
+      }).catch(() => undefined);
+    });
+  }
+
+  #clearDormancySafetyTimer(): void {
+    if (this.#dormancySafetyTimer) clearTimeout(this.#dormancySafetyTimer);
+    this.#dormancySafetyTimer = undefined;
+  }
+
+  #armDormancySafetyTimer(): void {
+    if (this.#dormancySafetyUsed || this.#closed) return;
+    this.#dormancySafetyUsed = true;
+    this.#dormancySafetyTimer = setTimeout(() => {
+      this.#dormancySafetyTimer = undefined;
+      this.#scheduleIdleCheck();
+    }, IDLE_ACTOR_CHECK_MS);
+    this.#dormancySafetyTimer.unref?.();
+  }
+
+  async #ensureWakeWatch(): Promise<boolean> {
+    if (this.#wakeWatchSupported !== undefined) return this.#wakeWatchSupported;
+    try {
+      await assertResidentWakeWatch(this.config.residencyRoot);
+      this.#wakeWatchSupported = true;
+      this.#wakeWatchReprobeUsed = false;
+      this.#wakeWatchNeedsReprobe = false;
+      return true;
+    } catch (error) {
+      const watcherError = error instanceof ResidentWakeWatchError;
+      if (watcherError && !this.#wakeWatchReprobeUsed) {
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchSupported = undefined;
+        console.warn(`[pi-fabric] resident dormancy watcher failed for ${this.config.residencyRoot}: ${String(error)}`);
+        // An error event authorizes exactly one re-probe. Silent and synchronous
+        // failures remain cached as unsupported for this process and root.
+        this.#scheduleIdleCheck();
+        return false;
+      }
+      this.#wakeWatchSupported = false;
+      console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+      return false;
+    }
   }
 
   #writeWakeRoutes(): void {
@@ -1199,24 +1272,49 @@ export class ResidentHost {
     return protectedIds;
   }
 
-  async #checkIdle(): Promise<void> {
+  async #checkIdle(includeDormancy = true): Promise<void> {
     if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
     const now = Date.now();
-    if (this.#wakeWatchSupported !== false && now - this.#dormancyAt >= IDLE_ACTOR_CHECK_MS &&
-        this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
-      try { await assertResidentWakeWatch(this.config.residencyRoot); this.#wakeWatchSupported = true; }
-      catch (error) {
-        this.#wakeWatchSupported = false;
-        console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+    if (!includeDormancy && this.#idleCheckPending) return;
+    if (includeDormancy) {
+      if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
+      const owned = this.actors.listOwned();
+      const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
+      const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
+      const eligible = hasIdleActor && this.actors.hasDormantIdleActor(protectedIds);
+      if (!eligible) {
+        this.#dormancyEligible = false;
+        this.#dormancySafetyUsed = false;
+        this.#clearDormancySafetyTimer();
+      } else {
+        const firstEligibility = !this.#dormancyEligible;
+        this.#dormancyEligible = true;
+        if (!await this.#ensureWakeWatch()) {
+          this.#idleSince = now;
+          return;
+        }
+        if (firstEligibility) {
+          // Probe on the edge, but give actor/delivery settlement signals a chance
+          // to make the eligibility decision current before dormancy is committed.
+          this.#armDormancySafetyTimer();
+        } else {
+          try {
+            this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
+            await this.actors.dormantIdleActors(protectedIds);
+          } catch {
+            this.#idleSince = now;
+            this.#armDormancySafetyTimer();
+            return;
+          }
+        }
       }
     }
-    if (this.#wakeWatchSupported === false) { this.#idleSince = now; return; }
-    if (now - this.#dormancyAt >= IDLE_ACTOR_CHECK_MS) {
-      this.#dormancyAt = now;
-      try {
-        this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
-        await this.actors.dormantIdleActors(this.#expectedActors());
-      } catch { this.#idleSince = now; return; }
+    // A previously dormant actor still needs a working watcher before this host
+    // can release its final consumer gate after a failed re-probe.
+    if (this.#wakeWatchSupported === false && this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped")) {
+      this.#idleSince = now;
+      return;
     }
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
@@ -1233,7 +1331,7 @@ export class ResidentHost {
       return;
     }
     if (now - this.#idleSince < IDLE_EXIT_MS) return;
-    // Never exit on a reused actor observation: confirm with a current one.
+    // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
       this.#idleSince = now;
       return;
@@ -1270,15 +1368,21 @@ export class ResidentHost {
         this.control.resume();
         this.lifecycle.resume();
         this.#idleSince = Date.now();
+        this.#scheduleIdleCheck();
       }
     }
   }
 
   #trackPublication(promise: Promise<unknown>): void {
     this.#publications.add(promise);
-    void promise.then(() => this.#publications.delete(promise), () => {
+    this.#scheduleIdleCheck();
+    void promise.then(() => {
+      this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
+    }, () => {
       this.#publicationFailed = true;
       this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
     });
   }
 

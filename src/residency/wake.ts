@@ -67,26 +67,66 @@ export class ResidentWakePending extends Error {
   }
 }
 
-/** Prove this root can notify before releasing any actor's warm runtime. */
-export async function assertResidentWakeWatch(root: string): Promise<void> {
+/** A native watcher failed after being created; callers may make one bounded re-probe. */
+export class ResidentWakeWatchError extends Error {
+  readonly code = "RESIDENT_WAKE_WATCH_ERROR";
+  constructor(readonly root: string, message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "ResidentWakeWatchError";
+  }
+}
+
+const wakeWatchProofs = new Map<string, Promise<void>>();
+const wakeWatchErrors = new Map<string, Set<() => void>>();
+
+/** Subscribe without opening a watcher or arming a timer. */
+export function subscribeResidentWakeWatchErrors(root: string, listener: () => void): () => void {
+  root = path.resolve(root);
+  let listeners = wakeWatchErrors.get(root);
+  if (!listeners) wakeWatchErrors.set(root, listeners = new Set());
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size) wakeWatchErrors.delete(root);
+  };
+}
+
+/** One proof per root/process. Only a native watcher error invalidates a cached result. */
+export function assertResidentWakeWatch(root: string): Promise<void> {
+  root = path.resolve(root);
+  const cached = wakeWatchProofs.get(root);
+  if (cached) return cached;
   const name = `.wake-watch-${randomUUID()}`;
   const probe = path.join(root, name);
-  let watcher: fs.FSWatcher | undefined;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await new Promise<void>((resolve, reject) => {
+  const proof = new Promise<void>((resolve, reject) => {
+    let watcher: fs.FSWatcher | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    let proven = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      fs.rmSync(probe, { force: true });
+      if (error) { watcher?.close(); reject(error); }
+      else { proven = true; watcher?.unref?.(); resolve(); }
+    };
+    try {
       watcher = fs.watch(root, (_event, filename) => {
-        if ((filename === null || String(filename) === name) && fs.existsSync(probe)) resolve();
+        if (!settled && (filename === null || String(filename) === name) && fs.existsSync(probe)) finish();
       });
-      watcher.once("error", reject);
-      deadline = setTimeout(() => reject(new Error("Resident wake watcher did not notify")), 1_000);
+      watcher.once("error", error => {
+        wakeWatchProofs.delete(root);
+        if (proven) watcher?.close();
+        else finish(new ResidentWakeWatchError(root, `Resident wake watcher failed: ${String(error)}`, error));
+        for (const listener of wakeWatchErrors.get(root) ?? []) listener();
+      });
+      deadline = setTimeout(() => finish(new Error("Resident wake watcher did not notify")), 1_000);
       fs.writeFileSync(probe, "", { flag: "wx", mode: 0o600 });
-    });
-  } finally {
-    watcher?.close();
-    if (deadline) clearTimeout(deadline);
-    fs.rmSync(probe, { force: true });
-  }
+    } catch (error) { finish(error); }
+  });
+  wakeWatchProofs.set(root, proof);
+  return proof;
 }
 
 export class ResidentWakeStartupFailed extends Error {

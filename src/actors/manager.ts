@@ -943,6 +943,24 @@ export class ActorManager {
       .map((actor) => this.#publicInfo(actor));
   }
 
+  /** Whether at least one owned durable actor can be made dormant right now. */
+  hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
+    if (!this.#persistent || this.#closing || this.#releasePaused) return false;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    return [...this.#actors.values()].some(actor => this.#dormantIdleCandidate(actor, protectedIds));
+  }
+
+  #dormantIdleCandidate(actor: ManagedActor, protectedIds: ReadonlySet<string>): boolean {
+    return this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status === "idle" &&
+      !protectedIds.has(actor.id) && !actor.draining && !actor.abortController && !actor.inFlightRun && !actor.preparing &&
+      !actor.removal && !this.#inFlight.has(actor.id) && !this.#draining.has(actor.id) && !actor.queue.length &&
+      !this.#overflow.get(actor.id)?.length && !this.#parked.get(actor.id)?.length &&
+      !this.#deferredHandoffs.get(actor.id)?.length && !this.#pendingHandoffConsumption.get(actor.id)?.size &&
+      !this.#pendingResets.has(actor.id) && !this.#pendingRunArchives.get(actor.id)?.size &&
+      !this.#deadLetterCount(actor.id) && !this.#childCompletionStore(actor).hasPendingReply();
+  }
+
   /** Dormancy releases runtime references, not identity, subscriptions or the durable transcript. */
   async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
     if (!this.#persistent || this.#closing || this.#releasePaused) return 0;
@@ -950,13 +968,7 @@ export class ActorManager {
     this.#refreshOwnership(undefined, false);
     const sleeping: ManagedActor[] = [];
     for (const actor of this.#actors.values()) {
-      if (!this.#canManageCached(actor.id) || actor.residency !== "durable" || actor.status !== "idle" ||
-          protectedIds.has(actor.id) || actor.draining || actor.abortController || actor.inFlightRun || actor.preparing ||
-          actor.removal || this.#inFlight.has(actor.id) || this.#draining.has(actor.id) || actor.queue.length ||
-          this.#overflow.get(actor.id)?.length || this.#parked.get(actor.id)?.length ||
-          this.#deferredHandoffs.get(actor.id)?.length || this.#pendingHandoffConsumption.get(actor.id)?.size ||
-          this.#pendingResets.has(actor.id) || this.#pendingRunArchives.get(actor.id)?.size ||
-          this.#deadLetterCount(actor.id) || this.#childCompletionStore(actor).hasPendingReply()) continue;
+      if (!this.#dormantIdleCandidate(actor, protectedIds)) continue;
       if (!this.#persistQueue(actor.id, true, true)) continue;
       actor.status = "dormant";
       actor.updatedAt = Date.now();
@@ -3318,6 +3330,7 @@ export class ActorManager {
       }
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
+      this.#emitChange(); // Final settlement changes dormancy eligibility, not just public status.
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
       const rearm = this.#drainRearms.delete(actor.id);

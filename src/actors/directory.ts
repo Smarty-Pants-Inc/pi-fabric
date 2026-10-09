@@ -72,6 +72,9 @@ export class ActorDirectory extends ActorManager {
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
+  override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
+    return super.hasDormantIdleActor(protectedIds) || this.#secondary.hasDormantIdleActor(protectedIds);
+  }
   override async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
     return await super.dormantIdleActors(protectedIds) + await this.#secondary.dormantIdleActors(protectedIds);
   }

@@ -32,13 +32,19 @@ export const processScopePath = (pid: number, unit?: string): string | undefined
   catch (error) { if (gone(error)) return undefined; throw error; }
 };
 export type ExecutionIdentity = { pid: number; parent: number; group: number; session: number; started: string };
-export const executionIdentity = (pid: number): ExecutionIdentity | undefined => {
+export type LinuxGroupMember = ExecutionIdentity & { state: string };
+export const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    if (["Z", "X"].includes(fields[0]!)) return undefined;
-    return { pid, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), started: fields[19]! };
+    return { pid, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), started: fields[19]!, state: fields[0]! };
   } catch (error) { if (gone(error)) return undefined; throw error; }
+};
+export const executionIdentity = (pid: number): ExecutionIdentity | undefined => {
+  const member = linuxGroupMember(pid);
+  if (!member || ["Z", "X"].includes(member.state)) return undefined;
+  const { state: _state, ...identity } = member;
+  return identity;
 };
 
 /** Kernel membership owns orphans. All file IO uses a pinned directory fd, not
@@ -125,9 +131,12 @@ const pinCgroup = (directory: string, execution?: ExecutionIdentity): CgroupCust
     try {
       fs.writeFileSync(file("cgroup.freeze"), "1");
       if (!await waitFrozen()) return;
-      // Frozen members cannot exit/reuse their PID between this list and kill.
-      // Node has no pidfd_send_signal; the freezer is our atomic-signal answer.
+      // Only live frozen members keep their PID allocated until the signal.
+      // Zombies can be reaped by an outside parent despite the freezer.
       for (const pid of members()) {
+        let member: LinuxGroupMember | undefined;
+        try { member = linuxGroupMember(pid); } catch { continue; }
+        if (!member || ["Z", "X"].includes(member.state)) continue;
         try { process.kill(pid, signal); }
         catch (error) { if (!gone(error)) throw error; }
       }

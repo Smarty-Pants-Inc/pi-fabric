@@ -6,7 +6,7 @@ import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { randomUUID } from "node:crypto";
-import { cgroupCustody, executionIdentity, processScopePath, scopePath, scopeLauncherEnvironment, CUSTODY_POLL_MS, type CgroupCustody, type ExecutionIdentity } from "../../process-cgroup.js";
+import { cgroupCustody, executionIdentity, linuxGroupMember, processScopePath, scopePath, scopeLauncherEnvironment, CUSTODY_POLL_MS, type CgroupCustody, type ExecutionIdentity, type LinuxGroupMember } from "../../process-cgroup.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -257,17 +257,6 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
-type LinuxGroupMember = { pid: number; parent: number; group: number; started: string; state: string };
-const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    return { pid, parent: Number(fields[1]), group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
-    throw error; // Unknown identity is not permission to signal or to report exit.
-  }
-};
 const linuxProcesses = (): LinuxGroupMember[] =>
   fs.readdirSync("/proc").flatMap((entry) => {
     if (!/^\d+$/.test(entry)) return [];

@@ -7,6 +7,10 @@ import type {
 import { invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
 import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
+import type { AsyncMeshStateStore, AsyncMeshStateStoreOptions } from "../mesh/state-async.js";
+
+/** Audited independent single-key state only; host/typed state never moves with this opt-in. */
+const ASYNC_STATE_PREFIX = "shared/";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
@@ -160,6 +164,52 @@ export class MeshProvider implements FabricProvider {
   readonly description =
     "Durable topics and compare-and-swap shared state for emergent agent coordination";
 
+  #asyncState: AsyncMeshStateStore | undefined;
+  #closed = false;
+  #closing: Promise<void> | undefined;
+
+  /** Explicit experimental selector. No startup registration, config/env override or fallback. */
+  static async withStateBackend(
+    store: MeshStore,
+    identity: MeshIdentity,
+    participants: FabricParticipantSource,
+    options: Extract<AsyncMeshStateStoreOptions, { backend: "nats-kv" }>,
+  ): Promise<MeshProvider> {
+    if (options.backend !== "nats-kv" || options.nats?.experimentalNatsKv !== true) {
+      throw new Error("Async mesh tools require backend: nats-kv and experimentalNatsKv: true");
+    }
+    // Optional network/client work starts only after this explicitly awaited factory call.
+    const { openAsyncMeshStateStore } = await import("../mesh/state-async.js");
+    const state = await openAsyncMeshStateStore(store.root, options);
+    const provider = new MeshProvider(store, identity, participants);
+    provider.#asyncState = state;
+    return provider;
+  }
+
+  #usesAsyncState(key: string): boolean {
+    return this.#asyncState !== undefined && key.startsWith(ASYNC_STATE_PREFIX);
+  }
+
+  async #listState(prefix: string) {
+    const local = this.store.listAll(prefix, { fresh: true });
+    if (!this.#asyncState) return local;
+    const selected = local.filter(entry => !entry.key.startsWith(ASYNC_STATE_PREFIX));
+    if (prefix.startsWith(ASYNC_STATE_PREFIX) || ASYNC_STATE_PREFIX.startsWith(prefix)) {
+      const remote = await this.#asyncState.listAll(prefix.length < ASYNC_STATE_PREFIX.length ? ASYNC_STATE_PREFIX : prefix);
+      selected.push(...remote.filter(entry => entry.key.startsWith(ASYNC_STATE_PREFIX) && entry.key.startsWith(prefix)));
+    }
+    // Mixed listings are not atomic cross-backend snapshots; remote values cannot shadow host state.
+    return selected.sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  /** Provider owns only its explicit async handle; the supplied MeshStore remains caller-owned. */
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#closed = true;
+    this.#closing = (async () => { await this.#asyncState?.close(); })();
+    return this.#closing;
+  }
+
   constructor(
     readonly store: MeshStore,
     readonly identity: MeshIdentity,
@@ -197,6 +247,7 @@ export class MeshProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    if (this.#closed) throw new Error("MeshProvider is closed");
     context = snapshotFabricInvocation(context);
     switch (actionName) {
       case "self":
@@ -259,8 +310,10 @@ export class MeshProvider implements FabricProvider {
       case "get": {
         const key = String(args.key);
         assertReadableStateKey(key);
-        // Guest code pairs get with compare-and-swap writes: read the current file.
-        return this.store.get(key, { fresh: true }) ?? null;
+        // Guest code pairs get with CAS: await remote leader authority, never a watch cache.
+        return (this.#usesAsyncState(key)
+          ? await this.#asyncState!.get(key)
+          : this.store.get(key, { fresh: true })) ?? null;
       }
       case "list": {
         const prefix = typeof args.prefix === "string" ? args.prefix : "";
@@ -272,8 +325,7 @@ export class MeshProvider implements FabricProvider {
             this.store.maxReadEvents,
           ),
         );
-        return this.store
-          .listAll(prefix, { fresh: true })
+        return (await this.#listState(prefix))
           .filter(
             (entry) =>
               !PRIVATE_STATE_PREFIXES.some((privatePrefix) =>
@@ -285,7 +337,7 @@ export class MeshProvider implements FabricProvider {
       case "put": {
         const key = String(args.key);
         assertPublicStateKey(key);
-        return this.store.put({
+        return (this.#usesAsyncState(key) ? this.#asyncState! : this.store).put({
           key,
           value: args.value,
           identity: this.identity,
@@ -295,7 +347,7 @@ export class MeshProvider implements FabricProvider {
       case "delete": {
         const key = String(args.key);
         assertPublicStateKey(key);
-        return this.store.delete({
+        return (this.#usesAsyncState(key) ? this.#asyncState! : this.store).delete({
           key,
           ...(typeof args.ifVersion === "number" ? { ifVersion: args.ifVersion } : {}),
         });

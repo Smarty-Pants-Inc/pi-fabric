@@ -281,6 +281,22 @@ describe("NATS KV single-key adapter (mock protocol, NOT real R3 evidence)", () 
     await expect(store.get("a")).rejects.toBe(error); broker.update.mockRejectedValueOnce(error);
     await expect(store.put({ ...request, ifVersion: 1 })).rejects.toBe(error);
   });
+  it("does not grant read or publish authority when eligibility changes during an awaited RPC", async () => {
+    const connection = broker.connection(); fake.connect.mockResolvedValueOnce(connection); const store = await open();
+    broker.get.mockImplementationOnce(async () => { connection.info.version = "2.14.6"; return null; });
+    await expect(store.get("a")).rejects.toThrow(/minimum version/);
+    connection.info.version = "2.14.7";
+    broker.put.mockImplementationOnce(async () => { connection.info.version = "2.14.6"; return 1; });
+    await expect(store.put(request)).rejects.toThrow(/minimum version/);
+  });
+  it("returns one shared close promise and awaits the transport even for concurrent closers", async () => {
+    const store = await open(); let release!: () => void;
+    const closed = new Promise<void>(resolve => { release = resolve; }); broker.close.mockReturnValueOnce(closed);
+    const first = store.close(), second = store.close(); expect(first).toBe(second);
+    let finished = false; second.then(() => { finished = true; }); await Promise.resolve(); expect(finished).toBe(false);
+    await expect(store.get("a")).rejects.toThrow(/closed/);
+    release(); await Promise.all([first, second]); expect(broker.close).toHaveBeenCalledOnce();
+  });
   it.each([-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN])("rejects invalid revision %s before writing", async revision => {
     const store = await open(); await expect(store.put({ ...request, ifVersion: revision })).rejects.toThrow(/revision/);
     await expect(store.delete({ key: "a", ifVersion: revision })).rejects.toThrow(/revision/); expect(broker.put).not.toHaveBeenCalled();

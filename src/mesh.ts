@@ -1,4 +1,4 @@
-export { openAsyncMeshStateStore } from "./mesh/state-async.js";
+export { openAsyncMeshStateStore, openNatsMeshProvider } from "./mesh/state-async.js";
 export type { AsyncMeshStateStore, AsyncMeshStateStoreOptions } from "./mesh/state-async.js";
 export { NatsKvStateStore, encodeNatsKvKey, decodeNatsKvKey, natsKvPrefixFilter, natsKvBucketForRoot,
   isSupportedNatsKvServer, NATS_KV_MIN_SERVER_VERSION, NATS_KV_MAX_VALUE_BYTES, NATS_KV_MAX_KEYS } from "./mesh/state-nats-kv.js";

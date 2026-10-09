@@ -10,7 +10,7 @@ This is the least-code correct seam, **not a whole-runtime NATS cutover**. The a
 
 ### Cost and alternatives
 
-A TypeScript-symbol census finds **278** relevant main state method/property references: **216** outside the four store implementations, including **154** consuming the synchronous surface (transaction-view reads, cache properties and close included). Unrelated Map/SQLite-statement methods are excluded. There are **15** external `writeBatch` sites; migration needs transaction design, not just `await`. Exact annotated inventory: retained `main-store-call-sites.txt`. This bounded implementation migrates the mesh provider's two async-capable read sites, routes its already-async put/delete, and owns awaited shutdown. Full (a) migration also propagates promises through the families below and their callers/tests; `prepare`, delete conditions, outbox effects and event-append fencing must be redesigned or kept transactional. Costs: one leader RPC/get, one RPC/scanned key, explicit errors/deadlines and awaited teardown.
+A TypeScript-symbol census finds **286** relevant main state method/property references: **223** outside the four store implementations, including **161** consuming the synchronous surface (transaction-view reads, cache properties and close included). Unrelated Map/SQLite-statement methods are excluded. There are **15** external `writeBatch` sites; migration needs transaction design, not just `await`. Exact annotated inventory: retained `main-store-call-sites.txt`. This bounded implementation migrates the mesh provider's two async-capable read sites, routes its already-async put/delete, and owns awaited shutdown. Full (a) migration also propagates promises through the families below and their callers/tests; `prepare`, delete conditions, outbox effects and event-append fencing must be redesigned or kept transactional. Costs: one leader RPC/get, one RPC/scanned key, explicit errors/deadlines and awaited teardown.
 
 (b) A write-through/watch cache is rejected: sync `fresh` reads cease being leader authority; cross-host batch replication can partially commit. #708 leases alone do not fence protected writes: the resource must persist/enforce the lease token on **every** write, and checking a lease before a separate KV put has a TOCTOU gap. Correct replication needs durable intents/cursors, provisional-vs-acknowledged versions, conflict/offline policy and downstream fencing. The local #708 lease design explicitly keeps that integration held. More code, weaker semantics.
 
@@ -30,22 +30,22 @@ Combine each file with each line in its cell (`file:line`). Every external synch
 | `src/fabric-runtime-state.ts` | 1823, 1953 |
 | `src/lifecycle/broker.ts` | 159, 172, 226, 389, 409 |
 | `src/mesh/backend-migration.ts` | 567 |
-| `src/mesh/bridge.ts` | 223, 309, 362, 413, 433, 434, 450, 456, 495, 504, 549, 550, 632 |
+| `src/mesh/bridge.ts` | 223, 309, 362, 413, 433, 434, 450, 456, 495, 504, 549, 550, 607, 632 |
 | `src/mesh/commit-outbox.ts` | 141, 188, 195, 207, 213, 249 |
 | `src/mesh/state-projector.ts` | 571, 716 |
 | `src/providers/mesh-provider.ts` | 263, 275 |
 | `src/residency/client.ts` | 1141 |
-| `src/residency/host.ts` | 777 |
+| `src/residency/host.ts` | 725, 777, 1011 |
 | `src/residency/operator-safety.ts` | 41 |
 | `src/schema/controller.ts` | 109, 254, 321, 515, 542, 562, 793, 797 |
-| `src/state/store.ts` | 531, 572, 605, 811, 840, 851, 1086, 1117, 1130, 1181, 1223, 1265 |
+| `src/state/store.ts` | 531, 572, 605, 811, 840, 851, 896, 897, 1086, 1117, 1130, 1181, 1223, 1265 |
 | `src/topology/control-plane.ts` | 758, 999, 1046, 1069, 1079, 1306, 1316, 1345, 1350 |
 | `src/topology/host-reaper.ts` | 55, 63, 87, 90, 114, 115, 118, 131, 205 |
 | `src/topology/host-record-compaction.ts` | 32 |
-| `src/topology/participant-directory.ts` | 974, 975, 977, 980, 981, 984, 995, 1127, 1143, 1147, 1155, 1220, 1236, 1255, 1262, 1264, 1296, 1298, 1299, 1308, 1309, 1310, 1411, 1415, 1550, 1590, 1594, 1602, 1680, 1686, 1687, 1695, 1721, 1741, 1751, 1759, 1797, 1903, 1930, 1939, 2051, 2130, 2156, 2203, 2208, 2227, 2287, 2319, 2325, 2326, 2342 |
+| `src/topology/participant-directory.ts` | 974, 975, 977, 980, 981, 984, 995, 1127, 1143, 1147, 1155, 1220, 1236, 1255, 1262, 1264, 1296, 1298, 1299, 1308, 1309, 1310, 1411, 1415, 1550, 1590, 1594, 1602, 1680, 1686, 1687, 1695, 1721, 1741, 1751, 1759, 1797, 1903, 1930, 1939, 2051, 2130, 2156, 2183, 2203, 2208, 2227, 2287, 2319, 2325, 2326, 2342 |
 | `src/topology/publication-generation.ts` | 47 |
 | `src/topology/root-inbox.ts` | 354 |
-| `src/topology/stall-alarms.ts` | 108, 114, 116, 125 |
+| `src/topology/stall-alarms.ts` | 108, 114, 115, 116, 125 |
 | `src/ui/controller.ts` | 695, 834, 841, 842, 852, 854, 869 |
 | `src/ui/snapshot.ts` | 125 |
 
@@ -58,6 +58,24 @@ Combine each file with each line in its cell (`file:line`). Every external synch
 - `shared/` routing is host-controlled. Existing local `shared/` values are neither migrated nor fallback: migrate separately before opt-in. Remote values cannot shadow host/private namespaces; non-shared keys retain original backend/guards.
 - Disconnect/capacity/timeout errors propagate. Unknown acknowledgements grant no authority; mutations are not automatically replayed. Reconnect re-establishes transport/server eligibility; storage restart retains old fences. Provider close awaits only its owned async handle, never caller-owned MeshStore.
 - R3/file/history=1, no TTL/purge/delete; `sync_interval: always` on every member is a deployment prerequisite. One-host loopback R3 is functional evidence, **not** three-host/power-loss qualification. Bucket-destruction/restore-epoch and TLS/ACL/three-host gates remain held.
+
+## Explicit API (no automatic registration)
+
+```ts
+import { openNatsMeshProvider } from "pi-fabric/mesh";
+const provider = await openNatsMeshProvider(mesh, identity, participants, {
+  backend: "nats-kv",
+  nats: { servers: trustedServers, experimentalNatsKv: true },
+});
+// Register this provider explicitly instead of the ordinary MeshProvider, if desired.
+// Only shared/* changes authority; state/current and host coordination remain local.
+try {
+  const written = await provider.invoke("put", { key: "shared/example", value: 1, ifVersion: 0 }, invocation);
+  const read = await provider.invoke("get", { key: "shared/example" }, invocation);
+} finally { await provider.close(); } // does not close mesh
+```
+
+The public factory and provider's `withStateBackend` require both selector and experimental flag. Optional imports use stable build entries (`mesh/state-async.js`, `providers/mesh-provider.js`); ordinary construction neither loads the client nor opens NATS. `NatsKvStateStore.connectionStatus()` exposes transport diagnostics only; a reconnect event never grants state/lease authority.
 
 ## Acceptance / reproduction
 

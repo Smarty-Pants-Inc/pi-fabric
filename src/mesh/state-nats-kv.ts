@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import type { JetStreamClient, KV, KvEntry, NatsConnection, QueuedIterator } from "nats";
+import type { JetStreamClient, KV, KvEntry, NatsConnection, QueuedIterator, Status } from "nats";
 import { jsonClone, MeshBatchConflictError, type MeshStateEntry } from "./state-file.js";
 import type { StateBackendDeleteInput, StateBackendPutInput } from "./state-backend.js";
 import type { AsyncMeshStateStore } from "./state-async.js";
@@ -103,6 +103,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
   readonly #js: JetStreamClient;
   readonly #watches = new Map<QueuedIterator<KvEntry>, () => void>();
   #closed = false;
+  #closing: Promise<void> | undefined;
 
   private constructor(bucket: string, nc: NatsConnection, kv: KV, js: JetStreamClient, maxValueBytes: number, maxKeys: number) {
     this.bucket = bucket; this.#nc = nc; this.#kv = kv; this.#js = js;
@@ -158,6 +159,12 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
     } catch (error) { await nc.close(); throw error; }
   }
 
+  /** Transport diagnostics only: reconnect events do not grant read/write or lease authority. */
+  connectionStatus(): AsyncIterable<Status> {
+    this.#assertOpen();
+    return this.#nc.status();
+  }
+
   #assertOpen(): void {
     if (this.#closed) throw new Error("NatsKvStateStore is closed");
     if (!isSupportedNatsKvServer(this.#nc.info?.version ?? "")) throw new Error("Connected NATS server no longer satisfies the Fabric KV minimum version");
@@ -176,12 +183,14 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
   async get(key: string): Promise<MeshStateEntry | undefined> {
     this.#assertOpen();
     const raw = await this.#kv.get(encodeNatsKvKey(key));
+    this.#assertOpen();
     return raw?.operation === "PUT" ? this.#entry(raw) : undefined;
   }
   /** Leader-read revision, INCLUDING a retained delete marker. Missing virgin keys have revision 0. */
   async version(key: string): Promise<number> {
     this.#assertOpen();
     const revision = (await this.#kv.get(encodeNatsKvKey(key)))?.revision ?? 0;
+    this.#assertOpen();
     validateRevision(revision);
     return revision;
   }
@@ -203,6 +212,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
         ? await this.#kv.put(encoded, bytes, { previousSeq: 0 })
         : await this.#kv.update(encoded, bytes, input.ifVersion);
     } catch (error) { return this.#conflict(error, input.key, input.ifVersion ?? 0); }
+    this.#assertOpen();
     validateRevision(revision);
     return { key: input.key, value: data.value, version: revision, updatedAt: data.updatedAt, updatedBy: data.updatedBy };
   }
@@ -217,6 +227,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
     // Unlike kv.delete (void), retaining its PubAck returns THIS deletion's exact revision, even if raced.
     for (let attempt = 0; attempt < 8; attempt++) {
       const raw = await this.#kv.get(encoded);
+      this.#assertOpen();
       const found = raw?.revision ?? 0;
       validateRevision(found);
       if (input.ifVersion !== undefined && input.ifVersion !== found) throw new MeshBatchConflictError(input.key, input.ifVersion, found);
@@ -227,6 +238,7 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
       h.set("Nats-Expected-Last-Subject-Sequence", String(found));
       try {
         const ack = await this.#js.publish(`$KV.${this.bucket}.${encoded}`, new Uint8Array(), { headers: h });
+        this.#assertOpen();
         validateRevision(ack.seq);
         return { deleted: true, version: ack.seq };
       } catch (error) {
@@ -247,12 +259,14 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
         if (selected.length > this.maxKeys) throw new Error("Fabric KV key limit exceeded");
       }
     } finally { keys.stop(); }
+    this.#assertOpen();
     const entries: MeshStateEntry[] = [];
     // Each get is authoritative. This scan is NOT an atomic multi-key snapshot.
     for (const key of selected.sort((a, b) => a.localeCompare(b))) {
       const entry = await this.get(key);
       if (entry) entries.push(entry);
     }
+    this.#assertOpen();
     return entries;
   }
   async list(prefix = "", limit = 100): Promise<MeshStateEntry[]> {
@@ -295,11 +309,12 @@ export class NatsKvStateStore implements AsyncMeshStateStore {
       throw: async (error?: unknown) => { stop(); return fail(error); },
     });
   }
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
     for (const stop of this.#watches.values()) stop();
     this.#watches.clear();
-    await this.#nc.close();
+    this.#closing = this.#nc.close();
+    return this.#closing;
   }
 }

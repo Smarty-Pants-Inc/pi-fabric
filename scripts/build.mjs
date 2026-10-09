@@ -41,6 +41,8 @@ const primaryEntryPoints = [
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
   "src/mesh/state-projector.ts",
+  "src/mesh/state-async.ts",
+  "src/providers/mesh-provider.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",

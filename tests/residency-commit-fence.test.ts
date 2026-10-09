@@ -1093,6 +1093,9 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
       await state.participants.refresh(); // resumed Main owns a real renewed lease at this watermark
+      // The 250 ms exchange budget exists to expire the create above; this follow-up status read only checks the
+      // committed actor, so give it a bounded 5 s budget (a 2-core CI runner timed out at 250 ms; smarty-dev#7651).
+      state.client.options.commandTimeoutMs = 5_000;
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();

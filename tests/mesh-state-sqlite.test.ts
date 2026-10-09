@@ -81,7 +81,7 @@ const outcome = async <T>(run: () => Promise<T>): Promise<unknown> => {
 };
 
 describe("SqliteStateStore", () => {
-  it("opens WAL with synchronous=NORMAL, no client autocheckpoint, a clamped busy timeout and a 0600 file", async () => {
+  it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {
     const root = tempRoot("pragmas");
     const executed: string[] = [];
     const recording = (file: string): SqliteConnection => {
@@ -92,7 +92,7 @@ describe("SqliteStateStore", () => {
     const store = await open(root, { open: recording, busyTimeoutMs: 10_000 });
     await store.put({ key: "a/1", value: 1, identity });
     expect(executed).toEqual(expect.arrayContaining([
-      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 0", "BEGIN IMMEDIATE", "COMMIT",
+      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 1000", "BEGIN IMMEDIATE", "COMMIT",
     ]));
     const observer = raw(root);
     expect(observer.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });

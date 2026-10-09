@@ -200,6 +200,25 @@ export interface FabricActorValidityFacts {
   wakeText?: ActorWakeText;
 }
 
+/** Leading-edge admission policy for host agent_settled observations only. */
+export interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; 0 disables. Runtime windows reset on restart. */
+  minIntervalMs: number;
+}
+
+export function normalizeActorActivation(value: unknown): FabricActorActivationPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== "minIntervalMs")) {
+    throw new Error("Invalid actor activation: use { minIntervalMs: non-negative integer }");
+  }
+  const minIntervalMs = (value as { minIntervalMs?: unknown }).minIntervalMs;
+  if (typeof minIntervalMs !== "number" || !Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0) {
+    throw new Error("Invalid actor activation.minIntervalMs: use a non-negative safe integer in milliseconds");
+  }
+  return { minIntervalMs };
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest {
@@ -223,6 +242,8 @@ export interface FabricActorRequest {
    * same topic with the same value there is replaced by the newer one, in its queue place.
    */
   coalesceKey?: string;
+  /** Optional per-source leading-edge minimum interval for agent_settled only; omitted is off. */
+  activation?: FabricActorActivationPolicy;
   /**
    * Skip-only rules checked before a queued event runs the model: preset names ("hold",
    * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
@@ -294,6 +315,7 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };

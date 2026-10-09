@@ -76,6 +76,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
+import { isMeshStateMovedMarker } from "./backend-fence.js";
 import { MeshLockTicket } from "./lock-queue.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
@@ -108,6 +109,41 @@ export class MeshStateUnsupportedError extends Error {
     this.name = "MeshStateUnsupportedError";
   }
 }
+
+/**
+ * smarty-dev#6477: a sqlite-mode open never initialises an authoritative EMPTY database over a root
+ * whose state still lives in state.json. Without an initialised state.db, a state.json that is not
+ * cutover's moved marker and is not empty (entries, tombstones or an allocation clock) is live file
+ * state: refuse BEFORE creating state.db, so the root is left byte-identical (no db, no fence, no epoch).
+ * The import tool (backend-migration.ts) opens the database itself and never comes through here.
+ */
+export const assertSqliteRootImported = (root: string): void => {
+  try {
+    if (fs.statSync(path.join(root, "state.db")).size > 0) return; // initialised (or being initialised): its meta decides
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  let serialized: string;
+  try { serialized = fs.readFileSync(path.join(root, "state.json"), "utf8"); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return; // a fresh root
+    throw error;
+  }
+  if (!serialized.trim()) return; // a zero-length state.json holds nothing
+  let parsed: unknown;
+  try { parsed = JSON.parse(serialized); } catch { parsed = undefined; } // damaged: not provably empty, refuse
+  if (isMeshStateMovedMarker(parsed)) return;
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const state = parsed as { entries?: unknown; versions?: unknown; tombstoneOrder?: unknown; highWater?: unknown };
+    const empty = (value: unknown): boolean => value === undefined || value === null
+      || (typeof value === "object" && Object.keys(value).length === 0);
+    if (state.entries !== null && typeof state.entries === "object" && !Array.isArray(state.entries)
+      && empty(state.entries) && empty(state.versions) && empty(state.tombstoneOrder)
+      && (state.highWater === undefined || state.highWater === 0)) return; // a fresh root's empty state file
+  }
+  throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refused for ${root}: this root has file-backend state; `
+    + `run \`fabric-mesh-backend import --root ${root}\` first (smarty-dev#6477)`);
+};
 
 /** The database was retired (rolled back to the file backend) or re-epoched: use the file path. */
 export class MeshStateRetiredError extends Error {
@@ -458,6 +494,7 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    assertSqliteRootImported(root);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
@@ -494,6 +531,7 @@ export class SqliteStateStore {
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    assertSqliteRootImported(root);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }

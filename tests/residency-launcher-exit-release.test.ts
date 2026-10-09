@@ -283,7 +283,48 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
       await expect(runResidentHostFromConfigPath(h.configPath)).rejects.toThrow("injected start failure");
       expect(files).toBeDefined();
       for (const [file, bytes] of Object.entries(files!)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
-      expect(stderr.join("")).toContain("Fabric resident host exit (error) without a proven root fence: injected start failure");
+      expect(stderr.join("")).toContain("Fabric resident host exit (error) without a proven root fence");
+      expect(stderr.join("")).toContain("Fabric resident host error: injected start failure without a proven root fence");
+    } finally {
+      vi.restoreAllMocks();
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["replaced host.lock", "another owner.json"] as const)("revalidates before error.json: fence lost after the exit line (%s) leaves the successor's error.json byte-identical", { timeout: 60_000 }, async loss => {
+    const h = harness(`between-${loss === "replaced host.lock" ? "lock" : "owner"}`);
+    const stderr = captureStderr();
+    const errorPath = path.join(h.residencyRoot, "error.json");
+    const sentinel = JSON.stringify({ error: "successor sentinel" });
+    let lost = false;
+    const writeSync = fs.writeSync;
+    // The hook sits between the two writes: right after the exit line lands.
+    vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, data: string, ...rest: never[]) => {
+      const written = writeSync(fd, data, ...rest);
+      if (!lost && String(data).includes('"event":"resident-exit"')) {
+        lost = true;
+        if (loss === "replaced host.lock") {
+          const replacement = path.join(h.residencyRoot, "host.lock.next");
+          fs.writeFileSync(replacement, "", { mode: 0o600 });
+          fs.renameSync(replacement, path.join(h.residencyRoot, "host.lock"));
+        } else {
+          fs.writeFileSync(h.ownerPath, JSON.stringify({ format: 1, hostId: "resident:successor", pid: process.pid, token: "successor", startedAt: Date.now() }));
+        }
+        fs.writeFileSync(errorPath, sentinel, { mode: 0o600 });
+      }
+      return written;
+    }) as typeof fs.writeSync);
+    const mkdirSync = fs.mkdirSync;
+    vi.spyOn(fs, "mkdirSync").mockImplementation(((dir: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+      if (String(dir) === path.join(h.residencyRoot, "requests")) throw new Error("injected start failure");
+      return mkdirSync(dir, options);
+    }) as typeof fs.mkdirSync);
+    try {
+      await expect(runResidentHostFromConfigPath(h.configPath)).rejects.toThrow("injected start failure");
+      expect(lost).toBe(true); // the exit line was written while the fence held
+      expect(exitLines(h.residencyRoot)).toEqual([expect.objectContaining({ reason: "error" })]);
+      expect(fs.readFileSync(errorPath, "utf8")).toBe(sentinel);
+      expect(stderr.join("")).toContain("Fabric resident host error: injected start failure without a proven root fence");
     } finally {
       vi.restoreAllMocks();
       fs.rmSync(h.root, { recursive: true, force: true });

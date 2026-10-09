@@ -202,10 +202,11 @@ export class ResidentHost {
   #released = false;
   /**
    * Last act just before this host releases owner.json (smarty-dev#7770).
-   * `failure` is the startup error, if any. `owned` is false when the root's
-   * fence or owner.json no longer proves this host: it may then write nothing there.
+   * `failure` is the startup error, if any. `owned()` revalidates the root's
+   * fence and owner.json; call it immediately before EACH root write, and write
+   * nothing there when it is false.
    */
-  beforeRelease: ((failure: unknown, owned: boolean) => void) | undefined;
+  beforeRelease: ((failure: unknown, owned: () => boolean) => void) | undefined;
   readonly #lockPath: string;
   readonly #errorPath: string;
   readonly #requestsPath: string;
@@ -1798,7 +1799,7 @@ export class ResidentHost {
   #releaseLock(failure = this.#failure): void {
     if (this.#lockFd === undefined) return;
     if (!this.#released && !(failure instanceof ResidentHostAlreadyRunning)) {
-      try { this.beforeRelease?.(failure, this.#holdsRoot()); } catch { /* diagnostics never block release */ }
+      try { this.beforeRelease?.(failure, () => this.#holdsRoot()); } catch { /* diagnostics never block release */ }
     }
     this.#released = true;
     // Remove our publication while holding the claim. POSIX never unlinks its
@@ -1905,15 +1906,18 @@ const runResidentHost = async (
   // owner.json last, and nothing may write under the root after that (smarty-dev#1882).
   host.beforeRelease = (failure, owned) => {
     const exitReason = failure === undefined ? reason ?? "error" : "error";
-    if (!owned) {
-      // No proven fence: the root may be another generation's. stderr only.
-      const detail = failure === undefined ? "" : `: ${errorMessage(failure)}`;
-      try { process.stderr.write(`Fabric resident host exit (${exitReason}) without a proven root fence${detail}\n`); } catch { /* best effort */ }
-      return;
-    }
-    reportResidentExit(config.residencyRoot, exitReason);
-    if (failure !== undefined) writeResidentError(config.residencyRoot, failure);
+    // No proven fence: the root may be another generation's. stderr only.
+    const unfenced = (what: string): void => {
+      try { process.stderr.write(`Fabric resident host ${what} without a proven root fence\n`); } catch { /* best effort */ }
+    };
+    // Revalidate immediately before each root write: the fence can be lost between them.
+    if (owned()) reportResidentExit(config.residencyRoot, exitReason);
+    else unfenced(`exit (${exitReason})`);
+    if (failure === undefined) return;
+    if (owned()) writeResidentError(config.residencyRoot, failure);
+    else unfenced(`error: ${errorMessage(failure)}`);
   };
+
   await host.start();
   if (signal?.aborted) {
     reason = "stopped";

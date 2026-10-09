@@ -58,7 +58,9 @@ native install; do not run Linux amd64 on m4/m5/i9. No fleet installation here.
    Example reviewed CLI (operator-provided, version-pinned; not installed here):
    `nats --context fabric-ops --js-domain fleet stream add ROOT_ryzen3 --config <root-json>`.
    Split the manifest into one config per stream; audit every stream subject and
-   replica count. KV streams are the `KV_STATE_H` backing streams with ten history
+   replica count. Provision only approved/enrolled host slots: exclude conditional
+   `epyc1` root/KV definitions until the fifth-host reconciliation is approved.
+   A generated example is not permission to provision its stream or credential. KV streams are the `KV_STATE_H` backing streams with ten history
    revisions; SDK contexts must select domain `fleet` and H-prefixed inboxes.
    Reject unexpected pre-existing streams/subjects; do not overwrite to make a
    check pass. Consumers cannot have arbitrary push delivery subjects.

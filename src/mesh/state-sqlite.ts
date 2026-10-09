@@ -1739,7 +1739,7 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
 export const ensurePrivateRoot = (root: string): void => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const refuse = (why: string): never => {
-    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: it ${why}`);
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses root ${root}: it ${why} (fix: chmod 700 ${root}, owned by this user)`);
   };
   const named = fs.lstatSync(root);
   if (named.isSymbolicLink()) refuse("is a symbolic link");
@@ -1755,7 +1755,7 @@ export const ensurePrivateRoot = (root: string): void => {
     if (!opened.isDirectory()) refuse("is not a directory");
     if (opened.dev !== named.dev || opened.ino !== named.ino) refuse("changed while it was checked");
     if (opened.uid !== process.getuid()) refuse(`is owned by uid ${opened.uid}, not this process's uid ${process.getuid()}`);
-    if ((opened.mode & 0o077) !== 0) refuse(`is accessible to group or other (mode ${(opened.mode & 0o777).toString(8)}; it must be 0700)`);
+    if ((opened.mode & 0o777) !== 0o700) refuse(`has mode ${(opened.mode & 0o777).toString(8)}; it must be exactly 0700`);
   } finally { if (fd !== undefined) fs.closeSync(fd); }
 };
 

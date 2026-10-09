@@ -385,9 +385,9 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
 
   it("refuses an existing 0755 or 0750 root (never repaired) and a symlinked root", async () => {
     const root = await prepared("root-0755");
-    for (const mode of [0o755, 0o750]) {
+    for (const mode of [0o755, 0o750, 0o500]) {
       fs.chmodSync(root, mode);
-      expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/it must be 0700/) });
+      expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/must be exactly 0700.*chmod 700/) });
       expect(await refused(root, true)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
       expect(fs.statSync(root).mode & 0o777).toBe(mode); // left as found
     }
@@ -400,7 +400,7 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
   it("refuses a root that others can write", async () => {
     const root = await prepared("root-mode");
     fs.chmodSync(root, 0o777);
-    try { expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/it must be 0700/) }); }
+    try { expect(await refused(root)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/must be exactly 0700.*chmod 700/) }); }
     finally { fs.chmodSync(root, 0o700); }
   });
 

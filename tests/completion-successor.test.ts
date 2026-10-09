@@ -231,7 +231,7 @@ describe("round 5 Windows completion file confirmation", () => {
     } finally { Object.defineProperty(process, "platform", platform); }
   });
 
-  it.each(["win32", "linux", "darwin"])("F6: %s explicit consumption retries confirm receipts, drain archives without fsync", async platformName => {
+  it.each(["win32", "linux", "darwin"])("F6: %s explicit and recovery consumption retries require receipt confirmation", async platformName => {
     const h = harness(); h.setLive([h.participant("B", 200)]);
     const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, vi.fn());
     journal.save(h.result); await journal.drain(false);
@@ -266,13 +266,17 @@ describe("round 5 Windows completion file confirmation", () => {
       expect(() => receiptBeforeArchive(h.meshRoot, h.result.id, "C")).toThrow(denied);
       expect(() => journal.acknowledge(h.result.id)).toThrow(denied);
       expect(() => journal.forget(h.result.id)).toThrow(denied);
-      await expect(journal.drain(false)).resolves.toBeUndefined();
-      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+      await expect(journal.drain(false)).rejects.toThrow(denied);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
+      expect(asyncFailed.mock.calls.some(([file, mode]) => String(file) === receipt && mode === (platformName === "win32" ? "r+" : "r"))).toBe(true);
       expect(fs.readFileSync(receipt, "utf8")).toBe(originalReceipt);
-      expect(fs.readFileSync(path.join(dir, "archive", path.basename(envelope)), "utf8")).toBe(originalEnvelope);
+      expect(fs.readFileSync(envelope, "utf8")).toBe(originalEnvelope);
+      expect(fs.existsSync(path.join(dir, "archive", path.basename(envelope)))).toBe(false);
       expect(journal.enqueue).not.toHaveBeenCalled();
     } finally { Object.defineProperty(process, "platform", platform); failed.mockRestore(); asyncFailed.mockRestore(); }
     await journal.drain(false);
+    expect(fs.readFileSync(path.join(dir, "archive", path.basename(envelope)), "utf8")).toBe(originalEnvelope);
+    expect(fs.readFileSync(receipt, "utf8")).toBe(originalReceipt);
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
     expect(journal.enqueue).not.toHaveBeenCalled();
   });
@@ -446,7 +450,7 @@ describe("round 4 completion fences", () => {
     fs.unlinkSync(file); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
   });
 
-  it.skipIf(process.platform === "win32")("F5/receipt: explicit retries require barriers while plain drain retains the archived outcome", async () => {
+  it.skipIf(process.platform === "win32")("F5/receipt: explicit and recovery retries require barriers before archiving the outcome", async () => {
     const h = harness(); h.setLive([h.participant("B", 200)]);
     let delivered!: () => void;
     const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, (_result, callback) => { delivered = callback; });
@@ -461,9 +465,10 @@ describe("round 4 completion fences", () => {
       fault.barrier = barrier;
       expect(() => receiptBeforeArchive(h.meshRoot, h.result.id, "C")).toThrow(/post-rename .* barrier failed/);
       expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true); // Scan reads do not claim durability.
-      await expect(retry.drain(false)).resolves.toBeUndefined();
-      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
-      expect(fs.existsSync(path.join(path.dirname(dir), "archive", path.basename(target)))).toBe(true);
+      await expect(retry.drain(false)).rejects.toThrow(/post-rename .* barrier failed/);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
+      expect(fs.existsSync(path.join(path.dirname(dir), path.basename(target)))).toBe(true);
+      expect(fs.existsSync(path.join(path.dirname(dir), "archive", path.basename(target)))).toBe(false);
       expect(fs.readFileSync(target, "utf8")).toBe(original);
     }
     fault.barrier = "none"; fault.fileSyncs = 0; fault.directorySyncs = 0;
@@ -1049,7 +1054,7 @@ describe("round 2 completion security", () => {
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
     });
 
-  it("Astra P1-2: plain receipt reads precede archive and claim retirement without file confirmation", async () => {
+  it("Astra P1-2: one async receipt confirmation precedes archive and claim retirement", async () => {
     const h = harness(); h.setLive([h.participant("A", 100)]);
     const journal = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
     journal.save(h.result); await journal.drain(false); receiptBeforeArchive(h.meshRoot, h.result.id, "A");
@@ -1062,10 +1067,10 @@ describe("round 2 completion security", () => {
       return open(...args);
     });
     const sync = vi.spyOn(fs, "fsyncSync"); await journal.drain(false);
-    expect(confirmations).toBe(0); expect(sync).not.toHaveBeenCalled();
+    expect(confirmations).toBe(1); expect(sync).not.toHaveBeenCalled();
     expect(fs.existsSync(body)).toBe(false); expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
     opened.mockRestore(); await journal.drain(false); // Bodyless idle pass owes no barrier at all.
-    expect(confirmations).toBe(0); expect(sync).not.toHaveBeenCalled();
+    expect(confirmations).toBe(1); expect(sync).not.toHaveBeenCalled();
   });
 
   // #3178: bounded reclamation is same-root crash recovery, not new-principal succession.
@@ -1092,7 +1097,7 @@ describe("round 2 completion security", () => {
   });
 
   it.skipIf(process.platform === "win32").each(["namespace alias", "new child", "replaced child"])(
-    "Astra P1-2: explicit retries owe barriers after %s, idle archive recovery remains plain reads", async mutation => {
+    "Astra P1-2: explicit and recovery retries owe namespace barriers after %s", async mutation => {
       const h = harness(); h.setLive([h.participant("A", 100)]);
       const journal = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
       journal.save(h.result); await journal.drain(false);
@@ -1152,10 +1157,12 @@ describe("round 2 completion security", () => {
       expect(() => journal.acknowledge(result.id)).toThrow("owed parent barrier failed");
       expect(fs.existsSync(body)).toBe(true); expect(h.mesh.listAll("residency/completion-claims/")).toEqual([claim]);
       sync.mockRestore(); const plainSync = vi.spyOn(fs, "fsyncSync");
-      await journal.drain(false); // No receipt/directory fsync, even with an unavailable async barrier.
+      await expect(journal.drain(false)).rejects.toThrow("owed parent barrier failed");
+      expect(fs.existsSync(body)).toBe(true); expect(h.mesh.listAll("residency/completion-claims/")).toEqual([claim]);
+      failed.mockRestore(); await journal.drain(false);
       expect(plainSync).not.toHaveBeenCalled();
       expect(fs.existsSync(body)).toBe(false); expect(fs.existsSync(path.join(dir, "archive", path.basename(body)))).toBe(true);
-      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0); failed.mockRestore(); plainSync.mockRestore();
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0); plainSync.mockRestore();
     });
 
   it("F3: repeated receipts retire claims within reduced mesh capacity and prevent successor replay", async () => {

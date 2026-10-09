@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { renameAtomic, syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
+import { renameAtomic, syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
@@ -108,9 +108,9 @@ async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
 }
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
 interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
-// Only callers that have written a durable receipt or validated an existing replay
-// fence may archive. Receipt-then-rename preserves crash-left sources for recovery;
-// rename keeps the body/inode intact and stays on the journal's filesystem. The
+// Only callers that have written a durable receipt or re-confirmed an existing
+// receipt's durability may archive. Receipt-then-rename preserves crash-left
+// sources for recovery; rename keeps the body/inode on the same filesystem. The
 // receipt is the replay fence, so archive maintenance owes no file fsync/rewrite.
 const archiveCompletion = (source: string): void => {
   if (!fs.existsSync(source)) return;
@@ -246,6 +246,19 @@ const syncCompletionFile = (file: string, value: unknown): void => {
     fs.fsyncSync(fd);
     syncPathNamespace(file, stat);
   } finally { fs.closeSync(fd); }
+};
+// Recovery cannot infer a successful post-rename barrier from readable bytes.
+// Re-confirm only receipts authorizing cleanup, never scan archived history.
+const syncCompletionFileAsync = async (file: string, value: unknown): Promise<void> => {
+  const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || JSON.stringify(JSON.parse(await handle.readFile("utf8"))) !== JSON.stringify(value)) {
+      throw new Error(`Completion file changed before durability confirmation at ${file}`);
+    }
+    await handle.sync();
+    await syncPathNamespaceAsync(file, stat);
+  } finally { await handle.close(); }
 };
 const readReceiptAsync = async (file: string, id?: string): Promise<CompletionReceipt | undefined> => {
   const value = await readReplayFenceAsync<CompletionReceipt>(file);
@@ -589,8 +602,8 @@ export class CompletionJournal {
     }
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
       sameRecipient(address, recipient);
-    // Bound crash-left cleanup. Receipts are durable before archive admission;
-    // recovery reads them without fsyncing or rewriting unchanged history.
+    // Bound crash-left cleanup. A readable receipt may have failed its rename
+    // barrier, so re-confirm it before cleanup. Archived history stays untouched.
     let pruned = 0;
     const project = await canonicalAsync(recipient.projectRoot);
     for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
@@ -612,6 +625,7 @@ export class CompletionJournal {
         await this.#retireClaim(receipt.id, claim);
         if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
       } else {
+        await syncCompletionFileAsync(fence, receipt);
         if (path.dirname(target) === directory(this.meshRoot)) await archiveCompletionAsync(target);
         else await fs.promises.rm(target, { force: true });
       }
@@ -668,8 +682,9 @@ export class CompletionJournal {
     const file = receiptPath(this.meshRoot, id);
     const receipt = await readReceiptAsync(file, id);
     if (!receipt) return false;
-    // A validated replay fence suppresses this outcome. Receipt durability belongs
-    // to consumeCompletion, not a repeated idle-drain fsync of unchanged files.
+    // Receipt visibility suppresses replay, but only successful file/namespace
+    // barriers authorize claim retirement and source cleanup after a restart.
+    await syncCompletionFileAsync(file, receipt);
     const recipient = this.recipient;
     const targets: string[] = [];
     for (const target of [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)]) {

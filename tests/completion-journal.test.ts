@@ -464,7 +464,7 @@ describe("completion journal idle scans", () => {
     expect(fs.existsSync(h.file(foreignProject.id))).toBe(true); expect(fs.existsSync(h.file(foreignLane.id))).toBe(true);
   });
 
-  it("archives crash-left bodies with plain receipt reads and no namespace fsync", async () => {
+  it("archives crash-left bodies only after async receipt and namespace confirmation", async () => {
     const h = setup(); const a = h.seed(1), b = h.seed(2);
     const receipts = path.dirname(h.receipt(a.id)); fs.mkdirSync(receipts, { recursive: true });
     const receipt = (id: string) => JSON.stringify({ id, sessionId: h.recipient.sessionId, consumedAt: 1 });
@@ -472,14 +472,17 @@ describe("completion journal idle scans", () => {
     const counts = new Map<string, number>(); const open = fs.promises.open;
     vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       const handle = await open(...args);
-      vi.spyOn(handle, "sync").mockImplementation(async () => { const file = String(args[0]); counts.set(file, (counts.get(file) ?? 0) + 1); throw new Error("unexpected sync"); });
+      const syncHandle = handle.sync.bind(handle);
+      vi.spyOn(handle, "sync").mockImplementation(async () => { const file = String(args[0]); counts.set(file, (counts.get(file) ?? 0) + 1); await syncHandle(); });
       return handle;
     });
     const sync = vi.spyOn(fs, "fsyncSync"); const journal = h.journal(); await journal.drain();
     h.seed(1); await journal.drain();
     h.seed(1); const replacement = `${h.receipt(a.id)}.replacement`; fs.writeFileSync(replacement, receipt(a.id)); fs.renameSync(replacement, h.receipt(a.id));
     await journal.drain();
-    expect(counts.size).toBe(0); expect(sync).not.toHaveBeenCalled();
+    expect(counts.get(h.receipt(a.id))).toBe(3); expect(counts.get(h.receipt(b.id))).toBe(1);
+    if (process.platform !== "win32") expect(counts.get(receipts)).toBe(4);
+    expect(sync).not.toHaveBeenCalled();
     expect(fs.existsSync(h.file(a.id))).toBe(false); expect(fs.existsSync(h.archive(a.id))).toBe(true);
     expect(fs.existsSync(h.archive(b.id))).toBe(true);
   });

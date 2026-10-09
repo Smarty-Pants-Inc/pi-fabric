@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
@@ -73,15 +74,87 @@ describe("completion receipt-time archive", () => {
     expect(fs.existsSync(h.file(result.id))).toBe(true); expect(fs.existsSync(h.archive(result.id))).toBe(false);
   });
 
-  it.each([false, true])("recovers receipt-before-rename crash with plain reads, claim=%s", async claim => {
+  it.skipIf(process.platform === "win32").each([false, true])("re-syncs a post-rename receipt before recovery cleanup, claim=%s", async claim => {
+    const h = setup(); const result = h.seed(1); const enqueue = vi.fn();
+    const attempt = path.join(h.directory, "attempts", path.basename(h.file(result.id)));
+    fs.mkdirSync(path.dirname(attempt)); fs.copyFileSync(h.file(result.id), attempt);
+    if (claim) await h.journal(enqueue).drain();
+    const rename = fs.renameSync; const sync = fs.fsyncSync; let receiptRenamed = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to); if (String(to) === h.receipt(result.id)) receiptRenamed = true;
+    });
+    const failure = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (receiptRenamed && fs.fstatSync(fd).isDirectory()) throw new Error("receipt directory sync failed");
+      sync(fd);
+    });
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("receipt directory sync failed");
+    expect(receiptRenamed).toBe(true); expect(fs.existsSync(h.file(result.id))).toBe(true);
+    expect(fs.existsSync(h.archive(result.id))).toBe(false);
+    const before = fs.readFileSync(h.receipt(result.id), "utf8"); const stat = fs.statSync(h.receipt(result.id));
+    failure.mockRestore();
+    const recovered = h.journal(enqueue); const open = fs.promises.open;
+    let blocked = true; let receiptDirectorySynced = false; let archives = 0;
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args); const syncHandle = handle.sync.bind(handle);
+      if (String(args[0]) === path.dirname(h.receipt(result.id))) vi.spyOn(handle, "sync").mockImplementation(async () => {
+        if (blocked) throw new Error("recovery directory sync failed");
+        await syncHandle(); receiptDirectorySynced = true;
+      });
+      return handle;
+    });
+    const renameAsync = fs.promises.rename;
+    vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === h.file(result.id)) { expect(receiptDirectorySynced).toBe(true); archives++; }
+      await renameAsync(from, to);
+    });
+    const removeClaim = vi.spyOn(h.mesh, "delete");
+    await expect(recovered.drain()).rejects.toThrow("recovery directory sync failed");
+    expect(removeClaim).not.toHaveBeenCalled(); expect(fs.existsSync(h.file(result.id))).toBe(true);
+    expect(fs.existsSync(attempt)).toBe(true);
+    expect(fs.existsSync(h.archive(result.id))).toBe(false);
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(claim ? 1 : 0);
+    blocked = false; await recovered.drain(); await recovered.drain();
+    expect(archives).toBe(1); expect(enqueue).toHaveBeenCalledTimes(claim ? 1 : 0);
+    expect(fs.existsSync(attempt)).toBe(false);
+    expect(fs.existsSync(h.file(result.id))).toBe(false); expect(fs.existsSync(h.archive(result.id))).toBe(true);
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    expect(fs.readFileSync(h.receipt(result.id), "utf8")).toBe(before);
+    expect(fs.statSync(h.receipt(result.id))).toMatchObject({ ino: stat.ino, mtimeMs: stat.mtimeMs });
+  });
+
+  it.skipIf(process.platform === "win32")("a fresh process re-syncs a failed receipt rename before exactly one archive", () => {
+    const h = setup(); const result = h.seed(1); const rename = fs.renameSync; const sync = fs.fsyncSync; let renamed = false;
+    const renames = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to); if (String(to) === h.receipt(result.id)) renamed = true;
+    });
+    const failure = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (renamed && fs.fstatSync(fd).isDirectory()) throw new Error("post-rename sync failed");
+      sync(fd);
+    });
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("post-rename sync failed");
+    failure.mockRestore(); renames.mockRestore();
+    const receipt = fs.readFileSync(h.receipt(result.id), "utf8");
+    const script = `import fs from 'node:fs'; import {CompletionJournal} from ${JSON.stringify(path.resolve("src/agents/completion-journal.ts"))};
+      const open=fs.promises.open, rename=fs.promises.rename; let synced=false, archives=0;
+      fs.promises.open=async (...args)=>{const handle=await open(...args); const sync=handle.sync.bind(handle);
+        if(String(args[0])===${JSON.stringify(path.dirname(h.receipt(result.id)))}) handle.sync=async()=>{await sync(); synced=true;}; return handle;};
+      fs.promises.rename=async (from,to)=>{if(String(from)===${JSON.stringify(h.file(result.id))}){if(!synced) throw new Error('unconfirmed receipt'); archives++;} await rename(from,to);};
+      const journal=new CompletionJournal(${JSON.stringify(h.meshRoot)},${JSON.stringify(h.recipient)},{list:()=>[]},{listAll:()=>[],get:()=>undefined},()=>{throw new Error('redelivered');});
+      await journal.drain(); await journal.drain(); console.log(JSON.stringify({synced,archives}));`;
+    expect(JSON.parse(execFileSync("bun", ["--eval", script], { encoding: "utf8", timeout: 15_000 }))).toEqual({ synced: true, archives: 1 });
+    expect(fs.existsSync(h.file(result.id))).toBe(false); expect(fs.existsSync(h.archive(result.id))).toBe(true);
+    expect(fs.readFileSync(h.receipt(result.id), "utf8")).toBe(receipt);
+  });
+
+  it.each([false, true])("recovers receipt-before-rename crash with async confirmation, claim=%s", async claim => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
     if (claim) await journal.drain(false);
     const crash = crashBeforeArchive(h.file(result.id));
     expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("crash before archive"); crash.mockRestore();
     const before = fs.readFileSync(h.receipt(result.id), "utf8"); const mtime = fs.statSync(h.receipt(result.id)).mtimeMs;
-    const enqueue = vi.fn(); const probes = noDrainSync();
+    const enqueue = vi.fn(); const sync = vi.spyOn(fs, "fsyncSync"); const open = vi.spyOn(fs.promises, "open");
     await h.journal(enqueue).drain(); await h.journal(enqueue).drain();
-    expect(probes.sync).not.toHaveBeenCalled(); expect(probes.handles.every(spy => spy.mock.calls.length === 0)).toBe(true);
+    expect(sync).not.toHaveBeenCalled(); expect(open.mock.calls.filter(([file]) => String(file) === h.receipt(result.id))).toHaveLength(1);
     expect(enqueue).not.toHaveBeenCalled(); expect(fs.existsSync(h.file(result.id))).toBe(false); expect(fs.existsSync(h.archive(result.id))).toBe(true);
     expect(fs.readFileSync(h.receipt(result.id), "utf8")).toBe(before); expect(fs.statSync(h.receipt(result.id)).mtimeMs).toBe(mtime);
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
@@ -159,8 +232,9 @@ describe("completion receipt-time archive", () => {
   it("retains archive and receipt while an exact-owner claim deletion is refused", async () => {
     const h = setup(); const result = h.seed(1); const journal = h.journal(); await journal.drain(false);
     consumeCompletion(h.meshRoot, result.id, "main"); vi.spyOn(h.mesh, "delete").mockRejectedValue(new Error("CAS refused"));
-    const probes = noDrainSync(); await journal.drain(false);
-    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1); expect(probes.sync).not.toHaveBeenCalled();
+    const sync = vi.spyOn(fs, "fsyncSync"); const open = vi.spyOn(fs.promises, "open"); await journal.drain(false);
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1); expect(sync).not.toHaveBeenCalled();
+    expect(open.mock.calls.filter(([file]) => String(file) === h.receipt(result.id))).toHaveLength(1);
     expect(fs.existsSync(h.archive(result.id))).toBe(true); expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
   });
 });

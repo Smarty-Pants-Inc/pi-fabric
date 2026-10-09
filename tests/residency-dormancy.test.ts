@@ -221,6 +221,42 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { prove(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it.each(["rejection", "abort"] as const)("rechecks dormancy after a presence refresh %s clears live Main protection", async outcome => {
+    const { root, config, host } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    const error = Object.assign(new Error(`presence refresh ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error" });
+    let mainLive = true;
+    let fail: (() => void) | undefined;
+    let update: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      vi.spyOn(wake, "assertResidentWakeWatch").mockResolvedValue();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const get = host.participants.get.bind(host.participants);
+      vi.spyOn(host.participants, "get").mockImplementation((id, ...rest) => id === config.rootId
+        ? mainLive ? { id: config.rootId, kind: "root", rootId: config.rootId } as never : undefined : get(id, ...rest));
+      const checks = vi.spyOn(host.actors, "hasDormantIdleActor");
+      const actor = await host.actors.create({ name: `failed-presence-${outcome}`, instructions: "supervise", events: ["agent_settled"], residency: "durable" });
+      await until(() => checks.mock.calls.some(([protectedIds]) => protectedIds?.has(actor.id)));
+      expect(host.actors.status(actor.id).status).toBe("idle");
+
+      const pending = new Promise<void>((_resolve, reject) => { fail = () => reject(error); });
+      const refresh = vi.spyOn(host.participants, "refreshPresence").mockImplementationOnce(() => pending);
+      checks.mockClear();
+      update = host.actors.setInstructions(actor.id, "supervise after presence clears");
+      // Consume the mutation's idle check while Main still protects the actor;
+      // clearing presence below must not require another actor event or timer.
+      await until(() => refresh.mock.calls.length === 1 && checks.mock.calls.some(([protectedIds]) => protectedIds?.has(actor.id)));
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      mainLive = false;
+      fail!();
+      await update;
+      expect(warn).toHaveBeenCalledWith(`[pi-fabric] host actor presence: ${error.message}`);
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
+    } finally { if (update) { fail?.(); await update; } vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["no-op", "failure"] as const)("does not retry a %s dormancy commit without a new event", async outcome => {
     const { root, host } = fixture();
     try {

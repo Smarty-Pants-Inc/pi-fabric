@@ -547,8 +547,11 @@ export class ResidentHost {
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         presencePublisher: { refresh: async () => {
-          await this.participants.refreshPresence();
-          this.#scheduleIdleCheck();
+          try {
+            await this.participants.refreshPresence();
+          } finally {
+            this.#scheduleIdleCheck();
+          }
         }, schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,

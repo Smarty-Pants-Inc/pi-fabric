@@ -1153,7 +1153,8 @@ interface FabricMeshStateEntry<T = unknown> {
 interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
   /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
-  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
+  /** key (1-200 chars) makes a retry idempotent: within 7 days the same key from the same publisher returns the original event. */
+  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; key?: string; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;

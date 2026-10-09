@@ -14,7 +14,7 @@ The directory stores participant records separately from short-lived execution-h
 
 ## Topics (durable channels)
 
-- `mesh.publish({ topic, kind?, to?, text?, data? })` returns a `FabricMeshEvent`. Use `to` for a direct message.
+- `mesh.publish({ topic, kind?, to?, text?, data?, key? })` returns a `FabricMeshEvent`. Use `to` for a direct message. Pass a stable `key` (1-200 characters) when you may retry after an uncertain outcome: within 7 days, the same key from the same publisher returns the original event (same `id` and `sequence`) and publishes nothing, so the event is delivered once. Keys are scoped to the publisher, so other actors cannot collide with or suppress yours. Reusing a live key for a different topic, kind or recipient fails; after 7 days the key publishes again.
 - `mesh.read({ after?, topic?, to?, limit? })` returns `FabricMeshEvent[]` by cursor, topic, or recipient. Each event has `{ id, sequence, topic, kind, from, to?, text?, data?, createdAt }`.
 
 Topics provide durable channel and direct-message semantics with sequence cursors.

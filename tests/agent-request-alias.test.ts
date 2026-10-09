@@ -110,3 +110,25 @@ describe("alias thinking levels", () => {
     expect(request.thinking).toBe("low");
   });
 });
+
+describe("denied configured default falls back to the caller (#2890, review P2)", () => {
+  const caller = { inheritedModel: { provider: "dest", id: "caller" }, inheritedThinking: "high" };
+  const inherited = { model: "dest/caller", thinking: "high" };
+  it.each([
+    ["exact", "dest/denied", ["dest/denied"]],
+    ["case and whitespace variant", "  Dest/Denied ", ["dest/denied"]],
+    ["denied list variant", "dest/denied", [" DEST/DENIED "]],
+  ])("treats a %s as denied", (_label, model, deniedModels) => {
+    expect(normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model, deniedModels }))
+      .toMatchObject(inherited);
+  });
+  it("treats an alias whose target is denied as denied", () => {
+    expect(normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model: "Shallow", deniedModels: ["google/gemini-2.5-flash"] }))
+      .toMatchObject(inherited);
+  });
+  it("keeps an allowed configured model", () => {
+    // An allowed configured default stays a default (the manager applies it), never the caller's binding.
+    const request = normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model: "dest/ok", deniedModels: ["dest/denied"] });
+    expect(request.model ?? "dest/ok").toBe("dest/ok");
+  });
+});

@@ -192,7 +192,7 @@ export interface FabricAgentConfig {
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
   /** Configured effort only; excludes the built-in thinking fallback. */
-  configuredThinking?: FabricThinking;
+  configuredThinking?: FabricThinking | undefined;
   maxConcurrent: number;
   maxPerExecution: number;
   maxDepth: number;

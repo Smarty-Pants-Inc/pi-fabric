@@ -9,6 +9,26 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
   throw new Error(`Invalid Fabric agent kernel: ${String(value)}`);
 };
 
+/**
+ * True when fleet policy would deny the configured selector: the selector itself or any target of the alias it
+ * names, compared as assertFabricModelAllowed compares (trimmed, case-insensitive). ponytail: any denied alias
+ * target counts, because alias resolution may pick it; a denied configured default then falls back to the
+ * caller's admitted binding instead of failing later in the policy check.
+ */
+const configuredModelDenied = (
+  model: string,
+  denied: readonly string[] | undefined,
+  aliases: FabricModelAliases | undefined,
+): boolean => {
+  if (!denied?.length) return false;
+  const blocked = new Set(denied.map((entry) => entry.trim().toLowerCase()));
+  const key = model.trim().toLowerCase();
+  if (blocked.has(key)) return true;
+  const name = aliases ? Object.keys(aliases).find((alias) => alias.toLowerCase() === key) : undefined;
+  const targets = name !== undefined && aliases ? aliases[name]?.targets ?? [] : [];
+  return targets.some((target) => blocked.has(target.trim().toLowerCase()));
+};
+
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
   defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; configuredThinking?: AgentRunRequest["thinking"]; deniedModels?: readonly string[]; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
@@ -31,7 +51,8 @@ export const normalizeAgentRunRequest = (
   const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
   // A configured default that fleet policy denies does not win: fall back to the caller's admitted
   // binding (#2490), so the deny-replacement path stays where it was before #6062.
-  const configuredModel = runner === "pi" && defaults.model && !defaults.deniedModels?.includes(defaults.model)
+  const configuredModel = runner === "pi" && defaults.model
+    && !configuredModelDenied(defaults.model, defaults.deniedModels, defaults.models?.aliases)
     ? defaults.model : undefined;
   // Configured defaults win. Otherwise inherit the caller's admitted Pi binding,
   // also in actor/task processes whose Main target is remote. Never infer from that target.

@@ -5461,12 +5461,17 @@ export class ActorManager {
     // Index this snapshot's accepted queue receipts before importing pending. Own
     // work loads before predecessors; the same index also covers mixed queue/pending
     // snapshots without allowing a restore-time rewrite to drop unimported work.
+    // Mirror the queue loop's ID acceptance: a record whose ID is already held (or
+    // repeated in this snapshot) is rejected there, so its receipt must not clear
+    // pending here; held work's own receipts are indexed above.
+    const preindexed = new Set(heldItems.map(item => item.id));
     for (const record of records) {
       if (typeof record !== "object" || record === null) continue;
       const value = record as Partial<ActorQueueItem>;
-      if (typeof value.id !== "string" || typeof value.source !== "string" ||
-          typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null ||
-          (saved.cancelled === true && !(value.source === "child-completion" && value.deferredHandoff === true))) continue;
+      if (typeof value.id !== "string" || typeof value.source !== "string" || preindexed.has(value.id) ||
+          typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null) continue;
+      preindexed.add(value.id);
+      if (saved.cancelled === true && !(value.source === "child-completion" && value.deferredHandoff === true)) continue;
       for (const id of this.#settledDeliveryReceipts(value)) settledReceipts.add(id);
     }
     // A later predecessor may carry the destination queue rather than pending.

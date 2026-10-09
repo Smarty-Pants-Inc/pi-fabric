@@ -1935,3 +1935,82 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     await expect(provider.invoke("create", { name: "provider-invalid", instructions: "Observe.", activation: { minIntervalMs: -1 } }, context)).rejects.toThrow(/activation|minIntervalMs/);
   });
 });
+
+describe("actor settled round 5 return-lineage regression", () => {
+  it("r5-preindex: A->B->A return keeps newer pending B when the incoming coalesced id X is rejected", async () => {
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settled-lineage-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    closers.push(() => agents.close());
+    const alive = new Map<string, boolean>([["session:a", true]]);
+    const host = (name: string, rootId: string, owns: () => boolean | undefined = () => undefined) => {
+      const value = new ActorManager(name, { id: `${rootId}:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId, claimResidency: "session",
+          canManageActor: owns, lineageAlive: (lineage) => alive.get(lineage) ?? true,
+          adoptionGraceMs: 0, releasePaused: true, meshCursorPath: path.join(root, `cursor-${name}.json`),
+        });
+      closers.push(() => value.close());
+      value.resumeQueued();
+      return value;
+    };
+    type Item = { id: string; payload: { marker?: string }; settledDeliveryId?: string; settledDeliveryIds?: string[] };
+    type Snapshot = { items: Item[]; settledWindows?: Array<{ pending: { deliveryId?: string; payload: { marker?: string } } }> };
+    const read = (file: string): Snapshot => JSON.parse(fs.readFileSync(file, "utf8"));
+    const queueFile = (rootId: string) => path.join(root, "actors", actorId,
+      `queue-${createHash("sha256").update([rootId, "session"].join("\0")).digest("hex").slice(0, 16)}.json`);
+    const a = host("owner-a", "session:a", () => (alive.get("session:a") ? true : undefined));
+    const actor = await a.create({ name: "r5-lineage", instructions: "Observe.", events: ["agent_settled"],
+      coalesce: true, activation: { minIntervalMs: 1_000 } });
+    const actorId = actor.id;
+    const fileA = queueFile("session:a"), fileB = queueFile("session:b");
+    a.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    a.dispatchHostEvent("agent_settled", { ...payload(), marker: "payload-a" });
+    await waitFor(() => fs.existsSync(fileA) && read(fileA).items[0]?.payload.marker === "payload-a" && !read(fileA).settledWindows);
+    const idX = read(fileA).items[0]!.id;
+    const receiptA = read(fileA).items[0]!.settledDeliveryId;
+    a.dispatchHostEvent("agent_settled", { ...payload(), marker: "payload-b" });
+    const pendingB = read(fileA).settledWindows?.[0]?.pending.deliveryId;
+    expect(receiptA).toEqual(expect.any(String));
+    expect(pendingB, "payload-b must be a newer pending delivery behind coalesced X/A").toEqual(expect.any(String));
+    await a.close();
+    alive.set("session:a", false);
+    // B genuinely claims A through manager adoption; only B's unlink of A's file fails.
+    const remove = fs.rmSync;
+    const unlinkFailure = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === fileA) throw new Error("r5b predecessor unlink unavailable");
+      remove(target, options);
+    });
+    alive.set("session:b", true);
+    const b = host("adopter-b", "session:b");
+    await waitFor(() => b.status(actorId).rootId === "session:b");
+    await waitFor(() => fs.existsSync(fileB) && read(fileB).items[0]?.settledDeliveryId === pendingB && !read(fileB).settledWindows);
+    const savedB = read(fileB);
+    expect(savedB.items).toEqual([expect.objectContaining({ id: idX, payload: expect.objectContaining({ marker: "payload-b" }) })]);
+    const savedA = read(fileA);
+    expect(savedA.items).toEqual([expect.objectContaining({ id: idX, payload: expect.objectContaining({ marker: "payload-a" }) })]);
+    expect(savedA.settledWindows?.[0]?.pending).toMatchObject({ deliveryId: pendingB, payload: { marker: "payload-b" } });
+    await b.close();
+    alive.set("session:b", false);
+    unlinkFailure.mockRestore();
+    alive.set("session:a", true);
+    const back = host("owner-a", "session:a");   // A genuinely adopts back from B
+    await waitFor(() => back.status(actorId).rootId === "session:a");
+    back.resumeAfterRelease();
+    const transcriptFile = path.join(root, "actors", actorId, "session.jsonl");
+    const executed = () => !fs.existsSync(transcriptFile) ? [] : fs.readFileSync(transcriptFile, "utf8").trim().split("\n")
+      .map(line => JSON.parse(line) as { message?: { role?: string; content?: unknown } })
+      .filter(entry => entry.message?.role === "user")
+      .flatMap(entry => [...String(entry.message?.content).matchAll(/"marker":\s*"([^"]+)"/g)].map(match => match[1]));
+    await waitFor(() => back.status(actorId).status === "idle" && back.status(actorId).queued === 0 &&
+      back.inFlightCount() === 0 && executed().length > 0);
+    await new Promise(resolve => setTimeout(resolve, 1_500));   // any trailing pending deadline would have fired
+    console.info("r5-preindex evidence", JSON.stringify({ idX, receiptA, pendingB, executed: executed() }));
+    expect(executed()).toEqual(["payload-b"]);   // stale payload-a coalesced away; latest B exactly once
+  }, 30_000);
+});

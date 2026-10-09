@@ -78,13 +78,13 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
-    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000) => {
+    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000, kind = "handoff") => {
       const id = randomUUID();
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
       const sequence = (lines.length ? (JSON.parse(lines.at(-1)!) as { sequence: number }).sequence : 0) + 1;
       fs.appendFileSync(log, `${JSON.stringify({
-        id, sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
+        id, sequence, topic: "fleet.work.pi-fabric.1", kind,
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
         ...(to ? { to } : {}),
         text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - ageMs,
@@ -155,7 +155,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
 
   it("summarises a 20-hour backlog once at turn start without injecting work or chaining turns (#3036)", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();
-    for (let index = 0; index < 45; index++) missedWork(`stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    for (let index = 0; index < 45; index++) missedWork(`stale shadow ${index}`, undefined, 20 * 60 * 60_000, "progress");
     let inferences = 0;
     faux.setResponses([() => { inferences++; return fauxAssistantMessage("next"); },
       () => { inferences++; return fauxAssistantMessage("unwanted backlog wake"); }]);
@@ -176,7 +176,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
     let inferences = 0;
     faux.setResponses([() => { inferences++; return fauxAssistantMessage("must not wake"); }]);
-    for (let index = 0; index < 45; index++) missedWork(`idle stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    for (let index = 0; index < 45; index++) missedWork(`idle stale shadow ${index}`, undefined, 20 * 60 * 60_000, "progress");
     const summaries = () => session.sessionManager.getEntries().filter(entry => entry.type === "custom_message" &&
       entry.customType === "pi-fabric-inbox-summary");
     const deadline = Date.now() + 10_000;
@@ -188,6 +188,22 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(summaries()).toHaveLength(1);
     expect(inferences).toBe(0);
     expect(session.isStreaming).toBe(false);
+  }, 60_000);
+
+  it("delivers a three-hour-old addressed answer to Main with its age, only once (#4313)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start();
+    missedWork("BLOCKED: lane needs Main", undefined, 3 * 60 * 60_000, "answer");
+    faux.setResponses([() => {
+      expect(inboxMessages()).toHaveLength(1);
+      const content = JSON.stringify(inboxMessages()[0]);
+      expect(content).toContain("(delivered late: created ");
+      expect(content).toContain("3 h ago) BLOCKED: lane needs Main");
+      return fauxAssistantMessage("seen blocker");
+    }]);
+    await session.prompt("drain old results");
+    faux.setResponses([fauxAssistantMessage("no duplicate")]);
+    await session.prompt("drain again");
+    expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 
   it("brings a missed work event to the next turn, and only once", async () => {
@@ -415,6 +431,66 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+  }, 60_000);
+
+  // A passive followUp records context without inference. Its receipt prevents repeated idle
+  // injection and a second copy at before_agent_start (Pi's nextTurn queue has no receipt yet).
+  const occurrences = (value: unknown, needle: string) => JSON.stringify(value).split(needle).length - 1;
+  const threeHours = 3 * 60 * 60_000;
+
+  it("queues a late answer for an idle Main's next natural turn without a model turn, and brings it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    const id = missedWork("LATE-IDLE-553 answer for Main", undefined, threeHours, "answer");
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read the late answer");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await until(() => inboxMessages().length > 0 || faux.state.callCount > calls, 5_000);
+    expect(inboxMessages()).toHaveLength(1);
+    // Many idle ticks after passive admission: no inference and no second copy.
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("3 h ago) LATE-IDLE-553 answer for Main");
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    faux.setResponses([fauxAssistantMessage("again")]);
+    await session.prompt("again");
+    expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("does not chain an inference for a late answer that arrives during a run; the next turn takes it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    let id = "";
+    faux.setResponses([
+      () => { id = missedWork("LATE-SETTLE-553 answer for Main", undefined, threeHours, "answer"); return fauxAssistantMessage("working"); },
+      fauxAssistantMessage("unexpected chained turn"),
+    ]);
+    await session.prompt("work");
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read it");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 2);
   }, 60_000);
 
   it("is inert on a Pi without the preflight capability: an idle Main takes the event at its next turn", async () => {

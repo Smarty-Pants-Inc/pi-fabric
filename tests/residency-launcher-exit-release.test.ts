@@ -22,67 +22,81 @@ const snapshot = (directory: string, files = new Map<string, string>()): Map<str
   }
   return files;
 };
-afterEach(() => {
-  vi.restoreAllMocks();
-  delete process.env.PI_FABRIC_EXIT_FD;
-});
+const exitLines = (residencyRoot: string): Array<Record<string, unknown>> => {
+  try {
+    return fs.readFileSync(path.join(residencyRoot, "launcher.log"), "utf8").trim().split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>).filter(row => row.event === "resident-exit");
+  } catch { return []; }
+};
+afterEach(() => { vi.restoreAllMocks(); });
 
-// smarty-dev#7770 / #1882: the exit marker (which the launcher logs into
-// launcher.log) and error.json are root writes. After the host releases
-// owner.json the root may belong to the next generation: nothing more.
-it("a failure from close() after the release writes no marker, no error.json, nothing late", { timeout: 60_000 }, async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-exit-release-"));
-  const sessionId = "exit-release";
+const harness = (name: string) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `resident-exit-${name}-`));
+  const sessionId = `exit-${name}`;
   const meshRoot = path.join(root, "mesh");
   const residencyRoot = residentRoot(meshRoot, `session:${sessionId}`);
   const config: ResidentHostConfig = {
     format: 1, rootId: `session:${sessionId}`, sessionId, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"), residencyRoot,
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   fs.mkdirSync(residencyRoot, { recursive: true, mode: 0o700 });
   const configPath = path.join(residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
-  // The launcher's exit channel, here a file outside the snapshotted mesh/.
-  const channel = fs.openSync(path.join(root, "exit-channel"), "w");
-  process.env.PI_FABRIC_EXIT_FD = String(channel);
   const ownerPath = path.join(residencyRoot, "owner.json");
-  const markers: Array<{ line: string; owned: boolean }> = [];
-  const writeSync = fs.writeSync;
-  vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, data: string, ...rest: never[]) => {
-    if (String(data).startsWith("pi-fabric-resident-exit ")) markers.push({ line: String(data), owned: fs.existsSync(ownerPath) });
-    return writeSync(fd, data, ...rest);
-  }) as typeof fs.writeSync);
-  // The release is the last step of close(); this failure surfaces after it.
-  vi.spyOn(AgentManager.prototype, "close").mockRejectedValue(new Error("injected teardown failure"));
-  let released: Map<string, string> | undefined;
+  // The hook: at owner.json removal (the release), what launcher.log and mesh/ hold.
+  const atRelease: { lines?: Array<Record<string, unknown>>; files?: Map<string, string> } = {};
   const rmSync = fs.rmSync;
   vi.spyOn(fs, "rmSync").mockImplementation(((file: fs.PathLike, options?: fs.RmOptions) => {
     rmSync(file, options);
-    if (String(file) === ownerPath) released = snapshot(meshRoot);
+    if (String(file) === ownerPath) { atRelease.lines = exitLines(residencyRoot); atRelease.files = snapshot(meshRoot); }
   }) as typeof fs.rmSync);
-  const controller = new AbortController();
+  const late = (): string[] => [...snapshot(meshRoot)].filter(([file, stamp]) => atRelease.files!.get(file) !== stamp)
+    .map(([file]) => path.relative(root, file));
+  return { root, residencyRoot, configPath, ownerPath, atRelease, late };
+};
+
+// smarty-dev#7770: a clean idle exit must not look like an outside kill. The
+// host names it in launcher.log itself, synchronously, while it owns the root.
+it("an idle exit leaves one resident-exit idle-exit line, written before owner.json is removed", { timeout: 60_000 }, async () => {
+  const h = harness("idle");
   try {
-    const run = runResidentHostFromConfigPath(configPath, controller.signal);
-    await waitFor(() => fs.existsSync(ownerPath), 30_000);
-    controller.abort();
-    await expect(run).rejects.toThrow("injected teardown failure");
-    expect(released).toBeDefined();
-    const late = [...snapshot(meshRoot)].filter(([file, stamp]) => released!.get(file) !== stamp).map(([file]) => path.relative(root, file));
-    expect(late).toEqual([]);
-    expect(fs.existsSync(path.join(residencyRoot, "error.json"))).toBe(false);
-    // One marker, written while the host still owned the root.
-    expect(markers).toEqual([{ line: 'pi-fabric-resident-exit {"reason":"stopped"}\n', owned: true }]);
-    expect(fs.readFileSync(path.join(root, "exit-channel"), "utf8")).toBe('pi-fabric-resident-exit {"reason":"stopped"}\n');
-    // The host adopted the channel (and closed this fd): never close it here,
-    // its number may already be reused in this process.
-    // Workers the host spawns never inherit the channel's address.
-    expect(process.env.PI_FABRIC_EXIT_FD).toBeUndefined();
+    const run = runResidentHostFromConfigPath(h.configPath);
+    await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    // Skip the 30 s idle window: the host's idle check reads Date.now().
+    const now = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
+    await run;
+    expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "idle-exit", pid: process.pid })]);
+    expect(exitLines(h.residencyRoot)).toHaveLength(1);
+    expect(h.late()).toEqual([]);
   } finally {
     vi.restoreAllMocks();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+// #1882: after the host releases owner.json the root may belong to the next
+// generation: no exit line, no error.json, nothing late.
+it("a failure from close() after the release writes no line, no error.json, nothing late", { timeout: 60_000 }, async () => {
+  const h = harness("release");
+  // The release is the last step of close(); this failure surfaces after it.
+  vi.spyOn(AgentManager.prototype, "close").mockRejectedValue(new Error("injected teardown failure"));
+  const controller = new AbortController();
+  try {
+    const run = runResidentHostFromConfigPath(h.configPath, controller.signal);
+    await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    controller.abort();
+    await expect(run).rejects.toThrow("injected teardown failure");
+    expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "stopped" })]);
+    expect(exitLines(h.residencyRoot)).toHaveLength(1);
+    expect(h.late()).toEqual([]);
+    expect(fs.existsSync(path.join(h.residencyRoot, "error.json"))).toBe(false);
+  } finally {
+    vi.restoreAllMocks();
+    fs.rmSync(h.root, { recursive: true, force: true });
   }
 });

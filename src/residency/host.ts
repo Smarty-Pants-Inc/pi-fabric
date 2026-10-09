@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
-import { RESIDENT_EXIT_MARKER, adoptExitChannel, type ResidentExitReason } from "./launcher-owner.js";
 import { randomUUID } from "node:crypto";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -1824,16 +1823,25 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
 
-/** The launcher's dedicated exit-reason pipe (PI_FABRIC_EXIT_FD); stderr never carries the marker. */
-let exitFd: number | undefined;
-/** Tells the launcher why this host exits; it names the reason in launcher.log (smarty-dev#7770). */
-const reportResidentExit = (reason: ResidentExitReason): void => {
-  if (exitFd === undefined) return;
-  try { fs.writeSync(exitFd, `${RESIDENT_EXIT_MARKER}${JSON.stringify({ reason })}\n`); } catch { /* best effort */ }
+/** Why a resident host exits (smarty-dev#7770). */
+export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";
+
+/**
+ * Names this host's exit in the root's launcher.log, in the launcher's trace
+ * shape (smarty-dev#7770). Call only while this host still owns the root: the
+ * launcher writes nothing after a clean owned exit (#2010), and nothing may.
+ */
+const reportResidentExit = (residencyRoot: string, reason: ResidentExitReason): void => {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(path.join(residencyRoot, "launcher.log"),
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    fs.appendFileSync(fd, `${JSON.stringify({ event: "resident-exit", at: Date.now(), reason, pid: process.pid })}\n`);
+  } catch { /* Diagnostics never block the release. */ }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } } }
 };
 
 const writeResidentError = (residencyRoot: string, error: unknown): void => {
-  reportResidentExit("error");
   try {
     atomicWrite(path.join(residencyRoot, "error.json"), {
       error: errorMessage(error),
@@ -1862,8 +1870,8 @@ const runResidentHost = async (
   // Every path reports while this host still owns the root: close releases
   // owner.json last, and nothing may write under the root after that (smarty-dev#1882).
   host.beforeRelease = (failure) => {
+    reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error");
     if (failure !== undefined) writeResidentError(config.residencyRoot, failure);
-    else reportResidentExit(reason ?? "error");
   };
   await host.start();
   if (signal?.aborted) {
@@ -1890,8 +1898,6 @@ export const runResidentHostFromConfigPath = async (
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
   let host: ResidentHost | undefined;
-  // Before any worker spawns: none may inherit the channel or its address.
-  if (process.env.PI_FABRIC_EXIT_FD) exitFd = adoptExitChannel();
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
     await runResidentHost(config, signal, modelRegistry, (created) => { host = created; });

@@ -29,6 +29,7 @@ import type { JevObservationHost } from "./jev/observation.js";
 import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
+import { isMainInterruptSupervisor } from "./interrupt-authority.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
 import { FabricComponentCatalog } from "./components/catalog.js";
 import { FabricComponentLoader } from "./components/loader.js";
@@ -661,6 +662,15 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
+      {
+        interruptFrom: () => this.config.agents.interruptFrom,
+        isSupervisor: (sender, rootId) => {
+          if (sender.kind !== "actor") return false;
+          try {
+            return isMainInterruptSupervisor(sender, rootId, this.#actors?.status(sender.id));
+          } catch { return false; }
+        },
+      },
     );
     this.#mainAgent = mainAgent;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;

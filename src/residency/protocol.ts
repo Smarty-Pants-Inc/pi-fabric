@@ -489,6 +489,8 @@ interface ResidentCreateActorCommand {
   requestId: string;
   rootId: string;
   request: FabricActorCreateRequest;
+  /** Optional verified owning Main; old/non-Main creators mint no interrupt delegation. */
+  caller?: ResidentActorCaller;
   createdAt: number;
 }
 

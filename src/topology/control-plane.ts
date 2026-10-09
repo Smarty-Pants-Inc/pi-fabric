@@ -73,6 +73,8 @@ export interface FabricControlCommand {
   deadlineAt?: number;
 }
 
+import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
+
 export interface FabricControlAcceptance {
   warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
@@ -91,14 +93,17 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
+  errorCode?: FabricInterruptErrorCode;
   /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
   notRun?: true;
 }
 
 /** An owner's rejection; `notRun` only when the owner proved the handler did not run. */
 class FabricControlRejection extends Error {
-  constructor(message: string, readonly notRun: boolean) {
+  constructor(message: string, readonly notRun: boolean, readonly code?: FabricInterruptErrorCode) {
     super(message);
+    if (code) this.name = code === "FABRIC_INTERRUPT_NOT_AUTHORIZED"
+      ? "FabricInterruptNotAuthorizedError" : "FabricInterruptRateLimitedError";
   }
 }
 
@@ -675,6 +680,7 @@ export class FabricControlPlane {
             ? `${error}; not delivered, safe to resend.`
             : error,
           acknowledged.notRun === true,
+          acknowledged.errorCode,
         );
       }
       return { commandId, acceptance: acknowledged };
@@ -994,6 +1000,8 @@ export class FabricControlPlane {
         ? { result: event.data.result }
         : {}),
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
+      ...(event.data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || event.data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
+        ? { errorCode: event.data.errorCode } : {}),
       ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
   }
@@ -1410,6 +1418,7 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
+          ...(acceptance.errorCode ? { errorCode: acceptance.errorCode } : {}),
           ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
           };
         },

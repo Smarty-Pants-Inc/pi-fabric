@@ -1,3 +1,4 @@
+import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
@@ -756,8 +757,10 @@ export class AgentMessageRouter {
         ...(command.data === undefined ? {} : { data: command.data }),
         });
       } catch (error) {
-        // A full followUp queue, for example: the sender sees why.
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+        // Admission refusals retain their typed code across verified mesh/bridge ACKs.
+        const errorCode = interruptErrorCode(error);
+        return { accepted: false, error: error instanceof Error ? error.message : String(error),
+          ...(errorCode ? { errorCode, notRun: true } : {}) };
       }
       return {
         accepted: true,

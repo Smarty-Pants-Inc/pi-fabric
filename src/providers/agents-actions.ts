@@ -543,11 +543,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "steer",
     description:
-      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. Optional priority interrupt aborts Main's running tool call and delivers the steer next, without retrying the tool. Default delivery is unchanged. Non-local targets route over the project mesh.",
+      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. Optional priority interrupt requires owning-root/supervisor or host allowlist authority, aborts at most once per Main turn, and has a 60-second sender cooldown. It delivers the steer next without retrying the tool. Default delivery is unchanged. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" }, message: { type: "string" }, data: {},
-        priority: { type: "string", enum: ["interrupt"], description: "Main only: abort its running tool call, then deliver this steer as the next user-role message." },
+        priority: { type: "string", enum: ["interrupt"], description: "Main only; separate interrupt authority required. One abort per turn, 60-second sender cooldown. Abort its tool, then deliver the steer next." },
         idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,

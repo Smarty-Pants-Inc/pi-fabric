@@ -240,6 +240,39 @@ describe("resident activation filter telemetry", () => {
   });
 });
 
+describe("verified resident supervisor creation (#7452)", () => {
+  it("mints a durable binding only for a freshly verified owning Main creator", async () => {
+    const { root, config, host } = fixture({}, true);
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const mesh = new MeshStore(config.meshRoot, 65536, 1000);
+    const participants = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity,
+    });
+    participants.registerSource(() => [{
+      format: 1, id: config.rootId, kind: "root", rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: config.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const client = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: true } as FabricMainAgentTarget });
+    const legacy = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: false } as FabricMainAgentTarget });
+    const request = { name: "supervisor", instructions: "Watch Main.", residency: "durable" as const,
+      events: ["agent_settled" as const], responseMode: "directive" as const, delivery: "steer" as const, triggerTurn: true };
+    try {
+      await participants.start(); await host.start();
+      const own = await client.createActor(request);
+      expect(own.supervisorFor).toBe(config.rootId);
+      expect(host.actors.status(own.id).supervisorFor).toBe(config.rootId);
+      const unbound = await legacy.createActor({ ...request, name: "legacy-supervisor", supervisorFor: config.rootId } as any);
+      expect(unbound.supervisorFor).toBeUndefined();
+    } finally {
+      await client.close(); await legacy.close(); await host.close(); await participants.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {
     const { root, config, host } = fixture();

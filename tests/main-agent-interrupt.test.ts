@@ -5,26 +5,32 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, type Context } from "
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
+import { loadFabricConfig } from "../src/config.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { MeshStore } from "../src/mesh/store.js";
 
-const from = { id: "session:sender", name: "sender", kind: "main" as const };
+const from = { id: "session:receiver", name: "owner", kind: "main" as const };
+const second = { id: "session:second", name: "second", kind: "main" as const };
 const closers: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
   for (const close of closers.splice(0).reverse()) await close();
   vi.unstubAllEnvs();
 });
 const wait = async (check: () => boolean) => vi.waitFor(() => expect(check()).toBe(true), { timeout: 5000, interval: 5 });
-const router = (main: MainAgentController) => new AgentMessageRouter(
+const router = (main: MainAgentController, identity = from) => new AgentMessageRouter(
   { status: () => { throw new Error("Unknown Fabric agent"); } } as any,
-  { identity: from } as any, main,
+  { identity } as any, main,
   { get: () => undefined, scheduleRefresh: () => {}, lastKnown: () => undefined } as any,
   undefined, binding => binding,
 );
-const setup = async (flushMs = 120_000) => {
+const setup = async (flushMs = 120_000, interruptFrom: string[] = []) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-interrupt-"));
   closers.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(agentDir);
+  fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { interruptFrom } }));
+  const config = loadFabricConfig({ cwd: root, agentDir, projectTrusted: true });
   const faux = fauxProvider();
   const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "absent-auth.json") });
   runtime.registerNativeProvider(faux.provider);
@@ -40,7 +46,7 @@ const setup = async (flushMs = 120_000) => {
         ctx.abort = () => { aborts++; abortAt = performance.now(); abort(); };
       });
       pi.on("session_start", (_event, ctx) => {
-        main = new MainAgentController(pi, "session:receiver", true, root);
+        main = new MainAgentController(pi, "session:receiver", true, root, undefined, true, undefined, { interruptFrom: () => config.agents.interruptFrom });
         main.attachFollowUpDrain(ctx, flushMs, path.join(root, "journal.json"));
       });
     }],
@@ -116,8 +122,8 @@ describe("Main interrupt-priority steer (#7452)", () => {
     const run = f.session.prompt("start work");
     try {
       await wait(() => fs.existsSync(path.join(f.root, "entered")));
-      f.main.deliverAgent({ from, message: "older followUp", delivery: "followUp" });
-      f.main.deliverAgent({ from, message: "priority HOLD", delivery: "steer", priority: "interrupt" });
+      f.main.deliverAgent({ from, verification: "mesh", message: "older followUp", delivery: "followUp" });
+      f.main.deliverAgent({ from, verification: "mesh", message: "priority HOLD", delivery: "steer", priority: "interrupt" });
       await run;
       await f.session.waitForIdle();
       const delivered = received(f.session);
@@ -128,14 +134,15 @@ describe("Main interrupt-priority steer (#7452)", () => {
     } finally { await f.session.abort(); await run.catch(() => undefined); }
   });
 
-  it("keeps consecutive interrupts in arrival order and aborts only once", async () => {
-    const f = await setup();
+  it("coalesces distinct authorized senders in arrival order and aborts only once", async () => {
+    const f = await setup(120_000, [second.id]);
     f.faux.setResponses([work(30), f.reply("first HOLD"), f.reply("second HOLD")]);
     const run = f.session.prompt("start work");
     try {
       await wait(() => fs.existsSync(path.join(f.root, "entered")));
-      f.main.deliverAgent({ from, message: "first priority HOLD", delivery: "steer", priority: "interrupt" });
-      f.main.deliverAgent({ from, message: "second priority HOLD", delivery: "steer", priority: "interrupt" });
+      f.main.deliverAgent({ from, verification: "mesh", message: "first priority HOLD", delivery: "steer", priority: "interrupt" });
+      const excess = f.main.deliverAgent({ from: second, verification: "mesh", message: "second priority HOLD", delivery: "steer", priority: "interrupt" });
+      expect(excess.reason).toContain("ordinary steer");
       await run;
       await f.session.waitForIdle();
       const delivered = received(f.session);
@@ -153,7 +160,7 @@ describe("Main interrupt-priority steer (#7452)", () => {
     const run = f.session.prompt("start work");
     try {
       await wait(() => fs.existsSync(path.join(f.root, "entered")));
-      f.main.deliverAgent({ from, message: "priority HOLD", delivery: "steer", priority: "interrupt" });
+      f.main.deliverAgent({ from, verification: "mesh", message: "priority HOLD", delivery: "steer", priority: "interrupt" });
       f.main.stop();
       await run;
       await f.session.waitForIdle();
@@ -169,7 +176,7 @@ describe("Main interrupt-priority steer (#7452)", () => {
     const run = f.session.prompt("ordinary work");
     try {
       await wait(() => fs.existsSync(path.join(f.root, "entered")));
-      f.main.deliverAgent({ from, message: "ordinary correction", delivery: "steer" });
+      f.main.deliverAgent({ from, verification: "mesh", message: "ordinary correction", delivery: "steer" });
       await new Promise(resolve => setTimeout(resolve, 50));
       expect(received(f.session)).toHaveLength(0);
       expect(f.events.some(item => item.type === "tool_execution_end")).toBe(false);
@@ -185,7 +192,7 @@ describe("Main interrupt-priority steer (#7452)", () => {
   it("idle Main handles interrupt priority as a plain steer", async () => {
     const f = await setup();
     f.faux.setResponses([f.reply("idle correction read")]);
-    const outcome = f.main.deliverAgent({ from, message: "idle HOLD", delivery: "steer", priority: "interrupt" });
+    const outcome = f.main.deliverAgent({ from, verification: "mesh", message: "idle HOLD", delivery: "steer", priority: "interrupt" });
     expect(outcome.triggered).toBe(true);
     await wait(() => f.contexts.length === 1);
     await f.session.waitForIdle();
@@ -225,11 +232,65 @@ describe("Main interrupt-priority steer (#7452)", () => {
     } finally { await f.session.abort(); await run.catch(() => undefined); }
   });
 
+  it("ordinary steer access cannot abort or deliver an unauthorized interrupt", async () => {
+    const f = await setup();
+    f.faux.setResponses([work(0), f.reply("ordinary peer steer read")]);
+    const run = f.session.prompt("keep working");
+    try {
+      await wait(() => fs.existsSync(path.join(f.root, "entered")));
+      await expect(router(f.main, second).routeMessage(f.main.id, "forbidden HOLD", undefined, "steer", undefined, { priority: "interrupt" }))
+        .rejects.toMatchObject({ code: "FABRIC_INTERRUPT_NOT_AUTHORIZED" });
+      expect(f.aborts()).toBe(0); expect(received(f.session)).toHaveLength(0);
+      await router(f.main, second).routeMessage(f.main.id, "ordinary peer correction", undefined, "steer");
+      fs.writeFileSync(path.join(f.root, "release"), "1"); await run;
+      expect(fs.existsSync(path.join(f.root, "completed"))).toBe(true);
+      expect(received(f.session)).toHaveLength(1);
+      expect(JSON.stringify(f.contexts)).not.toContain("forbidden HOLD");
+      expect(JSON.stringify(f.contexts)).toContain("ordinary peer correction");
+    } finally { await f.session.abort(); await run.catch(() => undefined); }
+  });
+
+  it("a host-allowlisted session aborts the native tool", async () => {
+    const f = await setup(120_000, [second.id]);
+    f.faux.setResponses([work(30), f.reply("allowlisted HOLD read")]);
+    const run = f.session.prompt("start work");
+    try {
+      await wait(() => fs.existsSync(path.join(f.root, "entered")));
+      await router(f.main, second).routeMessage(f.main.id, "allowlisted HOLD", undefined, "steer", undefined, { priority: "interrupt" });
+      await run; await f.session.waitForIdle();
+      expect(f.aborts()).toBe(1); expect(fs.existsSync(path.join(f.root, "completed"))).toBe(false);
+      expect(JSON.stringify(received(f.session))).toContain("allowlisted HOLD");
+    } finally { await f.session.abort(); await run.catch(() => undefined); }
+  });
+
+  it("cannot abort successive tools in the interrupted turn or repeat a sender inside cooldown", async () => {
+    const f = await setup(120_000, [second.id]);
+    f.faux.setResponses([work(30), work(0), f.reply("second tool finished with ordinary steer")]);
+    const run = f.session.prompt("start work");
+    try {
+      await wait(() => fs.existsSync(path.join(f.root, "entered")));
+      f.main.deliverAgent({ from, verification: "mesh", message: "first HOLD", delivery: "steer", priority: "interrupt" });
+      await wait(() => f.events.filter(item => item.type === "tool_execution_start").length === 2);
+      expect(() => f.main.deliverAgent({ from, verification: "mesh", message: "rate refused", delivery: "steer", priority: "interrupt" }))
+        .toThrow(expect.objectContaining({ code: "FABRIC_INTERRUPT_RATE_LIMITED" }));
+      f.main.deliverAgent({ from: second, verification: "mesh", message: "ordinary same-turn correction", delivery: "steer", priority: "interrupt" });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(f.aborts()).toBe(1);
+      expect(f.events.filter(item => item.type === "tool_execution_end")).toHaveLength(1);
+      fs.writeFileSync(path.join(f.root, "release"), "1");
+      await run; await f.session.waitForIdle();
+      expect(fs.existsSync(path.join(f.root, "completed"))).toBe(true);
+      expect(f.aborts()).toBe(1); expect(received(f.session)).toHaveLength(2);
+      expect(JSON.stringify(f.contexts)).toContain("ordinary same-turn correction");
+      expect(JSON.stringify(f.contexts)).not.toContain("rate refused");
+    } finally { await f.session.abort(); await run.catch(() => undefined); }
+  });
+
   it("validates priority and refuses non-Main targets instead of downgrading", async () => {
     const f = await setup();
-    expect(() => f.main.deliverAgent({ from, message: "bad", delivery: "steer", priority: "urgent" as any })).toThrow("priority must");
-    expect(() => f.main.deliverAgent({ from, message: "bad", delivery: "followUp", priority: "interrupt" })).toThrow("priority must");
-    expect(() => f.main.deliverAgent({ from, message: "bad", delivery: "steer", priority: "interrupt", triggerTurn: false })).toThrow("triggering steer");
+    expect(() => f.main.deliverAgent({ from, verification: "mesh", message: "bad", delivery: "steer", priority: "urgent" as any })).toThrow("priority must");
+    expect(() => f.main.deliverAgent({ from, verification: "mesh", message: "bad", delivery: "followUp", priority: "interrupt" })).toThrow("priority must");
+    expect(() => f.main.deliverAgent({ from, verification: "mesh", message: "bad", delivery: "steer", priority: "interrupt", triggerTurn: false })).toThrow("triggering steer");
     await expect(router(f.main).routeMessage("actor:other", "HOLD", undefined, "steer", undefined, { priority: "interrupt" })).rejects.toThrow("only for a Main");
     const plane = new FabricControlPlane(new MeshStore(path.join(f.root, "mesh"), 64 * 1024, 100), from, { enabled: true, hostId: from.id });
     closers.push(() => plane.close());

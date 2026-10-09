@@ -39,7 +39,29 @@ user-role Fabric message after the aborted run settles. Fabric does not retry th
 aborted tool. Older held followUps stay behind the HOLD. If Main is idle or has
 no active tool call, this is an ordinary steer. Omit priority to keep the
 existing tool-boundary queue. Only `"interrupt"` is valid; followUp, non-Main
-participants and legacy control routes reject it. Sender authority is unchanged.
+participants and legacy control routes reject it. Interrupt has narrower authority than
+ordinary steer: the verified sender must be this Main's own root session, its
+owner-created supervisor bound to that root, or a Main/session listed in host-only
+`agents.interruptFrom` (session ids or exact Main names; default `[]`). Workspace
+configuration cannot grant this authority. An unauthorized request fails with
+`FABRIC_INTERRUPT_NOT_AUTHORIZED` and is not delivered, even as an ordinary steer.
+Bridge admission checks the bridge-verified identity, never identities in message data.
+
+Main admits at most one actual interrupt per turn, including the HOLD-induced
+restart. Another authorized sender's interrupt in that turn becomes an ordinary
+steer without another abort. The same sender must wait 60 seconds between actual
+interrupts to this target; requests inside that window fail with
+`FABRIC_INTERRUPT_RATE_LIMITED` and are not delivered. Cooldown refusal takes
+precedence over same-turn coalescing; an idempotent retry of an already-admitted
+command remains a duplicate, not a second interrupt.
+
+The native supervisor convention is an owner-created `supervisor` or
+`*-supervisor` directive actor observing `agent_settled`, with `delivery: "steer"`
+and `triggerTurn: true`. Creation records an immutable `supervisorFor` root
+binding; a name, ordinary actor membership, later configuration changes or a
+forged message field cannot grant it. Old records without this binding remain
+closed; recreate the supervisor from its owning Main to grant it. Adoption to a
+different root does not transfer the original root's delegation.
 
 The receiver must run this Fabric version on a Pi host with `ctx.abort()` and
 `agent_settled`. Native cancellation is cooperative: a blocked event loop or a

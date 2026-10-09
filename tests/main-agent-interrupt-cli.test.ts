@@ -14,13 +14,14 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
     const clients: RpcClient[] = [];
     const events: Record<string, Event[]> = { receiver: [], sender: [] };
     let run: Promise<void> | undefined;
-    const make = (name: string) => {
+    const make = (name: string, interruptFrom: string[] = []) => {
       const cwd = path.join(root, name);
       const agentDir = path.join(cwd, "agent");
       fs.mkdirSync(agentDir, { recursive: true });
       fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false } }));
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { kernel: "typescript" }, fullCodeMode: name === "receiver" && tool === "fabric_exec",
         mesh: { enabled: true, announce: true, followUpFlushMs: 10 },
+        agents: { interruptFrom },
         mcp: { enabled: false }, jev: { enabled: false }, memory: { enabled: false },
         compaction: { engine: "pi" }, entropy: { compile: false }, speculation: { enabled: false },
       }));
@@ -39,9 +40,13 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
     const exists = (name: string, file: string) => fs.existsSync(path.join(root, name, file));
     const wait = async (check: () => boolean) => vi.waitFor(() => expect(check()).toBe(true), { timeout: 15_000, interval: 10 });
     try {
-      const receiver = make("receiver"), sender = make("sender");
-      await Promise.all(clients.map(client => client.start()));
-      await wait(() => exists("receiver", "ready.json") && exists("sender", "ready.json"));
+      const sender = make("sender");
+      await sender.start();
+      await wait(() => exists("sender", "ready.json"));
+      const senderReady = JSON.parse(fs.readFileSync(path.join(root, "sender", "ready.json"), "utf8"));
+      const receiver = make("receiver", [senderReady.id]);
+      await receiver.start();
+      await wait(() => exists("receiver", "ready.json"));
       const ready = JSON.parse(fs.readFileSync(path.join(root, "receiver", "ready.json"), "utf8"));
       run = receiver.prompt(`WORK ${tool}`);
       void run.catch(() => undefined);
@@ -81,7 +86,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
         const dest = path.join(process.env.FABRIC_7452_EVIDENCE_DIR, "cli", tool);
         fs.mkdirSync(dest, { recursive: true });
         fs.writeFileSync(path.join(dest, "rpc-events.json"), JSON.stringify(events, null, 2));
-        for (const [index, name] of ["receiver", "sender"].entries()) {
+        for (const [index, name] of ["sender", "receiver"].entries()) {
           fs.writeFileSync(path.join(dest, `${name}-stderr.log`), clients[index]?.getStderr() ?? "");
           for (const file of ["provider-context.jsonl", "abort.json"]) if (exists(name, file)) fs.copyFileSync(path.join(root, name, file), path.join(dest, `${name}-${file}`));
           if (exists(name, "ready.json")) {

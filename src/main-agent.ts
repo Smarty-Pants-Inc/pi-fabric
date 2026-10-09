@@ -9,6 +9,8 @@ import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
+import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
+
 const MAIN_AGENT_ALIAS = "main";
 // Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
 // in Pi's native queue, behind later followUps flushed as steers by this drain (#754).
@@ -329,6 +331,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   readonly #tools = new Set<string>();
   // Only live admission may abort. Journal replay is an ordinary steer, never another abort.
   readonly #interrupts = new Set<string>();
+  #interruptUsedThisTurn = false;
+  #interruptResume = false;
+  readonly #lastInterrupt = new Map<string, number>();
   #flushMs = 0;
   #flushAll = false;
   #stallS = 600;
@@ -367,6 +372,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     readonly sessionId?: string,
     readonly interactive = true,
     readonly onProviderWakeReleased?: (event: { until: string; messageIds: string[] }) => void,
+    readonly interruptAuthority: FabricInterruptAuthority = {},
   ) {}
 
   matches(id: string): boolean {
@@ -506,6 +512,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!message) throw new Error("Main agent message must not be empty");
     const sender = senderIdentity(request.from);
     if (!sender) throw new Error("Main agent message needs a sender with a string id and kind");
+    if (request.priority === "interrupt") {
+      const verified = request.verification === "mesh" || request.verification === "bridge";
+      const session = (id: string): string => id.startsWith("session:") ? id.slice(8) : id;
+      const ownRoot = sender.kind === "main" && session(sender.id) === session(this.id);
+      const allowlisted = sender.kind === "main" && (this.interruptAuthority.interruptFrom?.() ?? []).some(entry =>
+        session(entry) === session(sender.id) || entry === sender.name);
+      if (!verified || !(ownRoot || allowlisted || this.interruptAuthority.isSupervisor?.(sender, this.id) === true)) {
+        throw new FabricInterruptNotAuthorizedError(sender.id, this.id);
+      }
+    }
     const deliveryId = typeof request.deliveryId === "string" && request.deliveryId ? request.deliveryId : undefined;
     if (deliveryId !== undefined) {
       // A durable id needs the journal: without one (closed at shutdown or reload, or never
@@ -513,6 +529,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (!this.#journal) throw new Error("Main has no follow-up journal open; retry the durable delivery later");
       const admitted = this.#admitted(deliveryId);
       if (admitted) return { queued: true, messageId: admitted, routed: "main", duplicate: true, triggered: false };
+    }
+    if (request.priority === "interrupt") {
+      const now = performance.now();
+      for (const [id, at] of this.#lastInterrupt) if (now - at >= 60_000) this.#lastInterrupt.delete(id);
+      if (this.#lastInterrupt.has(sender.id)) throw new FabricInterruptRateLimitedError(sender.id, this.id);
     }
     const item: HeldAgentMessage = {
       id: randomUUID(),
@@ -546,7 +567,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
     }
     if (request.priority === "interrupt" && triggerTurn && this.#context &&
-      (this.#interrupts.size > 0 || (!this.#context.signal?.aborted && !this.#context.isIdle() && this.#tools.size > 0))) {
+      (this.#interrupts.size > 0 || (!this.#interruptUsedThisTurn && !this.#context.signal?.aborted && !this.#context.isIdle() && this.#tools.size > 0))) {
       if (typeof this.#context.abort !== "function") throw new Error("Main host has no tool abort hook");
       item.deliverAs = "steer";
       item.triggerTurn = true;
@@ -554,12 +575,18 @@ export class MainAgentController implements FabricMainAgentTarget {
       const index = this.#interrupts.size;
       this.#held.splice(index, 0, item);
       try { this.#save(); } catch (error) { this.#held.splice(index, 1); throw error; }
-      const abort = this.#interrupts.size === 0;
+      const abort = !this.#interruptUsedThisTurn;
       this.#interrupts.add(item.id);
       // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
       // agent_settled hands this message over only after all tool results are persisted.
-      if (abort) this.#context.abort();
-      return { queued: true, messageId: item.id, routed: "main", triggered: false, reason: "interrupt pending settlement" };
+      if (abort) {
+        this.#interruptUsedThisTurn = true;
+        this.#interruptResume = true;
+        this.#lastInterrupt.set(sender.id, performance.now());
+        this.#context.abort();
+      }
+      return { queued: true, messageId: item.id, routed: "main", triggered: false,
+        reason: abort ? "interrupt pending settlement" : "interrupt already used this turn; ordinary steer" };
     }
     let triggered: boolean | undefined = false;
     let replaced: HeldAgentMessage | undefined;
@@ -1049,6 +1076,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      this.#interruptUsedThisTurn = false;
+      this.#interruptResume = false;
       if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
       this.#halted = false;
       this.#recoverProvider(false);
@@ -1148,6 +1177,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       else this.#stopOperation();
     });
     on("agent_start", () => {
+      // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
+      if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
+      this.#interruptResume = false;
       this.#compactionDecline = undefined;
       this.#stopOperation();
       this.#providerFailureRecorded = false;

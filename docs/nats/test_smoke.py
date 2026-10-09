@@ -2,7 +2,7 @@
 """Bounded smoke protocol tests; no servers, credentials or third-party modules."""
 import time
 import unittest
-from smoke import Nats, SmokeCancelled, eventually
+from smoke import Nats, SmokeCancelled, eventually, inbox_name
 
 
 class Socket:
@@ -44,6 +44,11 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             c.until_pong()
         self.assertGreater(c.sock.timeouts[0], c.sock.timeouts[-1])
+
+    def test_reconnect_inboxes_are_unique_and_host_scoped(self):
+        first, second = inbox_name('ryzen3'), inbox_name('ryzen3')
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith('ryzen3.') and second.startswith('ryzen3.'))
 
     def test_cancellation_escapes_readiness_retries(self):
         def cancelled():

@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 
 from render import API, CORE, HOSTS, MAX_PAYLOAD, render
 
@@ -26,10 +27,16 @@ class SmokeCancelled(BaseException):
     """Cancellation must escape read-only readiness retry loops."""
 
 
+def inbox_name(host):
+    # Delayed replies from a discarded read-only connection must not reach a
+    # fresh connection reusing sid=1. Keep the random token under the host ACL.
+    return f'{host}.{uuid.uuid4().hex}'
+
+
 class Nats:
     def __init__(self, port, tlsdir, identity, inbox, timeout=10):
         self.timeout = timeout
-        self.inbox = inbox
+        self.inbox = inbox_name(inbox)
         self.sid = 0
         sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
         # NATS sends plaintext INFO before the TLS handshake (not a STARTTLS command).
@@ -314,6 +321,7 @@ def main():
             replicas = info.get('cluster', {}).get('replicas', [])
             live_names = {name for name, proc in processes.items() if proc.poll() is None}
             current = [r for r in replicas if r.get('current') and r['name'] in live_names]
+            assert info['config']['name'] == stream, info
             assert info['config']['num_replicas'] == 3, info
             assert info['cluster'].get('leader') in live_names, info
             assert len(current) >= alive - 1, info

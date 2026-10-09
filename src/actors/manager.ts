@@ -128,6 +128,8 @@ interface SettledWindow {
   acceptedAt: number;
   intervalMs: number;
   pending?: { payload: unknown; images: ImageContent[]; sourceRootId: string; observedAt: number };
+  /** Only the current pending snapshot's successful queue checkpoint grants durability. */
+  pendingCheckpointed?: boolean;
   timer?: NodeJS.Timeout;
 }
 
@@ -718,7 +720,6 @@ export class ActorManager {
         if (this.#initialRetentionPending) this.#startRetentionSweep();
         this.#syncActorsFromRegistry();
         this.#refreshOwnership(undefined, false);
-        this.#resumeSettledWindows();
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
         }
@@ -1944,6 +1945,7 @@ export class ActorManager {
         const window = windows.get(sourceId);
         if (window && now - window.acceptedAt < window.intervalMs) {
           window.pending = { payload: structuredClone(payload), images: images.map((image) => ({ ...image })), sourceRootId, observedAt: now };
+          window.pendingCheckpointed = false;
           // Latest payload wins, but subsequent arrivals never move the original boundary.
           this.#persistQueue(actor.id);
           if (!window.timer) this.#armSettledWindow(actor.id, sourceId, window);
@@ -1971,21 +1973,23 @@ export class ActorManager {
     return true;
   }
 
-  #resumeSettledWindows(): void {
+  #resumeSettledWindows(onlyActorId?: string): void {
     // The host calls resumeQueued/resumeAfterRelease after providers and ownership
     // bootstrap. Registry construction/polls must only retain, not activate, work.
     if (!this.#settledRestoreReady || this.#closing || this.#halted || this.#canConsumeMesh?.() === false) return;
     for (const [actorId, sources] of this.#settledWindows) {
-      if (!this.#canManageCached(actorId)) continue;
+      if ((onlyActorId !== undefined && actorId !== onlyActorId) || !this.#canManageCached(actorId)) continue;
       for (const [sourceId, window] of sources) {
-        if (window.pending && !window.timer) this.#armSettledWindow(actorId, sourceId, window);
+        if (!window.pending || window.timer) continue;
+        if (Date.now() - window.acceptedAt >= window.intervalMs) this.#flushSettledWindow(actorId, sourceId, window);
+        else this.#armSettledWindow(actorId, sourceId, window);
       }
     }
   }
 
-  #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow, retryMs = 0): void {
+  #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
     // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
-    const remaining = Math.max(retryMs, 0, window.intervalMs - (Date.now() - window.acceptedAt));
+    const remaining = Math.max(0, window.intervalMs - (Date.now() - window.acceptedAt));
     window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
     window.timer.unref();
   }
@@ -2019,9 +2023,8 @@ export class ActorManager {
       }
     } catch (error) {
       actor.lastError = error instanceof Error ? error.message : String(error);
-      if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending) {
-        this.#armSettledWindow(actorId, sourceId, window, this.#preparationRetryMs);
-      }
+      // Retain pending until a settle, dequeue, or ownership/bootstrap-ready transition.
+      // The original deadline is the only timer; failed admission never starts a watcher.
     }
   }
 
@@ -2031,7 +2034,14 @@ export class ActorManager {
       const sources = this.#settledWindows.get(id);
       if (!sources) continue;
       const pending = [...sources.values()].some(window => window.pending);
-      for (const window of sources.values()) if (window.timer) clearTimeout(window.timer);
+      for (const window of sources.values()) {
+        if (window.timer) clearTimeout(window.timer);
+        delete window.timer;
+      }
+      // Suspend may discard memory only after the latest snapshot is saved. A failed
+      // final save keeps it here, timer-free, and leaves the earlier committed file intact.
+      if (suspend && this.#persistent && [...sources.values()].some(window => window.pending && !window.pendingCheckpointed) &&
+          !this.#persistQueue(id, true)) continue;
       this.#settledWindows.delete(id);
       // Close suspends the persisted queue; stop/halt/removal cancel its pending work.
       if (pending && !suspend) this.#persistQueue(id, true);
@@ -2541,8 +2551,8 @@ export class ActorManager {
 
   close(): Promise<void> {
     if (!this.#closePromise) {
-      this.#closing = true;
       this.#clearSettledWindows(undefined, true);
+      this.#closing = true;
       this.#closePromise = this.#close();
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
@@ -3034,6 +3044,7 @@ export class ActorManager {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
           this.#recordFiltered(actor, item, filteredBy);
           this.#persistQueue(actor.id);
+          queueMicrotask(() => this.#resumeSettledWindows(actor.id));
           this.#replayDeadLetters(actor);
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           await this.#publishDrainPresence(actor);
@@ -3044,11 +3055,15 @@ export class ActorManager {
           // smarty-dev#6062: the owning root is positively dead. Skipped like a filter match.
           this.#recordDeadRootSkip(actor, item, deadRoot);
           this.#persistQueue(actor.id);
+          queueMicrotask(() => this.#resumeSettledWindows(actor.id));
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           await this.#publishDrainPresence(actor);
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        // Only after tracking (or checkpointing a skip): admission must never
+        // persist a snapshot with the dequeued item absent from queue/inFlight.
+        queueMicrotask(() => this.#resumeSettledWindows(actor.id));
         // Only now: the replay rewrites the queue file, which must still hold this item (round 4 P2).
         this.#replayDeadLetters(actor);
         const inferenceContext = actor.inferenceContext;
@@ -3386,6 +3401,7 @@ export class ActorManager {
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
           this.#finishInFlight(actor.id, item, handoffConsumed);
+          queueMicrotask(() => this.#resumeSettledWindows(actor.id));
           // Status coalescing can make the idle boundary visible before the next
           // monitor poll. Reconcile native live receipts before exposing that
           // boundary or admitting a mailbox activation, not via incidental save I/O.
@@ -5089,9 +5105,10 @@ export class ActorManager {
       });
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
-    const settledWindows = [...(this.#settledWindows.get(actorId) ?? [])]
-      .flatMap(([sourceId, window]) => window.pending
-        ? [{ sourceId, acceptedAt: window.acceptedAt, intervalMs: window.intervalMs, pending: window.pending }] : []);
+    const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
+      .flatMap(([sourceId, window]) => window.pending ? [{ sourceId, window, pending: window.pending }] : []);
+    const settledWindows = pendingWindows.map(({ sourceId, window, pending }) =>
+      ({ sourceId, acceptedAt: window.acceptedAt, intervalMs: window.intervalMs, pending }));
     try {
       if (items.length === 0 && settledWindows.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
@@ -5125,8 +5142,12 @@ export class ActorManager {
         }, { durable });
       }
     } catch (error) {
+      if (pendingWindows.length) actor.lastError = errorText(error);
       if (release) throw error;
       return false;                                         // best-effort; memory still runs the work
+    }
+    for (const { sourceId, window, pending } of pendingWindows) {
+      if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
     }
     for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
     this.#takenOver.delete(actorId);
@@ -5229,7 +5250,7 @@ export class ActorManager {
         const existing = windows.get(value.sourceId);
         if (existing?.pending && existing.pending.observedAt >= value.pending.observedAt) continue;
         if (existing?.timer) clearTimeout(existing.timer);
-        windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending });
+        windows.set(value.sourceId, { acceptedAt: value.acceptedAt, intervalMs: value.intervalMs, pending: value.pending, pendingCheckpointed: !foreign });
       }
     }
     const counter = (value: unknown): number =>
@@ -5698,6 +5719,7 @@ export class ActorManager {
       if (!next) this.#maybeAdoptOrphan(actor);
     }
     if (!acquired || !this.#persistent || this.#closing) {
+      if (acquired && !this.#closing) queueMicrotask(() => this.#resumeSettledWindows());
       this.#scheduleRestoreParked();
       return;
     }
@@ -5721,6 +5743,9 @@ export class ActorManager {
     } finally {
       this.#reloadingOwnership = false;
     }
+    // Resolve current registry objects after reload, outside an ordinary timer's
+    // ownership refresh stack; identity fencing makes concurrent wakes harmless.
+    queueMicrotask(() => this.#resumeSettledWindows());
     this.#scheduleRestoreParked();
   }
 

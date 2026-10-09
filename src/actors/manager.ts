@@ -21,7 +21,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -37,7 +37,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
@@ -158,6 +158,7 @@ interface ManagedActor {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   activationFilterExpiresAt?: number;
@@ -171,6 +172,8 @@ interface ManagedActor {
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
+  /** Last resolved runtime binding; model/thinking below remain project defaults. */
+  resolvedBinding?: FabricActorRunBinding;
   model?: string;
   modelReason?: string;
   thinking?: FabricThinking;
@@ -270,6 +273,8 @@ const PRESENCE_RETRY_MS = 5_000;
 export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
+/** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
+const PROCESSED_KEY_MEMORY = 256;
 const warnedActivationFilters = new Set<string>();
 // smarty-dev#1579: an unreadable stored filter never drops or rewrites its actor. It is kept as
 // stored (and written back unchanged) but not applied, so every event is delivered.
@@ -309,8 +314,8 @@ function loadedFilterSkipped(value: unknown): FabricActorInfo["filterSkipped"] {
 }
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
 
-// The value at a dotted path in a mesh event's data, when it is a string or a finite number.
-const meshCoalesceValue = (data: unknown, keyPath: string): string | number | undefined => {
+// The value at a dotted path in an event or its data, when it is a string or a finite number.
+const meshScalarValue = (data: unknown, keyPath: string): string | number | undefined => {
   let value: unknown = data;
   for (const segment of keyPath.split(".")) {
     if (typeof value !== "object" || value === null || Array.isArray(value) || !Object.hasOwn(value, segment)) return undefined;
@@ -410,11 +415,17 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
+export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
 /** At most one owner alarm per actor per hour while its events dead-letter. */
 const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+/** An activation block older than this is alarmed again from the retention sweep (smarty-dev#7782)... */
+export const ACTOR_BLOCK_REALARM_AFTER_MS = 2 * 60 * 60 * 1000;
+/** ...at most once per this interval per actor while it stays blocked. */
+export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
@@ -560,6 +571,8 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Independent of registry objects: ownership/reload may replace them during a drain.
+  readonly #processedKeys = new Map<string, Set<string>>();
   // Admission times belong to the manager, not replaceable registry objects.
   // Only windows with undelivered work survive in the lineage's existing queue file.
   readonly #settledWindows = new Map<string, Map<string, SettledWindow>>();
@@ -646,6 +659,8 @@ export class ActorManager {
       preparationRetryMs?: number;
       /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
       removalRetryMs?: number;
+      /** Retention sweep interval (tests shorten it). */
+      retentionSweepMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -719,7 +734,7 @@ export class ActorManager {
     });
     this.#acquireCapabilityView = options.acquireCapabilityView;
     this.#startRetentionSweep();
-    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
+    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), options.retentionSweepMs ?? RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
@@ -853,6 +868,7 @@ export class ActorManager {
     }
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
+    validateActorDedupeKey(request.dedupeKey);
     const activation = normalizeActorActivation(request.activation);
     const activationFilter = request.activationFilter === undefined
       ? undefined
@@ -897,6 +913,7 @@ export class ActorManager {
       triggerTurn: deliveryPolicy.triggerTurn,
       coalesce: request.coalesce ?? true,
       ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
+      ...(request.dedupeKey ? { dedupeKey: request.dedupeKey } : {}),
       ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       residency,
@@ -925,8 +942,13 @@ export class ActorManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    this.#rememberResolvedBinding(actor, {
+      ...(admittedModel ? { model: admittedModel } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
+      thinking: request.thinking ?? this.agents.config.thinking,
+    });
     // Validate the complete public value before any directory, predecessor or registry effect.
-    this.#assertPresenceValue(this.#publicInfo(actor, false));
+    this.#assertPresenceValue(this.#publicInfo(actor, false, true));
     await beforeCommit?.(id);
     checkActive?.();
     if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
@@ -965,12 +987,13 @@ export class ActorManager {
     );
   }
 
-  listOwned(): FabricActorInfo[] {
+  /** Registry publishers report the resolved binding, not this reader's private overlay. */
+  listOwned(registryView = false): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
-      .map((actor) => this.#publicInfo(actor));
+      .map((actor) => this.#publicInfo(actor, true, registryView));
   }
 
   /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
@@ -1711,6 +1734,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       ...(actor.requirements.length > 0
@@ -2537,6 +2561,7 @@ export class ActorManager {
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
+      await this.mesh.delete({ key: actorRealarmKey(cleanup.id) }).catch(() => undefined);
       if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
@@ -2582,6 +2607,7 @@ export class ActorManager {
         throw error;
       }
       this.#revoked.add(actor.id);
+      this.#processedKeys.delete(actor.id);
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
     }
@@ -3156,6 +3182,15 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        // A retry may have queued while its first activation was in flight, or arrived
+        // through a predecessor's queue. Recheck at execution, not only at ingress.
+        if (this.#hasProcessedKey(actor, item.source, item.payload)) {
+          this.#persistQueue(actor.id, true);
+          this.#replayDeadLetters(actor);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishDrainPresence(actor);
+          continue;
+        }
         // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
         // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
         // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
@@ -3283,6 +3318,13 @@ export class ActorManager {
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
+              // AgentManager can canonicalize a selector after permit admission. Use
+              // its actual handle, then piggyback on the existing running publication.
+              this.#rememberResolvedBinding(actor, {
+                ...(handle.model ? { model: handle.model } : {}),
+                ...(launchBinding.modelReason !== undefined ? { modelReason: launchBinding.modelReason } : {}),
+                ...(handle.thinking ? { thinking: handle.thinking } : {}),
+              });
               workerLaunched = true;
               item.launchEvidenceVersion = 1;
               item.executionStarted = true;
@@ -3378,7 +3420,11 @@ export class ActorManager {
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
-          delete actor.activationBlocked;
+          if (actor.activationBlocked) {
+            delete actor.activationBlocked;
+            // Best effort: a stale claim names an older since, so it never gates a new block.
+            void this.mesh.delete({ key: actorRealarmKey(actor.id) }).catch(() => undefined);
+          }
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
@@ -3526,7 +3572,7 @@ export class ActorManager {
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
-          this.#finishInFlight(actor.id, item, handoffConsumed);
+          this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
           queueMicrotask(() => this.#resumeSettledWindows(actor.id));
           // Status coalescing can make the idle boundary visible before the next
           // monitor poll. Reconcile native live receipts before exposing that
@@ -3944,7 +3990,7 @@ export class ActorManager {
     const now = Date.now();
     const event = item.payload as { id?: unknown; topic?: unknown; data?: unknown } | null | undefined;
     const mesh = item.source.startsWith("mesh:");
-    const value = mesh && actor.coalesceKey ? meshCoalesceValue(event?.data, actor.coalesceKey) : undefined;
+    const value = mesh && actor.coalesceKey ? meshScalarValue(event?.data, actor.coalesceKey) : undefined;
     const key = item.coalesceKey ?? (mesh
       ? value === undefined ? undefined : JSON.stringify(["mesh", event?.topic, value])
       : actor.coalesce ? item.source : undefined);
@@ -4096,7 +4142,10 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
-          this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
+          if (this.#hasProcessedKey(actor, `mesh:${event.topic}`, event)) {
+            // Do not advance the mesh cursor past a memory-only completion fence.
+            if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+          } else this.#enqueue(actor, `mesh:${event.topic}`, event, this.#meshEnqueueOptions(actor, event));
         }
         this.#delivered.add(delivery);
         handedOn = true;
@@ -4112,8 +4161,37 @@ export class ActorManager {
     return full ? false : handedOn ? true : "ignored";
   }
 
+  #processedMeshKey(actor: ManagedActor, source: string, payload: unknown): string | undefined {
+    if (!this.#persistent || actor.residency !== "durable" || !actor.dedupeKey || !source.startsWith("mesh:")) return undefined;
+    const event = payload as { topic?: unknown } | undefined;
+    if (typeof event?.topic !== "string") return undefined;
+    const key = meshScalarValue(event, actor.dedupeKey);
+    // Blank occurrence values are no key; keep resource coalescing's scalar rules unchanged.
+    if (key === undefined || (typeof key === "string" && key.trim().length === 0)) return undefined;
+    // Occurrence identity is explicitly opted into, never inferred from a resource
+    // coalesceKey. A new namespace also excludes legacy resource completion fences.
+    return JSON.stringify(["mesh-dedupe", actor.dedupeKey, event.topic, key]);
+  }
+
+  #hasProcessedKey(actor: ManagedActor, source: string, payload: unknown): boolean {
+    const key = this.#processedMeshKey(actor, source, payload);
+    return key !== undefined && (this.#processedKeys.get(actor.id)?.has(key) ?? false);
+  }
+
+  #rememberProcessedKey(actor: ManagedActor, item: ActorQueueItem): boolean {
+    if (item.resolve || item.reject) return false;
+    const key = this.#processedMeshKey(actor, item.source, item.payload);
+    if (key === undefined) return false;
+    const keys = this.#processedKeys.get(actor.id) ?? new Set<string>();
+    if (keys.has(key)) return false; // A repeat never refreshes retention order.
+    keys.add(key);
+    if (keys.size > PROCESSED_KEY_MEMORY) keys.delete(keys.values().next().value!);
+    this.#processedKeys.set(actor.id, keys);
+    return true;
+  }
+
   #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
-    const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+    const key = actor.coalesceKey ? meshScalarValue(event.data, actor.coalesceKey) : undefined;
     return {
       ...(event.verification === "mesh" || event.verification === "bridge"
         ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
@@ -4242,8 +4320,12 @@ export class ActorManager {
         const entry = entries[taken]!;
         if (!held.has(entry.event.id)) {
           held.add(entry.event.id);
-          this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
-          added++;
+          if (this.#hasProcessedKey(actor, entry.source, entry.event)) {
+            if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+          } else {
+            this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+            added++;
+          }
         }
         taken++;
       }
@@ -4325,6 +4407,50 @@ export class ActorManager {
     } catch { /* the next slot retries */ }
   }
 
+  // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
+  // One durable mesh claim per actor gates each 6 h slot of a block episode, across managers,
+  // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes.
+  #realarmBlockedActivation(actor: ManagedActor, now: number): void {
+    const blocked = actor.activationBlocked;
+    if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
+    const slot = Math.floor((now - blocked.since - ACTOR_BLOCK_REALARM_AFTER_MS) / ACTOR_BLOCK_REALARM_EVERY_MS);
+    const key = actorRealarmKey(actor.id);
+    const covers = (entry: MeshStateEntry | undefined): boolean => {
+      const claimed = entry?.value as { since?: unknown; slot?: unknown } | undefined;
+      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot;
+    };
+    if (covers(this.mesh.get(key))) return;
+    const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+      since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
+    void (async () => {
+      // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
+      // tombstone, so a claim removed when an earlier block cleared can be taken again.
+      let previous: MeshStateEntry | undefined;
+      const results = await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: (view) => {
+        const current = view.get(key);
+        if (covers(current)) return [];
+        previous = current;
+        return [{ kind: "put", key, ifVersion: view.version(key), onConflict: "skip",
+          value: { since: blocked.since, slot, at: now, owner: this.identity.id } }];
+      } }).catch(() => [] as MeshBatchResult[]);
+      // No applied claim: another sweep or owner holds this slot, and only it publishes.
+      const claim = results.find((result) => result.key === key && result.applied);
+      if (!claim) return;
+      // ponytail: claim before publish. A crash between the two loses this slot's alarm and the
+      // next slot alarms; for a repeat alarm that is the safe direction (never a duplicate).
+      // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
+      try {
+        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity, data });
+      } catch {
+        // Release the slot, fenced to our claim, so the next sweep retries.
+        await (previous
+          ? this.mesh.put({ key, identity: previous.updatedBy, value: previous.value, ifVersion: claim.version })
+          : this.mesh.delete({ key, ifVersion: claim.version })).catch(() => undefined);
+      }
+    })();
+  }
+
   #startRetentionSweep(): void {
     if (this.#retentionSweep || this.#closing) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
@@ -4348,6 +4474,7 @@ export class ActorManager {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          this.#realarmBlockedActivation(actor, now);
           this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
@@ -4476,7 +4603,7 @@ export class ActorManager {
     let value: FabricActorInfo;
     try {
       // Exclude our own diagnostic so a repaired value can fit again.
-      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false);
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false, true);
       value = legacy;
       this.#assertPresenceValue(value);
     } catch (error) {
@@ -4618,9 +4745,12 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
+      // Keep defaults in the pre-existing fields: rollback writers rebuild
+      // known fields and may discard the optional last-run binding.
       ...(actor.model ? { model: actor.model } : {}),
       ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
@@ -4631,6 +4761,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter
         ? { activationFilter: actor.activationFilter }
@@ -4998,6 +5129,11 @@ export class ActorManager {
       try { instructions = this.#registry.instructions(source); }
       catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
       const record = { ...source, instructions } as Partial<ManagedActor>;
+      // Top-level model/thinking are always project defaults, including after
+      // an old writer drops unknown fields. Never infer defaults from a run pin.
+      const binding = typeof source.resolvedBinding === "object" &&
+        source.resolvedBinding !== null && !Array.isArray(source.resolvedBinding)
+        ? source.resolvedBinding as FabricActorRunBinding : undefined;
       if (
         typeof record.id !== "string" ||
         !/^[a-f0-9]{32}$/.test(record.id) ||
@@ -5072,6 +5208,11 @@ export class ActorManager {
         ...(typeof record.model === "string" ? { model: record.model } : {}),
         ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        ...(binding ? { resolvedBinding: {
+          ...(typeof binding.model === "string" ? { model: binding.model } : {}),
+          ...(typeof binding.modelReason === "string" ? { modelReason: binding.modelReason } : {}),
+          ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
+        } } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
         ...(Array.isArray(record.tools)
@@ -5092,6 +5233,9 @@ export class ActorManager {
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
           ? { coalesceKey: record.coalesceKey }
+          : {}),
+        ...(typeof record.dedupeKey === "string" && record.dedupeKey.length <= 200 && COALESCE_KEY_LOAD_PATTERN.test(record.dedupeKey)
+          ? { dedupeKey: record.dedupeKey }
           : {}),
         ...(activation ? { activation } : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
@@ -5242,6 +5386,7 @@ export class ActorManager {
       });
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
+    const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
     const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
       .flatMap(([sourceId, window]) => window.pending ? [{ sourceId, window, pending: window.pending }] : []);
     // Projection is serialization-only: pending stays in memory until the atomic write commits.
@@ -5284,6 +5429,7 @@ export class ActorManager {
       const cancelledPredecessors = [...(this.#cancelledPredecessors.get(actorId) ?? [])];
       snapshot = {
         format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+        ...(processedKeys.length ? { processedKeys } : {}),
         mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
         ...(settledWindows.length ? { settledWindows } : {}),
         ...(cleanHandover ? { cleanHandover: true } : {}),
@@ -5291,7 +5437,7 @@ export class ActorManager {
       };
       // Keep the obligation-free soft empty fast path. Durable empty state and
       // cancellation/predecessor fences require a file + namespace receipt.
-      if (items.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length) {
+      if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length) {
         fs.rmSync(file, { force: true });
       } else writeJsonAtomic(file, snapshot, { durable });
     } catch (error) {
@@ -5362,7 +5508,7 @@ export class ActorManager {
     } finally { fs.closeSync(fd); }
   }
 
-  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
+  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean, completed: boolean): void {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
     const cancelled = this.#cancelledInFlight.get(actorId);
     cancelled?.delete(item.id);
@@ -5370,6 +5516,9 @@ export class ActorManager {
     const actor = this.#actors.get(actorId);
     const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
+    // Completed inference is terminal even if ownership or delivery failed afterwards.
+    // Preparation failures, interrupted workers and parked retries are never processed.
+    const processed = actor !== undefined && !stillPending && completed && this.#rememberProcessedKey(actor, item);
     const context = item.handoffContext ?? [];
     delete item.handoffContext;
     const deferred = this.#deferredHandoffs.get(actorId) ?? [];
@@ -5388,7 +5537,7 @@ export class ActorManager {
       for (const id of consumedIds) pending.add(id);
       this.#pendingHandoffConsumption.set(actorId, pending);
       this.#flushHandoffConsumption(actor);
-    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+    } else this.#persistQueue(actorId, processed || item.source === "child-completion" || context.length > 0);
   }
 
   #flushHandoffConsumption(actor: ManagedActor): void {
@@ -5441,10 +5590,19 @@ export class ActorManager {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
+      processedKeys?: unknown;
       settledWindows?: unknown; cancelled?: unknown; cancelledPredecessors?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {
+      // Predecessor history precedes locally completed work; never let an old
+      // handoff evict a newer local completion. Legacy snapshots have no history.
+      const incoming = saved.processedKeys.slice(-PROCESSED_KEY_MEMORY).filter((key): key is string => typeof key === "string");
+      const keys = new Set([...incoming, ...(this.#processedKeys.get(actor.id) ?? [])]);
+      while (keys.size > PROCESSED_KEY_MEMORY) keys.delete(keys.values().next().value!);
+      if (keys.size) this.#processedKeys.set(actor.id, keys);
+    }
     if (Array.isArray(saved.cancelledPredecessors)) {
       const fences = this.#cancelledPredecessors.get(actor.id) ?? new Set<string>();
       for (const file of saved.cancelledPredecessors) {
@@ -5596,6 +5754,7 @@ export class ActorManager {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
         continue;
       }
+      if (this.#hasProcessedKey(actor, item.source, item.payload)) continue;
       // A cursor replay of the same mesh event must not queue it a second time, nor may a
       // predecessor's copy of an event this manager already took.
       const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null
@@ -5656,9 +5815,27 @@ export class ActorManager {
     };
   }
 
-  #publicInfo(actor: ManagedActor, includePresenceError = true): FabricActorInfo {
-    const session = this.#bindings.get(actor.id);
-    const effective = this.#runBinding(actor);
+  #rememberResolvedBinding(actor: ManagedActor, binding: FabricActorRunBinding): void {
+    const live = this.#actors.get(actor.id);
+    // Model admission may await while a registry reload replaces the executing
+    // object. Carry only the binding to the same lineage, never its defaults.
+    const targets = live && live !== actor && this.#lineage(live) === this.#lineage(actor)
+      ? [actor, live] : [actor];
+    for (const target of targets) {
+      const previous = target.resolvedBinding;
+      if (previous && previous.model === binding.model && previous.thinking === binding.thinking &&
+          previous.modelReason === binding.modelReason) continue;
+      target.resolvedBinding = { ...binding };
+    }
+    // No save, notification, or wake: create/run lifecycle publications already
+    // persist and advertise this value. Unchanged bindings do no extra work.
+  }
+
+  #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
+    const session = registryView ? undefined : this.#bindings.get(actor.id);
+    // Shared observers cannot know a legacy row's last admitted binding. An
+    // omitted model/thinking means unknown, not this reader's session overlay.
+    const effective = registryView ? actor.resolvedBinding ?? {} : this.#runBinding(actor);
     return {
       id: actor.id,
       scope: this.#actorScope,
@@ -5697,14 +5874,14 @@ export class ActorManager {
       ...(effective.model ? { model: effective.model } : {}),
       ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
-      binding: {
-        scope: "session",
+      ...(!registryView ? { binding: {
+        scope: "session" as const,
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
         ...(session?.modelReason !== undefined ? { modelReason: session.modelReason } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
-      },
+      } } : {}),
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),
@@ -5717,6 +5894,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
@@ -6072,7 +6250,7 @@ export class ActorManager {
     if (!actor.coalesceKey || item.resolve || item.reject || !item.source.startsWith("mesh:")) return undefined;
     const event = item.payload as { topic?: unknown; data?: unknown } | undefined;
     if (typeof event?.topic !== "string") return undefined;
-    const value = meshCoalesceValue(event.data, actor.coalesceKey);
+    const value = meshScalarValue(event.data, actor.coalesceKey);
     return value === undefined ? undefined : JSON.stringify(["mesh", event.topic, value]);
   }
 

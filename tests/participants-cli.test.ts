@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
 import { main, resolveMeshRoot } from "../src/participants-cli.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -80,6 +81,54 @@ describe("fabric-participants", () => {
 
     expect(JSON.parse((await run(["--mesh", root, "--kind", "actor"])).out)).toEqual([]);
     expect(fs.readdirSync(root).map((name) => [name, fs.statSync(path.join(root, name)).mtimeMs])).toEqual(before);
+  });
+
+  it("reads a root switched to SQLite (state.json is the moved marker) in any configured mode (smarty-dev#6477)", async () => {
+    const root = scratch();
+    const store = new MeshStore(root, 64 * 1024, 1_000);
+    const live = await addRoot(store, "live");
+    await importMeshState(root);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toContain('"movedTo":"state.db"');
+    const previous = process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    try {
+      for (const mode of [undefined, "file", "sqlite"]) {
+        if (mode === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+        else process.env.PI_FABRIC_MESH_STATE_BACKEND = mode;
+        const result = await run(["--json", "--mesh", root, "--kind", "root"]);
+        expect(result, `mode ${String(mode)}`).toMatchObject({ code: 0, err: "" });
+        expect(ids(result.out)).toEqual([live]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+      else process.env.PI_FABRIC_MESH_STATE_BACKEND = previous;
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("denies a switched root whose state.db is a link, foreign-writable, missing or without its marker, never []", async () => {
+    const other = scratch();
+    await addRoot(new MeshStore(other, 64 * 1024, 1_000), "other");
+    await importMeshState(other);
+    const root = scratch();
+    await addRoot(new MeshStore(root, 64 * 1024, 1_000), "mine");
+    await importMeshState(root);
+    const db = path.join(root, "state.db");
+    const denied = async (why: string) => {
+      const result = await run(["--json", "--mesh", root, "--kind", "root"]);
+      expect(result, why).toMatchObject({ code: 2, out: "" });
+      expect(result.err, why).toContain("FABRIC_MESH_UNREADABLE");
+    };
+    fs.renameSync(db, `${db}.aside`);
+    fs.symlinkSync(path.join(other, "state.db"), db); // another mesh's database
+    await denied("symbolic link");
+    fs.unlinkSync(db);
+    await denied("marker without its database");
+    fs.renameSync(`${db}.aside`, db);
+    fs.chmodSync(db, 0o666);
+    await denied("group/world-writable database");
+    fs.chmodSync(db, 0o600);
+    expect((await run(["--json", "--mesh", root, "--kind", "root"])).code).toBe(0);
+    fs.unlinkSync(path.join(root, "state.json")); // the marker is gone: never an empty file mesh
+    await denied("database without its marker");
   });
 
   it("prints [] for an empty mesh and exits 2 with a named error for a missing one", async () => {

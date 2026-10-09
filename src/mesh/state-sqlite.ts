@@ -81,7 +81,7 @@
  * pass `open` to plug in another driver (for example `bun:sqlite`) through `SqliteConnection`.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
@@ -1601,11 +1601,18 @@ const lockHolder = (record: string): { pid: number; started?: string | undefined
 
 // An advisory try-lock file (O_EXCL). It is reclaimed only from a holder proven dead on this host (its pid
 // gone, or alive with other start ticks: the host-lease rule, residentProcessAlive), or, with no readable
-// owner, when it is older than `staleMs` (pi-fabric#694 P2-C: never on age alone from a live owner). The
-// reclaim renames it aside and checks that the moved file is the one this process read (inode, mtime and
-// record). Anything else is linked back, and when a newer lock holds the name the moved file is left in
-// place, never deleted: a lock whose inode changed since this process read it is never unlinked.
-export const tryLockFile = (file: string, staleMs: number, token: string): boolean => {
+// owner, when it is older than `staleMs` (pi-fabric#694 P2-C: never on age alone from a live owner).
+// A reclaim never moves the shared name aside (pi-fabric#694 P2, smarty-dev#6477). It first takes an exclusive
+// CLAIM named by the dead record (`<file>.reclaim.<hash>`, itself a tryLockFile, so a dead claimer's claim is
+// reclaimed the same way one level down), then re-reads the lock: same inode, mtime and record. From then until
+// its unlink only two parties could vacate the name: the dead holder (it cannot) and the claim's holder (us).
+// The live owner's own release (removeOwnedFile) never runs for a dead owner. So the unlink removes exactly the
+// dead record and no successor can be detached; a lock that changed since it was read is left alone.
+// `hooks` is a test seam for the interleavings.
+export interface LockFileHooks { afterVerdict?: () => void; afterClaim?: () => void }
+export const reclaimClaimPath = (file: string, key: string): string =>
+  `${file}.reclaim.${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+export const tryLockFile = (file: string, staleMs: number, token: string, hooks: LockFileHooks = {}): boolean => {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const fd = fs.openSync(file, "wx", 0o600);
@@ -1620,17 +1627,19 @@ export const tryLockFile = (file: string, staleMs: number, token: string): boole
       const holder = lockHolder(record);
       const dead = holder ? !residentProcessAlive(holder.pid, holder.started) : Date.now() - stat.mtimeMs > staleMs;
       if (!dead) return false;
-      const aside = `${file}.${process.pid}.${randomUUID()}.stale`;
-      try { fs.renameSync(file, aside); } catch { return false; }
-      const moved = fs.lstatSync(aside, { throwIfNoEntry: false });
-      let movedRecord: string | undefined;
-      try { movedRecord = fs.readFileSync(aside, "utf8"); } catch { /* unreadable: not the one read */ }
-      const same = moved !== undefined && moved.ino === stat.ino && moved.dev === stat.dev && moved.mtimeMs === stat.mtimeMs
-        && movedRecord === record;
-      if (same) { try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ } continue; }
-      try { fs.linkSync(aside, file); } catch { return false; /* a newer lock holds the name: leave the moved one */ }
-      try { fs.rmSync(aside, { force: true }); } catch { /* the second link of a restored lock; best effort */ }
-      return false;
+      hooks.afterVerdict?.();
+      // A record names its holder uniquely; an ownerless file is named by its inode and mtime.
+      const claim = reclaimClaimPath(file, holder ? record : `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${record}`);
+      if (!tryLockFile(claim, staleMs, token)) return false; // another live reclaimer has this dead record
+      try {
+        hooks.afterClaim?.();
+        const current = fs.lstatSync(file, { throwIfNoEntry: false });
+        let currentRecord: string | undefined;
+        try { currentRecord = fs.readFileSync(file, "utf8"); } catch { /* gone: already reclaimed */ }
+        if (current === undefined || current.ino !== stat.ino || current.dev !== stat.dev || current.mtimeMs !== stat.mtimeMs
+          || currentRecord !== record) return false; // already reclaimed, and maybe held by a successor: never touch it
+        try { fs.unlinkSync(file); } catch { return false; }
+      } finally { removeOwnedFile(claim, token); }
     }
   }
   return false;
@@ -1721,14 +1730,12 @@ const assertPrivateStateFiles = (file: string): void => {
   for (const name of [file, `${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
 };
 
-// Rename aside, check the token, and link a foreign file back (link(2) never overwrites a newer one). A
-// foreign file that cannot go back (a newer one holds the name) is left in place, never deleted (#694 P2-C).
+// The owner's release: check the token, then unlink (pi-fabric#694 P2, smarty-dev#6477). Nothing is moved aside.
+// While this owner lives nobody else vacates its lock: a reclaimer needs a dead holder (tryLockFile), so the
+// file checked here is still ours at the unlink.
 export const removeOwnedFile = (file: string, token: string): void => {
   if (!ownsFile(file, token)) return; // plainly not ours: never displace it
-  const aside = `${file}.${process.pid}.${randomUUID()}.release`;
-  try { fs.renameSync(file, aside); } catch { return; }
-  if (!ownsFile(aside, token)) try { fs.linkSync(aside, file); } catch { return; /* a newer file holds the name */ }
-  try { fs.rmSync(aside, { force: true }); } catch { /* private name; best effort */ }
+  try { fs.unlinkSync(file); } catch { /* already gone */ }
 };
 
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));

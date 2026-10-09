@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { isMeshRetryableBusy, isMeshStateBusy } from "../src/mesh/state-backend.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, removeOwnedFile, SqliteStateStore, tryLockFile }
+import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, reclaimClaimPath, removeOwnedFile, SqliteStateStore, tryLockFile }
   from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
@@ -411,31 +411,70 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
   });
 
-  it("never unlinks a lock whose inode changed since it was read, even when it cannot go back", () => {
+  // pi-fabric#694 P2 (smarty-dev#6477): a reclaim never moves the shared name aside. A reclaimer paused after its
+  // verdict, while another reclaims and holds, and a third tries, ends with exactly one holder and its record at
+  // the canonical name: no `.stale` file, no leftover claim.
+  const dead = (): string => `${spawnSync(process.execPath, ["-e", ""]).pid}.12345.00000000-0000-0000-0000-000000000000\n`;
+  const entries = (lock: string) => fs.readdirSync(path.dirname(lock)).sort();
+
+  it("A reclaim vs B reclaim vs C acquire of one dead lock: B alone holds, A never touches it", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    fs.writeFileSync(lock, dead());
+    const a = ownerToken();
+    const b = ownerToken();
+    const c = ownerToken();
+    let bHolds = false;
+    let cHolds = false;
+    const aHolds = tryLockFile(lock, 2_000, a, { afterVerdict: () => {
+      bHolds = tryLockFile(lock, 2_000, b); // B reclaims the same dead record and holds it now
+      cHolds = tryLockFile(lock, 2_000, c); // C tries before A goes on
+    } });
+    cHolds ||= tryLockFile(lock, 2_000, c);
+    expect([aHolds, bHolds, cHolds]).toEqual([false, true, false]);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${b}\n`);
+    expect(entries(lock)).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("the reviewer's interleaving: B replaces the lock after A's check, C tries before A goes on: B alone holds", () => {
     const lock = path.join(lockRoot(), "state-wal-reset.lock");
     fs.writeFileSync(lock, "crashed\n");
     age(lock, 5_000);
-    const live = ownerToken();
-    const renameSync = fs.renameSync.bind(fs);
-    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
-      if (String(from) === lock && String(to).endsWith(".stale")) {
-        fs.rmSync(lock); // another reclaimer took it and holds a live lock now
-        fs.writeFileSync(lock, `${live}\n`);
-        renameSync(from, to);
-        fs.writeFileSync(lock, "third\n"); // and a third process holds the name before any link-back
-        return;
-      }
-      renameSync(from, to);
-    }) as typeof fs.renameSync);
-    try {
-      expect(tryLockFile(lock, 2_000, ownerToken())).toBe(false);
-    } finally {
-      spy.mockRestore();
-    }
-    expect(fs.readFileSync(lock, "utf8")).toBe("third\n");
-    const moved = fs.readdirSync(path.dirname(lock)).filter((name) => name.endsWith(".stale"));
-    expect(moved).toHaveLength(1);
-    expect(fs.readFileSync(path.join(path.dirname(lock), moved[0]!), "utf8")).toBe(`${live}\n`);
+    const b = ownerToken();
+    const c = ownerToken();
+    let cHolds = false;
+    const aHolds = tryLockFile(lock, 2_000, ownerToken(), { afterClaim: () => {
+      fs.rmSync(lock); // replaced behind A's back (no code path does this to a dead record A has claimed)
+      fs.writeFileSync(lock, `${b}\n`);
+      cHolds = tryLockFile(lock, 2_000, c);
+    } });
+    cHolds ||= tryLockFile(lock, 2_000, c);
+    expect([aHolds, cHolds]).toEqual([false, false]);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${b}\n`);
+    expect(entries(lock)).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("while A holds the claim on a dead record, no other reclaimer or creator can vacate or take the name", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    fs.writeFileSync(lock, dead());
+    const a = ownerToken();
+    const others: boolean[] = [];
+    const aHolds = tryLockFile(lock, 2_000, a, { afterClaim: () => {
+      others.push(tryLockFile(lock, 2_000, ownerToken()), tryLockFile(lock, 2_000, ownerToken()));
+    } });
+    expect([aHolds, ...others]).toEqual([true, false, false]);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${a}\n`);
+    expect(entries(lock)).toEqual(["state-wal-reset.lock"]);
+  });
+
+  it("a claim left by a dead reclaimer is reclaimed one level down, never blocking recovery for good", () => {
+    const lock = path.join(lockRoot(), "state-wal-reset.lock");
+    const record = dead();
+    fs.writeFileSync(lock, record);
+    fs.writeFileSync(reclaimClaimPath(lock, record), dead()); // a reclaimer that died holding the claim
+    const mine = ownerToken();
+    expect(tryLockFile(lock, 2_000, mine)).toBe(true);
+    expect(fs.readFileSync(lock, "utf8")).toBe(`${mine}\n`);
+    expect(entries(lock)).toEqual(["state-wal-reset.lock"]);
   });
 
   it("never deletes a fresh lock that another reclaimer created after this process saw the stale one", () => {

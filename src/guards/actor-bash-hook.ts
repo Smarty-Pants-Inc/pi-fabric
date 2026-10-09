@@ -7,7 +7,8 @@ import { applyRunBashDefaults } from "./actor-bash-timeout.js";
 // worker loads this defaults-only hook with `-e` for every Pi run it launches (#6137: task agents
 // too); `-e` still loads under --no-extensions. It adds no tool and no authority, and it must not
 // import the Fabric graph. When Fabric is loaded too, both hooks run; each acts only when no timeout
-// is set and the command is not already wrapped, so the second one does nothing. The worker loads
+// is set and the input lacks the hook-set private wrapping metadata, so the second does nothing.
+// A marker in caller-supplied command text is never trusted. The worker loads
 // this one after Fabric's `-e`, so Fabric's foreground-wait guard still judges the caller's command.
 export default function actorBashHook(pi: ExtensionAPI): void {
   pi.on("tool_call", (event) => {

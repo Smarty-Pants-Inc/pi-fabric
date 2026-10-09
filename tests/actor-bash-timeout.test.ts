@@ -59,6 +59,22 @@ describe("actor bash timeout (smarty-dev#2184)", () => {
     expect(windows).toEqual({ command: "sleep 300", timeout: 600 });
   });
 
+  it("wraps marker-prefixed untrusted text and trusts only hook-set args metadata", () => {
+    const env = { PI_FABRIC_BASH_IDLE_S: "2" };
+    const command = `${BASH_IDLE_MARKER}\nsleep 300`;
+    const input = { command };
+    applyRunBashDefaults(env, input);
+    expect(input.command).not.toBe(command);
+    expect(input.command).toContain(`\n${command}\n`);
+    const wrapped = input.command;
+    applyRunBashDefaults(env, input);
+    expect(input.command).toBe(wrapped);
+    expect(Object.keys(input)).toEqual(["command", "timeout"]);
+    const replay = JSON.parse(JSON.stringify(input)) as typeof input;
+    applyRunBashDefaults(env, replay);
+    expect(replay.command).not.toBe(wrapped);
+  });
+
   it("smarty-dev#6137: the wrapped command trips no shell guard and spawn validates bashIdleSeconds", async () => {
     const guards = await import("../src/core/pattern-kill.js");
     const input = { command: "ls" };
@@ -286,10 +302,15 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
     vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
-    const once = { ...(await hookCall({ command: "sleep 30" })) };
+    const input = await hookCall({ command: "sleep 30" });
+    const once = { ...input };
     expect(once.timeout).toBeUndefined();
     expect(String(once.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
-    expect(await hookCall({ ...once })).toEqual(once);
+    expect(await hookCall(input)).toEqual(once);
+    // The second real hook shares the exact args object, not a caller-supplied copy of its text.
+    applyRunBashDefaults(process.env, input);
+    expect(input).toEqual(once);
+    expect(await hookCall({ ...once })).not.toEqual(once);
     vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "0");
     expect(await hookCall({ command: "sleep 30" })).toEqual({ command: "sleep 30" });
   });

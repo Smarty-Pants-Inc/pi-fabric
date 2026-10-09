@@ -22,8 +22,10 @@ export const MAX_ACTOR_BASH_TIMEOUT_S = 2_147_483;
 export const DEFAULT_BASH_IDLE_S = 180;
 /** Exit code of an idle-killed command, as timeout(1). */
 export const BASH_IDLE_EXIT_CODE = 124;
-/** First line of a wrapped command; also stops a second hook from wrapping it again. */
+/** Diagnostic first line only: command text is never evidence that a call was wrapped. */
 export const BASH_IDLE_MARKER = "# pi-fabric bash idle watchdog (smarty-dev#6137)";
+/** Bounded TERM-to-KILL grace; output/early shell exit cannot cancel escalation. */
+export const BASH_IDLE_TERM_GRACE_S = 5;
 
 type Env = Readonly<Record<string, string | undefined>>;
 
@@ -44,30 +46,56 @@ export const actorBashTimeout = (env: Env, timeout: unknown): number | undefined
 export const bashIdleSeconds = (env: Env): number | undefined =>
   fabricRun(env) ? seconds(env.PI_FABRIC_BASH_IDLE_S, DEFAULT_BASH_IDLE_S) : undefined;
 
+// The standalone hook and Fabric bundle have separate module instances. Share a host-only nonce,
+// and put it in non-enumerable symbol metadata on the actual tool-call args. JSON input cannot
+// supply it, and copying/serializing a wrapped command must not exempt a new untrusted call.
+const WRAPPED = Symbol.for("pi-fabric.bash-idle.wrapped");
+const WRAP_STATE = Symbol.for("pi-fabric.bash-idle.wrap-state");
+const host = globalThis as typeof globalThis & { [WRAP_STATE]?: { nonce: string } };
+const wrapNonce = (host[WRAP_STATE] ??= { nonce: randomBytes(24).toString("hex") }).nonce;
+type BashInput = { command?: unknown; timeout?: unknown; background?: unknown; monitor?: unknown; [WRAPPED]?: string };
+
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
 
-// Runs as `node -e`, argv tail [idleSeconds, shell], command on stdin. The command runs in the same
-// shell and process group (so Pi's own abort and total timeout still kill it). After N seconds without
-// output it SIGKILLs the command's descendants (setsid children too, while their parent chain is
-// alive) and, when it leads its group, the rest of the group (orphaned background jobs); then it
-// reports and exits 124. After the shell exits it keeps Pi's 100 ms quiet-pipe grace.
+// This detached execution envelope is the command's process-group leader. IPC custody ensures
+// Pi killing the outer watchdog on total timeout/abort also kills this newly detached group.
+// Ignore TERM in the envelope so it retains custody while the command handles TERM during grace.
+const GROUP_RUNNER = `
+const cp=require("child_process"),os=require("os");
+process.on("SIGTERM",()=>{});
+process.on("disconnect",()=>{try{process.kill(-process.pid,"SIGKILL")}catch{process.exit(1)}});
+const[sh,command]=process.argv.slice(-2);
+const c=cp.spawn(sh,["-c",command],{stdio:["ignore","inherit","inherit"]});
+c.on("error",e=>{process.stderr.write(String(e)+"\\n");process.exit(127)});
+c.on("exit",(code,sig)=>process.exit(code??128+(os.constants.signals[sig]||0)));
+`.trim();
+
+// Runs as `node -e`, argv tail [idleSeconds, shell], command on stdin. A detached group makes
+// reparented background jobs killable even when this watchdog isn't its own group leader.
+// Linux /proc ppid traversal is a second net for setsid children, with start times retained
+// across TERM/reparenting to avoid signaling reused PIDs. No ps executable is required.
+// A double-forked setsid daemon that leaves the group before discovery is not covered (#7934).
+// No per-command delegated cgroup-v2 launch is reachable from this lightweight tool_call hook.
 const WATCHDOG = `
 const fs=require("fs"),cp=require("child_process"),os=require("os");
-const[s,sh]=process.argv.slice(-2),n=Number(s),me=process.pid;
-const c=cp.spawn(sh,["-c",fs.readFileSync(0,"utf8")],{stdio:["ignore","pipe","pipe"]});
+const[s,sh]=process.argv.slice(-2),n=Number(s);
+const c=cp.spawn(process.execPath,["-e",${JSON.stringify(GROUP_RUNNER)},sh,fs.readFileSync(0,"utf8")],{detached:true,stdio:["ignore","pipe","pipe","ipc"]});
 let t,g,code=1,exited=false,idle=false,done=false;
+const tracked=new Map();
 const finish=()=>{if(done)return;done=true;clearTimeout(t);clearTimeout(g);let p=2;const e=()=>--p||process.exit(idle?${BASH_IDLE_EXIT_CODE}:code);process.stdout.write("",e);process.stderr.write("",e)};
-const sweep=()=>{let rows=[];try{rows=cp.execFileSync("ps",["-A","-o","pid=,ppid=,pgid="],{encoding:"utf8"}).trim().split("\\n").map(l=>l.trim().split(/\\s+/).map(Number))}catch{}
-const kill=new Set([c.pid]);for(let grew=true;grew;){grew=false;for(const[p,pp]of rows)if(kill.has(pp)&&!kill.has(p)){kill.add(p);grew=true}}
-if(rows.some(([p,,pg])=>p===me&&pg===me))for(const[p,,pg]of rows)if(pg===me&&p!==me)kill.add(p);
-for(const p of kill)try{process.kill(p,"SIGKILL")}catch{}};
-const expire=()=>{idle=true;process.stderr.write("\\n[pi-fabric] bash idle timeout: no output for "+n+" s; killed; rerun with a bounded range or a command that prints progress\\n");sweep();sweep();g=setTimeout(finish,1000)};
+const rows=()=>{const result=new Map();try{for(const name of fs.readdirSync("/proc")){if(!/^\\d+$/.test(name))continue;try{const stat=fs.readFileSync("/proc/"+name+"/stat","utf8"),a=stat.slice(stat.lastIndexOf(")")+2).split(" ");result.set(Number(name),{pp:Number(a[1]),pg:Number(a[2]),start:a[19]})}catch{}}}catch{}return result};
+const sweep=sig=>{const all=rows(),owned=new Set([c.pid]);for(const[p,start]of tracked)if(all.get(p)?.start===start)owned.add(p);
+for(let grew=true;grew;){grew=false;for(const[p,r]of all)if((owned.has(r.pp)||r.pg===c.pid)&&!owned.has(p)){owned.add(p);grew=true}}
+for(const p of owned){const r=all.get(p);if(r)tracked.set(p,r.start)}
+try{process.kill(-c.pid,sig)}catch{}
+for(const[p,start]of tracked){const r=all.get(p);if(r?.start===start&&r.pg!==c.pid)try{process.kill(p,sig)}catch{}}};
+const expire=()=>{idle=true;process.stderr.write("\\n[pi-fabric] bash idle timeout: no output for "+n+" s; killed; rerun with a bounded range or a command that prints progress\\n");sweep("SIGTERM");g=setTimeout(()=>{sweep("SIGKILL");finish()},${BASH_IDLE_TERM_GRACE_S}*1000)};
 const arm=()=>{clearTimeout(t);if(!exited&&!idle)t=setTimeout(expire,n*1000)};
-const forward=w=>d=>{w.write(d);if(exited){clearTimeout(g);g=setTimeout(finish,100)}else arm()};
+const forward=w=>d=>{w.write(d);if(idle)return;if(exited){clearTimeout(g);g=setTimeout(finish,100)}else arm()};
 c.stdout.on("data",forward(process.stdout));c.stderr.on("data",forward(process.stderr));
-c.on("error",e=>{process.stderr.write(String(e)+"\\n");code=127;finish()});
-c.on("exit",(x,sig)=>{exited=true;clearTimeout(t);code=x??128+(os.constants.signals[sig]||0);clearTimeout(g);g=setTimeout(finish,100)});
-c.on("close",finish);
+c.on("error",e=>{process.stderr.write(String(e)+"\\n");code=127;if(!idle)finish()});
+c.on("exit",(x,sig)=>{exited=true;clearTimeout(t);code=x??128+(os.constants.signals[sig]||0);if(!idle){clearTimeout(g);g=setTimeout(finish,100)}});
+c.on("close",()=>{if(!idle)finish()});
 arm();
 `.trim();
 
@@ -83,13 +111,14 @@ export const idleWatchdogCommand = (command: string, idleSeconds: number, nodePa
  * pi.bash `background`/`monitor` jobs detach at once, so they may be silent.
  */
 export const applyRunBashDefaults = (
-  env: Env, input: { command?: unknown; timeout?: unknown; background?: unknown; monitor?: unknown },
+  env: Env, input: BashInput,
   platform: NodeJS.Platform = process.platform,
 ): void => {
   const idle = bashIdleSeconds(env);
   const detached = input.background === true || input.monitor !== undefined;
-  if (idle !== undefined && !detached && platform !== "win32" && typeof input.command === "string" && !input.command.startsWith(BASH_IDLE_MARKER)) {
+  if (idle !== undefined && !detached && platform !== "win32" && typeof input.command === "string" && input[WRAPPED] !== wrapNonce) {
     input.command = idleWatchdogCommand(input.command, idle);
+    Object.defineProperty(input, WRAPPED, { value: wrapNonce });
   }
   const total = actorBashTimeout(env, input.timeout);
   if (total !== undefined) input.timeout = total;

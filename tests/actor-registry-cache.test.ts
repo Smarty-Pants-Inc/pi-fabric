@@ -13,7 +13,13 @@ const setup = () => {
   const file = path.join(root, "actors.json");
   const value = { format: 1, actors: [{ id: "actor", extra: { values: [1, 2] } }] };
   fs.writeFileSync(file, JSON.stringify(value));
-  return { root, file, value, store: new ActorRegistryStore(root) };
+  const fd = fs.openSync(file, "r");
+  let cacheable: boolean;
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    cacheable = stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n;
+  } finally { fs.closeSync(fd); }
+  return { root, file, value, cacheable, store: new ActorRegistryStore(root) };
 };
 afterEach(() => {
   vi.restoreAllMocks();
@@ -24,34 +30,41 @@ describe("ActorRegistryStore cached read (#7791)", () => {
   it("bounds decoded generations to 64 paths and promotes hits before LRU eviction", () => {
     const fixtures = Array.from({ length: 65 }, () => setup());
     const views = fixtures.slice(0, 64).map(({ store }) => store.read());
-    expect(fixtures[0]!.store.read()).toBe(views[0]); // Most recently used, not oldest inserted.
+    const promoted = fixtures[0]!.store.read();
+    if (fixtures[0]!.cacheable) expect(promoted).toBe(views[0]); // Most recently used, not oldest inserted.
+    else expect(promoted).not.toBe(views[0]); // Unproven identity always re-reads.
     fixtures[64]!.store.read();
     const parse = vi.spyOn(JSON, "parse");
-    expect(fixtures[0]!.store.read()).toBe(views[0]);
-    expect(parse).not.toHaveBeenCalled();
+    const retained = fixtures[0]!.store.read();
+    if (fixtures[0]!.cacheable) expect(retained).toBe(views[0]);
+    else expect(retained).not.toBe(views[0]);
+    const misses = fixtures[0]!.cacheable ? 0 : 1;
+    expect(parse).toHaveBeenCalledTimes(misses);
     expect(fixtures[1]!.store.read()).not.toBe(views[1]);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(misses + 1);
     // Reading the evicted path inserts it and evicts the next least recent path.
     expect(fixtures[2]!.store.read()).not.toBe(views[2]);
-    expect(parse).toHaveBeenCalledTimes(2);
+    expect(parse).toHaveBeenCalledTimes(misses + 2);
   });
 
   it("explicit release evicts the shared normalized path but preserves other roots", () => {
     const { root, store } = setup();
     const alias = new ActorRegistryStore(path.join(root, "."));
-    const other = setup().store;
+    const { store: other, cacheable } = setup();
     const before = store.read(), retained = other.read();
     alias.releaseReadCache();
     const parse = vi.spyOn(JSON, "parse");
     expect(store.read()).not.toBe(before);
     expect(parse).toHaveBeenCalledTimes(1);
-    expect(other.read()).toBe(retained);
-    expect(parse).toHaveBeenCalledTimes(1);
+    const otherView = other.read();
+    if (cacheable) expect(otherView).toBe(retained);
+    else expect(otherView).not.toBe(retained);
+    expect(parse).toHaveBeenCalledTimes(cacheable ? 1 : 2);
   });
 
 
-  it("parses once for 1,000 unchanged reads with one fstat per read, shared across path aliases", () => {
-    const { root, value, store } = setup();
+  it("shares proven generations across 1,000 alias reads, but re-reads unproven identities", () => {
+    const { root, value, cacheable, store } = setup();
     const alias = new ActorRegistryStore(path.join(root, "."));
     const parse = vi.spyOn(JSON, "parse");
     const stat = vi.spyOn(fs, "statSync");
@@ -61,11 +74,12 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     let last = first;
     for (let i = 1; i < 1_000; i++) last = (i % 2 ? alias : store).read();
     expect(first).toEqual(value);
-    expect(parse).toHaveBeenCalledTimes(1);
-    expect(last).toBe(first);
+    expect(parse).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
+    if (cacheable) expect(last).toBe(first);
+    else expect(last).not.toBe(first);
     expect(fstat).toHaveBeenCalledTimes(1_000);
     expect(stat).not.toHaveBeenCalled();
-    expect(disk).toHaveBeenCalledTimes(1);
+    expect(disk).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
     const view = first as typeof value;
     expect(() => view.actors.push({ id: "bad", extra: { values: [] } })).toThrow(TypeError);
     expect(() => { view.actors[0]!.extra.values[0] = 99; }).toThrow(TypeError);
@@ -91,53 +105,134 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(store.read()).toEqual(value);
   });
 
-  it("binds bytes and identity to the same descriptor across an atomic replacement", () => {
-    const { file, value, store } = setup();
-    const replacement = { format: 1, actors: [{ id: "new" }] };
+  it.each([false, true])("binds bytes and identity to the same descriptor across an atomic replacement (warm=%s)", warm => {
+    const { file, value, cacheable, store } = setup();
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    expect(JSON.stringify(replacement)).toHaveLength(JSON.stringify(value).length);
+    if (warm) store.read(); // An existing cached generation must not mask the replacement.
+    const disk = vi.spyOn(fs, "readFileSync");
     const fstat = fs.fstatSync.bind(fs);
-    let replaced = false;
+    let replaced = false, deferred = false;
     vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) => {
       const stat = Reflect.apply(fstat, fs, [fd, options]);
       if (!replaced) {
         replaced = true;
         fs.writeFileSync(`${file}.new`, JSON.stringify(replacement));
-        fs.renameSync(`${file}.new`, file);
+        try { fs.renameSync(`${file}.new`, file); }
+        catch (error) {
+          // Windows can refuse rename-over-open-file. Publish only after read closes
+          // its descriptor; do not retry synchronously while that handle is held.
+          expect(process.platform).toBe("win32");
+          expect(["EPERM", "EACCES", "EEXIST", "EBUSY"]).toContain((error as NodeJS.ErrnoException).code);
+          deferred = true;
+        }
       }
       return stat;
     }) as typeof fs.fstatSync);
-    expect(store.read()).toEqual(value);
+    const during = store.read();
+    if (process.platform === "win32") expect([value, replacement]).toContainEqual(during);
+    else expect(during).toEqual(value); // POSIX keeps the old inode readable.
+    if (!cacheable) expect(disk).toHaveBeenCalledTimes(1);
+    if (deferred) fs.renameSync(`${file}.new`, file);
     expect(store.read()).toEqual(replacement);
+    if (!cacheable) expect(disk).toHaveBeenCalledTimes(2);
   });
 
   it("keeps complete generations under a concurrent atomic writer and reader", async () => {
-    const { file, store } = setup();
+    const { file, cacheable, store } = setup();
     fs.writeFileSync(file, JSON.stringify({ format: 1, epoch: 0, actors: Array.from({ length: 8 }, () => ({ id: "actor", epoch: 0 })) }));
     const worker = new Worker(`
       const fs = require('node:fs');
       const { workerData } = require('node:worker_threads');
+      const wait = new Int32Array(new SharedArrayBuffer(4));
       for (let epoch = 1; epoch <= 100; epoch++) {
         fs.writeFileSync(workerData + '.new', JSON.stringify({ format: 1, epoch,
           actors: Array.from({ length: 8 }, () => ({ id: 'actor', epoch })) }));
-        fs.renameSync(workerData + '.new', workerData);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+        for (let attempt = 0; ; attempt++) {
+          try { fs.renameSync(workerData + '.new', workerData); break; }
+          catch (error) {
+            if (process.platform !== 'win32' || attempt >= 200 ||
+                !['EPERM', 'EACCES', 'EEXIST', 'EBUSY'].includes(error.code)) throw error;
+            Atomics.wait(wait, 0, 0, 1);
+          }
+        }
+        Atomics.wait(wait, 0, 0, 1);
       }
     `, { eval: true, workerData: file });
     let done = false;
     const exit = once(worker, "exit");
     worker.on("exit", () => { done = true; });
-    let reads = 0;
+    let reads = 0, previous: { epoch: number; actors: { epoch: number }[] } | undefined;
+    const disk = vi.spyOn(fs, "readFileSync");
     try {
       while (!done) {
-        const view = store.read() as { epoch: number; actors: { epoch: number }[] };
-        expect(view.actors).toHaveLength(8);
-        expect(view.actors.every(row => row.epoch === view.epoch)).toBe(true);
-        reads++;
+        let view: typeof previous;
+        try { view = store.read() as NonNullable<typeof previous>; }
+        catch (error) {
+          // A Windows sharing violation is an error, never cached success.
+          expect(process.platform).toBe("win32");
+          expect(["EPERM", "EACCES", "EBUSY"]).toContain((error as NodeJS.ErrnoException).code);
+        }
+        if (view) {
+          expect(view.actors).toHaveLength(8);
+          expect(view.actors.every(row => row.epoch === view.epoch)).toBe(true);
+          expect(view.epoch).toBeGreaterThanOrEqual(previous?.epoch ?? 0);
+          if (!cacheable && previous) expect(view).not.toBe(previous);
+          previous = view;
+          reads++;
+        }
         await new Promise(resolve => setImmediate(resolve));
       }
       expect(await exit).toEqual([0]);
       expect(reads).toBeGreaterThan(1);
       expect((store.read() as { epoch: number }).epoch).toBe(100);
+      if (!cacheable) expect(disk.mock.calls.filter(([name]) => typeof name === "number").length).toBeGreaterThanOrEqual(reads + 1);
     } finally { await worker.terminate(); }
+  });
+
+  it("includes descriptor ctime in a generation with unchanged inode, size and mtime", () => {
+    const { file, value, store } = setup();
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    expect(JSON.stringify(replacement)).toHaveLength(JSON.stringify(value).length);
+    const fstat = fs.fstatSync.bind(fs);
+    let ctimeNs = 1n;
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(fstat, fs, [fd, options]), { ino: 1n, mtimeNs: 1n, ctimeNs })) as typeof fs.fstatSync);
+    const before = store.read();
+    expect(store.read()).toBe(before);
+    fs.writeFileSync(file, JSON.stringify(replacement));
+    ctimeNs = 2n;
+    expect(store.read()).toEqual(replacement);
+    expect(store.read()).not.toBe(before);
+  });
+
+  it.each(["native", "win32"] as const)("re-reads zero-ID descriptors with colliding size and timestamps (%s)", platform => {
+    const { file, value, store } = setup();
+    const replacement = { ...value, actors: [{ id: "other", extra: { values: [3, 4] } }] };
+    expect(JSON.stringify(replacement)).toHaveLength(JSON.stringify(value).length);
+    const cached = store.read();
+    const stamp = fs.statSync(file, { bigint: true });
+    const fstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      Object.assign(Reflect.apply(fstat, fs, [fd, options]), {
+        dev: 0n, ino: 0n, size: stamp.size, mtimeNs: stamp.mtimeNs, ctimeNs: stamp.ctimeNs,
+      })) as typeof fs.fstatSync);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      if (platform === "win32") Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });
+      const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
+      const before = store.read();
+      expect(before).toEqual(value);
+      expect(before).not.toBe(cached);
+      fs.writeFileSync(`${file}.new`, JSON.stringify(replacement));
+      fs.renameSync(`${file}.new`, file);
+      const after = store.read();
+      expect(after).toEqual(replacement);
+      expect(store.read()).toEqual(replacement);
+      expect(store.read()).not.toBe(after);
+      expect(parse).toHaveBeenCalledTimes(4);
+      expect(disk).toHaveBeenCalledTimes(4);
+    } finally { Object.defineProperty(process, "platform", descriptor); }
   });
 
   it.each(["write", "prepared", "downgrade"] as const)("invalidates all stores after %s even if the identity check returns the previous stamp", async kind => {

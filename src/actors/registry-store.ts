@@ -62,6 +62,8 @@ const freezeRegistryValue = <T>(value: T): T => {
 // Stores naming the same normalized path share one immutable decoded generation.
 // Read identity is taken from the open descriptor, so an atomic rename between
 // lookup and decoding cannot cache new bytes under the old inode (or vice versa).
+// Timestamps alone cannot prove identity: Windows fstat may report zero file IDs.
+// Such descriptors always miss rather than aliasing unrelated file generations.
 // Keep at most 64 normalized paths, least recently read first. Managers also
 // release their path on close; ad-hoc store readers remain bounded by this LRU.
 const REGISTRY_READ_CACHE_LIMIT = 64;
@@ -449,18 +451,22 @@ export class ActorRegistryStore {
     catch (error) { this.releaseReadCache(); throw error; }
     try {
       const stat = fs.fstatSync(fd, { bigint: true });
-      const generation = `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.size}`;
+      const generation = stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
+        ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+        : undefined;
       const cached = registryReadCache.get(this.#registryPath);
       // Delete/reinsert promotes both unchanged and replaced generations.
       registryReadCache.delete(this.#registryPath);
-      if (cached?.generation === generation) {
+      if (generation !== undefined && cached?.generation === generation) {
         registryReadCache.set(this.#registryPath, cached);
         return cached.value;
       }
       const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
-      registryReadCache.set(this.#registryPath, { generation, value });
-      if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
-        registryReadCache.delete(registryReadCache.keys().next().value!);
+      if (generation !== undefined) {
+        registryReadCache.set(this.#registryPath, { generation, value });
+        if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
+          registryReadCache.delete(registryReadCache.keys().next().value!);
+        }
       }
       return value;
     } finally {

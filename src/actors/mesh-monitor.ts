@@ -34,10 +34,11 @@ export class ActorMeshMonitor {
   /** Last safe page boundary; live dispatch can throw after advancing the in-memory offset. */
   #safeCursor: MonitorCursor;
   #persistedCursor: string | undefined;
+  #persistedEventAnchor = false;
   #lastCheckpointAt = Date.now();
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -52,15 +53,23 @@ export class ActorMeshMonitor {
     },
   ) {
     const saved = this.#readCursor();
-    this.#offset = saved?.cursor ?? mesh.latestOffset();
-    this.#last = saved?.last;
+    const initial: MonitorCursor = saved ?? mesh.latestCursor?.() ?? { cursor: mesh.latestOffset() };
+    this.#offset = initial.cursor;
+    this.#last = initial.last;
+    this.#persistedCursor = saved ? JSON.stringify(saved) : undefined;
+    this.#persistedEventAnchor = (saved?.last?.sequence ?? 0) > 0;
+    if (saved && !saved.last && mesh.read) {
+      // A legacy/crash seed has no sequence boundary. Its bytes may now name a different
+      // file, even before the generation bump. Replay conservatively once, not on idle polls.
+      this.#last = { sequence: 0, id: "" };
+      this.#offset = meshCursorAtStart(meshCursorGeneration(saved.cursor));
+    }
     this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
-    this.#persistedCursor = saved ? JSON.stringify(this.#safeCursor) : undefined;
     if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
       this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
       this.#catchingUp = true;
     }
-    if (saved?.last !== undefined) this.#archiveAfter = saved.last.sequence;
+    if (saved && this.#last) this.#archiveAfter = this.#last.sequence;
   }
 
   start(): void {
@@ -124,8 +133,8 @@ export class ActorMeshMonitor {
     this.#polling = true;
     try {
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
-      // Live and catch-up both read whole pages. Live advances first, so a failing dispatch
-      // never blocks the stream; the cursor file is committed after the page.
+      // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
+      // before its event, so an empty later poll cannot checkpoint past failed work.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
       // A rewrite restarts the stream at the retained log; the events it cut are in the archive
@@ -162,7 +171,16 @@ export class ActorMeshMonitor {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
-        const accepted = this.callbacks.onEvent(event);
+        let accepted: boolean | void | "ignored";
+        try {
+          accepted = this.callbacks.onEvent(event);
+        } catch (error) {
+          // Keep only this page's consumed prefix. No second read can move the retry
+          // boundary; #last describes that prefix and suppresses duplicates on reread.
+          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
+          throw error;
+        }
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
         if (accepted === false && (catchingUp || isWork(event))) {
@@ -258,11 +276,14 @@ export class ActorMeshMonitor {
     if (!this.callbacks.cursorPath) return;
     const serialized = JSON.stringify(this.#safeCursor);
     if (serialized === this.#persistedCursor) return;
-    // Seed a missing cursor once, so even an idle first run can resume a downtime gap.
-    if (!immediate && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) return;
+    // Seed once; never batch away the first actual sequence anchor. Later ignored-only
+    // progress can wait ten seconds because restart already has a safe archive boundary.
+    const firstAnchor = !this.#persistedEventAnchor && (this.#safeCursor.last?.sequence ?? 0) > 0;
+    if (!immediate && !firstAnchor && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) return;
     try {
       writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { space: 2 });
       this.#persistedCursor = serialized;
+      this.#persistedEventAnchor = (this.#safeCursor.last?.sequence ?? 0) > 0;
       this.#lastCheckpointAt = Date.now();
     } catch {
       // Cursor persistence is best-effort; replay resumes from the latest safe cursor.

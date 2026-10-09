@@ -5,7 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
-import { createRunLogWriter } from "../src/worker/run-log.js";
+import { createRunLogWriter, MAX_EVENT_LINE_CHARS } from "../src/worker/run-log.js";
+import { PiEventProjection } from "../src/worker/event-projection.js";
+import { TranscriptAccumulator } from "../src/ui/transcript-parser.js";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -78,7 +80,104 @@ const readEntries = (text: string) => new AgentTranscriptReader()
   .read({ id: "run", status: "completed", logFile: logFile(text) })
   .entries.map(({ id: _id, ...entry }) => entry);
 
+// Actual lexical projection and writer, with the worker's shared character cap
+// applied before JSON.parse/runLog.event (newline > MAX_EVENT_LINE_CHARS).
+const projectedWrite = (events: Array<Record<string, unknown>>) => {
+  const projection = new PiEventProjection();
+  const projected = projection.write(events.map((event) => `${JSON.stringify(event)}\n`).join("")) + projection.end();
+  let text = "";
+  const dropped: number[] = [];
+  const writer = createRunLogWriter((chunk) => { text += chunk; });
+  for (const line of projected.trimEnd().split("\n")) {
+    if (line.length > MAX_EVENT_LINE_CHARS) { dropped.push(line.length); continue; }
+    writer.event(line, JSON.parse(line) as Record<string, unknown>);
+  }
+  writer.flush();
+  return { text, dropped, lines: text.trimEnd().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>) };
+};
+
+const capEvents = (text: string, isError = false, extras = {}) => {
+  const result = { content: [{ type: "text", text }], details: {}, ...extras };
+  const end = { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result, isError };
+  const message = { role: "toolResult", toolCallId: "capcall", toolName: "cap", content: result.content,
+    details: result.details, isError, timestamp: 1700000000000 };
+  const events = [
+    { type: "tool_execution_start", toolCallId: "capcall", toolName: "cap", args: {} }, end,
+    { type: "message_start", message }, { type: "message_end", message },
+    { type: "turn_end", toolResults: [message] }, { type: "agent_end", messages: [message] },
+  ];
+  return { events, end, message };
+};
+
 describe("worker run log", () => {
+  it.each([false, true])("retains the only accepted result when canonical envelopes exceed the unchanged cap (isError=%s)", (isError) => {
+    // Success is the exact review sequence: end4194304 / canonical4194344.
+    const { events, end } = capEvents("x".repeat(4194157 + Number(isError)), isError);
+    const original = JSON.stringify(events);
+    expect(JSON.stringify(end).length).toBe(4194304);
+    expect(JSON.stringify(events[3]).length).toBe(4194344);
+    const { text, lines, dropped } = projectedWrite(events);
+    expect(dropped).toEqual([4194346, 4194344]);
+    expect(lines[1]).toEqual(end);
+    expect(lines.at(-2)?.toolResults).toEqual([]);
+    expect(lines.at(-1)?.messages).toEqual([]);
+    expect(lines.filter((line) => line.type === "message_end")).toHaveLength(0);
+    expect(JSON.stringify(events)).toBe(original);
+    // There is no canonical/history/prefix fallback: the full accepted end is
+    // sufficient for the production dashboard accumulator and whole-record reader.
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append(lines);
+    expect(accumulator.entries).toEqual([expect.objectContaining({
+      kind: "tool", status: isError ? "failed" : "completed", result: expect.any(Object),
+    })]);
+    const reader = new NativeConversationReader();
+    reader.read({ id: "cap", status: "completed", logFile: logFile(text) });
+    // The initial tail can contain only the small lifecycle records after a
+    // near-cap result; walk older whole-record pages, as the UI does.
+    const retained = reader.loadOlder(3)!;
+    expect(retained.hasMore).toBe(false);
+    expect(retained.streaming.tools[0]?.result).toEqual(end.result);
+    expect(retained.streaming.tools[0]?.status).toBe(isError ? "failed" : "completed");
+    const legacyReader = new NativeConversationReader();
+    legacyReader.read({ id: "legacy", status: "completed", logFile: logFile(events.filter((event) => event.type.startsWith("tool_execution_")).map((event) => `${JSON.stringify(event)}\n`).join("")) });
+    const legacy = legacyReader.loadOlder(3)!;
+    expect(retained.streaming).toEqual(legacy.streaming);
+  });
+
+  it("keeps a conservative envelope reserve without changing the worker cap", () => {
+    expect(MAX_EVENT_LINE_CHARS).toBe(4194304);
+    for (const reserve of [128, 127]) {
+      const { events, end } = capEvents("x".repeat(4194157 - reserve));
+      expect(JSON.stringify(end).length).toBe(MAX_EVENT_LINE_CHARS - reserve);
+      const { lines, dropped } = projectedWrite(events);
+      expect(dropped).toEqual([]);
+      if (reserve === 128) expect(lines[1]?.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify(end.result)) });
+      else expect(lines[1]).toEqual(end); // Deliberately conservative even if canonical fits.
+    }
+    const { events } = capEvents("x".repeat(4194158));
+    expect(projectedWrite(events).dropped).toEqual([4194305, 4194347, 4194345]);
+  });
+
+  it("uses character admission rather than UTF-8 bytes and keeps normal canonical bodies single", () => {
+    const extras = { terminate: true, arbitrary: { values: [null, false, 7] } };
+    const { events, end } = capEvents("界".repeat(1_400_000), false, extras);
+    const original = JSON.stringify(events);
+    const { text, lines, dropped } = projectedWrite(events);
+    expect(JSON.stringify(end).length).toBeLessThan(MAX_EVENT_LINE_CHARS - 128);
+    expect(Buffer.byteLength(JSON.stringify(end.result))).toBeGreaterThan(MAX_EVENT_LINE_CHARS);
+    expect(dropped).toEqual([]);
+    expect(lines[1]?.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify(end.result)) });
+    expect(lines[1]?.resultMetadata).toEqual(extras);
+    expect(lines.filter((line) => (line.message as { role?: string } | undefined)?.role === "toolResult")).toHaveLength(1);
+    const body = end.result.content[0]!.text;
+    expect(text.indexOf(body)).toBeGreaterThan(0);
+    expect(text.indexOf(body)).toBe(text.lastIndexOf(body));
+    expect(JSON.stringify(events)).toBe(original);
+    const reader = new NativeConversationReader();
+    reader.read({ id: "unicode", status: "completed", logFile: logFile(text) });
+    expect(reader.loadOlder(3)!.streaming.tools[0]?.result).toEqual({ content: end.result.content, details: end.result.details });
+  });
+
   it("merges deltas per content block, keeps the latest tool update, and drops repeated messages", () => {
     const { lines } = write(run, true);
     const deltas = lines.filter((line) => line.type === "message_update" && String((line.assistantMessageEvent as { type: string }).type).endsWith("_delta"));

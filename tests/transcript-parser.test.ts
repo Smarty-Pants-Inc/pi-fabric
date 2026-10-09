@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { missingToolStartIds, TranscriptAccumulator } from "../src/ui/transcript-parser.js";
+import { missingToolStartIds, toolLifecycleContext, TranscriptAccumulator } from "../src/ui/transcript-parser.js";
+import { isCompactToolResult } from "../src/ui/transcript-sanitization.js";
 
 const start = (id: string) => ({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: id } });
 const end = (id: string, result: unknown, isError = false) => ({ type: "tool_execution_end", toolCallId: id, toolName: "bash", result, isError });
@@ -61,6 +62,49 @@ describe("TranscriptAccumulator canonical tool results", () => {
     expect(accumulator.snapshot().entries[2]?.result).toEqual({ ...payload(result("a")), opaque: "legacy" });
     accumulator.append([start("a"), result("a")]);
     expect(accumulator.snapshot().entries[3]?.result).toEqual(payload(result("a")));
+  });
+
+  it.each([false, true])("reads legacy full results with an opaque elided field (canonical=%s)", (withCanonical) => {
+    const accumulator = new TranscriptAccumulator();
+    const legacy = { content: [{ type: "text", text: "legacy" }], details: { exitCode: 1 }, elided: true, customFlag: 0 };
+    accumulator.append([start("a"), end("a", legacy, true), ...(withCanonical ? [result("a")] : [])]);
+    expect(accumulator.snapshot().entries).toEqual([expect.objectContaining({ id: "a", status: "failed", result: legacy })]);
+  });
+
+  it.each([
+    { elided: true }, { elided: true, bytes: -1 }, { elided: true, bytes: 0.5 },
+    { elided: true, bytes: "10" }, { elided: true, bytes: null },
+    { elided: true, bytes: NaN }, { elided: true, bytes: Infinity },
+    { elided: true, bytes: 10, customFlag: 0 },
+    { elided: true, bytes: 10, content: [] }, { elided: true, bytes: 10, details: {} },
+    { elided: false, bytes: 10 },
+  ])("does not suppress malformed or extended marker-like results: %j", (value) => {
+    expect(isCompactToolResult(value)).toBe(false);
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([start("a"), end("a", value), result("a")]);
+    expect(accumulator.snapshot().entries).toHaveLength(1);
+    expect(accumulator.snapshot().entries[0]).toMatchObject({ status: "completed", result: value });
+  });
+
+  it.each([0, 1, 120])("accepts only exact compact markers, including bytes=%s", (bytes) => {
+    expect(isCompactToolResult({ bytes, elided: true })).toBe(true);
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([start("a"), end("a", { bytes, elided: true })]);
+    expect(accumulator.snapshot().entries[0]).toMatchObject({ status: "running" });
+    expect(accumulator.snapshot().entries[0]?.result).toBeUndefined();
+  });
+
+  it("selects nearest context ends and stops at reused lifecycle boundaries", () => {
+    const oldMarker = { ...end("a", { elided: true, bytes: 100 }), resultMetadata: { terminate: true } };
+    const newMarker = end("a", { elided: true, bytes: 80 });
+    const missing = new Set(["a"]);
+    expect(toolLifecycleContext([start("a"), oldMarker, newMarker], missing)).toEqual([start("a"), newMarker]);
+    expect(toolLifecycleContext([start("a"), oldMarker, result("a"), start("a")], missing)).toEqual([start("a")]);
+    expect(toolLifecycleContext([start("a"), oldMarker, result("a")], missing)).toEqual([]);
+    expect(toolLifecycleContext([start("a"), oldMarker, end("a", payload(result("a")))], missing)).toEqual([start("a"), end("a", payload(result("a")))]);
+    expect(toolLifecycleContext([result("a"), newMarker], missing)).toEqual([newMarker]);
+    expect(toolLifecycleContext([newMarker], missing)).toEqual([newMarker]);
+    expect(missing).toEqual(new Set(["a"]));
   });
 
   it("does not fabricate unavailable metadata in a canonical-only page", () => {

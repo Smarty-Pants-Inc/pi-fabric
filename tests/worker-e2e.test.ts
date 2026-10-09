@@ -352,8 +352,10 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
-    expect(events.find((event) => event.type === "tool_execution_end")?.result.content[1]).toEqual(stub);
-    expect(events.find((event) => event.message?.role === "toolResult")?.message.content[1]).toEqual(stub);
+    const end = events.find((event) => event.type === "tool_execution_end");
+    const canonical = events.find((event) => event.type === "message_end" && event.message?.role === "toolResult");
+    expect(end?.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content: canonical.message.content }), "utf8") });
+    expect(canonical?.message.content[1]).toEqual(stub);
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

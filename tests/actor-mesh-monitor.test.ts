@@ -332,14 +332,61 @@ describe("ActorMeshMonitor", () => {
     s.onEvent.mockReturnValue("ignored");
     s.monitor.start();
     await flush();
-    s.mesh.tail.mockReturnValue({ events: [{ topic: "t" } as MeshEvent], nextOffset: 30 });
+    const failed = { id: "failed", sequence: 1, topic: "fleet.work.a", createdAt: Date.now() } as MeshEvent;
+    s.mesh.tail.mockReturnValue({ events: [failed], nextOffset: 30, cursors: [30] });
     s.onEvent.mockImplementationOnce(() => { throw new Error("dispatch"); });
     s.monitor.schedule();
     await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     expect(s.onEvent).toHaveBeenCalledTimes(2);
+    // Model a fallback poll that would be empty at the wrongly advanced offset.
+    s.mesh.tail.mockImplementation((offset: number) => offset >= 30
+      ? { events: [], nextOffset: 30 }
+      : { events: [failed], nextOffset: 30, cursors: [30] });
+    s.onEvent.mockImplementation(() => { throw new Error("dispatch still fails"); });
+    s.monitor.schedule();
+    await flush();
     s.monitor.close();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
+    const offered: string[] = [];
+    const resumed = new ActorMeshMonitor(s.mesh, s.monitor.config, {
+      cursorPath: s.cursorPath, beforePoll: () => true, onEvent: (event) => { offered.push(event.id); },
+    });
+    monitors.push(resumed);
+    resumed.schedule();
+    await flush();
+    expect(offered).toEqual(["failed"]);
+  });
+
+  it("retains only the same-page consumed prefix when a later dispatch throws", async () => {
+    const s = setup('{"format":1,"cursor":3,"last":{"sequence":0,"id":""}}');
+    const events = [1, 2, 3].map((sequence) => ({
+      id: `e${sequence}`, sequence, topic: "fleet.work.a", createdAt: Date.now(),
+    })) as MeshEvent[];
+    s.mesh.tail.mockImplementation((offset: number) => {
+      const index = offset === 3 ? 0 : offset / 10;
+      return { events: events.slice(index), nextOffset: 30, cursors: [10, 20, 30].slice(index) };
+    });
+    s.onEvent.mockImplementation((event: MeshEvent) => {
+      if (event.sequence === 2) throw new Error("dispatch");
+      return true;
+    });
+    s.monitor.start();
+    await flush();
+    s.monitor.schedule();
+    await flush();
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(10, 7);
+    expect(s.onEvent.mock.calls.map(([event]) => event.id)).toEqual(["e1", "e2", "e2"]);
+    s.monitor.close();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 10, last: { sequence: 1, id: "e1" } });
+    const offered: string[] = [];
+    const resumed = new ActorMeshMonitor(s.mesh, s.monitor.config, {
+      cursorPath: s.cursorPath, beforePoll: () => true, onEvent: (event) => { offered.push(event.id); },
+    });
+    monitors.push(resumed);
+    resumed.schedule();
+    await flush();
+    expect(offered).toEqual(["e2", "e3"]);
   });
 
   it("does not commit a cursor after dispatch failure and tolerates cursor write failure", async () => {
@@ -352,9 +399,68 @@ describe("ActorMeshMonitor", () => {
     fs.mkdirSync(s.cursorPath);
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7);
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(3, 7);
     expect(s.onEvent).toHaveBeenCalledTimes(2);
   });
+});
+
+describe("ActorMeshMonitor unanchored crash recovery", () => {
+  for (const mode of ["empty seed", "existing tail seed", "first ignored progress", "legacy lastless"] as const) {
+    it(`recovers archived targeted work after ${mode}, without a later-sequence seed`, async () => {
+      vi.useFakeTimers({ now: 1_000_000 });
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-anchor-"));
+      roots.push(base);
+      const root = path.join(base, "mesh");
+      const dir = path.join(base, "archive");
+      fs.mkdirSync(root);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+      vi.spyOn(fs, "watch").mockReturnValue(Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as FSWatcher);
+      const mesh = new MeshStore(root, 4_096, 50);
+      const from = { id: "peer", name: "peer", kind: "actor" as const };
+      const cursorPath = path.join(base, "cursor.json");
+      const historical = mode === "existing tail seed" || mode === "legacy lastless"
+        ? await mesh.publish({ topic: mode === "existing tail seed" ? "fleet.work.a" : "team.noise", from, text: "before first start" })
+        : undefined;
+      if (mode === "legacy lastless") fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: mesh.latestOffset() }));
+      const before = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 50 }, {
+        cursorPath, beforePoll: () => true, onEvent: () => "ignored",
+      });
+      monitors.push(before);
+      // Leave a legacy lastless cursor untouched until the restart after compaction.
+      if (mode !== "legacy lastless") {
+        before.start();
+        await flush();
+      }
+      if (mode === "first ignored progress") {
+        const ignored = await mesh.publish({ topic: "team.noise", from });
+        before.schedule();
+        await flush();
+        // The first actual event anchor must not wait for the ten-second checkpoint.
+        expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).last).toEqual({ sequence: ignored.sequence, id: ignored.id });
+      }
+      const crashCursor = fs.readFileSync(cursorPath, "utf8");
+      before.close();
+      fs.writeFileSync(cursorPath, crashCursor); // Restore the bytes a crash (no close flush) leaves.
+      const noise = await mesh.publish({ topic: "team.noise", from, text: "old ordinary" });
+      const target = await mesh.publish({ topic: "fleet.work.a", to: "actor:a", from, text: "archived target" });
+      const retained = await mesh.publish({ topic: "team.noise", from, text: "retained old ordinary" });
+      const live = path.join(root, "events.jsonl");
+      const suffix = fs.readFileSync(live, "utf8").split("\n").filter((line) => line && JSON.parse(line).sequence >= retained.sequence);
+      fs.writeFileSync(`${live}.tmp`, suffix.join("\n") + "\n");
+      fs.renameSync(`${live}.tmp`, live);
+      fs.writeFileSync(path.join(root, "generation"), "1");
+      const seen: MeshEvent[] = [];
+      const resumed = new ActorMeshMonitor(mesh, before.config, {
+        cursorPath, maxReplayAgeMs: -60_000, beforePoll: () => true, onEvent: (event) => { seen.push(event); },
+      });
+      monitors.push(resumed);
+      resumed.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(seen.map((event) => event.id)).toEqual([target.id]);
+      expect(seen.some((event) => event.id === noise.id || event.id === historical?.id)).toBe(false);
+    });
+  }
 });
 
 describe("ActorManager idle checkpoints", () => {
@@ -421,12 +527,19 @@ describe("ActorManager idle checkpoints", () => {
     const writes = vi.spyOn(fs, "renameSync");
     const initial = s.cursor();
     try {
+      let firstIgnored!: MeshEvent;
       for (let index = 0; index < 40; index++) {
-        await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
+        const event = await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
+        if (index === 0) firstIgnored = event;
         await s.poll();
       }
-      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(0);
-      expect(s.cursor()).toEqual(initial);
+      // An empty seed is safe at sequence zero; the first real ignored event anchors
+      // immediately, then the remaining unrelated burst stays batched.
+      expect(initial.last).toEqual({ sequence: 0, id: "" });
+      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+      // Actor creation may have reserved an earlier sequence; assert the actual
+      // handed-on anchor rather than assuming this event is sequence one.
+      expect(s.cursor().last).toEqual({ sequence: firstIgnored.sequence, id: firstIgnored.id });
       const skipped = await s.mesh.publish({ topic: "fleet.work.wanted", kind: "skip", from: s.from });
       await s.poll();
       expect(s.actors.status(s.actor.id).filteredCount).toBe(1);
@@ -437,7 +550,7 @@ describe("ActorManager idle checkpoints", () => {
       await s.firstRun;
       expect(s.run).toHaveBeenCalledOnce();
       expect(s.cursor().last).toEqual({ sequence: directed.sequence, id: directed.id });
-      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(2);
+      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(3);
     } finally {
       s.release();
       await s.actors.close();

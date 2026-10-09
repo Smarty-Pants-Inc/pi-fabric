@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,4 +27,54 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
     }
   });
   return { TMPDIR: directory, TMP: directory, TEMP: directory };
+}
+
+// Vitest may reload this module for each isolated file; one process-owned exit hook
+// avoids accumulating hundreds of listeners while retaining cleanup for every root.
+const fleetRootsKey = Symbol.for("pi-fabric.test-owned-fleet-roots");
+
+/** Run at config evaluation AND before each test file's source imports. */
+export function isolateTestFleetEnvironment(): Record<string, string> {
+  // Clear the entire namespace, including future path/identity/capability selectors.
+  // Unsetting paths alone would fall back to the checkout or the user's Pi profile.
+  for (const key of Object.keys(process.env)) {
+    if (key.toUpperCase().startsWith("PI_FABRIC_")) delete process.env[key];
+  }
+  for (const key of [
+    "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",
+    "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG",
+  ]) delete process.env[key];
+
+  // Keep Windows' stable TMP policy, but never share fleet state between workers/files.
+  const root = mkdtempSync(join(tmpdir(), "pi-fabric-test-fleet-"));
+  const owner = process as typeof process & { [fleetRootsKey]?: Set<string> };
+  if (!owner[fleetRootsKey]) {
+    const roots = owner[fleetRootsKey] = new Set<string>();
+    process.once("exit", () => {
+      for (const directory of roots) {
+        try {
+          rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+        } catch {
+          // A killed child may still hold a Windows handle; never mask test results.
+        }
+      }
+    });
+  }
+  owner[fleetRootsKey]!.add(root);
+  const environment = {
+    PI_FABRIC_MESH_ROOT: join(root, "mesh"),
+    PI_FABRIC_PROJECT_ROOT: join(root, "project"),
+    PI_FABRIC_PROJECT: join(root, "project"),
+    PI_FABRIC_RUN_ROOT: join(root, "runs"),
+    PI_FABRIC_AGENT_DIR: join(root, "exports"),
+    PI_CODING_AGENT_DIR: join(root, "agent"),
+    // An explicit private MCP layer prevents fallback to the real home config.
+    MCPORTER_CONFIG: join(root, "mcporter.json"),
+  };
+  for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
+    mkdirSync(join(root, directory), { recursive: true });
+  }
+  writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');
+  Object.assign(process.env, environment);
+  return environment;
 }

@@ -5,6 +5,7 @@ import {
   clip,
   compactRedactedValue,
   contentText,
+  isCompactToolResult,
   messageError,
   recordOf,
   redact,
@@ -469,7 +470,7 @@ export class TranscriptAccumulator {
       // Neither the marker nor its extra fields are an interim result preview.
       // Canonical content/details/isError finish the call; the message omits
       // other tool result fields (e.g. fabric_reply's terminate).
-      if (recordOf(event.result)?.elided === true) {
+      if (isCompactToolResult(event.result)) {
         const toolId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
         if (toolId && !this.#finishedTools.has(toolId)) {
           const { content: _content, details: _details, ...metadata } = recordOf(event.resultMetadata) ?? {};
@@ -635,6 +636,43 @@ const toolLifecycleEndIds = (event: Record<string, unknown>): string[] => {
       ? [part.tool_use_id]
       : [];
   });
+};
+
+// Recover only the nearest lifecycle. A prior canonical completion is a
+// boundary too: a reused ID must not borrow an older call's start or metadata.
+export const toolLifecycleContext = (
+  events: Array<Record<string, unknown>>,
+  missingIds: Set<string>,
+): Array<Record<string, unknown>> => {
+  const remaining = new Set(missingIds);
+  const ends = new Map<string, { index: number; event: Record<string, unknown> }>();
+  const selected: Array<{ index: number; event: Record<string, unknown> }> = [];
+  const finish = (id: string): void => {
+    const end = ends.get(id);
+    if (end) selected.push(end);
+    ends.delete(id);
+    remaining.delete(id);
+  };
+  for (let index = events.length - 1; index >= 0 && remaining.size > 0; index--) {
+    const event = events[index]!;
+    for (const start of normalizedToolStarts(event)) {
+      if (!remaining.has(start.id)) continue;
+      selected.push({ index, event: start.event });
+      finish(start.id);
+    }
+    for (const id of toolLifecycleEndIds(event)) {
+      if (!remaining.has(id)) continue;
+      if (event.type === "tool_execution_end" && !ends.has(id)) {
+        // The nearest end wins even if it carries no metadata. Retain full
+        // legacy ends too, so a canonical-only page keeps their args/result.
+        ends.set(id, { index, event });
+      } else if (event.type !== "tool_execution_end" || !isCompactToolResult(event.result)) {
+        finish(id);
+      }
+    }
+  }
+  for (const end of ends.values()) selected.push(end);
+  return selected.sort((a, b) => a.index - b.index).map(({ event }) => event);
 };
 
 export const missingToolStartIds = (events: Array<Record<string, unknown>>): Set<string> => {

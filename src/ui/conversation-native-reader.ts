@@ -42,6 +42,17 @@ import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 // history. Files that cannot be read are reported through the bounded
 // `unavailable`/`error` snapshot fields instead of throwing.
 
+// ponytail: duplicate this tiny wire guard to avoid a new static shared chunk
+// in the eager native-reader graph; keep identical to transcript-sanitization.
+const isCompactToolResult = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result);
+  return keys.length === 2 && keys.includes("elided") && keys.includes("bytes") &&
+    result.elided === true && typeof result.bytes === "number" &&
+    Number.isInteger(result.bytes) && result.bytes >= 0;
+};
+
 export type NativeAgentMessage = SessionMessageEntry["message"];
 
 export interface NativeConversationSource {
@@ -993,10 +1004,10 @@ export class NativeConversationReader {
         const tool = this.#toolFor(event);
         if (!tool) return;
         this.#streamingDirty = true;
-        const result = event.result as { content?: unknown[]; details?: unknown; elided?: boolean } | undefined;
+        const result = event.result as { content?: unknown[]; details?: unknown } | undefined;
         // Leave the partial visible until the canonical message arrives. An
         // empty result here would replace it with an empty final card for a frame.
-        if (result && typeof result === "object" && result.elided !== true) {
+        if (result && typeof result === "object" && !isCompactToolResult(result)) {
           tool.result = {
             ...(Array.isArray(result.content) ? { content: result.content } : {}),
             ...(result.details !== undefined ? { details: result.details } : {}),

@@ -929,7 +929,16 @@ export class ResidencyClient {
     const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, metadata.id));
     if (saved?.id === metadata.id && terminal(saved.status)) return saved;
     const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
-    if (live?.id === metadata.id) return live;
+    if (live?.id === metadata.id) {
+      if (live.transport === "process" && terminal(live.status) &&
+          (this.#attemptMayRetry(metadata.id) || runTreeExitVeto(metadata.runDirectory, 0, undefined, true))) {
+        // A worker candidate is not the resident supervisor's tree-exit outcome.
+        // Preserve its final text, but keep status and wait/join non-terminal.
+        const { finishedAt: _finishedAt, ...pending } = live;
+        return { ...pending, status: "finishing" };
+      }
+      return live;
+    }
     if (fs.existsSync(metadata.runDirectory) || this.#liveOwner()) return undefined;
     const { handle } = metadata;
     return {

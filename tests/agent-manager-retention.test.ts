@@ -29,13 +29,17 @@ it("Windows native-close discharge preserves main custody; cached invalidation d
       startedAt: now, updatedAt: now, finishedAt: now, text: "exact saved outcome", turns: 1, toolCalls: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     });
-    expect(await manager.wait(handle.id)).toMatchObject({ status: "completed", text: "exact saved outcome" });
+    let settled = false;
+    const waiting = manager.wait(handle.id).then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("finishing"));
+    expect(settled).toBe(false);
     const snapshot = () => manager.retentionReferences({ now, budgetMs: 100, maxEntries: 128 });
     expect(snapshot().has(handle.id)).toBe(true);
     // Windows uses main's uncached reference scan, not the V2 targeted veto.
     manager.listForUi(); manager.status(handle.id);
     expect(snapshot().has(handle.id)).toBe(true);
     release();
+    expect(await waiting).toMatchObject({ status: "completed", text: "exact saved outcome" });
     // Main has no retention cache on Windows: each call must observe the real
     // native close/debt-discharge transition without an artificial clock advance.
     await vi.waitFor(() => {

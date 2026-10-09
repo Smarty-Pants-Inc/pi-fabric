@@ -6,11 +6,14 @@ import { executionGroup } from "../src/worker/execution-group.js";
 
 afterEach(() => vi.restoreAllMocks());
 describe.skipIf(process.platform !== "linux")("worker execution group identity", () => {
-  const setup = () => {
+  const setup = (scope: "shared" | "dedicated" = "shared") => {
     const processes = new Map<number, { started: string; group: number }>([[100, { started: "leader-birth", group: 100 }]]);
     let unreadable = false;
     vi.spyOn(fs, "readdirSync").mockImplementation(() => [...processes.keys()].map(String) as never);
+    vi.spyOn(fs, "existsSync").mockReturnValue(true);
     vi.spyOn(fs, "readFileSync").mockImplementation(file => {
+      if (String(file) === "/proc/self/cgroup") return "0::/worker.scope\n";
+      if (String(file) === "/proc/100/cgroup") return scope === "dedicated" ? "0::/execution.scope\n" : "0::/worker.scope\n";
       if (unreadable) throw Object.assign(new Error("identity unreadable"), { code: "EIO" });
       const pid = Number(String(file).split("/")[2]);
       const value = processes.get(pid);
@@ -24,6 +27,12 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     const group = executionGroup(child);
     return { processes, child, kill, group, unknown: () => { unreadable = true; } };
   };
+
+  it("uses cgroup events only for a dedicated execution scope, never a shared worker scope", () => {
+    expect(setup("shared").group.cgroupEventsFile).toBeUndefined();
+    vi.restoreAllMocks();
+    expect(setup("dedicated").group.cgroupEventsFile).toBe("/sys/fs/cgroup/execution.scope/cgroup.events");
+  });
 
   it("retains a descendant birth after native leader exit and pipe close", () => {
     const { processes, child, kill, group } = setup();

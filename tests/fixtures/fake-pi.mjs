@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 // A stub `pi` binary for the real-worker e2e. The Fabric worker spawns this as
 // the child agent and talks to it over stdin/stdout JSON lines. Behavior is
 // selected with the FAKE_PI_BEHAVIOR env var so the e2e can drive the real
@@ -79,6 +80,46 @@ const terminated = () => {
 };
 
 switch (behavior) {
+  case "finishing-root-stubborn": {
+    process.on("SIGTERM", () => {});
+    fs.writeFileSync(process.env.FAKE_PI_FINISHING_PID, String(process.pid));
+    setInterval(() => {}, 1_000); // retain the native Pi root after EOF
+    emit({ type: "agent_start" });
+    emit({ type: "message_end", message: { role: "assistant", content: "QUIESCENT", stopReason: "stop" } });
+    const boundary = setInterval(() => {
+      if (!fs.existsSync(process.env.FAKE_PI_FINISHING_SETTLE)) return;
+      clearInterval(boundary);
+      emit({ type: "agent_end", willRetry: false });
+      emit({ type: "agent_settled", outcome: "completed" });
+    }, 10);
+    break;
+  }
+  case "finishing-child":
+  case "finishing-child-stubborn": {
+    const pidFile = process.env.FAKE_PI_FINISHING_PID;
+    const release = process.env.FAKE_PI_FINISHING_RELEASE;
+    const settle = process.env.FAKE_PI_FINISHING_SETTLE;
+    const child = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      ${behavior.endsWith("stubborn") ? 'process.on("SIGTERM", () => {});' : ""}
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+      setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) process.exit(0); }, 10);
+    `], { stdio: "ignore" });
+    child.unref();
+    const ready = setInterval(() => {
+      if (!fs.existsSync(pidFile)) return;
+      clearInterval(ready);
+      emit({ type: "agent_start" });
+      emit({ type: "message_end", message: { role: "assistant", content: "QUIESCENT", stopReason: "stop" } });
+      const boundary = setInterval(() => {
+        if (!fs.existsSync(settle)) return;
+        clearInterval(boundary);
+        emit({ type: "agent_end", willRetry: false });
+        emit({ type: "agent_settled", outcome: "completed" });
+      }, 10);
+    }, 10);
+    break;
+  }
   case "terminated-hang":
   case "retry-hang": {
     terminated();

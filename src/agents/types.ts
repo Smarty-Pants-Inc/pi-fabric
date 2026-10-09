@@ -15,6 +15,7 @@ import type { InheritedSessionPin } from "./session-pins.js";
 export type AgentRunStatus =
   | "queued"
   | "running"
+  | "finishing"
   | "completed"
   | "failed"
   | "stopped"
@@ -199,8 +200,9 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
-  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
+  /** Machine-readable terminal cause; failure publication is not an exit receipt. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "CUSTODY_UNCONFIRMED";
+  executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -399,6 +401,12 @@ export interface AgentTransportHandle {
   sessionId?: string;
   attachCommand?: string;
   livenessPollIntervalMs?: number;
+  /** Natural-exit grace after a native terminal candidate, before custody cleanup. */
+  finishingGraceMs?: number;
+  /** Birth-checked descendants signalled during custody cleanup, counted once. */
+  forcedCleanupCount?(): number;
+  /** Conservative count of descendants whose exit is not confirmed. */
+  remainingDescendantCount?(): number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
@@ -415,8 +423,8 @@ export interface AgentTransportHandle {
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
   /** Immutable debt from this captured native stop/close deadline, not a generic
-   * liveness failure. Logical stop may finish while this exact debt retains files
-   * and admission; cancelled launches still require confirmed execution exit. */
+   * liveness failure. Bounded host shutdown may finish with custody retained,
+   * but task settlement and admission still require confirmed execution exit. */
   stopDebt?(): string | undefined;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;

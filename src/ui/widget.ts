@@ -30,7 +30,7 @@ const colorStatus = (theme: Theme, status: string, value: string): string => {
   if (status === "completed" || status === "done" || status === "exited") return theme.fg("success", value);
   if (status === "failed" || status === "timed_out") return theme.fg("error", value);
   if (status === "blocked" || status === "stopping") return theme.fg("warning", value);
-  if (status === "running" || status === "in_progress" || status === "spilled") return theme.fg("accent", value);
+  if (status === "running" || status === "finishing" || status === "in_progress" || status === "spilled") return theme.fg("accent", value);
   return theme.fg("dim", value);
 };
 

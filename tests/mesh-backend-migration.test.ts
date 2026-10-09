@@ -426,11 +426,11 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
-    const code = await main(["cutover", "--root", other], {
+    const code = await main(["cutover", "--root", other, "--accept-empty-registry"], {
       census: async () => ({ writers: [fileWriter] }), stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe(`fabric-mesh-backend: no reader registered in ${other}/readers\nfabric-mesh-backend: advisory: 1 writer, 0 unknown\n`);
+    expect(err).toBe(`fabric-mesh-backend: no reader registered in ${other}/readers (accepted by --accept-empty-registry)\nfabric-mesh-backend: advisory: 1 writer, 0 unknown\n`);
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 
@@ -912,7 +912,7 @@ describe("fabric-mesh-backend CLI", () => {
     // An unknown writer never blocks: the cutover is fenced on .lock and custody.lock only.
     expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(2);
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
-    const cutover = await run("cutover", "--root", root, "--json");
+    const cutover = await run("cutover", "--root", root, "--accept-empty-registry", "--json");
     expect(cutover.code).toBe(0);
     expect(cutover.err).toMatch(/fabric-mesh-backend: advisory: 0 writers, 1 unknown/);
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1 });

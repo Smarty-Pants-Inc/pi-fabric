@@ -140,6 +140,12 @@ export interface MeshBackendOptions {
   open?: SqliteOpener;
   /** Synchronous crash-point hook (tests kill the tool here). */
   onStep?: (step: MeshBackendStep) => void;
+  /**
+   * Runs synchronously under the fence, inside the import transaction right before its COMMIT, with
+   * the flag and epoch from before this import. A throw rolls the import back with nothing changed
+   * (smarty-dev#7815: the reader readiness gate is re-checked here, see reader-proof.ts).
+   */
+  beforeCommit?: (before: { backend: string; epoch: number; commit: number }) => void;
   /** Fence violations and late writers. The error is thrown as well. */
   onAlarm?: (alarm: MeshBackendAlarm) => void;
 }
@@ -747,6 +753,7 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
     verifyImported(fence, { epoch: next, digest }, root, options, "importing");
     // Reconcile right before COMMIT: a state.json that moved since G0 keeps the flag where it was.
     assertFileUnchanged(root, options, { generation, digest }, "before the flag commit", "import aborted, the backend flag is unchanged");
+    options.beforeCommit?.({ backend: meta.backend, epoch: meta.epoch, commit: meta.commit });
     return { epoch: next, previousEpoch: previous };
   });
   options.onStep?.("import-commit");

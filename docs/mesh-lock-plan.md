@@ -137,7 +137,7 @@ A reader uses `state.json` only when `backend=file` and it is a real state file 
 ```sh
 fabric-mesh-backend census   --root <mesh>   # the L4a writer census, ADVISORY: "advisory: N writers, M unknown" and each entry; exit 0
 fabric-mesh-backend status   --root <mesh>   # flag, epochs, digests, reader decision, advisory census; 0 fence holds, 3 violated
-fabric-mesh-backend cutover  --root <mesh>   # file -> sqlite (the fenced section above); 0 done, 3 refused (also a reader not ready: docs/mesh-backend.md)
+fabric-mesh-backend cutover  --root <mesh>   # file -> sqlite (the fenced section above); 0 done, 3 refused (also a reader not ready or no reader registered: docs/mesh-backend.md)
 fabric-mesh-backend reader-proof --root <mesh> --name N --backend sqlite  # a reader proves a real read for the readiness gate
 fabric-mesh-backend rollback --root <mesh>   # sqlite -> file, steps 1 to 5; 0 done (a rerun converges), 3 refused
 fabric-mesh-backend abort-rollback --root <mesh>  # exporting -> sqlite at E+1; 0 done, 3 refused

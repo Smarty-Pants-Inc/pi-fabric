@@ -103,7 +103,7 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
     const before = cli("status", "--root", root);
     expect(before, before.err).toMatchObject({ code: 0 });
     expect(before.out).toContain("census        advisory: 0 writers, 0 unknown");
-    const cutover = cli("cutover", "--root", root);
+    const cutover = cli("cutover", "--root", root, "--accept-empty-registry");
     expect(cutover, cutover.err).toMatchObject({ code: 0 });
     expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
     expect(cutover.out).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\), 1 entries/);
@@ -147,7 +147,7 @@ describe("fabric-mesh-backend with the writer census (W1)", () => {
     writer.child.stdin.write("exit\n");
     await new Promise(resolve => writer.child.once("exit", resolve));
     expect(await run("census", "--root", root)).toMatchObject({ code: 0, out: "census        advisory: 0 writers, 0 unknown\n" });
-    const cutover = await run("cutover", "--root", root, "--json");
+    const cutover = await run("cutover", "--root", root, "--accept-empty-registry", "--json");
     expect(cutover.code).toBe(0);
     expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1,

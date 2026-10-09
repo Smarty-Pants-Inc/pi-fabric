@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RootInboxBatch, RootInboxKnownWake, RootInboxSession } from "./topology/root-inbox.js";
+import type { RootInboxBatch, RootInboxKnownWake, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -315,8 +315,8 @@ export class FabricState {
   /** Existing current runtime only; asking for a hint must never activate anything. */
   observeRootInbox(session: RootInboxSession): readonly string[] { return this.#current()?.observeRootInbox(session) ?? []; }
   get rootInboxKnownWake(): RootInboxKnownWake | undefined { return this.#current()?.rootInboxKnownWake; }
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, hint?: RootInboxKnownWake): Promise<RootInboxBatch | undefined> {
-    return this.#current()?.nextRootInbox(session, idle, hint);
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions, hint?: RootInboxKnownWake): Promise<RootInboxBatch | undefined> {
+    return this.#current()?.nextRootInbox(session, idle, options, hint);
   }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {

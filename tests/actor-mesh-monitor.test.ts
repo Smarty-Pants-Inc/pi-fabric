@@ -35,9 +35,39 @@ function setup(cursor?: string) {
   return { root, cursorPath, watcher, mesh, beforePoll, onEvent, monitor };
 }
 
-const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
+// Include the background retry fence and the retained-wake microtask.
+const flush = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it.each([50, 1_600])("delivers every changed watch burst within 100 ms without an actorPollMs=%i trailing timer", async actorPollMs => {
+    const s = setup();
+    s.monitor.config.actorPollMs = actorPollMs;
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    s.monitor.start(); await flush();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    for (let index = 0; index < 12; index++) {
+      const event = { topic: `burst-${index}` } as MeshEvent;
+      s.mesh.tail.mockReturnValue({ events: [event], nextOffset: 20 + index });
+      fs.appendFileSync(path.join(s.root, "events.jsonl"), `${index}\n`);
+      const startedAt = Date.now();
+      notify("change", index % 2 ? "events.jsonl" : null);
+      notify("change", "events.jsonl"); // same-turn notification coalescing
+      notify("rename", "state.read-signal.json");
+      await flush();
+      expect(s.onEvent).toHaveBeenLastCalledWith(event);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(index + 2);
+      expect(Date.now() - startedAt).toBeLessThan(100);
+      await vi.advanceTimersByTimeAsync(10); // no quiet window between events
+    }
+    expect(vi.getTimerCount()).toBe(1); // only the named safety net
+    const count = s.mesh.tail.mock.calls.length;
+    notify("change", "events.jsonl"); await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count); // duplicate edge, unchanged stamp
+    s.monitor.close();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("arms no fast recurring idle timer and takes no actor poll for five minutes", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
@@ -48,6 +78,108 @@ describe("ActorMeshMonitor", () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(s.beforePoll).toHaveBeenCalledOnce(); expect(s.mesh.tail).toHaveBeenCalledOnce();
     expect(s.onEvent).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("checks stamps before noisy notifications and detects same-size rewrites and generation changes", async () => {
+    const s = setup();
+    fs.writeFileSync(path.join(s.root, "events.jsonl"), "old");
+    s.monitor.start(); await flush();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    s.mesh.tail.mockClear(); s.beforePoll.mockClear();
+    for (let index = 0; index < 20; index++) { notify("change", null); await flush(); }
+    expect(s.mesh.tail).not.toHaveBeenCalled();
+    expect(s.beforePoll).not.toHaveBeenCalled();
+    fs.writeFileSync(path.join(s.root, "replacement"), "new");
+    fs.renameSync(path.join(s.root, "replacement"), path.join(s.root, "events.jsonl"));
+    notify("rename", "events.jsonl"); await flush();
+    expect(s.mesh.tail).toHaveBeenCalledOnce();
+    fs.writeFileSync(path.join(s.root, "generation"), "1");
+    notify("change", "generation"); await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    notify("change", "registry.json"); await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["linux", "win32"])("watches the parent directory on %s and delivers nameless rename-only replacements without rearming", async platformName => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: platformName });
+    try {
+      const s = setup();
+      s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+      // The watched directory exists, but the log and generation file do not yet.
+      s.monitor.start(); await flush();
+      expect(fs.watch).toHaveBeenCalledExactlyOnceWith(s.root, { persistent: false }, expect.any(Function));
+      const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+      for (let index = 0; index < 3; index++) {
+        const event = { topic: `replacement-${index}` } as MeshEvent;
+        s.mesh.tail.mockReturnValue({ events: [event], nextOffset: 20 + index });
+        fs.writeFileSync(path.join(s.root, "replacement"), `new-${index}`);
+        fs.renameSync(path.join(s.root, "replacement"), path.join(s.root, "events.jsonl"));
+        const startedAt = Date.now();
+        notify("rename", null); // Windows need not supply a filename or a change edge.
+        await flush();
+        expect(s.onEvent).toHaveBeenLastCalledWith(event);
+        expect(s.mesh.tail).toHaveBeenCalledTimes(index + 2);
+        expect(Date.now() - startedAt).toBeLessThan(100);
+        notify("rename", null); await flush();
+        expect(s.mesh.tail).toHaveBeenCalledTimes(index + 2); // duplicate edge
+      }
+      fs.writeFileSync(path.join(s.root, "replacement"), "1");
+      fs.renameSync(path.join(s.root, "replacement"), path.join(s.root, "generation"));
+      notify("rename", null); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5);
+      notify("rename", "registry.json"); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5);
+      expect(fs.watch).toHaveBeenCalledOnce(); // replacing files never detaches a directory watch
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(5); // no healthy-watch idle polling
+      s.monitor.schedule(); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(6); // explicit capacity wake still forces a read
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("delivers through a real directory watcher after log and generation replacements", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-watch-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const seen: MeshEvent[] = [];
+    const watch = vi.spyOn(fs, "watch"); // wrap, do not inject, the native watcher
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 },
+      { beforePoll: () => true, onEvent: event => { seen.push(event); } });
+    monitors.push(monitor);
+    try {
+      monitor.start(); await flush();
+      expect(watch.mock.calls.filter(([directory]) => directory === mesh.root)).toEqual([[mesh.root, { persistent: false }, expect.any(Function)]]);
+      const from = { id: "session:peer", name: "peer", kind: "main" as const };
+      const first = await mesh.publish({ topic: "fleet.work.watch", from, text: "first" });
+      // Less than the five-second safety net: this must be native watch delivery.
+      await vi.waitFor(() => expect(seen.map(event => event.id)).toEqual([first.id]), { timeout: 1_000, interval: 10 });
+      for (const name of ["events.jsonl", "generation"]) {
+        const file = path.join(mesh.root, name);
+        fs.writeFileSync(`${file}.tmp`, fs.existsSync(file) ? fs.readFileSync(file) : "0");
+        fs.renameSync(`${file}.tmp`, file);
+      }
+      const second = await mesh.publish({ topic: "fleet.work.watch", from, text: "after replacement" });
+      await vi.waitFor(() => expect(seen.map(event => event.id)).toEqual([first.id, second.id]), { timeout: 1_000, interval: 10 });
+      expect(watch.mock.calls.filter(([directory]) => directory === mesh.root)).toHaveLength(1);
+    } finally {
+      monitor.close();
+      mesh.closeState();
+    }
+  });
+
+  it("rechecks unreadable metadata on real notifications, never on a safety tick", async () => {
+    const s = setup(); s.monitor.start(); await flush();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.mesh.tail).toHaveBeenCalledOnce();
+    const stat = vi.spyOn(fs, "statSync").mockImplementation(() => { throw new Error("metadata unavailable"); });
+    try {
+      notify("change", "events.jsonl"); await flush();
+      notify("rename", null); await flush();
+      expect(s.mesh.tail).toHaveBeenCalledTimes(3);
+    } finally { stat.mockRestore(); }
   });
 
   it("retries a blocked work event only on queue-space, never a tick or unrelated mesh heartbeat", async () => {
@@ -73,78 +205,41 @@ describe("ActorMeshMonitor", () => {
     s.monitor.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.skipIf(process.platform === "win32").each([250, 1_600])("leads watch bursts and retains one trailing poll per max(1 s, actorPollMs=%i) window", async actorPollMs => {
+  it("retains explicit queue-capacity wakes received inside dispatch", async () => {
     const s = setup();
-    s.monitor.config.actorPollMs = actorPollMs;
-    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
-    const interval = vi.spyOn(globalThis, "setInterval");
+    s.onEvent.mockImplementationOnce(() => { s.monitor.schedule(); });
     s.monitor.start(); await flush();
-    // Isolate watch coalescing from the independent idle reconciliation timer.
-    clearInterval(interval.mock.results[0]!.value);
-    const call = vi.mocked(fs.watch).mock.calls[0]! as unknown[];
-    const notify = call.at(-1) as (event: string, filename: string | null) => void;
-    const window = Math.max(1_000, actorPollMs);
-    for (let burst = 0; burst < 3; burst++) {
-      for (let elapsed = 0; elapsed < window; elapsed += 100) {
-        notify("change", elapsed === 0 ? null : "events.jsonl");
-        notify("rename", "state.read-signal.json"); // unrelated files do not schedule polls
-        await flush();
-        // Startup/previous trailing polls never suppress the leading event.
-        expect(s.mesh.tail).toHaveBeenCalledTimes(2 + burst * 2);
-        await vi.advanceTimersByTimeAsync(Math.min(100, window - elapsed));
-      }
-      expect(s.mesh.tail).toHaveBeenCalledTimes(3 + burst * 2);
-    }
-    const leading = { topic: "first" } as MeshEvent;
-    s.mesh.tail.mockReturnValue({ events: [leading], nextOffset: 20 });
-    notify("change", "events.jsonl"); await flush();
-    expect(s.onEvent).toHaveBeenCalledExactlyOnceWith(leading);
-    s.onEvent.mockClear();
-    await vi.advanceTimersByTimeAsync(100);
-    const final = { topic: "last" } as MeshEvent;
-    s.mesh.tail.mockReturnValue({ events: [final], nextOffset: 30 });
-    notify("change", "events.jsonl");
-    // Explicit polls are prompt but cannot slide away the trailing notification.
-    s.monitor.schedule(); await flush(); s.onEvent.mockClear();
-    await vi.advanceTimersByTimeAsync(window - 101);
-    expect(s.onEvent).not.toHaveBeenCalled();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+  });
+
+  it("drains full live pages without another watch edge, yielding between pages", async () => {
+    const s = setup();
+    const events = Array.from({ length: 17 }, (_, index) => ({ topic: `page-${index}` } as MeshEvent));
+    s.mesh.tail.mockImplementation((offset, limit) => {
+      const page = events.slice(offset - 10, offset - 10 + limit);
+      return { events: page, nextOffset: offset + page.length };
+    });
+    s.monitor.start();
     await vi.advanceTimersByTimeAsync(1);
-    expect(s.onEvent).toHaveBeenCalledExactlyOnceWith(final);
-    notify("change", "events.jsonl"); await flush();
-    notify("change", "events.jsonl"); // close cancels the pending trailing wake
-    const delivered = s.onEvent.mock.calls.length;
-    s.monitor.close();
-    await vi.advanceTimersByTimeAsync(window * 2);
-    expect(s.onEvent).toHaveBeenCalledTimes(delivered);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(s.onEvent.mock.calls.map(([event]) => event)).toEqual(events);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(3);
   });
 
-  it.skipIf(process.platform === "win32")("does not delay isolated events after a quiet actor cadence", async () => {
-    const s = setup(); s.monitor.start(); await flush();
-    const call = vi.mocked(fs.watch).mock.calls[0]! as unknown[];
-    const notify = call.at(-1) as (event: string, filename: string | null) => void;
-    s.mesh.tail.mockClear();
-    for (let i = 0; i < 3; i++) {
-      await vi.advanceTimersByTimeAsync(80);
-      notify("change", "events.jsonl"); await flush();
-      expect(s.mesh.tail).toHaveBeenCalledTimes(i + 1);
-    }
-  });
-
-  it("uses native watch with non-waking attachment safety checks on Windows", async () => {
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-    try {
-      const s = setup(); s.monitor.start(); await flush();
-      expect(fs.watch).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(59_999);
-      expect(s.mesh.tail).toHaveBeenCalledOnce();
-      fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
-      await vi.advanceTimersByTimeAsync(1);
-      expect(s.mesh.tail).toHaveBeenCalledTimes(1); // A missed append is not admitted by safety.
-      s.monitor.schedule(); await flush();
-      expect(s.mesh.tail).toHaveBeenCalledTimes(2);
-    } finally { Object.defineProperty(process, "platform", platform); }
+  it("flushes an ignored-only checkpoint at the safety net without rereading an unchanged log", async () => {
+    const s = setup();
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    s.monitor.start(); await flush();
+    const writes = vi.spyOn(fs, "renameSync");
+    s.onEvent.mockReturnValue("ignored");
+    s.mesh.tail.mockReturnValue({ events: [{ topic: "noise" } as MeshEvent], nextOffset: 20 });
+    s.monitor.schedule(); await flush();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
   });
 
   it("3864 holds the event boundary when the lease is lost during dispatch", async () => {
@@ -187,29 +282,23 @@ describe("ActorMeshMonitor", () => {
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
 
-  it.skipIf(process.platform === "win32")("falls back after watcher errors and closes timers and queued work", async () => {
+  it("repairs a failed watcher without draining work and closes timers and queued work", async () => {
     const s = setup();
-    s.monitor.start();
-    await flush();
-    s.watcher.emit("error", new Error("watch failed"));
-    await flush();
+    s.monitor.start(); await flush();
+    s.watcher.emit("error", new Error("watch failed")); await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1);
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(59_999);
+    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
-    fs.writeFileSync(path.join(s.root, "events.jsonl"), "missed append\n");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count);
+    expect(fs.watch).toHaveBeenCalledTimes(2);
     s.monitor.schedule(); await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
-    s.monitor.schedule();
-    s.monitor.close();
-    s.monitor.close();
-    s.watcher.emit("error", new Error("late error"));
-    await vi.advanceTimersByTimeAsync(5000);
+    s.monitor.schedule(); s.monitor.close(); s.monitor.close();
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     expect(vi.getTimerCount()).toBe(0);
-    expect(s.watcher.close).toHaveBeenCalledTimes(2); // safety reattached the test watcher
   });
 
   it("resumes from a saved cursor but skips events older than the replay window", async () => {
@@ -596,7 +685,7 @@ describe("ActorMeshMonitor unanchored crash recovery", () => {
 });
 
 describe("ActorManager idle checkpoints", () => {
-  const fixture = async (filtered: boolean) => {
+  const fixture = async (filtered: boolean, actorCount = 1) => {
     vi.useFakeTimers();
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-manager-cursor-"));
     roots.push(root);
@@ -609,17 +698,7 @@ describe("ActorManager idle checkpoints", () => {
       return watcher as unknown as FSWatcher;
     });
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-    let pollFinished: (() => void) | undefined;
-    const tail = mesh.tail.bind(mesh);
-    vi.spyOn(mesh, "tail").mockImplementation((...args) => {
-      const result = tail(...args);
-      // Dispatch and the safe-page checkpoint are synchronous after tail returns.
-      // Resolve on the next microtask, not at a guessed timer delay.
-      const finished = pollFinished;
-      pollFinished = undefined;
-      if (finished) queueMicrotask(finished);
-      return result;
-    });
+    const reads = vi.spyOn(mesh, "tail");
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -642,18 +721,56 @@ describe("ActorManager idle checkpoints", () => {
       responseMode: "text", coalesce: false,
       ...(filtered ? { activationFilter: [{ id: "skip", topic: ["fleet.work.wanted"], kind: ["skip"] }] } : {}),
     });
+    for (let index = 1; index < actorCount; index++) {
+      await actors.create({ name: `idle-${index}`, instructions: "Observe", topics: [], responseMode: "text" });
+    }
     await vi.advanceTimersByTimeAsync(0);
     const poll = async () => {
-      const finished = new Promise<void>((resolve) => { pollFinished = resolve; });
       watcher.emit("change", "change", "events.jsonl");
-      await vi.advanceTimersByTimeAsync(1_000);
-      await finished;
+      // Unchanged notifications intentionally do not call tail. Await the owned
+      // microtasks, not a promise that only a needless log reread could resolve.
+      await vi.advanceTimersByTimeAsync(0);
     };
     const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { cursor: number; last?: { sequence: number; id: string } };
     const from = { id: "session:peer", name: "main", kind: "main" as const };
     const notify = () => watcher.emit("change", "change", "events.jsonl");
-    return { mesh, actors, agents, actor, run, firstRun, allRuns, release, cursorPath, cursor, from, poll, notify };
+    return { mesh, actors, agents, actor, run, reads, firstRun, allRuns, release, cursorPath, cursor, from, poll, notify };
   };
+
+  it("keeps 20 idle actors free of log rescans for 60 s and wakes a delivered actor within 100 ms", async () => {
+    let monitor!: ActorMeshMonitor;
+    const start = ActorMeshMonitor.prototype.start;
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      monitor = this;
+      return start.call(this);
+    });
+    const s = await fixture(false, 20);
+    try {
+      await s.poll();
+      expect(s.actors.list()).toHaveLength(20);
+      expect(s.actors.list().every(actor => actor.status === "idle")).toBe(true);
+      const maintenance = vi.spyOn(monitor.callbacks, "beforePoll");
+      s.reads.mockClear();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(s.reads).not.toHaveBeenCalled();
+      expect(maintenance).not.toHaveBeenCalled(); // Minute repair never invokes the manager or drains work.
+      expect(s.run).not.toHaveBeenCalled();
+      await s.mesh.publish({ topic: "fleet.work.wanted", to: s.actor.id, from: s.from });
+      const startedAt = Date.now();
+      await s.poll();
+      // Queue acceptance and preparation entry are the actor wake, not the
+      // downstream async model-admission/presence commit.
+      expect(s.actors.status(s.actor.id).status).toBe("preparing");
+      expect(Date.now() - startedAt).toBeLessThan(100);
+      expect(s.reads).toHaveBeenCalled();
+    } finally {
+      s.release();
+      const closing = s.actors.close();
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+      await s.agents.close();
+    }
+  });
 
   it("real manager ignores unrelated appends but immediately checkpoints a relevant skip and direct event", async () => {
     const s = await fixture(true);
@@ -665,7 +782,7 @@ describe("ActorManager idle checkpoints", () => {
         const event = await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
         if (index === 0) firstIgnored = event;
         if (index === 0) await s.poll();
-        else s.notify(); // one burst inside the next fixed poll window
+        else s.notify(); // event-driven burst; no fixed watch window
       }
       await s.poll();
       // An empty seed is safe at sequence zero; the first real ignored event anchors
@@ -708,9 +825,8 @@ describe("ActorManager idle checkpoints", () => {
       }
       expect(s.cursor().last).toEqual({ sequence: events[9]!.sequence, id: events[9]!.id });
       const count = writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath).length;
-      // Blocked pages do not reread on file churn; only actual queue-space retries.
-      s.notify(); await vi.advanceTimersByTimeAsync(1_000);
-      s.notify(); await vi.advanceTimersByTimeAsync(1_000);
+      await s.poll();
+      await s.poll();
       expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(count);
       expect(s.run).toHaveBeenCalledOnce();
       s.release();

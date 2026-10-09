@@ -9,8 +9,8 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  * A root session's durable inbox (smarty-dev#754 §3.2 step 3): work events addressed to this root
  * on `fleet.*` topics that no steer or follow-up delivered. Senders publish a shadow record there
  * before they steer (the #1255 rule); a steer can time out or reach a root that is shutting down,
- * but the event stays in the mesh and in its archive. The root reconciles at turn start and when a
- * completed run settles, from a processing cursor in mesh state.
+ * but the event stays in the mesh and in its archive. The root reconciles at run start, every
+ * turn boundary and every settle, from a processing cursor in mesh state.
  *
  * A batch is saved as pending before it is delivered, and the cursor moves past it only once the
  * session's own entries hold its message. Until then every reconcile delivers it again, so work
@@ -56,6 +56,9 @@ const WAKE_COOLDOWN_MS = 5 * 60_000;
 const URGENT_KINDS = new Set(["p0", "steer"]);
 /** Each idle wake publishes one event here, so the fleet's wakes per hour can be counted. */
 export const ROOT_INBOX_WAKE_TOPIC = "fabric.inbox.wake";
+/** Observational, once per pending range, only when a turn proves the root is active. */
+export const ROOT_INBOX_ALARM_TOPIC = "fleet.alarm.root-inbox";
+const PENDING_ALARM_MS = 15 * 60_000;
 const wakeCooldownMs = (): number => {
   const value = Number(process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS);
   return process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() && Number.isFinite(value) && value >= 0 ? value : WAKE_COOLDOWN_MS;
@@ -76,9 +79,16 @@ export interface RootInboxKnownWake {
   readonly ids: readonly string[];
 }
 
+export interface RootInboxReconcileOptions {
+  /** Failed/aborted runs acknowledge held work, but admit and deliver nothing newer. */
+  commitOnly?: boolean;
+  /** A turn boundary is positive progress evidence for the pending-batch wedge alarm. */
+  turnEnd?: boolean;
+}
+
 interface RootInboxState {
   after: number;
-  pending?: { through: number; ids: string[] };
+  pending?: { through: number; ids: string[]; since: number; alarmed?: boolean };
   /** Hashed delivery/work identities, scoped by this recipient's state key. */
   delivered?: string[];
   /** Receipt times parallel to delivered. Legacy string-only states migrate on first save. */
@@ -313,7 +323,7 @@ export class RootInbox {
    * not hold is delivered again. A new batch stops at the first event younger than the steer
    * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
    */
-  async next(session: RootInboxSession, admitted?: ReadonlySet<string>): Promise<RootInboxBatch> {
+  async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}, admitted?: ReadonlySet<string>): Promise<RootInboxBatch> {
     this.#wakeProbe = undefined; // Turn/settle and receipt recovery always use the trusted drain.
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
@@ -321,13 +331,18 @@ export class RootInbox {
     receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
     let skippedStale = 0;
     if (state.pending) {
-      // Confirmed held batches may retire normally; a deadline cannot retry an
-      // unconfirmed pending batch that it did not observe.
-      if (admitted && !session.holdsBatch(state.pending.ids) && state.pending.ids.some(id => !admitted.has(id))) {
+      if (options.turnEnd) await this.#alarmPending(state).catch(error => {
+        // An observational alarm must never keep confirmed work wedged behind publication.
+        console.warn(`[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      const holdsBatch = session.holdsBatch(state.pending.ids);
+      // A deadline cannot retry an unconfirmed batch outside its exact admitted ids.
+      if (!holdsBatch && (options.commitOnly || (admitted && state.pending.ids.some(id => !admitted.has(id))))) {
+        await this.#save(receiptsChanged);
         return { events: [], through: state.after };
       }
       const pending = this.#reread(state.after, state.pending);
-      if (session.holdsBatch(state.pending.ids)) {
+      if (holdsBatch) {
         this.#remember(pending.flatMap(eventReceipts));
       } else {
         // A missing retained event proves neither delivery nor expiry. Keep its id pending.
@@ -353,6 +368,10 @@ export class RootInbox {
       delete state.pending;
       await this.#save(true);
     }
+    if (options.commitOnly) {
+      await this.#save(receiptsChanged);
+      return { events: [], through: state.after };
+    }
     const batch = this.#scan(state.after, session, true, (event) => {
       receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
     }, admitted);
@@ -364,7 +383,7 @@ export class RootInbox {
       await this.#save(receiptsChanged || skippedStale > 0);
       return batch;
     }
-    state.pending = { through: batch.through, ids: batch.events.map((event) => event.id) };
+    state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), since: this.#now() };
     await this.#save(true);
     return batch;
   }
@@ -374,8 +393,8 @@ export class RootInbox {
    * once per wake cooldown; an urgent event (kind p0 or steer) wakes at once. Inside the cooldown
    * nothing is saved, so a batch held back does not block an urgent event behind it as pending.
    * The urgency check looks past the batch bounds (review F1): an urgent event behind a full batch
-   * still wakes the root at once. The wake brings the batches in order, one per completed run
-   * (the settle path has no cooldown), so the cursor never skips an event.
+   * still wakes the root at once. Turn/settle reconciliation brings the batches in order
+   * without this idle cooldown, so the cursor never skips an event.
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
   async wake(session: RootInboxSession, idle: () => boolean, hint?: RootInboxKnownWake): Promise<RootInboxBatch | undefined> {
@@ -401,7 +420,7 @@ export class RootInbox {
       this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
       return undefined;
     }
-    const batch = await this.next(session, admitted);
+    const batch = await this.next(session, {}, admitted);
     if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn.
@@ -531,7 +550,7 @@ export class RootInbox {
     while (low < high) {
       const middle = Math.floor((low + high) / 2);
       assign(middle);
-      if (Buffer.byteLength(JSON.stringify(state), "utf8") > budget) low = middle + 1;
+      if (Buffer.byteLength(JSON.stringify(state), "utf8") >= budget) low = middle + 1;
       else high = middle;
     }
     assign(low);
@@ -561,9 +580,23 @@ export class RootInbox {
     return found;
   }
 
+  async #alarmPending(state: RootInboxState): Promise<void> {
+    const pending = state.pending!;
+    const heldMs = this.#now() - pending.since;
+    if (pending.alarmed || heldMs <= PENDING_ALARM_MS) return;
+    // A publication receipt also deduplicates a reload after publish but before cursor save.
+    await this.mesh.publish({
+      topic: ROOT_INBOX_ALARM_TOPIC, kind: "alarm", from: this.identity,
+      dedupeKey: `root-inbox-alarm:${this.identity.id}:${state.after}:${pending.through}`,
+      data: { rootId: this.identity.id, pending: { after: state.after, through: pending.through, ids: pending.ids }, heldMs },
+    });
+    pending.alarmed = true;
+  }
+
   #load(): RootInboxState {
     if (this.#state) return this.#state;
-    const value = this.mesh.get(this.key)?.value as Partial<RootInboxState> | undefined;
+    const stored = this.mesh.get(this.key);
+    const value = stored?.value as Partial<RootInboxState> | undefined;
     const saved = typeof value?.after === "number" && Number.isSafeInteger(value.after);
     const pending = value?.pending;
     // A root with no cursor starts at the present: the inbox is for what it misses from now on.
@@ -571,7 +604,10 @@ export class RootInbox {
       after: saved ? value!.after! : this.mesh.latestSequence(),
       ...(Array.isArray(value?.delivered) ? { delivered: value.delivered.filter((id): id is string => typeof id === "string") } : {}),
       ...(pending && Array.isArray(pending.ids) && typeof pending.through === "number"
-        ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string") } }
+        ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string"),
+          since: typeof pending.since === "number" && Number.isFinite(pending.since) ? pending.since : stored?.updatedAt ?? this.#now(),
+          ...(pending.alarmed === true ? { alarmed: true } : {}),
+        } }
         : {}),
     };
     this.#delivered = new Map((this.#state.delivered ?? []).map((id, index) => {

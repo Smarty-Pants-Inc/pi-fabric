@@ -30,6 +30,17 @@ const baseRequest: FabricActorRequest = {
 };
 
 describe("GlobalActorRegistry", () => {
+  it("round-trips explicit occurrence dedupe independently of resource coalescing", () => {
+    const { registry, agentDir } = setup();
+    const original = registry.create({ ...baseRequest, dedupeKey: "data.key", coalesceKey: "payload.number" });
+    expect(registry.update(original.id, { instructions: "Updated" })).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number" });
+    const restored = new GlobalActorRegistry(agentDir, 64 * 1024);
+    expect(restored.toRequest(restored.resolve(original.id)!)).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number" });
+    expect(restored.update(original.id, { dedupeKey: "data.occurrence" })).toMatchObject({ dedupeKey: "data.occurrence" });
+    expect(() => restored.update(original.id, { dedupeKey: "invalid path" })).toThrow("Invalid actor dedupeKey");
+    expect(() => restored.create({ ...baseRequest, name: "invalid", dedupeKey: "" })).toThrow("Invalid actor dedupeKey");
+  });
+
   it("round-trips inference policy without history and keeps same-ID updates", () => {
     const { registry, agentDir } = setup();
     const original = registry.create({ ...baseRequest, inferenceContext: "activation", extensions: false });

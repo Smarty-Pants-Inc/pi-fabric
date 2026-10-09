@@ -80,7 +80,7 @@ const expectInStep = async (root: string): Promise<void> => {
   const file = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8")) as {
     entries: Record<string, unknown>; versions?: Record<string, number>; tombstoneOrder?: string[]; highWater: number;
   };
-  const store = await SqliteStateStore.open(projectorDatabaseRoot(root), 64 * 1024, 1_000);
+  const store = await SqliteStateStore.open(projectorDatabaseRoot(root), 64 * 1024, 1_000, { initialize: "detached" });
   try {
     const projected = store.exportState();
     expect(projected.entries).toEqual(file.entries);

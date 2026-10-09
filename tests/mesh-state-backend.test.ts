@@ -255,6 +255,9 @@ describe("sqlite backend acquisition", () => {
   it("never takes the mesh .lock for state", async () => {
     const root = tempRoot("nolock");
     const store = open(root, { stateBackend: "sqlite" });
+    // A fixture's first open of a fresh root installs the marker under the import's fence (custody.lock and
+    // .lock, smarty-dev#6477 review round 2): that is initialisation, not state, so it happens before watching.
+    expect(store.listAll("")).toEqual([]);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     try {
@@ -265,7 +268,8 @@ describe("sqlite backend acquisition", () => {
       await new Promise(resolve => setTimeout(resolve, 50));
     } finally { watcher.close(); }
     expect(seen.filter(name => name.startsWith(".lock"))).toEqual([]);
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // state.json is only the moved marker a fresh root's initialisation leaves (smarty-dev#6477), never state.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
   });
 

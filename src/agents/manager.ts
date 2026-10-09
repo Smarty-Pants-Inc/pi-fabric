@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import {
@@ -477,7 +477,7 @@ const safeName = (value: string): string =>
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const parsed: unknown = JSON.parse(readFileRetrying(filePath));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as AgentRunRecord;
     return {
@@ -625,7 +625,12 @@ const failedRecord = (
     finishedAt: now,
     turns: Math.max(progress.turns, previous?.turns ?? 0),
     toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
-    text: "",
+    // A forced termination (Windows stop or SIGKILL) cannot publish a worker
+    // exit record. Its last atomic streaming checkpoint is still actual output;
+    // retain only prose, never a structured reply or a success/error verdict.
+    text: previous?.text ?? "",
+    ...(previous?.partialText !== undefined ? { partialText: previous.partialText } : {}),
+    ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),

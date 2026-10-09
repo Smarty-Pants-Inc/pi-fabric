@@ -47,7 +47,6 @@ export function meshObserverWatch(
 }
 const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
 const OBSERVED_DIRECTORIES = ["actors", "participants", "host-leases"];
-const MESH_BACKGROUND_POLL_MS = 1_000;
 const CURSOR_CHECKPOINT_MS = 10_000;
 type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
@@ -60,22 +59,17 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
-  #timer: NodeJS.Timeout | undefined;
+  #safetyNetTimer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
-  #eventStamp: string | undefined;
-  #retryNeeded = false;
   #blocked = false;
-  #retryBlocked = false;
-  #watchTimer: NodeJS.Timeout | undefined;
-  #lastWatchAt = Number.NEGATIVE_INFINITY;
-  #watchPending = false;
-  #watchTailPending = false;
+  #stamp: string | undefined;
+  #needsPoll = true;
   #offset: number;
   #scheduled = false;
-  #running = false;
-  #dirty = false;
-  #tailRequested = false;
+  #wakePending = false;
+  #explicitWake = false;
+  #maintenanceWake = false;
   #polling = false;
   #closed = false;
   #started = false;
@@ -136,7 +130,7 @@ export class ActorMeshMonitor {
     if (this.#started || this.#closed || !this.config.enabled) return;
     this.#started = true;
     this.#attachWatcher();
-    this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
+    this.#startSafetyNet();
     this.schedule();
   }
 
@@ -151,10 +145,8 @@ export class ActorMeshMonitor {
 
   close(): void {
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = undefined;
-    if (this.#watchTimer) clearTimeout(this.#watchTimer);
-    this.#watchTimer = undefined;
+    if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
+    this.#safetyNetTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -162,70 +154,40 @@ export class ActorMeshMonitor {
     if (this.#started) this.#persistCursor(true);
   }
 
-  /** A dequeue is the admission for retrying a previously blocked page. */
-  notifyQueueSpace(): void {
-    if (this.#retryNeeded) this.schedule();
-  }
+  /** Explicit delivery/resume/queue-capacity wake; never delayed by watch traffic. */
+  schedule(): void { this.#schedule(true); }
 
-  schedule(readTail = true, retryBlocked = true): void {
+  /** Queue-space, not an elapsed-time tick, admits a blocked-page retry. */
+  notifyQueueSpace(): void { if (this.#needsPoll) this.schedule(); }
+
+  #schedule(explicit = false, maintenance = false): void {
     if (this.#closed || !this.config.enabled) return;
-    this.#retryBlocked ||= retryBlocked;
-    this.#tailRequested ||= readTail;
-    this.#dirty = true;
-    if (this.#scheduled || this.#running) return;
+    this.#wakePending = true;
+    this.#explicitWake ||= explicit;
+    this.#maintenanceWake ||= maintenance;
+    if (this.#scheduled) return;
     this.#scheduled = true;
-    this.#backgroundPoll.success(); // The event, not elapsed backoff, owns this attempt.
-    queueMicrotask(() => {
-      this.#scheduled = false;
-      if (this.#closed) return;
-      this.#running = true;
-      this.#dirty = false;
-      void this.#backgroundPoll.run(() => this.#poll()).then(result => {
-        this.#running = false;
-        if (this.#dirty) this.schedule(false, false);
-        // A blocked page stays at its safe cursor until queue-space or a
-        // genuine mesh/ownership notification. Never retry it on a timer.
-        if (result !== "done") this.#retryNeeded = true;
-      });
-    });
-  }
-
-  // Lead after a quiet actor cadence, then retain one trailing wake for a burst.
-  // The window belongs to watch notifications, not startup/explicit/idle polls:
-  // none of those may delay the first new event. Continuous notifications never
-  // slide the trailing deadline; isolated events retain their original latency.
-  #scheduleBackground(readTail = true): void {
-    if (this.#closed || !this.config.enabled) return;
-    this.#tailRequested ||= readTail;
-    const now = Date.now();
-    const quiet = now - this.#lastWatchAt >= this.config.actorPollMs;
-    this.#lastWatchAt = now;
-    if (this.#watchTimer && !quiet) {
-      this.#watchPending = true;
-      this.#watchTailPending ||= readTail;
-      return;
-    }
-    if (this.#watchTimer) clearTimeout(this.#watchTimer);
-    this.#watchPending = false;
-    this.#watchTailPending = false;
-    this.schedule(false, false);
-    this.#watchTimer = setTimeout(() => {
-      this.#watchTimer = undefined;
-      if (this.#watchPending) {
-        this.#watchPending = false;
-        const readTail = this.#watchTailPending;
-        this.#watchTailPending = false;
-        this.schedule(readTail, false);
+    this.#backgroundPoll.success(); // A genuine event, not elapsed backoff, owns this attempt.
+    queueMicrotask(async () => {
+      const force = this.#explicitWake;
+      const maintain = this.#maintenanceWake;
+      this.#wakePending = this.#explicitWake = this.#maintenanceWake = false;
+      try {
+        if (!this.#closed) await this.#backgroundPoll.run(() => this.#poll(force, maintain));
+      } finally {
+        this.#scheduled = false;
+        // A callback can free a receiver slot or append another page while dispatching.
+        // Retain that wake until the background operation releases its running fence.
+        if (this.#wakePending) this.#schedule();
       }
-    }, Math.max(MESH_BACKGROUND_POLL_MS, this.config.actorPollMs));
-    this.#watchTimer.unref();
+    });
   }
 
   #fallback(watcher: FSWatcher): void {
     if (this.#closed || this.#watcher !== watcher) return;
     watcher.close();
     this.#watcher = undefined;
-    // Watch loss is not queue-space or delivery admission.
+    // Watch loss is attachment repair only, never delivery admission.
   }
 
   #attachWatcher(reconcile = false): void {
@@ -246,7 +208,7 @@ export class ActorMeshMonitor {
         const watcher = meshObserverWatch(watchedPath, { persistent: false, recursive: Boolean(recursive) }, (_event, filename) => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           if (filename !== null && path.basename(filename.toString()) === "mesh-cursor.json") return;
-          this.#scheduleBackground(false);
+          this.#schedule(false, true);
         });
         if (!watcher) continue;
         this.#directoryWatchers.set(directory, watcher);
@@ -269,7 +231,7 @@ export class ActorMeshMonitor {
           else if (!OBSERVED_FILES.includes(file)) return;
         }
         const file = filename === null ? undefined : path.basename(filename.toString());
-        this.#scheduleBackground(file === undefined || file === "events.jsonl" || file === "generation");
+        this.#schedule(false, file !== undefined && file !== "events.jsonl" && file !== "generation");
       });
       if (!watcher) return;
       this.#watcher = watcher;
@@ -277,28 +239,48 @@ export class ActorMeshMonitor {
     } catch { /* Retry attachment at the bounded safety check, never fast idle polling. */ }
   }
 
-  #startTimer(delay: number): void {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = setInterval(() => {
+  #startSafetyNet(): void {
+    if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
+    this.#safetyNetTimer = setInterval(() => {
       this.#attachWatcher(true);
-      // Reviewed R-no-polling exception: watcher attachment repair only.
-      // Even a changed stamp cannot acquire delivery authority on a safety tick.
-    }, delay);
-    this.#timer.unref();
+      // No manager callback, log drain or blocked-page retry on a safety tick.
+      // Only already-consumed safe progress may be checkpointed.
+      this.#persistCursor(false);
+    }, Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
+    this.#safetyNetTimer.unref();
   }
 
-  async #poll(): Promise<void> {
+  #meshStamp(): string | undefined {
+    try {
+      return ["events.jsonl", "generation"].map(name => {
+        const stat = fs.statSync(path.join(this.mesh.root, name), { bigint: true, throwIfNoEntry: false });
+        return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : "missing";
+      }).join("/");
+    } catch {
+      // Unknown is not unchanged: unreadable metadata must not hide recovery work.
+      return undefined;
+    }
+  }
+
+  async #poll(explicit: boolean, maintenance: boolean): Promise<void> {
     if (this.#polling || this.#closed || !this.config.enabled) return;
-    const readTail = this.#tailRequested;
-    this.#tailRequested = false;
-    if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
-    const retryBlocked = this.#retryBlocked;
-    this.#retryBlocked = false;
-    if (this.#blocked && !retryBlocked) return;
-    const eventStamp = meshObserverStamp(this.mesh.root, ["events.jsonl", "generation"]);
-    if (!readTail && eventStamp !== undefined && eventStamp === this.#eventStamp && !this.#retryNeeded && this.#archiveAfter === undefined && !this.#catchingUp) return;
-    this.#eventStamp = eventStamp;
-    this.#retryNeeded = true; // Only an admitted read can acquire a blocked-page obligation.
+    const stamp = this.#meshStamp();
+    const unchanged = !this.#needsPoll && stamp !== undefined && stamp === this.#stamp;
+    if (!explicit && !maintenance && unchanged) return;
+    // The safety net also retains the manager's registry/ownership/filter/child-result
+    // recovery obligations, even with a quiet log. It does not reread that log.
+    if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) {
+      this.#needsPoll = true;
+      return;
+    }
+    if (this.#blocked && !explicit) return;
+    if (!explicit && unchanged) {
+      // Ignored-only progress can still owe its ten-second checkpoint, even
+      // though an unchanged log needs no reread.
+      this.#persistCursor(false);
+      return;
+    }
+    this.#needsPoll = true;
     this.#polling = true;
     try {
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
@@ -377,12 +359,15 @@ export class ActorMeshMonitor {
       }
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor(handedOn);
-      this.#retryNeeded = false;
+      this.#stamp = stamp;
+      this.#needsPoll = false;
       this.#blocked = false;
-      if (!catchingUp && tail.events.length === this.config.maxReadEvents) setImmediate(() => this.schedule());
-      // Yield to the event loop between catch-up pages, so timers such as the lease
-      // heartbeat keep running through a long backlog.
-      if (catchingUp) setImmediate(() => this.schedule());
+      // A watch is an edge, not one notification per page. Drain a full live page too;
+      // yield between pages so the lease heartbeat can run through a large backlog.
+      if (catchingUp || tail.events.length >= this.config.maxReadEvents) {
+        this.#needsPoll = true;
+        setImmediate(() => this.schedule());
+      }
     } finally {
       this.#polling = false;
     }

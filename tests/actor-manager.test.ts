@@ -1712,17 +1712,13 @@ describe("ActorManager", () => {
     expect(restored.status(actor.id).nice).toBe(19);
   });
 
-  it("uses event monitoring where supported and polling fallback on Windows", async () => {
+  it("uses event monitoring on every supported platform without idle log rereads", async () => {
     const { mesh } = setup();
     const tail = vi.spyOn(mesh, "tail");
 
     await new Promise((resolve) => setTimeout(resolve, 80));
 
-    if (process.platform === "win32") {
-      expect(tail.mock.calls.length).toBeGreaterThan(1);
-    } else {
-      expect(tail).toHaveBeenCalledTimes(1);
-    }
+    expect(tail).toHaveBeenCalledTimes(1);
   });
 
   it("owner-gates execution and project defaults while allowing session bindings", async () => {

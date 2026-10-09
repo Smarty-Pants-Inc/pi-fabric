@@ -257,7 +257,7 @@ describe("changed source activation and Main gate", () => {
     expect(h.inbox()).toHaveLength(1);
   }, 60_000);
 
-  it("leaves a busy Main's event to the completed settle drain", async () => {
+  it("reconciles a busy Main's mature event at the turn boundary before settlement (#726)", async () => {
     const h = await startSession(true, 80);
     const order: string[] = [];
     h.session.subscribe(event => {
@@ -268,7 +268,7 @@ describe("changed source activation and Main gate", () => {
       fauxAssistantMessage("settle received")]);
     await h.session.prompt("work");
     await vi.waitFor(() => { expect(h.inbox()).toHaveLength(1); expect(h.session.isStreaming).toBe(false); }, { timeout: 10_000 });
-    expect(order.slice(0, 2)).toEqual(["settled", "inbox"]);
+    expect(order.slice(0, 2)).toEqual(["inbox", "settled"]);
   }, 60_000);
 
   it("rearms a young event arriving while Main is busy for its exact due time after settlement", async () => {

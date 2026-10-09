@@ -12,7 +12,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { isMeshStateBusy } from "./state-backend.js";
+import { isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -40,6 +40,15 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
+// A WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP) can last until the operator rolls back: log it at most once a minute.
+const WAL_CAP_LOG_MS = 60_000;
+// A capped WAL stays capped until a reader lets go or the operator rolls back: back off 1 s doubling to 30 s,
+// never the 100 ms lock-retry cadence that would hammer a stuck WAL (pi-fabric#694 P1 2).
+const WAL_CAP_RETRY_MIN_MS = 1_000;
+const WAL_CAP_RETRY_MAX_MS = 30_000;
+/** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
+export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
+  previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -398,25 +407,28 @@ export class StoreBridgeSide implements BridgeSide {
       // The cursor advances only after the destination confirms its append durably.
       durable: true,
       from: { ...checked.from, verified: "bridge" },
-      // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
-      // ownership at commit: a native takeover before it refuses the event (security review
-      // round 3, F2). Every state writer takes the same lock on the `file` backend. SQLite state
-      // writers do not take `.lock`, so a held event also runs in the state write fence (plan
-      // R20, smarty-dev#6477 L2b owner review P1): with `.lock` held, one `BEGIN IMMEDIATE`, then
-      // this check on that transaction's snapshot and the synchronous append, then ROLLBACK. A
-      // takeover's commit waits for the append, or commits first and this check refuses. Lock
-      // order is `.lock`, then the SQLite write lock, never the reverse (a SQLite transaction is
-      // one synchronous segment and `.lock` is only acquired asynchronously). Under the
-      // participants-files policy a native's first file is written without it; its host record,
-      // which reserves the root id, still goes through the lock, and a mirror never outranks a
-      // native file (#142 S2).
-      ...(held.length > 0 ? { fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit) } : {}),
-      data: () => {
-        for (const id of held) {
-          if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
-        }
-        return data;
-      },
+      // The data is fixed, so the store encodes it before the lock (smarty-dev#6729); the
+      // ownership check is its admission step. Evaluated under the mesh lock that commits the
+      // event, so the ownership it checks is the ownership at commit: a native takeover before
+      // it refuses the event (security review round 3, F2). Every state writer takes the same
+      // lock on the `file` backend. SQLite state writers do not take `.lock`, so a held event
+      // also runs in the state write fence (plan R20, smarty-dev#6477 L2b owner review P1): with
+      // `.lock` held, one `BEGIN IMMEDIATE`, then this check on that transaction's snapshot and
+      // the synchronous append, then ROLLBACK. A takeover's commit waits for the append, or
+      // commits first and this check refuses. Lock order is `.lock`, then the SQLite write lock,
+      // never the reverse (a SQLite transaction is one synchronous segment and `.lock` is only
+      // acquired asynchronously). Under the participants-files policy a native's first file is
+      // written without it; its host record, which reserves the root id, still goes through the
+      // lock, and a mirror never outranks a native file (#142 S2).
+      ...(held.length > 0 ? {
+        fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit),
+        admit: () => {
+          for (const id of held) {
+            if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+          }
+        },
+      } : {}),
+      data,
     };
   }
 
@@ -754,7 +766,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           } catch (error) {
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshLockTimeout(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+              ...(isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
           }
         });
@@ -929,6 +941,8 @@ export interface MeshBridgeOptions {
   presenceMs?: number;
   /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
   stopMs?: number;
+  /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
+  walCapRetryMinMs?: number;
   log?: (message: string) => void;
 }
 
@@ -1110,7 +1124,7 @@ export class MeshBridge {
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
-    const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];
+    const failure = failures.find((result) => !isMeshRetryableBusy(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
@@ -1354,6 +1368,8 @@ export class MeshBridge {
     let started = false;
     let retryMs = LOCK_RETRY_MIN_MS;
     let reportedTimeout = false;
+    let walCapLoggedAt = Number.NEGATIVE_INFINITY;
+    let walCapDelay: number | undefined;
     while (!this.#stopped) {
       const pass = started ? this.step() : this.start();
       // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
@@ -1362,6 +1378,7 @@ export class MeshBridge {
       try {
         await pass;
         reportedTimeout = false;
+        walCapDelay = undefined;
         if (!started) {
           started = true;
           retryMs = LOCK_RETRY_MIN_MS;
@@ -1371,10 +1388,20 @@ export class MeshBridge {
         delay = this.options.pollMs ?? DEFAULT_POLL_MS;
       } catch (error) {
         if (this.#stopped) return;
-        if (!isMeshLockTimeout(error)) throw error;
+        // smarty-dev#6477: a raw SQLite busy is contention too, never a reason to stop the bridge; so is a
+        // WAL-cap refusal (pi-fabric#694 P1 2), logged with its reader report at most once a minute.
+        if (!isMeshRetryableBusy(error)) throw error;
         delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        if (!reportedTimeout) {
+        if (isMeshStateWalCap(error)) {
+          walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+          delay = walCapDelay;
+          const now = Date.now();
+          if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
+            this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);
+            walCapLoggedAt = now;
+          }
+        } else if (!reportedTimeout) {
           this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
           reportedTimeout = true;
         }

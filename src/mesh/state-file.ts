@@ -328,7 +328,9 @@ const statStamp = (filePath: string): string | undefined => {
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
   // After the SQLite switch state.json is the moved marker and state.db is the state: a SQLite store reads it
   // and a file store's reads fail closed on the marker (smarty-dev#6477), so the marker is not damage here.
-  if (readMeshStateMovedMarker(root) !== undefined) return;
+  // A marker without its database still fails closed below (an alarm, never an empty mesh).
+  const moved = readMeshStateMovedMarker(root);
+  if (moved !== undefined && fs.existsSync(path.resolve(root, moved.movedTo))) return;
   const file = path.resolve(root, "state.json");
   const identity = stateReadIdentity(file, maxBytes);
   const shared = processReadSnapshots.get(file)?.deref();

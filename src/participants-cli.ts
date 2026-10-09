@@ -142,13 +142,17 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
     reapDeadHosts: false,
   });
   // Scope project: the whole mesh without the reader's own synthetic self entry.
-  const participants = directory.list({
-    scope: "project",
-    fresh: true,
-    ...(options.includeStale ? { includeStale: true } : {}),
-    ...(options.kinds ? { kinds: options.kinds } : {}),
-  });
-  return participants;
+  try {
+    return directory.list({
+      scope: "project",
+      fresh: true,
+      ...(options.includeStale ? { includeStale: true } : {}),
+      ...(options.kinds ? { kinds: options.kinds } : {}),
+    });
+  } finally {
+    // Release the state.db handle: an open handle holds the file (Windows EBUSY) after the CLI returns.
+    store.closeState();
+  }
 };
 
 export const main = async (

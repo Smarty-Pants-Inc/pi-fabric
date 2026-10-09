@@ -80,7 +80,7 @@ export const main = (argv: string[], io: {
   if (options === "help") { write(`${USAGE}\n`); return 0; }
   const root = path.resolve(options.mesh ?? resolveMeshRoot(io.env, io.cwd));
   const problems: string[] = [];
-  const summary = summarizeLockStats(root, readLockStats(root, problems), { minutes: options.minutes, top: options.top, now: io.now });
+  const summary = summarizeLockStats(root, readLockStats(root, problems, { minutes: options.minutes, now: io.now }), { minutes: options.minutes, top: options.top, now: io.now });
   for (const problem of problems) warn(`fabric-mesh-lock-stats: ignored ${label(problem)}\n`);
   const gated = options.maxBusy !== undefined || options.maxTimeouts !== undefined;
   write(`${options.json ? JSON.stringify(summary, (_key, value: unknown) =>

@@ -37,6 +37,9 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
     : key.startsWith("topology/hosts/") ? "host-lease"
     : key.startsWith("topology/participants/") ? "participant"
     : key.startsWith("topology/") ? "topology" : key.split("/")[0] || "state";
+  // Named maintenance exception: opt-in PI_FABRIC_COMMIT_STATS diagnostic sampler.
+  // Its unref'd minute boundary (including zero samples) is the public sink contract.
+  // Disabled by default, so normal file stores/bridges allocate no sampler timer.
   const timer = setInterval(() => {
     const at = Date.now();
     try {
@@ -71,7 +74,8 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 //
 // Every acquisition of a mesh root's `.lock` records who took it (the store entry point), how
 // long it waited and how long it held the lock. Wall-clock minutes are aggregated in memory and
-// written just after each minute (and at exit) to `<root>/lock-stats/<host>-<pid>.json`: one
+// written on the next acquisition after a minute boundary (and at exit/explicit flush) to
+// `<root>/lock-stats/<host>-<pid>.json`: one
 // small file per process, rewritten by an atomic rename, holding at most the last 60 complete
 // minutes plus the current one (the longest query window, see LOCK_STATS_RETAIN_MINUTES). No extra
 // lock, no fsync, and nothing at all before the first acquisition. `fabric-mesh-lock-stats`
@@ -212,12 +216,14 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const host = lockStatsHost();
   const startedAt = Date.now();
   const roots = new Map<string, RootLockStats>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let flushedMinute = Math.floor(startedAt / 60_000);
   let started = false;
   const warn = options.warn ?? warnPrivately;
 
   // By age only, the own file included: a fresh own file is never stale, and a stale one (no
   // acquisition here for a day) is safe to delete because the next write recreates it by rename.
+  // ponytail: no sooner prune by pid liveness (smarty-dev#7826 review): pid reuse would race it, and
+  // the reader skips files outside its window before the cap, so stale files no longer hide live ones.
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
@@ -273,7 +279,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
           write(entry, now);
           entry.dirty = false;
         }
-        // Hourly and read-only, also for a quiet root: never creates the directory.
+        // At most hourly, during actual diagnostic work: never creates the directory.
         if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
           entry.prunedAt = now;
           prune(path.join(entry.root, LOCK_STATS_DIR), now);
@@ -290,14 +296,14 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       }
     }
   };
-  // Just after each wall-clock minute (spread by pid), so a reader sees every process's last
-  // complete minute within a few seconds.
-  const schedule = (): void => {
-    timer = setTimeout(() => {
-      flush();
-      schedule();
-    }, 60_000 - Date.now() % 60_000 + 500 + process.pid % 2_000);
-    timer.unref?.();
+  // A minute boundary alone is not work: even one startup sample must not wake an
+  // otherwise empty bridge 60 s later. Flush on the next real record in a newer minute
+  // (and at exit/explicit flush). Quiet roots are pruned only during that actual work.
+  const flushIfDue = (): void => {
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute <= flushedMinute) return;
+    flushedMinute = minute;
+    flush();
   };
   const onExit = (): void => flush();
   // One bucket per real root, whatever the spelling (relative, trailing slash, symlink, case on
@@ -324,7 +330,6 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       roots.set(key, entry);
       if (!started) {
         started = true;
-        schedule();
         process.once("exit", onExit);
       }
     }
@@ -350,6 +355,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (holdMs > bucket.holdMaxMs) bucket.holdMaxMs = holdMs;
       bucket.waitHist[histogramIndex(waitMs)]!++;
       bucket.holdHist[histogramIndex(holdMs)]!++;
+      flushIfDue();
     },
     failed(root, lockClass, waitMs, tried) {
       const bucket = bucketOf(root, lockClass);
@@ -357,11 +363,10 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (tried) bucket.tries++;
       else bucket.timeouts++;
       bucket.failedWaitMs += waitMs;
+      flushIfDue();
     },
   };
   const dispose = (): void => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
     started = false;
     process.removeListener("exit", onExit);
   };
@@ -420,11 +425,15 @@ const readRegularFile = (file: string): string => {
   } finally { fs.closeSync(descriptor); }
 };
 
+/** Start of a window of `span` complete minutes before `now`, the current minute included. */
+const lockStatsWindowStartMs = (now: number, span: number): number => (Math.floor(now / 60_000) - span) * 60_000;
+
 /**
- * Every process's file under `<root>/lock-stats`. Unreadable, oversized, foreign or invalid
- * files are skipped and named in `problems` (a gate must not pass on what it could not read).
+ * Every process's file under `<root>/lock-stats` that can hold a minute of the window. Unreadable, oversized,
+ * foreign or invalid files are skipped and named in `problems` (a gate must not pass on what it could not read).
  */
-export const readLockStats = (root: string, problems: string[] = []): LockStatsFile[] => {
+export const readLockStats = (root: string, problems: string[] = [],
+  options: { minutes?: number; now?: number | undefined } = {}): LockStatsFile[] => {
   const directory = path.join(root, LOCK_STATS_DIR);
   let names: string[];
   try {
@@ -434,13 +443,28 @@ export const readLockStats = (root: string, problems: string[] = []): LockStatsF
     }
     names = fs.readdirSync(directory);
   } catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
-  const candidates = names.filter(name => name.endsWith(".json")).sort();
+  // A file is written after each minute it holds, so one modified before the window starts
+  // holds no minute in it: skip it before the cap, and cap the newest (smarty-dev#7826). The
+  // window is summarizeLockStats's exactly: the `span` complete minutes before the current one.
+  const span = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(options.minutes ?? LOCK_STATS_RETAIN_MINUTES)));
+  const since = lockStatsWindowStartMs(options.now ?? Date.now(), span);
+  const candidates: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const { mtimeMs } = fs.lstatSync(path.join(directory, name));
+      if (mtimeMs >= since) candidates.push({ name, mtimeMs });
+    } catch (error) {
+      if (errorCodeOf(error) !== "ENOENT") problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (candidates.length > LOCK_STATS_MAX_FILES) {
-    problems.push(`${directory}: ${candidates.length} stats files, read only the first ${LOCK_STATS_MAX_FILES}`);
+    problems.push(`${directory}: ${candidates.length} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`);
     candidates.length = LOCK_STATS_MAX_FILES;
   }
   const files: LockStatsFile[] = [];
-  for (const name of candidates) {
+  for (const { name } of candidates) {
     try {
       const file = JSON.parse(readRegularFile(path.join(directory, name))) as unknown;
       const invalid = invalidLockStats(file);

@@ -54,8 +54,15 @@ const p99 = (values: number[]): number => {
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.99) - 1)]!;
 };
 
-afterEach(() => {
-  for (const child of children.splice(0)) try { child.kill("SIGKILL"); } catch { /* gone */ }
+afterEach(async () => {
+  // Wait for each child to exit before the rm: on Windows a child still holding state.db makes the unlink EBUSY,
+  // and kill() returns before the process is gone (smarty-dev#7630).
+  await Promise.all(children.splice(0).map((child) => {
+    if (child.exitCode !== null || child.signalCode !== null) return undefined;
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    try { child.kill("SIGKILL"); } catch { /* gone */ }
+    return exited;
+  }));
   for (const database of databases.splice(0)) try { database.close(); } catch { /* closed */ }
   for (const store of sqlite.splice(0)) try { store.close(); } catch { /* closed */ }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -134,8 +141,7 @@ describe("SQLite WAL hard cap admission across stores and the rollback path (pi-
     }
   });
 
-  // Skipped on Windows until smarty-dev#7630 (EBUSY unlinking state.db: a handle may stay open after the refusal).
-  it.skipIf(process.platform === "win32")("multi-store boundary: after the first refusal every store refuses, a child process included; the WAL stays within one commit per store", async () => {
+  it("multi-store boundary: after the first refusal every store refuses, a child process included; the WAL stays within one commit per store", async () => {
     const root = tempRoot("multi");
     const a = await openStore(root, { walHardCapBytes: SMALL_CAP });
     const b = await openStore(root, { walHardCapBytes: SMALL_CAP });

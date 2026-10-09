@@ -638,7 +638,7 @@ export class ResidentHost {
         ),
       );
       this.participants.registerSource(() =>
-        this.actors.listOwned().map((actor) =>
+        this.actors.listOwned(true).map((actor) =>
           actorParticipantRecord(
             actor,
             this.config.rootId,

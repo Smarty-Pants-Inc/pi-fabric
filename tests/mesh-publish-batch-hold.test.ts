@@ -125,14 +125,14 @@ describe("publishBatch hold (smarty-dev#6729)", () => {
     expect(await mesh.publishBatch([inputs[1]!])).toEqual([published[1]]);
   });
 
-  // Skipped on Windows until smarty-dev#7630 (fails there from pi-fabric#694 on; possibly real lock-order behaviour).
-  it.skipIf(process.platform === "win32")("keeps the archive-coupled receipt protocol under the lock (smarty-dev#6000)", async () => {
+  it("keeps the archive-coupled receipt protocol under the lock (smarty-dev#6000)", async () => {
     const mesh = archived();
     unbounded();
     const receipts: boolean[] = [];
     const rename = fs.renameSync.bind(fs);
     vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
-      if (/event-receipts\/[a-f0-9]{64}\.json$/.test(String(target))) receipts.push(held(mesh.root));
+      // Either separator: path.join gives "\" on Windows, where a "/"-only match saw no receipt (smarty-dev#7630).
+      if (/event-receipts[\\/][a-f0-9]{64}\.json$/.test(String(target))) receipts.push(held(mesh.root));
       return rename(source, target);
     });
     const published = await mesh.publishBatch(mixed("archived"));

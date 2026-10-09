@@ -28,6 +28,22 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Native process liveness
+
+Local process workers use captured child `exit`/`close` events, not a 1 s
+liveness poll or a periodic manager wake. When the scope owner supplies a
+`treeClosed` receipt from `cgroup.events` `populated 0`, the same monitor also
+subscribes to that receipt. Neither notification alone authorizes collection:
+native-close and process-tree custody obligations still have to be joined.
+
+Each execution has one deadline safety read to catch a missed notification.
+A failed event watcher is never replaced with polling: at the deadline the run
+fails with `errorCode: "PROCESS_LIVENESS_WATCH_FAILED"`, retaining unconfirmed
+worker files and admission rather than retrying a possibly live worker. Status
+and lifecycle files are observed separately by filesystem events (including
+atomic status-file renames), so progress does not require a liveness query.
+External/placed process adapters keep their existing checked-query contract.
+
 ### Opt-in process task placement
 
 A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.

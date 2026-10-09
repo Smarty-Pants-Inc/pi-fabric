@@ -134,19 +134,38 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 
-  it("keeps default mode off with invalid policy, but preserves agent enforcement", () => {
+  it("enforces with invalid JSON policy even without an agent opt-in", () => {
     simulateRootOwnership(); fs.writeFileSync(HOST_POLICY_PATH, "{broken");
-    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
-    expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    expect(config.liveLandlockSettings({ mode: "off", disabled: true, allowEscape: true }, agentDir)).toEqual({ mode: "enforce", disabled: false });
     writeAgent({ executor: { landlock: { mode: "enforce", disabled: true } } });
     expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
     expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "enforce", disabled: false });
   });
 
-  it("ignores invalid root Landlock fields rather than changing product defaults", () => {
-    simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: "permissive", disabled: "true" } } });
-    expect(load().executor.landlock).toEqual({ mode: "off", disabled: false });
-    expect(config.liveLandlockSettings(load().executor.landlock, agentDir)).toEqual({ mode: "off", disabled: false });
+  it.each([
+    { executor: { landlock: { mode: "permissive" } } },
+    { executor: { landlock: { disabled: "true" } } },
+    { executor: { landlock: { allowEscape: "true" } } },
+    { executor: { landlock: [] } },
+    { executor: null },
+    { agents: { deniedModels: [1] } },
+    { agents: { modelPolicy: { requireReason: false } } },
+    { agents: { processSlice: "not-a-slice" } },
+  ])("fails strict on invalid root authority schema: %j", document => {
+    simulateRootOwnership(); writePolicy(document);
+    writeAgent({ executor: { landlock: { mode: "off", disabled: true, allowEscape: true } } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "off", disabled: true, allowEscape: true } } }));
+    for (const loaded of [load(), config.loadGlobalFabricConfig(agentDir),
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "global"),
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project")]) {
+      expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false });
+      expect(config.liveLandlockSettings(loaded.executor.landlock, agentDir)).toEqual({ mode: "enforce", disabled: false });
+      expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    }
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain(HOST_POLICY_PATH);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("must be");
   });
 
   it("keeps tightening agent settings without a root policy", () => {
@@ -224,8 +243,8 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
       expect(config.liveLandlockSettings({ mode: "enforce", disabled: true }, agentDir).disabled).toBe(false);
     }
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
-    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
-    expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "off", disabled: false });
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    expect(config.liveLandlockSettings({ mode: "off", disabled: true }, agentDir)).toEqual({ mode: "enforce", disabled: false });
     expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
     expect(warn.mock.calls.some(call => String(call[0]).includes("is missing"))).toBe(false);
   });
@@ -234,6 +253,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     if (process.getuid?.() === 0) return; // covered above via explicit non-root uid on root runners
     writePolicy({ executor: { landlock: { disabled: true } } });
     expect(policy.readHostPolicy().status).toBe("invalid");
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 
   it("applies a root-owned mode-off relaxation while ignoring the agent copy", () => {
@@ -294,7 +314,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(() => fs.fstatSync(openedDescriptor!)).toThrow();
   });
 
-  it.each(["truncated-prefix", "same-size-rewrite", "short-read", "inode-change"])("rejects an unstable policy read: %s and keeps the built-in baseline", kind => {
+  it.each(["truncated-prefix", "same-size-rewrite", "short-read", "inode-change"])("rejects an unstable policy read: %s and enforces without an opt-in", kind => {
     simulateRootOwnership();
     const grant = JSON.stringify({ executor: { landlock: { disabled: true, allowEscape: true } } });
     const original = grant + " ".repeat(128);
@@ -338,7 +358,45 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(() => fs.fstatSync(openedDescriptor!)).toThrow();
     // Reinstate the original bytes before repeating the same fault via the loader.
     fs.writeFileSync(HOST_POLICY_PATH, original); openedMetadata = {}; reads = 0;
-    expect(load().executor.landlock).toEqual(config.DEFAULT_FABRIC_CONFIG.executor.landlock);
+    expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("policy changed while reading or read was incomplete");
+  });
+
+  it.each(["lstat", "open", "read"])("enforces on unreadable policy at %s with a once-only reason", step => {
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: "off", disabled: true, allowEscape: true } } });
+    const denied = () => { throw Object.assign(new Error(`EACCES at ${step}`), { code: "EACCES" }); };
+    if (step === "lstat") {
+      const stat = fs.lstatSync;
+      vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) =>
+        String(file) === HOST_POLICY_PATH ? denied() : (stat as (...input: unknown[]) => fs.Stats)(file, ...args)) as typeof fs.lstatSync);
+    } else if (step === "open") {
+      const open = fs.openSync;
+      vi.mocked(fs.openSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) =>
+        String(file) === HOST_POLICY_PATH ? denied() : (open as (...input: unknown[]) => number)(file, ...args)) as typeof fs.openSync);
+    } else {
+      const read = fs.readSync;
+      vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) =>
+        args[0] === openedDescriptor ? denied() : (read as (...input: unknown[]) => number)(...args)) as typeof fs.readSync);
+    }
+    for (let i = 0; i < 2; i++) {
+      expect(load().executor.landlock).toEqual({ mode: "enforce", disabled: false });
+      expect(config.liveLandlockSettings({ mode: "off", disabled: true, allowEscape: true }, agentDir)).toEqual({ mode: "enforce", disabled: false });
+    }
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain(HOST_POLICY_PATH);
+    expect(String(warn.mock.calls[0]?.[0])).toContain(`EACCES at ${step}`);
+    if (openedDescriptor !== undefined) expect(() => fs.fstatSync(openedDescriptor!)).toThrow();
+  });
+
+  it("tightens an already loaded root off grant when policy becomes unprovable", () => {
+    simulateRootOwnership(); writePolicy({ executor: { landlock: { mode: "off", disabled: true, allowEscape: true } } });
+    const loaded = load().executor.landlock;
+    expect(loaded).toEqual({ mode: "off", disabled: true, allowEscape: true });
+    fs.chmodSync(HOST_POLICY_PATH, 0o660);
+    expect(config.liveLandlockSettings(loaded, agentDir)).toEqual({ mode: "enforce", disabled: false });
+    fs.unlinkSync(HOST_POLICY_PATH);
+    expect(config.liveLandlockSettings(loaded, agentDir)).toEqual({ mode: "off", disabled: false });
   });
 
   it("does not fall back if an existing file vanishes before open", () => {

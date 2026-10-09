@@ -75,6 +75,26 @@ static int equal(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return *a == *b;
 }
+/* Every launcher of this helper is confined. No environment value can grant
+ * an escape here: only the trusted host wrapper can choose a different executable,
+ * after root-policy validation and mandatory logging. Consume reserved prefixes
+ * here too, so exec/spawn callers that bypass the Pi bash provider cannot recreate
+ * the control variable after the environment has been scrubbed. */
+static int whitespace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+static char *confined_command(char *command) {
+    const char *prefix = "PI_FABRIC_LANDLOCK_ESCAPE=1";
+    for (;;) {
+        char *start = command;
+        while (whitespace(*start)) start++;
+        unsigned int i = 0;
+        while (prefix[i] && prefix[i] == start[i]) i++;
+        if (prefix[i] || (start[i] != ' ' && start[i] != '\t')) return command;
+        command = start + i;
+        while (*command == ' ' || *command == '\t') command++;
+    }
+}
 /* Parse "<decimal>:" and advance; any other shape is a malformed policy. */
 static unsigned long decimal(char **cursor) {
     unsigned long result = 0;
@@ -174,5 +194,5 @@ __attribute__((used, noreturn)) void fabric_start(long *stack) {
             && !value(one, "PI_FABRIC_LANDLOCK_ESCAPE")) *kept++ = *item;
     }
     *kept = 0;
-    execute(shell, argv[2], env);
+    execute(shell, confined_command(argv[2]), env);
 }

@@ -1723,10 +1723,11 @@ export const writeJsonAtomic = (
   }
 };
 
-// Root policy overlays product defaults; absence never opts a host into confinement.
+// Missing policy preserves rollout defaults; damaged/unprovable policy must fail closed.
 const hostLandlockBaseline = (policy: HostPolicy): LandlockSettings => {
   const defaults = DEFAULT_FABRIC_CONFIG.executor.landlock;
-  if (policy.status !== "valid") return { ...defaults };
+  if (policy.status === "missing") return { ...defaults };
+  if (policy.status === "invalid") return { mode: "enforce", disabled: false };
   const landlock = objectValue(objectValue(policy.document.executor).landlock);
   return {
     mode: landlock.mode === "off" || landlock.mode === "enforce" ? landlock.mode : defaults.mode,
@@ -1746,12 +1747,13 @@ const resolveFabricConfig = (
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
   const policy = readHostPolicy();
   const rootPolicyValid = policy.status === "valid";
+  // Invalid/unprovable policy must tighten even when there is no writable config.
+  merged = mergeObjects(merged, { executor: { landlock: hostLandlockBaseline(policy) } });
   if (rootPolicyValid) {
     // Whitelist authority keys: root policy is not a third general settings layer.
     const agents = objectValue(policy.document.agents);
     const requireReason = objectValue(agents.modelPolicy).requireReason;
     merged = mergeObjects(merged, {
-      executor: { landlock: hostLandlockBaseline(policy) },
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
@@ -1882,8 +1884,8 @@ export const readHostLandlockDisabled = (_agentDir: string): boolean =>
 export const liveLandlockSettings = (settings: LandlockSettings, _agentDir: string): LandlockSettings => {
   const baseline = hostLandlockBaseline(readHostPolicy());
   return {
-    // Preserve session tightening and honor a newly enforced root baseline,
-    // without turning missing/invalid policy into a fleet-wide mode change.
+    // Preserve session tightening and honor live enforcement. Only genuinely
+    // missing policy uses the product default; unprovable policy enforces.
     mode: settings.mode === "enforce" ? "enforce" : baseline.mode,
     disabled: baseline.disabled,
     ...(baseline.allowEscape === true ? { allowEscape: true } : {}),

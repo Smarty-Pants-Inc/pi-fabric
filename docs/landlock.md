@@ -20,7 +20,7 @@ The authorized fallback is implemented:
 { "executor": { "landlock": { "mode": "enforce" } } }
 ```
 
-- `mode: "off"` is the default until rollout; bash behavior is unchanged.
+- `mode: "off"` is the default with missing root policy or a valid root `off` baseline; bash behavior is unchanged. Present but unprovable policy selects strict `enforce` (no kill switch or escape grant).
 - `mode: "enforce"` requires Linux with active Landlock ABI >=4. Unsupported
   kernels, missing helper, malformed policy, setup failures and incompatible
   opaque/managed overrides fail closed, never retry through an unconfined shell.
@@ -60,13 +60,25 @@ process, and runs the command **confined**; its journal event is `enforce`, not
 or making the policy missing, unsafe or unstable revokes escape authority for
 already-running lanes.
 
-With the grant, Fabric removes this reserved prefix, records an `escape` event **before spawning**,
-and runs that one command unconfined through the same cooperative filters.
-Every use emits a visible escape notice and is appended to
+Escape handling lives in the common Landlock operations wrapper, not the
+`pi.bash` action-name branch: every exec/spawn adapter using that wrapper gets
+the same decision. It runs after cooperative preparation and strips repeated
+leading assignments after exact trusted PID/middleware decorations. Explicit or
+inherited child environment `PI_FABRIC_LANDLOCK_ESCAPE=1` requests the same
+root-gated escape. The reserved variable is removed from child environment for
+both denied and granted requests, so a grant does not propagate implicitly.
+The native helper also strips prefixes and scrubs the variable for every direct
+helper caller; it always confines and cannot authorize an escape from env.
+
+With the grant, Fabric records an `escape` event **before spawning**, and runs
+that one command unconfined through the same cooperative filters. Every use
+emits a visible escape notice and is appended to
 `<session cwd>/.pi/landlock-audit.jsonl`. If mandatory logging fails, no command
-runs. An assignment inside the shell body, quoted/encoded spelling, `env ...`, or
-an ambient inherited flag cannot lift a restriction already imposed by the
-kernel. The escape does not bypass the text guard, approvals or timeouts.
+runs. An assignment inside a running shell body, quoted/encoded spelling or
+`env ...` cannot lift a restriction already imposed by the kernel. Descendants
+inherit that restriction across exec/spawn; this does not newly confine the
+unrelated executor/agent launchers excluded at the top of this document.
+The escape does not bypass the text guard, approvals or timeouts.
 
 The journal records UTC time, role, execution cwd, shell job directory and a
 SHA-256 command digest (not potentially secret-bearing command text). Enforced

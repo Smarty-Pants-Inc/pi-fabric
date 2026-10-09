@@ -106,7 +106,7 @@ export const buildExecutorSection = (
           ),
         }),
         setting("executor.landlock.mode", "Bash filesystem confinement", config.executor.landlock.mode, {
-          description: "Linux Landlock ABI >=4 only. Defaults off unless valid root policy or agent/project enforce opts in. Enforce denies writes outside the reviewed role list; agent/project off or permissive values cannot relax the baseline. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command only when valid root policy grants executor.landlock.allowEscape: true, and is logged; otherwise it is stripped, warns once and stays confined. Non-Linux unchanged.",
+          description: "Linux Landlock ABI >=4 only. Missing root policy defaults off; present but invalid/unreadable/untrusted policy fails strict enforce. Valid root policy or agent/project enforce can also opt in. Enforce denies writes outside the reviewed role list; agent/project off or permissive values cannot relax the baseline. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command only when valid root policy grants executor.landlock.allowEscape: true, and is logged; otherwise it is stripped, warns once and stays confined. Non-Linux unchanged.",
           values: ["off", "enforce"],
         }),
         setting("executor.landlock.disabled", "Fleet confinement kill switch", String(config.executor.landlock.disabled), {

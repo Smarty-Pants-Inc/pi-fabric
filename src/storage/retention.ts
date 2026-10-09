@@ -636,6 +636,8 @@ export const compactTerminalRunEvents = (
  * recovery evidence, not rotation history, and keep their existing exemption. */
 export const pruneActorSessionBackups = (sessionFile: string, options: {
   dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
+  /** Asked right before each unlink; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
+  stop?: () => boolean;
 } = {}): string[] => {
   const directory = path.dirname(sessionFile);
   if (!ownedStat(directory)?.isDirectory()) return [];
@@ -653,6 +655,7 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
       const checked = ownedStat(file);
       if (!checked || checked.dev !== backup.stat.dev || checked.ino !== backup.stat.ino ||
           checked.size !== backup.stat.size || checked.mtimeMs !== backup.stat.mtimeMs) continue;
+      if (options.stop?.()) break;
       if (!options.dryRun) fs.unlinkSync(file);
       options.onPrune?.({ path: file, bytes: backup.stat.size });
       removed.push(file);

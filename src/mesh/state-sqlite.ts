@@ -45,7 +45,7 @@
  * maintenance holder, tests) checkpoints on an unref'd timer: PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
  * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
- * few ms, so the checkpointer raises `state-checkpoint.flag` and writers yield while it is fresh
+ * few ms, so the checkpointer raises its own flag in `state-checkpoint.flags/` and writers yield while any is fresh
  * (< 1 s, so a crashed checkpointer stalls nobody for longer). TRUNCATE then holds the writer lock,
  * so the WAL stops growing, and waits only for readers that started before it; new readers read
  * the database file. Reads are single statements (`.get()`/`.all()`, never an iterator or a read

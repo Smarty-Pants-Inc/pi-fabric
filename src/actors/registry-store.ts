@@ -59,6 +59,11 @@ const freezeRegistryValue = <T>(value: T): T => {
   return value;
 };
 
+// Stores naming the same normalized path share one immutable decoded generation.
+// Read identity is taken from the open descriptor, so an atomic rename between
+// lookup and decoding cannot cache new bytes under the old inode (or vice versa).
+const registryReadCache = new Map<string, { generation: string; value: unknown }>();
+
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
 );
@@ -95,7 +100,7 @@ export class ActorRegistryStore {
     // reread it while holding the earlier fence. No work at module import.
     this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
-    this.#registryPath = path.join(actorRoot, "actors.json");
+    this.#registryPath = path.resolve(actorRoot, "actors.json");
     this.#writer = new AtomicFileWriter(this.#registryPath);
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
@@ -192,6 +197,8 @@ export class ActorRegistryStore {
           }
           this.#snapshot = undefined;
           throw error;
+        } finally {
+          registryReadCache.delete(this.#registryPath);
         }
       },
       dispose: () => fs.rmSync(temporary, { force: true }),
@@ -327,6 +334,8 @@ export class ActorRegistryStore {
       catch (error) {
         writeFileAtomic(this.#registryPath, previous, { durable: true });
         throw error;
+      } finally {
+        registryReadCache.delete(this.#registryPath);
       }
       return actors.length;
     });
@@ -424,8 +433,20 @@ export class ActorRegistryStore {
     }
   }
 
+  /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
-    return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
+    const fd = fs.openSync(this.#registryPath, "r");
+    try {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      const generation = `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.size}`;
+      const cached = registryReadCache.get(this.#registryPath);
+      if (cached?.generation === generation) return cached.value;
+      const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
+      registryReadCache.set(this.#registryPath, { generation, value });
+      return value;
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
@@ -463,6 +484,8 @@ export class ActorRegistryStore {
       if (previous === undefined) fs.rmSync(this.#registryPath, { force: true });
       else writeFileAtomic(this.#registryPath, previous, { durable: true });
       throw error;
+    } finally {
+      registryReadCache.delete(this.#registryPath);
     }
   }
 }

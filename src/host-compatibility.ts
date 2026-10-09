@@ -3,6 +3,56 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
 
+// Shared host/agent input metadata lives beside existing public policy errors so
+// eager configuration and lazy launch validation do not add a startup chunk.
+export const MAX_AGENT_REQUIRED_INPUTS = 64;
+export const MAX_AGENT_REQUIRED_INPUT_BYTES = 4096;
+
+/** Invalid declarations and missing local inputs are known-unlaunched refusals. */
+export class AgentInputError extends Error {
+  readonly code = "FABRIC_AGENT_INPUT_ERROR";
+  readonly launchOutcome = "unlaunched";
+
+  constructor(readonly field: string, message: string) {
+    super(message);
+    this.name = "AgentInputError";
+  }
+}
+
+/** Needs and launcher guarantees share the same canonical token vocabulary. */
+export const normalizeAgentCapabilityTokens = (value: unknown, field = "needs"): string[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new AgentInputError(field, `Invalid agent ${field}: expected capability strings`);
+  const tokens: string[] = [];
+  for (const [index, entry] of value.entries()) {
+    const parts = typeof entry === "string"
+      ? entry.normalize("NFKC").toLowerCase().split(/[\p{White_Space},]+/u).filter(Boolean)
+      : [];
+    if (!parts.length) throw new AgentInputError(field, `Invalid agent ${field}[${index}]: expected nonempty capability tokens`);
+    for (const token of parts) {
+      if (!/^[a-z0-9._-]+$/u.test(token)) {
+        throw new AgentInputError(field, `Invalid agent ${field}[${index}]: token ${JSON.stringify(token)} must contain only ASCII letters, digits, dot, underscore or hyphen`);
+      }
+      tokens.push(token);
+    }
+  }
+  return [...new Set(tokens)];
+};
+
+/** A target-side preflight proved that this literal input was absent before launch. */
+export class RequiredInputMissingError extends AgentInputError {
+  readonly path: string;
+  readonly index: number | undefined;
+
+  constructor(path: string, index?: number) {
+    const slot = index === undefined ? "requires" : `requires[${index}]`;
+    super("requires", `Missing required agent input ${slot}: ${path}; path must exist on the selected host; no worker started`);
+    this.name = "RequiredInputMissingError";
+    this.path = path;
+    this.index = index;
+  }
+}
+
 /** Trusted host policy for every Fabric participant model selection. */
 export interface FabricModelPolicy {
   deniedModels?: readonly string[];

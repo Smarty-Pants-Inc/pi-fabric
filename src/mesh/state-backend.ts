@@ -350,7 +350,7 @@ const sqliteUnavailable = (): string | undefined => {
 };
 
 export type CreateStateBackendOptions = StateBackendOptions & StateFileOptions & {
-  /** shadow: period of the automatic divergence check; 0 disables. Default 60 s. */
+  /** shadow: unref'd safety verifier, at most once per minute; 0 disables. Default 60 s. */
   shadowVerifyMs?: number;
 };
 
@@ -901,8 +901,15 @@ export class ShadowStateBackend implements StateBackend {
       // A copy outside the mesh root, never the fence: it initialises itself (smarty-dev#6477).
       initialize: "detached",
     });
-    const verifyMs = Math.max(0, Math.floor(options.shadowVerifyMs ?? 60_000));
+    const requestedVerifyMs = options.shadowVerifyMs ?? 60_000;
+    // Node treats an overflowing/NaN interval as 1 ms: do not turn a safety exception
+    // into an accidental high-frequency poll even for a malformed direct option.
+    const verifyMs = requestedVerifyMs <= 0 ? 0 : Number.isFinite(requestedVerifyMs)
+      ? Math.min(2_147_483_647, Math.max(60_000, Math.floor(requestedVerifyMs))) : 60_000;
     if (verifyMs > 0) {
+      // Named maintenance exception: shadow-divergence safety check. Unref'd, <= 1/minute,
+      // shadow only (never the normal file backend or an empty native bridge). Mirrors are
+      // already driven by commits; this checks out-of-process edits that bypass mirroring.
       // A failed reconcile is already counted by the mirror; only other verify failures count here.
       this.#timer = setInterval(() => {
         void this.verify().catch((error: unknown) => { if (!(error instanceof MeshShadowNotReconciledError)) this.#failures += 1; });

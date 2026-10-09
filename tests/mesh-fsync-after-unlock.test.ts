@@ -95,6 +95,8 @@ describe("off-lock live barriers and locked receipt CAS (smarty-dev#6477 E1)", (
     expect(watcher.syncs.some(sync => sync.live)).toBe(true);
     expect(watcher.held()).toEqual([]);
     expect(image.get().toString("utf8")).toContain(`"id":"${event.id}"`);
+    expect(event.dedupeKey).toBeUndefined();
+    expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
   });
 
   it("publish: concurrent durable appends share one group barrier; a later append gets a fresh one", async () => {
@@ -369,13 +371,91 @@ describe("off-lock live barriers and locked receipt CAS (smarty-dev#6477 E1)", (
     const watcher = watchBarriers(mesh.root, fd => { if (sameFile(fd, receiptPath) && !held()) receiptSynced = true; });
     expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
     expect(installed).toBe(true);
-    // Receipt confirmation stays off-lock; the matched intent unlink holds the CAS lock.
+    // The first receipt confirmation stays off-lock; cleanup rechecks and confirms the
+    // still-matching receipt under CAS before unlinking the intent (portable file barrier).
     expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
     expect(watcher.held().length).toBeGreaterThan(0);
     // The receipt is confirmed and the original intent removed before retry resolves.
     expect(receiptSynced).toBe(true);
     expect(fs.existsSync(intentPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each([false, true])("recovery: receipt cleanup has a file barrier without directory fsync (batch=%s)", async batch => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `portable-cleanup-${batch}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    // Exercise Windows' actual barrier branch on every CI host, not a directory-fsync
+    // assertion that passes on Linux but cannot observe any barrier on native Windows.
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    let offLockReceiptSynced = false, lockedReceiptSynced = false, directorySynced = false;
+    const watcher = watchBarriers(mesh.root, fd => {
+      if (fs.fstatSync(fd).isDirectory()) directorySynced = true;
+      if (sameFile(fd, receiptPath)) {
+        if (held()) lockedReceiptSynced = true;
+        else offLockReceiptSynced = true;
+      }
+    });
+    const result = batch ? (await mesh.publishBatch([packet]))[0] : await mesh.publish(packet);
+    expect(result).toEqual(committed);
+    expect(offLockReceiptSynced).toBe(true);
+    expect(lockedReceiptSynced).toBe(true);
+    expect(directorySynced).toBe(false);
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+    platform.mockRestore();
+  });
+
+  it("recovery: a failed cleanup receipt barrier preserves the intent and retry never re-appends", async () => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, "cleanup-barrier-failure");
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const sync = fs.fsyncSync.bind(fs);
+    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"))) {
+        throw new Error("cleanup receipt barrier failed");
+      }
+      sync(fd);
+    });
+    await expect(mesh.publish(packet)).rejects.toThrow("cleanup receipt barrier failed");
+    fail.mockRestore();
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each(["missing", "replaced"] as const)("recovery: cleanup retains its intent if the confirmed receipt is %s before CAS", async change => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `receipt-${change}-before-cas`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const replacement = { ...committed, id: "replacement-receipt", sequence: committed.sequence + 1 };
+    const close = fs.closeSync.bind(fs);
+    let changed = false;
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+      const confirmedReceipt = sameFile(fd, receiptPath) && !fs.existsSync(path.join(mesh.root, ".lock"));
+      close(fd);
+      if (!changed && confirmedReceipt) {
+        changed = true;
+        if (change === "missing") fs.rmSync(receiptPath);
+        else fs.writeFileSync(receiptPath, JSON.stringify(replacement));
+      }
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    if (change === "missing") expect(fs.existsSync(receiptPath)).toBe(false);
+    else expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(replacement);
     expect(mesh.read()).toEqual([committed]);
   });
 });

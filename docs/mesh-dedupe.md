@@ -70,6 +70,15 @@ reacquires the lock and compare-and-sets the intent identity (`dedupeKey`,
 makes that finalizer a no-op. Single and batch publication await this finalizer.
 Receipt durability and pending-file cleanup remain inside that CAS lock hold,
 so a delayed finalizer cannot resurrect an evicted receipt outside the cap.
+An existing/late receipt is first confirmed off-lock. If its matching intent still
+exists, cleanup rechecks both receipt and intent identities under the CAS lock,
+confirms the still-matching receipt file, closes it, and only then removes the
+intent. A missing/replaced receipt or a failed barrier retains the intent; cleanup
+never rewrites or recreates a receipt. The receipt-file barrier is portable even
+on Windows, where directory fsync is unsupported. Windows unlink namespace
+persistence remains subject to that existing platform limitation: if an intent
+reappears after a crash, the authoritative receipt settles it without re-appending.
+Unkeyed publication does not enter this receipt/intent path.
 
 1. Read `event-receipts/<hash>.json`. A valid receipt is authoritative; confirm
    its file/namespace barriers, finish any pending-file cleanup, and return it.

@@ -264,14 +264,22 @@ export class EventLog {
     };
   }
 
-  /** A receipt-confirmation finalizer must not unlink a newer same-key reservation either. */
+  /** Recheck both identities before cleanup; never unlink a newer reservation or recreate a
+   * receipt lost since off-lock confirmation. The matched receipt's file barrier also works
+   * on Windows, where the intent unlink has no supported directory-fsync barrier. */
   #cleanupReceiptIntent(event: MeshEvent, intentPath: string): Promise<void> {
     return this.#lock.withLock(() => {
       let intent: MeshDedupeIntent;
       try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-      if (intent.dedupeKey === event.dedupeKey && intent.eventId === event.id &&
-          intent.reservedSequence === event.sequence) this.#removeDedupeIntent(intentPath);
+      if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
+          intent.reservedSequence !== event.sequence) return;
+      const current = this.#readDedupeReceipt(intent.dedupeKey, false);
+      if (!current || current.id !== event.id || current.sequence !== event.sequence) return;
+      // Keep the recovery fence until the still-authoritative receipt is confirmed under
+      // the same CAS hold. Close its descriptor before unlink (Windows delete semantics).
+      this.#confirmEventFile(this.#dedupePath(intent.dedupeKey, ".json"));
+      this.#removeDedupeIntent(intentPath);
     }, undefined, "publish");
   }
 

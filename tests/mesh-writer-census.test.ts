@@ -576,16 +576,24 @@ describe("mesh writer census", () => {
       },
       check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite",
         stateBackends: ["file", "sqlite"] })]) },
+    // The root gate (pi-fabric#694 sqsnap) refuses a SQLite open through a symlinked root on POSIX, so
+    // no SQLite writer can exist behind an alias there; a Windows junction is still opened and still counted.
     { label: "round 4: a sqlite writer through a symlink alias outlives the root's store", reportsUnknown: false,
       setup: async (mesh, close) => {
         const alias = path.join(root(), "alias");
         fs.symlinkSync(mesh, alias, process.platform === "win32" ? "junction" : "dir");
         const direct = new MeshStore(mesh, 4096, 100, { stateBackend: "file" });
-        const aliased = await sqliteStore(alias);
+        if (process.platform === "win32") {
+          const aliased = await sqliteStore(alias);
+          close.push(() => aliased.closeState());
+        } else {
+          const aliased = new MeshStore(alias, 4096, 100, { stateBackend: "sqlite" });
+          await expect(aliased.put({ key: "census/probe", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/symbolic link/) });
+          aliased.closeState();
+        }
         direct.closeState();
-        close.push(() => aliased.closeState());
       },
-      check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite" })]) },
+      check: result => expect(ownWriter(result)).toEqual(process.platform === "win32" ? [expect.objectContaining({ stateBackend: "sqlite" })] : []) },
     { label: "round 5: an unreadable census directory", reportsUnknown: true,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() }); denyRead(path.join(mesh, ".writer-census")); } },
     { label: "round 5: an unreadable record", reportsUnknown: true,

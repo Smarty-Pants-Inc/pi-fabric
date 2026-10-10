@@ -125,6 +125,8 @@ export interface AgentRunRequest {
   nice?: number;
   /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
   bashTimeoutSeconds?: number;
+  /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
+  bashIdleSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -327,6 +329,7 @@ export interface AgentWorkerOptions {
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
   bashTimeoutSeconds?: number;
+  bashIdleSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
   /** Host-only bounded judge: no ambient resources, compaction or retry. */

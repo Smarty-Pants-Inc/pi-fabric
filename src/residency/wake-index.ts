@@ -6,7 +6,7 @@ import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import { residentProcessAlive } from "./process-identity.js";
 import type { ResidentWakeRoutes } from "./wake.js";
 
-export interface WakeDelivery { id: string; sequence?: number }
+export interface WakeDelivery { id: string; sequence?: number; deferredAt?: number }
 export interface WakeSubscription { from?: string; to?: string; events?: string[] }
 export const readWakeJson = <T>(file: string): T | undefined => {
   let fd: number | undefined;
@@ -177,25 +177,91 @@ const indexAt = (meshRoot: string): WakeIndex => {
   index.refresh(); return index;
 };
 
-/** Synchronous, under the archive/live publication lock, BEFORE any wake attempt. */
+// Exceptional overflow is a mesh-owned nudge per root, not an unbounded journal or inbox.
+// Normal dormancy admission reserves capacity; these files cover old/racing forced sleepers.
+const overflowPath = (meshRoot: string, root: string): string =>
+  path.join(meshRoot, "wake-overflow", `${path.basename(root)}.json`);
+const overflowAt = (meshRoot: string): Map<string, WakeDelivery> => {
+  const pending = new Map<string, WakeDelivery>();
+  const directory = path.join(meshRoot, "wake-overflow");
+  let files: string[];
+  try { files = fs.readdirSync(directory); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return pending; throw error; }
+  for (const name of files) {
+    if (!name.endsWith(".json")) continue; // atomic-write temporary files are not committed
+    const fd = fs.openSync(path.join(directory, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    let record: Record;
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > 1024 || (process.getuid && stat.uid !== process.getuid()))
+        throw new Error("Resident wake overflow exceeds its bounded read or is unsafe");
+      record = JSON.parse(fs.readFileSync(fd, "utf8")) as Record;
+    } finally { fs.closeSync(fd); }
+    if (record.format !== 1 || record.op !== "pending" || typeof record.root !== "string" ||
+        path.dirname(record.root) !== path.join(meshRoot, "residency") || `${path.basename(record.root)}.json` !== name ||
+        typeof record.delivery?.id !== "string" ||
+        (record.delivery.sequence !== undefined && !Number.isSafeInteger(record.delivery.sequence)) ||
+        (record.delivery.deferredAt !== undefined && !Number.isSafeInteger(record.delivery.deferredAt)))
+      throw new Error("Invalid resident wake overflow record");
+    pending.set(record.root, record.delivery);
+  }
+  return pending;
+};
+
+/** Synchronous, under the publication lock, BEFORE any live append or wake attempt. */
 export function indexResidentDeliveries(meshRoot: string, event: MeshEvent, lifecycle: readonly WakeSubscription[]): void {
-  for (const root of residentDirectories(meshRoot)) {
+  const roots = residentDirectories(meshRoot).filter(root => {
     const routes = retainedRoutesAt(root);
-    if (!routes || (residentOwnerLive(root) && !residentOwnerSleeping(root)) ||
-        !residentDeliveryMatches(routes, event, lifecycle)) continue;
-    const index = indexAt(meshRoot);
-    const prior = index.pending.get(root);
+    return routes && (!residentOwnerLive(root) || residentOwnerSleeping(root)) &&
+      residentDeliveryMatches(routes, event, lifecycle);
+  });
+  const index = indexAt(meshRoot), overflow = overflowAt(meshRoot);
+  // Compute the entire matching set and remaining journal capacity before writing anything.
+  let available = RESIDENT_WAKE_INDEX_MAX_ROOTS - index.pending.size;
+  const records = roots.map(root => ({ format: 1 as const, op: "pending" as const, root,
+    delivery: { id: event.id, sequence: event.sequence } }));
+  for (const record of records) {
+    const prior = index.pending.get(record.root) ?? overflow.get(record.root);
     if (prior && covers(prior, event)) continue;
-    index.append({ format: 1, op: "pending", root, delivery: { id: event.id, sequence: event.sequence } });
+    if (index.pending.has(record.root) || (!overflow.has(record.root) && available > 0)) {
+      if (!index.pending.has(record.root)) available--;
+      index.append(record);
+    } else {
+      // Retain the first deferral fence when a later matching delivery advances the watermark.
+      const text = JSON.stringify({ ...record, delivery: { ...record.delivery,
+        deferredAt: overflow.get(record.root)?.deferredAt ?? event.sequence } });
+      if (Buffer.byteLength(text) > 1024) throw new Error("Resident wake overflow record bound exceeded");
+      writeFileAtomic(overflowPath(meshRoot, record.root), text, { durable: true });
+    }
   }
 }
 
 export function residentUnacknowledgedDeliveries(meshRoot: string): Map<string, WakeDelivery> {
-  return new Map(indexAt(meshRoot).pending);
+  return new Map([...indexAt(meshRoot).pending, ...overflowAt(meshRoot)]);
 }
+
+/** Caller holds the mesh lock; sleeping.json reserves the slot before releasing the owner. */
+export function residentWakeCapacityAvailable(meshRoot: string, root: string): boolean {
+  const reserved = new Set(residentUnacknowledgedDeliveries(meshRoot).keys());
+  // Count sleepers even BEFORE their first delivery: pending watermarks alone cannot
+  // prevent a single future event from matching more than 128 dormant roots.
+  for (const directory of residentDirectories(meshRoot)) {
+    if (retainedRoutesAt(directory)?.actors.length && (!residentOwnerLive(directory) || residentOwnerSleeping(directory)))
+      reserved.add(directory);
+  }
+  reserved.delete(root); // An already-reserved root does not consume a second slot.
+  return reserved.size < RESIDENT_WAKE_INDEX_MAX_ROOTS;
+}
+
 /** Caller holds the mesh publication lock. Only durable request/receipt success may acknowledge. */
 export function acknowledgeResidentDelivery(meshRoot: string, root: string, delivery: WakeDelivery): void {
   const index = indexAt(meshRoot);
   const pending = index.pending.get(root);
   if (pending && covers(delivery, pending)) index.append({ format: 1, op: "ack", root, delivery });
+  const overflow = overflowAt(meshRoot).get(root);
+  if (overflow && covers(delivery, overflow)) {
+    const file = overflowPath(meshRoot, root);
+    fs.unlinkSync(file);
+    syncPathNamespace(path.dirname(file));
+  }
 }

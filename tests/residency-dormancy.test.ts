@@ -12,7 +12,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors } from "../src/residency/wake.js";
 import { superviseWake } from "../src/residency/launcher.js";
-import { canonicalResidentWakeConfig, routesAt } from "../src/residency/wake-index.js";
+import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable } from "../src/residency/wake-index.js";
 import { requestResidentWake, ResidentWakeConfigMismatch } from "../src/residency/wake.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -50,6 +50,21 @@ const fixture = () => {
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+const fillWakeCapacity = (config: ResidentHostConfig): string[] => {
+  const residents: string[] = [];
+  for (let n = 0; n < 128; n++) {
+    const rootId = `session:capacity-${n}`;
+    const resident = residentRoot(config.meshRoot, rootId);
+    const saved = { ...config, rootId, residencyRoot: resident };
+    fs.mkdirSync(resident, { recursive: true });
+    fs.writeFileSync(path.join(resident, "config.json"), JSON.stringify(saved));
+    fs.writeFileSync(path.join(resident, "wake-routes.json"), JSON.stringify({ format: 1, rootId, hostId: `host:${n}`,
+      configJson: canonicalResidentWakeConfig(saved), actors: [{ id: `actor-${n}`, name: `actor-${n}`, topics: ["capacity.delivery"] }] }));
+    residents.push(resident);
+  }
+  return residents;
+};
+
 const fakeRun = (host: ResidentHost, consume: (task: string) => Promise<void> = async () => {}) =>
   vi.spyOn(host.agents, "run").mockImplementation(async (request, _signal, onSpawned) => {
     const id = "1".repeat(32);
@@ -216,6 +231,64 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(close).toHaveBeenCalledOnce();
       expect(host.actors.status(actor.id).status).toBe("idle");
       expect(fs.readdirSync(config.residencyRoot).some(name => name.startsWith(".wake-watch-"))).toBe(false);
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])("keeps the 129th dormancy request resident with one warning (outstanding watermarks: %s)", async outstanding => {
+    const { root, config, host, idle } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    vi.spyOn(wake, "wakeResidentActors").mockResolvedValue(); // retain the existing sleepers' pending work
+    const probes = vi.spyOn(wake, "assertResidentWakeWatch");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const residents = fillWakeCapacity(config);
+    const delivery = { id: "outstanding", sequence: 0 };
+    try {
+      await host.start();
+      if (outstanding) await host.mesh.exclusive(() => indexResidentDeliveries(config.meshRoot, { ...delivery,
+        topic: "capacity.delivery", kind: "event", from: { id: "publisher", name: "publisher", kind: "main" }, createdAt: 0 }, []));
+      const actor = await host.actors.create({ name: "resident-129", instructions: "wait", residency: "durable" });
+      await until(() => warn.mock.calls.some(([line]) => String(line).includes("wake capacity")));
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      expect(probes).not.toHaveBeenCalled();
+      await host.actors.setInstructions(actor.id, "still resident at capacity");
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      await sleep(200);
+      expect(idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(false);
+      expect(warn.mock.calls.filter(([line]) => String(line).includes("wake capacity"))).toHaveLength(1);
+      await host.mesh.exclusive(() => {
+        if (outstanding) acknowledgeResidentDelivery(config.meshRoot, residents[0]!, delivery);
+        fs.rmSync(residents[0]!, { recursive: true, force: true });
+        expect(residentWakeCapacityAvailable(config.meshRoot, config.residencyRoot)).toBe(true);
+      });
+      await host.actors.setInstructions(actor.id, "a slot is available now");
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(probes).toHaveBeenCalledOnce();
+    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rechecks capacity under the publication lock at the final host exit boundary", async () => {
+    const { root, config, host, idle } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    vi.spyOn(wake, "wakeResidentActors").mockResolvedValue();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "late-capacity", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      const residents = fillWakeCapacity(config); // capacity fills AFTER the actor's admission
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      await until(() => warn.mock.calls.some(([line]) => String(line).includes("wake capacity")));
+      expect(idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(false);
+      expect(readWakeJson<{ pid: number }>(path.join(config.residencyRoot, "owner.json"))?.pid).toBe(process.pid);
+      await host.mesh.exclusive(() => fs.rmSync(residents[0]!, { recursive: true, force: true }));
+      vi.spyOn(Date, "now").mockImplementation(() => now + 62_000);
+      await until(() => idle.mock.calls.length === 1);
+      expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(true);
+      expect(warn.mock.calls.filter(([line]) => String(line).includes("wake capacity"))).toHaveLength(1);
     } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

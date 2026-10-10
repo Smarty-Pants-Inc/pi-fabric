@@ -10,7 +10,7 @@ import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricParticipantInfo, FabricParticipantRecord } from "../topology/types.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, routesAt, residentDirectories, residentDeliveryMatches, residentUnacknowledgedDeliveries,
-  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch, type WakeDelivery } from "./wake-index.js";
+  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch, RESIDENT_WAKE_INDEX_MAX_ROOTS, type WakeDelivery } from "./wake-index.js";
 export { readWakeJson, residentOwnerLive, residentOwnerSleeping, ResidentWakeConfigMismatch } from "./wake-index.js";
 
 /** Sleep needs archive retention even on a mesh that previously used only a bounded live log. */
@@ -273,7 +273,12 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
   const pending = await mesh.exclusive(() => residentUnacknowledgedDeliveries(mesh.root));
   const acknowledge = (root: string, delivery: WakeDelivery): Promise<void> =>
     mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, delivery));
-  for (const root of residentDirectories(mesh.root)) {
+  let attempted = 0;
+  // A subsequent MATCHING delivery must not let a newly re-filled journal starve old overflow.
+  const deferred = [...pending].filter(([, delivery]) => delivery.deferredAt !== undefined &&
+    (!events.length || events.some(event => event.sequence > delivery.deferredAt!))).map(([root]) => root);
+  for (const root of new Set([...deferred, ...pending.keys(), ...residentDirectories(mesh.root)])) {
+    if (attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
     try {
       const routes = retainedRoutesAt(root);
@@ -282,6 +287,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
         const covered = pending.get(root);
         if (covered) {
           delivery = covered;
+          attempted++;
           await requestResidentWake(root, covered, launch, written => acknowledge(root, written));
         }
         continue;
@@ -297,6 +303,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       delivery = last ? { id: last.id, sequence: last.sequence } : pending.get(root) ?? failed?.delivery ??
         (request && JSON.stringify(sleeping?.request) !== JSON.stringify(request) ? request : undefined);
       if (delivery) {
+        attempted++;
         await requestResidentWake(root, delivery, launch, written => acknowledge(root, written));
         fs.rmSync(wakeFailurePath(root), { force: true });
       }

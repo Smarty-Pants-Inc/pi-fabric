@@ -170,7 +170,7 @@ export class EventLog {
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
   constructor(context: MeshStoreContext, options: EventLogOptions,
-    readonly indexCommittedDelivery?: (event: MeshEvent) => void) {
+    readonly indexDeliveryBeforeAppend?: (event: MeshEvent) => void) {
     const { root, maxEventBytes } = context;
     this.root = root;
     this.maxEventBytes = maxEventBytes;
@@ -524,6 +524,10 @@ export class EventLog {
         if (bytes > this.maxEventBytes) {
           throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
         }
+        // Match and bound the wake set before touching the live/archive event. Overflow
+        // remains a durable pending nudge for the next delivery, never a post-append throw.
+        // A failed append can leave only a harmless nudge; actor cursors still own delivery.
+        this.indexDeliveryBeforeAppend?.(event);
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.
@@ -556,9 +560,6 @@ export class EventLog {
         }
         // This distinct fence leaves the live event complete but the sidecar unconfirmed.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-        // Same archival path and lock: preserve a bounded retry watermark before wake
-        // dispatch can see this delivery (even if BOTH root-local wake writes later fail).
-        this.indexCommittedDelivery?.(event);
         if (pending) archive!.commit(pending);
         return { event, line, bytes };
       };

@@ -35,7 +35,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
-import { canonicalResidentWakeConfig, residentWakeConfigMatches } from "./wake-index.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
@@ -240,6 +240,7 @@ export class ResidentHost {
   #idleSince = Date.now();
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
+  #wakeCapacityWarned = false;
   #wakeWatchSupported: boolean | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
@@ -1268,6 +1269,25 @@ export class ResidentHost {
     return false;
   }
 
+  /** Capacity and its sleeping reservation share the publication lock across hosts. */
+  async #admitWakeDormancy(reserve = false): Promise<boolean> {
+    let available = false;
+    try {
+      available = await this.mesh.exclusive(() => {
+        if (!residentWakeCapacityAvailable(this.mesh.root, this.config.residencyRoot)) return false;
+        if (reserve) writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+          request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
+        return true;
+      });
+    } catch { /* Unreadable capacity is not permission to release the resident owner. */ }
+    if (available) this.#wakeCapacityWarned = false;
+    else if (!this.#wakeCapacityWarned) {
+      this.#wakeCapacityWarned = true;
+      console.warn(`[pi-fabric] resident dormancy deferred: wake capacity (${RESIDENT_WAKE_INDEX_MAX_ROOTS}) full or unavailable; staying resident for ${this.config.residencyRoot}`);
+    }
+    return available;
+  }
+
   #writeWakeRoutes(): void {
     const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
       configJson: canonicalResidentWakeConfig(this.config),
@@ -1318,6 +1338,7 @@ export class ResidentHost {
       const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
       const eligible = hasIdleActor && this.#hasWakeConfig() && this.actors.hasDormantIdleActor(protectedIds);
       if (eligible) {
+        if (!await this.#admitWakeDormancy()) { this.#idleSince = now; return; }
         if (!await this.#ensureWakeWatch()) {
           this.#idleSince = now;
           return;
@@ -1378,9 +1399,15 @@ export class ResidentHost {
       // Enable the existing file archive under the same publication lock before sleeping.
       if (this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
         await ensureResidentWakeArchive(this.mesh);
+        if (!await this.#admitWakeDormancy(true)) {
+          this.#sleeping = false;
+          this.#idleSince = Date.now();
+          return;
+        }
+      } else {
+        writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+          request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
       }
-      writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
-        request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
       this.#ready = false;
       this.actors.pauseForRelease();
       this.control.pause();

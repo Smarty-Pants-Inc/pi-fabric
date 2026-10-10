@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -572,6 +573,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #superseded: FabricHostLeaseSupersededError | undefined;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
+  /** Coalesce this directory's own lease writes, not an independent actor key wait. */
+  #leaseRenewing: Promise<number> | undefined;
+  /** Serialize only our own asynchronous lease gate users; foreign custody stays a one-shot try. */
+  #leaseCommitting: Promise<void> = Promise.resolve();
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
   readonly #stoppedRenewedAt = new Map<string, number>();
   /** A successful sequence claim survives discarded preparations for this root. */
@@ -597,7 +602,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #leaseConfirmed = false;
   /** Only a kept predecessor reload lease needs takeover after the first host commit. */
   #keptReloadLease = false;
-  #deadHostSweepAt = Date.now();
+  #deadHostSweepAt = performance.now();
   #presencePassAt = Date.now();
   #quiescing = false;
   #reloadUntil: number | undefined;
@@ -764,14 +769,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
       if (this.#closed) return false;
+      // The independent actor lane starts its lease write before publication.
+      // Join that write outside registry custody, never its per-key work: a slow
+      // actor key must neither stall shared admission nor retain adoption fences.
+      await this.#leaseRenewing;
+      if (this.#closed) return false;
       if (this.options.enabled && this.#prepareLeaseLock) {
-        // Main's file renewal was synchronous. Its now-async actor renewal starts
-        // before publication: drain it before preparing the same host's gate, or
-        // every heartbeat can collide with its own renewal and never recover.
-        await this.#actorRenewing;
-        if (this.#closed) return false;
-        await withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
-          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue });
+        await this.#withLeaseCommit(() => withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
+          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue }));
         this.#prepareLeaseLock = false;
         if (this.#closed) return false;
       }
@@ -792,10 +797,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     });
-    const settled = operation.then(() => undefined);
-    settled.catch(() => undefined);                            // awaiters still see a failure
-    this.#refreshing = settled;
     this.#refreshingFull = full;
+    // A joined refresh owns the whole receipt, including asynchronous lease
+    // fencing and confirmation bookkeeping after the state operation settles.
+    const refreshing = this.#finishRefresh(operation, full);
+    this.#refreshing = refreshing;
+    refreshing.catch(() => undefined);                        // awaiters still see a failure
+    await refreshing;
+  }
+
+  async #finishRefresh(operation: Promise<number | false>, full: boolean): Promise<void> {
     let lockTimedOut = false;
     try {
       const committed = await operation;
@@ -1559,9 +1570,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #sweepDeadHosts(): void {
     const reap = this.options.reapDeadHosts;
     if (!this.options.enabled || reap === false || this.#closed || this.#quiescing) return;
+    // Maintenance cadence is elapsed time, not lease authority. A forward wall
+    // clock adjustment must give other live hosts their ordinary renewal turn,
+    // not immediately retire their UUIDs before they can observe the new clock.
+    const elapsed = performance.now();
+    if (elapsed - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
+    this.#deadHostSweepAt = elapsed;
     const now = Date.now();
-    if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
-    this.#deadHostSweepAt = now;
     void this.#notifications.enqueue(() => reapDeadHostRecords(this.mesh, this.options.identity, {
       withCommitFence: operation => this.#withLeaseFence(operation),
       ownHostId: this.options.hostId,
@@ -2327,7 +2342,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ? this.#leasePredecessor : this.#leaseOwner();
   }
 
-  async #renewFileLease(): Promise<number> {
+  #renewFileLease(): Promise<number> {
+    if (this.#leaseRenewing) return this.#leaseRenewing;
+    const renewing = this.#withLeaseCommit(() => this.#commitFileLease());
+    this.#leaseRenewing = renewing.finally(() => { this.#leaseRenewing = undefined; });
+    return this.#leaseRenewing;
+  }
+
+  async #commitFileLease(): Promise<number> {
     this.#assertLeaseActive();
     if (this.#closed) return Date.now();
     const leaseAt = Date.now();
@@ -2385,15 +2407,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
       lease.rootId === participant.rootId && effectiveLiveness(undefined, lease).expiresAt >= now;
   }
 
-  async #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
-    this.#assertLeaseActive();
-    try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
-      { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
-    catch (error) {
-      if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
-      if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;
-      throw error;
-    }
+  #withLeaseCommit<T>(operation: () => Promise<T>): Promise<T> {
+    // Promise handoff, not lock retry: each local operation enters the physical
+    // gate exactly once. Actor key writes and shared publication must not report
+    // each other's still-releasing async custody as a foreign busy holder.
+    const committing = this.#leaseCommitting.then(() => {
+      this.#assertLeaseActive();
+      return operation();
+    });
+    this.#leaseCommitting = committing.then(() => undefined, () => undefined);
+    return committing;
+  }
+
+  #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
+    return this.#withLeaseCommit(async () => {
+      this.#assertLeaseActive();
+      try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
+        { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
+      catch (error) {
+        if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+        if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;
+        throw error;
+      }
+    });
   }
 
   #fileLockOptions(): ParticipantFileLockOptions {

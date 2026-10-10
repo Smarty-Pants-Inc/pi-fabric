@@ -400,8 +400,14 @@ const main = async (): Promise<void> => {
   if (persistentPiTask && options.inferenceContext !== "activation") {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
     const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
-    if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
-      piRetrySdk = resolveRetrySdk(options.piBinary);
+    const retrySdk = resolveRetrySdk(options.piBinary);
+    // Invalid personal entries must not prevent an opaque launcher from
+    // starting. Its explicit profile replay below counts the skipped entries.
+    let retryProfile: string | undefined;
+    try { retryProfile = prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale); }
+    catch (error) { if (retrySdk) throw error; }
+    if (retryProfile) {
+      piRetrySdk = retrySdk;
       // Opaque/custom launchers are a supported fallback, not a degraded run.
       // Keep profile-selection telemetry separate from result/cleanup warnings.
       if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
@@ -420,10 +426,11 @@ const main = async (): Promise<void> => {
   const piArguments = ["--mode", "rpc"];
   if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
-  // Opaque launchers have no supplied native discovery API. Fail closed on
-  // auto-discovery rather than reintroducing an unvalidated Fabric generation.
-  // Explicit task hooks still load; native launchers retain all other resources.
-  if (!options.extensions || (options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
+  // Opaque launchers have no supplied native discovery API. Keep discovery
+  // disabled, but replay the personal profile's explicit non-Fabric extensions
+  // so its guard policy survives. Native launchers retain their own discovery.
+  const opaqueFabricLauncher = options.runner === "pi" && options.fabricExtensionPath && !piReleaseSdk;
+  if (!options.extensions || opaqueFabricLauncher) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -443,6 +450,18 @@ const main = async (): Promise<void> => {
     // CLI extensions precede discovered extensions. Install the compaction
     // guard before any other hook can start summarization work.
     piArguments.push("-e", hookPath, "--no-auto-compaction");
+  }
+  if (opaqueFabricLauncher && options.extensions && !options.residentStartupProbe) {
+    const profileModule = import.meta.url.endsWith(".ts") ? "./worker/profile-extensions.ts" : "./worker/profile-extensions.js";
+    const { resolveProfileExtensions } = await import(profileModule) as typeof import("./worker/profile-extensions.js");
+    const profile = resolveProfileExtensions(pinnedFabricExtension!);
+    for (const extension of profile.paths) piArguments.push("-e", extension);
+    for (const [index, warning] of profile.warnings.entries()) {
+      record.warnings = [...(record.warnings ?? []), warning];
+      appendLog(`${JSON.stringify({ type: "worker_warning", warning, source: "profile_extensions", count: index + 1 })}\n`);
+    }
+    appendLog(`${JSON.stringify({ type: "fabric_profile_extensions", names: profile.names, loadedCount: profile.names.length, skippedCount: profile.warnings.length })}\n`);
+    writeRunRecord(options.statusFile, record);
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
   const deliveryHook = fileURLToPath(new URL(

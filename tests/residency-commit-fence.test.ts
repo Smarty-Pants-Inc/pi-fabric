@@ -837,7 +837,7 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   vi.spyOn(FabricState.prototype, "bootstrapped", "get").mockReturnValue(true);
   vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
   vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue(execution);
-  vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue(undefined);
+  vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue({ current: () => true });
   vi.spyOn(FabricState.prototype, "claimHandoff").mockResolvedValue(undefined);
   const registered = new Map<string, ToolDefinition<any, any, any>>();
   const api = {
@@ -935,6 +935,7 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
           outcome: "Keep one committed writer", steps: ["mutate once", "reconcile IDs"], verification: ["status and stop"], risks: "no replacement writer",
         })).toBe(true);
       }
+      return { current: () => true };
     });
     let boundaryApi: ExtensionAPI;
     vi.spyOn(FabricState.prototype, "runHandoffAtBoundary").mockImplementation(async function (this: FabricState, pending, result, ctx) {
@@ -1088,6 +1089,9 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      // The 250 ms exchange budget exists to expire the create above; this follow-up status read only checks the
+      // committed actor, so give it a bounded 5 s budget (a 2-core CI runner timed out at 250 ms; smarty-dev#7651).
+      state.client.options.commandTimeoutMs = 5_000;
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();
@@ -2270,7 +2274,7 @@ describe("outcome-unknown cross-process receipt isolation (#3172)", { timeout: 4
     vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
     vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue(execution);
     vi.spyOn(FabricState.prototype, "bootstrap").mockResolvedValue(undefined);
-    vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue(undefined);
+    vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue({ current: () => true });
     vi.spyOn(FabricState.prototype, "claimHandoff").mockResolvedValue(undefined);
     const faux = fauxProvider({ provider: "test", models: [{ id: "visible" }], tokensPerSecond: 10_000 });
     const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(state.root, "unused-auth.json") });

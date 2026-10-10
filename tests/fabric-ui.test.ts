@@ -304,6 +304,27 @@ describe("Fabric dynamic UI", () => {
     expect(formatToolCallDuration(100, 1_100)).toBe("1.0s");
   });
 
+  it.each([false, true])("shows only fixed run/agent durations (completed=%s)", completed => {
+    const current = snapshot();
+    current.actors = [];
+    const run = current.runs[0]!;
+    run.startedAt = current.now - 70_000;
+    run.status = completed ? "completed" : "running";
+    if (completed) run.finishedAt = current.now;
+    else delete run.finishedAt;
+    current.agents = current.agents.slice(0, 1).map(agent => {
+      const value = { ...agent, rootId: current.main.id,
+        status: completed ? "completed" : "running", startedAt: run.startedAt };
+      if (completed) value.finishedAt = current.now;
+      else delete value.finishedAt;
+      return value;
+    });
+    const lines = new FabricWidget(theme, () => current, 8).render(400);
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines[0]!.includes("1m10s")).toBe(completed);
+    expect(lines[1]!.includes("1m10s")).toBe(completed);
+  });
+
   it.each([0, 999, 1_000])("omits zero/subsecond widget and entity timers without stray separators (%s ms)", elapsed => {
     const current = snapshot();
     const run = current.runs[0]!;
@@ -3200,6 +3221,28 @@ describe("Fabric dashboard global actors and instructions editor", () => {
       dashboard.handleInput("\x1b[B");
       dashboard.handleInput("\r");
       expect(onGlobalDeliveryPolicy).toHaveBeenCalledWith("g-actor-1", "steer", false);
+    } finally {
+      dashboard.dispose();
+    }
+  });
+
+  it("edits global template host events with v", () => {
+    const tui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
+    const onGlobalEvents = vi.fn();
+    const dashboard = new FabricDashboard(tui, theme, baseSnapshot, vi.fn(), {
+      onGlobalEvents,
+    });
+    try {
+      dashboard.handleInput("l");
+      dashboard.handleInput("j");
+      expect(dashboard.render(120).join("\n")).toContain("v events");
+      dashboard.handleInput("\r");
+      expect(dashboard.render(120).join("\n")).toContain("v events");
+      dashboard.handleInput("v");
+      expect(dashboard.render(120).join("\n")).toContain("Host events for template");
+      dashboard.handleInput(" ");
+      dashboard.handleInput("\r");
+      expect(onGlobalEvents).toHaveBeenCalledWith("g-actor-1", ["input", "turn_end"]);
     } finally {
       dashboard.dispose();
     }

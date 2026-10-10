@@ -42,11 +42,36 @@ queue_rules:
       - -check-failure = review/astra
       - -check-failure = review/security
 
+# Queue order (smarty-dev#6477, Paul 10-08: the SQLite store is the fleet's top priority and gets the merge
+# queue's top tier). A fleet-top PR is queued ahead of p0, and a p0 PR ahead of the rest. Neither interrupts a
+# batch already in CI (smarty-dev#2143). It still needs every queue and merge condition above.
+priority_rules:
+  - name: fleet-top
+    conditions:
+      - label = fleet-top
+    priority: 4000
+    allow_checks_interruption: false
+  - name: p0
+    conditions:
+      - label = p0
+    priority: high
+    allow_checks_interruption: false
+
 # GitHub suspended smarty-agents (2026-09-25); the review agent queues as the write App's bot,
 # which has no collaborator permission (smarty-dev#562). Humans with write access still can.
 # This block is the fleet template (smarty-dev#1513), copied from smarty-dev's .mergify.yml.
 commands_restrictions:
   queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # The same allowance for `requeue` (smarty-dev#7327): without it Mergify refuses a fleet bot's requeue
+  # ('Command disallowed'), and a dequeued PR sits until someone notices (k3#958, ~18.5 h on 10-08).
+  requeue:
     conditions:
       - or:
           - sender-permission >= write

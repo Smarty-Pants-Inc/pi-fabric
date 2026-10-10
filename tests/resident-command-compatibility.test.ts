@@ -187,7 +187,10 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       expect(recovered.actor).toMatchObject({ id: before.actors[0].id, name: "untouched-rollback" });
       await stop(legacy, () => output);
       const after = JSON.parse(fs.readFileSync(registryPath, "utf8"));
-      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      // B70 drops the newer last-run binding cache, not the top-level project
+      // model/thinking defaults (#7682); those settings must still compare exactly.
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages,
+        resolvedBinding: _resolvedBinding, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
       expect(after.actors.map(settings)).toEqual(before.actors.map(settings));
     } finally {
       if (current.exitCode === null && current.signalCode === null) { current.kill("SIGKILL"); await once(current, "exit"); }
@@ -247,8 +250,11 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
       // B70 predates the external message journal: its rewrite drops the registry's
       // messageHistory reference, which the current release re-reads from the
       // untouched messages-head.json (a legacy rewrite never clears history).
+      // It also drops the newer last-run resolvedBinding cache (#7682), while
+      // top-level project model/thinking defaults remain part of the exact check.
       const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId, messages: _messages,
-        messageHistory: _messageHistory, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+        messageHistory: _messageHistory, resolvedBinding: _resolvedBinding, runnerSessionId: _runnerSessionId,
+        ...entry }: Record<string, unknown>) => entry;
       expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
       if (beforeRegistry.actors[0]?.messageHistory) expect.soft(beforeHistoryHead).toBe(JSON.stringify(beforeRegistry.actors[0].messageHistory));
       expect.soft(historyHead()).toBe(beforeHistoryHead);

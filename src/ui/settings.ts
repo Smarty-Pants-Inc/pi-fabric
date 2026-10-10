@@ -60,7 +60,12 @@ export async function openFabricSettings(
   context: ExtensionContext,
   deps: FabricSettingsDeps,
 ): Promise<void> {
-  await deps.state.ensure(context);
+  // The lease spans ensure(): a shutdown or replacement that resets approvals
+  // while ensure() is pending retires this flow before it touches `context`.
+  const lease = await deps.state.ensure(context);
+  if (!lease.current()) return;
+  const generation = deps.state.sessionApprovals?.generation;
+  const live = (): boolean => lease.current() && generation === deps.state.sessionApprovals?.generation;
 
   const agentDir = resolveAgentDir();
   const projectTrusted = context.isProjectTrusted();
@@ -76,6 +81,7 @@ export async function openFabricSettings(
     : undefined;
 
   const apply = (id: string, value: unknown): void => {
+    if (!live()) return;
     const partial = id === COMPACTION_THRESHOLD_SETTING_ID && activeModelKey
       ? compactionThresholdPartial(activeModelKey, value as CompactionThresholdSelection)
       : buildPartial(id, value);
@@ -128,7 +134,7 @@ export async function openFabricSettings(
     claudeModelSource,
     () => deps.state.agents.claudeModels(),
   ).catch((error: unknown) => {
-    if (deps.state.config.agents.runner === "claude") {
+    if (live() && deps.state.config.agents.runner === "claude") {
       context.ui.notify(
         `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
         "warning",
@@ -181,9 +187,23 @@ export async function openFabricSettings(
         rootComponent = component;
         return component;
       },
+      {
+        // Draw the settings screen as an overlay. pi composites overlays over
+        // the transcript and clears the cells beneath them; a plain custom
+        // screen leaves native image placements painted over the panel.
+        overlay: true,
+        overlayOptions: {
+          width: "94%",
+          minWidth: 40,
+          maxHeight: "90%",
+          anchor: "center",
+          margin: 1,
+        },
+      },
     );
   }
 
+  if (!live()) return;
   if (dirty) {
     if (deps.state.kernelReloadRequired) {
       if (deps.reloadResources) {

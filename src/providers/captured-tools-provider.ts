@@ -1,6 +1,6 @@
 import path from "node:path";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { runAbortable, throwIfAborted } from "../async-settlement.js";
+import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
@@ -94,9 +94,14 @@ export class CapturedToolsProvider implements FabricProvider {
     "Tools captured from other Pi extensions and invoked lazily through Fabric";
 
   readonly #scheduler = new CapturedToolScheduler();
+  readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
   constructor(readonly catalog: CapturedToolCatalog) {}
+
+  async close(): Promise<void> {
+    this.#lifetime.abort(new Error("Captured extension tool session closed"));
+  }
 
   async list(
     request: FabricProviderListRequest,
@@ -138,6 +143,12 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<CapturedToolInvocationResult> {
     this.#assertAllowed(actionName);
+    // Include provider custody even for host-direct calls without a turn signal.
+    // Queued work and non-cooperative late results cannot use a retired runner.
+    context = { ...context, signal: shareCancellationEffects(AbortSignal.any([
+      this.#lifetime.signal, ...(context.signal ? [context.signal] : []),
+    ]), context.signal) };
+    throwIfAborted(context.signal);
     const entry = this.catalog.require(actionName);
     return this.#scheduler.run(entry.definition.executionMode, () =>
       runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
@@ -169,6 +180,11 @@ export class CapturedToolsProvider implements FabricProvider {
     let thrown: unknown;
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
+    // A retired invocation (provider closed, turn cancelled, or execute already settled) must
+    // never touch the turn's context: a non-cooperative tool's late onUpdate is dropped, the
+    // same way runner emits are fenced by the combined signal (smarty-dev#5962).
+    let settled = false;
+    const retired = (): boolean => settled || context.signal?.aborted === true;
     try {
       const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
         type: "tool_call",
@@ -187,8 +203,11 @@ export class CapturedToolsProvider implements FabricProvider {
         : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
+        if (retired()) return;
         const progress = textFromContent(partialResult.content).trim();
-        if (progress) context.update(`${entry.name}: ${progress.slice(0, 500)}`);
+        if (progress) {
+          try { context.update(`${entry.name}: ${progress.slice(0, 500)}`); } catch { /* progress is advisory */ }
+        }
         updateTail = updateTail
           .then(() =>
             runAbortable(context.signal, () => runner.emit({
@@ -216,6 +235,7 @@ export class CapturedToolsProvider implements FabricProvider {
       };
     }
 
+    settled = true;
     await updateTail;
     throwIfAborted(context.signal);
     const patch = await runAbortable(context.signal, () => runner.emitToolResult({

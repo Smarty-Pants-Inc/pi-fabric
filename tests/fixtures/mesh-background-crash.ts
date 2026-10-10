@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { EventEmitter, once } from "node:events";
 import path from "node:path";
 import { CapturedToolCatalog } from "../../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../../src/config.js";
 import { FabricRuntimeState } from "../../src/fabric-runtime-state.js";
 import { MeshStore } from "../../src/mesh/store.js";
+import { withStateFence } from "../../src/mesh/commit-outbox.js";
 import { MeshProvider } from "../../src/providers/mesh-provider.js";
 import { QuickJsRuntime } from "../../src/runtime/quickjs-runtime.js";
 import { ParticipantDirectory } from "../../src/topology/participant-directory.js";
@@ -26,12 +28,30 @@ process.env.PI_FABRIC_PROJECT_ROOT = root;
 process.env.PI_FABRIC_MESH_ROOT = path.join(root, "mesh");
 process.env.PI_FABRIC_RUN_ROOT = path.join(root, "runs");
 const identity = { id: "session:crash-probe", name: "main", kind: "main" as const, sessionId: "crash-probe" };
+const mutations = new EventEmitter();
+const nextMutation = async (event: "lock-timeout" | "commit") => {
+  const controller = new AbortController();
+  // Keep the probe alive even when the directory's own retry timers are unref'd.
+  const deadline = setTimeout(() => controller.abort(new Error(`No ${event} for ${mode}`)), 5_000);
+  try { await once(mutations, event, { signal: controller.signal }); }
+  finally { clearTimeout(deadline); }
+};
 // Real acquisitions, with a short deadline even for runtime-owned stores. Never touch fleet locks.
 for (const method of ["publish", "put", "delete", "writeBatch"] as const) {
   const original = MeshStore.prototype[method] as Function;
-  (MeshStore.prototype[method] as Function) = function(this: MeshStore, ...args: unknown[]) {
+  (MeshStore.prototype[method] as Function) = async function(this: MeshStore, ...args: unknown[]) {
     const impatient = new MeshStore(this.root, this.maxEventBytes, this.maxReadEvents, { lockTimeoutMs: 40, lockProtocol: this.lockProtocol });
-    return original.apply(impatient, args);
+    try {
+      const result = await original.apply(impatient, args);
+      // Notify after the directory has consumed the mutation's settlement.
+      setImmediate(() => mutations.emit("commit"));
+      return result;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "FABRIC_MESH_LOCK_TIMEOUT") {
+        setImmediate(() => mutations.emit("lock-timeout"));
+      }
+      throw error;
+    }
   };
 }
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -77,25 +97,27 @@ if (mode === "foreground") {
   await provider.invoke("put", { key: "probe", value: 2 }, {} as FabricInvocationContext);
   assert.equal(mesh.get("probe")?.value, 2);
 } else if (mode.startsWith("directory-")) {
-  // A change refresh that hit a lock timeout is deliberately NOT retried by later
-  // change requests: pending changes ride the next heartbeat (#4383, e442f292).
-  // Keep that heartbeat well after the 350 ms hold but inside wait()'s 5 s, so
-  // recovery is proven through the designed path rather than a 60 s timer.
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
-    heartbeatMs: mode === "directory-change" ? 1_000 : 100, leaseMs: 180_000 });
+    heartbeatMs: mode === "directory-change" ? 60_000 : 100, leaseMs: 180_000,
+    // Change refreshes do not retry an outage; use the resident host's admission lane.
+    ...(mode === "directory-change" ? { waitForPublicationRetry: () => withStateFence(mesh, identity, () => undefined) } : {}) });
   let name = "before";
   directory.registerSource(() => [{ ...member(identity.id, true), name, label: "probe" }]);
   await directory.start();
   const initial = mesh.listAll("topology/hosts/")[0]!.version;
   const release = hold(mesh);
   name = "after";
+  const stalled = nextMutation("lock-timeout");
   if (mode === "directory-change") directory.scheduleRefresh();
-  await sleep(350);
+  await stalled;
+  assert.ok(directory.writeStalled());
   assert.equal(mesh.listAll("topology/hosts/")[0]!.version, initial);
+  const committed = nextMutation("commit");
   release();
-  // During the outage this must be a no-op (no extra retry); the heartbeat recovers.
-  if (mode === "directory-change") directory.scheduleRefresh();
-  await wait(() => directory.list().some(value => value.name === "after"));
+  await committed;
+  assert.equal(directory.writeStalled(), undefined);
+  assert.ok(directory.list().some(value => value.name === "after"));
+  assert.ok(mesh.listAll("topology/hosts/")[0]!.version > initial);
   await directory.close();
 } else if (mode === "actor-presence") {
   const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, enabled: false }, { workerPath: path.join(root, "unused.mjs"), runRoot: path.join(root, "runs") });

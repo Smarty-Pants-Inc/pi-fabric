@@ -6,6 +6,27 @@ import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
+// A veto that persists under custody is retried with fresh state up to the
+// pre-#554 bound. Backoff happens outside the fence (smarty-dev#816).
+const ACTOR_REGISTRY_VETO_RETRY_MS = 5_000;
+const ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS = 10;
+const ACTOR_REGISTRY_VETO_BACKOFF_MAX_MS = 200;
+const VETOED: unique symbol = Symbol("vetoed");
+
+/** A caller validate() veto that persisted under custody: nothing was committed; retry. */
+export class ActorRegistryUpdateVetoedError extends Error {
+  readonly code = "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED";
+  readonly retryable = true;
+  constructor() {
+    super("Actor registry update was vetoed by its validation and not committed; retry");
+    this.name = "ActorRegistryUpdateVetoedError";
+  }
+}
+
+/** The fence wait expired before custody was acquired. */
+class ActorRegistryLockTimeoutError extends Error {
+  constructor() { super("Timed out waiting for the Fabric actor registry lock"); }
+}
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,6 +59,48 @@ const freezeRegistryValue = <T>(value: T): T => {
   return value;
 };
 
+// Stores naming the same normalized path share one immutable decoded generation.
+// Read identity is taken from the open descriptor, so an atomic rename between
+// lookup and decoding cannot cache new bytes under the old inode (or vice versa).
+// Timestamps alone cannot prove identity: Windows fstat may report zero file IDs.
+// Such descriptors always miss rather than aliasing unrelated file generations.
+// Keep at most 64 normalized paths, least recently read first. Managers also
+// release their path on close; ad-hoc store readers remain bounded by this LRU.
+const REGISTRY_READ_CACHE_LIMIT = 64;
+const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
+const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
+// The racy-file age proof compares filesystem mtime with the client's clock.
+// Linux local filesystems share that clock; remote/unknown filesystems do not.
+// Probe the opened file: a remote file bind mount can sit under a local directory.
+// Node has no fstatfs; /proc/self/fd resolves the descriptor's backing filesystem.
+// Overlayfs is not proof that its backing layers share the host clock.
+// Key verdicts by descriptor dev/ino so remounts and replacements are rechecked.
+// Keep verdicts bounded too, and drop a path's retained identities on release.
+const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
+  0xEF53, // ext2/3/4
+  0x58465342, // XFS
+  0x9123683E, // btrfs
+  0x01021994, // tmpfs
+  0xF2F52010, // f2fs
+  0x2FC12FC1, // ZFS
+]);
+const registryLocalClockCache = new Map<string, { filePath: string; local: boolean }>();
+const registryHasLocalClock = (filePath: string, fd: number, stat: fs.BigIntStats): boolean => {
+  // Other platforms' statfs type values are not comparable to Linux magic values.
+  if (process.platform !== "linux" || stat.ino <= 0n) return false;
+  const identity = `${stat.dev}:${stat.ino}`;
+  const known = registryLocalClockCache.get(identity);
+  if (known !== undefined) return known.local;
+  let local = false;
+  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(`/proc/self/fd/${fd}`).type); }
+  catch { /* An unavailable filesystem identity cannot prove a host-local clock. */ }
+  registryLocalClockCache.set(identity, { filePath, local });
+  if (registryLocalClockCache.size > REGISTRY_READ_CACHE_LIMIT) {
+    registryLocalClockCache.delete(registryLocalClockCache.keys().next().value!);
+  }
+  return local;
+};
+
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
 );
@@ -65,13 +128,16 @@ export class ActorRegistryStore {
   readonly #ownProcessStart: string | undefined;
   #snapshot: ActorRegistrySnapshot | undefined;
   readonly #encoded = new WeakMap<Record<string, unknown>, string>();
+  readonly #now: () => number;
 
-  constructor(actorRoot: string) {
+  /** `now` is a monotonic millisecond clock (injectable for tests); it bounds vetoed-save retries. */
+  constructor(actorRoot: string, options?: { now?: () => number }) {
+    this.#now = options?.now ?? (() => performance.now());
     // Capture immutable self identity before multi-registry acquisition, never
     // reread it while holding the earlier fence. No work at module import.
     this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
-    this.#registryPath = path.join(actorRoot, "actors.json");
+    this.#registryPath = path.resolve(actorRoot, "actors.json");
     this.#writer = new AtomicFileWriter(this.#registryPath);
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
@@ -96,9 +162,9 @@ export class ActorRegistryStore {
     }
   }
 
-  /** Read/merge/compact/encode and stage before acquisition. Only generation
-   * checks, prepared payload writes, rename and required barriers remain fenced.
-   * Stale preparations never publish heads, and retries re-run source selection. */
+  /** Read/merge/compact/encode and stage outside the optimistic fence. After a
+   * conflict, update also uses this under custody to guarantee forward progress.
+   * Stale preparations never publish heads, and fallback re-runs source selection. */
   prepare(actors: readonly Record<string, unknown>[], options: { durable?: boolean } = {}, snapshot = this.snapshot()) {
     const prior = new Map(snapshot.actors.map(row => [row.id, row]));
     const smallState = (row: Record<string, unknown>): string =>
@@ -168,6 +234,8 @@ export class ActorRegistryStore {
           }
           this.#snapshot = undefined;
           throw error;
+        } finally {
+          registryReadCache.delete(this.#registryPath);
         }
       },
       dispose: () => fs.rmSync(temporary, { force: true }),
@@ -175,24 +243,77 @@ export class ActorRegistryStore {
   }
 
   async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
-    const retryUntil = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
-    for (;;) {
-      const snapshot = this.snapshot();
-      const mutation = select(snapshot.actors);
-      if (!mutation) return undefined;
-      const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
+    // ONE monotonic deadline for the whole update, computed once: no attempt starts,
+    // and nothing validates or commits, after it (smarty-dev#816, pi-fabric#577).
+    const retryUntil = this.#now() + ACTOR_REGISTRY_VETO_RETRY_MS;
+    let vetoed = false;
+    const expire = (): never => { throw new ActorRegistryUpdateVetoedError(); };
+    const live = (): void => { if (this.#now() >= retryUntil) expire(); };
+    // Every fence wait gets only the remaining budget, never a fresh 5 s, and the
+    // deadline is rechecked right after acquisition; a throw releases the fence.
+    const locked = async <R>(operation: () => R): Promise<R> => {
+      const remaining = retryUntil - this.#now();
+      if (remaining <= 0) expire();
       try {
-        const committed = await this.withLock(() => {
-          if (!prepared.valid() || mutation.validate?.() === false) return false;
+        return await this.withLock(() => { live(); return operation(); }, remaining);
+      } catch (error) {
+        if (vetoed && error instanceof ActorRegistryLockTimeoutError) expire();
+        throw error;
+      }
+    };
+    const snapshot = this.snapshot();
+    const mutation = select(snapshot.actors);
+    if (!mutation) return undefined;
+    const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
+    try {
+      const committed = await locked(() => {
+        if (!prepared.valid() || mutation.validate?.() === false) return false;
+        live();
+        prepared.commit();
+        return true;
+      });
+      if (committed) return mutation.value;
+    } finally { prepared.dispose(); }
+    vetoed = true;
+    // One optimistic attempt keeps the uncontended fence cheap. After any race,
+    // select and prepare under custody: a slow codec must not starve behind even
+    // infrequent writers on a CPU-starved host (smarty-dev#816).
+    // Caller-local cancellation/ownership validation still vetoes publication. A veto
+    // re-selects from a fresh snapshot; one that persists is never reported as
+    // success: undefined means only that select() declined to write.
+    const attempt = (): T | undefined | typeof VETOED => {
+      live();
+      const current = this.snapshot();
+      const selected = select(current.actors);
+      if (!selected) return undefined;
+      const prepared = this.prepare(selected.actors, { durable: selected.durable === true }, current);
+      try {
+        live();
+        if (prepared.valid() && selected.validate?.() !== false) {
+          live();
           prepared.commit();
-          return true;
-        });
-        if (committed) return mutation.value;
+          return selected.value;
+        }
       } finally { prepared.dispose(); }
-      if (Date.now() >= retryUntil) throw new Error("Actor registry changed repeatedly during preparation");
-      // Yield OUTSIDE the fence; contending setters can prepare/commit independently.
-      await delay(0);
+      return VETOED;
+    };
+    let result = await locked(() => {
+      const first = attempt();
+      return first === VETOED ? attempt() : first;
+    });
+    // Under contention (load 50+) the veto can persist across back-to-back tries.
+    // Keep retrying with fresh state until the old 5 s bound, holding the fence
+    // only per attempt and never across the jittered backoff (smarty-dev#816).
+    while (result === VETOED) {
+      const remaining = retryUntil - this.#now();
+      if (remaining <= 0) expire();
+      const backoff = ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS +
+        Math.random() * (ACTOR_REGISTRY_VETO_BACKOFF_MAX_MS - ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS);
+      await delay(Math.min(backoff, remaining));
+      // locked() rechecks the deadline after the backoff, before trying the fence.
+      result = await locked(attempt);
     }
+    return result;
   }
 
   records(): Array<Record<string, unknown> & { id: string }> {
@@ -250,6 +371,8 @@ export class ActorRegistryStore {
       catch (error) {
         writeFileAtomic(this.#registryPath, previous, { durable: true });
         throw error;
+      } finally {
+        registryReadCache.delete(this.#registryPath);
       }
       return actors.length;
     });
@@ -270,10 +393,10 @@ export class ActorRegistryStore {
 
   /** Global order: actor registries (sorted path), then mesh; never the reverse.
    * Retains registry custody while adoption/publication acquires the mesh fence. */
-  async withLock<T>(operation: () => T | Promise<T>): Promise<T> {
+  async withLock<T>(operation: () => T | Promise<T>, timeoutMs = ACTOR_REGISTRY_LOCK_TIMEOUT_MS): Promise<T> {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
-    const deadline = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
+    const deadline = Date.now() + Math.min(timeoutMs, ACTOR_REGISTRY_LOCK_TIMEOUT_MS);
     const token = randomUUID();
     const started = this.#ownProcessStart;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
@@ -319,7 +442,7 @@ export class ActorRegistryStore {
           // Lock creation or stale recovery raced; retry until the deadline.
         }
         if (Date.now() >= deadline) {
-          throw new Error("Timed out waiting for the Fabric actor registry lock");
+          throw new ActorRegistryLockTimeoutError();
         }
         await delay(10);
       }
@@ -347,8 +470,50 @@ export class ActorRegistryStore {
     }
   }
 
+  /** Release shared decoded state when its manager closes or its root is removed. */
+  releaseReadCache(): void {
+    registryReadCache.delete(this.#registryPath);
+    for (const [identity, verdict] of registryLocalClockCache) {
+      if (verdict.filePath === this.#registryPath) registryLocalClockCache.delete(identity);
+    }
+    this.#snapshot = undefined;
+  }
+
+  /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
-    return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
+    let fd: number;
+    try { fd = fs.openSync(this.#registryPath, "r"); }
+    catch (error) { this.releaseReadCache(); throw error; }
+    try {
+      const readTimeMs = Date.now();
+      const stat = fs.fstatSync(fd, { bigint: true });
+      const generation = registryHasLocalClock(this.#registryPath, fd, stat) &&
+        stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
+        ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+        : undefined;
+      const cached = registryReadCache.get(this.#registryPath);
+      // Delete/reinsert promotes both unchanged and replaced generations.
+      registryReadCache.delete(this.#registryPath);
+      // On host-local filesystems, coarse timestamps can hide same-size in-place
+      // writes within a 2 s quantum. Remote/unknown clocks never reach this hit path.
+      // Prove the bytes against their original read-start time, not the current
+      // clock: a racy entry must be re-read once settled, never merely age into a hit.
+      if (generation !== undefined && cached?.generation === generation &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
+      const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
+      if (generation !== undefined) {
+        registryReadCache.set(this.#registryPath, { generation, readTimeMs, value });
+        if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
+          registryReadCache.delete(registryReadCache.keys().next().value!);
+        }
+      }
+      return value;
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
@@ -386,6 +551,8 @@ export class ActorRegistryStore {
       if (previous === undefined) fs.rmSync(this.#registryPath, { force: true });
       else writeFileAtomic(this.#registryPath, previous, { durable: true });
       throw error;
+    } finally {
+      registryReadCache.delete(this.#registryPath);
     }
   }
 }

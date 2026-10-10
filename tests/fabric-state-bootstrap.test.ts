@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { resolveFabricModelGuidance } from "../src/components/model-guidance.js";
 import { FabricState } from "../src/fabric-state.js";
 import type { FabricComponentDefinition, FabricProvider } from "../src/protocol.js";
 
@@ -170,6 +171,43 @@ describe("FabricState lazy bootstrap", () => {
       await state.shutdown();
       fs.rmSync(cwd, { recursive: true, force: true });
       vi.unstubAllEnvs();
+    }
+  });
+
+  it("retires an ensure lease when shutdown or replacement lands while ensure is pending (#5962)", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const other = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    const context = contextAt(cwd);
+    try {
+      await state.bootstrap(context);
+      const settled = await state.ensure(context);
+      expect(settled.current()).toBe(true);
+
+      // Shutdown resets approvals after ensure() started but before it resolves.
+      const approvals = state.sessionApprovals.generation;
+      const racingShutdown = state.ensure(context);
+      const closing = state.shutdown("reload");
+      expect(state.sessionApprovals.generation).toBe(approvals + 1);
+      const retired = await racingShutdown;
+      await closing;
+      expect(retired.current()).toBe(false);
+      expect(settled.current()).toBe(false);
+
+      // Replacement reopens the facade; the pending lease still belongs to the old session.
+      await state.bootstrap(context);
+      await state.ensure(context);
+      const racingReplacement = state.ensure(context);
+      await state.bootstrap(contextAt(cwd, "session-2"));
+      expect((await racingReplacement).current()).toBe(false);
+
+      // ensure()'s own cwd bootstrap is not a supersession.
+      const own = await state.ensure(contextAt(other));
+      expect(own.current()).toBe(true);
+    } finally {
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true });
     }
   });
 
@@ -502,5 +540,40 @@ describe("FabricState lazy bootstrap", () => {
     await state.shutdown();
     expect(runtime.shutdown).toHaveBeenCalled();
     expect(state.initialized).toBe(false);
+  });
+});
+
+describe("FabricState built-in model guidance", () => {
+  // The Jev block must be part of the first system prompt. Registering it only
+  // when the runtime activates rewrites the prompt suffix mid-session and drops
+  // the provider prefix cache for the whole conversation.
+  it("resolves the Jev guidance before the runtime activates", async () => {
+    const cwd = project();
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      expect(harness.instances).toEqual([]);
+      const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+        model: "probe/probe", target: "main",
+      });
+      expect(resolved.appendText).toContain("Jev supplies typed Choice");
+      expect(resolved.sources.map((source) => source.label)).toEqual(["jev-programs"]);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("omits the Jev guidance when disabled or under Schema enforce", async () => {
+    for (const config of [{ jev: { enabled: false } }, { schema: { mode: "enforce" } }]) {
+      const cwd = project(config);
+      const harness = runtimeHarness();
+      const state = createState(harness.loader);
+      try {
+        await state.bootstrap(contextAt(cwd));
+        const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+          model: "probe/probe", target: "main",
+        });
+        expect(resolved.appendText ?? "").not.toContain("Jev supplies");
+      } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+    }
   });
 });

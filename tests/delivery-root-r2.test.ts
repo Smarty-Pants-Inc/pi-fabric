@@ -279,12 +279,15 @@ describe("Security R2 S3 file-only resume interleavings", () => {
     const actor = await host.actors.create({ name: "fenced-orphan", instructions: "Keep original lineage.", residency });
     await host.close(); await seedClosure(mesh);
     const registry = path.join(config.actorRoot, "actors.json"), before = fs.readFileSync(registry, "utf8");
-    const exclusive = mesh.exclusive.bind(mesh);
+    // Adoption's fence is a state operation (a no-op writeBatch, smarty-dev#6477 L2b), not exclusive().
+    const writeBatch = mesh.writeBatch.bind(mesh);
     let resumed = false, registryHeld = false, meshHeld = false;
-    const fence = vi.spyOn(mesh, "exclusive").mockImplementation(async operation => {
+    const fence = vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      const prepare = input.prepare;
+      if (input.ops.length > 0 || !prepare || input.afterCommit) return writeBatch(input);
       registryHeld = fs.existsSync(path.join(registry + ".lock", "owner"));
       await directory.refresh(); resumed = true;
-      return exclusive(() => { meshHeld = fs.existsSync(path.join(mesh.root, ".lock", "owner")); return operation(); });
+      return writeBatch({ ...input, prepare: view => { meshHeld = fs.existsSync(path.join(mesh.root, ".lock", "owner")); return prepare(view); } });
     });
     const next = new ActorManager(successor.slice(8), identity(successor), mesh, config.mesh, host.agents, () => {}, {
       actorRoot: config.actorRoot, persistent: true, rootId: successor, claimResidency: residency, project: config.project, role: "project-agent", adoptionGraceMs: 0,

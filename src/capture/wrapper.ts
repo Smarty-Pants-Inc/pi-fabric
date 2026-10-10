@@ -56,8 +56,13 @@ export const wrapRegisteredToolForCapture = (
   return {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate, ctx): Promise<any> => {
+      const invocationSignal = signal as AbortSignal | undefined;
+      invocationSignal?.throwIfAborted();
       const activeBefore = runner.getActiveTools();
       const result = await execute(toolCallId, params, signal, onUpdate, ctx);
+      // A browser/process tool can settle after reload canceled its caller. Never
+      // read the retired runner or merge its tools into a successor (#5962).
+      invocationSignal?.throwIfAborted();
       const activeAfter = runner.getActiveTools();
       const activeAfterNames = new Set(activeAfter);
       const removedToolNames = activeBefore.filter((name) => !activeAfterNames.has(name));

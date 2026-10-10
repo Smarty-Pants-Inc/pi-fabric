@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseSnapshot, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasesStamp, readHostLease, readHostLeases, readHostLeaseCurrent, readHostLeaseSnapshot, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 
 // Windows fails an open with EPERM while the owner's heartbeat renames a new lease file over the
 // old one. A live host then looked leaseless, and the failed read stayed cached until its next
@@ -33,6 +33,27 @@ describe("host lease files on a transient read failure", () => {
     };
     return { root, lease, failReads };
   };
+
+  it("round-trips the optional reload marker without adding it to ordinary leases", () => {
+    const { root, lease } = setup();
+    const reload = { ...lease(1_000), reloadUntil: lease(1_000).expiresAt };
+    writeHostLease(root, reload);
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(reload);
+    expect(readHostLease(root, "host:a")).toEqual(reload);
+    expect(readHostLeases(root).get("host:a")).toEqual(reload);
+    writeHostLease(root, lease(2_000));
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(lease(2_000));
+  });
+
+  it.each(["invalid", null])("rejects a malformed reload marker (%s)", (reloadUntil) => {
+    const { root, lease } = setup();
+    writeHostLease(root, lease(1_000));
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    fs.writeFileSync(file, JSON.stringify({ format: 1, ...lease(1_000), reloadUntil }));
+    expect(readHostLeaseCurrent(root, "host:a")).toBeUndefined();
+    expect(readHostLease(root, "host:a")).toBeUndefined();
+    expect(readHostLeases(root).size).toBe(0);
+  });
 
   it.each(["single", "all"])("reparses equal-size atomic replacements with preserved mtime through %s", (reader) => {
     const { root, lease } = setup();
@@ -214,6 +235,24 @@ describe("host lease files on a transient read failure", () => {
     reads.mockRestore();
     expect(readHostLease(root, "host:a")?.updatedAt).toBe(1_000); // the same file, read now
     expect(readHostLeases(root).get("host:a")?.updatedAt).toBe(1_000);
+  });
+
+  it("strict current reads do not reuse a cached lease when bytes are unreadable", () => {
+    const { root, lease } = setup();
+    writeHostLease(root, lease(1_000));
+    expect(readHostLease(root, "host:a")).toEqual(lease(1_000));
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    const read = fs.readFileSync;
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation((target, options) => {
+      if (target === file) throw Object.assign(new Error("lease unavailable"), { code: "EACCES" });
+      return read(target, options as never);
+    });
+    try {
+      expect(readHostLeaseCurrent(root, "host:a")).toBeUndefined();
+      // The compatibility reader deliberately retains its last answer; the
+      // strict operator reader never does.
+      expect(readHostLease(root, "host:a")).toEqual(lease(1_000));
+    } finally { spy.mockRestore(); }
   });
 
   it("keeps the last lease while a renewed file cannot be read", () => {

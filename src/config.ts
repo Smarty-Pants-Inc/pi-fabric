@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
@@ -205,7 +206,62 @@ export interface FabricAgentConfig {
   sessionExportDir: string;
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
+  /** Host-only, default off: hydrate projected GitHub webhook text from the local ingress receipt (smarty-dev#6144). */
+  wakeText?: FabricWakeTextConfig;
+  /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
+  deadRootFilter: FabricDeadRootFilterConfig;
 }
+
+export type FabricDeadRootFilterMode = "off" | "on";
+
+export interface FabricDeadRootFilterConfig {
+  /** "off" (default) never skips; "on" skips activations of non-exempt actors under a dead root. */
+  mode: FabricDeadRootFilterMode;
+  /** Actor ids, id prefixes or exact actor names that always run, even under a dead root. */
+  exempt: string[];
+}
+
+const MAX_DEAD_ROOT_EXEMPT = 512;
+
+const MAX_DEAD_ROOT_EXEMPT_LENGTH = 200;
+const deadRootExemptWarnings = new Set<string>();
+
+/** An absent list is []; anything but an array of non-blank strings (each <= 200 chars, <= 512) is invalid. */
+const deadRootExemptList = (value: unknown): string[] | undefined => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_DEAD_ROOT_EXEMPT) return undefined;
+  const entries: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") return undefined;
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > MAX_DEAD_ROOT_EXEMPT_LENGTH) return undefined;
+    entries.push(trimmed);
+  }
+  return [...new Set(entries)];
+};
+
+/**
+ * Unknown or malformed input means "off". An invalid `exempt` shape disables the filter (mode off)
+ * with one config warning: dropping a malformed exemption while staying on could skip a keep-actor.
+ */
+export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFilterConfig => {
+  const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const exempt = deadRootExemptList(input.exempt);
+  if (input.mode !== "on") return { mode: "off", exempt: exempt ?? [] };
+  if (exempt) return { mode: "on", exempt };
+  let shape: string;
+  try {
+    shape = String(JSON.stringify(input.exempt)).slice(0, 200);
+  } catch {
+    shape = typeof input.exempt;
+  }
+  if (!deadRootExemptWarnings.has(shape)) {
+    if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
+    deadRootExemptWarnings.add(shape);
+    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+  }
+  return { mode: "off", exempt: [] };
+};
 
 export interface FabricToolCaptureConfig {
   enabled: boolean;
@@ -298,9 +354,25 @@ const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   throw new Error("mesh.lockProtocol must be 1 or 2");
 };
 
+/** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
+export type MeshStateBackend = "file" | "shadow" | "sqlite";
+
+// Local and tiny on purpose: importing state-backend.ts here would put SQLite in the config graph.
+const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = ["file", "shadow", "sqlite"];
+const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
+  // The environment overrides the file setting; an unknown environment value is ignored (fail safe).
+  const override = env?.trim().toLowerCase();
+  if (override && (MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+  if (value === undefined) return "file";
+  if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
+  throw new Error("mesh.stateBackend must be file, shadow or sqlite");
+};
+
 export interface FabricMeshConfig {
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
+  /** Keyed-state backend: "file" (default), "shadow" or "sqlite"; env PI_FABRIC_MESH_STATE_BACKEND overrides. */
+  stateBackend: MeshStateBackend;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -510,6 +582,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExport: true,
     sessionExportDir: "",
     nice: 0,
+    deadRootFilter: { mode: "off", exempt: [] },
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -566,6 +639,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mesh: {
     lockProtocol: 1,
+    stateBackend: "file",
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -867,6 +941,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const wakeText = normalizeWakeTextConfig(agents.wakeText);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
@@ -1204,7 +1279,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
+      ...(wakeText ? { wakeText } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1310,6 +1387,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     mesh: {
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
+      stateBackend: meshStateBackend(mesh.stateBackend),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1670,8 +1748,10 @@ const resolveFabricConfig = (
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
+      delete agents.wakeText;
       delete agents.processSlice;
       delete agents.placement;
+      delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

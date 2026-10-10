@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -30,7 +31,7 @@ const names = (directory: string): string[] => {
 };
 interface InboxOwner {
   rootId: string; sessionId: string; sessionFile?: string | undefined;
-  ownerIdentityId: string; pid: number; processStartedAt?: string | undefined; retired?: true; activationId?: string;
+  ownerIdentityId: string; pid: number; host?: string; name?: string; processStartedAt?: string | undefined; retired?: true; activationId?: string;
 }
 interface InboxRoute { oldRoot: string; newRoot?: string; messageId: string; item?: HeldAgentMessage; done?: true }
 interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
@@ -41,14 +42,14 @@ interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
 export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string): string => {
   const activationId = randomUUID();
   writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId,
-    ownerIdentityId: identity.id, pid: process.pid, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
+    ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
   return activationId;
 };
 /** Called only after the old Main/control drainer has closed on an actual native session change. */
 export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string): Promise<void> => {
   if (oldRoot === newRoot) return;
-  await mesh.exclusive(() => {
+  await mesh.custody(() => {
     const owner = read<InboxOwner>(ownerFile(mesh.root, oldSessionId));
     if (!owner || owner.rootId !== oldRoot || owner.pid !== process.pid) throw new Error("Cannot rotate an unowned Main inbox");
     const prior = read<Successor>(successorFile(mesh.root, oldRoot));
@@ -61,7 +62,7 @@ export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldS
 /** Pi's native replacement shuts down the old extension runtime before starting the
  * new one. Bind its explicit targetSessionFile, never infer succession from a label. */
 export const stageMainSuccessor = async (mesh: MeshStore, oldRoot: string, sessionId: string, targetSessionFile: string): Promise<void> => {
-  await mesh.exclusive(() => {
+  await mesh.custody(() => {
     const file = ownerFile(mesh.root, sessionId);
     const owner = read<InboxOwner>(file);
     if (!owner || owner.rootId !== oldRoot || owner.pid !== process.pid) throw new Error("Cannot retire an unowned Main inbox");
@@ -74,7 +75,7 @@ export const stageMainSuccessor = async (mesh: MeshStore, oldRoot: string, sessi
 };
 export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string): Promise<boolean> => {
   if (!sessionFile) return false;
-  return mesh.exclusive(() => {
+  return mesh.custody(() => {
     const intentFile = path.join(mailbox(mesh.root), "rotations", `${hash(path.resolve(sessionFile))}.json`);
     const intent = read<{ oldRoot: string; sessionId: string; activationId?: string; targetSessionFile: string }>(intentFile);
     if (!intent) return false;
@@ -197,7 +198,7 @@ export class MainInboxMaintenance {
         await alarm(item, owner.rootId, owner.ownerIdentityId);
         // A lapsed lease is not permission to move a still-running writer's volatile queue.
         if (live.has(owner.rootId) || (!owner.retired && residentProcessAlive(owner.pid, owner.processStartedAt))) continue;
-        await this.mesh.exclusive(() => {
+        await this.mesh.custody(() => {
           const currentOwner = read<InboxOwner>(ownerFile(this.mesh.root, owner.sessionId));
           if (!currentOwner || JSON.stringify(currentOwner) !== JSON.stringify(owner) ||
             (!currentOwner.retired && residentProcessAlive(currentOwner.pid, currentOwner.processStartedAt))) return;
@@ -234,8 +235,9 @@ export class MainInboxMaintenance {
       }
       // Claims are durable inbox custody, even before the target has a journal.
       // Serialize recovery AND journal admission against root activation and other
-      // drainers; publishing happens afterwards because it takes the same lock.
-      const route = await this.mesh.exclusive((): InboxRoute | undefined => {
+      // drainers under the file custody lock (smarty-dev#6477 L5); publishing happens
+      // afterwards, outside custody.
+      const route = await this.mesh.custody((): InboxRoute | undefined => {
         const current = read<InboxRoute>(file);
         if (!current || JSON.stringify(current) !== JSON.stringify(pending)) return;
         if (!target) return current;
@@ -267,7 +269,7 @@ export class MainInboxMaintenance {
       await this.mesh.publish({ topic: "fleet.work.inbox-receipts", kind: route.newRoot ? "rerouted" : "undeliverable",
         from: this.identity, to: item.from.id, text, dedupeKey: `inbox-disposition:${item.id}:${route.oldRoot}:${route.newRoot ?? "gone"}`,
         data: { messageId: item.id, oldRoot: route.oldRoot, newRoot: route.newRoot } });
-      await this.mesh.exclusive(() => {
+      await this.mesh.custody(() => {
         const current = read<InboxRoute>(file);
         if (!current || JSON.stringify(current) !== JSON.stringify(route)) return;
         const { item: _payload, ...claim } = route;

@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -210,11 +211,12 @@ export class ResidencyClient {
         };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
-          options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
+          options.mainAgent.deliverAgent(withFabricWakeAdmission({ from: { id: result.id, name: result.name, kind: "agent" },
             verification: "mesh", message: `Fabric agent ${result.name} ${result.status}` +
               (result.completionDelivery?.redeliveredFrom ? ` [re-delivered from dead Main session ${result.completionDelivery.redeliveredFrom}]` : "") +
               `: ${result.error ?? result.text}`, delivery: "followUp", triggerTurn: true, data: result,
-            deliveryId: `agent-completion:${result.id}` });
+            deliveryId: `agent-completion:${result.id}` }, [fabricWakeCause(
+              { id: result.id, name: result.name, kind: "agent" }, "inbox", "agent-completion", result.id)]));
           acknowledge();
         }
       });
@@ -265,6 +267,21 @@ export class ResidencyClient {
 
   syncPiModels(): void {
     this.#refreshPiModels();
+    if (fs.existsSync(this.options.config.residencyRoot)) {
+      atomicWrite(this.#configPath, this.options.config);
+    }
+  }
+
+  /**
+   * Host-only agents.wakeText after a live Main config reload (smarty-dev#6144 review round 3). The
+   * resident host reads it from config.json at every activation, so enabling applies and removing
+   * revokes at once, with no host restart.
+   */
+  updateWakeText(wakeText: ResidentHostConfig["agents"]["wakeText"]): void {
+    const agents = this.options.config.agents;
+    if (JSON.stringify(agents.wakeText) === JSON.stringify(wakeText)) return;
+    if (wakeText) agents.wakeText = structuredClone(wakeText);
+    else delete agents.wakeText;
     if (fs.existsSync(this.options.config.residencyRoot)) {
       atomicWrite(this.#configPath, this.options.config);
     }
@@ -1196,7 +1213,14 @@ export class ResidencyClient {
     // until Main durably admitted it: deliverAgent journals it under the record's stable id before
     // it returns, keeps it until the session holds it, and admits one id once across restarts and
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
-    this.options.mainAgent.deliverAgent({
+    // Ignore the resident payload's optional wakeCause. The owner-authenticated
+    // writer emits host notices; positively classified output delegates the actor
+    // identity under the existing resident admission policy. Topic/key are the
+    // receiving storage route and envelope key, never producer diagnostic fields.
+    const wakeCause = fabricWakeCause(value.source === "actor-output" ? value.from : entry.updatedBy,
+      value.source === "fabric-host" ? "host-event" : value.source === "actor-output" ? "actor" : value.delivery,
+      "fabric.resident.delivery", entry.key);
+    this.options.mainAgent.deliverAgent(withFabricWakeAdmission({
       from: value.from,
       source: value.source,
       // The authenticated resident writer alone does not prove actor authorship: older
@@ -1209,7 +1233,7 @@ export class ResidencyClient {
       triggerTurn: value.triggerTurn,
       ...(value.data === undefined ? {} : { data: value.data }),
       deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
-    });
+    }, [wakeCause]));
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
   }
 }

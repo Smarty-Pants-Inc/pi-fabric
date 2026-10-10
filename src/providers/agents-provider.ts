@@ -1346,6 +1346,7 @@ export class AgentsProvider implements FabricProvider {
         return result;
       }
       case "actorStatus": {
+        await this.actorManager.reconcileSessionOrphans();
         const id = String(args.id);
         let actor: FabricActorInfo | undefined;
         try {
@@ -1353,7 +1354,7 @@ export class AgentsProvider implements FabricProvider {
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
         }
-        if (actor && this.actorManager.owns(actor.id)) return actor;
+        if (actor && (actor.sessionOrphan && actor.status === "stopped" || this.actorManager.owns(actor.id))) return actor;
         // A retained definition is not a fresh execution snapshot. Recover its
         // exact owner before a resident query or the synchronous live overlay.
         await this.#resolveActorTarget(actor?.id ?? id);
@@ -1377,6 +1378,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "actors": {
         if (args.scope === "global") return this.globalActors.list();
+        await this.actorManager.reconcileSessionOrphans();
         const local = this.#actorsWithLiveState();
         const resident = this.#liveResidentActorClient();
         if (!resident) return local;
@@ -1811,6 +1813,9 @@ export class AgentsProvider implements FabricProvider {
 
   /** Registry definitions/bindings are useful; non-owned execution snapshots are not (#2726). */
   #actorWithLiveState(actor: FabricActorInfo): FabricActorReadInfo {
+    // A fenced terminal root-gone decision outranks stale owner advertisements and
+    // must remain inspectable without entering routing lease grace/recovery.
+    if (actor.status === "stopped" && actor.sessionOrphan) return actor;
     if (this.actorManager.owns(actor.id)) return actor;
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.

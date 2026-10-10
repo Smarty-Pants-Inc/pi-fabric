@@ -9,7 +9,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { main } from "../src/actors-cli.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
-import { offlineRemovalHooks } from "../src/actors/remove-offline.js";
+import { mainStoppedAudit, offlineRemovalHooks, removeActorOffline } from "../src/actors/remove-offline.js";
+import * as operatorSafety from "../src/residency/operator-safety.js";
 import { MeshStore, meshProcessStartedAt } from "../src/mesh/store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as fileLock from "../src/residency/file-lock.js";
@@ -42,12 +43,12 @@ const rootParticipantKey = (rootId: string) => "topology/participants/" + create
 
 // smarty-dev#7817: `fabric-actors remove --confirm-dead-root --main-stopped --evidence` for the two dead-root shapes.
 const EVIDENCE = "herdr agent list: no pane for session dead-root\nps: no pi process for session dead-root";
-const fixture = async () => {
+const fixture = async (options: { actorRoot?: string } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-dead-root-"));
   const meshRoot = path.join(root, "mesh");
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:dead-root", sessionId: "dead-root", cwd: process.cwd(), projectRoot: process.cwd(),
-    meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, "session:dead-root"),
+    meshRoot, actorRoot: options.actorRoot ?? path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, "session:dead-root"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 4, budgetUsd: 0 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 30 }, retention: { ...DEFAULT_FABRIC_CONFIG.retention },
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
@@ -93,8 +94,15 @@ const fixture = async () => {
   return { config, host, cli, create, registered, archives, mainParticipant, killResident, confirmed, close: async () => {
     if (!closed) { for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true); await host.close(); }
     fs.rmSync(root, { recursive: true, force: true });
-  } };
+  }, root };
 };
+
+/** Every file under `root` with its bytes: the registry, bindings, removal records and actor trees. */
+const treeSnapshot = (root: string): Array<[string, string]> => fs.readdirSync(root, { recursive: true, withFileTypes: true })
+  .filter(entry => entry.isFile() || entry.isSymbolicLink())
+  .map(entry => path.join(entry.parentPath, entry.name))
+  .map(file => [path.relative(root, file), fs.lstatSync(file).isSymbolicLink() ? `-> ${fs.readlinkSync(file)}` : fs.readFileSync(file, "utf8")] as [string, string])
+  .sort(([a], [b]) => a.localeCompare(b));
 
 describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead root (smarty-dev#7817)", () => {
   const fresh = ROOT_PARTICIPANT_FRESH_MS;
@@ -597,6 +605,85 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const row = path.join(output.archive, `${actor.id}.registry.json`);
       expect(fs.readFileSync(path.join(output.archive, "SHA256SUMS"), "utf8")).toContain(createHash("sha256").update(fs.readFileSync(row)).digest("hex"));
     } finally { await f.close(); }
+  }, 40_000);
+
+  const expectNoChange = (f: Awaited<ReturnType<typeof fixture>>, id: string, before: Array<[string, string]>) => {
+    // No audit, no removal record, no registry or binding change, no actor tree change, no fence.
+    expect(treeSnapshot(f.config.actorRoot)).toEqual(before);
+    expect(f.registered(id)).toBe(true);
+    expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${id}.json`))).toBe(false);
+    expect(fs.existsSync(path.join(f.config.meshRoot, "main-publication-fences"))).toBe(false);
+  };
+  const seedActor = async (f: Awaited<ReturnType<typeof fixture>>, name: string) => {
+    const actor = await f.create(name);
+    const actorDir = path.join(f.config.actorRoot, actor.id);
+    fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+    await f.killResident();
+    return actor;
+  };
+
+  it("smarty-dev#8159 (a): archives as a symlink to another dir refuses with no audit, marker, registry or binding change", async () => {
+    const f = await fixture();
+    try {
+      const actor = await seedActor(f, "archives-link");
+      const elsewhere = path.join(f.root, "elsewhere"); fs.mkdirSync(elsewhere);
+      fs.symlinkSync(elsewhere, path.join(f.config.residencyRoot, "archives"));
+      const before = treeSnapshot(f.config.actorRoot);
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("Archive path component is not a real directory owned by this OS user");
+      expect(result.err).toContain("refusing before any change (smarty-dev#8159)");
+      expectNoChange(f, actor.id, before);
+      expect(fs.readdirSync(elsewhere)).toEqual([]);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("smarty-dev#8159 (b): an archive dir on another filesystem (real: the actor root on /dev/shm) refuses before any change", async () => {
+    const shm = "/dev/shm";
+    const reachable = fs.existsSync(shm) && fs.statSync(shm).dev !== fs.statSync(os.tmpdir()).dev;
+    if (!reachable) return; // no second filesystem without root on this host
+    const actorRoot = fs.mkdtempSync(path.join(shm, "fabric-dead-root-actors-"));
+    const f = await fixture({ actorRoot });
+    try {
+      const actor = await seedActor(f, "other-fs");
+      const before = treeSnapshot(f.config.actorRoot);
+      const archives = fs.readdirSync(f.config.residencyRoot).includes("archives");
+      const result = await f.cli(actor.id);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("archive dir is on another filesystem or mount (EXDEV); refusing before any change (smarty-dev#8159)");
+      expectNoChange(f, actor.id, before);
+      expect(fs.readdirSync(f.config.residencyRoot).includes("archives")).toBe(archives); // not even a mkdir
+    } finally { await f.close(); fs.rmSync(actorRoot, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it("smarty-dev#8159 (c): a symlink in an intermediate component (the resident root) refuses before any change", async () => {
+    const f = await fixture();
+    try {
+      const actor = await seedActor(f, "intermediate-link");
+      const real = path.join(f.root, "moved-residency"); fs.renameSync(f.config.residencyRoot, real);
+      fs.symlinkSync(real, f.config.residencyRoot);
+      const before = treeSnapshot(f.config.actorRoot);
+      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, { confirmDeadRoot: f.config.rootId,
+        mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) }))
+        .rejects.toThrow(`Archive path component is not a real directory owned by this OS user: ${f.config.residencyRoot}`);
+      expectNoChange(f, actor.id, before);
+      expect(fs.existsSync(path.join(real, "archives"))).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("offline --dry-run against a live root goes through assertResidentOperatorConfirmed with dryRun=false and reports 'would refuse: Main is live'", async () => {
+    const f = await fixture();
+    const spy = vi.spyOn(operatorSafety, "assertResidentOperatorConfirmed");
+    try {
+      const actor = await seedActor(f, "dry-live-pinned");
+      f.mainParticipant(Date.now()); // the root's Main is live
+      const before = treeSnapshot(f.config.actorRoot);
+      const dry = await f.cli(actor.id, [...f.confirmed, "--dry-run"]);
+      expect(dry.code).toBe(1); expect(dry.err).toContain("would refuse: Main is live");
+      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ rootId: f.config.rootId, liveLease: true }), f.config.rootId, false, true);
+      expect(spy.mock.calls.some(call => call[2] === true)).toBe(false);
+      expectNoChange(f, actor.id, before);
+    } finally { spy.mockRestore(); await f.close(); }
   }, 40_000);
 
   // The race tests above call main() in-process: their injections must land between two steps, which a child cannot time.

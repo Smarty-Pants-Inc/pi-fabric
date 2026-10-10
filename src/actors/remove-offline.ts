@@ -20,7 +20,7 @@ import { withStateFence } from "../mesh/commit-outbox.js";
 import { acquireMainPublicationFence, deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { withParticipantFileTryLock } from "../topology/participant-files.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence, type MainToolEvidence } from "../residency/operator-safety.js";
-import { residentActorRoots, residentHostId, type ResidentHostConfig } from "../residency/protocol.js";
+import { residentActorRoots, residentHostId, residentRoot, type ResidentHostConfig } from "../residency/protocol.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { ActorBindingStore } from "./binding-store.js";
@@ -54,15 +54,59 @@ const pinActorRoot = (directory: string): PinnedActorRoot | undefined => {
   return { dev: stat.dev, ino: stat.ino };
 };
 
-/** A fresh, exclusive archive directory: mkdir (never recursive at the leaf) fails if the name exists. */
-const createArchiveDirectory = (archiveRoot: string, id: string, at = Date.now()): string => {
-  fs.mkdirSync(archiveRoot, { recursive: true, mode: 0o700 });
+const ARCHIVE_EXDEV = "archive dir is on another filesystem or mount (EXDEV); refusing before any change (smarty-dev#8159)";
+
+/** A real directory (lstat: not a link) owned by this OS user, or undefined when absent. */
+const ownedDirectory = (file: string): fs.Stats | undefined => {
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== process.getuid!()) {
+    throw new Error(`Archive path component is not a real directory owned by this OS user: ${file}; refusing before any change (smarty-dev#8159)`);
+  }
+  return stat;
+};
+
+/**
+ * The archive root, verified before ANY state change (smarty-dev#8159): every component from the mesh root
+ * down to archives is a real directory owned by this user (lstat, no link), archives resolves to exactly
+ * <real residency root>/archives, and it is on the pinned actor directory's filesystem. A missing archives
+ * is created by a plain, non-recursive mkdir (only when `create`), then verified again.
+ */
+const verifyArchiveRoot = (meshRoot: string, residencyRoot: string, realResidencyRoot: string, pin: PinnedActorRoot | undefined,
+  create: boolean): string => {
+  const residency = path.join(path.resolve(meshRoot), "residency");
+  if (path.dirname(path.resolve(residencyRoot)) !== residency) throw new Error(`Resident root is outside the mesh residency directory: ${residencyRoot}`);
+  for (const component of [residency, path.resolve(residencyRoot)]) {
+    if (!ownedDirectory(component)) throw new Error(`Archive path component is missing: ${component}; refusing before any change (smarty-dev#8159)`);
+  }
+  if (fs.realpathSync(residencyRoot) !== realResidencyRoot) throw new Error(`Resident root changed: ${residencyRoot}; refusing before any change (smarty-dev#8159)`);
+  // Before any mkdir: archives is made inside the residency root, so that must be on the actor's filesystem.
+  if (pin && fs.lstatSync(path.resolve(residencyRoot)).dev !== pin.dev) throw new Error(ARCHIVE_EXDEV);
+  const archiveRoot = path.join(path.resolve(residencyRoot), "archives");
+  let stat = ownedDirectory(archiveRoot);
+  if (!stat && create) {
+    fs.mkdirSync(archiveRoot, { mode: 0o700 }); // plain mkdir: the parent is verified above
+    stat = ownedDirectory(archiveRoot);
+  }
+  const placed = stat ?? fs.lstatSync(path.resolve(residencyRoot)); // a dry run: where archives would be made
+  if (stat && fs.realpathSync(archiveRoot) !== path.join(realResidencyRoot, "archives")) {
+    throw new Error(`Archive dir resolves elsewhere: ${archiveRoot}; refusing before any change (smarty-dev#8159)`);
+  }
+  if (pin && placed.dev !== pin.dev) throw new Error(ARCHIVE_EXDEV);
+  return archiveRoot;
+};
+
+/** A fresh, exclusive archive directory: a plain mkdir fails if the name exists; verified after. */
+const createArchiveDirectory = (archiveRoot: string, id: string, dev: number, at = Date.now()): string => {
   const directory = path.join(archiveRoot, `${id}.${stamp(at)}.${randomUUID()}`);
   try { fs.mkdirSync(directory, { mode: 0o700 }); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Archive target already exists: ${directory}; refusing (an archive is never overwritten or merged)`);
     throw error;
   }
+  const stat = ownedDirectory(directory);
+  if (!stat || stat.dev !== dev) throw new Error(`${ARCHIVE_EXDEV}: ${directory}`);
   return directory;
 };
 
@@ -270,11 +314,6 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     };
     try { assertResidentOperatorConfirmed(evidence, options.confirmDeadRoot, false, mainStopped); }
     catch (error) { if (dryRun) wouldRefuse(error); throw error; }
-    // The root Main publication fence (smarty-dev#7817): taken before the first check below, released
-    // in finally. A Main refuses to publish its root participant while it stands, in the same atomic
-    // step as the write; each check runs under that root's participant key lock inside the state
-    // transaction, so a Main publication either precedes the check (and refuses removal) or is refused.
-    if (!dryRun) releaseFence = await acquireMainPublicationFence(config.meshRoot, config.rootId);
     const incarnation = await ownProcessIncarnation();
     const identity = { id: residentHostId(config.rootId), name: "fabric-actors remove", kind: "agent" as const };
     const rootKey = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
@@ -302,20 +341,23 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     // Pin the actor directory (a real directory owned by this user) and refuse a cross-filesystem archive
     // before anything is written.
     const pin = pinActorRoot(actorDirectory);
-    const archiveRoot = path.join(directory, "archives");
-    if (pin && fs.statSync(path.dirname(archiveRoot)).dev !== pin.dev) {
-      throw new Error(`Actor directory and archive root are on different filesystems (EXDEV); refusing, no copy: ${actorDirectory}`);
-    }
+    // The archive root is verified (and, for a real run, created) before any state change (smarty-dev#8159).
+    const archiveRoot = verifyArchiveRoot(config.meshRoot, residentRoot(config.meshRoot, config.rootId), fs.realpathSync(directory), pin, !dryRun);
     if (dryRun) return { offline: true, dryRun, actor: summary, operatorEvidence: evidence,
       plan: { archiveRoot, archive: path.join(archiveRoot, `${id}.<time>.<random>`),
         audit: { ...options.mainStoppedAudit!, toolEvidence: evidence.toolEvidence! } } };
 
+    // The root Main publication fence (smarty-dev#7817), after every pre-change check and before the first
+    // check() below; released in finally. A Main refuses to publish its root participant while it stands,
+    // in the same atomic step as the write; each check runs under that root's participant key lock inside
+    // the state transaction, so a Main publication either precedes the check (and refuses) or is refused.
+    if (!dryRun) releaseFence = await acquireMainPublicationFence(config.meshRoot, config.rootId);
     // The tool's own observation at removal time, kept beside the operator's attestation.
     const assertion: MainStoppedAudit = { ...options.mainStoppedAudit!,
       toolEvidence: readResidentOperatorEvidence(config, mesh, undefined, { mainStopped }).toolEvidence! };
     // 1. Archive first: nothing is deleted or revoked before it is taken.
     await check();
-    const archive = createArchiveDirectory(archiveRoot, id);
+    const archive = createArchiveDirectory(archiveRoot, id, pin?.dev ?? fs.lstatSync(archiveRoot).dev);
     writeArchiveRecords(archive, row, assertion);
     // 2. The durable removal record, as #commitRemove: a later owner start finishes from it.
     const presenceKey = `actors/${config.sessionId}/${id}`;

@@ -193,8 +193,8 @@ const fixture = path.resolve("tests/fixtures/mesh-archive-group-crash.mjs");
 type Phase = "after-pending" | "after-datasync" | "after-live";
 interface Paused { pid: number; phase: Phase; call: string; target: string; lockHeldBySelf: boolean; pending: string | null; head: string | null; segmentLines: string[] }
 /** A child publisher stopped at one explicit boundary; one stdout IPC receipt, blocked on stdin. */
-const pausedPublisher = async (mesh: Setup, packet: Record<string, unknown> | Array<Record<string, unknown>>, phase: Phase) => {
-  const child = spawn(process.execPath, [fixture, mesh.root, mesh.dir, JSON.stringify(packet), phase], {
+const pausedPublisher = async (mesh: Setup, packet: Record<string, unknown> | Array<Record<string, unknown>>, phase: Phase, preload?: string) => {
+  const child = spawn(process.execPath, [...(preload ? ["--import", preload] : []), fixture, mesh.root, mesh.dir, JSON.stringify(packet), phase], {
     cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"],
   });
   children.push(child);
@@ -225,6 +225,18 @@ const pausedPublisher = async (mesh: Setup, packet: Record<string, unknown> | Ar
   });
   return {
     paused: record("paused") as Paused,
+    closeInput: () => child.stdin!.end(),
+    exitWithin: async (timeoutMs: number) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          closed,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`paused publisher did not exit within ${timeoutMs}ms: ${stderr}`)), timeoutMs);
+          }),
+        ]);
+      } finally { clearTimeout(timer); }
+    },
     kill: async () => { child.kill("SIGKILL"); const result = await closed; expect(result.signal).toBe("SIGKILL"); },
     release: async () => {
       child.stdin!.write("r");
@@ -399,7 +411,9 @@ describe("archived publish: one segment data barrier, strict v1 visibility (smar
     const line = JSON.stringify(old);
     fs.writeFileSync(path.join(mesh.root, "sequence"), "2");
     const pending = archive.begin({ event: old, line });
-    expect(pending).toMatchObject({ sequence: 2, id: old.id, file: path.relative(mesh.dir, mesh.segment("ops.mixed")), indexed: true });
+    // v1 stores POSIX relative addresses on every OS; native joins are only for disk access.
+    const relative = path.posix.join(today(), archiveFileName("ops.mixed"));
+    expect(pending).toMatchObject({ sequence: 2, id: old.id, file: relative, indexed: true });
     expect(archive.pending()).toMatchObject({ sequence: 2, id: old.id });
     fs.appendFileSync(path.join(mesh.root, "events.jsonl"), `${line}\n`);
     archive.commit(pending);
@@ -409,7 +423,10 @@ describe("archived publish: one segment data barrier, strict v1 visibility (smar
     const shape = (entry: Record<string, unknown>) => Object.keys(entry).sort();
     expect(shape(index(1))).toEqual(shape(index(2)));
     expect(shape(index(3))).toEqual(shape(index(2)));
-    for (const event of [first, old, third]) expect(archive.lookupEntry(event.sequence)).toMatchObject({ event, committed: true });
+    for (const event of [first, old, third]) {
+      expect(index(event.sequence).file).toBe(relative);
+      expect(archive.lookupEntry(event.sequence)).toMatchObject({ event, committed: true });
+    }
     expect(archive.head()).toEqual({ sequence: 3, id: third.id, file: pending.file });
     expect(archive.pending()).toBeUndefined();
     expect(archive.readAfter(0, 3, () => true, 10).map(event => event.id)).toEqual([first.id, old.id, third.id]);
@@ -466,6 +483,60 @@ describe("archived publish: one segment data barrier, strict v1 visibility (smar
       const { all: published, live } = expectConsistent(mesh, rebooted);
       expect(published.map(event => event.id)).toEqual([...events.map(event => event.id), published.at(-1)!.id]);
       expect(live.map(event => event.sequence)).toEqual([1, 2, 3, 4, 5]);
+    });
+  });
+
+  describe.skipIf(linuxOnly)("paused publisher lifetime", () => {
+    it("open but silent stdin exits within the 30-second bound and the abandoned lock is reclaimable", async () => {
+      const mesh = setup();
+      await mesh.store.publish({ topic: "ops.crash", from, text: "before" });
+      const child = await pausedPublisher(mesh, { topic: "ops.crash", from, text: "abandoned" }, "after-datasync");
+      expect(child.paused.lockHeldBySelf).toBe(true);
+      const started = performance.now();
+      // Keep the pipe open, but never write the release byte: exercise real EAGAIN reads.
+      expect(await child.exitWithin(32_000)).toEqual({ code: 4, signal: null });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(29_000);
+      const restarted = mesh.open();
+      await restarted.publish({ topic: "ops.crash", from, text: "after timeout" });
+      expect(expectConsistent(mesh, restarted).all.map(event => event.text)).toEqual(["before", "after timeout"]);
+    }, 55_000);
+
+    it("stdin EOF exits immediately instead of retaining the publish lock", async () => {
+      const mesh = setup();
+      const child = await pausedPublisher(mesh, { topic: "ops.crash", from, text: "abandoned" }, "after-datasync");
+      expect(child.paused.lockHeldBySelf).toBe(true);
+      child.closeInput();
+      expect(await child.exitWithin(2_000)).toEqual({ code: 3, signal: null });
+    });
+
+    it.each(["reparented", "changed parent", "missing parent"] as const)("%s exits immediately even when stdin keeps returning EAGAIN", async loss => {
+      const mesh = setup();
+      const preload = path.join(mesh.base, "parent-loss.mjs");
+      // Simulate parent loss only after the first stdin read so the real child reaches its
+      // locked pause first. No production seam: these probes patch only this child's APIs.
+      fs.writeFileSync(preload, `
+        import fs from "node:fs";
+        const parentPid = process.ppid;
+        let lost = false;
+        const read = fs.readSync.bind(fs);
+        fs.readSync = (fd, ...args) => {
+          if (fd !== 0) return read(fd, ...args);
+          lost = true;
+          throw Object.assign(new Error("silent stdin"), { code: "EAGAIN" });
+        };
+        ${loss === "missing parent" ? `
+          const probe = process.kill.bind(process);
+          process.kill = (pid, signal) => {
+            if (lost && pid === parentPid && signal === 0) throw Object.assign(new Error("parent gone"), { code: "ESRCH" });
+            return probe(pid, signal);
+          };
+        ` : `
+          Object.defineProperty(process, "ppid", { get: () => lost ? ${loss === "reparented" ? "1" : "parentPid + 1"} : parentPid });
+        `}
+      `);
+      const child = await pausedPublisher(mesh, { topic: "ops.crash", from, text: "abandoned" }, "after-datasync", preload);
+      expect(child.paused.lockHeldBySelf).toBe(true);
+      expect(await child.exitWithin(2_000)).toEqual({ code: 5, signal: null });
     });
   });
 

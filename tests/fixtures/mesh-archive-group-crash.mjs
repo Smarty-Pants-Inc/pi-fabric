@@ -9,13 +9,15 @@
 //                   and the commit (HEAD).
 //   after-live:     the live append returned; before the archive commit (PENDING removal, HEAD).
 // One IPC receipt per stop: a `{"paused":{...}}` JSON line on stdout. The process then blocks in a
-// read of stdin until the parent writes a byte (release) or kills it. A final `{"done":{...}}`
-// line reports the result.
+// read of stdin until the parent writes a byte (release) or kills it. An idle stdin cannot
+// strand the mesh lock: EOF exits 3, a 30-second deadline exits 4, and parent loss exits 5.
+// A final `{"done":{...}}` line reports a released publish's result.
 // argv: <mesh root> <archive dir> <packet json, an array means publishBatch> <phase>
 import fs from "node:fs";
 import path from "node:path";
 import { createJiti } from "jiti";
 
+const parentPid = process.ppid;
 const [root, archiveDir, packetJson, phase] = process.argv.slice(2);
 if (!["after-pending", "after-datasync", "after-live"].includes(phase)) throw new Error(`unknown pause phase: ${phase}`);
 const archiveReal = fs.realpathSync(archiveDir);
@@ -38,10 +40,22 @@ const pause = (call, target) => {
     head: readText(path.join(archiveReal, "HEAD.json")) ?? null,
     segmentLines: isSegment(target) ? (readText(target) ?? "").split("\n").filter(Boolean) : [],
   } });
+  // Node may inherit a blocking pipe. The synchronous loop must regain control to check
+  // its deadline and parent even when the harness leaves stdin open without a byte.
+  process.stdin._handle?.setBlocking(false);
   const byte = Buffer.alloc(1);
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = performance.now() + 30_000;
   for (;;) {
+    if (parentPid === 1 || process.ppid !== parentPid) process.exit(5);
+    try { process.kill(parentPid, 0); } catch { process.exit(5); }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) process.exit(4);
     try { if (fs.readSync(0, byte, 0, 1, null) === 0) process.exit(3); break; }
-    catch (error) { if (error?.code !== "EAGAIN") throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
+    catch (error) {
+      if (error?.code !== "EAGAIN") throw error;
+      Atomics.wait(sleeper, 0, 0, Math.min(5, remaining));
+    }
   }
 };
 

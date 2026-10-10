@@ -1,4 +1,4 @@
-import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -4078,6 +4078,7 @@ export class ActorManager {
             from: event.from,
             ...(event.verification === undefined ? {} : { verification: event.verification }),
             principal: event.principal,
+            wakeCause: fabricWakeCause(event.from, "mesh", event.topic, event.id),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),

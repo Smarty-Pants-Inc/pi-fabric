@@ -29,7 +29,7 @@ since activation, in dated/topic files and sequence indexes. It has **no mesh-ev
   mounts; that value is a deployment identity, not a secret.
 - Root token = full SHA256 of the root identity. Stream = `FABRIC_<root-token>` (one/root).
 - Subject = `fabric.<root-token>.<hex(UTF-8 topic)>`. Every topic occupies one token. Dots, colons,
-  slashes, dashes and underscores escape injectively; `a.b`, `a/b`, `a:b` never collide. Fabric's
+  slashes, dashes and `_` characters have unique encodings; `a.b`, `a/b`, `a:b` never collide. Fabric's
   existing 128-character ASCII topic grammar remains enforced. Exact topic filtering is server-side.
 - The stream owns the global sequence across topics. Stored JSON contains no sequence; reads stamp
   the envelope with the authoritative `PubAck.seq` / message stream sequence. Consumer delivery
@@ -53,7 +53,7 @@ that window or after deleting/recreating the stream. Persist the pending envelop
 you need to recover an unkeyed operation after process death. A missing ACK throws
 `JetStreamPublishUncertainError` with those exact bytes/id. A duplicate ACK returns the original
 stored event at its original stream sequence (not a new timestamp/payload). If retention has already
-removed it, reconciliation fails rather than fabricating a changed event.
+removed it, reconciliation fails and does not create a changed event.
 
 Batches are ordered and non-atomic, with 1..256 inputs. All payloads are captured/validated before
 sending. Success returns the entire prefix (there is no local-lock 50 ms yield requirement). Failure
@@ -74,7 +74,7 @@ interleave between events: stream order, not batch adjacency, is the guarantee.
 - Consumer creation is an explicit bounded API request. The nats 2.x ordered helper's initial retry
   loop can hide errors for minutes. Callback `consume` also avoids the raw pull iterator's early-break
   close deadlock observed during fault work. Snapshot completion closes/deletes its ephemeral
-  consumer; a 30-second deadline fails rather than silently returning an incomplete snapshot.
+  consumer; a 30-second deadline fails with an error if the snapshot is incomplete.
 - `openReader({cursorId,after,topic,to})` creates/binds `cursor_<SHA256(cursorId)>` in this stream.
   The durable uses explicit ACKs, StartSequence, Instant replay, `max_ack_pending=1`, and inherits
   stream replication. `after` is the **initial** boundary only; an existing durable resumes its
@@ -99,7 +99,7 @@ protects against one server/leader loss; it is not a proof against simultaneous 
 ## Retention and archive translation
 
 - `retention:"live"` (default): 64 MiB `max_bytes`, no age expiry (`max_age=0`). JetStream continuously
-  evicts oldest messages at the limit, rather than file compaction's 64-to-16 MiB hysteresis. Thus it
+  evicts oldest messages at the limit. File compaction uses 64-to-16 MiB hysteresis. Thus it
   retains **at least the intended recent tail**, but not byte-identical generations. NATS accounting
   includes envelope/subject/header overhead; don't equate bytes with JSONL payload bytes.
 - `retention:"archive"`: unlimited bytes (`max_bytes=-1`) and age (`max_age=0`), matching today's
@@ -113,7 +113,7 @@ protects against one server/leader loss; it is not a proof against simultaneous 
 
 ## Usage and reproducible checks
 
-```ts
+```ts host
 import { openJetStreamEventLog } from "pi-fabric/mesh";
 const log = await openJetStreamEventLog({
   root: "/mesh/example", rootId: "example-mesh", servers: ["nats://127.0.0.1:4222"],
@@ -134,7 +134,7 @@ The lane contains the inherited official `nats-server v2.14.7` Linux amd64 relea
 branch-only dependency in `package.json` / `bun.lock`. No global client/server install or service.
 Tests find an explicit `NATS_SERVER`, then `nats-server` on PATH, then that lane binary. Without it,
 transport integration tests skip and file conformance remains available for optional local runs.
-Set `NATS_SERVER_REQUIRED=1` to fail instead of skipping when the binary is missing. The Ubuntu CI
+With `NATS_SERVER_REQUIRED=1`, a missing binary makes the tests fail. The Ubuntu CI
 job downloads the official v2.14.7 Linux amd64 release, verifies its release SHA256SUMS and pinned
 archive digest `e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2`, adds it to PATH,
 and always runs all three suites below with the server required, independently of affected-test

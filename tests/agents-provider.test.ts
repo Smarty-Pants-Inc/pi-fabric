@@ -24,6 +24,8 @@ import type {
 } from "../src/lifecycle/types.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  loadFabricConfig,
+  normalizeFabricConfig,
   type FabricAgentConfig,
   type FabricModelsConfig,
 } from "../src/config.js";
@@ -82,6 +84,7 @@ const usage = {
 
 const visiblePiModels = [
   { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
   { provider: "cliproxyapi", id: "gpt-6-astra" },
   { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
@@ -574,7 +577,7 @@ describe("fleet model policy (#2490)", () => {
   it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
-      agentsConfig: policy, callerThinking: "max",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
     const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
@@ -813,6 +816,74 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe("configured task model precedence (#2890, #6062)", () => {
+  const sol = "cliproxyapi/gpt-6.1-sol";
+  const opus = "cliproxyapi-anthropic/claude-opus-5-5";
+  const callers = (["main", "actor", "agent"] as const)
+    .flatMap(kind => (["run", "spawn"] as const).map(action => [kind, action] as const));
+  const parentContext = {
+    ...context,
+    extensionContext: {
+      ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext,
+  };
+  const callerOptions = (kind: "main" | "actor" | "agent", agentsConfig: FabricAgentConfig) => ({
+    identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+    ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
+    agentsConfig,
+    callerThinking: "xhigh",
+  });
+
+  for (const scope of ["global", "project"] as const) {
+    it.each(callers)(`${scope} model/effort wins for %s caller via %s`, async (kind, action) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-task-default-"));
+      roots.push(root);
+      const cwd = path.join(root, "workspace"); const agentDir = path.join(root, "agent");
+      fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+      fs.mkdirSync(agentDir);
+      if (scope === "project") {
+        fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { model: opus, thinking: "low" } }));
+      }
+      const configPath = scope === "global" ? path.join(agentDir, "fabric.json") : path.join(cwd, ".pi", "fabric.json");
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { model: sol, thinking: "high" } }));
+      const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+      const { provider, agents } = setup([], [], undefined, { ...callerOptions(kind, config.agents), cwd });
+      const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+      expect(child).toMatchObject({ model: sol, thinking: "high" });
+      if (action === "spawn") expect((await agents.wait(child.id)).status).toBe("completed");
+      else expect(child.status).toBe("completed");
+    });
+  }
+
+  it.each(callers)("unconfigured model inherits %s caller via %s, not the remote Main", async (kind, action) => {
+    const config = normalizeFabricConfig({ agents: { thinking: "high" } });
+    const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
+    const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "xhigh" });
+    if (action === "spawn") await agents.wait(child.id);
+  });
+
+  it.each(callers)("explicit model/effort beats configured defaults for %s caller via %s", async (kind, action) => {
+    const config = normalizeFabricConfig({ agents: { model: sol, thinking: "high" } });
+    const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
+    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "low" });
+    if (action === "spawn") await agents.wait(child.id);
+  });
+
+  it.each([undefined, "high"] as const)("configured thinking %s has precedence over an alias, not built-in medium", async thinking => {
+    const config = normalizeFabricConfig({ agents: { model: "task-default", ...(thinking ? { thinking } : {}) } });
+    const { provider, agents } = setup([], [], undefined, {
+      ...callerOptions("main", config.agents),
+      modelsConfig: { aliases: { "task-default": { targets: [sol], thinking: "low" } } },
+    });
+    const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: sol, thinking: thinking ?? "low" });
+    await agents.wait(child.id);
+  });
+});
 
 describe("#2643 immediate bound spawner routing", () => {
   it.each(["session", "durable"] as const)("routes a %s actor child's spawner followUp to the actor, not root Main", async (residency) => {

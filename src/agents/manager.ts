@@ -856,12 +856,14 @@ export class AgentManager {
     this.#completionRecipient = options.completionRecipient;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    // Nested work returns to its immediate caller. This launch-only binding does
+    // not change the owning Main that an actor discovers or steers during its turn.
+    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     this.#taskReturnAddressArguments = taskReturnAddressArguments(
-      this.#identityId ?? process.env.PI_FABRIC_ACTOR_ID ?? process.env.PI_FABRIC_PARENT_RUN,
+      this.#spawner?.id,
       options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
       this.#mainAgentId,
     );
-    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1341,7 +1343,7 @@ export class AgentManager {
         const spawnerGuidance = runner === "pi" && extensions && this.#spawner && this.#spawner.kind !== "main"
           ? `Your immediate Fabric spawner is ${this.#spawner.kind} ${this.#spawner.id}${this.#spawner.runId ? ` (run ${this.#spawner.runId})` : ""}. ` +
             "Your final result is returned to that spawner automatically. For addressed updates use agents.followUp({id:'spawner',message:'...'}); " +
-            "agents.spawner() discovers this binding. The 'main' target is the lineage root, NOT an actor spawner."
+            "agents.spawner() discovers this binding. In a process task child, agents.main() and 'main' use the spawn-bound return address; in an actor turn they still address the owning Main."
           : undefined;
         const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))

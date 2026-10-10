@@ -93,8 +93,14 @@ const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
 // Bounded backoff for an observed fault obligation only; no obligation, no timer.
 const FAULT_RETRY_MIN_MS = 1_000;
-const FAULT_RETRY_MAX_MS = 60_000;
-/** Exact inputs a faulted delivery pass retains; owned pending keys retry via #retryDirty. */
+const FAULT_RETRY_MAX_MS = 5_000;
+const DELIVERY_MAX_ATTEMPTS = 8;
+// Admission pressure/reload and transient storage faults can recover without a new
+// notification. Unknown errors (including validation/refusal) never earn a timer.
+const isRetryableDeliveryError = (error: unknown): boolean => isMeshLockTimeout(error) ||
+  (error instanceof Error && (/Main(?:'s)?(?:.*followUp queue is full| busy)|no follow-up journal open|(?:journal|inbox).*closed|closed.*(?:journal|inbox)|^Main could not record the (?:message|followUp):|barrier.*(?:unavailable|closed)/i.test(error.message) ||
+    ["EAGAIN", "EBUSY", "EINTR", "ETIMEDOUT", "EMFILE", "ENFILE", "EIO"].includes((error as NodeJS.ErrnoException).code ?? "")));
+/** Exact inputs a faulted delivery pass retains; delivery retries own only their keys. */
 interface FaultObligation { mesh: boolean; journal: boolean; policy: boolean; deliveries: Set<string>; claims: Set<string>; names: Set<string> }
 const DELIVERY_NAMESPACE = "residency/deliveries/";
 const CLAIM_NAMESPACE = "residency/completion-claims/";
@@ -212,6 +218,9 @@ export class ResidencyClient {
   #scheduled = false;
   readonly #deliveryEntries = new Map<string, string>();
   readonly #pendingDeliveries = new Set<string>();
+  readonly #faultDeliveries = new Set<string>();
+  readonly #deliveryAttempts = new Map<string, number>();
+  #journalRetryDirty = false;
   // Authenticated own completions suppressed by policy are not retry work.
   readonly #quietDeliveries = new Set<string>();
   // Authenticated completion hints only; acknowledgment wakes exact fresh keys.
@@ -321,6 +330,7 @@ export class ResidencyClient {
   retryDeliveries(): void {
     if (this.#closed) return;
     this.#refreshWatchers();
+    this.#deliveryAttempts.clear(); // Explicit recovery grants a fresh bounded budget.
     this.#meshDirty = this.#journalDirty = this.#retryDirty = true;
     this.#requestDrain();
   }
@@ -1426,7 +1436,7 @@ export class ResidencyClient {
         if (this.#closed) return;
         // These flags can only be set by an event arriving during the owned pass.
         // A failed pass alone does not acquire an immediate attempt.
-        if (this.#meshDirty || this.#journalDirty || this.#retryDirty || this.#policyDirty || this.#receiptDeliveries.size ||
+        if (this.#meshDirty || this.#journalDirty || this.#retryDirty || this.#journalRetryDirty || this.#faultDeliveries.size || this.#policyDirty || this.#receiptDeliveries.size ||
             this.#changedDeliveries.size || this.#changedClaims.size || this.#unknownNotifications.size || this.#unknownOverflow) {
           this.#requestDrain();
           return;
@@ -1457,13 +1467,13 @@ export class ResidencyClient {
       this.#faultObligation = undefined;
       if (this.#closed || !obligation) return;
       this.#refreshWatchers();
-      // Re-read only owned pending keys and the faulted pass's exact inputs: never
-      // an all-mesh sweep. #deliver/#adoptCompletion re-check every fence fresh.
-      this.#retryDirty = true;
+      // Retry only the fault's keys, not other pending/permanently refused records.
+      // #deliver/#adoptCompletion re-check every fence fresh.
+      this.#journalRetryDirty ||= obligation.journal || obligation.claims.size > 0;
       this.#meshDirty ||= obligation.mesh;
       this.#journalDirty ||= obligation.journal;
       this.#policyDirty ||= obligation.policy;
-      for (const key of obligation.deliveries) this.#changedDeliveries.add(key);
+      for (const key of obligation.deliveries) this.#faultDeliveries.add(key);
       for (const key of obligation.claims) this.#changedClaims.add(key);
       for (const name of obligation.names) this.#unknownNotifications.add(name);
       this.#requestDrain(false);
@@ -1562,6 +1572,9 @@ export class ResidencyClient {
     const meshDirty = this.#meshDirty;
     const journalDirty = this.#journalDirty;
     const retryPending = this.#retryDirty;
+    const retryJournal = retryPending || this.#journalRetryDirty;
+    const faultKeys = [...this.#faultDeliveries];
+    this.#faultDeliveries.clear(); this.#journalRetryDirty = false;
     const policyWake = this.#policyDirty;
     const receiptKeys = [...this.#receiptDeliveries];
     const deliveryKeys = [...this.#changedDeliveries], claimKeys = [...this.#changedClaims];
@@ -1582,13 +1595,13 @@ export class ResidencyClient {
       for (const key of deliveryKeys) {
         const entry = this.options.mesh.get(key, { fresh: true });
         if (entry && this.#deliveryEntries.get(key) !== JSON.stringify(entry) && !entries.some(item => item.key === key)) entries.push(entry);
-        else if (!entry) { this.#deliveryEntries.delete(key); this.#pendingDeliveries.delete(key); this.#forgetNotification(key); }
+        else if (!entry) { this.#deliveryEntries.delete(key); this.#pendingDeliveries.delete(key); this.#deliveryAttempts.delete(key); this.#forgetNotification(key); }
       }
-      if (retryPending) for (const key of this.#pendingDeliveries) {
+      for (const key of new Set([...faultKeys, ...(retryPending ? this.#pendingDeliveries : [])])) {
         if (entries.some(entry => entry.key === key)) continue;
         const entry = this.options.mesh.get(key, { fresh: true });
         if (entry) entries.push(entry);
-        else this.#pendingDeliveries.delete(key);
+        else { this.#pendingDeliveries.delete(key); this.#deliveryAttempts.delete(key); }
       }
       // Re-read only known OWN quiet keys on enable. Keys are hints, never
       // authority: #deliver rechecks the fresh host/root/metadata/receipt fences.
@@ -1618,6 +1631,7 @@ export class ResidencyClient {
       for (const entry of entries) {
         // Remember the attempted signature even on failure. An unrelated key
         // notification must never turn a failed delivery into fresh work.
+        if (this.#deliveryEntries.get(entry.key) !== JSON.stringify(entry)) this.#deliveryAttempts.delete(entry.key);
         this.#deliveryEntries.set(entry.key, JSON.stringify(entry));
         this.#mapNotification(entry.key);
         try {
@@ -1630,18 +1644,31 @@ export class ResidencyClient {
             ? await this.#deliver(entry) : await this.#adoptCompletion(entry);
           if (pending) this.#pendingDeliveries.add(entry.key);
           else this.#pendingDeliveries.delete(entry.key);
+          this.#deliveryAttempts.delete(entry.key);
+          this.#faultObligation?.deliveries.delete(entry.key);
           if (pending || this.options.config.agents.notifyOnComplete) this.#quietDeliveries.delete(entry.key);
           this.#deliveryEntries.set(entry.key, JSON.stringify(entry));
         } catch (error) {
-          // The record remains durable. Back off a locked mesh; retain ordinary failed senders
-          // without blocking the other entries in this pass.
-          this.#pendingDeliveries.add(entry.key); // Explicit recovery or this key’s event only.
+          // The durable record stays pending, but only retryable failures own a timer.
+          this.#pendingDeliveries.add(entry.key);
+          if (isRetryableDeliveryError(error)) {
+            const attempts = (this.#deliveryAttempts.get(entry.key) ?? 0) + 1;
+            this.#deliveryAttempts.set(entry.key, attempts);
+            if (attempts < DELIVERY_MAX_ATTEMPTS) this.#faultObligationState().deliveries.add(entry.key);
+            else {
+              this.#faultObligation?.deliveries.delete(entry.key);
+              if (attempts === DELIVERY_MAX_ATTEMPTS) console.warn(`[pi-fabric] resident delivery ${entry.key}: retry exhausted after ${attempts} attempts; retained for event/explicit recovery`);
+            }
+          } else {
+            this.#deliveryAttempts.set(entry.key, DELIVERY_MAX_ATTEMPTS);
+            this.#faultObligation?.deliveries.delete(entry.key);
+          }
           if (isMeshLockTimeout(error)) throw error;
           fault ??= error;
         }
       }
-      if (journalDirty || claims.length) await this.#completions.drainChanged(this.options.config.agents.notifyOnComplete,
-        { retryPending, claims });
+      if (journalDirty || retryJournal || claims.length) await this.#completions.drainChanged(this.options.config.agents.notifyOnComplete,
+        { retryPending: retryJournal, claims });
       journalDrained = true;
       if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;
@@ -1649,20 +1676,23 @@ export class ResidencyClient {
       // Keep failed work as owned obligations: its next notification/receipt, or one
       // bounded fault retry of exactly these inputs, never an idle all-mesh drain.
       for (const key of receiptKeys) this.#pendingDeliveries.add(key);
-      const obligation = this.#faultObligationState();
       if (isMeshLockTimeout(error)) {
+        const obligation = this.#faultObligationState();
         // The outage may have interrupted discovery itself: retain its exact inputs.
         obligation.mesh ||= meshDirty;
         obligation.policy ||= policyWake;
-        for (const key of deliveryKeys) obligation.deliveries.add(key);
+        for (const key of [...deliveryKeys, ...faultKeys]) {
+          if ((this.#deliveryAttempts.get(key) ?? 0) < DELIVERY_MAX_ATTEMPTS) obligation.deliveries.add(key);
+        }
         // Unresolved hints of an interrupted resolution stay hints, never a sweep.
         for (const name of unknownNames) obligation.names.add(name);
         // A lost overflow becomes one bounded signature diff, which retries no unchanged key.
         obligation.mesh ||= unknownOverflow;
       }
-      if (!journalDrained && (journalDirty || claims.length || claimKeys.length)) {
+      if (!journalDrained && (journalDirty || retryJournal || claims.length || claimKeys.length)) {
         // Claims were signed before the journal drain; unsign them so the retry sees them.
-        obligation.journal ||= journalDirty;
+        const obligation = this.#faultObligationState();
+        obligation.journal ||= journalDirty || retryJournal;
         for (const claim of claims) { this.#claimEntries.delete(claim.key); obligation.claims.add(claim.key); }
         for (const key of claimKeys) obligation.claims.add(key);
       }

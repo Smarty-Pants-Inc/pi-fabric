@@ -12,6 +12,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENCY_NOTIFICATION_DIR, residencyNotificationName } from "../src/mesh/residency-notifications.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import * as kernelFence from "../src/residency/file-lock.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { residentHostId, residentDeliveryPrefix, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 
@@ -210,6 +211,86 @@ describe("ResidencyClient event-driven idle", () => {
       await vi.advanceTimersByTimeAsync(60_000); await settled();
       expect(h.deliverAgent).toHaveBeenCalledOnce(); expect(select).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
     } finally { warn.mockRestore(); await h.client.close(); h.mesh.closeState(); }
+  });
+
+  it.each([
+    "Main busy",
+    "Main's followUp queue is full (test); Main is busy and reads followUps only at its next tool boundary. Wait, or send a short steer.",
+    "Main has no follow-up journal open; retry the durable delivery later",
+    "Main follow-up journal barrier is closed",
+  ])("redelivers one transient admission failure after backoff, without an event or safety tick: %s", async message => {
+    const h = fixture(); fakeWatches();
+    const key = residentDeliveryPrefix(h.config.rootId) + "busy-once";
+    await h.mesh.put({ key, identity: { id: residentHostId(h.config.rootId), name: "host", kind: "main" }, value: {
+      format: 1, id: "busy-once", rootId: h.config.rootId, from: { id: "actor", name: "actor", kind: "actor" },
+      message: "busy-once", delivery: "followUp", triggerTurn: true, createdAt: 1 } });
+    h.deliverAgent.mockImplementationOnce(() => { throw new Error(message); });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    const drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drain.mock.results[0]!.value; await settled();
+    expect(h.deliverAgent).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(1);
+    const select = vi.spyOn(h.mesh, "listAllShared"), get = vi.spyOn(h.mesh, "get");
+    await vi.advanceTimersByTimeAsync(999); await settled(); expect(h.deliverAgent).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1); await settled(); expect(h.deliverAgent).toHaveBeenCalledTimes(2);
+    expect(get.mock.calls.map(([read]) => read).filter(read => read.startsWith("residency/deliveries/"))).toEqual([key]);
+    expect(select).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+    expect(h.mesh.get(key, { fresh: true })).toBeUndefined();
+    select.mockClear(); get.mockClear();
+    await vi.advanceTimersByTimeAsync(300_000); await settled();
+    expect(h.deliverAgent).toHaveBeenCalledTimes(2); expect(select).not.toHaveBeenCalled(); expect(get).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["Main agent message must not be empty", "Unknown target: vanished", "Permanent refusal: forbidden"])(
+    "does not sweep a permanent failure into another key's transient retry: %s", async permanent => {
+      const h = fixture(); fakeWatches();
+      const writer = { id: residentHostId(h.config.rootId), name: "host", kind: "main" as const };
+      const keys = ["permanent", "transient"].map(id => residentDeliveryPrefix(h.config.rootId) + id);
+      for (const [index, key] of keys.entries()) await h.mesh.put({ key, identity: writer, value: {
+        format: 1, id: index ? "transient" : "permanent", rootId: h.config.rootId, from: { id: "actor", name: "actor", kind: "actor" },
+        message: index ? "transient" : "permanent", delivery: "followUp", triggerTurn: true, createdAt: 1 } });
+      let transientAttempts = 0;
+      h.deliverAgent.mockImplementation(request => {
+        if (request.message === "permanent") throw new Error(permanent);
+        if (++transientAttempts === 1) throw new Error("Main busy");
+      });
+      vi.spyOn(console, "warn").mockImplementation(() => {}); vi.useFakeTimers();
+      const drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
+      h.client.start(); await vi.advanceTimersByTimeAsync(20); await drain.mock.results[0]!.value; await settled();
+      expect(h.deliverAgent).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000); await settled();
+      expect(h.deliverAgent.mock.calls.filter(([request]) => request.message === "permanent")).toHaveLength(1);
+      expect(transientAttempts).toBe(2); expect(h.mesh.get(keys[0]!, { fresh: true })).toBeDefined();
+      expect(h.mesh.get(keys[1]!, { fresh: true })).toBeUndefined(); expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(300_000); await settled();
+      expect(h.deliverAgent).toHaveBeenCalledTimes(3); expect(vi.getTimerCount()).toBe(0);
+    });
+
+  it.each(["Main busy", "mesh lock"])("caps %s delivery attempts at eight, logs exhaustion once, and retains explicit recovery", async kind => {
+    const h = fixture(); fakeWatches();
+    const key = residentDeliveryPrefix(h.config.rootId) + "exhausted";
+    await h.mesh.put({ key, identity: { id: residentHostId(h.config.rootId), name: "host", kind: "main" }, value: {
+      format: 1, id: "exhausted", rootId: h.config.rootId, from: { id: "actor", name: "actor", kind: "actor" },
+      message: "exhausted", delivery: "followUp", triggerTurn: true, createdAt: 1 } });
+    h.deliverAgent.mockImplementation(() => { throw kind === "mesh lock" ? new MeshLockTimeoutError("test", 1, 1) : new Error(kind); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {}); vi.useFakeTimers();
+    // This test owns delivery retries, not asynchronous journal I/O; keep the
+    // startup clock anchored before asserting exact per-attempt backoff.
+    vi.spyOn(CompletionJournal.prototype, "drainChanged").mockResolvedValue(undefined);
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await settled();
+    expect(h.deliverAgent).toHaveBeenCalledOnce();
+    for (const [index, ms] of [1_000, 2_000, 4_000, 5_000, 5_000, 5_000, 5_000].entries()) {
+      await vi.advanceTimersByTimeAsync(ms); await settled(); expect(h.deliverAgent).toHaveBeenCalledTimes(index + 2);
+    }
+    await vi.advanceTimersByTimeAsync(300_000); await settled();
+    expect(h.deliverAgent).toHaveBeenCalledTimes(8); expect(vi.getTimerCount()).toBe(0);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("retry exhausted after 8 attempts"))).toHaveLength(1);
+    expect(h.mesh.get(key, { fresh: true })).toBeDefined();
+    h.deliverAgent.mockImplementation(() => {}); h.client.retryDeliveries();
+    await vi.waitFor(() => expect(h.mesh.get(key, { fresh: true })).toBeUndefined()); await settled();
+    expect(h.deliverAgent).toHaveBeenCalledTimes(9);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("retries a faulted owned delivery without any event at 1 s then 2 s, then idles with zero timers", async () => {

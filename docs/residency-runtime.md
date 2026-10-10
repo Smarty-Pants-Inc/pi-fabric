@@ -74,7 +74,7 @@ safety timer only repairs watch attachment, never discovers/delivers work.
 
 Windows retains a 5-second trusted safety drain for control, lifecycle and
 residency observation. Native watches observe recursively from stable parent
-paths rather than holding the mesh, journal or run directories open; Windows
+paths, so the mesh, journal and run directories are never held open; Windows
 cannot rename a directory pinned by `ReadDirectoryChangesW`. Missing callbacks,
 unsupported watches and directory replacements therefore cannot strand new
 commands, ACKs, completion files or consumed-delivery cleanup. Namespace discovery
